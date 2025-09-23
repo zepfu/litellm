@@ -602,6 +602,14 @@ async def anthropic_proxy_route(
         region_name=None,
     )
 
+    custom_headers = {}
+    if (
+        "authorization" not in request.headers
+        and "x-api-key" not in request.headers
+        and anthropic_api_key is not None
+    ):
+        custom_headers["x-api-key"] = "{}".format(anthropic_api_key)
+
     ## check for streaming
     is_streaming_request = await is_streaming_request_fn(request)
 
@@ -609,7 +617,7 @@ async def anthropic_proxy_route(
     endpoint_func = create_pass_through_route(
         endpoint=endpoint,
         target=str(updated_url),
-        custom_headers={"x-api-key": "{}".format(anthropic_api_key)},
+        custom_headers=custom_headers,
         _forward_headers=True,
         is_streaming_request=is_streaming_request,
     )  # dynamically construct pass-through endpoint based on incoming path
