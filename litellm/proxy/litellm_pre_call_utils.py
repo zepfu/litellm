@@ -251,6 +251,10 @@ def clean_headers(
             litellm_key_lower is None or header_lower != litellm_key_lower
         ):
             clean_headers[header] = value
+        # Preserve Authorization header when it contains an Anthropic OAuth token
+        # so forward_client_headers_to_llm_api can forward it to the provider
+        elif header_lower == "authorization" and value.startswith("Bearer sk-ant-oat"):
+            clean_headers[header] = value
     return clean_headers
 
 
@@ -330,6 +334,8 @@ class LiteLLMProxyRequestSetup:
             ):  # causes openai sdk to fail
                 forwarded_headers[header] = value
             elif header.lower().startswith("anthropic-beta"):
+                forwarded_headers[header] = value
+            elif header.lower() == "authorization":
                 forwarded_headers[header] = value
 
         return forwarded_headers
