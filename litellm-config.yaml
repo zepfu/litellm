@@ -1,0 +1,282 @@
+model_list:
+  # Claude models via native anthropic/ provider.
+  # Auth: forward_client_headers_to_llm_api (general_settings) passes the client's
+  # Authorization: Bearer sk-ant-oat01-... header directly to Anthropic.
+  # No ANTHROPIC_API_KEY needed on the server — the Claude Pro/Max OAuth token
+  # is supplied by the client (Claude Code) on every request.
+  - model_name: "openai/claude-sonnet-4-20250514"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+
+  - model_name: "openai/claude-opus-4-6"
+    litellm_params:
+      model: "anthropic/claude-opus-4-6"
+
+  # Short aliases for Claude models
+  - model_name: "sonnet"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+
+  - model_name: "opus"
+    litellm_params:
+      model: "anthropic/claude-opus-4-6"
+
+  - model_name: "haiku"
+    litellm_params:
+      model: "anthropic/claude-haiku-4-5"
+
+  # Claude Code sends these exact model IDs via the Anthropic messages API.
+  # These aliases map them to the anthropic/ provider with header forwarding.
+  - model_name: "claude-opus-4-6"
+    litellm_params:
+      model: "anthropic/claude-opus-4-6"
+
+  - model_name: "claude-sonnet-4-6"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-6"
+
+  - model_name: "claude-sonnet-4-20250514"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+
+  - model_name: "claude-haiku-4-5-20251001"
+    litellm_params:
+      model: "anthropic/claude-haiku-4-5-20251001"
+
+  - model_name: "claude-haiku-4-5"
+    litellm_params:
+      model: "anthropic/claude-haiku-4-5"
+
+  # Gemini models via CLIProxyAPI (Docker Compose service name for inter-container routing)
+  # NOTE: Gemini kept on CLIProxyAPI — no native LiteLLM OAuth support yet (GitHub #18606).
+  - model_name: "openai/gemini-2.5-pro"
+    litellm_params:
+      model: "openai/gemini-2.5-pro"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "openai/gemini-2.5-flash"
+    litellm_params:
+      model: "openai/gemini-2.5-flash"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "openai/gemini-3-pro-preview"
+    litellm_params:
+      model: "openai/gemini-3-pro-preview"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "openai/gemini-3-flash-preview"
+    litellm_params:
+      model: "openai/gemini-3-flash-preview"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "openai/gemini-2.5-flash-lite"
+    litellm_params:
+      model: "openai/gemini-2.5-flash-lite"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  # Short aliases for Gemini models
+  - model_name: "gemini-pro"
+    litellm_params:
+      model: "openai/gemini-2.5-pro"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "gemini-flash"
+    litellm_params:
+      model: "openai/gemini-2.5-flash"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "gemini-pro-preview"
+    litellm_params:
+      model: "openai/gemini-3-pro-preview"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "gemini-flash-preview"
+    litellm_params:
+      model: "openai/gemini-3-flash-preview"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  - model_name: "flash-lite"
+    litellm_params:
+      model: "openai/gemini-2.5-flash-lite"
+      api_base: "http://cliproxyapi:8317/v1"
+      api_key: "aawm-local-only"
+
+  # ChatGPT/Codex models via native chatgpt/ provider.
+  # Auth: device-code OAuth flow. First request triggers an interactive browser-based
+  # device-code login (one-time). Token stored at ~/.config/litellm/chatgpt/auth.json,
+  # mounted as a named volume (chatgpt_auth) so it persists across container restarts.
+  # Subsequent requests are fully headless — no interaction required.
+  # model_info.mode: responses — required for ChatGPT Responses API compatibility.
+  - model_name: "openai/gpt-5"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5"
+
+  - model_name: "openai/gpt-5.1"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.1"
+
+  - model_name: "openai/gpt-5.2"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.2"
+
+  # Codex models via native chatgpt/ provider
+  - model_name: "openai/gpt-5-codex"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5-codex"
+
+  - model_name: "openai/gpt-5-codex-mini"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5-codex-mini"
+
+  - model_name: "openai/gpt-5.1-codex"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.1-codex"
+
+  - model_name: "openai/gpt-5.1-codex-mini"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.1-codex-mini"
+
+  - model_name: "openai/gpt-5.1-codex-max"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.1-codex-max"
+
+  - model_name: "openai/gpt-5.2-codex"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.2-codex"
+
+  - model_name: "openai/gpt-5.3-codex"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.3-codex"
+
+  - model_name: "openai/gpt-5.3-codex-spark"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.3-codex-spark"
+
+  # Short aliases for OpenAI/Codex models
+  - model_name: "gpt"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.2"
+
+  - model_name: "codex"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.3-codex"
+
+  - model_name: "codex-mini"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5-codex-mini"
+
+  - model_name: "codex-max"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.1-codex-max"
+
+  - model_name: "codex-spark"
+    model_info:
+      mode: responses
+    litellm_params:
+      model: "chatgpt/gpt-5.3-codex-spark"
+
+  # xAI Grok models via direct API (OpenAI-compatible)
+  # API key: AAWM_XAI_API_KEY env var injected via docker-compose
+  - model_name: "xai/grok-4-1-fast-reasoning"
+    litellm_params:
+      model: "xai/grok-4-1-fast-reasoning"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
+  - model_name: "xai/grok-4-1-fast-non-reasoning"
+    litellm_params:
+      model: "xai/grok-4-1-fast-non-reasoning"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
+  - model_name: "xai/grok-4-0709"
+    litellm_params:
+      model: "xai/grok-4-0709"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
+  - model_name: "xai/grok-code-fast-1"
+    litellm_params:
+      model: "xai/grok-code-fast-1"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
+  - model_name: "xai/grok-3"
+    litellm_params:
+      model: "xai/grok-3"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
+  - model_name: "xai/grok-3-mini"
+    litellm_params:
+      model: "xai/grok-3-mini"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
+  - model_name: "xai/grok-2-vision-1212"
+    litellm_params:
+      model: "xai/grok-2-vision-1212"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
+  # OpenAI text-embedding-3-small for semantic embeddings (1536 dims).
+  # Routes through LiteLLM proxy → OpenAI API.
+  # API key injected via AAWM_OPENAI_API_KEY env var.
+  - model_name: "openai/text-embedding-3-small"
+    litellm_params:
+      model: "openai/text-embedding-3-small"
+      api_key: "os.environ/AAWM_OPENAI_API_KEY"
+
+
+litellm_settings:
+  drop_params: true
+  # Langfuse observability — log all successful LLM calls as traces.
+  # Requires LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST env vars
+  # (injected via docker-compose environment block on the litellm service).
+  success_callback: ["langfuse"]
+  # Request timeout note: LiteLLM proxy default is 6000s (from constants.py env var
+  # REQUEST_TIMEOUT). CLIProxyAPI logs show Claude API can take 5-10s under load.
+  # Setting request_timeout here does NOT reliably override the default due to
+  # LiteLLM proxy startup order (use REQUEST_TIMEOUT env var to override instead).
+  # The 6000s default is deliberately permissive — do not lower below 30s.
+
+general_settings:
+  # Forward client Authorization header to Anthropic untouched.
+  # This is what allows Claude Pro/Max OAuth tokens (sk-ant-oat01-...) to work
+  # without a server-side ANTHROPIC_API_KEY. The client (Claude Code) supplies
+  # the bearer token directly to LiteLLM, which passes it through to the upstream
+  # Anthropic API. Proxy auth is disabled for local dev — localhost-only binding
+  # provides sufficient security.
+  forward_client_headers_to_llm_api: true

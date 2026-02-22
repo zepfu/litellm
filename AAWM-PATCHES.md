@@ -3,6 +3,57 @@
 This fork of [BerriAI/litellm](https://github.com/BerriAI/litellm) tracks the
 upstream `v1.81.13` release with AAWM-specific patches applied on top.
 
+## Standalone Deployment
+
+`litellm-config.yaml` and `docker-compose.yml` are now co-located in this repo,
+enabling the fork to run independently without the AAWM repo.
+
+**`litellm-config.yaml`** — copied from `~/projects/aawm/litellm-config.yaml`.
+This is the canonical model routing config. Updates should be made here and
+synced back to AAWM if needed (or AAWM can reference this repo as the source
+of truth going forward).
+
+**`docker-compose.yml`** — standalone compose file that brings up all required
+services: LiteLLM (built from this fork), CLIProxyAPI (Gemini routing),
+and the full Langfuse v3 observability stack (ClickHouse, Redis, MinIO,
+langfuse-web, langfuse-worker, PostgreSQL).
+
+**One prerequisite:** `cliproxyapi-config.yaml` must be present in this repo
+root before `docker compose up`. Copy from the AAWM repo:
+
+```bash
+cp ~/projects/aawm/cliproxyapi-config.yaml ./cliproxyapi-config.yaml
+```
+
+**AAWM-specific references in `litellm-config.yaml`** (no changes needed —
+these work as-is in the compose network):
+
+- Gemini models use `api_base: "http://cliproxyapi:8317/v1"` — resolves to the
+  `cliproxyapi` service defined in this compose file.
+- Langfuse callback uses `LANGFUSE_HOST: "http://langfuse-web:3000"` — resolves
+  to the `langfuse-web` service defined in this compose file.
+- `os.environ/AAWM_XAI_API_KEY` and `os.environ/AAWM_OPENAI_API_KEY` — set
+  these in a `.env` file at repo root (both optional; only needed for xAI/OpenAI
+  models).
+
+**Port allocation** (matches AAWM defaults to avoid host conflicts):
+
+| Service | Host port |
+|---------|-----------|
+| LiteLLM proxy | 4000 |
+| CLIProxyAPI | 8317 |
+| Langfuse web | 3000 |
+| PostgreSQL | 5435 |
+| ClickHouse HTTP | 8123 |
+| Redis | 6380 |
+| MinIO S3 | 9010 |
+| MinIO console | 9011 |
+
+Note: PostgreSQL is mapped to host port **5435** (not 5434) to avoid conflicting
+with the AAWM tristore if both stacks are running simultaneously on the same host.
+
+---
+
 ## Branch Strategy
 
 | Branch | Purpose |
