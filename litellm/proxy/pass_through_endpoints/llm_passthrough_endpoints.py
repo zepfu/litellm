@@ -601,6 +601,16 @@ async def anthropic_proxy_route(
         region_name=None,
     )
 
+    ## Detect Anthropic OAuth tokens (sk-ant-oat) in the Authorization header.
+    ## When present, skip setting x-api-key so the OAuth bearer token is
+    ## forwarded as-is via forward_headers. Without this, get_credentials()
+    ## returns None and sends "x-api-key: None" which Anthropic rejects.
+    _auth_header = request.headers.get("authorization", "")
+    if _auth_header.startswith("Bearer sk-ant-oat"):
+        _anthropic_custom_headers: dict = {}
+    else:
+        _anthropic_custom_headers = {"x-api-key": "{}".format(anthropic_api_key)}
+
     ## check for streaming
     is_streaming_request = await is_streaming_request_fn(request)
 
@@ -608,7 +618,7 @@ async def anthropic_proxy_route(
     endpoint_func = create_pass_through_route(
         endpoint=endpoint,
         target=str(updated_url),
-        custom_headers={"x-api-key": "{}".format(anthropic_api_key)},
+        custom_headers=_anthropic_custom_headers,
         _forward_headers=True,
         is_streaming_request=is_streaming_request,
     )  # dynamically construct pass-through endpoint based on incoming path
