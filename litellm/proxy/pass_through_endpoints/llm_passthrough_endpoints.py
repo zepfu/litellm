@@ -214,18 +214,31 @@ async def gemini_proxy_route(
     base_url = httpx.URL(base_target_url)
     updated_url = base_url.copy_with(path=encoded_endpoint)
 
+    ## Detect Google Cloud OAuth tokens (ya29.*) in the Authorization header.
+    ## When present, skip injecting the server-side GEMINI_API_KEY query param and
+    ## forward the Authorization header as-is to Google's API. Without this,
+    ## requests using GCP service-account tokens fail because the server injects
+    ## an API key that conflicts with the OAuth credential.
+    _auth_header = request.headers.get("authorization", "")
+    _is_google_oauth = _auth_header.startswith("Bearer ya29.")
+
     # Add or update query parameters
-    gemini_api_key: Optional[str] = passthrough_endpoint_router.get_credentials(
-        custom_llm_provider="gemini",
-        region_name=None,
-    )
-    if gemini_api_key is None:
-        raise Exception(
-            "Required 'GEMINI_API_KEY'/'GOOGLE_API_KEY' in environment to make pass-through calls to Google AI Studio."
-        )
-    # Merge query parameters, giving precedence to those in updated_url
     merged_params = dict(request.query_params)
-    merged_params.update({"key": gemini_api_key})
+    if _is_google_oauth:
+        # Remove the 'key' param if the client sent one; Google OAuth auth
+        # does not use API key query params.
+        merged_params.pop("key", None)
+    else:
+        gemini_api_key: Optional[str] = passthrough_endpoint_router.get_credentials(
+            custom_llm_provider="gemini",
+            region_name=None,
+        )
+        if gemini_api_key is None:
+            raise Exception(
+                "Required 'GEMINI_API_KEY'/'GOOGLE_API_KEY' in environment to make pass-through calls to Google AI Studio."
+            )
+        # Merge query parameters, giving precedence to those in updated_url
+        merged_params.update({"key": gemini_api_key})
 
     ## check for streaming
     is_streaming_request = False
@@ -237,6 +250,7 @@ async def gemini_proxy_route(
         endpoint=endpoint,
         target=str(updated_url),
         custom_llm_provider="gemini",
+        _forward_headers=_is_google_oauth,
         is_streaming_request=is_streaming_request,
         query_params=merged_params,
     )  # dynamically construct pass-through endpoint based on incoming path
