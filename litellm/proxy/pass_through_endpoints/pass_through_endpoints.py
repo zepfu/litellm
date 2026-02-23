@@ -51,6 +51,7 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
+from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.utils import get_server_root_path
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.custom_http import httpxSpecialProvider
@@ -724,11 +725,13 @@ async def pass_through_request(  # noqa: PLR0915
             params={"timeout": 600},
         )
         async_client = async_client_obj.client
+        _cleaned_headers = clean_headers(request.headers)
         passthrough_logging_payload = PassthroughStandardLoggingPayload(
             url=str(url),
             request_body=_parsed_body,
             request_method=getattr(request, "method", None),
             cost_per_request=cost_per_request,
+            request_headers=_cleaned_headers,
         )
         kwargs = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
             user_api_key_dict=user_api_key_dict,
