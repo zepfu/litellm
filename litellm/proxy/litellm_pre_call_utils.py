@@ -251,9 +251,12 @@ def clean_headers(
             litellm_key_lower is None or header_lower != litellm_key_lower
         ):
             clean_headers[header] = value
-        # Preserve Authorization header when it contains an Anthropic OAuth token
-        # so forward_client_headers_to_llm_api can forward it to the provider
-        elif header_lower == "authorization" and value.startswith("Bearer sk-ant-oat"):
+        # Preserve Authorization header when it contains an Anthropic or Google
+        # OAuth token so forward_client_headers_to_llm_api can forward it to
+        # the provider. Without this, SpecialHeaders cache would strip it.
+        elif header_lower == "authorization" and (
+            value.startswith("Bearer sk-ant-oat") or value.startswith("Bearer ya29.")
+        ):
             clean_headers[header] = value
     return clean_headers
 
