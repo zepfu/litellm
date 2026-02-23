@@ -282,7 +282,9 @@ def clean_headers(
     for header, value in headers.items():
         header_lower = header.lower()
 
-        if header_lower == "authorization" and is_anthropic_oauth_key(value):
+        if header_lower == "authorization" and (
+            is_anthropic_oauth_key(value) or value.startswith("Bearer ya29.")
+        ):
             if (
                 authenticated_with_header is None
                 or authenticated_with_header.lower() != "authorization"
