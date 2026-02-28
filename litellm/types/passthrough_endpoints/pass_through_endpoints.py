@@ -42,3 +42,14 @@ class PassthroughStandardLoggingPayload(TypedDict, total=False):
 
     Optional field, we use this for cost tracking only if it's set.
     """
+
+    request_headers: Optional[dict]
+    """
+    Cleaned request headers from the original inbound request.
+
+    Populated by clean_headers() (same function used by the normal LiteLLM
+    pre-call flow) so that callback integrations such as Langfuse can extract
+    metadata from headers on pass-through routes.  Without this field,
+    add_metadata_from_header() receives no headers and silently skips all
+    header-based metadata extraction.
+    """
