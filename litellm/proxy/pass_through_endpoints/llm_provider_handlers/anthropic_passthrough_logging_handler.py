@@ -139,10 +139,16 @@ class AnthropicPassthroughLoggingHandler:
                 user = AnthropicPassthroughLoggingHandler._get_user_from_metadata(
                     passthrough_logging_payload=passthrough_logging_payload,
                 )
+                _proxy_server_request: dict = {}
                 if user:
+                    _proxy_server_request["body"] = {"user": user}
+                request_headers = passthrough_logging_payload.get("request_headers")
+                if request_headers:
+                    _proxy_server_request["headers"] = request_headers
+                if _proxy_server_request:
                     kwargs.setdefault("litellm_params", {})
-                    kwargs["litellm_params"].update(
-                        {"proxy_server_request": {"body": {"user": user}}}
+                    kwargs["litellm_params"]["proxy_server_request"] = (
+                        _proxy_server_request
                     )
 
             # pretty print standard logging object
