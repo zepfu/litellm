@@ -1,23 +1,21 @@
 # AAWM LiteLLM Fork — Patch Registry and Migration Guide
 
-This fork of [BerriAI/litellm](https://github.com/BerriAI/litellm) tracks the
-upstream `main` branch (v1.81.14 as of 2026-02-28) with AAWM-specific patches
-applied on top.
+This fork of [BerriAI/litellm](https://github.com/BerriAI/litellm) tracks
+upstream releases with AAWM-specific patches applied on top.
+
+**Base version:** v1.82.1 (commit `d07689d2d7`, rebased 2026-03-06)
 
 **Note:** aawm.1 (OAuth token preservation in `clean_headers` and
 `_get_forwardable_headers`) was absorbed by upstream in PR #19912 (v1.81.13)
-and is no longer needed as a separate patch. The `aawm/patches-rebase` branch
-drops aawm.1 and is based directly on `upstream/main`.
+and is no longer carried as a separate patch.
 
 ## Standalone Deployment
 
-`litellm-config.yaml` and `docker-compose.yml` are now co-located in this repo,
+`litellm-config.yaml` and `docker-compose.yml` are co-located in this repo,
 enabling the fork to run independently without the AAWM repo.
 
-**`litellm-config.yaml`** — copied from `~/projects/aawm/litellm-config.yaml`.
-This is the canonical model routing config. Updates should be made here and
-synced back to AAWM if needed (or AAWM can reference this repo as the source
-of truth going forward).
+**`litellm-config.yaml`** — canonical model routing config. Updates should be
+made here and synced back to AAWM if needed.
 
 **`docker-compose.yml`** — standalone compose file that brings up all required
 services: LiteLLM (built from this fork), CLIProxyAPI (Gemini routing),
@@ -64,12 +62,12 @@ with the AAWM tristore if both stacks are running simultaneously on the same hos
 
 | Branch | Purpose |
 |--------|---------|
-| `main` | Mirrors upstream `main` at the latest stable release. Receives upstream version bumps when AAWM is ready to upgrade. |
-| `aawm/patches` | Previous patch set — based on `v1.81.13`. Kept for reference. |
-| `aawm/patches-rebase` | Current patch set — rebased onto `upstream/main` (v1.81.14), drops aawm.1. |
+| `aawm/patches` | Production branch — latest stable patches on top of a pinned upstream release. |
+| `dev` | Integration branch — worktrees merge here for testing before promotion to `aawm/patches`. |
+| `main` | Mirrors upstream `main` at the latest stable release. |
 
 **Versioning scheme:** `{upstream_version}-aawm.{patch_number}`
-Current version: `1.81.14-aawm.4` (4 active patches)
+Current version: `1.82.1-aawm.4` (4 active patches)
 
 ## Applied Patches
 
@@ -89,6 +87,10 @@ bearer token passes through unmodified via `_forward_headers=True`.
 
 **Why not upstream:** Upstream assumes API key auth. OAuth-only authentication
 (no API key) is a non-standard configuration not currently supported upstream.
+
+**Upstream watch:** v1.82.2+ adds `forward_llm_provider_auth_headers` and
+`authenticated_with_header` in `clean_headers()`. This BYOK flow may eventually
+supersede Patch 2. Monitor upstream BYOK for pass-through route coverage.
 
 ---
 
@@ -112,6 +114,11 @@ upstream feature.
 **Note:** Includes the unused-import fix (removal of `Union` import) that was
 previously a separate `chore` commit — squashed into this patch.
 
+**Upstream watch:** v1.82.2+ adds `x-litellm-agent-id` / `x-litellm-trace-id`
+agent tracing headers. These are header-based (not system-prompt-based) and
+require client support. Patch 4 remains needed because Claude Code cannot set
+per-subagent headers dynamically.
+
 ---
 
 ### aawm.3 — Propagate request headers through pass-through logging handlers
@@ -134,8 +141,7 @@ header-based metadata extraction.
 3. In `AnthropicPassthroughLoggingHandler.anthropic_passthrough_logged_success_handler()`,
    populate `proxy_server_request["headers"]` from `request_headers` when present.
 
-**Why not upstream:** Upstream bug not fixed as of Feb 2026. Submitted as
-potential upstream contribution (see discussion #4848).
+**Why not upstream:** Upstream bug not fixed as of v1.82.1 (March 2026).
 
 ---
 
@@ -164,6 +170,10 @@ Google OAuth tokens via the `_SPECIAL_HEADERS_CACHE` mechanism.
 does not support OAuth token-based authentication. GCP service-account tokens
 and user OAuth credentials are an AAWM-specific use case.
 
+**Upstream watch:** v1.82.2+ adds `authenticated_with_header` param to
+`clean_headers()`. When we next rebase past v1.82.2, integrate the `ya29.*`
+check with the new `authenticated_with_header` guard.
+
 ---
 
 ## Dropped Patches
@@ -173,11 +183,43 @@ and user OAuth credentials are an AAWM-specific use case.
 **Upstream status:** Merged in PR #19912, included in v1.81.13.
 **What it did:** Preserved `Authorization` headers containing Anthropic OAuth
 tokens (`sk-ant-oat*`) in `clean_headers()` and `_get_forwardable_headers()`.
-**Action:** Dropped from `aawm/patches-rebase`. Upstream now handles this via
+**Action:** Dropped since v1.81.14 rebase. Upstream now handles this via
 `is_anthropic_oauth_key()` in both functions.
 
 aawm.5 extends the upstream `clean_headers()` fix to also cover Google OAuth
 tokens (`ya29.*`).
+
+---
+
+## Upstream Changelog: v1.81.14 → v1.82.1
+
+Key changes in the 685 commits between our previous base and current base:
+
+**Features:**
+- Generic `llm_passthrough_factory_proxy_route()` — shared factory for LLM provider pass-through endpoints
+- Cursor pass-through endpoint (`/cursor/{endpoint:path}`)
+- GPT-5.4/5.4-pro model support, ChatGPT gpt-5.3 OAuth model aliases
+- Anthropic top-level `cache_control` for automatic prompt caching
+- MCP BYOK with OAuth 2.1 PKCE
+- A2A agent custom headers (`static_headers`, `extra_headers`)
+- Chat UI with MCP tools and streaming
+- RBAC for Vector Stores and Agents
+
+**Bug Fixes:**
+- OAuth token handling in `count_tokens` endpoint
+- Pass-through Azure 429/5xx streaming propagation
+- Exception catching in pass-through streaming logging handler
+
+**Security:**
+- JWT plaintext leak in debug logs fixed
+
+**Breaking Changes:**
+- `StreamingChoices` removed from `ModelResponse` (use `ModelResponseStream`)
+- `python-multipart` version bumped to `>=0.0.22`
+
+**Post-v1.82.1 upstream (not included in this rebase):**
+- Claude Code BYOK: `forward_llm_provider_auth_headers` config + `authenticated_with_header` param in `clean_headers()`. May eventually supersede Patches 2 and 5.
+- Agent Tracing: `context_id`-based trace propagation + `x-litellm-agent-id` / `x-litellm-trace-id` headers.
 
 ---
 
@@ -201,26 +243,7 @@ RUN pip install --no-cache-dir --upgrade "litellm>=1.81.13"
 ### Target approach (build from this fork)
 
 ```dockerfile
-# Build the LiteLLM wheel from the fork at a pinned commit
-FROM python:3.11-slim AS builder
-WORKDIR /build
-COPY . .
-RUN pip install build && python -m build --wheel
-
-# Runtime image matches upstream base
-FROM ghcr.io/berriai/litellm:main-v1.81.14
-# Replace the installed litellm package with our patched wheel
-COPY --from=builder /build/dist/litellm-*.whl /tmp/
-RUN pip install --no-cache-dir --force-reinstall /tmp/litellm-*.whl && rm /tmp/litellm-*.whl
-
-ENV CONFIG_FILE_PATH=/app/config.yaml
-EXPOSE 4000
-```
-
-**Alternatively (simpler, no wheel build needed):**
-
-```dockerfile
-FROM ghcr.io/berriai/litellm:main-v1.81.14
+FROM ghcr.io/berriai/litellm:main-v1.82.1
 # Overlay patched source files directly from the fork checkout
 COPY litellm/proxy/litellm_pre_call_utils.py \
      /usr/local/lib/python3.11/site-packages/litellm/proxy/litellm_pre_call_utils.py
@@ -239,26 +262,22 @@ ENV CONFIG_FILE_PATH=/app/config.yaml
 EXPOSE 4000
 ```
 
-This second approach is simpler for a small set of patched files. It requires knowing the
-Python site-packages path inside the base image (verify with
-`python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"`).
-
 ### Migration steps
 
 1. Confirm fork builds and patches are stable across a full `docker compose up`.
-2. Update `aawm/litellm.Dockerfile` to use one of the approaches above,
-   referencing a specific commit SHA or tag from this fork (not `main-latest`).
+2. Update `aawm/litellm.Dockerfile` to use the overlay approach above,
+   referencing `ghcr.io/berriai/litellm:main-v1.82.1` as the base image.
 3. Add a GitHub Actions workflow in this fork to build and push a Docker image
-   to `ghcr.io/zepfu/litellm` on pushes to `aawm/patches-rebase`.
+   to `ghcr.io/zepfu/litellm` on pushes to `aawm/patches`.
 4. Update `aawm/docker-compose.yml` to pull the pre-built image from
-   `ghcr.io/zepfu/litellm:1.81.14-aawm.4` instead of building locally.
+   `ghcr.io/zepfu/litellm:1.82.1-aawm.4` instead of building locally.
 
 ### Upstream version upgrades
 
 When upgrading to a new upstream LiteLLM version:
 
 1. Fetch upstream tags: `git fetch upstream --tags`
-2. Create new rebase branch: `git checkout upstream/main -b aawm/patches-rebase-vX.Y.Z`
+2. Create new rebase branch: `git checkout <target-commit> -b aawm/patches-vX.Y.Z`
 3. Cherry-pick AAWM commits in order (excluding any that were absorbed upstream).
 4. Resolve conflicts (most likely in the patched files — check if upstream
    changed the target code blocks).
