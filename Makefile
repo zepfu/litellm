@@ -6,7 +6,7 @@
 	test-proxy-unit-a test-proxy-unit-b test-integration test-unit-helm \
 	info lint lint-dev format \
 	install-dev install-proxy-dev install-test-deps \
-	install-helm-unittest check-circular-imports check-import-safety
+	install-helm-unittest check-circular-imports check-import-safety docker-test
 
 # Default target
 help:
@@ -191,3 +191,9 @@ test-llm-translation-single: install-test-deps
 	poetry run pytest tests/llm_translation/$(FILE) \
 		--junitxml=test-results/junit.xml \
 		-v --tb=short --maxfail=100 --timeout=300
+
+# AAWM: build and verify the venv artifact image
+docker-test:
+	docker build --target venv-builder -t litellm-venv-test .
+	docker run --rm litellm-venv-test /opt/litellm-venv/bin/python -c "import litellm; print('litellm', litellm.version)"
+	@echo "Docker venv artifact build OK"
