@@ -9,53 +9,6 @@ upstream releases with AAWM-specific patches applied on top.
 `_get_forwardable_headers`) was absorbed by upstream in PR #19912 (v1.81.13)
 and is no longer carried as a separate patch.
 
-## Standalone Deployment
-
-`litellm-config.yaml` and `docker-compose.yml` are co-located in this repo,
-enabling the fork to run independently without the AAWM repo.
-
-**`litellm-config.yaml`** — canonical model routing config. Updates should be
-made here and synced back to AAWM if needed.
-
-**`docker-compose.yml`** — standalone compose file that brings up all required
-services: LiteLLM (built from this fork), CLIProxyAPI (Gemini routing),
-and the full Langfuse v3 observability stack (ClickHouse, Redis, MinIO,
-langfuse-web, langfuse-worker, PostgreSQL).
-
-**One prerequisite:** `cliproxyapi-config.yaml` must be present in this repo
-root before `docker compose up`. Copy from the AAWM repo:
-
-```bash
-cp ~/projects/aawm/cliproxyapi-config.yaml ./cliproxyapi-config.yaml
-```
-
-**AAWM-specific references in `litellm-config.yaml`** (no changes needed —
-these work as-is in the compose network):
-
-- Gemini models use `api_base: "http://cliproxyapi:8317/v1"` — resolves to the
-  `cliproxyapi` service defined in this compose file.
-- Langfuse callback uses `LANGFUSE_HOST: "http://langfuse-web:3000"` — resolves
-  to the `langfuse-web` service defined in this compose file.
-- `os.environ/AAWM_XAI_API_KEY` and `os.environ/AAWM_OPENAI_API_KEY` — set
-  these in a `.env` file at repo root (both optional; only needed for xAI/OpenAI
-  models).
-
-**Port allocation** (matches AAWM defaults to avoid host conflicts):
-
-| Service | Host port |
-|---------|-----------|
-| LiteLLM proxy | 4000 |
-| CLIProxyAPI | 8317 |
-| Langfuse web | 3000 |
-| PostgreSQL | 5435 |
-| ClickHouse HTTP | 8123 |
-| Redis | 6380 |
-| MinIO S3 | 9010 |
-| MinIO console | 9011 |
-
-Note: PostgreSQL is mapped to host port **5435** (not 5434) to avoid conflicting
-with the AAWM tristore if both stacks are running simultaneously on the same host.
-
 ---
 
 ## Branch Strategy
@@ -66,8 +19,9 @@ with the AAWM tristore if both stacks are running simultaneously on the same hos
 | `dev` | Integration branch — worktrees merge here for testing before promotion to `aawm/patches`. |
 | `main` | Mirrors upstream `main` at the latest stable release. |
 
-**Versioning scheme:** `{upstream_version}-aawm.{patch_number}`
-Current version: `1.82.1-aawm.4` (4 active patches)
+**Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
+Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
+Current version: `1.82.1+aawm.4` (4 active patches)
 
 ## Applied Patches
 
@@ -223,56 +177,7 @@ Key changes in the 685 commits between our previous base and current base:
 
 ---
 
-## Migration Plan: Building from Fork Instead of Patching at Runtime
-
-### Current approach (litellm.Dockerfile in aawm repo)
-
-```dockerfile
-FROM ghcr.io/berriai/litellm:main-latest
-RUN pip install --no-cache-dir --upgrade "litellm>=1.81.13"
-# ... runtime Python one-liner patches ...
-```
-
-**Problems:**
-- Patches are fragile: they assert on exact upstream source strings. Any upstream
-  refactor breaks the build with an `AssertionError`.
-- The `pip install --upgrade litellm>=1.81.13` step pulls from PyPI and may
-  change on every build (non-deterministic).
-- One-liner patches are difficult to read, review, and test.
-
-### Target approach (build from this fork)
-
-```dockerfile
-FROM ghcr.io/berriai/litellm:main-v1.82.1
-# Overlay patched source files directly from the fork checkout
-COPY litellm/proxy/litellm_pre_call_utils.py \
-     /usr/local/lib/python3.11/site-packages/litellm/proxy/litellm_pre_call_utils.py
-COPY litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py \
-     /usr/local/lib/python3.11/site-packages/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
-COPY litellm/proxy/pass_through_endpoints/pass_through_endpoints.py \
-     /usr/local/lib/python3.11/site-packages/litellm/proxy/pass_through_endpoints/pass_through_endpoints.py
-COPY litellm/proxy/pass_through_endpoints/llm_provider_handlers/anthropic_passthrough_logging_handler.py \
-     /usr/local/lib/python3.11/site-packages/litellm/proxy/pass_through_endpoints/llm_provider_handlers/anthropic_passthrough_logging_handler.py
-COPY litellm/integrations/aawm_agent_identity.py \
-     /usr/local/lib/python3.11/site-packages/litellm/integrations/aawm_agent_identity.py
-COPY litellm/types/passthrough_endpoints/pass_through_endpoints.py \
-     /usr/local/lib/python3.11/site-packages/litellm/types/passthrough_endpoints/pass_through_endpoints.py
-
-ENV CONFIG_FILE_PATH=/app/config.yaml
-EXPOSE 4000
-```
-
-### Migration steps
-
-1. Confirm fork builds and patches are stable across a full `docker compose up`.
-2. Update `aawm/litellm.Dockerfile` to use the overlay approach above,
-   referencing `ghcr.io/berriai/litellm:main-v1.82.1` as the base image.
-3. Add a GitHub Actions workflow in this fork to build and push a Docker image
-   to `ghcr.io/zepfu/litellm` on pushes to `aawm/patches`.
-4. Update `aawm/docker-compose.yml` to pull the pre-built image from
-   `ghcr.io/zepfu/litellm:1.82.1-aawm.4` instead of building locally.
-
-### Upstream version upgrades
+## Upstream Version Upgrades
 
 When upgrading to a new upstream LiteLLM version:
 
@@ -282,4 +187,4 @@ When upgrading to a new upstream LiteLLM version:
 4. Resolve conflicts (most likely in the patched files — check if upstream
    changed the target code blocks).
 5. Update this file: version string, patch entries, dropped patches.
-6. Push branch, update `aawm/litellm.Dockerfile` to reference the new AAWM image tag.
+6. Tag: `git tag v{version}-aawm.{patch_count}`
