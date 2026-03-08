@@ -214,6 +214,12 @@ model_list:
     litellm_params:
       model: "chatgpt/gpt-5.3-codex-spark"
 
+  # Short aliases for xAI Grok models
+  - model_name: "grok"
+    litellm_params:
+      model: "xai/grok-4-1-fast-non-reasoning"
+      api_key: "os.environ/AAWM_XAI_API_KEY"
+
   # xAI Grok models via direct API (OpenAI-compatible)
   # API key: AAWM_XAI_API_KEY env var injected via docker-compose
   - model_name: "xai/grok-4-1-fast-reasoning"
