@@ -10,6 +10,8 @@ COPY . .
 RUN pip install --no-cache-dir build && python -m build --wheel --outdir /dist
 
 FROM python:3.13-slim AS venv-builder
+RUN apt-get update && apt-get install -y --no-install-recommends gcc python3-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=wheel-builder /dist/*.whl /tmp/
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m venv /opt/litellm-venv \
