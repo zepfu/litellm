@@ -5,6 +5,8 @@ upstream releases with AAWM-specific patches applied on top.
 
 **Base version:** v1.82.1 (commit `d07689d2d7`, rebased 2026-03-06)
 
+**Image format:** venv artifact (`FROM scratch` — not a runnable image). Consumed via `COPY --from=`.
+
 **Note:** aawm.1 (OAuth token preservation in `clean_headers` and
 `_get_forwardable_headers`) was absorbed by upstream in PR #19912 (v1.81.13)
 and is no longer carried as a separate patch.
