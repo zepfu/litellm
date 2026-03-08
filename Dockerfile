@@ -4,12 +4,12 @@
 # Not a runnable image — no CMD, no entrypoint.
 # ---------------------------------------------------------------------------
 
-FROM python:3.14-slim AS wheel-builder
+FROM python:3.13-slim AS wheel-builder
 WORKDIR /src
 COPY . .
 RUN pip install --no-cache-dir build && python -m build --wheel --outdir /dist
 
-FROM python:3.14-slim AS venv-builder
+FROM python:3.13-slim AS venv-builder
 COPY --from=wheel-builder /dist/*.whl /tmp/
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m venv /opt/litellm-venv \
