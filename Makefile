@@ -195,5 +195,5 @@ test-llm-translation-single: install-test-deps
 # AAWM: build and verify the venv artifact image
 docker-test:
 	docker build --target venv-builder -t litellm-venv-test .
-	docker run --rm litellm-venv-test /opt/litellm-venv/bin/python -c "import litellm; print('litellm', litellm.version)"
+	docker run --rm litellm-venv-test /opt/litellm-venv/bin/python -c "from importlib.metadata import version; print('litellm', version('litellm'))"
 	@echo "Docker venv artifact build OK"
