@@ -305,6 +305,13 @@ def initialize_callbacks_on_proxy(  # noqa: PLR0915
         else:
             litellm.callbacks = imported_list  # type: ignore
 
+        # Also register CustomLogger instances in success callback lists
+        # so pass-through endpoints (which skip function_setup()) can see them
+        for cb in imported_list:
+            if isinstance(cb, CustomLogger):
+                litellm.logging_callback_manager.add_litellm_success_callback(cb)
+                litellm.logging_callback_manager.add_litellm_async_success_callback(cb)
+
         if "prometheus" in value:
             from litellm.integrations.prometheus import PrometheusLogger
 
