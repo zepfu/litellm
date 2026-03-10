@@ -124,7 +124,12 @@ def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict:
 
 
 def _enrich_trace_name(kwargs: Dict[str, Any], result: Any) -> Tuple[dict, Any]:
-    """Enrich Langfuse trace_name with the extracted agent name."""
+    """Shared enrichment logic for both sync and async hooks.
+
+    Extracts agent name, converts headers to mutable dict, and enriches
+    langfuse_trace_name header from "claude-code" to "claude-code.<agent>".
+    Falls back to setting metadata directly if headers are unavailable.
+    """
     agent_name = _extract_agent_name(kwargs)
     headers = _ensure_mutable_headers(kwargs)
 
@@ -157,12 +162,18 @@ def _enrich_trace_name(kwargs: Dict[str, Any], result: Any) -> Tuple[dict, Any]:
 
 
 class AawmAgentIdentity(CustomLogger):
-    """CustomLogger that enriches Langfuse trace_name with agent identity."""
+    """CustomLogger that enriches Langfuse trace_name with agent identity.
+
+    Implements both sync logging_hook() and async async_logging_hook() to
+    cover all code paths:
+    - Sync: pass-through endpoints run Langfuse in sync success_handler (thread pool)
+    - Async: standard LLM calls run Langfuse in async_success_handler
+    """
 
     def logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
     ) -> Tuple[dict, Any]:
-        """Sync hook for pass-through success handler paths."""
+        """Sync hook - runs before Langfuse in sync success handler."""
         try:
             return _enrich_trace_name(kwargs, result)
         except Exception as exc:
@@ -172,7 +183,7 @@ class AawmAgentIdentity(CustomLogger):
     async def async_logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
     ) -> Tuple[dict, Any]:
-        """Async hook for standard async success handler paths."""
+        """Async hook - runs before Langfuse in async success handler."""
         try:
             return _enrich_trace_name(kwargs, result)
         except Exception as exc:
