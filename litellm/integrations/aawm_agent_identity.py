@@ -18,7 +18,7 @@ Registration in litellm-config.yaml:
 """
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
@@ -122,7 +122,7 @@ class AawmAgentIdentity(CustomLogger):
 
     async def async_logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
-    ) -> None:
+    ) -> Tuple[dict, Any]:
         """Runs before async_log_success_event callbacks.
 
         Converts immutable headers to dict and enriches langfuse_trace_name.
@@ -139,7 +139,7 @@ class AawmAgentIdentity(CustomLogger):
                         "AawmAgentIdentity: enriched header trace_name to claude-code.%s",
                         agent_name,
                     )
-                    return
+                    return kwargs, result
 
             # Fallback: set metadata directly
             litellm_params = kwargs.get("litellm_params") or {}
@@ -157,7 +157,9 @@ class AawmAgentIdentity(CustomLogger):
                 agent_name,
                 metadata.get("trace_name"),
             )
+            return kwargs, result
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.async_logging_hook failed: %s", exc
             )
+            return kwargs, result
