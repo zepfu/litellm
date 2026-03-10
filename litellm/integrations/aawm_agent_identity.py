@@ -57,9 +57,6 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
     4. kwargs["passthrough_logging_payload"]["request_body"]["messages"] - first user message.
        Claude Code SubagentStart hook injects identity into the task prompt (first user message),
        not the system prompt. The tightened regex avoids false positives.
-
-    Returns:
-        The agent name if found, otherwise _DEFAULT_AGENT ("orchestrator").
     """
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
@@ -124,12 +121,7 @@ def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict:
 
 
 def _enrich_trace_name(kwargs: Dict[str, Any], result: Any) -> Tuple[dict, Any]:
-    """Shared enrichment logic for both sync and async hooks.
-
-    Extracts agent name, converts headers to mutable dict, and enriches
-    langfuse_trace_name header from "claude-code" to "claude-code.<agent>".
-    Falls back to setting metadata directly if headers are unavailable.
-    """
+    """Shared enrichment logic for both sync and async hooks."""
     agent_name = _extract_agent_name(kwargs)
     headers = _ensure_mutable_headers(kwargs)
 
