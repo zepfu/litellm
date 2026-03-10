@@ -48,19 +48,7 @@ def _content_to_text(content: Any) -> str:
 
 
 def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
-    """Extract agent name from request content.
-
-    Checks four sources:
-    1. kwargs["messages"] - system messages only (standard LLM call path).
-    2. kwargs["system"] - Anthropic pass-through transforms system to top-level kwarg.
-    3. kwargs["passthrough_logging_payload"]["request_body"]["system"] - pass-through system field.
-    4. kwargs["passthrough_logging_payload"]["request_body"]["messages"] - first user message.
-       Claude Code SubagentStart hook injects identity into the task prompt (first user message),
-       not the system prompt. The tightened regex avoids false positives.
-
-    Returns:
-        The agent name if found, otherwise _DEFAULT_AGENT ("orchestrator").
-    """
+    """Extract agent name from request content."""
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
         for message in messages:
@@ -183,6 +171,4 @@ class AawmAgentIdentity(CustomLogger):
 
 
 # Module-level instance for config registration via get_instance_fn().
-# Config must reference this instance name, not the class name:
-#   callbacks: ["litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance"]
 aawm_agent_identity_instance = AawmAgentIdentity()
