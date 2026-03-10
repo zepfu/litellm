@@ -1,4 +1,0 @@
-litellm
-
-[dev]
-build
