@@ -36,6 +36,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Smoke test — verify venv imports
+        run: |
+          docker build --target venv-builder -t litellm-venv-test .
+          docker run --rm litellm-venv-test /opt/litellm-venv/bin/python -c "
+          from importlib.metadata import version
+          print('litellm', version('litellm'))
+          import litellm
+          from litellm.proxy.proxy_server import app
+          print('proxy server module loaded')
+          print('smoke test passed')
+          "
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
