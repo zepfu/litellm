@@ -10,6 +10,12 @@ Markers injected into system prompts by AAWM:
     LF_TENANT: <project/repo>     → metadata["trace_user_id"] (Langfuse user_id)
     LF_TASK_IDS: <id1/id2/...>   → metadata["session_id"]  (Langfuse session ID)
 
+Supported request paths:
+    - Standard LLM calls: markers read from kwargs["messages"] (role == "system").
+    - Pass-through endpoints (e.g. Anthropic native API): markers read from
+      kwargs["passthrough_logging_payload"]["request_body"]["system"], which
+      may be a plain string or a list of Anthropic content blocks.
+
 Registration in litellm-config.yaml:
     litellm_settings:
       callbacks: ["litellm.integrations.aawm_agent_identity.AawmAgentIdentity"]
@@ -17,13 +23,32 @@ Registration in litellm-config.yaml:
 """
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 
 # Matches LF_AGENT, LF_TENANT, or LF_TASK_IDS followed by optional whitespace and a value
 _MARKER_RE = re.compile(r"LF_(AGENT|TENANT|TASK_IDS):\s*(\S+)")
+
+
+def _extract_markers_from_text(text: str) -> Dict[str, str]:
+    """Extract AAWM identity markers from a plain text string.
+
+    Args:
+        text: Any string that may contain LF_* markers.
+
+    Returns:
+        Dict mapping marker names ("AGENT", "TENANT", "TASK_IDS") to their
+        first-occurrence values. Only keys that were found are included.
+    """
+    found: Dict[str, str] = {}
+    for match in _MARKER_RE.finditer(text):
+        marker_key = match.group(1)  # "AGENT", "TENANT", or "TASK_IDS"
+        marker_val = match.group(2)
+        if marker_key not in found:
+            found[marker_key] = marker_val
+    return found
 
 
 def _extract_markers(messages: List[Any]) -> Dict[str, str]:
@@ -59,18 +84,56 @@ def _extract_markers(messages: List[Any]) -> Dict[str, str]:
         elif not isinstance(content, str):
             content = str(content)
 
-        for match in _MARKER_RE.finditer(content):
-            marker_key = match.group(1)   # "AGENT", "TENANT", or "TASK_IDS"
-            marker_val = match.group(2)
-            if marker_key not in found:
-                # Take the first occurrence of each marker
-                found[marker_key] = marker_val
+        for key, val in _extract_markers_from_text(content).items():
+            if key not in found:
+                found[key] = val
 
         if len(found) == 3:
             # All three markers found; no need to scan further
             break
 
     return found
+
+
+def _extract_markers_from_passthrough(kwargs: Dict[str, Any]) -> Dict[str, str]:
+    """Extract AAWM identity markers from a pass-through request body.
+
+    Looks in kwargs["passthrough_logging_payload"]["request_body"]["system"].
+    The system field may be a plain string or a list of Anthropic content
+    blocks (each a dict with a "text" key).
+
+    Args:
+        kwargs: The full kwargs dict from the logging callback.
+
+    Returns:
+        Dict mapping marker names ("AGENT", "TENANT", "TASK_IDS") to their
+        first-occurrence values. Only keys that were found are included.
+    """
+    payload = kwargs.get("passthrough_logging_payload")
+    if not isinstance(payload, dict):
+        return {}
+
+    request_body = payload.get("request_body")
+    if not isinstance(request_body, dict):
+        return {}
+
+    system = request_body.get("system")
+    if not system:
+        return {}
+
+    if isinstance(system, list):
+        # Anthropic content blocks: [{"type": "text", "text": "..."}, ...]
+        text_parts: List[str] = []
+        for block in system:
+            if isinstance(block, dict):
+                text_parts.append(str(block.get("text", "")))
+            else:
+                text_parts.append(str(block))
+        text = "\n".join(text_parts)
+    else:
+        text = str(system)
+
+    return _extract_markers_from_text(text)
 
 
 def _apply_markers_to_metadata(
@@ -107,15 +170,25 @@ def _apply_markers_to_metadata(
 def _process_kwargs(kwargs: Dict[str, Any]) -> None:
     """Core logic: extract markers from kwargs and inject into metadata.
 
+    Tries two sources in order:
+    1. kwargs["messages"] — standard LLM call path.
+    2. kwargs["passthrough_logging_payload"]["request_body"]["system"] —
+       pass-through endpoint path (e.g. Anthropic native API).
+
     Args:
         kwargs: The kwargs dict passed to log_success_event /
             async_log_success_event.
     """
+    # --- Standard messages path ---
     messages = kwargs.get("messages")
-    if not messages or not isinstance(messages, list):
-        return
+    markers: Dict[str, str] = {}
+    if messages and isinstance(messages, list):
+        markers = _extract_markers(messages)
 
-    markers = _extract_markers(messages)
+    # --- Pass-through fallback ---
+    if not markers:
+        markers = _extract_markers_from_passthrough(kwargs)
+
     if not markers:
         verbose_logger.debug(
             "AawmAgentIdentity: no LF_ markers found in system prompt"
