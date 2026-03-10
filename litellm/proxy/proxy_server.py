@@ -2923,37 +2923,95 @@ class ProxyConfig:
                         # user passed custom_callbacks.async_on_succes_logger. They need us to import a function
                         if "." in callback:
                             litellm.logging_callback_manager.add_litellm_success_callback(
-                                get_instance_fn(value=callback)
+                                get_instance_fn(
+                                    value=callback,
+                                    config_file_path=config_file_path,
+                                )
                             )
-                        # these are litellm callbacks - "langfuse", "sentry", "wandb"
+                        # known custom logger callbacks — initialize immediately
+                        # so pass-through endpoints (which skip set_callbacks()) get them
+                        elif (
+                            callback
+                            in litellm._known_custom_logger_compatible_callbacks
+                        ):
+                            from litellm.litellm_core_utils.litellm_logging import (
+                                _init_custom_logger_compatible_class,
+                            )
+
+                            callback_class = _init_custom_logger_compatible_class(
+                                callback,
+                                internal_usage_cache=None,
+                                llm_router=None,
+                            )
+                            if callback_class is not None:
+                                litellm.logging_callback_manager.add_litellm_success_callback(
+                                    callback_class
+                                )
+                                litellm.logging_callback_manager.add_litellm_async_success_callback(
+                                    callback_class
+                                )
+                            else:
+                                litellm.logging_callback_manager.add_litellm_success_callback(
+                                    callback
+                                )
+                        # these are litellm callbacks - "sentry", "wandb", etc.
                         else:
                             litellm.logging_callback_manager.add_litellm_success_callback(
                                 callback
                             )
-                            if "prometheus" in callback:
-                                from litellm.integrations.prometheus import (
-                                    PrometheusLogger,
-                                )
+                        if "prometheus" in callback:
+                            from litellm.integrations.prometheus import (
+                                PrometheusLogger,
+                            )
 
-                                if PrometheusLogger is not None:
-                                    verbose_proxy_logger.debug(
-                                        "mounting metrics endpoint"
-                                    )
-                                    PrometheusLogger._mount_metrics_endpoint()
+                            if PrometheusLogger is not None:
+                                verbose_proxy_logger.debug(
+                                    "mounting metrics endpoint"
+                                )
+                                PrometheusLogger._mount_metrics_endpoint()
                     print(  # noqa
                         f"{blue_color_code} Initialized Success Callbacks - {litellm.success_callback} {reset_color_code}"
                     )  # noqa
                 elif key == "failure_callback":
                     litellm.failure_callback = []
 
-                    # initialize success callbacks
+                    # initialize failure callbacks
                     for callback in value:
                         # user passed custom_callbacks.async_on_succes_logger. They need us to import a function
                         if "." in callback:
                             litellm.logging_callback_manager.add_litellm_failure_callback(
-                                get_instance_fn(value=callback)
+                                get_instance_fn(
+                                    value=callback,
+                                    config_file_path=config_file_path,
+                                )
                             )
-                        # these are litellm callbacks - "langfuse", "sentry", "wandb"
+                        # known custom logger callbacks — initialize immediately
+                        # so pass-through endpoints (which skip set_callbacks()) get them
+                        elif (
+                            callback
+                            in litellm._known_custom_logger_compatible_callbacks
+                        ):
+                            from litellm.litellm_core_utils.litellm_logging import (
+                                _init_custom_logger_compatible_class,
+                            )
+
+                            callback_class = _init_custom_logger_compatible_class(
+                                callback,
+                                internal_usage_cache=None,
+                                llm_router=None,
+                            )
+                            if callback_class is not None:
+                                litellm.logging_callback_manager.add_litellm_failure_callback(
+                                    callback_class
+                                )
+                                litellm.logging_callback_manager.add_litellm_async_failure_callback(
+                                    callback_class
+                                )
+                            else:
+                                litellm.logging_callback_manager.add_litellm_failure_callback(
+                                    callback
+                                )
+                        # these are litellm callbacks - "sentry", "wandb", etc.
                         else:
                             litellm.logging_callback_manager.add_litellm_failure_callback(
                                 callback
