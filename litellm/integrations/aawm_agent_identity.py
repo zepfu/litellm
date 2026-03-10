@@ -7,8 +7,9 @@ API calls can be distinguished.
 The hook injects: "You are '<agent-name>' and you are working..."
 When no agent designation is found, defaults to "orchestrator".
 
-If trace_name is already "claude-code" (from ANTHROPIC_CUSTOM_HEADERS),
-it is enriched to "claude-code.<agent>" (e.g. "claude-code.ops").
+Enriches the langfuse_trace_name request header from "claude-code" to
+"claude-code.<agent>" (e.g. "claude-code.ops") so the value survives
+Langfuse's add_metadata_from_header() which overwrites metadata from headers.
 
 Registration in litellm-config.yaml:
     litellm_settings:
@@ -91,25 +92,51 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
 
 
 def _process_kwargs(kwargs: Dict[str, Any]) -> None:
-    """Extract agent name and enrich trace_name in metadata."""
+    """Extract agent name and enrich trace_name in request headers.
+
+    Modifies the langfuse_trace_name header directly so the enriched value
+    survives Langfuse's add_metadata_from_header() which overwrites metadata
+    from headers.
+    """
     agent_name = _extract_agent_name(kwargs)
 
-    litellm_params: Dict[str, Any] = kwargs.get("litellm_params") or {}
-    metadata: Dict[str, Any] = litellm_params.get("metadata") or {}
+    # Find the headers dict — try litellm_params.proxy_server_request.headers first,
+    # then passthrough_logging_payload.request_headers
+    headers = None
+    litellm_params = kwargs.get("litellm_params") or {}
+    proxy_server_request = litellm_params.get("proxy_server_request") or {}
+    headers = proxy_server_request.get("headers")
 
+    if not isinstance(headers, dict):
+        # Try passthrough_logging_payload
+        payload = kwargs.get("passthrough_logging_payload")
+        if isinstance(payload, dict):
+            headers = payload.get("request_headers")
+
+    if isinstance(headers, dict):
+        current = headers.get("langfuse_trace_name")
+        if current == "claude-code":
+            headers["langfuse_trace_name"] = f"claude-code.{agent_name}"
+            verbose_logger.debug(
+                "AawmAgentIdentity: enriched header trace_name to claude-code.%s",
+                agent_name,
+            )
+            return
+
+    # Fallback: set metadata directly (for non-header cases)
+    metadata: Dict[str, Any] = litellm_params.get("metadata") or {}
     current_trace_name = metadata.get("trace_name")
     if current_trace_name == "claude-code":
         metadata["trace_name"] = f"claude-code.{agent_name}"
     elif not current_trace_name:
         metadata["trace_name"] = agent_name
-
     litellm_params["metadata"] = metadata
     kwargs["litellm_params"] = litellm_params
 
     verbose_logger.debug(
         "AawmAgentIdentity: agent=%s, trace_name=%s",
         agent_name,
-        metadata["trace_name"],
+        metadata.get("trace_name"),
     )
 
 
