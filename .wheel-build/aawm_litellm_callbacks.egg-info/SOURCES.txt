@@ -1,8 +1,0 @@
-pyproject.toml
-aawm_litellm_callbacks/__init__.py
-aawm_litellm_callbacks/agent_identity.py
-aawm_litellm_callbacks.egg-info/PKG-INFO
-aawm_litellm_callbacks.egg-info/SOURCES.txt
-aawm_litellm_callbacks.egg-info/dependency_links.txt
-aawm_litellm_callbacks.egg-info/requires.txt
-aawm_litellm_callbacks.egg-info/top_level.txt
