@@ -47,3 +47,8 @@ jobs:
           EOF
           )" \
             .wheel-build/dist/aawm_litellm_callbacks-*.whl
+
+      - name: Move cb-latest tag
+        run: |
+          git tag -f cb-latest
+          git push origin cb-latest --force
