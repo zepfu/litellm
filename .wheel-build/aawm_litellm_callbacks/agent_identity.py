@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Tuple
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 
-_AGENT_RE = re.compile(r"You are '([^']+)'")
+_AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
 _DEFAULT_AGENT = "orchestrator"
 
 
@@ -50,27 +50,39 @@ def _content_to_text(content: Any) -> str:
 def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
     """Extract agent name from request content.
 
-    Checks two sources:
-    1. kwargs["messages"] — standard LLM call path (scans all messages).
-    2. kwargs["passthrough_logging_payload"]["request_body"] — pass-through
-       endpoint path. Checks both "system" (top-level Anthropic field) and
-       "messages" within the request body.
+    Checks four sources:
+    1. kwargs["messages"] — system messages only (standard LLM call path).
+    2. kwargs["system"] — Anthropic pass-through transforms system to top-level kwarg.
+    3. kwargs["passthrough_logging_payload"]["request_body"]["system"] — pass-through system field.
+    4. kwargs["passthrough_logging_payload"]["request_body"]["messages"] — first user message.
+       Claude Code SubagentStart hook injects identity into the task prompt (first user message),
+       not the system prompt. The tightened regex avoids false positives.
 
     Returns:
         The agent name if found, otherwise _DEFAULT_AGENT ("orchestrator").
     """
-    # --- Standard messages path ---
+    # --- Standard messages path (system messages only) ---
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
         for message in messages:
             if not isinstance(message, dict):
+                continue
+            if message.get("role") != "system":
                 continue
             text = _content_to_text(message.get("content", ""))
             match = _AGENT_RE.search(text)
             if match:
                 return match.group(1)
 
-    # --- Pass-through path ---
+    # --- Direct system field (Anthropic pass-through transforms system to top-level kwarg) ---
+    system_direct = kwargs.get("system")
+    if system_direct:
+        text = _content_to_text(system_direct)
+        match = _AGENT_RE.search(text)
+        if match:
+            return match.group(1)
+
+    # --- Pass-through path (system field) ---
     payload = kwargs.get("passthrough_logging_payload")
     if isinstance(payload, dict):
         request_body = payload.get("request_body")
@@ -82,16 +94,21 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
                 match = _AGENT_RE.search(text)
                 if match:
                     return match.group(1)
-            # Check messages within request body
-            msgs = request_body.get("messages")
-            if msgs and isinstance(msgs, list):
-                for msg in msgs:
+
+            # Check first user message — Claude Code injects agent identity
+            # into the task prompt (first user message), not the system prompt.
+            pt_messages = request_body.get("messages")
+            if pt_messages and isinstance(pt_messages, list):
+                for msg in pt_messages[:3]:
                     if not isinstance(msg, dict):
+                        continue
+                    if msg.get("role") != "user":
                         continue
                     text = _content_to_text(msg.get("content", ""))
                     match = _AGENT_RE.search(text)
                     if match:
                         return match.group(1)
+                    break  # Only check first user message
 
     return _DEFAULT_AGENT
 
@@ -196,3 +213,7 @@ class AawmAgentIdentity(CustomLogger):
                 "AawmAgentIdentity.async_logging_hook failed: %s", exc
             )
             return kwargs, result
+
+
+# Module-level instance for config registration via get_instance_fn().
+aawm_agent_identity_instance = AawmAgentIdentity()
