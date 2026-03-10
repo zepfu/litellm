@@ -8,8 +8,13 @@ The hook injects: "You are '<agent-name>' and you are working..."
 When no agent designation is found, defaults to "orchestrator".
 
 Enriches langfuse_trace_name from "claude-code" to "claude-code.<agent>"
-(e.g. "claude-code.ops"). Uses async_logging_hook() to run before Langfuse's
-add_metadata_from_header() which reads headers to populate trace metadata.
+(e.g. "claude-code.ops").
+
+Uses BOTH logging_hook() (sync) and async_logging_hook() (async) to modify
+headers BEFORE Langfuse's add_metadata_from_header() reads them.  The sync
+hook is critical for pass-through endpoints because Langfuse runs as a string
+callback ("langfuse") in the sync success_handler — the async hook alone
+would race with the thread-pool-submitted sync handler.
 
 Registration in litellm-config.yaml:
     litellm_settings:
@@ -114,50 +119,78 @@ def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict:
     return headers
 
 
+def _enrich_trace_name(kwargs: Dict[str, Any], result: Any) -> Tuple[dict, Any]:
+    """Shared enrichment logic for both sync and async hooks.
+
+    Extracts agent name, converts headers to mutable dict, and enriches
+    langfuse_trace_name header from "claude-code" to "claude-code.<agent>".
+    Falls back to setting metadata directly if headers are unavailable.
+
+    Returns (kwargs, result) tuple as required by logging hook contract.
+    """
+    agent_name = _extract_agent_name(kwargs)
+    headers = _ensure_mutable_headers(kwargs)
+
+    if headers:
+        current = headers.get("langfuse_trace_name")
+        if current == "claude-code":
+            headers["langfuse_trace_name"] = f"claude-code.{agent_name}"
+            verbose_logger.debug(
+                "AawmAgentIdentity: enriched header trace_name to claude-code.%s",
+                agent_name,
+            )
+            return kwargs, result
+
+    # Fallback: set metadata directly
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata: Dict[str, Any] = litellm_params.get("metadata") or {}
+    current_trace_name = metadata.get("trace_name")
+    if current_trace_name == "claude-code":
+        metadata["trace_name"] = f"claude-code.{agent_name}"
+    elif not current_trace_name:
+        metadata["trace_name"] = agent_name
+    litellm_params["metadata"] = metadata
+    kwargs["litellm_params"] = litellm_params
+
+    verbose_logger.debug(
+        "AawmAgentIdentity: agent=%s, trace_name=%s",
+        agent_name,
+        metadata.get("trace_name"),
+    )
+    return kwargs, result
+
+
 class AawmAgentIdentity(CustomLogger):
     """CustomLogger that enriches Langfuse trace_name with agent identity.
 
-    Uses async_logging_hook() to modify headers BEFORE Langfuse reads them.
+    Implements both sync logging_hook() and async async_logging_hook() to
+    cover all code paths:
+    - Sync: pass-through endpoints run Langfuse in sync success_handler (thread pool)
+    - Async: standard LLM calls run Langfuse in async_success_handler
     """
+
+    def logging_hook(
+        self, kwargs: Dict[str, Any], result: Any, call_type: str
+    ) -> Tuple[dict, Any]:
+        """Sync hook — runs in success_handler Loop 1, BEFORE Langfuse Loop 2.
+
+        Critical for pass-through endpoints where Langfuse is a string callback
+        processed in the sync success_handler thread pool.
+        """
+        try:
+            return _enrich_trace_name(kwargs, result)
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity.logging_hook failed: %s", exc
+            )
+            return kwargs, result
 
     async def async_logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
     ) -> Tuple[dict, Any]:
-        """Runs before async_log_success_event callbacks.
-
-        Converts immutable headers to dict and enriches langfuse_trace_name.
-        """
+        """Async hook — runs in async_success_handler Loop 1, BEFORE async Loop 2."""
         try:
-            agent_name = _extract_agent_name(kwargs)
-            headers = _ensure_mutable_headers(kwargs)
-
-            if headers:
-                current = headers.get("langfuse_trace_name")
-                if current == "claude-code":
-                    headers["langfuse_trace_name"] = f"claude-code.{agent_name}"
-                    verbose_logger.debug(
-                        "AawmAgentIdentity: enriched header trace_name to claude-code.%s",
-                        agent_name,
-                    )
-                    return kwargs, result
-
-            # Fallback: set metadata directly
-            litellm_params = kwargs.get("litellm_params") or {}
-            metadata: Dict[str, Any] = litellm_params.get("metadata") or {}
-            current_trace_name = metadata.get("trace_name")
-            if current_trace_name == "claude-code":
-                metadata["trace_name"] = f"claude-code.{agent_name}"
-            elif not current_trace_name:
-                metadata["trace_name"] = agent_name
-            litellm_params["metadata"] = metadata
-            kwargs["litellm_params"] = litellm_params
-
-            verbose_logger.debug(
-                "AawmAgentIdentity: agent=%s, trace_name=%s",
-                agent_name,
-                metadata.get("trace_name"),
-            )
-            return kwargs, result
+            return _enrich_trace_name(kwargs, result)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.async_logging_hook failed: %s", exc
