@@ -1,19 +1,19 @@
 """AAWM Agent Identity Callback for Langfuse attribution.
 
 Extracts agent identity from the SubagentStart hook context injected into
-request prompts, then enriches the Langfuse trace_name so each agent's
-API calls can be distinguished.
+request prompts, then enriches the langfuse_trace_name request header so
+each agent's API calls can be distinguished in Langfuse.
 
 The hook injects: "You are '<agent-name>' and you are working..."
 When no agent designation is found, defaults to "orchestrator".
 
-Enriches the langfuse_trace_name request header from "claude-code" to
-"claude-code.<agent>" (e.g. "claude-code.ops") so the value survives
-Langfuse's add_metadata_from_header() which overwrites metadata from headers.
+Enriches langfuse_trace_name from "claude-code" to "claude-code.<agent>"
+(e.g. "claude-code.ops"). Uses async_logging_hook() to run before Langfuse's
+add_metadata_from_header() which reads headers to populate trace metadata.
 
 Registration in litellm-config.yaml:
     litellm_settings:
-      callbacks: ["litellm.integrations.aawm_agent_identity.AawmAgentIdentity"]
+      callbacks: ["aawm_litellm_callbacks.agent_identity.AawmAgentIdentity"]
       success_callback: ["langfuse"]
 """
 
@@ -91,91 +91,73 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
     return _DEFAULT_AGENT
 
 
-def _process_kwargs(kwargs: Dict[str, Any]) -> None:
-    """Extract agent name and enrich trace_name in request headers.
+def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict:
+    """Ensure proxy_server_request.headers is a mutable dict.
 
-    Modifies the langfuse_trace_name header directly so the enriched value
-    survives Langfuse's add_metadata_from_header() which overwrites metadata
-    from headers.
+    Starlette Headers objects are immutable. This converts them to a plain
+    dict in-place on kwargs so subsequent modifications persist.
+
+    Returns the mutable headers dict, or empty dict if no headers found.
     """
-    agent_name = _extract_agent_name(kwargs)
-
-    # Find the headers dict — try litellm_params.proxy_server_request.headers first,
-    # then passthrough_logging_payload.request_headers
-    headers = None
     litellm_params = kwargs.get("litellm_params") or {}
-    proxy_server_request = litellm_params.get("proxy_server_request") or {}
-    headers = proxy_server_request.get("headers")
+    psr = litellm_params.get("proxy_server_request") or {}
+    headers = psr.get("headers")
 
+    if headers is None:
+        return {}
+
+    # Convert immutable Starlette Headers (or any non-dict mapping) to dict
     if not isinstance(headers, dict):
-        # Try passthrough_logging_payload
-        payload = kwargs.get("passthrough_logging_payload")
-        if isinstance(payload, dict):
-            headers = payload.get("request_headers")
+        headers = dict(headers)
+        psr["headers"] = headers
 
-    if isinstance(headers, dict):
-        current = headers.get("langfuse_trace_name")
-        if current == "claude-code":
-            headers["langfuse_trace_name"] = f"claude-code.{agent_name}"
-            verbose_logger.debug(
-                "AawmAgentIdentity: enriched header trace_name to claude-code.%s",
-                agent_name,
-            )
-            return
-
-    # Fallback: set metadata directly (for non-header cases)
-    metadata: Dict[str, Any] = litellm_params.get("metadata") or {}
-    current_trace_name = metadata.get("trace_name")
-    if current_trace_name == "claude-code":
-        metadata["trace_name"] = f"claude-code.{agent_name}"
-    elif not current_trace_name:
-        metadata["trace_name"] = agent_name
-    litellm_params["metadata"] = metadata
-    kwargs["litellm_params"] = litellm_params
-
-    verbose_logger.debug(
-        "AawmAgentIdentity: agent=%s, trace_name=%s",
-        agent_name,
-        metadata.get("trace_name"),
-    )
+    return headers
 
 
 class AawmAgentIdentity(CustomLogger):
     """CustomLogger that enriches Langfuse trace_name with agent identity.
 
-    Parses agent name from SubagentStart hook context in the request prompt.
-    Defaults to "orchestrator" when no agent designation is found.
-
-    Registration:
-        litellm_settings:
-          callbacks: ["litellm.integrations.aawm_agent_identity.AawmAgentIdentity"]
-          success_callback: ["langfuse"]
+    Uses async_logging_hook() to modify headers BEFORE Langfuse reads them.
     """
 
-    def log_success_event(
-        self,
-        kwargs: Dict[str, Any],
-        response_obj: Any,
-        start_time: Any,
-        end_time: Any,
+    async def async_logging_hook(
+        self, kwargs: Dict[str, Any], result: Any, call_type: str
     ) -> None:
-        try:
-            _process_kwargs(kwargs)
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity.log_success_event failed: %s", exc
-            )
+        """Runs before async_log_success_event callbacks.
 
-    async def async_log_success_event(
-        self,
-        kwargs: Dict[str, Any],
-        response_obj: Any,
-        start_time: Any,
-        end_time: Any,
-    ) -> None:
+        Converts immutable headers to dict and enriches langfuse_trace_name.
+        """
         try:
-            _process_kwargs(kwargs)
+            agent_name = _extract_agent_name(kwargs)
+            headers = _ensure_mutable_headers(kwargs)
+
+            if headers:
+                current = headers.get("langfuse_trace_name")
+                if current == "claude-code":
+                    headers["langfuse_trace_name"] = f"claude-code.{agent_name}"
+                    verbose_logger.debug(
+                        "AawmAgentIdentity: enriched header trace_name to claude-code.%s",
+                        agent_name,
+                    )
+                    return
+
+            # Fallback: set metadata directly
+            litellm_params = kwargs.get("litellm_params") or {}
+            metadata: Dict[str, Any] = litellm_params.get("metadata") or {}
+            current_trace_name = metadata.get("trace_name")
+            if current_trace_name == "claude-code":
+                metadata["trace_name"] = f"claude-code.{agent_name}"
+            elif not current_trace_name:
+                metadata["trace_name"] = agent_name
+            litellm_params["metadata"] = metadata
+            kwargs["litellm_params"] = litellm_params
+
+            verbose_logger.debug(
+                "AawmAgentIdentity: agent=%s, trace_name=%s",
+                agent_name,
+                metadata.get("trace_name"),
+            )
         except Exception as exc:
             verbose_logger.warning(
-                "AawmAgentIdentity.async_log_success_event failed: %s", exc
+                "AawmAgentIdentity.async_logging_hook failed: %s", exc
             )
