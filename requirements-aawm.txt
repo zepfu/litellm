@@ -48,6 +48,8 @@ async_generator==1.10.0
 # Auth
 pyjwt[crypto]==2.10.1
 pynacl==1.6.2
+email-validator>=2.0.0
+fastapi-sso==0.19.0
 python-multipart==0.0.22
 
 # Database
