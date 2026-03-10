@@ -847,6 +847,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     passthrough_success_handler_obj=pass_through_endpoint_logging,
                     url_route=str(url),
+                    passthrough_logging_payload=passthrough_logging_payload,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
@@ -884,6 +885,7 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     passthrough_success_handler_obj=pass_through_endpoint_logging,
                     url_route=str(url),
+                    passthrough_logging_payload=passthrough_logging_payload,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,

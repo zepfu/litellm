@@ -10,7 +10,10 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
+from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    EndpointType,
+    PassthroughStandardLoggingPayload,
+)
 from litellm.types.utils import StandardPassThroughResponseObject
 
 from .llm_provider_handlers.anthropic_passthrough_logging_handler import (
@@ -35,6 +38,7 @@ class PassThroughStreamingHandler:
         start_time: datetime,
         passthrough_success_handler_obj: PassThroughEndpointLogging,
         url_route: str,
+        passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = None,
     ):
         """
         - Yields chunks from the response
@@ -87,6 +91,7 @@ class PassThroughStreamingHandler:
                     start_time=start_time,
                     raw_bytes=raw_bytes,
                     end_time=end_time,
+                    passthrough_logging_payload=passthrough_logging_payload,
                 )
             )
         except Exception as e:
@@ -104,6 +109,7 @@ class PassThroughStreamingHandler:
         raw_bytes: List[bytes],
         end_time: datetime,
         model: Optional[str] = None,
+        passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = None,
     ):
         """
         Route the logging for the collected chunks to the appropriate handler
@@ -131,6 +137,7 @@ class PassThroughStreamingHandler:
                     start_time=start_time,
                     all_chunks=all_chunks,
                     end_time=end_time,
+                    passthrough_logging_payload=passthrough_logging_payload,
                 )
                 standard_logging_response_object = (
                     anthropic_passthrough_logging_handler_result["result"]
