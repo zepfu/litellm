@@ -146,6 +146,7 @@ def _enrich_trace_name(kwargs: Dict[str, Any], result: Any) -> Tuple[dict, Any]:
     Returns (kwargs, result) tuple as required by logging hook contract.
     """
     agent_name = _extract_agent_name(kwargs)
+    verbose_logger.debug("AawmAgentIdentity: extracted agent_name=%s", agent_name)
     headers = _ensure_mutable_headers(kwargs)
 
     if headers:
