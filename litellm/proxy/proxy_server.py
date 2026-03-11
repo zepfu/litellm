@@ -2919,12 +2919,17 @@ class ProxyConfig:
                     for callback in value:
                         # user passed custom_callbacks.async_on_succes_logger. They need us to import a function
                         if "." in callback:
-                            litellm.logging_callback_manager.add_litellm_success_callback(
-                                get_instance_fn(
-                                    value=callback,
-                                    config_file_path=config_file_path,
-                                )
+                            _custom_cb = get_instance_fn(
+                                value=callback,
+                                config_file_path=config_file_path,
                             )
+                            litellm.logging_callback_manager.add_litellm_success_callback(
+                                _custom_cb
+                            )
+                            if isinstance(_custom_cb, CustomLogger):
+                                litellm.logging_callback_manager.add_litellm_async_success_callback(
+                                    _custom_cb
+                                )
                         # known custom logger callbacks — initialize immediately
                         # so pass-through endpoints (which skip set_callbacks()) get them
                         elif (
