@@ -13,7 +13,7 @@ Enriches langfuse_trace_name from "claude-code" to "claude-code.<agent>"
 Uses BOTH logging_hook() (sync) and async_logging_hook() (async) to modify
 headers BEFORE Langfuse's add_metadata_from_header() reads them.  The sync
 hook is critical for pass-through endpoints because Langfuse runs as a string
-callback ("langfuse") in the sync success_handler — the async hook alone
+callback ("langfuse") in the sync success_handler --- the async hook alone
 would race with the thread-pool-submitted sync handler.
 
 Registration in litellm-config.yaml:
@@ -22,6 +22,8 @@ Registration in litellm-config.yaml:
       success_callback: ["langfuse"]
 """
 
+import json
+import os
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -30,6 +32,7 @@ from litellm.integrations.custom_logger import CustomLogger
 
 _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
 _DEFAULT_AGENT = "orchestrator"
+_DEBUG_DUMP = os.environ.get("AAWM_DEBUG_DUMP", "") != ""
 
 
 def _content_to_text(content: Any) -> str:
@@ -51,16 +54,78 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
     """Extract agent name from request content.
 
     Checks four sources:
-    1. kwargs["messages"] — system messages only (standard LLM call path).
-    2. kwargs["system"] — Anthropic pass-through transforms system to top-level kwarg.
-    3. kwargs["passthrough_logging_payload"]["request_body"]["system"] — pass-through system field.
-    4. kwargs["passthrough_logging_payload"]["request_body"]["messages"] — first user message.
+    1. kwargs["messages"] --- system messages only (standard LLM call path).
+    2. kwargs["system"] --- Anthropic pass-through transforms system to top-level kwarg.
+    3. kwargs["passthrough_logging_payload"]["request_body"]["system"] --- pass-through system field.
+    4. kwargs["passthrough_logging_payload"]["request_body"]["messages"] --- first user message.
        Claude Code SubagentStart hook injects identity into the task prompt (first user message),
        not the system prompt. The tightened regex avoids false positives.
 
     Returns:
         The agent name if found, otherwise _DEFAULT_AGENT ("orchestrator").
     """
+    if _DEBUG_DUMP:
+        # --- DEBUG DUMP v3 ---
+        try:
+            dump = {
+                "has_messages": bool(kwargs.get("messages")),
+                "has_system": bool(kwargs.get("system")),
+                "has_passthrough": bool(kwargs.get("passthrough_logging_payload")),
+            }
+            std_msgs = kwargs.get("messages")
+            if std_msgs and isinstance(std_msgs, list):
+                dump["std_msg_count"] = len(std_msgs)
+                for si, sm in enumerate(std_msgs[:5]):
+                    if isinstance(sm, dict):
+                        role = sm.get("role", "?")
+                        txt = _content_to_text(sm.get("content", ""))
+                        dump["std_msg%d_role" % si] = role
+                        dump["std_msg%d_len" % si] = len(txt)
+                        dump["std_msg%d_has_pattern" % si] = bool(_AGENT_RE.search(txt))
+                        you_are = re.findall(r"You are [^\n]{0,80}", txt)
+                        if you_are:
+                            dump["std_msg%d_you_are" % si] = you_are[:5]
+                        if role in ("user", "system"):
+                            dump["std_msg%d_preview" % si] = txt[:1000]
+            payload = kwargs.get("passthrough_logging_payload")
+            if isinstance(payload, dict):
+                rb = payload.get("request_body")
+                if isinstance(rb, dict):
+                    sys_val = rb.get("system")
+                    if sys_val:
+                        sys_text = _content_to_text(sys_val)
+                        dump["system_type"] = type(sys_val).__name__
+                        dump["system_full_len"] = len(sys_text)
+                        dump["system_has_pattern"] = bool(_AGENT_RE.search(sys_text))
+                        if isinstance(sys_val, list):
+                            dump["system_block_count"] = len(sys_val)
+                            dump["system_block_types"] = [type(b).__name__ for b in sys_val[:5]]
+                        you_are_matches = re.findall(r"You are [^\n]{0,80}", sys_text)
+                        dump["system_you_are_matches"] = you_are_matches[:5]
+                    msgs = rb.get("messages")
+                    if msgs and isinstance(msgs, list):
+                        dump["msg_count"] = len(msgs)
+                        for mi, m in enumerate(msgs[:3]):
+                            if isinstance(m, dict):
+                                role = m.get("role", "?")
+                                raw_content = m.get("content", "")
+                                txt = _content_to_text(raw_content)
+                                dump["msg%d_role" % mi] = role
+                                dump["msg%d_len" % mi] = len(txt)
+                                dump["msg%d_content_type" % mi] = type(raw_content).__name__
+                                if isinstance(raw_content, list):
+                                    dump["msg%d_block_count" % mi] = len(raw_content)
+                                dump["msg%d_has_pattern" % mi] = bool(_AGENT_RE.search(txt))
+                                you_are = re.findall(r"You are [^\n]{0,80}", txt)
+                                if you_are:
+                                    dump["msg%d_you_are" % mi] = you_are[:5]
+                                if role == "user":
+                                    dump["msg%d_preview" % mi] = txt[:2000]
+            with open("/tmp/aawm_debug.jsonl", "a") as df:
+                df.write(json.dumps(dump, default=str) + "\n")
+        except Exception as e:
+            verbose_logger.warning("AAWM debug dump failed: %s", e)
+
     # --- Standard messages path (system messages only) ---
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
@@ -95,7 +160,7 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
                 if match:
                     return match.group(1)
 
-            # Check first user message — Claude Code injects agent identity
+            # Check first user message --- Claude Code injects agent identity
             # into the task prompt (first user message), not the system prompt.
             pt_messages = request_body.get("messages")
             if pt_messages and isinstance(pt_messages, list):
@@ -190,7 +255,7 @@ class AawmAgentIdentity(CustomLogger):
     def logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
     ) -> Tuple[dict, Any]:
-        """Sync hook — runs in success_handler Loop 1, BEFORE Langfuse Loop 2.
+        """Sync hook --- runs in success_handler Loop 1, BEFORE Langfuse Loop 2.
 
         Critical for pass-through endpoints where Langfuse is a string callback
         processed in the sync success_handler thread pool.
@@ -206,7 +271,7 @@ class AawmAgentIdentity(CustomLogger):
     async def async_logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
     ) -> Tuple[dict, Any]:
-        """Async hook — runs in async_success_handler Loop 1, BEFORE async Loop 2."""
+        """Async hook --- runs in async_success_handler Loop 1, BEFORE async Loop 2."""
         try:
             return _enrich_trace_name(kwargs, result)
         except Exception as exc:
