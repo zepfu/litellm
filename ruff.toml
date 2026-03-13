@@ -5,6 +5,7 @@ exclude = ["litellm/types/*", "litellm/__init__.py", "litellm/proxy/example_conf
 
 
 [lint.per-file-ignores]
+"scripts/prompt_analyzer/cli.py" = ["T201"]
 "litellm/main.py" = ["F401"]
 "litellm/utils.py" = ["F401"]
 "litellm/proxy/proxy_server.py" = ["F401"]
