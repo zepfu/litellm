@@ -1,9 +1,7 @@
 name: Label Component Issues
 
 on:
-  issues:
-    types:
-      - opened
+  workflow_dispatch:
 
 jobs:
   add-component-label:

@@ -2,11 +2,6 @@ name: Simple PyPI Publish
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to publish (e.g., 1.74.10)'
-        required: true
-        type: string
 
 env:
   TWINE_USERNAME: __token__

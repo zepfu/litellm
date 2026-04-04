@@ -5,11 +5,7 @@ permissions:
   pull-requests: write
 
 on:
-  push:
-    paths:
-      - 'schema.prisma'  # Check root schema.prisma
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   publish-migrations:

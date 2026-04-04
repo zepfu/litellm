@@ -4,11 +4,6 @@ name: Regenerate poetry.lock
 # the "pyproject.toml changed significantly since poetry.lock was last generated"
 # CI failure).  Can also be triggered manually.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - pyproject.toml
   workflow_dispatch:
 
 permissions:

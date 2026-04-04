@@ -1,9 +1,7 @@
 name: Issue Keyword Labeler
 
 on:
-  issues:
-    types: 
-        - opened
+  workflow_dispatch:
 
 jobs:
   scan-and-label:

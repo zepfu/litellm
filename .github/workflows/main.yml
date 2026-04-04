@@ -2,7 +2,7 @@ name: Publish Dev Release to PyPI
 
 on:
   workflow_dispatch:
-  
+
 jobs:
   publish-dev-release:
     runs-on: ubuntu-latest

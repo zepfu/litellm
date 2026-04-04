@@ -1,8 +1,7 @@
 name: Check Duplicate Issues
 
 on:
-  issues:
-    types: [opened, edited]
+  workflow_dispatch:
 
 jobs:
   check-duplicate:

@@ -1,25 +1,6 @@
 name: Run Observatory Tests
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Docker image tag to test (e.g. v1.61.0.rc1)"
-        required: true
-        type: string
-      commit_hash:
-        description: "Commit hash (defaults to HEAD of current branch)"
-        required: false
-        type: string
-  workflow_call:
-    inputs:
-      tag:
-        description: "Docker image tag to test"
-        required: true
-        type: string
-      commit_hash:
-        description: "Commit hash of the release"
-        required: true
-        type: string
 
 permissions:
   contents: read

@@ -3,12 +3,7 @@
 name: Build, Publish LiteLLM Helm Chart. New Release
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "LiteLLM version tag (e.g., v1.81.0)"
-        required: true
 
-# Defines two custom environment variables for the workflow. Used for the Container registry domain, and a name for the Docker image that this workflow builds.
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}

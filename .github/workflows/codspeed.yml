@@ -1,14 +1,6 @@
 name: CodSpeed Benchmarks
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-  # Allow CodSpeed to trigger backtest performance analysis
-  # in order to generate initial data
   workflow_dispatch:
 
 permissions:

@@ -2,16 +2,6 @@ name: Publish litellm-proxy-extras to PyPI
 
 on:
   workflow_dispatch:
-    inputs:
-      bump:
-        description: "Version bump type"
-        required: true
-        default: "patch"
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
 
 jobs:
   publish:

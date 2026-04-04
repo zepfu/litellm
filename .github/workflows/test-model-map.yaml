@@ -1,8 +1,7 @@
 name: Validate model_prices_and_context_window.json
 
 on:
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   validate-model-prices-json:

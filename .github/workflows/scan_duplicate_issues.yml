@@ -2,16 +2,6 @@ name: Scan Duplicate Issues (One-Time)
 
 on:
   workflow_dispatch:
-    inputs:
-      threshold:
-        description: "Similarity threshold (0-1)"
-        required: false
-        default: "0.85"
-      close:
-        description: "Actually close duplicates (false = dry run)"
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   scan:
