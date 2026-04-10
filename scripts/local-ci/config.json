@@ -1,0 +1,66 @@
+{
+  "suite_version": 1,
+  "litellm_base_url": "http://127.0.0.1:4001",
+  "langfuse_query_url": "http://127.0.0.1:3000",
+  "langfuse_public_key_env": "LANGFUSE_PUBLIC_KEY",
+  "langfuse_secret_key_env": "LANGFUSE_SECRET_KEY",
+  "codex": {
+    "command": [
+      "codex",
+      "exec",
+      "-p",
+      "litellm",
+      "--skip-git-repo-check",
+      "--json",
+      "Reply with exactly two words: codex routed"
+    ],
+    "expected_trace_names": [
+      "codex"
+    ],
+    "expected_user_ids": [
+      "litellm"
+    ],
+    "streaming_checked": false,
+    "timeout_seconds": 180
+  },
+  "gemini": {
+    "command": [
+      "gemini",
+      "-p",
+      "Reply with exactly two words: gemini routed",
+      "--output-format",
+      "json"
+    ],
+    "expected_trace_names": [
+      "gemini"
+    ],
+    "expected_user_ids": [
+      "litellm"
+    ],
+    "streaming_checked": true,
+    "timeout_seconds": 180
+  },
+  "claude": {
+    "command": [
+      "claude",
+      "-p",
+      "@/home/zepfu/projects/litellm/scripts/local-ci/claude_acceptance_prompt.txt",
+      "--output-format",
+      "json"
+    ],
+    "env": {
+      "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+    },
+    "required_trace_names": [
+      "claude-code.orchestrator",
+      "claude-code.eyes",
+      "claude-code.grunt"
+    ],
+    "expected_user_ids": [
+      "litellm.fork"
+    ],
+    "minimum_trace_count": 3,
+    "streaming_checked": true,
+    "timeout_seconds": 180
+  }
+}
