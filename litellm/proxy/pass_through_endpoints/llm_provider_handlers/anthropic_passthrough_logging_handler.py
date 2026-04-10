@@ -182,6 +182,7 @@ class AnthropicPassthroughLoggingHandler:
         start_time: datetime,
         all_chunks: List[str],
         end_time: datetime,
+        passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = None,
     ) -> PassThroughEndpointLoggingTypedDict:
         """
         Takes raw chunks from Anthropic passthrough endpoint and logs them in litellm callbacks
@@ -218,7 +219,11 @@ class AnthropicPassthroughLoggingHandler:
         kwargs = AnthropicPassthroughLoggingHandler._create_anthropic_response_logging_payload(
             litellm_model_response=complete_streaming_response,
             model=model,
-            kwargs={},
+            kwargs=(
+                {"passthrough_logging_payload": passthrough_logging_payload}
+                if passthrough_logging_payload
+                else {}
+            ),
             start_time=start_time,
             end_time=end_time,
             logging_obj=litellm_logging_obj,
