@@ -17,16 +17,15 @@ and is no longer carried as a separate patch.
 
 | Branch | Purpose |
 |--------|---------|
-| `aawm/patches` | Production branch — latest stable patches on top of a pinned upstream release. |
-| `dev` | Integration branch — worktrees merge here for testing before promotion to `aawm/patches`. |
-| `main` | Mirrors upstream `main` at the latest stable release. |
+| `aawm/patches` | Legacy production branch name from the original fork workflow. |
+| `develop` | Integration branch — validated subsystem work should land here first. |
+| `main` | Promotion branch — advances from `develop` after the full validation matrix passes. |
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
 Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7` (6 active patches)
 
-**Version metadata note:** `pyproject.toml` and `litellm/_version.py` currently drift from this registry.
-Treat this file as the source of truth for the carried fork patches until version metadata is normalized.
+**Version metadata note:** `pyproject.toml` and `litellm/_version.py` should stay aligned to this registry's carried patch set.
 
 ## Applied Patches
 
