@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aawm-litellm-callbacks"
+version = "0.0.3"
+description = "AAWM agent identity callback for LiteLLM Langfuse integration"
+requires-python = ">=3.10"
+dependencies = ["litellm"]
+
+[project.optional-dependencies]
+dev = ["build"]
