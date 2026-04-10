@@ -1,0 +1,9 @@
+Dispatch to 2 personas in parallel: eyes and grunt.
+
+Do not answer for them yourself. You must wait for actual responses from both personas before you summarize anything.
+
+Each persona should reply with only:
+- the current date
+- a short acknowledgement
+
+After both personas have actually responded, provide a short summary and exit.
