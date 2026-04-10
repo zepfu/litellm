@@ -21,6 +21,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     bedrock_llm_proxy_route,
     create_pass_through_route,
     cursor_proxy_route,
+    gemini_proxy_route,
     llm_passthrough_factory_proxy_route,
     milvus_proxy_route,
     openai_proxy_route,
@@ -111,6 +112,58 @@ class TestBaseOpenAIPassThroughHandler:
         )
         print(f"Assistant API request: Added header: {result}")
         assert result["OpenAI-Beta"] == "assistants=v2"
+
+
+@pytest.mark.asyncio
+async def test_gemini_proxy_route_code_assist_oauth_passthrough_target():
+    captured_call = {}
+
+    def fake_create_pass_through_route(*args, **kwargs):
+        captured_call.update(kwargs)
+
+        async def _endpoint_func(request, fastapi_response, user_api_key_dict, **_):
+            return {"ok": True}
+
+        return _endpoint_func
+
+    body = b'{"model":"gemini-3-flash-preview","contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/gemini/v1internal:generateContent",
+        "query_string": b"",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer ya29.test-oauth-token"),
+        ],
+    }
+
+    async def async_receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(scope=scope, receive=async_receive)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        side_effect=fake_create_pass_through_route,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+        new=AsyncMock(return_value=MagicMock()),
+    ):
+        response = await gemini_proxy_route(
+            endpoint="v1internal:generateContent",
+            request=request,
+            fastapi_response=Response(),
+        )
+
+    assert response == {"ok": True}
+    assert (
+        captured_call["target"]
+        == "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+    )
+    assert captured_call["custom_llm_provider"] == "gemini"
+    assert captured_call["_forward_headers"] is True
+    assert captured_call["query_params"] == {}
 
     def test_assemble_headers(self):
         print("\nTesting _assemble_headers method...")
@@ -2304,6 +2357,105 @@ class TestOpenAIPassthroughRoute:
             
             # Verify result
             assert result == {"id": "chatcmpl-123", "choices": []}
+
+    @pytest.mark.asyncio
+    async def test_openai_passthrough_responses_api_preserves_client_auth(self):
+        """
+        Test that /openai_passthrough preserves inbound client auth for Responses API
+        calls instead of requiring a server-side OPENAI_API_KEY.
+        """
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer codex-client-token",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials"
+        ) as mock_get_credentials, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_endpoint_func = AsyncMock(
+                return_value={"id": "resp_123", "status": "completed"}
+            )
+            mock_create_route.return_value = mock_endpoint_func
+
+            result = await openai_proxy_route(
+                endpoint="responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+            mock_get_credentials.assert_not_called()
+            mock_create_route.assert_called_once()
+            call_args = mock_create_route.call_args[1]
+            assert call_args["target"] == "https://api.openai.com/v1/responses"
+            assert call_args["endpoint"] == "responses"
+            assert call_args["custom_headers"] == {}
+            assert call_args["_forward_headers"] is True
+            assert result == {"id": "resp_123", "status": "completed"}
+
+    @pytest.mark.asyncio
+    async def test_openai_passthrough_codex_native_auth_targets_chatgpt_backend(self):
+        """
+        Codex-native OAuth traffic should preserve client auth and target the ChatGPT
+        Codex backend instead of the public OpenAI Responses API.
+        """
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer codex-client-token",
+            "chatgpt-account-id": "acct_123",
+            "originator": "codex_exec",
+            "session_id": "sess_123",
+            "user-agent": "codex_exec/0.118.0",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials"
+        ) as mock_get_credentials, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_endpoint_func = AsyncMock(
+                return_value={"id": "resp_123", "status": "completed"}
+            )
+            mock_create_route.return_value = mock_endpoint_func
+
+            result = await openai_proxy_route(
+                endpoint="responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+            mock_get_credentials.assert_not_called()
+            mock_create_route.assert_called_once()
+            call_args = mock_create_route.call_args[1]
+            assert (
+                call_args["target"]
+                == "https://chatgpt.com/backend-api/codex/responses"
+            )
+            assert call_args["endpoint"] == "responses"
+            assert call_args["custom_headers"] == {}
+            assert call_args["_forward_headers"] is True
+            assert result == {"id": "resp_123", "status": "completed"}
 
     @pytest.mark.asyncio
     async def test_openai_passthrough_missing_api_key(self):

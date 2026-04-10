@@ -118,6 +118,13 @@ class TestGeminiPassthroughLoggingHandler:
         )
         assert model == "gemini-1.5-pro"
 
+    def test_extract_model_from_code_assist_request_body(self):
+        model = GeminiPassthroughLoggingHandler.extract_model_from_url(
+            "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+            request_body={"model": "gemini-3-flash-preview"},
+        )
+        assert model == "gemini-3-flash-preview"
+
     @patch("litellm.completion_cost")
     @patch("litellm.litellm_core_utils.litellm_logging.get_standard_logging_object_payload")
     def test_gemini_passthrough_handler_success(self, mock_get_standard_logging, mock_completion_cost):
@@ -164,6 +171,135 @@ class TestGeminiPassthroughLoggingHandler:
         assert mock_logging_obj.model_call_details["response_cost"] == 0.000045
         assert mock_logging_obj.model_call_details["model"] == "gemini-1.5-flash"
         assert mock_logging_obj.model_call_details["custom_llm_provider"] == "gemini"
+
+    @patch("litellm.completion_cost")
+    def test_gemini_passthrough_handler_code_assist_response(self, mock_completion_cost):
+        mock_completion_cost.return_value = 0.000045
+
+        mock_httpx_response = self._create_mock_httpx_response()
+        mock_logging_obj = self._create_mock_logging_obj()
+        passthrough_payload = self._create_passthrough_logging_payload()
+
+        kwargs = {
+            "passthrough_logging_payload": passthrough_payload,
+            "model": "gemini-3-flash-preview",
+        }
+
+        code_assist_response = {
+            "traceId": "trace-123",
+            "response": self.mock_gemini_response,
+        }
+
+        result = GeminiPassthroughLoggingHandler.gemini_passthrough_handler(
+            httpx_response=mock_httpx_response,
+            response_body=code_assist_response,
+            logging_obj=mock_logging_obj,
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+            result="",
+            start_time=self.start_time,
+            end_time=self.end_time,
+            cache_hit=False,
+            request_body={"model": "gemini-3-flash-preview"},
+            **kwargs,
+        )
+
+        assert result["kwargs"]["response_cost"] == 0.000045
+        assert result["kwargs"]["model"] == "gemini-3-flash-preview"
+        assert mock_logging_obj.model_call_details["model"] == "gemini-3-flash-preview"
+
+    def test_response_for_transform_strips_compression_headers_for_code_assist(self):
+        mock_httpx_response = MagicMock(spec=httpx.Response)
+        mock_httpx_response.status_code = 200
+        mock_httpx_response.headers = {
+            "content-type": "application/json",
+            "content-encoding": "gzip",
+            "transfer-encoding": "chunked",
+            "content-length": "123",
+        }
+        mock_httpx_response.request = httpx.Request(
+            "POST", "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        )
+
+        transformed_response = GeminiPassthroughLoggingHandler._response_for_transform(
+            httpx_response=mock_httpx_response,
+            response_body={
+                "traceId": "trace-123",
+                "response": self.mock_gemini_response,
+            },
+        )
+
+        assert transformed_response.headers["content-type"] == "application/json"
+        assert "content-encoding" not in transformed_response.headers
+        assert "transfer-encoding" not in transformed_response.headers
+        assert transformed_response.headers["content-length"] != "123"
+        assert transformed_response.json() == self.mock_gemini_response
+
+    def test_build_complete_streaming_response_code_assist_chunks(self):
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = json.dumps(
+            {
+                "traceId": "trace-123",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "Hello"}], "role": "model"},
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 2,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 3,
+                    },
+                },
+            }
+        )
+
+        response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=[chunk],
+            litellm_logging_obj=mock_logging_obj,
+            model="gemini-3-flash-preview",
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+        )
+
+        assert response is not None
+        assert response.usage.prompt_tokens == 2
+        assert response.usage.completion_tokens == 1
+
+    def test_build_complete_streaming_response_code_assist_sse_chunks(self):
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            {
+                "traceId": "trace-123",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "gemini routed"}], "role": "model"},
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 9136,
+                        "candidatesTokenCount": 3,
+                        "totalTokenCount": 9260,
+                    },
+                    "modelVersion": "gemini-3-flash-preview",
+                },
+            }
+        )
+
+        response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=[chunk, "data: [DONE]"],
+            litellm_logging_obj=mock_logging_obj,
+            model="gemini-3-flash-preview",
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+        )
+
+        assert response is not None
+        assert response.model == "gemini-3-flash-preview"
+        assert response.choices[0].message.content == "gemini routed"
 
     @patch("litellm.completion_cost")
     def test_gemini_passthrough_handler_streaming(self, mock_completion_cost):
