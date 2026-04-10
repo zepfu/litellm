@@ -23,7 +23,10 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current version: `1.82.1+aawm.4` (4 active patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7` (6 active patches)
+
+**Version metadata note:** `pyproject.toml` and `litellm/_version.py` currently drift from this registry.
+Treat this file as the source of truth for the carried fork patches until version metadata is normalized.
 
 ## Applied Patches
 
@@ -50,19 +53,19 @@ supersede Patch 2. Monitor upstream BYOK for pass-through route coverage.
 
 ---
 
-### aawm.4 — Agent identity callback for Langfuse attribution
+### aawm.4 — Agent identity callback for Langfuse trace naming
 
 **File:** `litellm/integrations/aawm_agent_identity.py` (new file)
 **Upstream issue:** LiteLLM has no built-in mechanism to extract agent/tenant
-identity from the system prompt and map it to Langfuse tracing metadata.
+identity from Claude Code prompt content and map it to Langfuse trace naming.
 
 **Fix:** Custom `AawmAgentIdentity(CustomLogger)` callback that:
-- Extracts `LF_AGENT`, `LF_TENANT`, and `LF_TASK_IDS` markers from system
-  prompts in `async_log_pre_api_call`.
-- Maps them to Langfuse fields: `trace_name` ← `LF_AGENT`,
-  `trace_user_id` ← `LF_TENANT`, `session_id` ← `LF_TASK_IDS`.
-- Enables per-agent and per-task cost attribution in Langfuse without requiring
-  Claude Code to support dynamic per-subagent headers.
+- Extracts Claude Code subagent identity from prompt text like
+  `You are 'orchestrator'` / `You are 'engineer'`.
+- Rewrites `langfuse_trace_name` / fallback `metadata["trace_name"]` so traces
+  become `claude-code.orchestrator`, `claude-code.engineer`, etc.
+- Preserves a workable attribution model without requiring Claude Code to emit
+  dynamic per-subagent headers.
 
 **Why not upstream:** AAWM-specific identity injection scheme; not a general
 upstream feature.
@@ -129,6 +132,82 @@ and user OAuth credentials are an AAWM-specific use case.
 **Upstream watch:** v1.82.2+ adds `authenticated_with_header` param to
 `clean_headers()`. When we next rebase past v1.82.2, integrate the `ya29.*`
 check with the new `authenticated_with_header` guard.
+
+---
+
+### aawm.6 — Codex-native passthrough with preserved client OAuth
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/pass_through_unit_tests/test_pass_through_unit_tests.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_openai_passthrough_logging_handler.py`
+
+**Upstream issue:** Redirecting Codex CLI to LiteLLM through the existing
+OpenAI passthrough path does not work if LiteLLM forwards the Codex OAuth
+bearer to the public `api.openai.com/v1/responses` API. The Codex bearer is
+valid for Codex-native upstream traffic but does not carry the public
+`api.responses.write` scope required by the OpenAI Responses API.
+
+**Fix:**
+1. Detect real Codex-native ingress on the OpenAI passthrough lane.
+2. Preserve the inbound Codex OAuth bearer and native Codex headers.
+3. Route the request to `https://chatgpt.com/backend-api/codex/responses`
+   instead of the public OpenAI Responses API.
+4. Keep passthrough observability intact by masking raw auth in logs and
+   hashing the inbound bearer before it lands in metadata.
+
+**Why not upstream:** Upstream OpenAI passthrough assumes generic OpenAI API
+traffic. This fork needs Codex-native passthrough semantics so Codex CLI can
+stay logged in normally while LiteLLM acts only as the routing and
+observability layer.
+
+**Validation status:** Real `codex exec -p litellm` traffic succeeded through
+`litellm-dev`, and Langfuse persisted traces with `name = "codex"`.
+
+---
+
+### aawm.7 — Gemini Code Assist native passthrough and logging fixes
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/streaming_handler.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/pass_through_unit_tests/test_gemini_streaming_handler.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py`
+
+**Upstream issue:** Gemini CLI `oauth-personal` traffic does not use the public
+Gemini Developer API path for this workflow. It targets Google Code Assist on
+`https://cloudcode-pa.googleapis.com/v1internal:...`. Upstream Gemini
+pass-through behavior is API-key oriented and did not correctly support the
+native Code Assist route, its streamed SSE chunk format, or its response
+envelope shape for observability callbacks.
+
+**Fix:**
+1. Detect Gemini Code Assist ingress on `/gemini/v1internal:...`.
+2. Preserve the inbound Google OAuth bearer and forward to
+   `https://cloudcode-pa.googleapis.com/v1internal:...`.
+3. Route streamed Gemini passthrough callbacks to the Gemini-specific logging
+   handler instead of the generic Vertex path.
+4. Parse SSE `data: {...}` chunks and unwrap Code Assist responses shaped like
+   `{ "traceId": ..., "response": {...} }`.
+5. Strip stale compression and transfer headers when reconstructing synthetic
+   `httpx.Response` objects for logging transforms so the callback path does not
+   trip `httpx.DecodingError`.
+
+**Why not upstream:** Upstream Gemini pass-through is focused on API-key-based
+Gemini API traffic. AAWM needs native Gemini CLI / Google Code Assist OAuth
+passthrough with clean Langfuse logging and no OpenAI-compatible translation
+layer.
+
+**Validation status:** Real `gemini -p ... --output-format json` traffic
+succeeded through `litellm-dev`, native `generateContent` and
+`streamGenerateContent?alt=sse` both returned `200`, and Langfuse persisted
+the Gemini traces.
 
 ---
 

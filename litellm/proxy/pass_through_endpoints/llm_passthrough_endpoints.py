@@ -23,6 +23,7 @@ from litellm.constants import (
     BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES,
 )
 from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
 from litellm.proxy.auth.route_checks import RouteChecks
@@ -56,6 +57,84 @@ router = APIRouter()
 default_vertex_config = None
 
 passthrough_endpoint_router = PassthroughEndpointRouter()
+
+
+def _is_openai_responses_endpoint(endpoint: str) -> bool:
+    normalized_path = httpx.URL(endpoint).path.rstrip("/")
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    return (
+        normalized_path == "/responses"
+        or normalized_path == "/v1/responses"
+        or normalized_path.startswith("/responses/")
+        or normalized_path.startswith("/v1/responses/")
+    )
+
+
+def _request_has_openai_client_auth(request: Request) -> bool:
+    headers = _safe_get_request_headers(request)
+    return bool(
+        headers.get("authorization")
+        or headers.get("Authorization")
+        or headers.get("api-key")
+        or headers.get("Api-Key")
+    )
+
+
+def _request_uses_codex_native_auth(request: Request) -> bool:
+    headers = _safe_get_request_headers(request)
+    chatgpt_account_id = headers.get("chatgpt-account-id") or headers.get(
+        "ChatGPT-Account-Id"
+    )
+    originator = headers.get("originator") or headers.get("Originator")
+    user_agent = headers.get("user-agent") or headers.get("User-Agent")
+    session_id = headers.get("session_id") or headers.get("Session_Id")
+
+    if isinstance(chatgpt_account_id, str) and len(chatgpt_account_id) > 0:
+        return True
+    if isinstance(originator, str) and "codex" in originator.lower():
+        return True
+    return bool(
+        isinstance(user_agent, str)
+        and "codex" in user_agent.lower()
+        and isinstance(session_id, str)
+        and len(session_id) > 0
+    )
+
+
+def _should_preserve_openai_client_auth(request: Request, endpoint: str) -> bool:
+    """
+    Preserve inbound client auth only for OpenAI Responses passthrough traffic.
+
+    This keeps Codex-style already-authenticated requests as close to native
+    behavior as possible while leaving the existing server-authenticated
+    passthrough behavior intact for other OpenAI endpoints.
+    """
+    return _is_openai_responses_endpoint(endpoint) and _request_has_openai_client_auth(
+        request
+    )
+
+
+def _get_openai_passthrough_target_base(request: Request, endpoint: str) -> str:
+    if _should_preserve_openai_client_auth(request=request, endpoint=endpoint):
+        if _request_uses_codex_native_auth(request):
+            return os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
+    return os.getenv("OPENAI_API_BASE") or "https://api.openai.com/"
+
+
+def _is_gemini_code_assist_endpoint(endpoint: str) -> bool:
+    normalized_endpoint = endpoint.lstrip("/")
+    return normalized_endpoint.startswith("v1internal:")
+
+
+def _get_gemini_passthrough_target_base(
+    endpoint: str,
+    has_google_oauth_bearer: bool,
+) -> str:
+    if has_google_oauth_bearer and _is_gemini_code_assist_endpoint(endpoint):
+        return os.getenv("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com"
+
+    return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
 
 
 def create_request_copy(request: Request):
@@ -117,7 +196,10 @@ async def llm_passthrough_factory_proxy_route(
             status_code=404, detail=f"Provider {custom_llm_provider} api base not found"
         )
 
-    encoded_endpoint = httpx.URL(endpoint).path
+    if _is_gemini_code_assist_endpoint(endpoint):
+        encoded_endpoint = endpoint.split("?", 1)[0]
+    else:
+        encoded_endpoint = httpx.URL(endpoint).path
 
     # Ensure endpoint starts with '/' for proper URL construction
     if not encoded_endpoint.startswith("/"):
@@ -202,10 +284,17 @@ async def gemini_proxy_route(
         request=request, api_key=f"Bearer {google_ai_studio_api_key}"
     )
 
-    base_target_url = (
-        os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
+    _auth_header = request.headers.get("authorization", "")
+    _is_google_oauth = _auth_header.startswith("Bearer ya29.")
+
+    base_target_url = _get_gemini_passthrough_target_base(
+        endpoint=endpoint,
+        has_google_oauth_bearer=_is_google_oauth,
     )
-    encoded_endpoint = httpx.URL(endpoint).path
+    if _is_gemini_code_assist_endpoint(endpoint):
+        encoded_endpoint = endpoint.split("?", 1)[0]
+    else:
+        encoded_endpoint = httpx.URL(endpoint).path
 
     # Ensure endpoint starts with '/' for proper URL construction
     if not encoded_endpoint.startswith("/"):
@@ -214,14 +303,6 @@ async def gemini_proxy_route(
     # Construct the full target URL using httpx
     base_url = httpx.URL(base_target_url)
     updated_url = base_url.copy_with(path=encoded_endpoint)
-
-    ## Detect Google Cloud OAuth tokens (ya29.*) in the Authorization header.
-    ## When present, skip injecting the server-side GEMINI_API_KEY query param and
-    ## forward the Authorization header as-is to Google's API. Without this,
-    ## requests using GCP service-account tokens fail because the server injects
-    ## an API key that conflicts with the OAuth credential.
-    _auth_header = request.headers.get("authorization", "")
-    _is_google_oauth = _auth_header.startswith("Bearer ya29.")
 
     # Add or update query parameters
     merged_params = dict(request.query_params)
@@ -1982,16 +2063,27 @@ async def openai_proxy_route(
 
     [Docs](https://docs.litellm.ai/docs/pass_through/openai_passthrough)
     """
-    base_target_url = os.getenv("OPENAI_API_BASE") or "https://api.openai.com/"
-    # Add or update query parameters
-    openai_api_key = passthrough_endpoint_router.get_credentials(
-        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-        region_name=None,
+    base_target_url = _get_openai_passthrough_target_base(
+        request=request,
+        endpoint=endpoint,
     )
-    if openai_api_key is None:
-        raise Exception(
-            "Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI."
+    preserve_client_auth = _should_preserve_openai_client_auth(
+        request=request,
+        endpoint=endpoint,
+    )
+    openai_api_key: Optional[str] = None
+    forward_headers = False
+    if preserve_client_auth:
+        forward_headers = True
+    else:
+        openai_api_key = passthrough_endpoint_router.get_credentials(
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            region_name=None,
         )
+        if openai_api_key is None:
+            raise Exception(
+                "Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI."
+            )
 
     return await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
         endpoint=endpoint,
@@ -2001,6 +2093,7 @@ async def openai_proxy_route(
         base_target_url=base_target_url,
         api_key=openai_api_key,
         custom_llm_provider=litellm.LlmProviders.OPENAI,
+        forward_headers=forward_headers,
     )
 
 
@@ -2015,11 +2108,12 @@ class BaseOpenAIPassThroughHandler:
         api_key: Optional[str],
         custom_llm_provider: litellm.LlmProviders,
         extra_headers: Optional[dict] = None,
+        forward_headers: bool = False,
     ):
-        encoded_endpoint = httpx.URL(endpoint).path
-        # Ensure endpoint starts with '/' for proper URL construction
-        if not encoded_endpoint.startswith("/"):
-            encoded_endpoint = "/" + encoded_endpoint
+        encoded_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+            endpoint=endpoint,
+            base_target_url=base_target_url,
+        )
 
         # Construct the full target URL by properly joining the base URL and endpoint path
         base_url = httpx.URL(base_target_url)
@@ -2041,6 +2135,7 @@ class BaseOpenAIPassThroughHandler:
             custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
                 api_key=api_key, request=request, extra_headers=extra_headers
             ),
+            _forward_headers=forward_headers,
             is_streaming_request=is_streaming_request,  # type: ignore
         )  # dynamically construct pass-through endpoint based on incoming path
         received_value = await endpoint_func(
@@ -2109,6 +2204,24 @@ class BaseOpenAIPassThroughHandler:
             )
 
         return joined_path_str
+
+    @staticmethod
+    def _normalize_endpoint_for_target(
+        endpoint: str, base_target_url: str
+    ) -> str:
+        normalized_endpoint = httpx.URL(endpoint).path
+        if not normalized_endpoint.startswith("/"):
+            normalized_endpoint = "/" + normalized_endpoint
+
+        base_url = httpx.URL(base_target_url)
+        if (
+            base_url.host
+            and "chatgpt.com" in base_url.host
+            and base_url.path.rstrip("/") == "/backend-api/codex"
+            and normalized_endpoint.startswith("/v1/")
+        ):
+            return normalized_endpoint[len("/v1") :]
+        return normalized_endpoint
 
 
 @router.api_route(

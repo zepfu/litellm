@@ -105,6 +105,11 @@ STABILIZATION_TODO.md
 sample.json
 
 # local dev artifacts
+.gemini
+.gemini/
+.codex
+.codex/
+captures/
 .agent/
 .analysis/
 .scenario.md

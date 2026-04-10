@@ -1,0 +1,11 @@
+model_list:
+  - model_name: "claude-sonnet-4-6"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-6"
+
+litellm_settings:
+  drop_params: true
+  success_callback: ["langfuse", "litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance", "litellm.integrations.aawm_payload_capture.aawm_payload_capture_instance"]
+  model_group_settings:
+    forward_client_headers_to_llm_api:
+      - "claude-sonnet-4-6"

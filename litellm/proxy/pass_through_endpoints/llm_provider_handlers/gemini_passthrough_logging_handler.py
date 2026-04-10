@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -27,6 +28,53 @@ else:
 
 
 class GeminiPassthroughLoggingHandler:
+    @staticmethod
+    def _parse_stream_chunk_json(chunk: str) -> Optional[Dict[str, Any]]:
+        normalized_chunk = chunk.strip()
+        if normalized_chunk.startswith("data:"):
+            normalized_chunk = normalized_chunk[len("data:") :].strip()
+        if normalized_chunk in {"", "[DONE]"}:
+            return None
+        try:
+            parsed_chunk = json.loads(normalized_chunk)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed_chunk, dict):
+            return None
+        return parsed_chunk
+
+    @staticmethod
+    def _unwrap_code_assist_response_body(response_body: Any) -> Any:
+        if isinstance(response_body, dict) and isinstance(response_body.get("response"), dict):
+            return response_body["response"]
+        return response_body
+
+    @staticmethod
+    def _response_for_transform(
+        httpx_response: httpx.Response,
+        response_body: Any,
+    ) -> httpx.Response:
+        unwrapped_response = GeminiPassthroughLoggingHandler._unwrap_code_assist_response_body(
+            response_body
+        )
+        if unwrapped_response is response_body:
+            return httpx_response
+
+        sanitized_headers = dict(httpx_response.headers)
+        for header_name in (
+            "content-encoding",
+            "transfer-encoding",
+            "content-length",
+        ):
+            sanitized_headers.pop(header_name, None)
+
+        return httpx.Response(
+            status_code=httpx_response.status_code,
+            headers=sanitized_headers,
+            content=json.dumps(unwrapped_response).encode("utf-8"),
+            request=getattr(httpx_response, "request", None),
+        )
+
     @staticmethod
     def gemini_passthrough_handler(
         httpx_response: httpx.Response,
@@ -80,7 +128,14 @@ class GeminiPassthroughLoggingHandler:
             }
 
         if "generateContent" in url_route:
-            model = GeminiPassthroughLoggingHandler.extract_model_from_url(url_route)
+            model = GeminiPassthroughLoggingHandler.extract_model_from_url(
+                url=url_route,
+                request_body=request_body,
+            )
+            transformed_httpx_response = GeminiPassthroughLoggingHandler._response_for_transform(
+                httpx_response=httpx_response,
+                response_body=response_body,
+            )
 
             # Use Gemini config for transformation
             instance_of_gemini_llm = litellm.GoogleAIStudioGeminiConfig()
@@ -90,7 +145,7 @@ class GeminiPassthroughLoggingHandler:
                     messages=[
                         {"role": "user", "content": "no-message-pass-through-endpoint"}
                     ],
-                    raw_response=httpx_response,
+                    raw_response=transformed_httpx_response,
                     model_response=litellm.ModelResponse(),
                     logging_obj=logging_obj,
                     optional_params={},
@@ -141,7 +196,8 @@ class GeminiPassthroughLoggingHandler:
         """
         kwargs: Dict[str, Any] = {}
         model = model or GeminiPassthroughLoggingHandler.extract_model_from_url(
-            url_route
+            url=url_route,
+            request_body=request_body,
         )
         complete_streaming_response = (
             GeminiPassthroughLoggingHandler._build_complete_streaming_response(
@@ -185,13 +241,51 @@ class GeminiPassthroughLoggingHandler:
     ) -> Optional[Union[ModelResponse, TextCompletionResponse]]:
         parsed_chunks = []
         if "generateContent" in url_route or "streamGenerateContent" in url_route:
+            parsed_json_chunks = []
+            for chunk in all_chunks:
+                parsed_chunk = GeminiPassthroughLoggingHandler._parse_stream_chunk_json(
+                    chunk
+                )
+                if parsed_chunk is not None:
+                    parsed_json_chunks.append(parsed_chunk)
+
+            code_assist_chunks = [
+                chunk.get("response")
+                for chunk in parsed_json_chunks
+                if isinstance(chunk, dict) and isinstance(chunk.get("response"), dict)
+            ]
+            if len(code_assist_chunks) > 0:
+                transformed_httpx_response = httpx.Response(
+                    status_code=200,
+                    content=json.dumps(code_assist_chunks[-1]).encode("utf-8"),
+                )
+                instance_of_gemini_llm = litellm.GoogleAIStudioGeminiConfig()
+                return instance_of_gemini_llm.transform_response(
+                    model=model,
+                    messages=[
+                        {"role": "user", "content": "no-message-pass-through-endpoint"}
+                    ],
+                    raw_response=transformed_httpx_response,
+                    model_response=litellm.ModelResponse(),
+                    logging_obj=litellm_logging_obj,
+                    optional_params={},
+                    litellm_params={},
+                    api_key="",
+                    request_data={},
+                    encoding=litellm.encoding,
+                )
+
             gemini_iterator: Any = GeminiModelResponseIterator(
                 streaming_response=None,
                 sync_stream=False,
                 logging_obj=litellm_logging_obj,
             )
             chunk_parsing_logic: Any = gemini_iterator._common_chunk_parsing_logic
-            parsed_chunks = [chunk_parsing_logic(chunk) for chunk in all_chunks]
+            normalized_chunks = []
+            for chunk in all_chunks:
+                normalized_chunks.append(chunk)
+
+            parsed_chunks = [chunk_parsing_logic(chunk) for chunk in normalized_chunks]
         else:
             return None
 
@@ -211,11 +305,15 @@ class GeminiPassthroughLoggingHandler:
         return complete_streaming_response
 
     @staticmethod
-    def extract_model_from_url(url: str) -> str:
+    def extract_model_from_url(
+        url: str, request_body: Optional[Dict[str, Any]] = None
+    ) -> str:
         pattern = r"/models/([^:]+)"
         match = re.search(pattern, url)
         if match:
             return match.group(1)
+        if request_body is not None and isinstance(request_body.get("model"), str):
+            return request_body["model"]
         return "unknown"
 
     @staticmethod
