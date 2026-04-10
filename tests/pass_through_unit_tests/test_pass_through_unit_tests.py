@@ -29,7 +29,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     pass_through_request,
 )
 from fastapi import Request
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import UserAPIKeyAuth, hash_token
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _update_metadata_with_tags_in_header,
     HttpPassThroughEndpointHelpers,
@@ -233,6 +233,56 @@ def test_init_kwargs_with_tags_in_header(mock_request, mock_user_api_key_dict):
     metadata = result["litellm_params"]["metadata"]
     print("metadata", metadata)
     assert metadata["tags"] == ["tag1", "tag2"]
+
+
+def test_init_kwargs_for_openai_responses_client_auth_passthrough_hashes_metadata(
+    mock_request,
+):
+    """
+    OpenAI Responses passthrough requests that preserve inbound client auth should
+    hash the auth token before exposing it in metadata.
+    """
+    request = mock_request(headers={"authorization": "Bearer codex-oauth-token"})
+    request.url = "http://localhost:4000/openai_passthrough/v1/responses"
+    passthrough_payload = PassthroughStandardLoggingPayload(
+        url="https://chatgpt.com/backend-api/codex/responses",
+        request_body={},
+    )
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="codex-oauth-token",
+        user_id="test-user",
+        team_id="test-team",
+        end_user_id="test-user",
+    )
+
+    result = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        passthrough_logging_payload=passthrough_payload,
+        litellm_call_id="test-call-id",
+        logging_obj=LiteLLMLoggingObj(
+            model="test-model",
+            messages=[],
+            stream=False,
+            call_type="test-call-type",
+            start_time=datetime.now(),
+            litellm_call_id="test-call-id",
+            function_id="test-function-id",
+        ),
+    )
+
+    expected_hash = hash_token("codex-oauth-token")
+    metadata = result["litellm_params"]["metadata"]
+    assert metadata["user_api_key_hash"] == expected_hash
+    assert metadata["user_api_key"] == expected_hash
+
+
+def test_get_endpoint_type_treats_chatgpt_codex_as_openai():
+    endpoint_type = HttpPassThroughEndpointHelpers.get_endpoint_type(
+        "https://chatgpt.com/backend-api/codex/responses"
+    )
+
+    assert endpoint_type == EndpointType.OPENAI
 
 
 athropic_request_body = {

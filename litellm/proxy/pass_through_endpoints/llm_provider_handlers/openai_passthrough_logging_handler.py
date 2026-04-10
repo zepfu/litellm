@@ -57,6 +57,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             and (
                 "api.openai.com" in parsed_url.hostname
                 or "openai.azure.com" in parsed_url.hostname
+                or "chatgpt.com" in parsed_url.hostname
             )
             and "/v1/chat/completions" in parsed_url.path
         )
@@ -72,6 +73,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             and (
                 "api.openai.com" in parsed_url.hostname
                 or "openai.azure.com" in parsed_url.hostname
+                or "chatgpt.com" in parsed_url.hostname
             )
             and "/v1/images/generations" in parsed_url.path
         )
@@ -87,6 +89,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             and (
                 "api.openai.com" in parsed_url.hostname
                 or "openai.azure.com" in parsed_url.hostname
+                or "chatgpt.com" in parsed_url.hostname
             )
             and "/v1/images/edits" in parsed_url.path
         )
@@ -102,6 +105,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             and (
                 "api.openai.com" in parsed_url.hostname
                 or "openai.azure.com" in parsed_url.hostname
+                or "chatgpt.com" in parsed_url.hostname
             )
             and ("/v1/responses" in parsed_url.path or "/responses" in parsed_url.path)
         )
@@ -378,6 +382,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     kwargs["litellm_params"].setdefault(
                         "proxy_server_request", {}
                     ).setdefault("body", {})["user"] = user
+                request_headers = passthrough_logging_payload.get("request_headers")
+                if request_headers:
+                    kwargs["litellm_params"].setdefault(
+                        "proxy_server_request", {}
+                    )["headers"] = request_headers
 
             # Create standard logging object
             if litellm_model_response is not None:
@@ -571,6 +580,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     kwargs["litellm_params"].setdefault(
                         "proxy_server_request", {}
                     ).setdefault("body", {})["user"] = user
+                request_headers = passthrough_logging_payload.get("request_headers")
+                if request_headers:
+                    kwargs["litellm_params"].setdefault(
+                        "proxy_server_request", {}
+                    )["headers"] = request_headers
 
             # Create standard logging object
             get_standard_logging_object_payload(

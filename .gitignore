@@ -102,3 +102,15 @@ STABILIZATION_TODO.md
 **/playwright-report
 **/*.storageState.json
 **/coverage
+sample.json
+
+# local dev artifacts
+.gemini
+.gemini/
+.codex
+.codex/
+captures/
+.agent/
+.analysis/
+.scenario.md
+.aawm-scripts/
