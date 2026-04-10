@@ -1,0 +1,21 @@
+FROM python:3.13-slim
+
+# Build dependencies for C extensions
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ make && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install requirements first for caching
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install litellm from source in editable mode
+COPY . .
+RUN pip install --no-cache-dir -e .
+
+# Install langfuse for observability
+RUN pip install --no-cache-dir langfuse
+
+EXPOSE 4001
+
+CMD ["litellm", "--config", "/app/litellm-dev-config.yaml", "--port", "4001", "--detailed_debug"]

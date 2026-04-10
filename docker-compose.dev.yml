@@ -1,0 +1,31 @@
+version: "3.8"
+services:
+  litellm-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: litellm-dev
+    ports:
+      - "4001:4001"
+    volumes:
+      # Mount source for live code changes (key files only)
+      - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
+      - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
+      - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
+      # Capture output — written to /tmp/captures inside container, visible on host
+      - ./captures:/tmp/captures
+    environment:
+      # Langfuse — read from host env or set defaults
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      # No server-side ANTHROPIC_API_KEY — client provides via x-api-key header
+      # Enable payload capture to ./captures/
+      - AAWM_CAPTURE=1
+    networks:
+      - default
+      - aawm_default
+
+networks:
+  aawm_default:
+    external: true

@@ -226,6 +226,55 @@ class TestOpenAIPassthroughLoggingHandler:
 
     @patch('litellm.completion_cost')
     @patch('litellm.litellm_core_utils.litellm_logging.get_standard_logging_object_payload')
+    def test_openai_passthrough_handler_uses_cleaned_request_headers(
+        self, mock_get_standard_logging, mock_completion_cost
+    ):
+        """OpenAI passthrough logging should overwrite proxy_server_request headers with cleaned request headers."""
+        mock_completion_cost.return_value = 0.000045
+        mock_get_standard_logging.return_value = {"test": "logging_payload"}
+
+        mock_httpx_response = self._create_mock_httpx_response()
+        mock_logging_obj = self._create_mock_logging_obj()
+        passthrough_payload = PassthroughStandardLoggingPayload(
+            url="https://api.openai.com/v1/chat/completions",
+            request_body={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello"}]},
+            request_method="POST",
+            request_headers={"x-trace-id": "trace-123"},
+        )
+
+        kwargs = {
+            "passthrough_logging_payload": passthrough_payload,
+            "model": "gpt-4o",
+            "litellm_params": {
+                "proxy_server_request": {
+                    "headers": {"authorization": "Bearer raw-token"}
+                }
+            },
+        }
+
+        result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+            httpx_response=mock_httpx_response,
+            response_body=self.mock_openai_response,
+            logging_obj=mock_logging_obj,
+            url_route="https://api.openai.com/v1/chat/completions",
+            result="",
+            start_time=self.start_time,
+            end_time=self.end_time,
+            cache_hit=False,
+            request_body={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello"}]},
+            **kwargs
+        )
+
+        proxy_server_request = result["kwargs"]["litellm_params"]["proxy_server_request"]
+        assert proxy_server_request["headers"] == {"x-trace-id": "trace-123"}
+
+    def test_is_openai_responses_route_accepts_chatgpt_codex_backend(self):
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route(
+            "https://chatgpt.com/backend-api/codex/responses"
+        )
+
+    @patch('litellm.completion_cost')
+    @patch('litellm.litellm_core_utils.litellm_logging.get_standard_logging_object_payload')
     def test_openai_passthrough_handler_with_user_tracking(self, mock_get_standard_logging, mock_completion_cost):
         """Test cost tracking with user information"""
         # Arrange

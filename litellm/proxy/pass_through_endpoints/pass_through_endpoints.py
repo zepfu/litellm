@@ -47,6 +47,7 @@ from litellm.proxy._types import (
     PassThroughGenericEndpoint,
     ProxyException,
     UserAPIKeyAuth,
+    hash_token,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
@@ -314,6 +315,98 @@ async def chat_completion_pass_through_endpoint(  # noqa: PLR0915
 
 class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
     @staticmethod
+    def get_masked_passthrough_headers(headers: Optional[dict]) -> dict:
+        masked_headers = dict(headers or {})
+        sensitive_header_names = {
+            "authorization",
+            "api-key",
+            "x-api-key",
+            "proxy-authorization",
+        }
+        for header_name, header_value in list(masked_headers.items()):
+            if header_name.lower() not in sensitive_header_names:
+                continue
+            if isinstance(header_value, str) and header_value.lower().startswith(
+                "bearer "
+            ):
+                masked_headers[header_name] = "Bearer ***"
+            else:
+                masked_headers[header_name] = "***"
+        return masked_headers
+
+    @staticmethod
+    def _get_passthrough_request_url_path(request: Request) -> str:
+        request_url = getattr(request, "url", "")
+        return urlparse(str(request_url)).path
+
+    @staticmethod
+    def _is_openai_responses_client_auth_passthrough_request(
+        request: Request,
+        passthrough_logging_payload: PassthroughStandardLoggingPayload,
+    ) -> bool:
+        request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
+            request
+        )
+        if "/openai_passthrough/" not in request_path and "/openai/" not in request_path:
+            return False
+
+        target_url = passthrough_logging_payload.get("url") or ""
+        parsed_target = urlparse(str(target_url))
+        target_path = parsed_target.path.rstrip("/")
+        is_openai_target = bool(
+            parsed_target.hostname
+            and (
+                "api.openai.com" in parsed_target.hostname
+                or "openai.azure.com" in parsed_target.hostname
+                or "chatgpt.com" in parsed_target.hostname
+            )
+        )
+        if not is_openai_target:
+            return False
+
+        is_responses_route = (
+            target_path == "/v1/responses"
+            or target_path.startswith("/v1/responses/")
+            or target_path == "/backend-api/codex/responses"
+            or target_path.startswith("/backend-api/codex/responses/")
+            or target_path == "/responses"
+            or target_path.startswith("/responses/")
+        )
+        if not is_responses_route:
+            return False
+
+        headers = _safe_get_request_headers(request)
+        return bool(
+            headers.get("authorization")
+            or headers.get("Authorization")
+            or headers.get("api-key")
+            or headers.get("Api-Key")
+        )
+
+    @staticmethod
+    def _get_safe_passthrough_user_api_key_hash(
+        request: Request,
+        user_api_key_dict: UserAPIKeyAuth,
+        passthrough_logging_payload: PassthroughStandardLoggingPayload,
+    ) -> Optional[str]:
+        if (
+            HttpPassThroughEndpointHelpers._is_openai_responses_client_auth_passthrough_request(
+                request=request,
+                passthrough_logging_payload=passthrough_logging_payload,
+            )
+        ):
+            headers = _safe_get_request_headers(request)
+            auth_header = headers.get("authorization") or headers.get("Authorization")
+            if isinstance(auth_header, str) and auth_header.lower().startswith("bearer "):
+                return hash_token(auth_header[len("Bearer ") :])
+
+            api_key_header = headers.get("api-key") or headers.get("Api-Key")
+            if isinstance(api_key_header, str) and api_key_header:
+                return hash_token(api_key_header)
+
+        return user_api_key_dict.api_key
+
+    @staticmethod
     def get_response_headers(
         headers: httpx.Headers,
         litellm_call_id: Optional[str] = None,
@@ -348,6 +441,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         elif (
             parsed_url.hostname == "api.openai.com"
             or parsed_url.hostname == "openai.azure.com"
+            or parsed_url.hostname == "chatgpt.com"
             or (parsed_url.hostname and "openai.com" in parsed_url.hostname)
         ):
             return EndpointType.OPENAI
@@ -495,6 +589,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         from litellm.types.utils import all_litellm_params
 
         _parsed_body = _parsed_body or {}
+        safe_user_api_key_hash = (
+            HttpPassThroughEndpointHelpers._get_safe_passthrough_user_api_key_hash(
+                request=request,
+                user_api_key_dict=user_api_key_dict,
+                passthrough_logging_payload=passthrough_logging_payload,
+            )
+        )
 
         litellm_params_in_body = {}
         for k in all_litellm_params:
@@ -503,7 +604,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         _metadata = dict(
             StandardLoggingUserAPIKeyMetadata(
-                user_api_key_hash=user_api_key_dict.api_key,
+                user_api_key_hash=safe_user_api_key_hash,
                 user_api_key_alias=user_api_key_dict.key_alias,
                 user_api_key_user_email=user_api_key_dict.user_email,
                 user_api_key_user_id=user_api_key_dict.user_id,
@@ -524,7 +625,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             )
         )
 
-        _metadata["user_api_key"] = user_api_key_dict.api_key
+        _metadata["user_api_key"] = safe_user_api_key_hash
 
         litellm_metadata = litellm_params_in_body.pop("litellm_metadata", None)
         metadata = litellm_params_in_body.pop("metadata", None)
@@ -696,9 +797,12 @@ async def pass_through_request(  # noqa: PLR0915
             _parsed_body = {}
         else:
             _parsed_body = await _read_request_body(request)
+        masked_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
+            headers=headers
+        )
         verbose_proxy_logger.debug(
             "Pass through endpoint sending request to \nURL {}\nheaders: {}\nbody: {}\n".format(
-                url, headers, _parsed_body
+                url, masked_headers, _parsed_body
             )
         )
 
@@ -810,7 +914,7 @@ async def pass_through_request(  # noqa: PLR0915
             additional_args={
                 "complete_input_dict": _parsed_body,
                 "api_base": str(logging_url),
-                "headers": headers,
+                "headers": masked_headers,
             },
         )
         stream = (
@@ -847,6 +951,9 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     passthrough_success_handler_obj=pass_through_endpoint_logging,
                     url_route=str(url),
+                    passthrough_logging_payload=passthrough_logging_payload,
+                    custom_llm_provider=custom_llm_provider,
+                    success_handler_kwargs=kwargs,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
@@ -884,6 +991,9 @@ async def pass_through_request(  # noqa: PLR0915
                     start_time=start_time,
                     passthrough_success_handler_obj=pass_through_endpoint_logging,
                     url_route=str(url),
+                    passthrough_logging_payload=passthrough_logging_payload,
+                    custom_llm_provider=custom_llm_provider,
+                    success_handler_kwargs=kwargs,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
