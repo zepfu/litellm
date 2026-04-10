@@ -3,9 +3,15 @@
 This fork of [BerriAI/litellm](https://github.com/BerriAI/litellm) tracks
 upstream releases with AAWM-specific patches applied on top.
 
-**Base version:** v1.82.1 (commit `d07689d2d7`, rebased 2026-03-06)
+**Base version:** v1.82.3-stable.patch.4 (commit `1e10e5cc8f`, rebased 2026-04-10)
 
 **Image format:** venv artifact (`FROM scratch` — not a runnable image). Consumed via `COPY --from=`.
+
+**Callback wheel:** production callback changes are published separately from
+`.wheel-build/` and consumed as a GitHub release wheel by the production image.
+The in-repo callback at `litellm/integrations/aawm_agent_identity.py` and the
+published wheel source under `.wheel-build/` must stay behaviorally aligned.
+See `WHEEL.md` for the production wheel workflow and release path.
 
 **Note:** aawm.1 (OAuth token preservation in `clean_headers` and
 `_get_forwardable_headers`) was absorbed by upstream in PR #19912 (v1.81.13)
@@ -17,16 +23,21 @@ and is no longer carried as a separate patch.
 
 | Branch | Purpose |
 |--------|---------|
-| `aawm/patches` | Production branch — latest stable patches on top of a pinned upstream release. |
-| `dev` | Integration branch — worktrees merge here for testing before promotion to `aawm/patches`. |
-| `main` | Mirrors upstream `main` at the latest stable release. |
+| `aawm/patches` | Legacy production branch name from the original fork workflow. |
+| `develop` | Integration branch — validated subsystem work should land here first. |
+| `main` | Promotion branch — advances from `develop` after the full validation matrix passes. |
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
 Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7` (6 active patches)
 
-**Version metadata note:** `pyproject.toml` and `litellm/_version.py` currently drift from this registry.
-Treat this file as the source of truth for the carried fork patches until version metadata is normalized.
+**Version metadata note:** `pyproject.toml` should stay aligned to this
+registry's carried patch set. `litellm/_version.py` now reflects the installed
+distribution version directly.
+
+**Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
+passed the local acceptance suite with artifact
+`.analysis/artifacts/local-acceptance-20260410T232900Z.json`.
 
 ## Applied Patches
 
