@@ -410,6 +410,8 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["claude_context_edit_count"] == 1
         assert litellm_metadata["claude_account_uuid"] == "claude-account-123"
         assert litellm_metadata["claude_device_id"] == "claude-device-123"
+        assert litellm_metadata["passthrough_route_family"] == "anthropic_messages"
+        assert "route:anthropic_messages" in litellm_metadata["tags"]
         assert "claude-thinking-type:adaptive" in litellm_metadata["tags"]
         assert "thinking-type:adaptive" in litellm_metadata["tags"]
         assert "claude-effort:high" in litellm_metadata["tags"]
@@ -674,6 +676,8 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
     assert litellm_metadata["gemini_tool_count"] == 1
     assert litellm_metadata["gemini_user_prompt_id"] == "prompt-123"
     assert litellm_metadata["gemini_project"] == "project-a"
+    assert litellm_metadata["passthrough_route_family"] == "gemini_generate_content"
+    assert "route:gemini_generate_content" in litellm_metadata["tags"]
     assert "gemini-thinking-config-present" in litellm_metadata["tags"]
     assert "gemini-include-thoughts:true" in litellm_metadata["tags"]
     assert "include-thoughts:true" in litellm_metadata["tags"]
@@ -808,6 +812,8 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
         assert litellm_metadata["codex_parallel_tool_calls"] is True
         assert litellm_metadata["codex_include"] == ["reasoning.encrypted_content"]
         assert litellm_metadata["codex_prompt_cache_key_present"] is True
+        assert litellm_metadata["passthrough_route_family"] == "codex_responses"
+        assert "route:codex_responses" in litellm_metadata["tags"]
         assert "codex-effort:xhigh" in litellm_metadata["tags"]
         assert "effort:xhigh" in litellm_metadata["tags"]
         assert "codex-tool-choice:auto" in litellm_metadata["tags"]
