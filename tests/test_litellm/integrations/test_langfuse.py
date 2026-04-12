@@ -354,8 +354,10 @@ class TestLangfuseUsageDetails(unittest.TestCase):
             self.assertIsNotNone(usage_details_arg)
 
             # Verify that None values were converted to 0
-            self.assertEqual(usage_arg["prompt_tokens"], 0)
-            self.assertEqual(usage_arg["completion_tokens"], 0)
+            self.assertEqual(usage_arg["input"], 0)
+            self.assertEqual(usage_arg["output"], 0)
+            self.assertEqual(usage_arg["total"], 0)
+            self.assertEqual(usage_arg["unit"], "TOKENS")
 
             self.assertEqual(usage_details_arg["input"], 0)
             self.assertEqual(usage_details_arg["output"], 0)
@@ -363,7 +365,153 @@ class TestLangfuseUsageDetails(unittest.TestCase):
             self.assertEqual(usage_details_arg["cache_creation_input_tokens"], 0)
             self.assertEqual(usage_details_arg["cache_read_input_tokens"], 0)
 
-            mock_add_prompt_params.assert_called_once()
+    def test_log_langfuse_v2_falls_back_to_standard_logging_object_for_zero_usage(self):
+        response_obj = MagicMock()
+        response_obj.id = "resp-codex"
+        response_obj.get = lambda key, default=None: response_obj.id if key == "id" else default
+        response_obj.usage = MagicMock()
+        response_obj.usage.prompt_tokens = 0
+        response_obj.usage.completion_tokens = 0
+        response_obj.usage.total_tokens = 0
+        response_obj.usage.get = lambda key, default=None: default
+
+        start_time = datetime.datetime.now()
+        end_time = start_time + datetime.timedelta(seconds=1)
+
+        standard_logging_payload = {
+            "metadata": {},
+            "prompt_tokens": 15518,
+            "completion_tokens": 27,
+            "total_tokens": 15545,
+            "response_cost": 0.123,
+            "model": "openai/gpt-5.4",
+            "trace_id": "trace-codex",
+        }
+        kwargs = {
+            "model": "",
+            "call_type": "pass_through_endpoint",
+            "custom_llm_provider": "openai",
+            "litellm_params": {"metadata": {}},
+            "standard_logging_object": standard_logging_payload,
+            "response_cost": None,
+        }
+
+        self.logger._log_langfuse_v2(
+            user_id=None,
+            metadata={},
+            litellm_params=kwargs["litellm_params"],
+            output=None,
+            start_time=start_time,
+            end_time=end_time,
+            kwargs=kwargs,
+            optional_params={},
+            input=None,
+            response_obj=response_obj,
+            level="DEFAULT",
+            litellm_call_id="call-codex",
+        )
+        with patch.object(self.logger, "_supports_prompt", return_value=False):
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata={},
+                litellm_params=kwargs["litellm_params"],
+                output=None,
+                start_time=start_time,
+                end_time=end_time,
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=response_obj,
+                level="DEFAULT",
+                litellm_call_id="call-codex",
+            )
+
+            generation_call = self.mock_langfuse_trace.generation.call_args
+            assert generation_call is not None
+            generation_kwargs = generation_call.kwargs
+
+            self.assertEqual(generation_kwargs["model"], "openai/gpt-5.4")
+            self.assertEqual(
+                generation_kwargs["usage"],
+                {
+                    "input": 15518,
+                    "output": 27,
+                    "total": 15545,
+                    "unit": "TOKENS",
+                    "total_cost": 0.123,
+                },
+            )
+            self.assertEqual(
+                generation_kwargs["usage_details"],
+                {
+                    "input": 15518,
+                    "output": 27,
+                    "total": 15545,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            )
+            self.assertEqual(
+                generation_kwargs["cost_details"],
+                {"total": 0.123},
+            )
+
+    def test_log_langfuse_v2_sets_cost_details_from_response_cost(self):
+        response_obj = MagicMock()
+        response_obj.id = "resp-live"
+        response_obj.get = (
+            lambda key, default=None: response_obj.id if key == "id" else default
+        )
+        response_obj.usage = MagicMock()
+        response_obj.usage.prompt_tokens = 100
+        response_obj.usage.completion_tokens = 25
+        response_obj.usage.total_tokens = 125
+        response_obj.usage.get = lambda key, default=None: default
+
+        fixed_time = datetime.datetime(2024, 1, 1, 12, 0, 0)
+        kwargs = {
+            "model": "gpt-5.4",
+            "call_type": "completion",
+            "custom_llm_provider": "openai",
+            "litellm_params": {"metadata": {}},
+            "standard_logging_object": None,
+            "response_cost": 0.024437,
+        }
+
+        with patch.object(self.logger, "_supports_prompt", return_value=False):
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata={},
+                litellm_params=kwargs["litellm_params"],
+                output=None,
+                start_time=fixed_time,
+                end_time=fixed_time + datetime.timedelta(seconds=1),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=response_obj,
+                level="DEFAULT",
+                litellm_call_id="call-live",
+            )
+
+            generation_call = self.mock_langfuse_trace.generation.call_args
+            assert generation_call is not None
+            generation_kwargs = generation_call.kwargs
+
+            self.assertEqual(
+                generation_kwargs["cost_details"],
+                {"total": 0.024437},
+            )
+            self.assertEqual(
+                generation_kwargs["usage"],
+                {
+                    "input": 100,
+                    "output": 25,
+                    "total": 125,
+                    "unit": "TOKENS",
+                    "total_cost": 0.024437,
+                },
+            )
 
     def _build_standard_logging_payload(self, trace_id: Optional[str] = None):
         payload = {

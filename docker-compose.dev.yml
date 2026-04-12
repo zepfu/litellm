@@ -11,6 +11,8 @@ services:
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
+      # Claude persisted-output files for local expansion
+      - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
       # Capture output — written to /tmp/captures inside container, visible on host
       - ./captures:/tmp/captures
     environment:
@@ -21,6 +23,8 @@ services:
       # No server-side ANTHROPIC_API_KEY — client provides via x-api-key header
       # Enable payload capture to ./captures/
       - AAWM_CAPTURE=1
+      - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
+      - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
     networks:
       - default
       - aawm_default

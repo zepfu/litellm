@@ -763,6 +763,25 @@ class LangFuseLogger:
             generation_id = None
             usage = None
             usage_details = None
+            cost_details: Optional[LangfuseCostDetails] = None
+            fallback_prompt_tokens = 0
+            fallback_completion_tokens = 0
+            fallback_total_tokens = 0
+            fallback_cost = cost
+            fallback_model_name: Optional[str] = None
+            if standard_logging_object is not None:
+                fallback_prompt_tokens = (
+                    standard_logging_object.get("prompt_tokens", 0) or 0
+                )
+                fallback_completion_tokens = (
+                    standard_logging_object.get("completion_tokens", 0) or 0
+                )
+                fallback_total_tokens = (
+                    standard_logging_object.get("total_tokens", 0) or 0
+                )
+                fallback_cost = standard_logging_object.get("response_cost", cost)
+                fallback_model_name = standard_logging_object.get("model")
+
             if response_obj is not None:
                 if (
                     hasattr(response_obj, "id")
@@ -789,13 +808,17 @@ class LangFuseLogger:
                         _usage_obj
                     )
 
+                    # Langfuse prefers the generic usage shape over provider-specific
+                    # token keys for persisting totalCost and trace rollups.
+                    input_tokens = prompt_tokens - cache_read_input_tokens
                     usage = {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
+                        "input": input_tokens,
+                        "output": completion_tokens,
+                        "total": total_tokens,
+                        "unit": "TOKENS",
                         "total_cost": cost if self._supports_costs() else None,
                     }
                     # According to langfuse documentation: "the input value must be reduced by the number of cache_read_input_tokens"
-                    input_tokens = prompt_tokens - cache_read_input_tokens
                     usage_details = LangfuseUsageDetails(
                         input=input_tokens,
                         output=completion_tokens,
@@ -803,6 +826,33 @@ class LangFuseLogger:
                         cache_creation_input_tokens=cache_creation_input_tokens,
                         cache_read_input_tokens=cache_read_input_tokens,
                     )
+                    if self._supports_costs() and cost is not None:
+                        cost_details = LangfuseCostDetails(total=float(cost))
+
+            if (
+                usage is None
+                or (
+                    usage.get("prompt_tokens", 0) == 0
+                    and usage.get("completion_tokens", 0) == 0
+                    and fallback_total_tokens > 0
+                )
+            ) and fallback_total_tokens > 0:
+                usage = {
+                    "input": fallback_prompt_tokens,
+                    "output": fallback_completion_tokens,
+                    "total": fallback_total_tokens,
+                    "unit": "TOKENS",
+                    "total_cost": fallback_cost if self._supports_costs() else None,
+                }
+                usage_details = LangfuseUsageDetails(
+                    input=fallback_prompt_tokens,
+                    output=fallback_completion_tokens,
+                    total=fallback_total_tokens,
+                    cache_creation_input_tokens=0,
+                    cache_read_input_tokens=0,
+                )
+                if self._supports_costs() and fallback_cost is not None:
+                    cost_details = LangfuseCostDetails(total=float(fallback_cost))
 
             generation_name = clean_metadata.pop("generation_name", None)
             if generation_name is None:
@@ -830,6 +880,12 @@ class LangFuseLogger:
             model_name = reconstruct_model_name(
                 kwargs.get("model", ""), custom_llm_provider, metadata
             )
+            if (
+                (not model_name or model_name == "unknown")
+                and fallback_model_name is not None
+                and len(fallback_model_name) > 0
+            ):
+                model_name = fallback_model_name
 
             generation_params = {
                 "name": generation_name,
@@ -842,6 +898,7 @@ class LangFuseLogger:
                 "output": output if not mask_output else "redacted-by-litellm",
                 "usage": usage,
                 "usage_details": usage_details,
+                "cost_details": cost_details,
                 "metadata": log_requester_metadata(clean_metadata),
                 "level": level,
                 "version": clean_metadata.pop("version", None),

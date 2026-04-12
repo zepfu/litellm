@@ -1499,6 +1499,44 @@ def test_convert_to_model_response_object_default_usage_overwritten():
     assert result.usage.total_tokens == 22
 
 
+def test_convert_to_model_response_object_normalizes_responses_api_usage():
+    response_object = {
+        "id": "resp-codex-usage-test",
+        "object": "response",
+        "created": 1775863780,
+        "model": "gpt-5.4",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "usage probe"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "input_tokens": 15517,
+            "output_tokens": 27,
+            "total_tokens": 15544,
+            "input_tokens_details": {"cached_tokens": 3456},
+            "output_tokens_details": {"reasoning_tokens": 0, "text_tokens": 27},
+        },
+    }
+
+    result = convert_to_model_response_object(
+        model_response_object=ModelResponse(),
+        response_object=response_object,
+        stream=False,
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+
+    assert result.usage.prompt_tokens == 15517
+    assert result.usage.completion_tokens == 27
+    assert result.usage.total_tokens == 15544
+    assert result.usage.prompt_tokens_details.cached_tokens == 3456
+    assert result.usage.completion_tokens_details.reasoning_tokens == 0
+    assert result.usage.completion_tokens_details.text_tokens == 27
+
+
 def test_convert_to_model_response_object_with_null_top_logprobs():
     """
     Test that convert_to_model_response_object handles null top_logprobs

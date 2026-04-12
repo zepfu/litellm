@@ -18,6 +18,10 @@ import litellm
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     RouteChecks,
+    _expand_claude_persisted_output_in_anthropic_request_body,
+    _expand_claude_persisted_output_text,
+    _prepare_anthropic_request_body_for_passthrough,
+    anthropic_proxy_route,
     bedrock_llm_proxy_route,
     create_pass_through_route,
     cursor_proxy_route,
@@ -71,6 +75,360 @@ class TestBaseOpenAIPassThroughHandler:
         )
         print(f"Base URL with trailing slash: '{base_url}' + '{path}' → '{result}'")
         assert str(result) == "https://api.example.com/v1/chat/completions"
+
+
+class TestClaudePersistedOutputExpansion:
+    def test_expand_claude_persisted_output_text_subagentstart(self, tmp_path, monkeypatch):
+        claude_root = tmp_path / ".claude" / "projects"
+        persisted_file = (
+            claude_root
+            / "project-a"
+            / "session-1"
+            / "tool-results"
+            / "hook-123-1-additionalContext.txt"
+        )
+        persisted_file.parent.mkdir(parents=True)
+        persisted_file.write_text(
+            "You are 'engineer' and you are working on the 'aegis' project.\nFull context.",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "1")
+        monkeypatch.setenv(
+            "LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", str(claude_root)
+        )
+
+        text = (
+            "<system-reminder>\n"
+            "SubagentStart hook additional context: <persisted-output>\n"
+            f"Output too large (24.4KB). Full output saved to: {persisted_file}\n\n"
+            "Preview (first 2KB):\n"
+            "truncated preview\n"
+            "</persisted-output>\n"
+            "</system-reminder>\n"
+        )
+
+        expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(text)
+
+        assert was_expanded is True
+        assert hook_name == "subagentstart"
+        assert "truncated preview" not in expanded_text
+        assert "You are 'engineer'" in expanded_text
+        assert expanded_text.startswith("<system-reminder>\nSubagentStart hook")
+        assert expanded_text.endswith("</system-reminder>\n")
+
+    def test_expand_claude_persisted_output_text_sessionstart(self, tmp_path, monkeypatch):
+        claude_root = tmp_path / ".claude" / "projects"
+        persisted_file = (
+            claude_root
+            / "project-a"
+            / "session-1"
+            / "tool-results"
+            / "hook-456-1-additionalContext.txt"
+        )
+        persisted_file.parent.mkdir(parents=True)
+        persisted_file.write_text(
+            "SessionStart full persisted output.",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "1")
+        monkeypatch.setenv(
+            "LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", str(claude_root)
+        )
+
+        text = (
+            "<system-reminder>\n"
+            "SessionStart hook additional context: <persisted-output>\n"
+            f"Output too large (111.6KB). Full output saved to: {persisted_file}\n\n"
+            "Preview (first 2KB):\n"
+            "truncated preview\n"
+            "</persisted-output>\n"
+            "</system-reminder>\n"
+        )
+
+        expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(text)
+
+        assert was_expanded is True
+        assert hook_name == "sessionstart"
+        assert "SessionStart full persisted output." in expanded_text
+        assert expanded_text.startswith("<system-reminder>\nSessionStart hook")
+
+    def test_expand_claude_persisted_output_text_noop_outside_allowed_root(
+        self, tmp_path, monkeypatch
+    ):
+        claude_root = tmp_path / ".claude" / "projects"
+        outside_file = tmp_path / "outside.txt"
+        outside_file.write_text("outside", encoding="utf-8")
+        monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "1")
+        monkeypatch.setenv(
+            "LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", str(claude_root)
+        )
+
+        text = (
+            "<system-reminder>\n"
+            "SubAgentStart hook additional context: <persisted-output>\n"
+            f"Output too large (24.4KB). Full output saved to: {outside_file}\n\n"
+            "Preview (first 2KB):\n"
+            "truncated preview\n"
+            "</persisted-output>\n"
+            "</system-reminder>\n"
+        )
+
+        expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(text)
+
+        assert was_expanded is False
+        assert hook_name is None
+        assert expanded_text == text
+
+    def test_expand_claude_persisted_output_in_anthropic_request_body(
+        self, tmp_path, monkeypatch
+    ):
+        claude_root = tmp_path / ".claude" / "projects"
+        persisted_file = (
+            claude_root
+            / "project-a"
+            / "session-1"
+            / "tool-results"
+            / "hook-789-1-additionalContext.txt"
+        )
+        persisted_file.parent.mkdir(parents=True)
+        persisted_file.write_text("expanded body payload", encoding="utf-8")
+        monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "1")
+        monkeypatch.setenv(
+            "LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", str(claude_root)
+        )
+
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "<system-reminder>\n"
+                                "SubagentStart hook additional context: <persisted-output>\n"
+                                f"Output too large (24.4KB). Full output saved to: {persisted_file}\n\n"
+                                "Preview (first 2KB):\n"
+                                "truncated preview\n"
+                                "</persisted-output>\n"
+                                "</system-reminder>\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        updated_body, expanded_count, hooks = _expand_claude_persisted_output_in_anthropic_request_body(
+            request_body
+        )
+
+        assert expanded_count == 1
+        assert hooks == {"subagentstart"}
+        updated_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "expanded body payload" in updated_text
+        assert "truncated preview" not in updated_text
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["claude_persisted_output_expanded"] is True
+        assert litellm_metadata["claude_persisted_output_expanded_count"] == 1
+        assert litellm_metadata["claude_persisted_output_hooks"] == ["subagentstart"]
+        assert "claude-persisted-output-expanded" in litellm_metadata["tags"]
+        assert "claude-persisted-output-hook:subagentstart" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_expands_persisted_output_before_passthrough(
+        self, tmp_path, monkeypatch
+    ):
+        claude_root = tmp_path / ".claude" / "projects"
+        persisted_file = (
+            claude_root
+            / "project-a"
+            / "session-1"
+            / "tool-results"
+            / "hook-999-1-additionalContext.txt"
+        )
+        persisted_file.parent.mkdir(parents=True)
+        persisted_file.write_text("expanded route payload", encoding="utf-8")
+        monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "1")
+        monkeypatch.setenv(
+            "LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", str(claude_root)
+        )
+
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "<system-reminder>\n"
+                                "SubagentStart hook additional context: <persisted-output>\n"
+                                f"Output too large (24.4KB). Full output saved to: {persisted_file}\n\n"
+                                "Preview (first 2KB):\n"
+                                "truncated preview\n"
+                                "</persisted-output>\n"
+                                "</system-reminder>\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value="anthropic-test-key",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_endpoint_func = AsyncMock(return_value={"id": "msg_123"})
+            mock_create_route.return_value = mock_endpoint_func
+
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+            assert result == {"id": "msg_123"}
+            mock_set_parsed_body.assert_called_once()
+            expanded_body = mock_set_parsed_body.call_args.args[1]
+            expanded_text = expanded_body["messages"][0]["content"][0]["text"]
+            assert "expanded route payload" in expanded_text
+            assert "truncated preview" not in expanded_text
+            litellm_metadata = expanded_body["litellm_metadata"]
+            assert "claude-persisted-output-expanded" in litellm_metadata["tags"]
+            assert (
+                "claude-persisted-output-hook:subagentstart"
+                in litellm_metadata["tags"]
+            )
+
+    def test_prepare_anthropic_request_body_extracts_billing_header(self):
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.101.a4a; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": "normal system text",
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        (
+            updated_body,
+            expanded_count,
+            hooks,
+            billing_header_fields,
+        ) = _prepare_anthropic_request_body_for_passthrough(request_body)
+
+        assert expanded_count == 0
+        assert hooks == set()
+        assert billing_header_fields == {
+            "cc_version": "2.1.101.a4a",
+            "cc_entrypoint": "cli",
+            "cch": "42aab",
+        }
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["anthropic_billing_header_present"] is True
+        assert litellm_metadata["anthropic_billing_header_keys"] == [
+            "cc_entrypoint",
+            "cc_version",
+            "cch",
+        ]
+        assert litellm_metadata["anthropic_billing_header_fields"] == {
+            "cc_version": "2.1.101.a4a",
+            "cc_entrypoint": "cli",
+            "cch": "42aab",
+        }
+        assert "anthropic-billing-header" in litellm_metadata["tags"]
+        assert (
+            "anthropic-billing-header-key:cc_version" in litellm_metadata["tags"]
+        )
+        assert (
+            "anthropic-billing-header:cc_entrypoint=cli"
+            in litellm_metadata["tags"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_extracts_billing_header_before_passthrough(
+        self,
+    ):
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.101.a4a; cc_entrypoint=cli; cch=42aab;",
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value="anthropic-test-key",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_endpoint_func = AsyncMock(return_value={"id": "msg_123"})
+            mock_create_route.return_value = mock_endpoint_func
+
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+            assert result == {"id": "msg_123"}
+            mock_set_parsed_body.assert_called_once()
+            prepared_body = mock_set_parsed_body.call_args.args[1]
+            litellm_metadata = prepared_body["litellm_metadata"]
+            assert litellm_metadata["anthropic_billing_header_present"] is True
+            assert "anthropic-billing-header" in litellm_metadata["tags"]
+            assert (
+                "anthropic-billing-header:cc_version=2.1.101.a4a"
+                in litellm_metadata["tags"]
+            )
 
     def test_append_openai_beta_header(self):
         print("\nTesting _append_openai_beta_header method...")

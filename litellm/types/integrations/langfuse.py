@@ -15,3 +15,7 @@ class LangfuseUsageDetails(TypedDict):
     total: Optional[int]
     cache_creation_input_tokens: Optional[int]
     cache_read_input_tokens: Optional[int]
+
+
+class LangfuseCostDetails(TypedDict, total=False):
+    total: float
