@@ -20,6 +20,9 @@
     "expected_user_ids": [
       "litellm"
     ],
+    "expected_trace_environment": "dev",
+    "require_trace_session_id": true,
+    "require_trace_ids_distinct_from_session_ids": true,
     "post_run_wait_seconds": 2,
     "allowed_generation_routes": [
       "/openai_passthrough/responses"
@@ -41,6 +44,10 @@
     "expected_user_ids": [
       "litellm"
     ],
+    "expected_trace_environment": "dev",
+    "require_trace_session_id": true,
+    "require_trace_ids_distinct_from_session_ids": true,
+    "match_trace_session_id_from_stdout": true,
     "post_run_wait_seconds": 8,
     "allowed_generation_routes": [
       "/gemini/v1internal:generateContent",
@@ -48,7 +55,11 @@
     ],
     "required_trace_tags": [
       "gemini-thought-signature",
-      "gemini-thought-signature-decoded"
+      "gemini-thought-signature-decoded",
+      "thinking-signature-present",
+      "thinking-signature-decoded",
+      "reasoning-empty",
+      "thinking-blocks-empty"
     ],
     "required_trace_tag_prefixes": [
       "gemini-tsig-records:",
@@ -127,13 +138,21 @@
     "expected_user_ids": [
       "litellm.fork"
     ],
+    "expected_trace_environment": "dev",
+    "require_trace_session_id": true,
+    "require_trace_ids_distinct_from_session_ids": true,
+    "match_trace_session_id_from_stdout": true,
     "post_run_wait_seconds": 2,
     "allowed_generation_routes": [
       "/anthropic/v1/messages"
     ],
     "required_trace_tags": [
       "anthropic-billing-header",
-      "claude-persisted-output-expanded"
+      "claude-persisted-output-expanded",
+      "thinking-signature-present",
+      "thinking-signature-decoded",
+      "reasoning-present",
+      "thinking-blocks-present"
     ],
     "required_trace_tag_prefixes": [
       "anthropic-billing-header-key:cc_version",
@@ -144,10 +163,17 @@
     ],
     "required_generation_metadata_truthy": [
       "anthropic_billing_header_present",
-      "claude_persisted_output_expanded"
+      "claude_persisted_output_expanded",
+      "claude_persisted_output_source_paths",
+      "claude_persisted_output_source_content_hashes"
     ],
     "required_generation_metadata_minimums": {
       "claude_persisted_output_expanded_count": 1
+    },
+    "request_source_file_verification": {
+      "source_paths_key": "claude_persisted_output_source_paths",
+      "source_hashes_key": "claude_persisted_output_source_content_hashes",
+      "source_bytes_key": "claude_persisted_output_source_bytes"
     },
     "request_text_checks": {
       "required_substrings": [
