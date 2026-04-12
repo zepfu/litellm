@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ARTIFACT_PATH="${1:-$ROOT/.analysis/artifacts/local-acceptance-$(date -u +%Y%m%dT%H%M%SZ).json}"
+CLI_CLAUDE_FANOUT_MODE="${2:-}"
 REBUILD_LITELLM_DEV="${REBUILD_LITELLM_DEV:-1}"
 BUILD_STATE_PATH="${BUILD_STATE_PATH:-$ROOT/.analysis/artifacts/litellm-dev-build-state.json}"
 
@@ -17,7 +18,7 @@ fi
 
 export LANGFUSE_QUERY_URL="${LANGFUSE_QUERY_URL:-http://127.0.0.1:3000}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-CLAUDE_FANOUT_MODE="${CLAUDE_FANOUT_MODE:-minimal}"
+CLAUDE_FANOUT_MODE="${CLI_CLAUDE_FANOUT_MODE:-${CLAUDE_FANOUT_MODE:-minimal}}"
 
 compute_build_fingerprint() {
   "$PYTHON_BIN" - <<'PY'

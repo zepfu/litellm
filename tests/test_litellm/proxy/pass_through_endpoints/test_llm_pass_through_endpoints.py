@@ -355,8 +355,15 @@ class TestClaudePersistedOutputExpansion:
         mock_request.headers = {}
         request_body = {
             "model": "claude-opus-4-6",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            },
             "metadata": {
                 "user_id": {
+                    "account_uuid": "claude-account-123",
+                    "device_id": "claude-device-123",
                     "session_id": "claude-session-123",
                 }
             },
@@ -394,6 +401,23 @@ class TestClaudePersistedOutputExpansion:
             "cc_version",
             "cch",
         ]
+        assert litellm_metadata["claude_thinking_type"] == "adaptive"
+        assert litellm_metadata["claude_effort"] == "high"
+        assert litellm_metadata["claude_context_edit_types"] == [
+            "clear_thinking_20251015"
+        ]
+        assert litellm_metadata["claude_context_keep_values"] == ["all"]
+        assert litellm_metadata["claude_context_edit_count"] == 1
+        assert litellm_metadata["claude_account_uuid"] == "claude-account-123"
+        assert litellm_metadata["claude_device_id"] == "claude-device-123"
+        assert "claude-thinking-type:adaptive" in litellm_metadata["tags"]
+        assert "thinking-type:adaptive" in litellm_metadata["tags"]
+        assert "claude-effort:high" in litellm_metadata["tags"]
+        assert "effort:high" in litellm_metadata["tags"]
+        assert (
+            "claude-context-edit:clear_thinking_20251015" in litellm_metadata["tags"]
+        )
+        assert "claude-context-keep:all" in litellm_metadata["tags"]
         assert litellm_metadata["session_id"] == "claude-session-123"
 
     def test_prepare_anthropic_request_body_extracts_session_from_stringified_user_id(
@@ -601,6 +625,8 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
     monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
     body = (
         b'{"model":"gemini-3-flash-preview","request":{"session_id":"gemini-session-123"},'
+        b'"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"HIGH","thinkingBudget":512}},'
+        b'"tools":[{"googleSearch":{}}],"user_prompt_id":"prompt-123","project":"project-a",'
         b'"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
     )
     scope = {
@@ -640,6 +666,21 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
     litellm_metadata = prepared_body["litellm_metadata"]
     assert litellm_metadata["session_id"] == "gemini-session-123"
     assert litellm_metadata["trace_environment"] == "dev"
+    assert litellm_metadata["gemini_thinking_config_present"] is True
+    assert litellm_metadata["gemini_include_thoughts"] is True
+    assert litellm_metadata["gemini_thinking_level"] == "high"
+    assert litellm_metadata["gemini_thinking_budget"] == 512
+    assert litellm_metadata["gemini_tools_present"] is True
+    assert litellm_metadata["gemini_tool_count"] == 1
+    assert litellm_metadata["gemini_user_prompt_id"] == "prompt-123"
+    assert litellm_metadata["gemini_project"] == "project-a"
+    assert "gemini-thinking-config-present" in litellm_metadata["tags"]
+    assert "gemini-include-thoughts:true" in litellm_metadata["tags"]
+    assert "include-thoughts:true" in litellm_metadata["tags"]
+    assert "gemini-thinking-level:high" in litellm_metadata["tags"]
+    assert "thinking-level:high" in litellm_metadata["tags"]
+    assert "gemini-thinking-budget-configured" in litellm_metadata["tags"]
+    assert "gemini-tools-present" in litellm_metadata["tags"]
 
     def test_assemble_headers(self):
         print("\nTesting _assemble_headers method...")
@@ -719,14 +760,27 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
 
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
-        mock_request.headers = {"session_id": "codex-session-123"}
+        mock_request.headers = {
+            "session_id": "codex-session-123",
+            "user-agent": "codex-cli/1.0",
+        }
         mock_request.query_params = {}
         mock_response = MagicMock(spec=Response)
         mock_user_api_key_dict = MagicMock()
 
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
-            new=AsyncMock(return_value={"model": "gpt-5.4", "input": "hello"}),
+            new=AsyncMock(
+                return_value={
+                    "model": "gpt-5.4",
+                    "input": "hello",
+                    "reasoning": {"effort": "xhigh"},
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": True,
+                    "include": ["reasoning.encrypted_content"],
+                    "prompt_cache_key": "prompt-cache-key-123",
+                }
+            ),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
         ) as mock_set_parsed_body, patch(
@@ -749,9 +803,16 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
         litellm_metadata = prepared_body["litellm_metadata"]
         assert litellm_metadata["session_id"] == "codex-session-123"
         assert litellm_metadata["trace_environment"] == "dev"
-        assert mock_endpoint_func.await_args is not None
-        # The endpoint_func is called with request, fastapi_response, user_api_key_dict
-        # No longer checking for stream and query_params as they're handled differently
+        assert litellm_metadata["codex_reasoning_effort"] == "xhigh"
+        assert litellm_metadata["codex_tool_choice"] == "auto"
+        assert litellm_metadata["codex_parallel_tool_calls"] is True
+        assert litellm_metadata["codex_include"] == ["reasoning.encrypted_content"]
+        assert litellm_metadata["codex_prompt_cache_key_present"] is True
+        assert "codex-effort:xhigh" in litellm_metadata["tags"]
+        assert "effort:xhigh" in litellm_metadata["tags"]
+        assert "codex-tool-choice:auto" in litellm_metadata["tags"]
+        assert "codex-parallel-tools:true" in litellm_metadata["tags"]
+        assert "codex-include:reasoning.encrypted_content" in litellm_metadata["tags"]
 
 
 class TestVertexAIPassThroughHandler:

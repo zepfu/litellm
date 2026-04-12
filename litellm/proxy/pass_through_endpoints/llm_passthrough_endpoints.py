@@ -378,6 +378,244 @@ def _prepare_request_body_for_passthrough_observability(
     )
 
 
+def _normalize_low_cardinality_tag_value(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        return cleaned or None
+    return None
+
+
+def _dedupe_sorted_str_list(values: list[str]) -> list[str]:
+    return sorted({value for value in values if isinstance(value, str) and value})
+
+
+def _extract_claude_request_breakout_fields(
+    request_body: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    tags_to_add: list[str] = []
+    extra_fields: dict[str, Any] = {}
+
+    thinking = request_body.get("thinking")
+    if isinstance(thinking, dict):
+        thinking_type = _normalize_low_cardinality_tag_value(thinking.get("type"))
+        if thinking_type:
+            tags_to_add.extend(
+                [f"claude-thinking-type:{thinking_type}", f"thinking-type:{thinking_type}"]
+            )
+            extra_fields["claude_thinking_type"] = thinking_type
+
+    output_config = request_body.get("output_config")
+    if isinstance(output_config, dict):
+        effort = _normalize_low_cardinality_tag_value(output_config.get("effort"))
+        if effort:
+            tags_to_add.extend([f"claude-effort:{effort}", f"effort:{effort}"])
+            extra_fields["claude_effort"] = effort
+
+    context_management = request_body.get("context_management")
+    context_edits = []
+    if isinstance(context_management, dict):
+        edits = context_management.get("edits")
+        if isinstance(edits, list):
+            context_edits = [edit for edit in edits if isinstance(edit, dict)]
+
+    edit_types: list[str] = []
+    keep_values: list[str] = []
+    for edit in context_edits:
+        edit_type = _normalize_low_cardinality_tag_value(edit.get("type"))
+        if edit_type:
+            edit_types.append(edit_type)
+            tags_to_add.append(f"claude-context-edit:{edit_type}")
+        keep_value = _normalize_low_cardinality_tag_value(edit.get("keep"))
+        if keep_value:
+            keep_values.append(keep_value)
+            tags_to_add.append(f"claude-context-keep:{keep_value}")
+
+    if context_edits:
+        extra_fields["claude_context_edit_count"] = len(context_edits)
+    if edit_types:
+        extra_fields["claude_context_edit_types"] = _dedupe_sorted_str_list(edit_types)
+    if keep_values:
+        extra_fields["claude_context_keep_values"] = _dedupe_sorted_str_list(
+            keep_values
+        )
+
+    account_uuid = _get_nested_str_value(request_body, ("metadata", "user_id", "account_uuid"))
+    if account_uuid:
+        extra_fields["claude_account_uuid"] = account_uuid
+    device_id = _get_nested_str_value(request_body, ("metadata", "user_id", "device_id"))
+    if device_id:
+        extra_fields["claude_device_id"] = device_id
+
+    return tags_to_add, extra_fields
+
+
+def _add_claude_request_breakout_logging_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    tags_to_add, extra_fields = _extract_claude_request_breakout_fields(request_body)
+    if not tags_to_add and not extra_fields:
+        return request_body
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
+
+
+def _extract_gemini_request_breakout_fields(
+    request_body: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    tags_to_add: list[str] = []
+    extra_fields: dict[str, Any] = {}
+
+    generation_config = request_body.get("generationConfig")
+    if not isinstance(generation_config, dict):
+        request_block = request_body.get("request")
+        if isinstance(request_block, dict):
+            nested_generation_config = request_block.get("generationConfig")
+            if isinstance(nested_generation_config, dict):
+                generation_config = nested_generation_config
+
+    if isinstance(generation_config, dict):
+        thinking_config = generation_config.get("thinkingConfig")
+        if isinstance(thinking_config, dict):
+            tags_to_add.append("gemini-thinking-config-present")
+            extra_fields["gemini_thinking_config_present"] = True
+
+            include_thoughts = thinking_config.get("includeThoughts")
+            if isinstance(include_thoughts, bool):
+                include_thoughts_tag = "true" if include_thoughts else "false"
+                tags_to_add.extend(
+                    [
+                        f"gemini-include-thoughts:{include_thoughts_tag}",
+                        f"include-thoughts:{include_thoughts_tag}",
+                    ]
+                )
+                extra_fields["gemini_include_thoughts"] = include_thoughts
+
+            thinking_level = thinking_config.get("thinkingLevel")
+            normalized_thinking_level = _normalize_low_cardinality_tag_value(
+                thinking_level
+            )
+            if normalized_thinking_level:
+                tags_to_add.extend(
+                    [
+                        f"gemini-thinking-level:{normalized_thinking_level}",
+                        f"thinking-level:{normalized_thinking_level}",
+                    ]
+                )
+                extra_fields["gemini_thinking_level"] = normalized_thinking_level
+
+            thinking_budget = thinking_config.get("thinkingBudget")
+            if isinstance(thinking_budget, (int, float)) and thinking_budget > 0:
+                tags_to_add.append("gemini-thinking-budget-configured")
+                extra_fields["gemini_thinking_budget"] = thinking_budget
+
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        request_block = request_body.get("request")
+        if isinstance(request_block, dict):
+            nested_tools = request_block.get("tools")
+            if isinstance(nested_tools, list):
+                tools = nested_tools
+
+    if isinstance(tools, list) and tools:
+        tags_to_add.append("gemini-tools-present")
+        extra_fields["gemini_tools_present"] = True
+        extra_fields["gemini_tool_count"] = len(tools)
+
+    for key in ("user_prompt_id", "project"):
+        value = request_body.get(key)
+        if not value and isinstance(request_body.get("request"), dict):
+            value = request_body["request"].get(key)
+        if isinstance(value, str) and value.strip():
+            extra_fields[f"gemini_{key}"] = value.strip()
+
+    return tags_to_add, extra_fields
+
+
+def _add_gemini_request_breakout_logging_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    tags_to_add, extra_fields = _extract_gemini_request_breakout_fields(request_body)
+    if not tags_to_add and not extra_fields:
+        return request_body
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
+
+
+def _extract_openai_passthrough_tool_choice(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return _normalize_low_cardinality_tag_value(value)
+    if isinstance(value, dict):
+        for key in ("type", "name"):
+            normalized = _normalize_low_cardinality_tag_value(value.get(key))
+            if normalized:
+                return normalized
+    return None
+
+
+def _extract_codex_request_breakout_fields(
+    request_body: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    tags_to_add: list[str] = []
+    extra_fields: dict[str, Any] = {}
+
+    reasoning = request_body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = _normalize_low_cardinality_tag_value(reasoning.get("effort"))
+        if effort:
+            tags_to_add.extend([f"codex-effort:{effort}", f"effort:{effort}"])
+            extra_fields["codex_reasoning_effort"] = effort
+
+    tool_choice = _extract_openai_passthrough_tool_choice(request_body.get("tool_choice"))
+    if tool_choice:
+        tags_to_add.append(f"codex-tool-choice:{tool_choice}")
+        extra_fields["codex_tool_choice"] = tool_choice
+
+    parallel_tool_calls = request_body.get("parallel_tool_calls")
+    if isinstance(parallel_tool_calls, bool):
+        tags_to_add.append(
+            f"codex-parallel-tools:{'true' if parallel_tool_calls else 'false'}"
+        )
+        extra_fields["codex_parallel_tool_calls"] = parallel_tool_calls
+
+    include = request_body.get("include")
+    normalized_includes: list[str] = []
+    if isinstance(include, list):
+        for value in include:
+            normalized = _normalize_low_cardinality_tag_value(value)
+            if normalized:
+                normalized_includes.append(normalized)
+                tags_to_add.append(f"codex-include:{normalized}")
+    if normalized_includes:
+        extra_fields["codex_include"] = _dedupe_sorted_str_list(normalized_includes)
+
+    prompt_cache_key = request_body.get("prompt_cache_key")
+    if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
+        extra_fields["codex_prompt_cache_key_present"] = True
+
+    return tags_to_add, extra_fields
+
+
+def _add_codex_request_breakout_logging_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    tags_to_add, extra_fields = _extract_codex_request_breakout_fields(request_body)
+    if not tags_to_add and not extra_fields:
+        return request_body
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
+
+
 def _add_claude_persisted_output_logging_metadata(
     request_body: dict[str, Any],
     expanded_count: int,
@@ -525,6 +763,7 @@ def _prepare_anthropic_request_body_for_passthrough(
             updated_body,
             billing_header_fields,
         )
+    updated_body = _add_claude_request_breakout_logging_metadata(updated_body)
     updated_body = _prepare_request_body_for_passthrough_observability(
         request=request,
         request_body=updated_body,
@@ -780,9 +1019,12 @@ async def gemini_proxy_route(
 
     if request.method == "POST":
         request_body = await get_request_body(request)
+        prepared_request_body = _add_gemini_request_breakout_logging_metadata(
+            request_body
+        )
         prepared_request_body = _prepare_request_body_for_passthrough_observability(
             request=request,
-            request_body=request_body,
+            request_body=prepared_request_body,
         )
         if prepared_request_body is not request_body:
             _safe_set_request_parsed_body(request, prepared_request_body)
@@ -2605,9 +2847,16 @@ class BaseOpenAIPassThroughHandler:
 
         if request.method == "POST":
             request_body = await get_request_body(request)
+            prepared_request_body = request_body
+            if _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
+                endpoint
+            ):
+                prepared_request_body = _add_codex_request_breakout_logging_metadata(
+                    prepared_request_body
+                )
             prepared_request_body = _prepare_request_body_for_passthrough_observability(
                 request=request,
-                request_body=request_body,
+                request_body=prepared_request_body,
             )
             if prepared_request_body is not request_body:
                 _safe_set_request_parsed_body(request, prepared_request_body)
