@@ -104,6 +104,21 @@ def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
         updated_kwargs["standard_logging_object"]["metadata"]["claude_thinking_signature_present"]
         is True
     )
+    span_names = [
+        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
+    ]
+    assert "claude.thinking_signature_decode" in span_names
+    claude_span = next(
+        span
+        for span in metadata["langfuse_spans"]
+        if isinstance(span, dict)
+        and span.get("name") == "claude.thinking_signature_decode"
+    )
+    assert claude_span["metadata"]["signature_count"] == 1
+    assert claude_span["metadata"]["decoded_signature_count"] == 1
+    assert claude_span["metadata"]["reasoning_content_present"] is True
+    assert "start_time" in claude_span
+    assert "end_time" in claude_span
     assert "gemini_thought_signature_present" not in metadata
 
 
@@ -184,4 +199,19 @@ AY89a19r/hypDnlNZTmQhYj/vLtBERR2L8wa4yt0Y+GwcOOi3fr3hsG8ovj6G2rfZypo/OPdkDOgU3IR
         updated_kwargs["standard_logging_object"]["metadata"]["gemini_thought_signature_present"]
         is True
     )
+    span_names = [
+        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
+    ]
+    assert "gemini.thought_signature_decode" in span_names
+    gemini_span = next(
+        span
+        for span in metadata["langfuse_spans"]
+        if isinstance(span, dict)
+        and span.get("name") == "gemini.thought_signature_decode"
+    )
+    assert gemini_span["metadata"]["signature_count"] == 1
+    assert gemini_span["metadata"]["decoded_signature_count"] == 1
+    assert gemini_span["metadata"]["record_counts"] == [9]
+    assert "start_time" in gemini_span
+    assert "end_time" in gemini_span
     assert "claude_thinking_signature_present" not in metadata
