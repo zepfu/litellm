@@ -126,3 +126,26 @@ class TestGetLitellmParamsExplicitFields:
         result = get_litellm_params(no_log=True)
         assert result["no-log"] is True
 
+
+class TestGetLitellmParamsTraceAndSessionSeparation:
+    def test_metadata_session_id_does_not_backfill_trace_id(self):
+        result = get_litellm_params(metadata={"session_id": "session-123"})
+        assert result["litellm_session_id"] == "session-123"
+        assert result["litellm_trace_id"] is None
+
+    def test_metadata_trace_id_does_not_backfill_session_id(self):
+        result = get_litellm_params(metadata={"trace_id": "trace-123"})
+        assert result["litellm_trace_id"] == "trace-123"
+        assert result["litellm_session_id"] is None
+
+    def test_explicit_trace_and_session_ids_are_preserved(self):
+        result = get_litellm_params(
+            litellm_trace_id="trace-abc",
+            litellm_session_id="session-xyz",
+            metadata={
+                "trace_id": "metadata-trace",
+                "session_id": "metadata-session",
+            },
+        )
+        assert result["litellm_trace_id"] == "trace-abc"
+        assert result["litellm_session_id"] == "session-xyz"

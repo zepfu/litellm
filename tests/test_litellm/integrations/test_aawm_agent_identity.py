@@ -86,11 +86,20 @@ def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
         == "numbat-v6-efforts-20-40-80-ab-prod"
     )
     assert metadata["claude_reasoning_content_present"] is True
+    assert metadata["thinking_signature_present"] is True
+    assert metadata["thinking_signature_decoded"] is True
+    assert metadata["reasoning_content_present"] is True
+    assert metadata["thinking_blocks_present"] is True
     assert "claude-thinking-signature" in tags
+    assert "thinking-signature-present" in tags
+    assert "thinking-signature-decoded" in tags
     assert "claude-thinking-decoded" in tags
     assert "claude-exp:numbat-v6-efforts-20-40-80-ab-prod" in tags
+    assert "reasoning-present" in tags
+    assert "thinking-blocks-present" in tags
     assert "claude-reasoning-present" in tags
     assert "claude-thinking-signature" in updated_kwargs["standard_logging_object"]["request_tags"]
+    assert "thinking-signature-present" in updated_kwargs["standard_logging_object"]["request_tags"]
     assert (
         updated_kwargs["standard_logging_object"]["metadata"]["claude_thinking_signature_present"]
         is True
@@ -156,12 +165,21 @@ AY89a19r/hypDnlNZTmQhYj/vLtBERR2L8wa4yt0Y+GwcOOi3fr3hsG8ovj6G2rfZypo/OPdkDOgU3IR
     assert metadata["gemini_tsig_marker_hex"] == "8f3d6b5f"
     assert len(metadata["gemini_tsig_marker_offsets"]) == 9
     assert metadata["gemini_reasoning_content_present"] is False
+    assert metadata["thinking_signature_present"] is True
+    assert metadata["thinking_signature_decoded"] is True
+    assert metadata["reasoning_content_present"] is False
+    assert metadata["thinking_blocks_present"] is False
     assert "gemini-thought-signature" in tags
+    assert "thinking-signature-present" in tags
+    assert "thinking-signature-decoded" in tags
     assert "gemini-thought-signature-decoded" in tags
     assert "gemini-tsig-records:9" in tags
+    assert "reasoning-empty" in tags
+    assert "thinking-blocks-empty" in tags
     assert "gemini-reasoning-empty" in tags
     assert any(tag.startswith("gemini-tsig-shape:") for tag in tags)
     assert "gemini-thought-signature" in updated_kwargs["standard_logging_object"]["request_tags"]
+    assert "thinking-signature-present" in updated_kwargs["standard_logging_object"]["request_tags"]
     assert (
         updated_kwargs["standard_logging_object"]["metadata"]["gemini_thought_signature_present"]
         is True

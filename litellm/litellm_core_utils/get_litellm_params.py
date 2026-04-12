@@ -96,12 +96,12 @@ def get_litellm_params(
     litellm_request_debug: Optional[bool] = None,
     **kwargs,
 ) -> dict:
-    # Derive litellm_session_id / litellm_trace_id from metadata when not provided (call chaining)
+    # Derive explicit session/trace ids from matching metadata keys only.
     _meta = metadata or {}
     if litellm_session_id is None:
-        litellm_session_id = _meta.get("session_id") or _meta.get("trace_id")
+        litellm_session_id = _meta.get("session_id")
     if litellm_trace_id is None:
-        litellm_trace_id = _meta.get("trace_id") or _meta.get("session_id")
+        litellm_trace_id = _meta.get("trace_id")
 
     # Build base dict with explicit parameters (always included)
     litellm_params = {

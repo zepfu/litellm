@@ -5082,27 +5082,29 @@ class StandardLoggingPayloadSetup:
         litellm_params: dict,
     ) -> str:
         """
-        Returns the `litellm_trace_id` for this request
+        Returns the trace identifier for this request.
 
-        This helps link sessions when multiple requests are made in a single session
+        Keep trace and session semantics separate:
+        - trace_id identifies a single top-level request/turn
+        - session_id groups multiple traces into one session lineage
         """
-        dynamic_litellm_session_id = litellm_params.get("litellm_session_id")
         dynamic_litellm_trace_id = litellm_params.get("litellm_trace_id")
+        dynamic_litellm_session_id = litellm_params.get("litellm_session_id")
 
-        # Note: we recommend using `litellm_session_id` for session tracking
-        # `litellm_trace_id` is an internal litellm param
-        if dynamic_litellm_session_id:
-            return str(dynamic_litellm_session_id)
-        elif dynamic_litellm_trace_id:
+        if dynamic_litellm_trace_id:
             return str(dynamic_litellm_trace_id)
-        # Fallback: use metadata.session_id or metadata.trace_id for call chaining
+        if dynamic_litellm_session_id:
+            return logging_obj.litellm_trace_id
+
+        # Fallback: prefer metadata.trace_id and only use session_id to keep a
+        # stable trace id when a caller provided session context but no trace id.
         metadata = litellm_params.get("metadata") or {}
-        metadata_session_id = metadata.get("session_id")
         metadata_trace_id = metadata.get("trace_id")
-        if metadata_session_id:
-            return str(metadata_session_id)
         if metadata_trace_id:
             return str(metadata_trace_id)
+        metadata_session_id = metadata.get("session_id")
+        if metadata_session_id:
+            return logging_obj.litellm_trace_id
         return logging_obj.litellm_trace_id
 
     @staticmethod
