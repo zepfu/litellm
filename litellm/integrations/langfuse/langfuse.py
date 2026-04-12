@@ -90,6 +90,54 @@ def _extract_cache_read_input_tokens(usage_obj) -> int:
     return cache_read_input_tokens
 
 
+def _coerce_langfuse_span_time(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        if not stripped_value:
+            return None
+        try:
+            normalized_value = stripped_value.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized_value)
+        except ValueError:
+            return None
+    return None
+
+
+def _log_metadata_spans_as_span(
+    trace: StatefulTraceClient,
+    metadata_spans: Any,
+) -> None:
+    if not isinstance(metadata_spans, list):
+        return
+
+    for span_descriptor in metadata_spans:
+        if not isinstance(span_descriptor, dict):
+            continue
+
+        span_name = span_descriptor.get("name")
+        if not isinstance(span_name, str) or not span_name.strip():
+            continue
+
+        span_kwargs: Dict[str, Any] = {
+            "name": span_name.strip(),
+            "input": span_descriptor.get("input"),
+            "output": span_descriptor.get("output"),
+            "metadata": span_descriptor.get("metadata"),
+        }
+        start_time = _coerce_langfuse_span_time(span_descriptor.get("start_time"))
+        end_time = _coerce_langfuse_span_time(span_descriptor.get("end_time"))
+        if start_time is not None:
+            span_kwargs["start_time"] = start_time
+        if end_time is not None:
+            span_kwargs["end_time"] = end_time
+
+        span = trace.span(**span_kwargs)
+        if hasattr(span, "end"):
+            span.end()
+
+
 class LangFuseLogger:
     # Class variables or attributes
     def __init__(
@@ -604,6 +652,7 @@ class LangFuseLogger:
             session_id = clean_metadata.pop("session_id", None)
             trace_name = cast(Optional[str], clean_metadata.pop("trace_name", None))
             trace_id = clean_metadata.pop("trace_id", None)
+            langfuse_spans = clean_metadata.pop("langfuse_spans", None)
             # Use standard_logging_object.trace_id if available (when trace_id from metadata is None)
             # This allows standard trace_id to be used when provided in standard_logging_object
             if trace_id is None and standard_logging_object is not None:
@@ -750,6 +799,8 @@ class LangFuseLogger:
                             clean_headers[key] = value
 
             trace: StatefulTraceClient = self.Langfuse.trace(**trace_params)
+
+            _log_metadata_spans_as_span(trace, langfuse_spans)
 
             # Log provider specific information as a span
             log_provider_specific_information_as_span(trace, clean_metadata)

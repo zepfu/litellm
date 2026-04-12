@@ -803,6 +803,50 @@ class TestLangfuseUsageDetails(unittest.TestCase):
         # session_id must still be set for session grouping
         assert self.last_trace_kwargs.get("session_id") == "session-999"
 
+    def test_log_langfuse_v2_logs_metadata_spans(self):
+        payload = self._build_standard_logging_payload(trace_id="std-trace-span")
+        kwargs = self._build_langfuse_kwargs(payload)
+        self.last_trace_kwargs = {}
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
+            side_effect=lambda generation_params, **kwargs: generation_params,
+            create=True,
+        ):
+            self.logger._log_langfuse_v2(
+                user_id="user-1",
+                metadata={
+                    "langfuse_spans": [
+                        {
+                            "name": "claude.persisted_output_expand",
+                            "metadata": {"expanded_count": 1},
+                            "start_time": "2026-04-12T14:00:00Z",
+                            "end_time": "2026-04-12T14:00:01Z",
+                        }
+                    ]
+                },
+                litellm_params={"metadata": {}},
+                output=None,
+                start_time=datetime.datetime.utcnow(),
+                end_time=datetime.datetime.utcnow(),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=None,
+                level="DEFAULT",
+                litellm_call_id="call-id-span",
+            )
+
+        self.mock_langfuse_trace.span.assert_any_call(
+            name="claude.persisted_output_expand",
+            input=None,
+            output=None,
+            metadata={"expanded_count": 1},
+            start_time=datetime.datetime(2026, 4, 12, 14, 0, tzinfo=datetime.timezone.utc),
+            end_time=datetime.datetime(2026, 4, 12, 14, 0, 1, tzinfo=datetime.timezone.utc),
+        )
+        self.mock_langfuse_span.end.assert_called()
+
 
 def test_failure_handler_langfuse_kwargs_excludes_original_response():
     """

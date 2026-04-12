@@ -25,6 +25,7 @@ Registration in litellm-config.yaml:
 import base64
 import hashlib
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from litellm._logging import verbose_logger
@@ -238,6 +239,40 @@ def _short_hash(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()[:12]
 
 
+def _format_langfuse_span_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _append_langfuse_span(
+    metadata: Dict[str, Any],
+    *,
+    name: str,
+    span_metadata: Optional[Dict[str, Any]] = None,
+    input_data: Any = None,
+    output_data: Any = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+) -> None:
+    existing_spans = metadata.get("langfuse_spans") or []
+    if not isinstance(existing_spans, list):
+        existing_spans = []
+
+    span_descriptor: Dict[str, Any] = {"name": name}
+    if input_data is not None:
+        span_descriptor["input"] = input_data
+    if output_data is not None:
+        span_descriptor["output"] = output_data
+    if span_metadata:
+        span_descriptor["metadata"] = span_metadata
+    if start_time is not None:
+        span_descriptor["start_time"] = _format_langfuse_span_timestamp(start_time)
+    if end_time is not None:
+        span_descriptor["end_time"] = _format_langfuse_span_timestamp(end_time)
+
+    existing_spans.append(span_descriptor)
+    metadata["langfuse_spans"] = existing_spans
+
+
 def _get_reasoning_state_tags(
     provider_prefix: str,
     reasoning_content: str,
@@ -293,6 +328,7 @@ def _extract_claude_experiment_ids(decoded_bytes: bytes) -> List[str]:
 
 
 def _enrich_claude_thinking_metadata(metadata: Dict[str, Any], message: Any) -> None:
+    span_started_at = datetime.now(timezone.utc)
     thinking_blocks = _extract_thinking_blocks(message)
     if not thinking_blocks:
         return
@@ -359,6 +395,19 @@ def _enrich_claude_thinking_metadata(metadata: Dict[str, Any], message: Any) -> 
     )
     tags_to_add.extend(f"claude-exp:{experiment_id}" for experiment_id in experiment_ids)
     _merge_tags(metadata, tags_to_add)
+    _append_langfuse_span(
+        metadata,
+        name="claude.thinking_signature_decode",
+        span_metadata={
+            "signature_count": len(signatures),
+            "decoded_signature_count": len(decoded_hashes),
+            "thinking_block_count": len(thinking_blocks),
+            "reasoning_content_present": bool(reasoning_content.strip()),
+            "experiment_ids": experiment_ids,
+        },
+        start_time=span_started_at,
+        end_time=datetime.now(timezone.utc),
+    )
 
 
 def _read_varint(data: bytes, offset: int) -> Tuple[Optional[int], int]:
@@ -444,6 +493,7 @@ def _extract_gemini_signature_summary(signature: str) -> Dict[str, Any]:
 def _enrich_gemini_thought_signature_metadata(
     metadata: Dict[str, Any], message: Any
 ) -> None:
+    span_started_at = datetime.now(timezone.utc)
     provider_specific_fields = _extract_provider_specific_fields(message)
     thought_signatures = provider_specific_fields.get("thought_signatures")
     thinking_blocks = _extract_thinking_blocks(message)
@@ -531,6 +581,21 @@ def _enrich_gemini_thought_signature_metadata(
         )
     )
     _merge_tags(metadata, tags_to_add)
+    _append_langfuse_span(
+        metadata,
+        name="gemini.thought_signature_decode",
+        span_metadata={
+            "signature_count": len(thought_signatures),
+            "decoded_signature_count": len(summaries),
+            "shape_hashes": sorted(set(shape_hashes)),
+            "record_counts": sorted(
+                {summary["record_count"] for summary in summaries} if summaries else []
+            ),
+            "reasoning_content_present": bool(reasoning_content.strip()),
+        },
+        start_time=span_started_at,
+        end_time=datetime.now(timezone.utc),
+    )
 
 
 def _enrich_trace_name_and_provider_metadata(

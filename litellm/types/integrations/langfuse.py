@@ -1,4 +1,5 @@
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional, Union
 
 from typing_extensions import TypedDict
 
@@ -19,3 +20,20 @@ class LangfuseUsageDetails(TypedDict):
 
 class LangfuseCostDetails(TypedDict, total=False):
     total: float
+
+
+class LangfuseSpanDescriptor(TypedDict, total=False):
+    name: str
+    input: Any
+    output: Any
+    metadata: dict[str, Any]
+    start_time: Union[str, datetime]
+    end_time: Union[str, datetime]
+
+
+__all__ = [
+    "LangfuseLoggingConfig",
+    "LangfuseUsageDetails",
+    "LangfuseCostDetails",
+    "LangfuseSpanDescriptor",
+]

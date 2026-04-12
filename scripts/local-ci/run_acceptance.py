@@ -235,6 +235,45 @@ def _recent_langfuse_generation_observations_for_trace_ids(
     return observations
 
 
+def _recent_langfuse_span_observations_for_trace_ids(
+    *,
+    query_url: str,
+    public_key: str,
+    secret_key: str,
+    trace_ids: list[str],
+    start_time: dt.datetime,
+    limit_per_trace: int = 25,
+) -> list[dict[str, Any]]:
+    floor = start_time - dt.timedelta(seconds=5)
+    observations: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for trace_id in trace_ids:
+        params = {
+            "traceId": trace_id,
+            "type": "SPAN",
+            "limit": str(limit_per_trace),
+            "orderBy": "startTime.desc",
+            "fields": "core",
+        }
+        url = f"{query_url.rstrip('/')}/api/public/observations?{urllib.parse.urlencode(params)}"
+        payload = _http_get_json(url, public_key, secret_key)
+        for observation in payload.get("data", []):
+            observation_id = observation.get("id")
+            if isinstance(observation_id, str) and observation_id in seen_ids:
+                continue
+            timestamp = _parse_langfuse_timestamp(
+                observation.get("startTime")
+                or observation.get("createdAt")
+                or observation.get("updatedAt")
+            )
+            if timestamp is None or timestamp < floor:
+                continue
+            if isinstance(observation_id, str):
+                seen_ids.add(observation_id)
+            observations.append(observation)
+    return observations
+
+
 def _extract_generation_metric(
     observation: dict[str, Any], *path: str
 ) -> Any:
@@ -335,6 +374,67 @@ def _validate_generation_observations(
             failures.append(f"{family} generation missing calculatedTotalCost")
 
     return route_filtered_observations, summaries, sorted(set(failures))
+
+
+def _validate_span_observations(
+    *,
+    family: str,
+    query_url: str,
+    public_key: str,
+    secret_key: str,
+    trace_ids: list[str],
+    start_time: dt.datetime,
+    required_names: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    required_names = required_names or []
+    if not required_names:
+        return [], [], []
+    if not trace_ids:
+        return [], [], [f"{family} missing trace ids for span validation"]
+
+    try:
+        observations = _recent_langfuse_span_observations_for_trace_ids(
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            trace_ids=trace_ids,
+            start_time=start_time,
+        )
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        http.client.RemoteDisconnected,
+        ConnectionResetError,
+        TimeoutError,
+    ) as exc:
+        return [], [], [f"{family} span lookup failed: {exc}"]
+
+    if not observations:
+        return [], [], [f"{family} missing span observations"]
+
+    observed_names = sorted(
+        {
+            str(observation.get("name")).strip()
+            for observation in observations
+            if isinstance(observation.get("name"), str) and observation.get("name").strip()
+        }
+    )
+    failures: list[str] = []
+    for name in required_names:
+        if name not in observed_names:
+            failures.append(f"{family} missing span observation: {name}")
+
+    summaries = [
+        {
+            "id": observation.get("id"),
+            "traceId": observation.get("traceId"),
+            "name": observation.get("name"),
+            "startTime": observation.get("startTime"),
+            "endTime": observation.get("endTime"),
+        }
+        for observation in observations
+    ]
+    return observations, summaries, sorted(set(failures))
 
 
 def _collect_trace_tags(traces: list[dict[str, Any]]) -> list[str]:
@@ -1087,6 +1187,16 @@ def _validate_codex(
         required_metadata_minimums=config.get("required_generation_metadata_minimums"),
     )
     failures.extend(generation_metadata_failures)
+    _, span_observations, span_failures = _validate_span_observations(
+        family="codex",
+        query_url=query_url,
+        public_key=public_key,
+        secret_key=secret_key,
+        trace_ids=trace_ids,
+        start_time=started,
+        required_names=config.get("required_span_names"),
+    )
+    failures.extend(span_failures)
     return {
         **run,
         "streaming_checked": config.get("streaming_checked", False),
@@ -1101,6 +1211,7 @@ def _validate_codex(
             "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,
+            "span_observations": span_observations,
             "generation_observations": generation_observations,
         },
         "passed": not failures,
@@ -1198,6 +1309,16 @@ def _validate_gemini(
         required_metadata_minimums=config.get("required_generation_metadata_minimums"),
     )
     failures.extend(generation_metadata_failures)
+    _, span_observations, span_failures = _validate_span_observations(
+        family="gemini",
+        query_url=query_url,
+        public_key=public_key,
+        secret_key=secret_key,
+        trace_ids=filtered_trace_ids,
+        start_time=started,
+        required_names=config.get("required_span_names"),
+    )
+    failures.extend(span_failures)
     gemini_signature_observed = any(
         _observation_has_gemini_thought_signature(observation)
         for observation in raw_generation_observations
@@ -1219,6 +1340,7 @@ def _validate_gemini(
             "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,
+            "span_observations": span_observations,
             "thought_signature_observed": gemini_signature_observed,
             "generation_observations": generation_observations,
         },
@@ -1388,6 +1510,16 @@ def _validate_claude(
         ),
     )
     failures.extend(source_file_failures)
+    _, span_observations, span_failures = _validate_span_observations(
+        family="claude",
+        query_url=query_url,
+        public_key=public_key,
+        secret_key=secret_key,
+        trace_ids=filtered_trace_ids,
+        start_time=started,
+        required_names=effective_config.get("required_span_names"),
+    )
+    failures.extend(span_failures)
     claude_signature_observed = any(
         _observation_has_claude_thinking_signature(observation)
         for observation in raw_generation_observations
@@ -1413,6 +1545,7 @@ def _validate_claude(
             "generation_metadata": generation_metadata_summary,
             "request_text_checks": request_text_summary,
             "request_source_file_verification": source_file_summary,
+            "span_observations": span_observations,
             "thought_signature_observed": claude_signature_observed,
             "generation_observations": generation_observations,
         },

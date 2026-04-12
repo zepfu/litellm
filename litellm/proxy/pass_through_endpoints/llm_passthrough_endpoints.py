@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union, cast
 
@@ -281,10 +282,46 @@ def _merge_litellm_metadata(
 
     litellm_metadata["tags"] = merged_tags
     if extra_fields:
-        litellm_metadata.update(extra_fields)
+        existing_spans = litellm_metadata.get("langfuse_spans")
+        incoming_spans = extra_fields.get("langfuse_spans")
+        if isinstance(existing_spans, list) and isinstance(incoming_spans, list):
+            merged_extra_fields = dict(extra_fields)
+            merged_extra_fields["langfuse_spans"] = list(existing_spans) + list(
+                incoming_spans
+            )
+            litellm_metadata.update(merged_extra_fields)
+        else:
+            litellm_metadata.update(extra_fields)
 
     updated_body["litellm_metadata"] = litellm_metadata
     return updated_body
+
+
+def _format_langfuse_span_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_langfuse_span_descriptor(
+    *,
+    name: str,
+    metadata: Optional[dict[str, Any]] = None,
+    input_data: Any = None,
+    output_data: Any = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+) -> dict[str, Any]:
+    descriptor: dict[str, Any] = {"name": name}
+    if input_data is not None:
+        descriptor["input"] = input_data
+    if output_data is not None:
+        descriptor["output"] = output_data
+    if metadata:
+        descriptor["metadata"] = metadata
+    if start_time is not None:
+        descriptor["start_time"] = _format_langfuse_span_timestamp(start_time)
+    if end_time is not None:
+        descriptor["end_time"] = _format_langfuse_span_timestamp(end_time)
+    return descriptor
 
 
 def _get_nested_str_value(source: Any, path: tuple[str, ...]) -> Optional[str]:
@@ -635,6 +672,29 @@ def _add_claude_persisted_output_logging_metadata(
     hooks: set[str],
     source_metadata_items: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    span_metadata: dict[str, Any] = {
+        "expanded_count": expanded_count,
+        "hook_count": len(hooks),
+    }
+    if hooks:
+        span_metadata["hooks"] = sorted(hooks)
+    if source_metadata_items:
+        span_metadata["source_count"] = len(source_metadata_items)
+        span_metadata["source_paths"] = [
+            item["path"]
+            for item in source_metadata_items
+            if isinstance(item.get("path"), str)
+        ]
+        span_metadata["source_content_hashes"] = [
+            item["content_hash"]
+            for item in source_metadata_items
+            if isinstance(item.get("content_hash"), str)
+        ]
+        span_metadata["source_bytes"] = [
+            item["bytes"]
+            for item in source_metadata_items
+            if isinstance(item.get("bytes"), int)
+        ]
     tags_to_add = ["claude-persisted-output-expanded"]
     tags_to_add.extend(
         f"claude-persisted-output-hook:{hook}" for hook in sorted(hooks) if hook
@@ -642,6 +702,12 @@ def _add_claude_persisted_output_logging_metadata(
     extra_fields: dict[str, Any] = {
         "claude_persisted_output_expanded": True,
         "claude_persisted_output_expanded_count": expanded_count,
+        "langfuse_spans": [
+            _build_langfuse_span_descriptor(
+                name="claude.persisted_output_expand",
+                metadata=span_metadata,
+            )
+        ],
     }
     if hooks:
         extra_fields["claude_persisted_output_hooks"] = sorted(hooks)
@@ -742,6 +808,7 @@ def _add_anthropic_billing_header_logging_metadata(
 def _expand_claude_persisted_output_in_anthropic_request_body(
     request_body: dict[str, Any]
 ) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
+    span_started_at = datetime.now(timezone.utc)
     (
         updated_body,
         expanded_count,
@@ -758,6 +825,22 @@ def _expand_claude_persisted_output_in_anthropic_request_body(
                 hooks,
                 source_metadata_items,
             )
+            litellm_metadata = updated_body.get("litellm_metadata")
+            if isinstance(litellm_metadata, dict):
+                langfuse_spans = litellm_metadata.get("langfuse_spans")
+                if isinstance(langfuse_spans, list):
+                    for span_descriptor in langfuse_spans:
+                        if (
+                            isinstance(span_descriptor, dict)
+                            and span_descriptor.get("name")
+                            == "claude.persisted_output_expand"
+                        ):
+                            span_descriptor["start_time"] = _format_langfuse_span_timestamp(
+                                span_started_at
+                            )
+                            span_descriptor["end_time"] = _format_langfuse_span_timestamp(
+                                datetime.now(timezone.utc)
+                            )
         return updated_body, expanded_count, hooks, source_metadata_items
     return request_body, 0, set(), []
 

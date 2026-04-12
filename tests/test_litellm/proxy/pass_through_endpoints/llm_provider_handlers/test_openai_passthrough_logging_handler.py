@@ -326,6 +326,8 @@ class TestOpenAIPassthroughLoggingHandler:
         assert standard_logging_object["prompt_tokens"] == 15517
         assert standard_logging_object["completion_tokens"] == 27
         assert standard_logging_object["total_tokens"] == 15544
+        metadata = result["kwargs"]["litellm_params"].get("metadata", {})
+        assert "langfuse_spans" not in metadata
 
     @patch("litellm.completion_cost")
     def test_openai_streaming_handler_rebuilds_responses_api_usage(
@@ -419,6 +421,54 @@ class TestOpenAIPassthroughLoggingHandler:
         mock_completion_cost.assert_called_once()
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.456
+
+    def test_openai_passthrough_handler_adds_codex_usage_normalize_span(self):
+        codex_response = {
+            "id": "resp-codex-span-test",
+            "object": "response",
+            "created": 1775863780,
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "usage probe"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "input_tokens_details": {"cached_tokens": 10},
+                "output_tokens_details": {"reasoning_tokens": 0, "text_tokens": 20},
+            },
+        }
+        mock_httpx_response = self._create_mock_httpx_response(codex_response)
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+            httpx_response=mock_httpx_response,
+            response_body=codex_response,
+            logging_obj=mock_logging_obj,
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            result="",
+            start_time=self.start_time,
+            end_time=self.end_time,
+            cache_hit=False,
+            request_body={"model": "gpt-5.4", "input": "usage probe"},
+            passthrough_logging_payload=PassthroughStandardLoggingPayload(
+                url="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.4", "input": "usage probe"},
+                request_method="POST",
+            ),
+            litellm_params={"metadata": {"passthrough_route_family": "codex_responses"}},
+        )
+
+        spans = result["kwargs"]["litellm_params"]["metadata"]["langfuse_spans"]
+        assert spans[0]["name"] == "codex.usage_normalize"
+        assert spans[0]["metadata"]["streaming"] is False
+        assert spans[0]["metadata"]["call_type"] == "responses"
+        assert spans[0]["metadata"]["total_tokens"] == 120
 
     @patch('litellm.completion_cost')
     @patch('litellm.litellm_core_utils.litellm_logging.get_standard_logging_object_payload')

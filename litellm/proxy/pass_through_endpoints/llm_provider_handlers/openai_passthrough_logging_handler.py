@@ -132,6 +132,30 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return None
 
     @staticmethod
+    def _append_langfuse_span_to_kwargs(
+        kwargs: dict,
+        *,
+        name: str,
+        span_metadata: Optional[dict] = None,
+    ) -> None:
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        langfuse_spans = metadata.get("langfuse_spans") or []
+        if not isinstance(langfuse_spans, list):
+            langfuse_spans = []
+        descriptor = {"name": name}
+        if span_metadata:
+            descriptor["metadata"] = span_metadata
+        langfuse_spans.append(descriptor)
+        metadata["langfuse_spans"] = langfuse_spans
+        litellm_params["metadata"] = metadata
+        kwargs["litellm_params"] = litellm_params
+
+    @staticmethod
     def _calculate_image_generation_cost(
         model: str,
         response_body: dict,
@@ -401,6 +425,25 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
             # Create standard logging object
             if litellm_model_response is not None:
+                if (
+                    is_responses
+                    and (
+                        (kwargs.get("litellm_params", {}) or {}).get("metadata", {})
+                        or {}
+                    ).get("passthrough_route_family")
+                    == "codex_responses"
+                ):
+                    usage = getattr(litellm_model_response, "usage", None)
+                    handler_instance._append_langfuse_span_to_kwargs(
+                        kwargs,
+                        name="codex.usage_normalize",
+                        span_metadata={
+                            "streaming": False,
+                            "call_type": "responses",
+                            "total_tokens": getattr(usage, "total_tokens", None),
+                            "response_cost": response_cost,
+                        },
+                    )
                 kwargs["standard_logging_object"] = get_standard_logging_object_payload(
                     kwargs=kwargs,
                     init_response_obj=litellm_model_response,
@@ -706,6 +749,24 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     )["headers"] = request_headers
 
             # Create standard logging object
+            if (
+                is_responses
+                and (
+                    (kwargs.get("litellm_params", {}) or {}).get("metadata", {}) or {}
+                ).get("passthrough_route_family")
+                == "codex_responses"
+            ):
+                usage = getattr(complete_response, "usage", None)
+                handler._append_langfuse_span_to_kwargs(
+                    kwargs,
+                    name="codex.usage_normalize",
+                    span_metadata={
+                        "streaming": True,
+                        "call_type": "responses",
+                        "total_tokens": getattr(usage, "total_tokens", None),
+                        "response_cost": response_cost,
+                    },
+                )
             kwargs["standard_logging_object"] = get_standard_logging_object_payload(
                 kwargs=kwargs,
                 init_response_obj=complete_response,

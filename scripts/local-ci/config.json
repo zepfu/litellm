@@ -35,6 +35,9 @@
       "codex-parallel-tools:true",
       "codex-include:reasoning.encrypted_content"
     ],
+    "required_span_names": [
+      "codex.usage_normalize"
+    ],
     "required_generation_metadata_truthy": [
       "passthrough_route_family",
       "codex_reasoning_effort",
@@ -83,6 +86,9 @@
     "required_trace_tag_prefixes": [
       "gemini-tsig-records:",
       "gemini-tsig-shape:"
+    ],
+    "required_span_names": [
+      "gemini.thought_signature_decode"
     ],
     "required_generation_metadata_truthy": [
       "passthrough_route_family",
@@ -189,6 +195,10 @@
       "anthropic-billing-header-key:cch",
       "claude-persisted-output-hook:sessionstart",
       "claude-persisted-output-hook:subagentstart"
+    ],
+    "required_span_names": [
+      "claude.persisted_output_expand",
+      "claude.thinking_signature_decode"
     ],
     "required_generation_metadata_truthy": [
       "passthrough_route_family",
