@@ -27,6 +27,20 @@
     "allowed_generation_routes": [
       "/openai_passthrough/responses"
     ],
+    "required_trace_tags": [
+      "codex-effort:xhigh",
+      "effort:xhigh",
+      "codex-tool-choice:auto",
+      "codex-parallel-tools:true",
+      "codex-include:reasoning.encrypted_content"
+    ],
+    "required_generation_metadata_truthy": [
+      "codex_reasoning_effort",
+      "codex_tool_choice",
+      "codex_parallel_tool_calls",
+      "codex_include",
+      "codex_prompt_cache_key_present"
+    ],
     "streaming_checked": false,
     "timeout_seconds": 180
   },
@@ -54,6 +68,8 @@
       "/gemini/v1internal:streamGenerateContent"
     ],
     "required_trace_tags": [
+      "gemini-thinking-config-present",
+      "gemini-thinking-budget-configured",
       "gemini-thought-signature",
       "gemini-thought-signature-decoded",
       "thinking-signature-present",
@@ -66,10 +82,12 @@
       "gemini-tsig-shape:"
     ],
     "required_generation_metadata_truthy": [
+      "gemini_thinking_config_present",
       "gemini_thought_signature_present",
       "gemini_tsig_shape_hash"
     ],
     "required_generation_metadata_minimums": {
+      "gemini_thinking_budget": 1,
       "gemini_thought_signature_count": 1,
       "gemini_tsig_record_count": 1
     },
@@ -149,6 +167,12 @@
     "required_trace_tags": [
       "anthropic-billing-header",
       "claude-persisted-output-expanded",
+      "claude-thinking-type:adaptive",
+      "thinking-type:adaptive",
+      "claude-effort:high",
+      "effort:high",
+      "claude-context-edit:clear_thinking_20251015",
+      "claude-context-keep:all",
       "thinking-signature-present",
       "thinking-signature-decoded",
       "reasoning-present",
@@ -165,10 +189,15 @@
       "anthropic_billing_header_present",
       "claude_persisted_output_expanded",
       "claude_persisted_output_source_paths",
-      "claude_persisted_output_source_content_hashes"
+      "claude_persisted_output_source_content_hashes",
+      "claude_thinking_type",
+      "claude_effort",
+      "claude_context_edit_types",
+      "claude_context_keep_values"
     ],
     "required_generation_metadata_minimums": {
-      "claude_persisted_output_expanded_count": 1
+      "claude_persisted_output_expanded_count": 1,
+      "claude_context_edit_count": 1
     },
     "request_source_file_verification": {
       "source_paths_key": "claude_persisted_output_source_paths",
