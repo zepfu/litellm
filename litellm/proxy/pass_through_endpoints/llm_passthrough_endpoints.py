@@ -6,6 +6,7 @@ Provider-specific Pass-Through Endpoints
 Use litellm with Anthropic SDK, Vertex AI SDK, Cohere SDK, etc.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -70,6 +71,12 @@ _CLAUDE_PERSISTED_OUTPUT_PATTERN = re.compile(
     re.DOTALL,
 )
 _ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+_PASSTHROUGH_SESSION_ID_HEADER_NAMES = (
+    "session_id",
+    "Session_Id",
+    "x-session-id",
+    "X-Session-Id",
+)
 
 
 def _is_openai_responses_endpoint(endpoint: str) -> bool:
@@ -127,24 +134,38 @@ def _resolve_claude_persisted_output_path(path_str: str) -> Optional[Path]:
     return candidate
 
 
-def _expand_claude_persisted_output_text(text: str) -> Tuple[str, bool, Optional[str]]:
+def _build_claude_persisted_output_source_metadata(
+    *, resolved_path: Path, file_text: str
+) -> dict[str, Any]:
+    file_bytes = file_text.encode("utf-8")
+    return {
+        "path": str(resolved_path),
+        "basename": resolved_path.name,
+        "content_hash": hashlib.sha256(file_bytes).hexdigest(),
+        "bytes": len(file_bytes),
+    }
+
+
+def _expand_claude_persisted_output_text(
+    text: str,
+) -> Tuple[str, bool, Optional[str], Optional[dict[str, Any]]]:
     if not _is_claude_persisted_output_expansion_enabled():
-        return text, False, None
+        return text, False, None, None
 
     match = _CLAUDE_PERSISTED_OUTPUT_PATTERN.match(text)
     if match is None:
-        return text, False, None
+        return text, False, None, None
 
     resolved_path = _resolve_claude_persisted_output_path(match.group("path"))
     if resolved_path is None:
-        return text, False, None
+        return text, False, None, None
 
     try:
         file_text = resolved_path.read_text(encoding="utf-8", errors="replace").rstrip(
             "\n"
         )
     except Exception:
-        return text, False, None
+        return text, False, None, None
 
     hook = match.group("hook")
     expanded = (
@@ -154,57 +175,91 @@ def _expand_claude_persisted_output_text(text: str) -> Tuple[str, bool, Optional
         "</persisted-output>\n"
         "</system-reminder>\n"
     )
-    return expanded, True, hook.lower()
+    return (
+        expanded,
+        True,
+        hook.lower(),
+        _build_claude_persisted_output_source_metadata(
+            resolved_path=resolved_path,
+            file_text=file_text,
+        ),
+    )
 
 
-def _expand_claude_persisted_output_value(value: Any) -> Tuple[Any, int, set[str]]:
+def _expand_claude_persisted_output_value(
+    value: Any,
+) -> Tuple[Any, int, set[str], list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
-            expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(
-                value["text"]
-            )
+            (
+                expanded_text,
+                was_expanded,
+                hook_name,
+                source_metadata,
+            ) = _expand_claude_persisted_output_text(value["text"])
             if was_expanded:
                 updated_value = dict(value)
                 updated_value["text"] = expanded_text
-                return updated_value, 1, {hook_name} if hook_name else set()
-            return value, 0, set()
+                return (
+                    updated_value,
+                    1,
+                    {hook_name} if hook_name else set(),
+                    [source_metadata] if source_metadata else [],
+                )
+            return value, 0, set(), []
 
         updated_dict: dict[str, Any] = {}
         expanded_count = 0
         hooks: set[str] = set()
+        source_metadata_items: list[dict[str, Any]] = []
         changed = False
         for key, child in value.items():
             (
                 updated_child,
                 child_expanded_count,
                 child_hooks,
+                child_source_metadata_items,
             ) = _expand_claude_persisted_output_value(child)
             updated_dict[key] = updated_child
             expanded_count += child_expanded_count
             hooks.update(child_hooks)
+            source_metadata_items.extend(child_source_metadata_items)
             if updated_child is not child:
                 changed = True
-        return (updated_dict if changed else value), expanded_count, hooks
+        return (
+            updated_dict if changed else value,
+            expanded_count,
+            hooks,
+            source_metadata_items,
+        )
 
     if isinstance(value, list):
         updated_list = []
         expanded_count = 0
         hooks: set[str] = set()
+        source_metadata_items: list[dict[str, Any]] = []
         changed = False
         for child in value:
             (
                 updated_child,
                 child_expanded_count,
                 child_hooks,
+                child_source_metadata_items,
             ) = _expand_claude_persisted_output_value(child)
             updated_list.append(updated_child)
             expanded_count += child_expanded_count
             hooks.update(child_hooks)
+            source_metadata_items.extend(child_source_metadata_items)
             if updated_child is not child:
                 changed = True
-        return (updated_list if changed else value), expanded_count, hooks
+        return (
+            updated_list if changed else value,
+            expanded_count,
+            hooks,
+            source_metadata_items,
+        )
 
-    return value, 0, set()
+    return value, 0, set(), []
 
 
 def _merge_litellm_metadata(
@@ -232,8 +287,102 @@ def _merge_litellm_metadata(
     return updated_body
 
 
+def _get_nested_str_value(source: Any, path: tuple[str, ...]) -> Optional[str]:
+    current = source
+    for key in path:
+        if isinstance(current, str):
+            stripped_current = current.strip()
+            if not stripped_current:
+                return None
+            try:
+                current = json.loads(stripped_current)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    if isinstance(current, str) and current.strip():
+        return current.strip()
+    return None
+
+
+def _extract_passthrough_session_id(
+    request: Request, request_body: Optional[dict[str, Any]] = None
+) -> Optional[str]:
+    if isinstance(request_body, dict):
+        for path in (
+            ("session_id",),
+            ("request", "session_id"),
+            ("metadata", "session_id"),
+            ("metadata", "user_id", "session_id"),
+        ):
+            value = _get_nested_str_value(request_body, path)
+            if value:
+                return value
+
+    headers = _safe_get_request_headers(request)
+    for header_name in _PASSTHROUGH_SESSION_ID_HEADER_NAMES:
+        value = headers.get(header_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _get_passthrough_trace_environment() -> Optional[str]:
+    for env_var in (
+        "LITELLM_LANGFUSE_TRACE_ENVIRONMENT",
+        "LANGFUSE_TRACING_ENVIRONMENT",
+    ):
+        value = os.getenv(env_var)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _add_passthrough_trace_context_metadata(
+    request_body: dict[str, Any],
+    *,
+    session_id: Optional[str],
+    trace_environment: Optional[str],
+) -> dict[str, Any]:
+    updated_body = dict(request_body)
+    litellm_metadata = dict(updated_body.get("litellm_metadata") or {})
+    changed = False
+
+    if session_id and not litellm_metadata.get("session_id"):
+        litellm_metadata["session_id"] = session_id
+        changed = True
+
+    if trace_environment and not litellm_metadata.get("trace_environment"):
+        litellm_metadata["trace_environment"] = trace_environment
+        changed = True
+
+    if not changed:
+        return request_body
+
+    updated_body["litellm_metadata"] = litellm_metadata
+    return updated_body
+
+
+def _prepare_request_body_for_passthrough_observability(
+    request: Request, request_body: dict[str, Any]
+) -> dict[str, Any]:
+    session_id = _extract_passthrough_session_id(
+        request=request, request_body=request_body
+    )
+    trace_environment = _get_passthrough_trace_environment()
+    return _add_passthrough_trace_context_metadata(
+        request_body,
+        session_id=session_id,
+        trace_environment=trace_environment,
+    )
+
+
 def _add_claude_persisted_output_logging_metadata(
-    request_body: dict[str, Any], expanded_count: int, hooks: set[str]
+    request_body: dict[str, Any],
+    expanded_count: int,
+    hooks: set[str],
+    source_metadata_items: list[dict[str, Any]],
 ) -> dict[str, Any]:
     tags_to_add = ["claude-persisted-output-expanded"]
     tags_to_add.extend(
@@ -245,6 +394,27 @@ def _add_claude_persisted_output_logging_metadata(
     }
     if hooks:
         extra_fields["claude_persisted_output_hooks"] = sorted(hooks)
+    if source_metadata_items:
+        extra_fields["claude_persisted_output_source_paths"] = [
+            item["path"]
+            for item in source_metadata_items
+            if isinstance(item.get("path"), str)
+        ]
+        extra_fields["claude_persisted_output_source_basenames"] = [
+            item["basename"]
+            for item in source_metadata_items
+            if isinstance(item.get("basename"), str)
+        ]
+        extra_fields["claude_persisted_output_source_content_hashes"] = [
+            item["content_hash"]
+            for item in source_metadata_items
+            if isinstance(item.get("content_hash"), str)
+        ]
+        extra_fields["claude_persisted_output_source_bytes"] = [
+            item["bytes"]
+            for item in source_metadata_items
+            if isinstance(item.get("bytes"), int)
+        ]
     return _merge_litellm_metadata(
         request_body,
         tags_to_add=tags_to_add,
@@ -320,24 +490,32 @@ def _add_anthropic_billing_header_logging_metadata(
 
 def _expand_claude_persisted_output_in_anthropic_request_body(
     request_body: dict[str, Any]
-) -> Tuple[dict[str, Any], int, set[str]]:
-    updated_body, expanded_count, hooks = _expand_claude_persisted_output_value(
+) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
+    (
+        updated_body,
+        expanded_count,
+        hooks,
+        source_metadata_items,
+    ) = _expand_claude_persisted_output_value(
         request_body
     )
     if isinstance(updated_body, dict):
         if expanded_count > 0:
             updated_body = _add_claude_persisted_output_logging_metadata(
-                updated_body, expanded_count, hooks
+                updated_body,
+                expanded_count,
+                hooks,
+                source_metadata_items,
             )
-        return updated_body, expanded_count, hooks
-    return request_body, 0, set()
+        return updated_body, expanded_count, hooks, source_metadata_items
+    return request_body, 0, set(), []
 
 
 def _prepare_anthropic_request_body_for_passthrough(
-    request_body: dict[str, Any]
+    request: Request, request_body: dict[str, Any]
 ) -> Tuple[dict[str, Any], int, set[str], dict[str, str]]:
-    updated_body, expanded_count, hooks = _expand_claude_persisted_output_in_anthropic_request_body(
-        request_body
+    updated_body, expanded_count, hooks, _source_metadata_items = (
+        _expand_claude_persisted_output_in_anthropic_request_body(request_body)
     )
     billing_header_fields = _extract_anthropic_billing_header_fields_from_request_body(
         updated_body
@@ -347,6 +525,10 @@ def _prepare_anthropic_request_body_for_passthrough(
             updated_body,
             billing_header_fields,
         )
+    updated_body = _prepare_request_body_for_passthrough_observability(
+        request=request,
+        request_body=updated_body,
+    )
     return updated_body, expanded_count, hooks, billing_header_fields
 
 
@@ -595,6 +777,15 @@ async def gemini_proxy_route(
     is_streaming_request = False
     if "stream" in str(updated_url):
         is_streaming_request = True
+
+    if request.method == "POST":
+        request_body = await get_request_body(request)
+        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+            request=request,
+            request_body=request_body,
+        )
+        if prepared_request_body is not request_body:
+            _safe_set_request_parsed_body(request, prepared_request_body)
 
     ## CREATE PASS-THROUGH
     endpoint_func = create_pass_through_route(
@@ -982,7 +1173,7 @@ async def anthropic_proxy_route(
             expanded_count,
             hooks,
             billing_header_fields,
-        ) = _prepare_anthropic_request_body_for_passthrough(request_body)
+        ) = _prepare_anthropic_request_body_for_passthrough(request, request_body)
         if prepared_request_body is not request_body:
             _safe_set_request_parsed_body(request, prepared_request_body)
             verbose_proxy_logger.debug(
@@ -2411,6 +2602,15 @@ class BaseOpenAIPassThroughHandler:
             path=encoded_endpoint,
             custom_llm_provider=custom_llm_provider,
         )
+
+        if request.method == "POST":
+            request_body = await get_request_body(request)
+            prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                request=request,
+                request_body=request_body,
+            )
+            if prepared_request_body is not request_body:
+                _safe_set_request_parsed_body(request, prepared_request_body)
 
         ## check for streaming
         is_streaming_request = False

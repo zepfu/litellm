@@ -20,6 +20,7 @@ services:
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
       - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=${LITELLM_LANGFUSE_TRACE_ENVIRONMENT:-dev}
       # No server-side ANTHROPIC_API_KEY — client provides via x-api-key header
       # Enable payload capture to ./captures/
       - AAWM_CAPTURE=1

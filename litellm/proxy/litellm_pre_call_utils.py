@@ -94,23 +94,36 @@ def _get_metadata_variable_name(request: Request) -> str:
     return "metadata"
 
 
-def get_chain_id_from_headers(headers: Optional[Dict[str, str]]) -> Optional[str]:
-    """
-    Extract chain id for call chaining from request headers.
-
-    x-litellm-trace-id and x-litellm-session-id are interchangeable; when both
-    are present, x-litellm-trace-id takes precedence. Header keys are matched
-    case-insensitively so this works with raw header dicts from any transport.
-
-    Used by MCP (and other paths that have raw_headers but no Request) to set
-    litellm_trace_id/litellm_session_id for spend logs and logging consistency.
-    """
+def _get_normalized_header_value(
+    headers: Optional[Dict[str, str]], header_name: str
+) -> Optional[str]:
     if not headers:
         return None
     normalized = {k.lower(): v for k, v in headers.items() if isinstance(k, str)}
-    return normalized.get("x-litellm-trace-id") or normalized.get(
-        "x-litellm-session-id"
-    )
+    value = normalized.get(header_name.lower())
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def get_trace_id_from_headers(headers: Optional[Dict[str, str]]) -> Optional[str]:
+    """Extract x-litellm-trace-id from request headers."""
+    return _get_normalized_header_value(headers, "x-litellm-trace-id")
+
+
+def get_session_id_from_headers(headers: Optional[Dict[str, str]]) -> Optional[str]:
+    """Extract x-litellm-session-id from request headers."""
+    return _get_normalized_header_value(headers, "x-litellm-session-id")
+
+
+def get_chain_id_from_headers(headers: Optional[Dict[str, str]]) -> Optional[str]:
+    """
+    Backwards-compatible helper for paths that still want a generic call-chain id.
+
+    Prefer get_trace_id_from_headers() and get_session_id_from_headers() at new
+    call sites so trace and session remain distinct.
+    """
+    return get_trace_id_from_headers(headers) or get_session_id_from_headers(headers)
 
 
 def safe_add_api_version_from_query_params(data: dict, request: Request):
@@ -630,10 +643,8 @@ class LiteLLMProxyRequestSetup:
         #########################################################################################
 
         agent_id_from_header = headers.get("x-litellm-agent-id")
-        # x-litellm-trace-id and x-litellm-session-id are interchangeable for call chaining
-        chain_id = headers.get("x-litellm-trace-id") or headers.get(
-            "x-litellm-session-id"
-        )
+        trace_id = get_trace_id_from_headers(headers)
+        session_id = get_session_id_from_headers(headers)
 
         if agent_id_from_header:
             metadata_from_headers["agent_id"] = agent_id_from_header
@@ -641,13 +652,18 @@ class LiteLLMProxyRequestSetup:
                 f"Extracted agent_id from header: {agent_id_from_header}"
             )
 
-        if chain_id:
-            metadata_from_headers["trace_id"] = chain_id
-            metadata_from_headers["session_id"] = chain_id
-            data["litellm_session_id"] = chain_id
-            data["litellm_trace_id"] = chain_id
+        if trace_id:
+            metadata_from_headers["trace_id"] = trace_id
+            data["litellm_trace_id"] = trace_id
             verbose_proxy_logger.debug(
-                f"Extracted chain_id from header (trace-id/session-id): {chain_id}"
+                f"Extracted trace_id from header: {trace_id}"
+            )
+
+        if session_id:
+            metadata_from_headers["session_id"] = session_id
+            data["litellm_session_id"] = session_id
+            verbose_proxy_logger.debug(
+                f"Extracted session_id from header: {session_id}"
             )
 
         if isinstance(data[_metadata_variable_name], dict):

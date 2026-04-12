@@ -1145,34 +1145,34 @@ async def test_add_litellm_metadata_from_request_headers():
         litellm.callbacks = original_callbacks
 
 
-def test_add_litellm_metadata_from_request_headers_x_litellm_trace_id_sets_chain_id():
-    """x-litellm-trace-id sets both metadata and top-level litellm_session_id/litellm_trace_id for call chaining."""
+def test_add_litellm_metadata_from_request_headers_x_litellm_trace_id_sets_trace_only():
+    """x-litellm-trace-id should only populate trace fields."""
     headers = {"x-litellm-trace-id": "foo"}
     data = {"metadata": {}}
     LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
     assert data["metadata"]["trace_id"] == "foo"
-    assert data["metadata"]["session_id"] == "foo"
-    assert data["litellm_session_id"] == "foo"
+    assert "session_id" not in data["metadata"]
+    assert "litellm_session_id" not in data
     assert data["litellm_trace_id"] == "foo"
 
 
-def test_add_litellm_metadata_from_request_headers_x_litellm_session_id_sets_chain_id():
-    """x-litellm-session-id sets both metadata and top-level litellm_session_id/litellm_trace_id for call chaining."""
+def test_add_litellm_metadata_from_request_headers_x_litellm_session_id_sets_session_only():
+    """x-litellm-session-id should only populate session fields."""
     headers = {"x-litellm-session-id": "bar"}
     data = {"metadata": {}}
     LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
-    assert data["metadata"]["trace_id"] == "bar"
     assert data["metadata"]["session_id"] == "bar"
     assert data["litellm_session_id"] == "bar"
-    assert data["litellm_trace_id"] == "bar"
+    assert "trace_id" not in data["metadata"]
+    assert "litellm_trace_id" not in data
 
 
-def test_add_litellm_metadata_from_request_headers_both_headers_trace_id_precedence():
-    """When both x-litellm-trace-id and x-litellm-session-id are present, trace-id takes precedence for chain_id."""
+def test_add_litellm_metadata_from_request_headers_both_headers_preserve_both_values():
+    """When both headers are present, trace and session should remain distinct."""
     headers = {
         "x-litellm-trace-id": "trace-value",
         "x-litellm-session-id": "session-value",
@@ -1182,8 +1182,8 @@ def test_add_litellm_metadata_from_request_headers_both_headers_trace_id_precede
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
     assert data["metadata"]["trace_id"] == "trace-value"
-    assert data["metadata"]["session_id"] == "trace-value"
-    assert data["litellm_session_id"] == "trace-value"
+    assert data["metadata"]["session_id"] == "session-value"
+    assert data["litellm_session_id"] == "session-value"
     assert data["litellm_trace_id"] == "trace-value"
 
 

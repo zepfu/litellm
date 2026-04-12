@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import hashlib
 import http.client
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -20,6 +22,7 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "scripts" / "local-ci" / "config.json"
+_CLAUDE_AGENT_NAME_RE = re.compile(r"You are '([^']+)' and you are working")
 
 
 def _utcnow() -> dt.datetime:
@@ -123,6 +126,7 @@ def _recent_langfuse_all_traces(
     secret_key: str,
     user_id: str | None,
     start_time: dt.datetime,
+    session_id: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     params = {
@@ -133,6 +137,8 @@ def _recent_langfuse_all_traces(
     }
     if user_id:
         params["userId"] = user_id
+    if session_id:
+        params["sessionId"] = session_id
     url = f"{query_url.rstrip('/')}/api/public/traces?{urllib.parse.urlencode(params)}"
     payload = _http_get_json(url, public_key, secret_key)
     traces = payload.get("data", [])
@@ -146,6 +152,48 @@ def _recent_langfuse_all_traces(
             continue
         recent.append(trace)
     return recent
+
+
+def _poll_langfuse_session_traces(
+    *,
+    query_url: str,
+    public_key: str,
+    secret_key: str,
+    user_id: str | None,
+    start_time: dt.datetime,
+    session_id: str,
+    timeout_seconds: int = 45,
+    interval_seconds: float = 3.0,
+) -> tuple[list[dict[str, Any]], str | None]:
+    deadline = time.time() + timeout_seconds
+    traces: list[dict[str, Any]] = []
+    last_error: str | None = None
+    while True:
+        try:
+            traces = _recent_langfuse_all_traces(
+                query_url=query_url,
+                public_key=public_key,
+                secret_key=secret_key,
+                user_id=user_id,
+                start_time=start_time,
+                session_id=session_id,
+                limit=100,
+            )
+            last_error = None
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            http.client.RemoteDisconnected,
+            ConnectionResetError,
+            TimeoutError,
+        ) as exc:
+            traces = []
+            last_error = str(exc)
+        if traces:
+            return traces, last_error
+        if time.time() >= deadline:
+            return traces, last_error
+        time.sleep(interval_seconds)
 
 
 def _recent_langfuse_generation_observations_for_trace_ids(
@@ -312,6 +360,144 @@ def _collect_trace_metadata(traces: list[dict[str, Any]]) -> list[dict[str, Any]
     return metadata_items
 
 
+def _parse_stdout_json_objects(stdout: str) -> list[dict[str, Any]]:
+    stripped = stdout.strip()
+    if not stripped:
+        return []
+
+    objects: list[dict[str, Any]] = []
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+
+    for line in stripped.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        try:
+            parsed_line = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed_line, dict):
+            objects.append(parsed_line)
+
+    return objects
+
+
+def _extract_command_session_id(stdout: str) -> str | None:
+    for obj in _parse_stdout_json_objects(stdout):
+        for key in ("session_id", "sessionId"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _extract_trace_environment(trace: dict[str, Any]) -> str | None:
+    value = trace.get("environment")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _extract_trace_session_id(trace: dict[str, Any]) -> str | None:
+    for key in ("sessionId", "session_id"):
+        value = trace.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _validate_trace_context(
+    *,
+    family: str,
+    traces: list[dict[str, Any]],
+    expected_environment: str | None = None,
+    require_trace_session_id: bool = False,
+    expected_trace_session_id: str | None = None,
+    require_trace_ids_distinct_from_session_ids: bool = False,
+) -> tuple[dict[str, Any], list[str]]:
+    failures: list[str] = []
+    trace_ids = sorted(
+        {str(trace.get("id")) for trace in traces if isinstance(trace.get("id"), str)}
+    )
+    environments = sorted(
+        {
+            environment
+            for trace in traces
+            if (environment := _extract_trace_environment(trace)) is not None
+        }
+    )
+    session_ids = sorted(
+        {
+            session_id
+            for trace in traces
+            if (session_id := _extract_trace_session_id(trace)) is not None
+        }
+    )
+    missing_environment_trace_ids = [
+        str(trace.get("id"))
+        for trace in traces
+        if _extract_trace_environment(trace) is None
+    ]
+    missing_session_id_trace_ids = [
+        str(trace.get("id"))
+        for trace in traces
+        if _extract_trace_session_id(trace) is None
+    ]
+
+    if expected_environment is not None:
+        unexpected_environment_trace_ids = [
+            str(trace.get("id"))
+            for trace in traces
+            if _extract_trace_environment(trace) != expected_environment
+        ]
+        if unexpected_environment_trace_ids:
+            failures.append(
+                f"{family} trace environment mismatch: expected `{expected_environment}`"
+            )
+    else:
+        unexpected_environment_trace_ids = []
+
+    if require_trace_session_id and missing_session_id_trace_ids:
+        failures.append(f"{family} missing trace sessionId")
+
+    if expected_trace_session_id is not None:
+        mismatched_session_trace_ids = [
+            str(trace.get("id"))
+            for trace in traces
+            if _extract_trace_session_id(trace) != expected_trace_session_id
+        ]
+        if mismatched_session_trace_ids:
+            failures.append(
+                f"{family} trace sessionId mismatch: expected `{expected_trace_session_id}`"
+            )
+    else:
+        mismatched_session_trace_ids = []
+
+    overlapping_trace_session_ids = sorted(set(trace_ids).intersection(session_ids))
+    if require_trace_ids_distinct_from_session_ids and overlapping_trace_session_ids:
+        failures.append(f"{family} trace ids collapsed into session ids")
+
+    summary = {
+        "trace_ids": trace_ids,
+        "trace_environments": environments,
+        "trace_session_ids": session_ids,
+        "missing_environment_trace_ids": missing_environment_trace_ids,
+        "missing_session_id_trace_ids": missing_session_id_trace_ids,
+        "unexpected_environment_trace_ids": unexpected_environment_trace_ids,
+        "mismatched_session_trace_ids": mismatched_session_trace_ids,
+        "overlapping_trace_session_ids": overlapping_trace_session_ids,
+    }
+    return summary, failures
+
+
 def _validate_trace_enrichment(
     *,
     family: str,
@@ -402,6 +588,17 @@ def _extract_logged_request_body(observation: dict[str, Any]) -> dict[str, Any] 
     return parsed if isinstance(parsed, dict) else None
 
 
+def _extract_claude_agent_name_from_observation(observation: dict[str, Any]) -> str | None:
+    request_body = _extract_logged_request_body(observation)
+    if not isinstance(request_body, dict):
+        return None
+    match = _CLAUDE_AGENT_NAME_RE.search(json.dumps(request_body))
+    if not match:
+        return None
+    agent_name = match.group(1).strip()
+    return agent_name or None
+
+
 def _collect_text_fragments(value: Any) -> list[str]:
     fragments: list[str] = []
     if isinstance(value, dict):
@@ -467,6 +664,100 @@ def _validate_logged_request_text_checks(
         "matched_observation_id": matched_observation_id,
         "required_substrings_found": matched_required,
         "forbidden_substring_hits": forbidden_hits,
+    }
+    return summary, failures
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _validate_logged_request_source_files(
+    *,
+    family: str,
+    observations: list[dict[str, Any]],
+    source_paths_key: str,
+    source_hashes_key: str | None = None,
+    source_bytes_key: str | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    failures: list[str] = []
+    checked_observation_ids: list[str] = []
+    checked_source_paths: list[str] = []
+    content_mismatch_paths: list[str] = []
+    metadata_hash_mismatch_paths: list[str] = []
+    metadata_bytes_mismatch_paths: list[str] = []
+    unreadable_source_paths: list[str] = []
+
+    for observation in observations:
+        metadata = observation.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        source_paths = metadata.get(source_paths_key)
+        if not isinstance(source_paths, list) or not any(
+            isinstance(path, str) and path.strip() for path in source_paths
+        ):
+            continue
+
+        request_body = _extract_logged_request_body(observation)
+        if request_body is None:
+            failures.append(f"{family} missing logged request body for source verification")
+            continue
+        request_text = "\n".join(_collect_text_fragments(request_body))
+        if not request_text:
+            failures.append(f"{family} missing logged request text for source verification")
+            continue
+
+        checked_observation_ids.append(str(observation.get("id")))
+        source_hashes = metadata.get(source_hashes_key) if source_hashes_key else None
+        source_bytes = metadata.get(source_bytes_key) if source_bytes_key else None
+
+        for index, source_path_value in enumerate(source_paths):
+            if not isinstance(source_path_value, str) or not source_path_value.strip():
+                continue
+            source_path = pathlib.Path(source_path_value)
+            checked_source_paths.append(str(source_path))
+            try:
+                file_text = source_path.read_text(encoding="utf-8", errors="replace").rstrip(
+                    "\n"
+                )
+            except Exception:
+                unreadable_source_paths.append(str(source_path))
+                continue
+
+            actual_hash = _sha256_text(file_text)
+            actual_bytes = len(file_text.encode("utf-8"))
+
+            if file_text not in request_text:
+                content_mismatch_paths.append(str(source_path))
+
+            if isinstance(source_hashes, list) and index < len(source_hashes):
+                metadata_hash = source_hashes[index]
+                if isinstance(metadata_hash, str) and metadata_hash != actual_hash:
+                    metadata_hash_mismatch_paths.append(str(source_path))
+
+            if isinstance(source_bytes, list) and index < len(source_bytes):
+                metadata_size = source_bytes[index]
+                if isinstance(metadata_size, int) and metadata_size != actual_bytes:
+                    metadata_bytes_mismatch_paths.append(str(source_path))
+
+    if not checked_observation_ids:
+        failures.append(f"{family} missing source-file metadata for request verification")
+    if unreadable_source_paths:
+        failures.append(f"{family} unreadable persisted-output source files")
+    if content_mismatch_paths:
+        failures.append(f"{family} logged request missing full persisted-output file contents")
+    if metadata_hash_mismatch_paths:
+        failures.append(f"{family} persisted-output content hash metadata mismatch")
+    if metadata_bytes_mismatch_paths:
+        failures.append(f"{family} persisted-output byte metadata mismatch")
+
+    summary = {
+        "checked_observation_ids": checked_observation_ids,
+        "checked_source_paths": checked_source_paths,
+        "content_mismatch_paths": content_mismatch_paths,
+        "metadata_hash_mismatch_paths": metadata_hash_mismatch_paths,
+        "metadata_bytes_mismatch_paths": metadata_bytes_mismatch_paths,
+        "unreadable_source_paths": unreadable_source_paths,
     }
     return summary, failures
 
@@ -730,6 +1021,7 @@ def _validate_codex(
 ) -> dict[str, Any]:
     started = _utcnow()
     run = _run_command(config["command"], timeout_seconds=int(config.get("timeout_seconds", 300)))
+    command_session_id = _extract_command_session_id(run["stdout"])
     post_run_wait_seconds = float(config.get("post_run_wait_seconds", 0) or 0)
     if post_run_wait_seconds > 0:
         time.sleep(post_run_wait_seconds)
@@ -777,6 +1069,17 @@ def _validate_codex(
         required_tag_prefixes=config.get("required_trace_tag_prefixes"),
     )
     failures.extend(trace_enrichment_failures)
+    trace_context_summary, trace_context_failures = _validate_trace_context(
+        family="codex",
+        traces=traces,
+        expected_environment=config.get("expected_trace_environment"),
+        require_trace_session_id=bool(config.get("require_trace_session_id")),
+        expected_trace_session_id=config.get("expected_trace_session_id"),
+        require_trace_ids_distinct_from_session_ids=bool(
+            config.get("require_trace_ids_distinct_from_session_ids")
+        ),
+    )
+    failures.extend(trace_context_failures)
     generation_metadata_summary, generation_metadata_failures = _validate_generation_metadata(
         family="codex",
         observations=_raw_generation_observations,
@@ -794,6 +1097,8 @@ def _validate_codex(
             "actual_user_ids": actual_user_ids,
             "trace_ids": trace_ids,
             "trace_count": len(traces),
+            "command_session_id": command_session_id,
+            "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,
             "generation_observations": generation_observations,
@@ -812,6 +1117,7 @@ def _validate_gemini(
 ) -> dict[str, Any]:
     started = _utcnow()
     run = _run_command(config["command"], timeout_seconds=int(config.get("timeout_seconds", 300)))
+    command_session_id = _extract_command_session_id(run["stdout"])
     post_run_wait_seconds = float(config.get("post_run_wait_seconds", 0) or 0)
     if post_run_wait_seconds > 0:
         time.sleep(post_run_wait_seconds)
@@ -870,6 +1176,21 @@ def _validate_gemini(
         required_tag_prefixes=config.get("required_trace_tag_prefixes"),
     )
     failures.extend(trace_enrichment_failures)
+    trace_context_summary, trace_context_failures = _validate_trace_context(
+        family="gemini",
+        traces=filtered_traces,
+        expected_environment=config.get("expected_trace_environment"),
+        require_trace_session_id=bool(config.get("require_trace_session_id")),
+        expected_trace_session_id=(
+            command_session_id
+            if config.get("match_trace_session_id_from_stdout")
+            else config.get("expected_trace_session_id")
+        ),
+        require_trace_ids_distinct_from_session_ids=bool(
+            config.get("require_trace_ids_distinct_from_session_ids")
+        ),
+    )
+    failures.extend(trace_context_failures)
     generation_metadata_summary, generation_metadata_failures = _validate_generation_metadata(
         family="gemini",
         observations=raw_generation_observations,
@@ -894,6 +1215,8 @@ def _validate_gemini(
             "trace_ids": trace_ids,
             "trace_count": len(traces),
             "filtered_trace_ids": filtered_trace_ids,
+            "command_session_id": command_session_id,
+            "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,
             "thought_signature_observed": gemini_signature_observed,
@@ -924,46 +1247,48 @@ def _validate_claude(
         extra_env=effective_config.get("env"),
         timeout_seconds=int(effective_config.get("timeout_seconds", 300)),
     )
+    command_session_id = _extract_command_session_id(run["stdout"])
     post_run_wait_seconds = float(effective_config.get("post_run_wait_seconds", 0) or 0)
     if post_run_wait_seconds > 0:
         time.sleep(post_run_wait_seconds)
     required_trace_names = effective_config.get("required_trace_names", [])
     expected_user_ids = effective_config.get("expected_user_ids", [])
-    traces, lookup_error = _poll_langfuse_required_name_traces(
-        query_url=query_url,
-        public_key=public_key,
-        secret_key=secret_key,
-        names=required_trace_names,
-        user_id=expected_user_ids[0] if expected_user_ids else None,
-        start_time=started,
-        limit=100,
-        timeout_seconds=int(effective_config.get("langfuse_poll_timeout_seconds", 60)),
-    )
+    if isinstance(command_session_id, str) and command_session_id.strip():
+        traces, lookup_error = _poll_langfuse_session_traces(
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            user_id=expected_user_ids[0] if expected_user_ids else None,
+            start_time=started,
+            session_id=command_session_id.strip(),
+            timeout_seconds=int(
+                effective_config.get("langfuse_poll_timeout_seconds", 60)
+            ),
+        )
+    else:
+        traces, lookup_error = _poll_langfuse_required_name_traces(
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            names=required_trace_names,
+            user_id=expected_user_ids[0] if expected_user_ids else None,
+            start_time=started,
+            limit=100,
+            timeout_seconds=int(
+                effective_config.get("langfuse_poll_timeout_seconds", 60)
+            ),
+        )
     actual_trace_names = sorted({trace.get("name") for trace in traces if trace.get("name")})
     actual_user_ids = sorted({trace.get("userId") for trace in traces if trace.get("userId")})
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
-    minimum_trace_count = int(
-        effective_config.get("minimum_trace_count", len(required_trace_names) or 1)
-    )
     failures: list[str] = []
     if run["exit_code"] != 0:
         failures.append("claude command failed")
     if lookup_error:
         failures.append(f"Claude Langfuse lookup warning: {lookup_error}")
-    for name in required_trace_names:
-        if name not in actual_trace_names:
-            failures.append(f"missing Claude trace name: {name}")
     for user_id in expected_user_ids:
         if user_id not in actual_user_ids:
             failures.append(f"missing Claude user id: {user_id}")
-    if len(actual_trace_names) < minimum_trace_count:
-        failures.append(
-            f"expected at least {minimum_trace_count} distinct Claude trace names, found {len(actual_trace_names)}"
-        )
-    if "claude-code.orchestrator" not in actual_trace_names:
-        failures.append("missing Claude orchestrator trace")
-    if len([name for name in actual_trace_names if name != "claude-code.orchestrator"]) == 0:
-        failures.append("missing Claude persona/subagent traces")
     (
         raw_generation_observations,
         generation_observations,
@@ -978,6 +1303,27 @@ def _validate_claude(
         allowed_request_routes=effective_config.get("allowed_generation_routes"),
     )
     failures.extend(generation_failures)
+    observed_agents = sorted(
+        {
+            agent_name
+            for observation in raw_generation_observations
+            if (agent_name := _extract_claude_agent_name_from_observation(observation))
+        }
+    )
+    required_agent_names = sorted(
+        {
+            name.removeprefix("claude-code.")
+            for name in required_trace_names
+            if isinstance(name, str) and name.strip()
+        }
+    )
+    for agent_name in required_agent_names:
+        if agent_name not in observed_agents:
+            failures.append(f"missing Claude agent observation: {agent_name}")
+    if "orchestrator" not in observed_agents:
+        failures.append("missing Claude orchestrator observation")
+    if len([name for name in observed_agents if name != "orchestrator"]) == 0:
+        failures.append("missing Claude persona/subagent observations")
     filtered_trace_ids = sorted(
         {
             observation.get("traceId")
@@ -995,6 +1341,21 @@ def _validate_claude(
         required_tag_prefixes=effective_config.get("required_trace_tag_prefixes"),
     )
     failures.extend(trace_enrichment_failures)
+    trace_context_summary, trace_context_failures = _validate_trace_context(
+        family="claude",
+        traces=filtered_traces,
+        expected_environment=effective_config.get("expected_trace_environment"),
+        require_trace_session_id=bool(effective_config.get("require_trace_session_id")),
+        expected_trace_session_id=(
+            command_session_id
+            if effective_config.get("match_trace_session_id_from_stdout")
+            else effective_config.get("expected_trace_session_id")
+        ),
+        require_trace_ids_distinct_from_session_ids=bool(
+            effective_config.get("require_trace_ids_distinct_from_session_ids")
+        ),
+    )
+    failures.extend(trace_context_failures)
     generation_metadata_summary, generation_metadata_failures = _validate_generation_metadata(
         family="claude",
         observations=raw_generation_observations,
@@ -1010,6 +1371,23 @@ def _validate_claude(
         forbidden_substrings=request_text_checks.get("forbidden_substrings"),
     )
     failures.extend(request_text_failures)
+    source_file_verification_config = effective_config.get(
+        "request_source_file_verification", {}
+    )
+    source_file_summary, source_file_failures = _validate_logged_request_source_files(
+        family="claude",
+        observations=raw_generation_observations,
+        source_paths_key=source_file_verification_config.get(
+            "source_paths_key", "claude_persisted_output_source_paths"
+        ),
+        source_hashes_key=source_file_verification_config.get(
+            "source_hashes_key", "claude_persisted_output_source_content_hashes"
+        ),
+        source_bytes_key=source_file_verification_config.get(
+            "source_bytes_key", "claude_persisted_output_source_bytes"
+        ),
+    )
+    failures.extend(source_file_failures)
     claude_signature_observed = any(
         _observation_has_claude_thinking_signature(observation)
         for observation in raw_generation_observations
@@ -1027,9 +1405,14 @@ def _validate_claude(
             "trace_count": len(traces),
             "lookup_error": lookup_error,
             "filtered_trace_ids": filtered_trace_ids,
+            "command_session_id": command_session_id,
+            "observed_agents": observed_agents,
+            "required_agent_names": required_agent_names,
+            "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,
             "request_text_checks": request_text_summary,
+            "request_source_file_verification": source_file_summary,
             "thought_signature_observed": claude_signature_observed,
             "generation_observations": generation_observations,
         },

@@ -21,6 +21,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _expand_claude_persisted_output_in_anthropic_request_body,
     _expand_claude_persisted_output_text,
     _prepare_anthropic_request_body_for_passthrough,
+    _prepare_request_body_for_passthrough_observability,
     anthropic_proxy_route,
     bedrock_llm_proxy_route,
     create_pass_through_route,
@@ -107,7 +108,9 @@ class TestClaudePersistedOutputExpansion:
             "</system-reminder>\n"
         )
 
-        expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(text)
+        expanded_text, was_expanded, hook_name, source_metadata = (
+            _expand_claude_persisted_output_text(text)
+        )
 
         assert was_expanded is True
         assert hook_name == "subagentstart"
@@ -115,6 +118,9 @@ class TestClaudePersistedOutputExpansion:
         assert "You are 'engineer'" in expanded_text
         assert expanded_text.startswith("<system-reminder>\nSubagentStart hook")
         assert expanded_text.endswith("</system-reminder>\n")
+        assert source_metadata is not None
+        assert source_metadata["path"] == str(persisted_file)
+        assert source_metadata["basename"] == persisted_file.name
 
     def test_expand_claude_persisted_output_text_sessionstart(self, tmp_path, monkeypatch):
         claude_root = tmp_path / ".claude" / "projects"
@@ -145,12 +151,16 @@ class TestClaudePersistedOutputExpansion:
             "</system-reminder>\n"
         )
 
-        expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(text)
+        expanded_text, was_expanded, hook_name, source_metadata = (
+            _expand_claude_persisted_output_text(text)
+        )
 
         assert was_expanded is True
         assert hook_name == "sessionstart"
         assert "SessionStart full persisted output." in expanded_text
         assert expanded_text.startswith("<system-reminder>\nSessionStart hook")
+        assert source_metadata is not None
+        assert source_metadata["path"] == str(persisted_file)
 
     def test_expand_claude_persisted_output_text_noop_outside_allowed_root(
         self, tmp_path, monkeypatch
@@ -173,11 +183,14 @@ class TestClaudePersistedOutputExpansion:
             "</system-reminder>\n"
         )
 
-        expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(text)
+        expanded_text, was_expanded, hook_name, source_metadata = (
+            _expand_claude_persisted_output_text(text)
+        )
 
         assert was_expanded is False
         assert hook_name is None
         assert expanded_text == text
+        assert source_metadata is None
 
     def test_expand_claude_persisted_output_in_anthropic_request_body(
         self, tmp_path, monkeypatch
@@ -220,8 +233,8 @@ class TestClaudePersistedOutputExpansion:
             ],
         }
 
-        updated_body, expanded_count, hooks = _expand_claude_persisted_output_in_anthropic_request_body(
-            request_body
+        updated_body, expanded_count, hooks, source_metadata_items = (
+            _expand_claude_persisted_output_in_anthropic_request_body(request_body)
         )
 
         assert expanded_count == 1
@@ -233,8 +246,20 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["claude_persisted_output_expanded"] is True
         assert litellm_metadata["claude_persisted_output_expanded_count"] == 1
         assert litellm_metadata["claude_persisted_output_hooks"] == ["subagentstart"]
+        assert litellm_metadata["claude_persisted_output_source_paths"] == [
+            str(persisted_file)
+        ]
+        assert litellm_metadata["claude_persisted_output_source_basenames"] == [
+            persisted_file.name
+        ]
+        assert len(litellm_metadata["claude_persisted_output_source_content_hashes"]) == 1
+        assert litellm_metadata["claude_persisted_output_source_bytes"] == [
+            len("expanded body payload".encode("utf-8"))
+        ]
         assert "claude-persisted-output-expanded" in litellm_metadata["tags"]
         assert "claude-persisted-output-hook:subagentstart" in litellm_metadata["tags"]
+        assert len(source_metadata_items) == 1
+        assert source_metadata_items[0]["path"] == str(persisted_file)
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_expands_persisted_output_before_passthrough(
@@ -317,14 +342,24 @@ class TestClaudePersistedOutputExpansion:
             assert "truncated preview" not in expanded_text
             litellm_metadata = expanded_body["litellm_metadata"]
             assert "claude-persisted-output-expanded" in litellm_metadata["tags"]
+            assert litellm_metadata["claude_persisted_output_source_paths"] == [
+                str(persisted_file)
+            ]
             assert (
                 "claude-persisted-output-hook:subagentstart"
                 in litellm_metadata["tags"]
             )
 
     def test_prepare_anthropic_request_body_extracts_billing_header(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
         request_body = {
             "model": "claude-opus-4-6",
+            "metadata": {
+                "user_id": {
+                    "session_id": "claude-session-123",
+                }
+            },
             "system": [
                 {
                     "type": "text",
@@ -343,7 +378,7 @@ class TestClaudePersistedOutputExpansion:
             expanded_count,
             hooks,
             billing_header_fields,
-        ) = _prepare_anthropic_request_body_for_passthrough(request_body)
+        ) = _prepare_anthropic_request_body_for_passthrough(mock_request, request_body)
 
         assert expanded_count == 0
         assert hooks == set()
@@ -359,19 +394,56 @@ class TestClaudePersistedOutputExpansion:
             "cc_version",
             "cch",
         ]
-        assert litellm_metadata["anthropic_billing_header_fields"] == {
-            "cc_version": "2.1.101.a4a",
-            "cc_entrypoint": "cli",
-            "cch": "42aab",
+        assert litellm_metadata["session_id"] == "claude-session-123"
+
+    def test_prepare_anthropic_request_body_extracts_session_from_stringified_user_id(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {
+                "user_id": json.dumps(
+                    {
+                        "device_id": "device-123",
+                        "account_uuid": "account-123",
+                        "session_id": "claude-session-json-123",
+                    }
+                )
+            },
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.101.a4a; cc_entrypoint=cli; cch=42aab;",
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
         }
-        assert "anthropic-billing-header" in litellm_metadata["tags"]
-        assert (
-            "anthropic-billing-header-key:cc_version" in litellm_metadata["tags"]
+
+        updated_body, _, _, _ = _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
         )
-        assert (
-            "anthropic-billing-header:cc_entrypoint=cli"
-            in litellm_metadata["tags"]
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "claude-session-json-123"
+
+    def test_prepare_request_body_for_passthrough_observability_sets_environment_and_session(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "header-session-abc"}
+        request_body = {"model": "gpt-5.4", "input": "hello"}
+
+        updated_body = _prepare_request_body_for_passthrough_observability(
+            mock_request,
+            request_body,
         )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "header-session-abc"
+        assert litellm_metadata["trace_environment"] == "dev"
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_extracts_billing_header_before_passthrough(
@@ -523,6 +595,52 @@ async def test_gemini_proxy_route_code_assist_oauth_passthrough_target():
     assert captured_call["_forward_headers"] is True
     assert captured_call["query_params"] == {}
 
+
+@pytest.mark.asyncio
+async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+    body = (
+        b'{"model":"gemini-3-flash-preview","request":{"session_id":"gemini-session-123"},'
+        b'"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
+    )
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/gemini/v1internal:generateContent",
+        "query_string": b"",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer ya29.test-oauth-token"),
+        ],
+    }
+
+    async def async_receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(scope=scope, receive=async_receive)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=AsyncMock(return_value={"ok": True}),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+        new=AsyncMock(return_value=MagicMock()),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body:
+        response = await gemini_proxy_route(
+            endpoint="v1internal:generateContent",
+            request=request,
+            fastapi_response=Response(),
+        )
+
+    assert response == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    prepared_body = mock_set_parsed_body.call_args.args[1]
+    litellm_metadata = prepared_body["litellm_metadata"]
+    assert litellm_metadata["session_id"] == "gemini-session-123"
+    assert litellm_metadata["trace_environment"] == "dev"
+
     def test_assemble_headers(self):
         print("\nTesting _assemble_headers method...")
 
@@ -592,6 +710,45 @@ async def test_gemini_proxy_route_code_assist_oauth_passthrough_target():
         # Verify endpoint_func was called with correct parameters
         print("Verifying endpoint_func call parameters...")
         mock_endpoint_func.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_base_openai_pass_through_handler_sets_trace_environment_and_session(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {"session_id": "codex-session-123"}
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value={"model": "gpt-5.4", "input": "hello"}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+            return_value=AsyncMock(return_value={"ok": True}),
+        ):
+            result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+                endpoint="/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+                base_target_url="https://api.openai.com",
+                api_key="test_api_key",
+                custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            )
+
+        assert result == {"ok": True}
+        mock_set_parsed_body.assert_called_once()
+        prepared_body = mock_set_parsed_body.call_args.args[1]
+        litellm_metadata = prepared_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "codex-session-123"
+        assert litellm_metadata["trace_environment"] == "dev"
         assert mock_endpoint_func.await_args is not None
         # The endpoint_func is called with request, fastapi_response, user_api_key_dict
         # No longer checking for stream and query_params as they're handled differently

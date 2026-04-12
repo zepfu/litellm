@@ -246,13 +246,17 @@ def _get_reasoning_state_tags(
     stripped_reasoning = reasoning_content.strip()
     tags: List[str] = []
     if stripped_reasoning:
+        tags.append("reasoning-present")
         tags.append(f"{provider_prefix}-reasoning-present")
     else:
+        tags.append("reasoning-empty")
         tags.append(f"{provider_prefix}-reasoning-empty")
 
     if thinking_blocks:
+        tags.append("thinking-blocks-present")
         tags.append(f"{provider_prefix}-thinking-blocks-present")
     else:
+        tags.append("thinking-blocks-empty")
         tags.append(f"{provider_prefix}-thinking-blocks-empty")
     return tags
 
@@ -337,9 +341,15 @@ def _enrich_claude_thinking_metadata(metadata: Dict[str, Any], message: Any) -> 
     if decode_errors:
         metadata["claude_thinking_decode_errors"] = decode_errors
 
-    tags_to_add = ["claude-thinking-signature"]
+    metadata["thinking_signature_present"] = True
+    metadata["thinking_signature_decoded"] = decoded_any
+    metadata["reasoning_content_present"] = bool(reasoning_content.strip())
+    metadata["reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
+    metadata["thinking_blocks_present"] = len(thinking_blocks) > 0
+
+    tags_to_add = ["claude-thinking-signature", "thinking-signature-present"]
     if decoded_any:
-        tags_to_add.append("claude-thinking-decoded")
+        tags_to_add.extend(["claude-thinking-decoded", "thinking-signature-decoded"])
     tags_to_add.extend(
         _get_reasoning_state_tags(
             provider_prefix="claude",
@@ -497,9 +507,17 @@ def _enrich_gemini_thought_signature_metadata(
     if decode_errors:
         metadata["gemini_tsig_decode_errors"] = decode_errors
 
-    tags_to_add = ["gemini-thought-signature"]
+    metadata["thinking_signature_present"] = True
+    metadata["thinking_signature_decoded"] = len(summaries) > 0
+    metadata["reasoning_content_present"] = bool(reasoning_content.strip())
+    metadata["reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
+    metadata["thinking_blocks_present"] = len(thinking_blocks) > 0
+
+    tags_to_add = ["gemini-thought-signature", "thinking-signature-present"]
     if summaries:
-        tags_to_add.append("gemini-thought-signature-decoded")
+        tags_to_add.extend(
+            ["gemini-thought-signature-decoded", "thinking-signature-decoded"]
+        )
         for shape_hash in sorted(set(shape_hashes)):
             tags_to_add.append(f"gemini-tsig-shape:{shape_hash}")
         for record_count in sorted({summary["record_count"] for summary in summaries}):

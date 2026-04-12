@@ -48,7 +48,8 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.ip_address_utils import IPAddressUtils
 from litellm.proxy.litellm_pre_call_utils import (
     LiteLLMProxyRequestSetup,
-    get_chain_id_from_headers,
+    get_session_id_from_headers,
+    get_trace_id_from_headers,
 )
 from litellm.types.mcp import MCPAuth
 from litellm.types.mcp_server.mcp_server_manager import MCPInfo, MCPServer
@@ -372,11 +373,13 @@ if MCP_AVAILABLE:
         try:
             # Create a body date for logging
             body_data = {"name": name, "arguments": arguments}
-            # Set trace/session id from raw_headers so spend logs and logging_obj stay consistent (same as A2A)
-            chain_id = get_chain_id_from_headers(raw_headers)
-            if chain_id:
-                body_data["litellm_trace_id"] = chain_id
-                body_data["litellm_session_id"] = chain_id
+            # Preserve trace/session separately so one session can contain multiple traces.
+            trace_id = get_trace_id_from_headers(raw_headers)
+            session_id = get_session_id_from_headers(raw_headers)
+            if trace_id:
+                body_data["litellm_trace_id"] = trace_id
+            if session_id:
+                body_data["litellm_session_id"] = session_id
 
             request = Request(
                 scope={
@@ -1037,10 +1040,10 @@ if MCP_AVAILABLE:
             # This is intentionally minimal: only async_success_handler / post_call_failure_hook
             rules_obj = Rules()
             list_tools_call_id = str(uuid.uuid4())
-            # Derive trace_id from raw_headers when not explicitly passed (same as A2A / MCP call_tool)
-            effective_litellm_trace_id = litellm_trace_id or get_chain_id_from_headers(
+            effective_litellm_trace_id = litellm_trace_id or get_trace_id_from_headers(
                 raw_headers
             )
+            effective_litellm_session_id = get_session_id_from_headers(raw_headers)
             spend_logs_metadata: Dict[str, Any] = {
                 "mcp_operation": "list_tools",
             }
@@ -1054,6 +1057,7 @@ if MCP_AVAILABLE:
                 "call_type": CallTypes.list_mcp_tools.value,
                 "litellm_call_id": list_tools_call_id,
                 "litellm_trace_id": effective_litellm_trace_id,
+                "litellm_session_id": effective_litellm_session_id,
                 "metadata": {
                     "spend_logs_metadata": spend_logs_metadata,
                 },

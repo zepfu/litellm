@@ -423,7 +423,7 @@ async def common_checks(  # noqa: PLR0915
     # Require trace id for agent keys when agent has require_trace_id_on_calls_by_agent
     if valid_token is not None and valid_token.agent_id:
         from litellm.proxy.agent_endpoints.agent_registry import global_agent_registry
-        from litellm.proxy.litellm_pre_call_utils import get_chain_id_from_headers
+        from litellm.proxy.litellm_pre_call_utils import get_trace_id_from_headers
 
         agent = global_agent_registry.get_agent_by_id(agent_id=valid_token.agent_id)
         if agent is not None:
@@ -432,7 +432,7 @@ async def common_checks(  # noqa: PLR0915
             )
             if require_trace_id:
                 headers_dict = dict(request.headers)
-                trace_id = get_chain_id_from_headers(headers_dict)
+                trace_id = get_trace_id_from_headers(headers_dict)
                 if not trace_id:
                     raise ProxyException(
                         message="Requests made with this agent's key must include the x-litellm-trace-id header.",
