@@ -258,6 +258,20 @@ class TestClaudePersistedOutputExpansion:
         ]
         assert "claude-persisted-output-expanded" in litellm_metadata["tags"]
         assert "claude-persisted-output-hook:subagentstart" in litellm_metadata["tags"]
+        assert isinstance(litellm_metadata["langfuse_spans"], list)
+        assert litellm_metadata["langfuse_spans"][0]["name"] == (
+            "claude.persisted_output_expand"
+        )
+        assert litellm_metadata["langfuse_spans"][0]["metadata"]["expanded_count"] == 1
+        assert litellm_metadata["langfuse_spans"][0]["metadata"]["hooks"] == [
+            "subagentstart"
+        ]
+        assert (
+            litellm_metadata["langfuse_spans"][0]["metadata"]["source_paths"]
+            == [str(persisted_file)]
+        )
+        assert "start_time" in litellm_metadata["langfuse_spans"][0]
+        assert "end_time" in litellm_metadata["langfuse_spans"][0]
         assert len(source_metadata_items) == 1
         assert source_metadata_items[0]["path"] == str(persisted_file)
 
