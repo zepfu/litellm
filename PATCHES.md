@@ -29,11 +29,12 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7` (6 active patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8` (7 active patches)
 
 **Version metadata note:** `pyproject.toml` should stay aligned to this
 registry's carried patch set. `litellm/_version.py` now reflects the installed
-distribution version directly.
+distribution version directly. The current working tree includes `aawm.8`;
+bump package/version metadata when this checkpoint is committed.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -177,6 +178,43 @@ observability layer.
 
 **Validation status:** Real `codex exec -p litellm` traffic succeeded through
 `litellm-dev`, and Langfuse persisted traces with `name = "codex"`.
+
+---
+
+### aawm.8 — Codex streamed usage normalization and cost preservation
+
+**Files:**
+- `litellm/litellm_core_utils/llm_response_utils/convert_dict_to_response.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_openai_passthrough_logging_handler.py`
+- `tests/llm_translation/test_llm_response_utils/test_convert_dict_to_chat_completion.py`
+
+**Upstream issue:** Native Codex passthrough responses carry Responses-API-style
+usage (`input_tokens`, `output_tokens`, `input_tokens_details`, etc.), but the
+chat-completion conversion and passthrough streaming logging paths were
+normalizing them incorrectly. The result was a successful Codex response with
+`prompt_tokens = 0`, `completion_tokens = 0`, and `response_cost = None` inside
+LiteLLM even though Codex CLI itself reported non-zero usage.
+
+**Fix:**
+1. Normalize Responses-API-style usage dicts before constructing `Usage` in the
+   completion-response conversion path.
+2. Detect `/responses` streaming routes in the OpenAI passthrough logging
+   handler and rebuild the final response from the actual `response.completed`
+   event instead of the chat-completions stream builder.
+3. Calculate passthrough streaming cost with `call_type="responses"` so Codex
+   usage is costed on the correct path.
+4. Add focused regression tests for both the direct conversion path and the
+   streamed passthrough logging path.
+
+**Why not upstream:** Upstream's generic OpenAI passthrough logging path does
+not cover this Codex-native `/backend-api/codex/responses` streaming shape.
+This fork needs accurate usage and pricing for native Codex CLI observability.
+
+**Validation status:** Focused handler regression tests passed, and a fresh live
+`codex exec -p litellm` run against rebuilt `litellm-dev` showed non-zero
+`input_tokens`, `cached_input_tokens`, and `output_tokens` on the passthrough
+response-completed path instead of zeroed usage.
 
 ---
 

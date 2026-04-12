@@ -1970,3 +1970,30 @@ def test_additional_costs_only_for_azure_ai():
         completion_tokens=50,
     )
     assert result is None, "Vertex AI should have no additional costs"
+
+
+def test_gpt_realtime_mini_cached_text_input_cost():
+    from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
+    from litellm.types.utils import PromptTokensDetailsWrapper, Usage
+
+    usage = Usage(
+        completion_tokens=100,
+        prompt_tokens=1000,
+        total_tokens=1100,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            cached_tokens=800,
+            text_tokens=200,
+        ),
+    )
+
+    input_cost, output_cost = generic_cost_per_token(
+        model="gpt-realtime-mini",
+        usage=usage,
+        custom_llm_provider="openai",
+    )
+
+    expected_input_cost = (200 * 6e-07) + (800 * 6e-08)
+    expected_output_cost = 100 * 2.4e-06
+
+    assert input_cost == pytest.approx(expected_input_cost, rel=1e-12)
+    assert output_cost == pytest.approx(expected_output_cost, rel=1e-12)

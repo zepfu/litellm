@@ -16,8 +16,13 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.litellm_logging import (
     get_standard_logging_object_payload,
 )
+from litellm.completion_extras.litellm_responses_transformation.transformation import (
+    LiteLLMResponsesTransformationHandler,
+)
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.llms.openai.openai import OpenAIConfig as OpenAIConfigType
+from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+from litellm.responses.utils import ResponseAPILoggingUtils
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
     BasePassthroughLoggingHandler,
@@ -29,7 +34,13 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     EndpointType,
     PassthroughStandardLoggingPayload,
 )
-from litellm.types.utils import ImageResponse, LlmProviders, PassthroughCallTypes
+from litellm.types.utils import (
+    Choices,
+    ImageResponse,
+    LlmProviders,
+    Message,
+    PassthroughCallTypes,
+)
 from litellm.utils import ModelResponse, TextCompletionResponse
 
 
@@ -390,7 +401,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
             # Create standard logging object
             if litellm_model_response is not None:
-                get_standard_logging_object_payload(
+                kwargs["standard_logging_object"] = get_standard_logging_object_payload(
                     kwargs=kwargs,
                     init_response_obj=litellm_model_response,
                     start_time=start_time,
@@ -444,6 +455,9 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         all_chunks: list,
         litellm_logging_obj: LiteLLMLoggingObj,
         model: str,
+        url_route: str,
+        request_body: Optional[dict] = None,
+        litellm_params: Optional[dict] = None,
     ) -> Optional[Union[ModelResponse, TextCompletionResponse]]:
         """
         Builds complete response from raw chunks for OpenAI streaming responses.
@@ -453,6 +467,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         - Builds complete response from litellm chunks
         """
         try:
+            if self.is_openai_responses_route(url_route):
+                return self._build_complete_streaming_responses_api_response(
+                    all_chunks=all_chunks,
+                    litellm_logging_obj=litellm_logging_obj,
+                    model=model,
+                    request_body=request_body or {},
+                    litellm_params=litellm_params or {},
+                )
             # OpenAI's response iterator to parse chunks
             from litellm.llms.openai.openai import OpenAIChatCompletionResponseIterator
 
@@ -507,6 +529,99 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             )
             return None
 
+    def _build_complete_streaming_responses_api_response(
+        self,
+        all_chunks: list,
+        litellm_logging_obj: LiteLLMLoggingObj,
+        model: str,
+        request_body: dict,
+        litellm_params: dict,
+    ) -> Optional[ModelResponse]:
+        """
+        Rebuild a complete response from Responses API streaming events.
+
+        Native Codex passthrough streams the ChatGPT backend's `/responses` SSE shape.
+        Replaying those chunks through the chat-completions stream builder drops the
+        `response.completed.response.usage` payload, which then zeros out cost logging.
+        """
+        try:
+            from litellm.llms.base_llm.base_model_iterator import (
+                BaseModelResponseIterator,
+            )
+
+            responses_config = OpenAIResponsesAPIConfig()
+            responses_transformer = LiteLLMResponsesTransformationHandler()
+            completed_response = None
+            output_text_parts: List[str] = []
+
+            for chunk_str in all_chunks:
+                parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                    str_line=chunk_str
+                )
+                if not parsed_chunk:
+                    continue
+                if parsed_chunk.get("type") == "response.output_text.delta":
+                    delta = parsed_chunk.get("delta")
+                    if isinstance(delta, str):
+                        output_text_parts.append(delta)
+                transformed_chunk = responses_config.transform_streaming_response(
+                    model=model,
+                    parsed_chunk=parsed_chunk,
+                    logging_obj=litellm_logging_obj,
+                )
+                if getattr(transformed_chunk, "type", None) == "response.completed":
+                    completed_response = getattr(transformed_chunk, "response", None)
+
+            if completed_response is None:
+                verbose_proxy_logger.warning(
+                    "No response.completed event found in OpenAI responses stream"
+                )
+                return None
+
+            if len(getattr(completed_response, "output", []) or []) == 0:
+                # Codex streams can emit text only through response.output_text.delta
+                # while leaving response.completed.output empty.
+                model_response = litellm.ModelResponse()
+                model_response.model = model
+                model_response.choices = [
+                    Choices(
+                        message=Message(
+                            role="assistant", content="".join(output_text_parts)
+                        ),
+                        finish_reason="stop",
+                        index=0,
+                    )
+                ]
+                model_response.usage = (
+                    ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+                        completed_response.usage
+                    )
+                )
+                raw_response_hidden_params = getattr(
+                    completed_response, "_hidden_params", {}
+                )
+                if raw_response_hidden_params:
+                    model_response._hidden_params.update(raw_response_hidden_params)
+                return model_response
+
+            return responses_transformer.transform_response(
+                model=model,
+                raw_response=completed_response,
+                model_response=litellm.ModelResponse(),
+                logging_obj=litellm_logging_obj,
+                request_data=request_body,
+                messages=request_body.get("messages", []),
+                optional_params=request_body.get("optional_params", {}),
+                litellm_params=litellm_params,
+                encoding=litellm.encoding,
+                json_mode=False,
+            )
+        except Exception as e:
+            verbose_proxy_logger.error(
+                f"Error rebuilding complete responses API stream: {str(e)}"
+            )
+            return None
+
     @staticmethod
     def _handle_logging_openai_collected_chunks(
         litellm_logging_obj: LiteLLMLoggingObj,
@@ -528,10 +643,17 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             # Build complete response from chunks using our streaming handler
             handler = OpenAIPassthroughLoggingHandler()
             handler_instance = handler
+            is_responses = handler.is_openai_responses_route(url_route)
+            existing_litellm_params = (
+                litellm_logging_obj.model_call_details.get("litellm_params", {}) or {}
+            )
             complete_response = handler._build_complete_streaming_response(
                 all_chunks=all_chunks,
                 litellm_logging_obj=litellm_logging_obj,
                 model=model,
+                url_route=url_route,
+                request_body=request_body,
+                litellm_params=existing_litellm_params,
             )
 
             if complete_response is None:
@@ -551,13 +673,10 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 completion_response=complete_response,
                 model=model,
                 custom_llm_provider=custom_llm_provider,
+                call_type="responses" if is_responses else None,
             )
 
             # Preserve existing litellm_params to maintain metadata tags
-            existing_litellm_params = (
-                litellm_logging_obj.model_call_details.get("litellm_params", {}) or {}
-            )
-
             # Prepare kwargs for logging
             kwargs = {
                 "response_cost": response_cost,
@@ -587,7 +706,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     )["headers"] = request_headers
 
             # Create standard logging object
-            get_standard_logging_object_payload(
+            kwargs["standard_logging_object"] = get_standard_logging_object_payload(
                 kwargs=kwargs,
                 init_response_obj=complete_response,
                 start_time=start_time,

@@ -17,6 +17,7 @@ fi
 
 export LANGFUSE_QUERY_URL="${LANGFUSE_QUERY_URL:-http://127.0.0.1:3000}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+CLAUDE_FANOUT_MODE="${CLAUDE_FANOUT_MODE:-minimal}"
 
 compute_build_fingerprint() {
   "$PYTHON_BIN" - <<'PY'
@@ -118,4 +119,5 @@ fi
 
 exec "$PYTHON_BIN" scripts/local-ci/run_acceptance.py \
   --config scripts/local-ci/config.json \
+  --claude-fanout-mode "$CLAUDE_FANOUT_MODE" \
   --write-artifact "$ARTIFACT_PATH"

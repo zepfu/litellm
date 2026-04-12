@@ -20,6 +20,10 @@
     "expected_user_ids": [
       "litellm"
     ],
+    "post_run_wait_seconds": 2,
+    "allowed_generation_routes": [
+      "/openai_passthrough/responses"
+    ],
     "streaming_checked": false,
     "timeout_seconds": 180
   },
@@ -37,6 +41,27 @@
     "expected_user_ids": [
       "litellm"
     ],
+    "post_run_wait_seconds": 8,
+    "allowed_generation_routes": [
+      "/gemini/v1internal:generateContent",
+      "/gemini/v1internal:streamGenerateContent"
+    ],
+    "required_trace_tags": [
+      "gemini-thought-signature",
+      "gemini-thought-signature-decoded"
+    ],
+    "required_trace_tag_prefixes": [
+      "gemini-tsig-records:",
+      "gemini-tsig-shape:"
+    ],
+    "required_generation_metadata_truthy": [
+      "gemini_thought_signature_present",
+      "gemini_tsig_shape_hash"
+    ],
+    "required_generation_metadata_minimums": {
+      "gemini_thought_signature_count": 1,
+      "gemini_tsig_record_count": 1
+    },
     "streaming_checked": true,
     "timeout_seconds": 180
   },
@@ -56,9 +81,84 @@
       "claude-code.eyes",
       "claude-code.grunt"
     ],
+    "fanout_modes": {
+      "minimal": {
+        "command": [
+          "claude",
+          "-p",
+          "@/home/zepfu/projects/litellm/scripts/local-ci/claude_acceptance_prompt.txt",
+          "--output-format",
+          "json"
+        ],
+        "required_trace_names": [
+          "claude-code.orchestrator",
+          "claude-code.eyes",
+          "claude-code.grunt"
+        ],
+        "minimum_trace_count": 3
+      },
+      "full": {
+        "command": [
+          "claude",
+          "-p",
+          "@/home/zepfu/projects/litellm/scripts/local-ci/claude_acceptance_prompt_full_fanout.txt",
+          "--output-format",
+          "json"
+        ],
+        "required_trace_names": [
+          "claude-code.orchestrator",
+          "claude-code.analyst",
+          "claude-code.data",
+          "claude-code.engineer",
+          "claude-code.eyes",
+          "claude-code.grunt",
+          "claude-code.infra",
+          "claude-code.ops",
+          "claude-code.qa",
+          "claude-code.release",
+          "claude-code.researcher",
+          "claude-code.salvage",
+          "claude-code.tester",
+          "claude-code.writer"
+        ],
+        "minimum_trace_count": 14
+      }
+    },
     "expected_user_ids": [
       "litellm.fork"
     ],
+    "post_run_wait_seconds": 2,
+    "allowed_generation_routes": [
+      "/anthropic/v1/messages"
+    ],
+    "required_trace_tags": [
+      "anthropic-billing-header",
+      "claude-persisted-output-expanded"
+    ],
+    "required_trace_tag_prefixes": [
+      "anthropic-billing-header-key:cc_version",
+      "anthropic-billing-header-key:cc_entrypoint",
+      "anthropic-billing-header-key:cch",
+      "claude-persisted-output-hook:sessionstart",
+      "claude-persisted-output-hook:subagentstart"
+    ],
+    "required_generation_metadata_truthy": [
+      "anthropic_billing_header_present",
+      "claude_persisted_output_expanded"
+    ],
+    "required_generation_metadata_minimums": {
+      "claude_persisted_output_expanded_count": 1
+    },
+    "request_text_checks": {
+      "required_substrings": [
+        "<persisted-output>",
+        "x-anthropic-billing-header:"
+      ],
+      "forbidden_substrings": [
+        "Output too large (",
+        "Preview (first 2KB):"
+      ]
+    },
     "minimum_trace_count": 3,
     "streaming_checked": true,
     "timeout_seconds": 180

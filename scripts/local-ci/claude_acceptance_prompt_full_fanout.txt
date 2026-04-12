@@ -1,0 +1,22 @@
+Dispatch to these personas in parallel:
+- analyst
+- data
+- engineer
+- eyes
+- grunt
+- infra
+- ops
+- qa
+- release
+- researcher
+- salvage
+- tester
+- writer
+
+Do not answer for them yourself. You must wait for actual responses from all listed personas before you summarize anything.
+
+Each persona should reply with only:
+- the current date
+- a short acknowledgement
+
+After all personas have actually responded, provide a short summary and exit.
