@@ -378,6 +378,19 @@ def _prepare_request_body_for_passthrough_observability(
     )
 
 
+def _add_route_family_logging_metadata(
+    request_body: dict[str, Any], route_family: str
+) -> dict[str, Any]:
+    normalized_route_family = _normalize_low_cardinality_tag_value(route_family)
+    if not normalized_route_family:
+        return request_body
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=[f"route:{normalized_route_family}"],
+        extra_fields={"passthrough_route_family": normalized_route_family},
+    )
+
+
 def _normalize_low_cardinality_tag_value(value: Any) -> Optional[str]:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -763,6 +776,9 @@ def _prepare_anthropic_request_body_for_passthrough(
             updated_body,
             billing_header_fields,
         )
+    updated_body = _add_route_family_logging_metadata(
+        updated_body, "anthropic_messages"
+    )
     updated_body = _add_claude_request_breakout_logging_metadata(updated_body)
     updated_body = _prepare_request_body_for_passthrough_observability(
         request=request,
@@ -1021,6 +1037,15 @@ async def gemini_proxy_route(
         request_body = await get_request_body(request)
         prepared_request_body = _add_gemini_request_breakout_logging_metadata(
             request_body
+        )
+        gemini_route_family = (
+            "gemini_stream_generate_content"
+            if "streamgeneratecontent" in endpoint.lower()
+            else "gemini_generate_content"
+        )
+        prepared_request_body = _add_route_family_logging_metadata(
+            prepared_request_body,
+            gemini_route_family,
         )
         prepared_request_body = _prepare_request_body_for_passthrough_observability(
             request=request,
@@ -2851,6 +2876,10 @@ class BaseOpenAIPassThroughHandler:
             if _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
                 endpoint
             ):
+                prepared_request_body = _add_route_family_logging_metadata(
+                    prepared_request_body,
+                    "codex_responses",
+                )
                 prepared_request_body = _add_codex_request_breakout_logging_metadata(
                     prepared_request_body
                 )

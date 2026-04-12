@@ -28,6 +28,7 @@
       "/openai_passthrough/responses"
     ],
     "required_trace_tags": [
+      "route:codex_responses",
       "codex-effort:xhigh",
       "effort:xhigh",
       "codex-tool-choice:auto",
@@ -35,6 +36,7 @@
       "codex-include:reasoning.encrypted_content"
     ],
     "required_generation_metadata_truthy": [
+      "passthrough_route_family",
       "codex_reasoning_effort",
       "codex_tool_choice",
       "codex_parallel_tool_calls",
@@ -68,6 +70,7 @@
       "/gemini/v1internal:streamGenerateContent"
     ],
     "required_trace_tags": [
+      "route:gemini_generate_content",
       "gemini-thinking-config-present",
       "gemini-thinking-budget-configured",
       "gemini-thought-signature",
@@ -82,6 +85,7 @@
       "gemini-tsig-shape:"
     ],
     "required_generation_metadata_truthy": [
+      "passthrough_route_family",
       "gemini_thinking_config_present",
       "gemini_thought_signature_present",
       "gemini_tsig_shape_hash"
@@ -165,6 +169,7 @@
       "/anthropic/v1/messages"
     ],
     "required_trace_tags": [
+      "route:anthropic_messages",
       "anthropic-billing-header",
       "claude-persisted-output-expanded",
       "claude-thinking-type:adaptive",
@@ -186,6 +191,7 @@
       "claude-persisted-output-hook:subagentstart"
     ],
     "required_generation_metadata_truthy": [
+      "passthrough_route_family",
       "anthropic_billing_header_present",
       "claude_persisted_output_expanded",
       "claude_persisted_output_source_paths",
