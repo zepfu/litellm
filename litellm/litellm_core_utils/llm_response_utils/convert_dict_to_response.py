@@ -10,6 +10,7 @@ from litellm.constants import RESPONSE_FORMAT_TOOL_NAME
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     _extract_reasoning_content,
 )
+from litellm.responses.utils import ResponseAPILoggingUtils
 from litellm.types.llms.databricks import DatabricksTool
 from litellm.types.llms.openai import (
     ChatCompletionThinkingBlock,
@@ -644,7 +645,18 @@ def convert_to_model_response_object(  # noqa: PLR0915
             model_response_object.choices = choice_list  # type: ignore
 
             if "usage" in response_object and response_object["usage"] is not None:
-                usage_object = litellm.Usage(**response_object["usage"])
+                raw_usage = response_object["usage"]
+                if (
+                    isinstance(raw_usage, dict)
+                    and ResponseAPILoggingUtils._is_response_api_usage(raw_usage)
+                ):
+                    usage_object = (
+                        ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+                            raw_usage
+                        )
+                    )
+                else:
+                    usage_object = litellm.Usage(**raw_usage)
                 setattr(model_response_object, "usage", usage_object)
             if "created" in response_object:
                 model_response_object.created = _safe_convert_created_field(

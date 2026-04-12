@@ -8,6 +8,8 @@ Use litellm with Anthropic SDK, Vertex AI SDK, Cohere SDK, etc.
 
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional, Tuple, Union, cast
 
 import httpx
@@ -58,6 +60,17 @@ default_vertex_config = None
 
 passthrough_endpoint_router = PassthroughEndpointRouter()
 
+_CLAUDE_PERSISTED_OUTPUT_PATTERN = re.compile(
+    r"\A<system-reminder>\n"
+    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
+    r"Output too large \([^)]+\)\. Full output saved to: (?P<path>/[^\n]+)\n\n"
+    r"Preview \(first 2KB\):\n"
+    r"(?P<preview>.*)"
+    r"\n</persisted-output>\n</system-reminder>\n?\Z",
+    re.DOTALL,
+)
+_ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+
 
 def _is_openai_responses_endpoint(endpoint: str) -> bool:
     normalized_path = httpx.URL(endpoint).path.rstrip("/")
@@ -79,6 +92,262 @@ def _request_has_openai_client_auth(request: Request) -> bool:
         or headers.get("api-key")
         or headers.get("Api-Key")
     )
+
+
+def _is_claude_persisted_output_expansion_enabled() -> bool:
+    value = os.getenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _get_claude_persisted_output_root() -> Path:
+    return Path(
+        os.getenv(
+            "LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", "/home/zepfu/.claude/projects"
+        )
+    ).expanduser()
+
+
+def _resolve_claude_persisted_output_path(path_str: str) -> Optional[Path]:
+    try:
+        root = _get_claude_persisted_output_root().resolve(strict=True)
+        candidate = Path(path_str).expanduser().resolve(strict=True)
+    except Exception:
+        return None
+
+    if not candidate.is_file():
+        return None
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    if "tool-results" not in candidate.parts:
+        return None
+    if not candidate.name.endswith("-additionalContext.txt"):
+        return None
+    return candidate
+
+
+def _expand_claude_persisted_output_text(text: str) -> Tuple[str, bool, Optional[str]]:
+    if not _is_claude_persisted_output_expansion_enabled():
+        return text, False, None
+
+    match = _CLAUDE_PERSISTED_OUTPUT_PATTERN.match(text)
+    if match is None:
+        return text, False, None
+
+    resolved_path = _resolve_claude_persisted_output_path(match.group("path"))
+    if resolved_path is None:
+        return text, False, None
+
+    try:
+        file_text = resolved_path.read_text(encoding="utf-8", errors="replace").rstrip(
+            "\n"
+        )
+    except Exception:
+        return text, False, None
+
+    hook = match.group("hook")
+    expanded = (
+        "<system-reminder>\n"
+        f"{hook} hook additional context: <persisted-output>\n"
+        f"{file_text}\n"
+        "</persisted-output>\n"
+        "</system-reminder>\n"
+    )
+    return expanded, True, hook.lower()
+
+
+def _expand_claude_persisted_output_value(value: Any) -> Tuple[Any, int, set[str]]:
+    if isinstance(value, dict):
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            expanded_text, was_expanded, hook_name = _expand_claude_persisted_output_text(
+                value["text"]
+            )
+            if was_expanded:
+                updated_value = dict(value)
+                updated_value["text"] = expanded_text
+                return updated_value, 1, {hook_name} if hook_name else set()
+            return value, 0, set()
+
+        updated_dict: dict[str, Any] = {}
+        expanded_count = 0
+        hooks: set[str] = set()
+        changed = False
+        for key, child in value.items():
+            (
+                updated_child,
+                child_expanded_count,
+                child_hooks,
+            ) = _expand_claude_persisted_output_value(child)
+            updated_dict[key] = updated_child
+            expanded_count += child_expanded_count
+            hooks.update(child_hooks)
+            if updated_child is not child:
+                changed = True
+        return (updated_dict if changed else value), expanded_count, hooks
+
+    if isinstance(value, list):
+        updated_list = []
+        expanded_count = 0
+        hooks: set[str] = set()
+        changed = False
+        for child in value:
+            (
+                updated_child,
+                child_expanded_count,
+                child_hooks,
+            ) = _expand_claude_persisted_output_value(child)
+            updated_list.append(updated_child)
+            expanded_count += child_expanded_count
+            hooks.update(child_hooks)
+            if updated_child is not child:
+                changed = True
+        return (updated_list if changed else value), expanded_count, hooks
+
+    return value, 0, set()
+
+
+def _merge_litellm_metadata(
+    request_body: dict[str, Any],
+    *,
+    tags_to_add: Optional[list[str]] = None,
+    extra_fields: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    updated_body = dict(request_body)
+    litellm_metadata = dict(updated_body.get("litellm_metadata") or {})
+    existing_tags = litellm_metadata.get("tags") or []
+    if not isinstance(existing_tags, list):
+        existing_tags = []
+
+    merged_tags = list(existing_tags)
+    for tag in tags_to_add or []:
+        if tag not in merged_tags:
+            merged_tags.append(tag)
+
+    litellm_metadata["tags"] = merged_tags
+    if extra_fields:
+        litellm_metadata.update(extra_fields)
+
+    updated_body["litellm_metadata"] = litellm_metadata
+    return updated_body
+
+
+def _add_claude_persisted_output_logging_metadata(
+    request_body: dict[str, Any], expanded_count: int, hooks: set[str]
+) -> dict[str, Any]:
+    tags_to_add = ["claude-persisted-output-expanded"]
+    tags_to_add.extend(
+        f"claude-persisted-output-hook:{hook}" for hook in sorted(hooks) if hook
+    )
+    extra_fields: dict[str, Any] = {
+        "claude_persisted_output_expanded": True,
+        "claude_persisted_output_expanded_count": expanded_count,
+    }
+    if hooks:
+        extra_fields["claude_persisted_output_hooks"] = sorted(hooks)
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
+
+
+def _parse_anthropic_billing_header_text(text: str) -> dict[str, str]:
+    parsed_fields: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped_line = line.strip()
+        if not stripped_line.lower().startswith(_ANTHROPIC_BILLING_HEADER_PREFIX):
+            continue
+        raw_header_value = stripped_line.split(":", 1)[1].strip()
+        for segment in raw_header_value.split(";"):
+            cleaned_segment = segment.strip()
+            if not cleaned_segment or "=" not in cleaned_segment:
+                continue
+            key, value = cleaned_segment.split("=", 1)
+            cleaned_key = key.strip()
+            cleaned_value = value.strip()
+            if cleaned_key and cleaned_value:
+                parsed_fields[cleaned_key] = cleaned_value
+    return parsed_fields
+
+
+def _extract_anthropic_billing_header_fields(value: Any) -> dict[str, str]:
+    parsed_fields: dict[str, str] = {}
+
+    if isinstance(value, str):
+        return _parse_anthropic_billing_header_text(value)
+
+    if isinstance(value, dict):
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            parsed_fields.update(_parse_anthropic_billing_header_text(value["text"]))
+        for child in value.values():
+            parsed_fields.update(_extract_anthropic_billing_header_fields(child))
+        return parsed_fields
+
+    if isinstance(value, list):
+        for child in value:
+            parsed_fields.update(_extract_anthropic_billing_header_fields(child))
+
+    return parsed_fields
+
+
+def _extract_anthropic_billing_header_fields_from_request_body(
+    request_body: dict[str, Any]
+) -> dict[str, str]:
+    return _extract_anthropic_billing_header_fields(request_body.get("system"))
+
+
+def _add_anthropic_billing_header_logging_metadata(
+    request_body: dict[str, Any],
+    billing_header_fields: dict[str, str],
+) -> dict[str, Any]:
+    tags_to_add = ["anthropic-billing-header"]
+    for key in sorted(billing_header_fields):
+        value = billing_header_fields[key]
+        tags_to_add.append(f"anthropic-billing-header-key:{key}")
+        tags_to_add.append(f"anthropic-billing-header:{key}={value}")
+
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields={
+            "anthropic_billing_header_present": True,
+            "anthropic_billing_header_keys": sorted(billing_header_fields),
+            "anthropic_billing_header_fields": dict(billing_header_fields),
+        },
+    )
+
+
+def _expand_claude_persisted_output_in_anthropic_request_body(
+    request_body: dict[str, Any]
+) -> Tuple[dict[str, Any], int, set[str]]:
+    updated_body, expanded_count, hooks = _expand_claude_persisted_output_value(
+        request_body
+    )
+    if isinstance(updated_body, dict):
+        if expanded_count > 0:
+            updated_body = _add_claude_persisted_output_logging_metadata(
+                updated_body, expanded_count, hooks
+            )
+        return updated_body, expanded_count, hooks
+    return request_body, 0, set()
+
+
+def _prepare_anthropic_request_body_for_passthrough(
+    request_body: dict[str, Any]
+) -> Tuple[dict[str, Any], int, set[str], dict[str, str]]:
+    updated_body, expanded_count, hooks = _expand_claude_persisted_output_in_anthropic_request_body(
+        request_body
+    )
+    billing_header_fields = _extract_anthropic_billing_header_fields_from_request_body(
+        updated_body
+    )
+    if billing_header_fields:
+        updated_body = _add_anthropic_billing_header_logging_metadata(
+            updated_body,
+            billing_header_fields,
+        )
+    return updated_body, expanded_count, hooks, billing_header_fields
 
 
 def _request_uses_codex_native_auth(request: Request) -> bool:
@@ -705,6 +974,23 @@ async def anthropic_proxy_route(
         and anthropic_api_key is not None
     ):
         custom_headers["x-api-key"] = "{}".format(anthropic_api_key)
+
+    if request.method == "POST":
+        request_body = await get_request_body(request)
+        (
+            prepared_request_body,
+            expanded_count,
+            hooks,
+            billing_header_fields,
+        ) = _prepare_anthropic_request_body_for_passthrough(request_body)
+        if prepared_request_body is not request_body:
+            _safe_set_request_parsed_body(request, prepared_request_body)
+            verbose_proxy_logger.debug(
+                "Prepared Anthropic passthrough request body; expanded_persisted_output=%s hooks=%s billing_header_keys=%s",
+                expanded_count,
+                sorted(hooks),
+                sorted(billing_header_fields),
+            )
 
     ## check for streaming
     is_streaming_request = await is_streaming_request_fn(request)

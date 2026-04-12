@@ -458,6 +458,121 @@ def test_anthropic_web_search_in_model_info():
         ), f"Model {model} should have a search context cost per query"
 
 
+def test_gpt_5_4_variant_reasoning_effort_flags():
+    import json
+    from pathlib import Path
+
+    model_cost = json.loads(
+        Path("model_prices_and_context_window.json").read_text()
+    )
+
+    supported_variants = [
+        "gpt-5.4",
+        "gpt-5.4-2026-03-05",
+        "azure/gpt-5.4",
+        "azure/gpt-5.4-2026-03-05",
+        "chatgpt/gpt-5.4",
+    ]
+    for model in supported_variants:
+        model_info = model_cost[model]
+        assert model_info["supports_none_reasoning_effort"] is True
+        assert model_info["supports_xhigh_reasoning_effort"] is True
+
+    pro_variants = [
+        "gpt-5.4-pro",
+        "gpt-5.4-pro-2026-03-05",
+        "azure/gpt-5.4-pro",
+        "azure/gpt-5.4-pro-2026-03-05",
+        "chatgpt/gpt-5.4-pro",
+    ]
+    for model in pro_variants:
+        model_info = model_cost[model]
+        assert model_info["supports_none_reasoning_effort"] is False
+        assert model_info["supports_xhigh_reasoning_effort"] is True
+
+
+def test_gpt_5_4_mini_and_nano_entries_present():
+    import json
+    from pathlib import Path
+
+    model_cost = json.loads(
+        Path("model_prices_and_context_window.json").read_text()
+    )
+
+    expected_entries = {
+        "gpt-5.4-mini": {
+            "input_cost_per_token": 7.5e-07,
+            "cache_read_input_token_cost": 7.5e-08,
+            "output_cost_per_token": 4.5e-06,
+            "max_input_tokens": 400000,
+            "supports_computer_use": True,
+            "supports_file_search": True,
+        },
+        "gpt-5.4-mini-2026-03-17": {
+            "input_cost_per_token": 7.5e-07,
+            "cache_read_input_token_cost": 7.5e-08,
+            "output_cost_per_token": 4.5e-06,
+            "max_input_tokens": 400000,
+            "supports_computer_use": True,
+            "supports_file_search": True,
+        },
+        "gpt-5.4-nano": {
+            "input_cost_per_token": 2e-07,
+            "cache_read_input_token_cost": 2e-08,
+            "output_cost_per_token": 1.25e-06,
+            "max_input_tokens": 400000,
+            "supports_file_search": True,
+        },
+        "gpt-5.4-nano-2026-03-17": {
+            "input_cost_per_token": 2e-07,
+            "cache_read_input_token_cost": 2e-08,
+            "output_cost_per_token": 1.25e-06,
+            "max_input_tokens": 400000,
+            "supports_file_search": True,
+        },
+    }
+
+    for model, expected in expected_entries.items():
+        entry = model_cost[model]
+        assert entry["litellm_provider"] == "openai"
+        assert entry["mode"] == "chat"
+        assert entry["max_output_tokens"] == 128000
+        assert entry["supports_web_search"] is True
+        assert entry["supports_none_reasoning_effort"] is True
+        assert entry["supports_xhigh_reasoning_effort"] is True
+        for key, value in expected.items():
+            assert entry[key] == value
+
+
+def test_xai_grok_4_20_model_entries_present():
+    import json
+    from pathlib import Path
+
+    model_cost = json.loads(
+        Path("model_prices_and_context_window.json").read_text()
+    )
+
+    expected_entries = {
+        "xai/grok-4.20-multi-agent-beta-0309": True,
+        "xai/grok-4.20-beta-0309-reasoning": True,
+        "xai/grok-4.20-beta-0309-non-reasoning": False,
+    }
+
+    for model, supports_reasoning in expected_entries.items():
+        entry = model_cost[model]
+        assert entry["litellm_provider"] == "xai"
+        assert entry["input_cost_per_token"] == 2e-06
+        assert entry["cache_read_input_token_cost"] == 2e-07
+        assert entry["output_cost_per_token"] == 6e-06
+        assert entry["max_input_tokens"] == 2000000
+        assert entry["max_output_tokens"] == 2000000
+        assert entry["supports_function_calling"] is True
+        assert entry["supports_tool_choice"] is True
+        assert entry["supports_vision"] is True
+        assert entry["supports_web_search"] is True
+        assert entry.get("supports_reasoning", False) is supports_reasoning
+
+
 def test_cohere_embedding_optional_params():
     from litellm import get_optional_params_embeddings
 
@@ -997,6 +1112,13 @@ def test_supports_tool_choice_simple_tests():
     )
 
     assert litellm.utils.supports_tool_choice(model="perplexity/sonar") is False
+    assert litellm.utils.supports_tool_choice(model="openai/responses/gpt-5.4") is True
+    assert (
+        litellm.utils.supports_tool_choice(
+            model="responses/gpt-5.4", custom_llm_provider="openai"
+        )
+        is True
+    )
 
 
 def test_check_provider_match():

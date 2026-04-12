@@ -2399,6 +2399,9 @@ def supports_native_streaming(model: str, custom_llm_provider: Optional[str]) ->
             model=model, custom_llm_provider=custom_llm_provider
         )
 
+        if model.startswith("responses/"):
+            model = model[len("responses/") :]
+
         model_info = _get_model_info_helper(
             model=model, custom_llm_provider=custom_llm_provider
         )
@@ -2537,6 +2540,9 @@ def _supports_factory(model: str, custom_llm_provider: Optional[str], key: str) 
         model, custom_llm_provider, _, _ = litellm.get_llm_provider(
             model=model, custom_llm_provider=custom_llm_provider
         )
+
+        if model.startswith("responses/"):
+            model = model[len("responses/") :]
 
         model_info = _get_model_info_helper(
             model=model, custom_llm_provider=custom_llm_provider

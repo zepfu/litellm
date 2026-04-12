@@ -273,6 +273,153 @@ class TestOpenAIPassthroughLoggingHandler:
             "https://chatgpt.com/backend-api/codex/responses"
         )
 
+    def test_openai_passthrough_handler_normalizes_responses_api_usage(self):
+        codex_response = {
+            "id": "resp-codex-usage-test",
+            "object": "response",
+            "created": 1775863780,
+            "model": "gpt-5.4",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "usage probe"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "input_tokens": 15517,
+                "output_tokens": 27,
+                "total_tokens": 15544,
+                "input_tokens_details": {"cached_tokens": 3456},
+                "output_tokens_details": {"reasoning_tokens": 0, "text_tokens": 27},
+            },
+        }
+        mock_httpx_response = self._create_mock_httpx_response(codex_response)
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+            httpx_response=mock_httpx_response,
+            response_body=codex_response,
+            logging_obj=mock_logging_obj,
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            result="",
+            start_time=self.start_time,
+            end_time=self.end_time,
+            cache_hit=False,
+            request_body={"model": "gpt-5.4", "input": "usage probe"},
+            passthrough_logging_payload=PassthroughStandardLoggingPayload(
+                url="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.4", "input": "usage probe"},
+                request_method="POST",
+            ),
+            litellm_params={},
+        )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        assert usage.prompt_tokens == 15517
+        assert usage.completion_tokens == 27
+        assert usage.total_tokens == 15544
+        assert usage.prompt_tokens_details.cached_tokens == 3456
+        assert usage.completion_tokens_details.text_tokens == 27
+        assert standard_logging_object["model"] == "gpt-5.4"
+        assert standard_logging_object["prompt_tokens"] == 15517
+        assert standard_logging_object["completion_tokens"] == 27
+        assert standard_logging_object["total_tokens"] == 15544
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_responses_api_usage(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.123
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":"priced codex"}',
+            'data: {"type":"response.completed","response":{"id":"resp-codex-stream","object":"response","created_at":1775863780,"status":"completed","model":"gpt-5.4","output":[{"type":"message","id":"msg_123","status":"completed","role":"assistant","content":[{"type":"output_text","text":"priced codex","annotations":[]}]}],"usage":{"input_tokens":15518,"output_tokens":25,"total_tokens":15543,"input_tokens_details":{"cached_tokens":6528},"output_tokens_details":{"reasoning_tokens":0,"text_tokens":25}}}}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4", "input": "priced codex"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        assert usage.prompt_tokens == 15518
+        assert usage.completion_tokens == 25
+        assert usage.total_tokens == 15543
+        assert usage.prompt_tokens_details.cached_tokens == 6528
+        assert usage.completion_tokens_details.text_tokens == 25
+        assert standard_logging_object["model"] == "gpt-5.4"
+        assert standard_logging_object["prompt_tokens"] == 15518
+        assert standard_logging_object["completion_tokens"] == 25
+        assert standard_logging_object["total_tokens"] == 15543
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
+        assert result["kwargs"]["response_cost"] == 0.123
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_codex_stream_with_empty_output(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.456
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-codex-stream","object":"response","created_at":1775868809,"status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.output_text.delta',
+            'data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":1,"content_index":0,"delta":"langfuse "}',
+            'event: response.output_text.delta',
+            'data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":1,"content_index":0,"delta":"fixed"}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-codex-stream","object":"response","created_at":1775868809,"status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":15519,"output_tokens":29,"total_tokens":15548,"input_tokens_details":{"cached_tokens":6528},"output_tokens_details":{"reasoning_tokens":19}}}}',
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4", "input": "langfuse fixed"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        assert result["result"].choices[0].message.content == "langfuse fixed"
+        assert usage.prompt_tokens == 15519
+        assert usage.completion_tokens == 29
+        assert usage.total_tokens == 15548
+        assert usage.prompt_tokens_details.cached_tokens == 6528
+        assert standard_logging_object["model"] == "gpt-5.4"
+        assert standard_logging_object["prompt_tokens"] == 15519
+        assert standard_logging_object["completion_tokens"] == 29
+        assert standard_logging_object["total_tokens"] == 15548
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
+        assert result["kwargs"]["response_cost"] == 0.456
+
     @patch('litellm.completion_cost')
     @patch('litellm.litellm_core_utils.litellm_logging.get_standard_logging_object_payload')
     def test_openai_passthrough_handler_with_user_tracking(self, mock_get_standard_logging, mock_completion_cost):
