@@ -7,7 +7,7 @@ import sys
 import pytest
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )  # Adds the parent directory to the system path
 import litellm
 
@@ -19,7 +19,7 @@ def setup_and_teardown():
     """
     curr_dir = os.getcwd()  # Get the current working directory
     sys.path.insert(
-        0, os.path.abspath("../..")
+        0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
     )  # Adds the project directory to the system path
 
     import litellm

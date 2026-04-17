@@ -29,12 +29,13 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8` (7 active patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11` (10 active patches)
 
 **Version metadata note:** `pyproject.toml` should stay aligned to this
 registry's carried patch set. `litellm/_version.py` now reflects the installed
-distribution version directly. The current working tree includes `aawm.8`;
-bump package/version metadata when this checkpoint is committed.
+distribution version directly. The current working tree includes `aawm.11`,
+but `pyproject.toml` still reports `1.82.3+aawm.7`; bump package/version
+metadata before the next release artifact/tag is cut.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -218,6 +219,73 @@ response-completed path instead of zeroed usage.
 
 ---
 
+### aawm.9 — Bridge Anthropic streaming payload into callback logging on the rebased base
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/anthropic_passthrough_logging_handler.py`
+
+**Upstream issue:** On the rebased `v1.82.3-stable.patch.4` base, the Anthropic
+streaming passthrough logging path rebuilt the final callback payload without
+the original `passthrough_logging_payload`. That meant downstream callback and
+logging code lost access to the request-side passthrough context during
+streaming Anthropic responses.
+
+**Fix:**
+1. Thread `passthrough_logging_payload` through
+   `AnthropicPassthroughLoggingHandler.chunk_creator()`.
+2. Reattach it when building the final kwargs passed into the Anthropic
+   callback/logging payload creation path.
+
+**Why not upstream:** This is a fork-carried compatibility bridge tied to the
+current rebased base and our callback/logging expectations on Anthropic
+streaming passthrough traffic. It is not part of the net-new observability span
+or tagging work; it restores request-context continuity that our existing
+callback flow depends on.
+
+**Validation status:** Included in the local acceptance runs that exercise
+Claude passthrough streaming through `litellm-dev`.
+
+---
+
+### aawm.10 — Expand Claude persisted-output wrappers before Anthropic passthrough send
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+
+**Upstream issue:** Recent Claude Code CLI releases truncate large
+`SubagentStart` / `SessionStart` additional-context payloads and replace them
+with a wrapper like:
+
+- `Output too large (...)`
+- `Full output saved to: /home/zepfu/.claude/projects/.../tool-results/...-additionalContext.txt`
+- `Preview (first 2KB): ...`
+
+This is not acceptable for the AAWM fork because subagents need to receive the
+full expanded context exactly as before, without being told to read a file
+manually.
+
+**Fix:**
+1. Detect the Claude persisted-output wrapper pattern in Anthropic passthrough
+   text blocks.
+2. Resolve the referenced file only when it is under the allowlisted Claude
+   projects root and matches the expected `tool-results/*-additionalContext.txt`
+   shape.
+3. Replace the truncated wrapper with the full file contents before the request
+   is sent upstream.
+
+**Why not upstream:** This is a Claude Code compatibility workaround for a
+specific local/private-machine workflow where LiteLLM is running on the same
+machine as Claude Code and can safely access the generated persisted-output
+files. It is not generic provider functionality.
+
+**Validation status:** Focused passthrough tests cover both `SubagentStart` and
+`SessionStart`, and the local acceptance harness verifies that the logged
+request text no longer contains the truncation wrapper and instead contains the
+fully expanded file contents.
+
+---
+
 ### aawm.7 — Gemini Code Assist native passthrough and logging fixes
 
 **Files:**
@@ -259,6 +327,41 @@ succeeded through `litellm-dev`, native `generateContent` and
 the Gemini traces.
 
 ---
+### aawm.11 — AAWM dynamic directive injection for Claude Anthropic passthrough
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+
+**Upstream issue:** AAWM-managed Claude prompt content needs a request-time
+expansion mechanism for dynamic context blocks such as agent memory. The model
+must see the expanded content, not a raw directive marker, and the resolution
+needs to happen on the Anthropic passthrough path after Claude persisted-output
+expansion but before the upstream request is sent.
+
+**Fix:**
+1. Add a generic `<!-- AAWM ... -->` directive parser on the Anthropic request
+   rewrite path.
+2. Extract trusted `agent` / `tenant` context from Claude's injected identity
+   line in the rewritten Anthropic request body.
+3. Resolve `p=get_agent_memories` against the configured AAWM Postgres stored
+   procedure `get_agent_memories(agent, tenant)`.
+4. Replace the directive inline with the returned markdown text, treat `NULL`
+   results as empty injections, and replace execution/config/context failures
+   with a short generic AAWM failure block.
+
+**Why not upstream:** This is AAWM-specific prompt/context control-plane
+functionality tied to our Anthropic passthrough workflow, local Claude Code
+request shape, and AAWM-backed context store. It is not generic LiteLLM
+provider behavior.
+
+**Validation status:** Focused passthrough tests cover successful injection,
+empty injection on `NULL`, failure replacement when required context is
+missing, persisted-output compatibility, and the now-async Anthropic request
+preparation path.
+
+---
+
 
 ## Dropped Patches
 

@@ -240,7 +240,12 @@ class AnthropicModelInfo(BaseLLMModelInfo):
 
     @staticmethod
     def _is_claude_4_6_model(model: str) -> bool:
-        """Check if the model is a Claude 4.6 model (Opus 4.6 or Sonnet 4.6)."""
+        """
+        Check if the model uses Anthropic's stable output_config effort API.
+
+        This covers Claude 4.6 models (Opus 4.6 or Sonnet 4.6) and the
+        native Claude Opus 4.7 alias.
+        """
         model_lower = model.lower()
         return any(
             v in model_lower
@@ -253,6 +258,10 @@ class AnthropicModelInfo(BaseLLMModelInfo):
                 "sonnet_4_6",
                 "sonnet-4.6",
                 "sonnet_4.6",
+                "opus-4-7",
+                "opus_4_7",
+                "opus-4.7",
+                "opus_4.7",
             )
         )
 
@@ -263,13 +272,15 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         Check if effort parameter is being used and requires a beta header.
 
         Returns True if effort-related parameters are present and
-        the model requires the effort beta header. Claude 4.6 models
-        use output_config as a stable API feature — no beta header needed.
+        the model requires the effort beta header. Claude 4.6 models and
+        Claude Opus 4.7 use output_config as a stable API feature — no beta
+        header needed.
         """
         if not optional_params:
             return False
 
-        # Claude 4.6 models use output_config as a stable API feature — no beta header needed
+        # Claude 4.6 models and Claude Opus 4.7 use output_config as a stable
+        # API feature — no beta header needed
         if model and self._is_claude_4_6_model(model):
             return False
 

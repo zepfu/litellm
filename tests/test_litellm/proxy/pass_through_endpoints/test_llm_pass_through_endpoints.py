@@ -364,7 +364,8 @@ class TestClaudePersistedOutputExpansion:
                 in litellm_metadata["tags"]
             )
 
-    def test_prepare_anthropic_request_body_extracts_billing_header(self):
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_extracts_billing_header(self):
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {}
         request_body = {
@@ -399,7 +400,7 @@ class TestClaudePersistedOutputExpansion:
             expanded_count,
             hooks,
             billing_header_fields,
-        ) = _prepare_anthropic_request_body_for_passthrough(mock_request, request_body)
+        ) = await _prepare_anthropic_request_body_for_passthrough(mock_request, request_body)
 
         assert expanded_count == 0
         assert hooks == set()
@@ -436,7 +437,8 @@ class TestClaudePersistedOutputExpansion:
         assert "claude-context-keep:all" in litellm_metadata["tags"]
         assert litellm_metadata["session_id"] == "claude-session-123"
 
-    def test_prepare_anthropic_request_body_extracts_session_from_stringified_user_id(
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_extracts_session_from_stringified_user_id(
         self,
     ):
         mock_request = MagicMock(spec=Request)
@@ -461,12 +463,610 @@ class TestClaudePersistedOutputExpansion:
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        updated_body, _, _, _ = _prepare_anthropic_request_body_for_passthrough(
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
             mock_request, request_body
         )
 
         litellm_metadata = updated_body["litellm_metadata"]
         assert litellm_metadata["session_id"] == "claude-session-json-123"
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_replaces_claude_auto_memory_section(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.110.abc; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Intro text before memory.\n\n"
+                        "# auto memory\n\n"
+                        "You have a persistent, file-based memory system at `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/memory/`. "
+                        "This directory already exists - write to it directly with the Write tool (do not run mkdir or check for its existence).\n\n"
+                        "If the user explicitly asks you to remember something, save it immediately as whichever type fits best. "
+                        "If they ask you to forget something, find and remove the relevant entry.\n\n"
+                        "## Types of memory\n\n"
+                        "There are several discrete types of memory that you can store in your memory system:\n\n"
+                        "<types>\n"
+                        "<type><name>user</name></type>\n"
+                        "<type><name>feedback</name></type>\n"
+                        "</types>\n\n"
+                        "## What NOT to save in memory\n\n"
+                        "- Old exclusion text.\n\n"
+                        "## How to save memories\n\n"
+                        "Old save flow.\n\n"
+                        "## When to access memories\n\n"
+                        "- Old access rules.\n\n"
+                        "## Before recommending from memory\n\n"
+                        "Verify the named file still exists.\n\n"
+                        "## Memory and other forms of persistence\n"
+                        "Memory is one of several persistence mechanisms.\n\n"
+                        "# Environment\n"
+                        "Other Claude system text.\n"
+                    ),
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        updated_system_text = updated_body["system"][1]["text"]
+        assert "persistent, file-based memory system at" not in updated_system_text
+        assert "write to it directly with the Write tool" not in updated_system_text
+        assert "memory_save(" in updated_system_text
+        assert "memory_forget(source_ids=[...])" in updated_system_text
+        assert "<types>\n<type><name>user</name></type>\n<type><name>feedback</name></type>\n</types>" in updated_system_text
+        assert "## What NOT to save in memory\n\n- Old exclusion text." in updated_system_text
+        assert "## Before recommending from memory\n\nVerify the named file still exists." in updated_system_text
+        assert "## Memory and other forms of persistence\nMemory is one of several persistence mechanisms." in updated_system_text
+        assert "# Environment\nOther Claude system text.\n" in updated_system_text
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["claude_system_prompt_override_count"] == 1
+        assert litellm_metadata["claude_system_prompt_override_ids"] == ["auto-memory"]
+        assert litellm_metadata["claude_system_prompt_override_failure_ids"] == []
+        assert litellm_metadata["claude_system_prompt_override_statuses"] == ["resolved"]
+        assert litellm_metadata["claude_system_prompt_override_cc_versions"] == ["2.1.110.abc"]
+        assert (
+            "context-replacement/claude-code/2.1.110/auto-memory-replacement.md"
+            in litellm_metadata["claude_system_prompt_override_template_paths"]
+        )
+        assert "claude-system-prompt-override" in litellm_metadata["tags"]
+        assert "claude-system-prompt-override:auto-memory" in litellm_metadata["tags"]
+        assert litellm_metadata["langfuse_spans"][0]["name"] == "claude.system_prompt_override"
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_skips_claude_auto_memory_override_for_unsupported_version(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        original_system_text = (
+            "# auto memory\n\n"
+            "You have a persistent, file-based memory system at `/tmp/memory/`.\n\n"
+            "## Types of memory\n\n"
+            "<types>\n<type><name>user</name></type>\n</types>\n\n"
+            "## What NOT to save in memory\n\n"
+            "- Old exclusion text.\n\n"
+            "## Before recommending from memory\n\n"
+            "Verify first.\n\n"
+            "## Memory and other forms of persistence\n"
+            "Old persistence text.\n\n"
+            "# Environment\n"
+        )
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.109.zzz; cc_entrypoint=cli; cch=42aab;",
+                },
+                {"type": "text", "text": original_system_text},
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        assert updated_body["system"][1]["text"] == original_system_text
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert "claude-system-prompt-override" not in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_applies_claude_auto_memory_override_for_newer_compatible_version(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.112.abc; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "# auto memory\n\n"
+                        "You have a persistent, file-based memory system at `/tmp/memory/`.\n\n"
+                        "## Types of memory\n\n"
+                        "<types>\n<type><name>user</name></type>\n</types>\n\n"
+                        "## What NOT to save in memory\n\n"
+                        "- Old exclusion text.\n\n"
+                        "## Before recommending from memory\n\n"
+                        "Verify first.\n\n"
+                        "## Memory and other forms of persistence\n"
+                        "Old persistence text.\n\n"
+                        "# Environment\n"
+                    ),
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        updated_system_text = updated_body["system"][1]["text"]
+        assert "persistent, file-based memory system at `/tmp/memory/`" not in updated_system_text
+        assert "memory_save(" in updated_system_text
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["claude_system_prompt_override_cc_versions"] == ["2.1.112.abc"]
+        assert "claude-system-prompt-override" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_applies_claude_prompt_patches(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        system_patch_before = (
+            "IMPORTANT: Go straight to the point. Try the simplest approach first without going in circles. "
+            "Do not overdo it. Be extra concise."
+        )
+        message_patch_before = (
+            "NOTE: You are meant to be a fast agent that returns output as quickly as possible. "
+            "In order to achieve this you must:\n"
+            "- Make efficient use of the tools that you have at your disposal: be smart about how you search for files and implementations\n"
+            "- Wherever possible you should try to spawn multiple parallel tool calls for grepping and reading files\n\n"
+            "Complete the user's search request efficiently and report your findings clearly."
+        )
+        security_patch_before = (
+            "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, "
+            "and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass "
+            "targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use "
+            "security tools (C2 frameworks, credential testing, exploit development) require clear "
+            "authorization context: pentesting engagements, CTF competitions, security research, or "
+            "defensive use cases."
+        )
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.112.abc; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": f"Prelude\n\n{system_patch_before}\n\n{security_patch_before}\n",
+                },
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": message_patch_before,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        updated_system_text = updated_body["system"][1]["text"]
+        updated_message_text = updated_body["messages"][0]["content"][0]["text"]
+        assert system_patch_before not in updated_system_text
+        assert (
+            "Choose the approach that correctly and completely solves the problem."
+            in updated_system_text
+        )
+        assert security_patch_before not in updated_system_text
+        assert (
+            "IMPORTANT: Assist with authorized security testing, defensive security, incident response, security research, CTF challenges, malware analysis, and educational use."
+            in updated_system_text
+        )
+        assert "Refuse requests for destructive techniques" not in updated_system_text
+        assert message_patch_before not in updated_message_text
+        assert "NOTE: Be thorough in your exploration." in updated_message_text
+        assert (
+            "Complete the user's search request thoroughly and report your findings clearly."
+            in updated_message_text
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["claude_prompt_patch_count"] == 3
+        assert litellm_metadata["claude_prompt_patch_replacement_count"] == 3
+        assert litellm_metadata["claude_prompt_patch_ids"] == [
+            "explore-agent-speed-note",
+            "output-efficiency-important-line",
+            "security-authorized-use-instruction",
+        ]
+        assert litellm_metadata["claude_prompt_patch_failure_ids"] == []
+        assert litellm_metadata["claude_prompt_patch_statuses"] == [
+            "resolved",
+            "resolved",
+            "resolved",
+        ]
+        assert litellm_metadata["claude_prompt_patch_cc_versions"] == ["2.1.112.abc"]
+        assert (
+            "context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json"
+            in litellm_metadata["claude_prompt_patch_manifest_paths"]
+        )
+        assert "claude-prompt-patch" in litellm_metadata["tags"]
+        assert (
+            "claude-prompt-patch:output-efficiency-important-line"
+            in litellm_metadata["tags"]
+        )
+        assert "claude-prompt-patch:explore-agent-speed-note" in litellm_metadata["tags"]
+        assert (
+            "claude-prompt-patch:security-authorized-use-instruction"
+            in litellm_metadata["tags"]
+        )
+        assert any(
+            span.get("name") == "claude.prompt_patch"
+            for span in litellm_metadata["langfuse_spans"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_skips_claude_prompt_patches_when_no_match(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.112.abc; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": "System text without any patch candidates.",
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert "claude-prompt-patch" not in litellm_metadata["tags"]
+        assert "claude_prompt_patch_ids" not in litellm_metadata
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_expands_aawm_dynamic_injection(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "<!-- AAWM p=get_agent_memories ctx=agent,tenant -->\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._call_aawm_get_agent_memories",
+            new=AsyncMock(return_value="# Feedback Memories\n[id:12345678] Memory line"),
+        ) as mock_get_agent_memories:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "<!-- AAWM" not in injected_text
+        assert "# Feedback Memories" in injected_text
+        mock_get_agent_memories.assert_awaited_once_with(
+            agent_name="eyes", tenant_id="aawm"
+        )
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_count"] == 1
+        assert litellm_metadata["aawm_dynamic_injection_procs"] == ["get_agent_memories"]
+        assert litellm_metadata["aawm_dynamic_injection_failure_procs"] == []
+        assert litellm_metadata["aawm_dynamic_injection_context_keys"] == ["agent", "tenant"]
+        assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["resolved"]
+        assert "aawm-dynamic-injection" in litellm_metadata["tags"]
+        assert "aawm-proc:get_agent_memories" in litellm_metadata["tags"]
+        assert litellm_metadata["langfuse_spans"][0]["name"] == "aawm.dynamic_injection"
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_expands_plaintext_aawm_dynamic_injection(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "AAWM p=get_agent_memories ctx=agent,tenant\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._call_aawm_get_agent_memories",
+            new=AsyncMock(return_value="# Feedback Memories\n[id:87654321] Memory line"),
+        ) as mock_get_agent_memories:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "\nAAWM p=get_agent_memories ctx=agent,tenant\n" not in injected_text
+        assert "# Feedback Memories" in injected_text
+        mock_get_agent_memories.assert_awaited_once_with(
+            agent_name="eyes", tenant_id="aawm"
+        )
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["resolved"]
+        assert "aawm-dynamic-injection" in litellm_metadata["tags"]
+        assert "aawm-proc:get_agent_memories" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_ignores_non_directive_aawm_text(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "AAWM maintains a managed fork of BerriAI/litellm for custom patches.\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._call_aawm_get_agent_memories",
+            new=AsyncMock(),
+        ) as mock_get_agent_memories:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert (
+            "AAWM maintains a managed fork of BerriAI/litellm for custom patches."
+            in injected_text
+        )
+        assert "litellm_metadata" not in updated_body or (
+            "aawm-dynamic-injection"
+            not in (updated_body["litellm_metadata"].get("tags") or [])
+        )
+        mock_get_agent_memories.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_expands_at_wrapped_aawm_dynamic_injection(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "@@@ AAWM p=get_agent_memories ctx=agent,tenant @@@\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._call_aawm_get_agent_memories",
+            new=AsyncMock(return_value="# Feedback Memories\n[id:99887766] Memory line"),
+        ) as mock_get_agent_memories:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "@@@ AAWM p=get_agent_memories ctx=agent,tenant @@@" not in injected_text
+        assert "# Feedback Memories" in injected_text
+        mock_get_agent_memories.assert_awaited_once_with(
+            agent_name="eyes", tenant_id="aawm"
+        )
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["resolved"]
+        assert "aawm-dynamic-injection" in litellm_metadata["tags"]
+        assert "aawm-proc:get_agent_memories" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_expands_aawm_dynamic_injection_to_no_memories_block(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'orchestrator' and you are working on the 'aawm' project.\n"
+                                "Before\n<!-- AAWM p=get_agent_memories ctx=agent,tenant -->\nAfter\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._call_aawm_get_agent_memories",
+            new=AsyncMock(return_value=None),
+        ):
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "<!-- AAWM" not in injected_text
+        assert 'AAWM "get_agent_memories" failed' not in injected_text
+        assert "# Memory Injection" in injected_text
+        assert "You have saved no memories as of yet." in injected_text
+        assert "Before\n# Memory Injection" in injected_text
+        assert "You have saved no memories as of yet.\n\nAfter" in injected_text
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["empty"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_tags_post_rewrite_context_files(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'orchestrator' and you are working on the 'litellm' project.\n"
+                                "Contents of /home/zepfu/.claude/projects/-home-zepfu-projects-litellm/memory/MEMORY.md:\n"
+                                "@@@ AAWM p=get_agent_memories ctx=agent,tenant @@@\n"
+                                "Contents of /home/zepfu/projects/litellm/CLAUDE.md:\n"
+                                "Project instructions.\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._call_aawm_get_agent_memories",
+            new=AsyncMock(return_value="# Project Memories\nMemory line"),
+        ):
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "# Project Memories" in injected_text
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["claude_post_rewrite_context_files_present"] == [
+            "MEMORY.md",
+            "CLAUDE.md",
+        ]
+        assert litellm_metadata["claude_post_rewrite_context_file_count"] == 2
+        assert "claude-post-rewrite-context-file-present" in litellm_metadata["tags"]
+        assert "claude-post-rewrite-context-file:memory-md" in litellm_metadata["tags"]
+        assert "claude-post-rewrite-context-file:claude-md" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_replaces_failed_aawm_dynamic_injection(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<!-- AAWM p=get_agent_memories ctx=agent,tenant -->\n",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._call_aawm_get_agent_memories",
+            new=AsyncMock(return_value="# should not be called"),
+        ) as mock_get_agent_memories:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert 'AAWM "get_agent_memories" failed for this session.' in injected_text
+        assert "Alert the user or session orchestrator." in injected_text
+        mock_get_agent_memories.assert_not_awaited()
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_failure_procs"] == ["get_agent_memories"]
+        assert "aawm-dynamic-injection-failed" in litellm_metadata["tags"]
 
     def test_prepare_request_body_for_passthrough_observability_sets_environment_and_session(
         self, monkeypatch

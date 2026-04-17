@@ -1,6 +1,7 @@
 # This file runs a health check for the LLM, used on litellm/proxy
 
 import asyncio
+from fnmatch import fnmatch
 import logging
 import random
 import sys
@@ -24,6 +25,51 @@ ILLEGAL_DISPLAY_PARAMS = [
 ]
 
 MINIMAL_DISPLAY_PARAMS = ["model", "mode_error"]
+
+
+def _deployment_requires_forwarded_client_headers(model: dict) -> bool:
+    configured_models = getattr(
+        getattr(litellm, "model_group_settings", None),
+        "forward_client_headers_to_llm_api",
+        None,
+    )
+    if not configured_models:
+        return False
+
+    litellm_params = model.get("litellm_params", {})
+    candidate_models = [
+        model.get("model_name"),
+        litellm_params.get("model"),
+    ]
+
+    for candidate in candidate_models:
+        if not candidate:
+            continue
+        for configured_model in configured_models:
+            if configured_model and fnmatch(candidate, configured_model):
+                return True
+    return False
+
+
+def _health_check_has_server_side_api_key(litellm_params: dict) -> bool:
+    try:
+        from litellm import get_llm_provider
+        from litellm.utils import get_api_key
+
+        model = litellm_params.get("model")
+        if not model:
+            return False
+
+        _, custom_llm_provider, dynamic_api_key, _ = get_llm_provider(
+            model=model,
+            custom_llm_provider=litellm_params.get("custom_llm_provider"),
+            api_base=litellm_params.get("api_base"),
+            api_key=litellm_params.get("api_key"),
+        )
+        resolved_api_key = get_api_key(custom_llm_provider, dynamic_api_key)
+        return bool(resolved_api_key)
+    except Exception:
+        return bool(litellm_params.get("api_key"))
 
 
 def _get_process_rss_mb() -> Optional[float]:
@@ -104,6 +150,14 @@ async def _run_model_health_check(model: dict):
     mode = model_info.get("mode", None)
     litellm_params = _update_litellm_params_for_health_check(model_info, litellm_params)
     timeout = model_info.get("health_check_timeout") or HEALTH_CHECK_TIMEOUT_SECONDS
+
+    if _deployment_requires_forwarded_client_headers(
+        model
+    ) and not _health_check_has_server_side_api_key(litellm_params):
+        return {
+            "status": "healthy",
+            "health_check_skipped": "forwarded_client_headers_required",
+        }
 
     return await run_with_timeout(
         litellm.ahealth_check(

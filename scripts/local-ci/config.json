@@ -177,11 +177,11 @@
     "required_trace_tags": [
       "route:anthropic_messages",
       "anthropic-billing-header",
+      "aawm-dynamic-injection",
+      "claude-system-prompt-override",
+      "claude-prompt-patch",
+      "claude-post-rewrite-context-file-present",
       "claude-persisted-output-expanded",
-      "claude-thinking-type:adaptive",
-      "thinking-type:adaptive",
-      "claude-effort:high",
-      "effort:high",
       "claude-context-edit:clear_thinking_20251015",
       "claude-context-keep:all",
       "thinking-signature-present",
@@ -190,19 +190,39 @@
       "thinking-blocks-present"
     ],
     "required_trace_tag_prefixes": [
+      "aawm-proc:get_agent_memories",
+      "claude-system-prompt-override:auto-memory",
+      "claude-prompt-patch:output-efficiency-important-line",
       "anthropic-billing-header-key:cc_version",
       "anthropic-billing-header-key:cc_entrypoint",
       "anthropic-billing-header-key:cch",
       "claude-persisted-output-hook:sessionstart",
-      "claude-persisted-output-hook:subagentstart"
+      "claude-persisted-output-hook:subagentstart",
+      "claude-thinking-type:",
+      "thinking-type:",
+      "claude-effort:",
+      "effort:"
     ],
     "required_span_names": [
+      "claude.system_prompt_override",
       "claude.persisted_output_expand",
       "claude.thinking_signature_decode"
     ],
     "required_generation_metadata_truthy": [
       "passthrough_route_family",
       "anthropic_billing_header_present",
+      "aawm_dynamic_injection_procs",
+      "aawm_dynamic_injection_context_keys",
+      "aawm_dynamic_injection_statuses",
+      "claude_system_prompt_override_ids",
+      "claude_system_prompt_override_statuses",
+      "claude_system_prompt_override_cc_versions",
+      "claude_system_prompt_override_template_paths",
+      "claude_prompt_patch_ids",
+      "claude_prompt_patch_statuses",
+      "claude_prompt_patch_cc_versions",
+      "claude_prompt_patch_manifest_paths",
+      "claude_post_rewrite_context_files_present",
       "claude_persisted_output_expanded",
       "claude_persisted_output_source_paths",
       "claude_persisted_output_source_content_hashes",
@@ -212,8 +232,29 @@
       "claude_context_keep_values"
     ],
     "required_generation_metadata_minimums": {
+      "aawm_dynamic_injection_count": 1,
+      "claude_system_prompt_override_count": 1,
+      "claude_prompt_patch_count": 1,
       "claude_persisted_output_expanded_count": 1,
       "claude_context_edit_count": 1
+    },
+    "aawm_dynamic_injection": {
+      "required_proc": "get_agent_memories",
+      "required_context_keys": [
+        "agent",
+        "tenant"
+      ],
+      "acceptable_statuses": [
+        "resolved",
+        "empty"
+      ],
+      "warning_statuses": [
+        "empty"
+      ],
+      "no_memory_required_substrings": [
+        "# Memory Injection",
+        "You have saved no memories as of yet."
+      ]
     },
     "request_source_file_verification": {
       "source_paths_key": "claude_persisted_output_source_paths",
@@ -223,11 +264,17 @@
     "request_text_checks": {
       "required_substrings": [
         "<persisted-output>",
-        "x-anthropic-billing-header:"
+        "x-anthropic-billing-header:",
+        "memory_save(",
+        "memory_forget(source_ids=[...])",
+        "Choose the approach that correctly and completely solves the problem."
       ],
       "forbidden_substrings": [
         "Output too large (",
-        "Preview (first 2KB):"
+        "Preview (first 2KB):",
+        "Try the simplest approach first without going in circles.",
+        "persistent, file-based memory system at",
+        "write to it directly with the Write tool"
       ]
     },
     "minimum_trace_count": 3,

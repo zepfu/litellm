@@ -13,7 +13,7 @@ load_dotenv()
 import os
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )  # Adds the parent directory to the system-path
 import pytest
 
@@ -2504,4 +2504,3 @@ def test_get_base_model_from_metadata():
     # Test 6: None input
     result = _get_base_model_from_metadata(None)
     assert result is None, f"Expected None for None input, got {result}"
-

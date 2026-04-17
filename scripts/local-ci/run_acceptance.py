@@ -768,6 +768,134 @@ def _validate_logged_request_text_checks(
     return summary, failures
 
 
+def _validate_aawm_dynamic_injection(
+    *,
+    family: str,
+    observations: list[dict[str, Any]],
+    required_proc: str,
+    required_context_keys: list[str] | None = None,
+    acceptable_statuses: list[str] | None = None,
+    warning_statuses: list[str] | None = None,
+    no_memory_required_substrings: list[str] | None = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    required_context_keys = required_context_keys or []
+    acceptable_statuses = acceptable_statuses or ["resolved"]
+    warning_statuses = warning_statuses or []
+    allowed_statuses = set(acceptable_statuses) | set(warning_statuses)
+    no_memory_required_substrings = no_memory_required_substrings or []
+
+    checked_observation_ids: list[str] = []
+    proc_values: set[str] = set()
+    context_key_values: set[str] = set()
+    status_values: list[str] = []
+    failed_observation_ids: list[str] = []
+    empty_observation_ids: list[str] = []
+    resolved_observation_ids: list[str] = []
+    request_contains_directive_ids: list[str] = []
+    request_contains_failure_block_ids: list[str] = []
+    request_missing_no_memory_text_ids: list[str] = []
+
+    for observation in observations:
+        metadata = observation.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if "aawm_dynamic_injection_count" not in metadata:
+            continue
+
+        checked_observation_ids.append(str(observation.get("id")))
+        procs = metadata.get("aawm_dynamic_injection_procs")
+        if isinstance(procs, list):
+            proc_values.update(
+                proc for proc in procs if isinstance(proc, str) and proc.strip()
+            )
+
+        context_keys = metadata.get("aawm_dynamic_injection_context_keys")
+        if isinstance(context_keys, list):
+            context_key_values.update(
+                key for key in context_keys if isinstance(key, str) and key.strip()
+            )
+
+        statuses = metadata.get("aawm_dynamic_injection_statuses")
+        normalized_statuses: list[str] = []
+        if isinstance(statuses, list):
+            normalized_statuses = [
+                status for status in statuses if isinstance(status, str) and status.strip()
+            ]
+            status_values.extend(normalized_statuses)
+
+        request_body = _extract_logged_request_body(observation)
+        request_text = "\n".join(_collect_text_fragments(request_body)) if request_body else ""
+        observation_id = str(observation.get("id"))
+
+        if "<!-- AAWM" in request_text:
+            request_contains_directive_ids.append(observation_id)
+        if (
+            f'AAWM "{required_proc}" failed for this session.' in request_text
+            or "## AAWM Injection Status" in request_text
+        ):
+            request_contains_failure_block_ids.append(observation_id)
+
+        if "failed" in normalized_statuses:
+            failed_observation_ids.append(observation_id)
+        if "empty" in normalized_statuses:
+            empty_observation_ids.append(observation_id)
+            if any(substring not in request_text for substring in no_memory_required_substrings):
+                request_missing_no_memory_text_ids.append(observation_id)
+        if "resolved" in normalized_statuses:
+            resolved_observation_ids.append(observation_id)
+
+    if not checked_observation_ids:
+        failures.append(f"{family} missing AAWM dynamic injection metadata")
+    if required_proc not in proc_values:
+        failures.append(f"{family} missing AAWM proc: {required_proc}")
+    missing_context_keys = [
+        key for key in required_context_keys if key not in context_key_values
+    ]
+    if missing_context_keys:
+        failures.append(
+            f"{family} missing AAWM context keys: {', '.join(sorted(missing_context_keys))}"
+        )
+    if failed_observation_ids:
+        failures.append(f"{family} AAWM dynamic injection failed")
+    if request_contains_directive_ids:
+        failures.append(f"{family} request still contains AAWM directive")
+    if request_contains_failure_block_ids:
+        failures.append(f"{family} request contains AAWM failure block")
+    if request_missing_no_memory_text_ids:
+        failures.append(f"{family} missing no-memory replacement text")
+
+    unexpected_statuses = sorted({status for status in status_values if status not in allowed_statuses})
+    if unexpected_statuses:
+        failures.append(
+            f"{family} unexpected AAWM injection statuses: {', '.join(unexpected_statuses)}"
+        )
+    if not any(status in allowed_statuses for status in status_values):
+        failures.append(
+            f"{family} missing acceptable AAWM injection status: {', '.join(sorted(allowed_statuses))}"
+        )
+    if empty_observation_ids:
+        warnings.append(
+            f"{family} AAWM memory not populated for {len(empty_observation_ids)} observation(s)"
+        )
+
+    summary = {
+        "checked_observation_ids": checked_observation_ids,
+        "proc_values": sorted(proc_values),
+        "context_key_values": sorted(context_key_values),
+        "status_values": status_values,
+        "resolved_observation_ids": resolved_observation_ids,
+        "empty_observation_ids": empty_observation_ids,
+        "failed_observation_ids": failed_observation_ids,
+        "request_contains_directive_ids": request_contains_directive_ids,
+        "request_contains_failure_block_ids": request_contains_failure_block_ids,
+        "request_missing_no_memory_text_ids": request_missing_no_memory_text_ids,
+        "warnings": warnings,
+    }
+    return summary, failures, warnings
+
+
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -1140,6 +1268,7 @@ def _validate_codex(
     actual_user_ids = sorted({trace.get("userId") for trace in traces if trace.get("userId")})
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
     failures: list[str] = []
+    warnings: list[str] = []
     if run["exit_code"] != 0:
         failures.append("codex command failed")
     for name in expected_trace_names:
@@ -1216,6 +1345,7 @@ def _validate_codex(
         },
         "passed": not failures,
         "failures": sorted(set(failures)),
+        "warnings": sorted(set(warnings)),
     }
 
 
@@ -1248,6 +1378,7 @@ def _validate_gemini(
     actual_user_ids = sorted({trace.get("userId") for trace in traces if trace.get("userId")})
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
     failures: list[str] = []
+    warnings: list[str] = []
     if run["exit_code"] != 0:
         failures.append("gemini command failed")
     for name in expected_trace_names:
@@ -1346,6 +1477,7 @@ def _validate_gemini(
         },
         "passed": not failures,
         "failures": sorted(set(failures)),
+        "warnings": sorted(set(warnings)),
     }
 
 
@@ -1404,10 +1536,11 @@ def _validate_claude(
     actual_user_ids = sorted({trace.get("userId") for trace in traces if trace.get("userId")})
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
     failures: list[str] = []
+    warnings: list[str] = []
     if run["exit_code"] != 0:
         failures.append("claude command failed")
     if lookup_error:
-        failures.append(f"Claude Langfuse lookup warning: {lookup_error}")
+        warnings.append(f"Claude Langfuse lookup warning: {lookup_error}")
     for user_id in expected_user_ids:
         if user_id not in actual_user_ids:
             failures.append(f"missing Claude user id: {user_id}")
@@ -1493,6 +1626,28 @@ def _validate_claude(
         forbidden_substrings=request_text_checks.get("forbidden_substrings"),
     )
     failures.extend(request_text_failures)
+    aawm_dynamic_injection_config = effective_config.get("aawm_dynamic_injection", {})
+    aawm_dynamic_injection_summary, aawm_dynamic_injection_failures, aawm_dynamic_injection_warnings = (
+        _validate_aawm_dynamic_injection(
+            family="claude",
+            observations=raw_generation_observations,
+            required_proc=aawm_dynamic_injection_config.get(
+                "required_proc", "get_agent_memories"
+            ),
+            required_context_keys=aawm_dynamic_injection_config.get(
+                "required_context_keys"
+            ),
+            acceptable_statuses=aawm_dynamic_injection_config.get(
+                "acceptable_statuses"
+            ),
+            warning_statuses=aawm_dynamic_injection_config.get("warning_statuses"),
+            no_memory_required_substrings=aawm_dynamic_injection_config.get(
+                "no_memory_required_substrings"
+            ),
+        )
+    )
+    failures.extend(aawm_dynamic_injection_failures)
+    warnings.extend(aawm_dynamic_injection_warnings)
     source_file_verification_config = effective_config.get(
         "request_source_file_verification", {}
     )
@@ -1544,6 +1699,7 @@ def _validate_claude(
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,
             "request_text_checks": request_text_summary,
+            "aawm_dynamic_injection": aawm_dynamic_injection_summary,
             "request_source_file_verification": source_file_summary,
             "span_observations": span_observations,
             "thought_signature_observed": claude_signature_observed,
@@ -1551,17 +1707,22 @@ def _validate_claude(
         },
         "passed": not failures,
         "failures": sorted(set(failures)),
+        "warnings": sorted(set(warnings)),
     }
 
 
 def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     failures: list[str] = []
+    warnings: list[str] = []
     for family, result in results.items():
         for failure in result.get("failures", []):
             failures.append(f"{family}: {failure}")
+        for warning in result.get("warnings", []):
+            warnings.append(f"{family}: {warning}")
     return {
         "passed": not failures,
         "failures": failures,
+        "warnings": warnings,
     }
 
 
@@ -1585,6 +1746,7 @@ def _family_error_result(name: str, exc: Exception) -> dict[str, Any]:
         },
         "passed": False,
         "failures": [f"{name} validator error: {exc}"],
+        "warnings": [],
     }
 
 
