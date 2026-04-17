@@ -49,6 +49,18 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     create_websocket_passthrough_route,
     websocket_passthrough_request,
 )
+from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
+    add_claude_post_rewrite_context_file_logging_metadata as _aawm_add_claude_post_rewrite_context_file_logging_metadata,
+)
+from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
+    apply_claude_prompt_patches_to_anthropic_request_body as _aawm_apply_claude_prompt_patches_to_anthropic_request_body,
+)
+from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
+    expand_aawm_dynamic_directives_in_anthropic_request_body as _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body,
+)
+from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
+    replace_claude_system_prompt_in_anthropic_request_body as _aawm_replace_claude_system_prompt_in_anthropic_request_body,
+)
 from litellm.proxy.utils import is_known_model
 from litellm.proxy.vector_store_endpoints.utils import (
     is_allowed_to_call_vector_store_endpoint,
@@ -2026,21 +2038,23 @@ async def _prepare_anthropic_request_body_for_passthrough(
         updated_body
     )
     updated_body, _claude_system_prompt_override_events = (
-        _replace_claude_system_prompt_in_anthropic_request_body(
+        _aawm_replace_claude_system_prompt_in_anthropic_request_body(
             updated_body,
             billing_header_fields,
         )
     )
     updated_body, _claude_prompt_patch_events = (
-        _apply_claude_prompt_patches_to_anthropic_request_body(
+        _aawm_apply_claude_prompt_patches_to_anthropic_request_body(
             updated_body,
             billing_header_fields,
         )
     )
     updated_body, _aawm_injection_events = (
-        await _expand_aawm_dynamic_directives_in_anthropic_request_body(updated_body)
+        await _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body(
+            updated_body
+        )
     )
-    updated_body = _add_claude_post_rewrite_context_file_logging_metadata(
+    updated_body = _aawm_add_claude_post_rewrite_context_file_logging_metadata(
         updated_body
     )
     if billing_header_fields:
