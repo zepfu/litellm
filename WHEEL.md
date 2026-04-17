@@ -82,6 +82,47 @@ are then installed on top of that pinned release:
 This keeps AAWM-specific overlays moving independently without forcing a full
 LiteLLM release cut for every prompt/tagging enhancement.
 
+## Infrastructure consumption
+
+The intended infrastructure pattern is:
+
+1. pin a specific LiteLLM fork release or image for the runtime base
+2. during image rebuilds, fetch the newest callback wheel
+3. during image rebuilds, fetch the newest control-plane wheel
+
+In other words:
+
+- the base image answers: "which LiteLLM fork release are we running?"
+- the overlay wheels answer: "which AAWM non-core behavior set are we layering on top?"
+
+That keeps base compatibility changes and AAWM enhancement changes on separate
+release cadences.
+
+### What infra should pin
+
+- base fork image / release tag:
+  - example: `ghcr.io/zepfu/litellm:1.82.3-aawm.17`
+
+### What infra should float
+
+- callback overlay wheel line:
+  - moving pointer tag: `cb-latest`
+- control-plane overlay wheel line:
+  - moving pointer tag: `cp-latest`
+
+If a deployment needs fully frozen behavior for incident response or rollback
+testing, pin the wheel tags too. But the normal operating model is:
+
+- pinned base LiteLLM fork release
+- latest callback overlay wheel
+- latest control-plane overlay wheel
+
+### Operational rule
+
+Do not treat callback/control-plane wheel updates as reasons to cut a new base
+LiteLLM fork release unless the change also requires a new core compatibility
+patch in the fork itself.
+
 ## Rebase rule
 
 When rebasing this fork:
