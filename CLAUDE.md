@@ -22,11 +22,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `make lint-mypy` - Run MyPy type checking only
 
 ### Single Test Files
-- `poetry run pytest tests/path/to/test_file.py -v` - Run specific test file
-- `poetry run pytest tests/path/to/test_file.py::test_function -v` - Run specific test
+- `./.venv/bin/pytest tests/path/to/test_file.py -v` - Run specific test file
+- `./.venv/bin/pytest tests/path/to/test_file.py::test_function -v` - Run specific test
 
 ### Running Scripts
-- `poetry run python script.py` - Run Python scripts (use for non-test files)
+- `./.venv/bin/python script.py` - Run Python scripts (use for non-test files)
 
 ### GitHub Issue & PR Templates
 When contributing to the project, use the appropriate templates:
