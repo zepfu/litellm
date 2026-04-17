@@ -261,7 +261,7 @@ async def _get_existing_call_ids(call_ids: Sequence[str]) -> Set[str]:
     await _ensure_session_history_schema(pool)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT litellm_call_id FROM session_history WHERE litellm_call_id = ANY($1::text[])",
+            "SELECT litellm_call_id FROM public.session_history WHERE litellm_call_id = ANY($1::text[])",
             list(call_ids),
         )
     return {
@@ -295,15 +295,22 @@ class LangfuseTraceTagBackfiller:
             headers={"Authorization": self._auth_header},
             method="GET",
         )
-        try:
-            with urlopen(request, timeout=10) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            if exc.code == 404:
-                return None
-            raise
-        except URLError:
-            raise
+        last_error: Optional[Exception] = None
+        for _attempt in range(3):
+            try:
+                with urlopen(request, timeout=10) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except HTTPError as exc:
+                if exc.code == 404:
+                    return None
+                last_error = exc
+            except (URLError, RemoteDisconnected) as exc:
+                last_error = exc
+        else:
+            if last_error is not None:
+                raise last_error
+            return None
 
         if isinstance(payload, dict):
             return payload
@@ -743,6 +750,7 @@ class LangfuseClickHouseSource:
                 o.level AS observation_level,
                 o.status_message AS observation_status_message,
                 o.version AS observation_version,
+                o.output AS observation_output,
                 o.provided_model_name AS observation_model,
                 o.internal_model_id AS observation_internal_model_id,
                 o.model_parameters AS observation_model_parameters,
@@ -870,7 +878,19 @@ def _build_langfuse_observation_from_clickhouse_row(row: Dict[str, Any]) -> Dict
     }
 
     tool_calls = row.get("observation_tool_calls") or []
-    output_payload: Any = {"tool_calls": tool_calls} if tool_calls else None
+    output_payload = _parse_clickhouse_value(row.get("observation_output"))
+    if not isinstance(output_payload, dict):
+        output_payload = {"raw_output": output_payload} if output_payload else None
+    if tool_calls:
+        if output_payload is None:
+            output_payload = {"tool_calls": tool_calls}
+        elif isinstance(output_payload, dict) and not isinstance(
+            output_payload.get("tool_calls"), list
+        ):
+            output_payload["tool_calls"] = tool_calls
+    tool_call_names = row.get("observation_tool_call_names") or []
+    if tool_call_names and isinstance(output_payload, dict):
+        output_payload.setdefault("tool_call_names", tool_call_names)
 
     return {
         "id": row.get("observation_id"),
@@ -904,7 +924,7 @@ def _build_langfuse_observation_from_clickhouse_row(row: Dict[str, Any]) -> Dict
         "environment": row.get("observation_environment"),
         "createdAt": row.get("observation_created_at"),
         "updatedAt": row.get("observation_updated_at"),
-        "toolCallNames": row.get("observation_tool_call_names") or [],
+        "toolCallNames": tool_call_names,
     }
 
 
@@ -913,6 +933,7 @@ class BackfillStats:
     scanned_rows: int = 0
     reconstructable_rows: int = 0
     inserted_rows: int = 0
+    updated_rows: int = 0
     existing_rows: int = 0
     skipped_rows: int = 0
     trace_tag_candidates: int = 0
@@ -920,6 +941,7 @@ class BackfillStats:
     traces_unchanged: int = 0
     traces_missing: int = 0
     trace_tags_added: int = 0
+    trace_write_errors: int = 0
 
 
 async def _create_source_prisma_client(database_url: str) -> PrismaClient:
@@ -1038,21 +1060,29 @@ async def _run_spend_log_backfill(
                 existing_ids = set()
 
             new_records = [
-                record
-                for record in records
-                if record["litellm_call_id"] not in existing_ids
+                record for record in records if record["litellm_call_id"] not in existing_ids
+            ]
+            existing_records = [
+                record for record in records if record["litellm_call_id"] in existing_ids
             ]
 
-            if args.apply and new_records:
-                await _persist_session_history_records(new_records)
+            if args.apply and records:
+                await _persist_session_history_records(records)
                 stats.inserted_rows += len(new_records)
+                stats.updated_rows += len(existing_records)
 
             stats.trace_tag_candidates += len(trace_tag_map)
             if langfuse_backfiller is not None and args.apply:
                 for trace_id, trace_tags in trace_tag_map.items():
                     if not trace_tags:
                         continue
-                    result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
+                    try:
+                        result = langfuse_backfiller.patch_tags(
+                            trace_id, sorted(trace_tags)
+                        )
+                    except Exception:
+                        stats.trace_write_errors += 1
+                        continue
                     status = result["status"]
                     if status == "patched":
                         stats.traces_patched += 1
@@ -1075,6 +1105,7 @@ async def _run_spend_log_backfill(
             "scanned_rows": stats.scanned_rows,
             "reconstructable_rows": stats.reconstructable_rows,
             "inserted_rows": stats.inserted_rows,
+            "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
@@ -1082,6 +1113,7 @@ async def _run_spend_log_backfill(
             "traces_unchanged": stats.traces_unchanged,
             "traces_missing": stats.traces_missing,
             "trace_tags_added": stats.trace_tags_added,
+            "trace_write_errors": stats.trace_write_errors,
         },
         "session_id_sources": dict(session_source_counts),
         "trace_id_sources": dict(trace_source_counts),
@@ -1228,22 +1260,30 @@ async def _run_langfuse_trace_backfill(
             existing_ids = set()
 
         new_records = [
-            record
-            for record in records
-            if record["litellm_call_id"] not in existing_ids
+            record for record in records if record["litellm_call_id"] not in existing_ids
+        ]
+        existing_records = [
+            record for record in records if record["litellm_call_id"] in existing_ids
         ]
 
-        if args.apply and new_records:
-            await _persist_session_history_records(new_records)
+        if args.apply and records:
+            await _persist_session_history_records(records)
             stats.inserted_rows += len(new_records)
+            stats.updated_rows += len(existing_records)
 
         stats.trace_tag_candidates += len(trace_tag_map)
         if langfuse_backfiller is not None and args.apply:
-            for trace_id, trace_tags in trace_tag_map.items():
-                if not trace_tags:
-                    continue
-                result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
-                status = result["status"]
+                for trace_id, trace_tags in trace_tag_map.items():
+                    if not trace_tags:
+                        continue
+                    try:
+                        result = langfuse_backfiller.patch_tags(
+                            trace_id, sorted(trace_tags)
+                        )
+                    except Exception:
+                        stats.trace_write_errors += 1
+                        continue
+                    status = result["status"]
                 if status == "patched":
                     stats.traces_patched += 1
                     stats.trace_tags_added += int(result["added"])
@@ -1278,6 +1318,7 @@ async def _run_langfuse_trace_backfill(
             "scanned_rows": stats.scanned_rows,
             "reconstructable_rows": stats.reconstructable_rows,
             "inserted_rows": stats.inserted_rows,
+            "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
@@ -1285,6 +1326,7 @@ async def _run_langfuse_trace_backfill(
             "traces_unchanged": stats.traces_unchanged,
             "traces_missing": stats.traces_missing,
             "trace_tags_added": stats.trace_tags_added,
+            "trace_write_errors": stats.trace_write_errors,
         },
         "session_id_sources": dict(session_source_counts),
         "trace_id_sources": dict(trace_source_counts),
@@ -1377,21 +1419,29 @@ async def _run_langfuse_db_backfill(
                 existing_ids = set()
 
             new_records = [
-                record
-                for record in records
-                if record["litellm_call_id"] not in existing_ids
+                record for record in records if record["litellm_call_id"] not in existing_ids
+            ]
+            existing_records = [
+                record for record in records if record["litellm_call_id"] in existing_ids
             ]
 
-            if args.apply and new_records:
-                await _persist_session_history_records(new_records)
+            if args.apply and records:
+                await _persist_session_history_records(records)
                 stats.inserted_rows += len(new_records)
+                stats.updated_rows += len(existing_records)
 
             stats.trace_tag_candidates += len(trace_tag_map)
             if args.apply and args.patch_langfuse_tags:
                 for trace_id, trace_tags in trace_tag_map.items():
                     if not trace_tags:
                         continue
-                    result = await langfuse_source.patch_tags(trace_id, sorted(trace_tags))
+                    try:
+                        result = await langfuse_source.patch_tags(
+                            trace_id, sorted(trace_tags)
+                        )
+                    except Exception:
+                        stats.trace_write_errors += 1
+                        continue
                     status = result["status"]
                     if status == "patched":
                         stats.traces_patched += 1
@@ -1430,6 +1480,7 @@ async def _run_langfuse_db_backfill(
             "scanned_rows": stats.scanned_rows,
             "reconstructable_rows": stats.reconstructable_rows,
             "inserted_rows": stats.inserted_rows,
+            "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
@@ -1437,6 +1488,7 @@ async def _run_langfuse_db_backfill(
             "traces_unchanged": stats.traces_unchanged,
             "traces_missing": stats.traces_missing,
             "trace_tags_added": stats.trace_tags_added,
+            "trace_write_errors": stats.trace_write_errors,
         },
         "session_id_sources": dict(session_source_counts),
         "trace_id_sources": dict(trace_source_counts),
@@ -1529,21 +1581,27 @@ async def _run_langfuse_clickhouse_backfill(
             existing_ids = set()
 
         new_records = [
-            record
-            for record in records
-            if record["litellm_call_id"] not in existing_ids
+            record for record in records if record["litellm_call_id"] not in existing_ids
+        ]
+        existing_records = [
+            record for record in records if record["litellm_call_id"] in existing_ids
         ]
 
-        if args.apply and new_records:
-            await _persist_session_history_records(new_records)
+        if args.apply and records:
+            await _persist_session_history_records(records)
             stats.inserted_rows += len(new_records)
+            stats.updated_rows += len(existing_records)
 
         stats.trace_tag_candidates += len(trace_tag_map)
         if langfuse_backfiller is not None and args.apply:
             for trace_id, trace_tags in trace_tag_map.items():
                 if not trace_tags:
                     continue
-                result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
+                try:
+                    result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
+                except Exception:
+                    stats.trace_write_errors += 1
+                    continue
                 status = result["status"]
                 if status == "patched":
                     stats.traces_patched += 1
@@ -1585,6 +1643,7 @@ async def _run_langfuse_clickhouse_backfill(
             "scanned_rows": stats.scanned_rows,
             "reconstructable_rows": stats.reconstructable_rows,
             "inserted_rows": stats.inserted_rows,
+            "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
@@ -1592,6 +1651,7 @@ async def _run_langfuse_clickhouse_backfill(
             "traces_unchanged": stats.traces_unchanged,
             "traces_missing": stats.traces_missing,
             "trace_tags_added": stats.trace_tags_added,
+            "trace_write_errors": stats.trace_write_errors,
         },
         "session_id_sources": dict(session_source_counts),
         "trace_id_sources": dict(trace_source_counts),
@@ -1614,7 +1674,7 @@ async def _load_trace_tag_candidates_from_session_history(
 
     query = f"""
         SELECT trace_id, metadata->'request_tags' AS request_tags
-        FROM session_history
+        FROM public.session_history
         WHERE {' AND '.join(where_clauses)}
     """
 
@@ -1654,7 +1714,11 @@ async def _run_trace_tag_writeback_from_session_history(
         for trace_id, trace_tags in trace_tag_map.items():
             if not trace_tags:
                 continue
-            result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
+            try:
+                result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
+            except Exception:
+                stats.trace_write_errors += 1
+                continue
             status = result["status"]
             if status == "patched":
                 stats.traces_patched += 1
@@ -1677,6 +1741,7 @@ async def _run_trace_tag_writeback_from_session_history(
             "traces_unchanged": stats.traces_unchanged,
             "traces_missing": stats.traces_missing,
             "trace_tags_added": stats.trace_tags_added,
+            "trace_write_errors": stats.trace_write_errors,
         },
     }
 
