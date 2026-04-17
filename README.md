@@ -387,12 +387,11 @@ Support for more providers. Missing a provider or LLM Platform, raise a [feature
 2. Run dependant services `docker-compose up db prometheus`
 
 ### Backend
-1. (In root) create virtual environment `python -m venv .venv`
+1. (In root) create the repo-local virtual environment `uv venv .venv`
 2. Activate virtual environment `source .venv/bin/activate`
-3. Install dependencies `pip install -e ".[all]"`
-4. `pip install prisma`
-5. `prisma generate`
-6. Start proxy backend `python litellm/proxy/proxy_cli.py`
+3. Install dependencies `make install-proxy-dev`
+4. Generate Prisma client `./.venv/bin/prisma generate`
+5. Start proxy backend `./.venv/bin/python litellm/proxy/proxy_cli.py`
 
 ### Frontend
 1. Navigate to `ui/litellm-dashboard`
@@ -418,11 +417,12 @@ We welcome contributions to LiteLLM! Whether you're fixing bugs, adding features
 
 ## Quick Start for Contributors
 
-This requires poetry to be installed.
+This repo uses `uv` to manage a repo-local `.venv`.
 
 ```bash
 git clone https://github.com/BerriAI/litellm.git
 cd litellm
+uv venv .venv
 make install-dev    # Install development dependencies
 make format         # Format your code
 make lint           # Run all linting checks
@@ -473,4 +473,3 @@ All these checks must pass before your PR can be merged.
 <a href="https://github.com/BerriAI/litellm/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=BerriAI/litellm" />
 </a>
-
