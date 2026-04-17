@@ -29,12 +29,12 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16` (15 active patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17` (16 active patches)
 
 **Version metadata note:** `pyproject.toml` should stay aligned to this
 registry's carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current working tree now aligns on
-`1.82.3+aawm.16`.
+`1.82.3+aawm.17`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -518,6 +518,41 @@ release metadata.
 **Validation status:** The previous `v1.82.3-aawm.15` tag failed on the stale
 smoke-test path. This patch updates the workflow to match the current Docker
 build model before the next image release tag is cut.
+
+---
+
+### aawm.17 — Split AAWM non-core control-plane behavior into an independent wheel line
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `.control-plane-wheel-build/pyproject.toml`
+- `.github/workflows/aawm-control-plane.yml`
+- `WHEEL.md`
+
+**Upstream issue:** AAWM-specific Claude control-plane behavior such as prompt
+rewrites, dynamic memory injection, and post-rewrite context tagging was still
+living only inside the forked LiteLLM release path. That made it impossible for
+infrastructure to pin a specific LiteLLM fork release while independently
+pulling newer AAWM enhancements as wheel artifacts.
+
+**Fix:**
+1. Extract the Claude control-plane enhancement path behind a dedicated module:
+   `litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py`.
+2. Route Anthropic request-prep through that module instead of binding the
+   enhancement logic directly to the main passthrough file.
+3. Add an independent `aawm-litellm-control-plane` wheel build and GitHub
+   release workflow on `cp-v*` tags.
+4. Update wheel documentation so callback vs control-plane overlays are treated
+   as separate artifact lines from the base LiteLLM fork release.
+
+**Why not upstream:** This is AAWM-specific control-plane packaging and release
+strategy. The goal is a clean distinction between required LiteLLM fork
+patches and AAWM-managed enhancements that should ship independently.
+
+**Validation status:** Focused Anthropic passthrough tests still cover the live
+rewrite/injection path after the helper-module split, and the control-plane
+wheel build definition now exists as its own releaseable artifact line.
 
 ---
 

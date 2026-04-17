@@ -1,0 +1,55 @@
+name: Build and release AAWM control-plane wheel
+
+on:
+  push:
+    tags:
+      - "cp-v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install --quiet build
+
+      - name: Build wheel
+        working-directory: .control-plane-wheel-build
+        run: python -m build --wheel --outdir dist/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#cp-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release and upload wheel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "aawm-litellm-control-plane v${{ steps.version.outputs.version }}" \
+            --notes "$(cat <<'EOF'
+          AAWM LiteLLM Claude control-plane wheel.
+
+          **Install:**
+          ```bash
+          pip install https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/aawm_litellm_control_plane-${{ steps.version.outputs.version }}-py3-none-any.whl
+          ```
+          EOF
+          )" \
+            .control-plane-wheel-build/dist/aawm_litellm_control_plane-*.whl
+
+      - name: Move cp-latest tag
+        run: |
+          git tag -f cp-latest
+          git push origin cp-latest --force
