@@ -12,7 +12,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Checkout
@@ -32,10 +32,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Smoke test — verify venv imports
+      - name: Smoke test — verify runtime imports
         run: |
-          docker build --target venv-builder -t litellm-venv-test .
-          docker run --rm litellm-venv-test /opt/litellm-venv/bin/python -c "
+          docker build -t litellm-runtime-test .
+          docker run --rm --entrypoint python3 litellm-runtime-test -c "
           from importlib.metadata import version
           print('litellm', version('litellm'))
           import litellm
@@ -51,3 +51,20 @@ jobs:
           push: true
           tags: ${{ format('{0}/{1}:{2},{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME, steps.version.outputs.version) }}
           platforms: linux/amd64
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "AAWM LiteLLM fork ${{ steps.version.outputs.version }}" \
+            --notes "$(cat <<'EOF'
+          AAWM LiteLLM fork image release.
+
+          **Container images:**
+          - `ghcr.io/zepfu/litellm:${{ steps.version.outputs.version }}`
+          - `ghcr.io/zepfu/litellm:latest`
+          EOF
+          )"

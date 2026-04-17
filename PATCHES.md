@@ -29,12 +29,12 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15` (14 active patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16` (15 active patches)
 
 **Version metadata note:** `pyproject.toml` should stay aligned to this
 registry's carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current working tree now aligns on
-`1.82.3+aawm.15`.
+`1.82.3+aawm.16`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -490,6 +490,34 @@ provider traffic.
 **Validation status:** The live `/health` response on `litellm-dev` now reports
 the Anthropic passthrough model healthy with
 `health_check_skipped=forwarded_client_headers_required`.
+
+---
+
+### aawm.16 — Align image release workflow with current Docker build and publish a GitHub release object
+
+**Files:**
+- `.github/workflows/aawm-publish.yml`
+
+**Upstream issue:** The fork image workflow still assumed an older `venv-builder`
+target and `/opt/litellm-venv/bin/python` smoke-test path that no longer exist
+in the current Dockerfile. It also pushed GHCR images without creating a GitHub
+release object for the `v*-aawm.*` tags, which made the release state hard to
+see in the GitHub UI.
+
+**Fix:**
+1. Change the smoke test to build the current runtime image shape and run the
+   import test with `--entrypoint python3`.
+2. Keep the existing GHCR publish path.
+3. Add an explicit GitHub release creation step for `v*-aawm.*` tags so image
+   releases are visible on the Releases page alongside the callback wheel line.
+
+**Why not upstream:** This is part of the AAWM fork release workflow and is
+specific to how this fork ships its container/image artifacts and GitHub
+release metadata.
+
+**Validation status:** The previous `v1.82.3-aawm.15` tag failed on the stale
+smoke-test path. This patch updates the workflow to match the current Docker
+build model before the next image release tag is cut.
 
 ---
 
