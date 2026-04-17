@@ -1,6 +1,6 @@
 {
   "suite_version": 1,
-  "litellm_base_url": "http://127.0.0.1:4001",
+  "litellm_base_url": "http://127.0.0.1:4000",
   "langfuse_query_url": "http://127.0.0.1:3000",
   "langfuse_public_key_env": "LANGFUSE_PUBLIC_KEY",
   "langfuse_secret_key_env": "LANGFUSE_SECRET_KEY",
@@ -20,7 +20,7 @@
     "expected_user_ids": [
       "litellm"
     ],
-    "expected_trace_environment": "dev",
+    "expected_trace_environment": "prod",
     "require_trace_session_id": true,
     "require_trace_ids_distinct_from_session_ids": true,
     "post_run_wait_seconds": 2,
@@ -63,7 +63,7 @@
     "expected_user_ids": [
       "litellm"
     ],
-    "expected_trace_environment": "dev",
+    "expected_trace_environment": "prod",
     "require_trace_session_id": true,
     "require_trace_ids_distinct_from_session_ids": true,
     "match_trace_session_id_from_stdout": true,
@@ -113,7 +113,7 @@
       "json"
     ],
     "env": {
-      "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000/anthropic"
     },
     "required_trace_names": [
       "claude-code.orchestrator",
@@ -166,7 +166,7 @@
     "expected_user_ids": [
       "litellm.fork"
     ],
-    "expected_trace_environment": "dev",
+    "expected_trace_environment": "prod",
     "require_trace_session_id": true,
     "require_trace_ids_distinct_from_session_ids": true,
     "match_trace_session_id_from_stdout": true,

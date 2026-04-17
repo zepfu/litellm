@@ -6,6 +6,7 @@ ARTIFACT_PATH="${1:-$ROOT/.analysis/artifacts/local-acceptance-$(date -u +%Y%m%d
 CLI_CLAUDE_FANOUT_MODE="${2:-}"
 REBUILD_LITELLM_DEV="${REBUILD_LITELLM_DEV:-1}"
 BUILD_STATE_PATH="${BUILD_STATE_PATH:-$ROOT/.analysis/artifacts/litellm-dev-build-state.json}"
+CONFIG_PATH="${ACCEPTANCE_CONFIG_PATH:-scripts/local-ci/config.json}"
 
 cd "$ROOT"
 
@@ -19,6 +20,19 @@ fi
 export LANGFUSE_QUERY_URL="${LANGFUSE_QUERY_URL:-http://127.0.0.1:3000}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CLAUDE_FANOUT_MODE="${CLI_CLAUDE_FANOUT_MODE:-${CLAUDE_FANOUT_MODE:-minimal}}"
+
+resolve_litellm_base_url() {
+  "$PYTHON_BIN" - "$CONFIG_PATH" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+config = json.loads(config_path.read_text())
+print(os.environ.get("LITELLM_BASE_URL") or config.get("litellm_base_url", "http://127.0.0.1:4001"))
+PY
+}
 
 compute_build_fingerprint() {
   "$PYTHON_BIN" - <<'PY'
@@ -93,32 +107,38 @@ should_rebuild_litellm_dev() {
   return 1
 }
 
-if [[ "$REBUILD_LITELLM_DEV" == "1" ]] && should_rebuild_litellm_dev; then
-  echo "litellm-dev image inputs changed; rebuilding and recreating the container..."
-  docker compose -f docker-compose.dev.yml build litellm-dev
-  docker compose -f docker-compose.dev.yml up -d --force-recreate litellm-dev
-  echo "Waiting briefly for litellm-dev to finish booting..."
-  sleep 10
-elif [[ "$REBUILD_LITELLM_DEV" == "1" ]]; then
-  echo "litellm-dev image inputs unchanged; skipping rebuild."
-  docker_status="$(docker ps --filter name=litellm-dev --format '{{.Status}}' || true)"
-  if [[ -z "$docker_status" ]]; then
-    echo "litellm-dev is not running; starting existing image..."
-    docker compose -f docker-compose.dev.yml up -d litellm-dev
+TARGET_LITELLM_BASE_URL="$(resolve_litellm_base_url)"
+
+if [[ "$TARGET_LITELLM_BASE_URL" == "http://127.0.0.1:4001" ]]; then
+  if [[ "$REBUILD_LITELLM_DEV" == "1" ]] && should_rebuild_litellm_dev; then
+    echo "litellm-dev image inputs changed; rebuilding and recreating the container..."
+    docker compose -f docker-compose.dev.yml build litellm-dev
+    docker compose -f docker-compose.dev.yml up -d --force-recreate litellm-dev
     echo "Waiting briefly for litellm-dev to finish booting..."
     sleep 10
+  elif [[ "$REBUILD_LITELLM_DEV" == "1" ]]; then
+    echo "litellm-dev image inputs unchanged; skipping rebuild."
+    docker_status="$(docker ps --filter name=litellm-dev --format '{{.Status}}' || true)"
+    if [[ -z "$docker_status" ]]; then
+      echo "litellm-dev is not running; starting existing image..."
+      docker compose -f docker-compose.dev.yml up -d litellm-dev
+      echo "Waiting briefly for litellm-dev to finish booting..."
+      sleep 10
+    fi
+  else
+    docker_status="$(docker ps --filter name=litellm-dev --format '{{.Status}}' || true)"
+    if [[ -z "$docker_status" ]]; then
+      echo "litellm-dev is not running; starting it now..."
+      docker compose -f docker-compose.dev.yml up -d litellm-dev
+      echo "Waiting briefly for litellm-dev to finish booting..."
+      sleep 10
+    fi
   fi
 else
-  docker_status="$(docker ps --filter name=litellm-dev --format '{{.Status}}' || true)"
-  if [[ -z "$docker_status" ]]; then
-    echo "litellm-dev is not running; starting it now..."
-    docker compose -f docker-compose.dev.yml up -d litellm-dev
-    echo "Waiting briefly for litellm-dev to finish booting..."
-    sleep 10
-  fi
+  echo "Acceptance harness targeting $TARGET_LITELLM_BASE_URL; skipping litellm-dev lifecycle management."
 fi
 
 exec "$PYTHON_BIN" scripts/local-ci/run_acceptance.py \
-  --config scripts/local-ci/config.json \
+  --config "$CONFIG_PATH" \
   --claude-fanout-mode "$CLAUDE_FANOUT_MODE" \
   --write-artifact "$ARTIFACT_PATH"

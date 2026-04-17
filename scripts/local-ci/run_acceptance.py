@@ -38,6 +38,12 @@ def _load_json(path: pathlib.Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def _resolve_litellm_base_url(config: dict[str, Any]) -> str:
+    return os.environ.get("LITELLM_BASE_URL") or config.get(
+        "litellm_base_url", "http://127.0.0.1:4001"
+    )
+
+
 def _http_get_json(url: str, public_key: str, secret_key: str, timeout: float = 20.0) -> dict[str, Any]:
     credentials = base64.b64encode(f"{public_key}:{secret_key}".encode("utf-8")).decode("ascii")
     request = urllib.request.Request(
@@ -1789,7 +1795,7 @@ def main() -> int:
         "git_commit": _git_value("rev-parse", "HEAD"),
         "git_branch": _git_value("branch", "--show-current"),
         "environment": {
-            "litellm_base_url": config.get("litellm_base_url", "http://127.0.0.1:4001"),
+            "litellm_base_url": _resolve_litellm_base_url(config),
             "langfuse_query_url": query_url,
             "docker_litellm_dev_status": _docker_status(),
         },
