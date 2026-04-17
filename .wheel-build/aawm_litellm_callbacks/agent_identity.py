@@ -95,7 +95,7 @@ _AAWM_DB_URL_ENV_VARS = (
     "AAWM_POSTGRES_URL",
 )
 _AAWM_SESSION_HISTORY_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS session_history (
+CREATE TABLE IF NOT EXISTS public.session_history (
     id BIGSERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     litellm_call_id TEXT UNIQUE,
@@ -127,11 +127,11 @@ CREATE TABLE IF NOT EXISTS session_history (
 )
 """
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON session_history (session_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON session_history (session_id, model, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON public.session_history (session_id, model, created_at DESC)",
 )
 _AAWM_SESSION_HISTORY_INSERT_SQL = """
-INSERT INTO session_history (
+INSERT INTO public.session_history (
     litellm_call_id,
     session_id,
     trace_id,
@@ -163,7 +163,60 @@ INSERT INTO session_history (
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24::jsonb, $25, $26::jsonb
 )
-ON CONFLICT (litellm_call_id) DO NOTHING
+ON CONFLICT (litellm_call_id) DO UPDATE SET
+    session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
+    trace_id = COALESCE(NULLIF(EXCLUDED.trace_id, ''), session_history.trace_id),
+    provider_response_id = COALESCE(
+        NULLIF(EXCLUDED.provider_response_id, ''),
+        session_history.provider_response_id
+    ),
+    provider = COALESCE(NULLIF(EXCLUDED.provider, ''), session_history.provider),
+    model = COALESCE(NULLIF(EXCLUDED.model, ''), session_history.model),
+    model_group = COALESCE(NULLIF(EXCLUDED.model_group, ''), session_history.model_group),
+    agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history.agent_name),
+    tenant_id = COALESCE(NULLIF(EXCLUDED.tenant_id, ''), session_history.tenant_id),
+    call_type = COALESCE(NULLIF(EXCLUDED.call_type, ''), session_history.call_type),
+    start_time = COALESCE(session_history.start_time, EXCLUDED.start_time),
+    end_time = COALESCE(EXCLUDED.end_time, session_history.end_time),
+    input_tokens = GREATEST(session_history.input_tokens, EXCLUDED.input_tokens),
+    output_tokens = GREATEST(session_history.output_tokens, EXCLUDED.output_tokens),
+    total_tokens = GREATEST(session_history.total_tokens, EXCLUDED.total_tokens),
+    cache_read_input_tokens = GREATEST(
+        session_history.cache_read_input_tokens,
+        EXCLUDED.cache_read_input_tokens
+    ),
+    cache_creation_input_tokens = GREATEST(
+        session_history.cache_creation_input_tokens,
+        EXCLUDED.cache_creation_input_tokens
+    ),
+    reasoning_tokens_reported = COALESCE(
+        GREATEST(session_history.reasoning_tokens_reported, EXCLUDED.reasoning_tokens_reported),
+        session_history.reasoning_tokens_reported,
+        EXCLUDED.reasoning_tokens_reported
+    ),
+    reasoning_tokens_estimated = COALESCE(
+        GREATEST(session_history.reasoning_tokens_estimated, EXCLUDED.reasoning_tokens_estimated),
+        session_history.reasoning_tokens_estimated,
+        EXCLUDED.reasoning_tokens_estimated
+    ),
+    reasoning_tokens_source = COALESCE(
+        NULLIF(EXCLUDED.reasoning_tokens_source, ''),
+        session_history.reasoning_tokens_source
+    ),
+    reasoning_present = session_history.reasoning_present OR EXCLUDED.reasoning_present,
+    thinking_signature_present = session_history.thinking_signature_present OR EXCLUDED.thinking_signature_present,
+    tool_call_count = GREATEST(session_history.tool_call_count, EXCLUDED.tool_call_count),
+    tool_names = CASE
+        WHEN jsonb_array_length(EXCLUDED.tool_names) > jsonb_array_length(session_history.tool_names)
+            THEN EXCLUDED.tool_names
+        ELSE session_history.tool_names
+    END,
+    response_cost_usd = COALESCE(
+        GREATEST(session_history.response_cost_usd, EXCLUDED.response_cost_usd),
+        session_history.response_cost_usd,
+        EXCLUDED.response_cost_usd
+    ),
+    metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "trace_name",
@@ -172,6 +225,12 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "route_tag",
     "reasoning_content_present",
     "thinking_signature_present",
+    "usage_reasoning_tokens_reported",
+    "usage_reasoning_tokens_source",
+    "usage_cache_read_input_tokens",
+    "usage_cache_creation_input_tokens",
+    "usage_tool_call_count",
+    "usage_tool_names",
 )
 _aawm_session_history_pool: Optional[Any] = None
 _aawm_session_history_pool_lock = asyncio.Lock()
@@ -562,13 +621,19 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
 
 
 def _extract_prompt_tokens(usage_obj: Any) -> int:
-    return _safe_int(_maybe_get(usage_obj, "prompt_tokens")) or 0
+    return (
+        _safe_int(_maybe_get(usage_obj, "prompt_tokens"))
+        or _safe_int(_maybe_get(usage_obj, "input_tokens"))
+        or _safe_int(_maybe_get(usage_obj, "input"))
+        or 0
+    )
 
 
 def _extract_completion_tokens(usage_obj: Any) -> int:
     return (
         _safe_int(_maybe_get(usage_obj, "completion_tokens"))
         or _safe_int(_maybe_get(usage_obj, "output_tokens"))
+        or _safe_int(_maybe_get(usage_obj, "candidatesTokenCount"))
         or 0
     )
 
@@ -576,16 +641,39 @@ def _extract_completion_tokens(usage_obj: Any) -> int:
 def _extract_total_tokens(usage_obj: Any, prompt_tokens: int, completion_tokens: int) -> int:
     return (
         _safe_int(_maybe_get(usage_obj, "total_tokens"))
+        or _safe_int(_maybe_get(usage_obj, "totalTokenCount"))
         or (prompt_tokens + completion_tokens)
     )
 
 
+def _extract_prompt_tokens_details(usage_obj: Any) -> Any:
+    return _first_non_none(
+        _maybe_get(usage_obj, "prompt_tokens_details"),
+        _maybe_get(usage_obj, "input_tokens_details"),
+        _maybe_get(usage_obj, "promptTokensDetails"),
+        _maybe_get(usage_obj, "inputTokensDetails"),
+    )
+
+
+def _extract_completion_tokens_details(usage_obj: Any) -> Any:
+    return _first_non_none(
+        _maybe_get(usage_obj, "completion_tokens_details"),
+        _maybe_get(usage_obj, "output_tokens_details"),
+        _maybe_get(usage_obj, "completionTokensDetails"),
+        _maybe_get(usage_obj, "outputTokensDetails"),
+        _maybe_get(usage_obj, "responseTokensDetails"),
+        _maybe_get(usage_obj, "candidatesTokensDetails"),
+    )
+
+
 def _extract_cache_read_input_tokens(usage_obj: Any) -> int:
-    prompt_tokens_details = _maybe_get(usage_obj, "prompt_tokens_details")
+    prompt_tokens_details = _extract_prompt_tokens_details(usage_obj)
     return (
         _safe_int(_maybe_get(usage_obj, "cache_read_input_tokens"))
         or _safe_int(_maybe_get(usage_obj, "cacheReadInputTokens"))
+        or _safe_int(_maybe_get(usage_obj, "cachedContentTokenCount"))
         or _safe_int(_maybe_get(prompt_tokens_details, "cached_tokens"))
+        or _safe_int(_maybe_get(prompt_tokens_details, "cachedTokens"))
         or 0
     )
 
@@ -594,17 +682,21 @@ def _extract_cache_creation_input_tokens(usage_obj: Any) -> int:
     return (
         _safe_int(_maybe_get(usage_obj, "cache_creation_input_tokens"))
         or _safe_int(_maybe_get(usage_obj, "cacheWriteInputTokens"))
+        or _safe_int(_maybe_get(usage_obj, "cacheWriteInputTokenCount"))
+        or _safe_int(_maybe_get(usage_obj, "cacheCreationInputTokens"))
         or 0
     )
 
 
 def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
-    completion_tokens_details = _maybe_get(usage_obj, "completion_tokens_details")
-    output_tokens_details = _maybe_get(usage_obj, "output_tokens_details")
+    completion_tokens_details = _extract_completion_tokens_details(usage_obj)
     return _first_non_none(
         _safe_int(_maybe_get(usage_obj, "reasoning_tokens")),
+        _safe_int(_maybe_get(usage_obj, "reasoningTokens")),
+        _safe_int(_maybe_get(usage_obj, "reasoning_token_count")),
+        _safe_int(_maybe_get(usage_obj, "thoughtsTokenCount")),
         _safe_int(_maybe_get(completion_tokens_details, "reasoning_tokens")),
-        _safe_int(_maybe_get(output_tokens_details, "reasoning_tokens")),
+        _safe_int(_maybe_get(completion_tokens_details, "reasoningTokens")),
     )
 
 
@@ -674,6 +766,28 @@ def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
     return 0, []
 
 
+def _extract_response_output_tool_call_info(result: Any) -> Tuple[int, List[str]]:
+    output_items = result if isinstance(result, list) else _maybe_get(result, "output")
+    if not isinstance(output_items, list):
+        return 0, []
+
+    tool_call_count = 0
+    tool_names: List[str] = []
+    for item in output_items:
+        item_type = _maybe_get(item, "type")
+        if item_type not in {"function_call", "apply_patch_call"}:
+            continue
+        tool_call_count += 1
+        tool_name = _maybe_get(item, "name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            if item_type == "apply_patch_call":
+                tool_name = "apply_patch"
+        if isinstance(tool_name, str) and tool_name.strip():
+            tool_names.append(tool_name)
+
+    return tool_call_count, tool_names
+
+
 def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
     litellm_params = kwargs.get("litellm_params") or {}
     metadata = litellm_params.get("metadata") or {}
@@ -706,6 +820,106 @@ def _extract_trace_id(kwargs: Dict[str, Any]) -> Optional[str]:
         if candidate is not None and str(candidate).strip():
             return str(candidate)
     return None
+
+
+def _infer_usage_breakout_provider_prefix(
+    kwargs: Dict[str, Any], metadata: Dict[str, Any]
+) -> Optional[str]:
+    route_family = metadata.get("passthrough_route_family")
+    if isinstance(route_family, str) and route_family.strip():
+        route_family_lower = route_family.lower()
+        if route_family_lower == "codex_responses":
+            return "codex"
+        if "gemini" in route_family_lower:
+            return "gemini"
+
+    provider = kwargs.get("custom_llm_provider")
+    if isinstance(provider, str) and provider.strip():
+        provider_lower = provider.lower()
+        if provider_lower == "gemini":
+            return "gemini"
+
+    model = kwargs.get("model")
+    if isinstance(model, str) and model.strip():
+        model_lower = model.lower()
+        if "gemini" in model_lower:
+            return "gemini"
+        if "codex" in model_lower:
+            return "codex"
+
+    return None
+
+
+def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None:
+    metadata = _ensure_mutable_metadata(kwargs)
+    provider_prefix = _infer_usage_breakout_provider_prefix(kwargs, metadata)
+    if provider_prefix is None:
+        return
+
+    usage_obj = _extract_usage_object(kwargs, result)
+    if usage_obj is None:
+        return
+
+    reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
+    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
+    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
+
+    message = _extract_first_response_message(result)
+    tool_call_count, tool_names = _extract_tool_call_info(message)
+    if tool_call_count == 0:
+        tool_call_count, tool_names = _extract_response_output_tool_call_info(result)
+
+    metadata["usage_cache_read_input_tokens"] = cache_read_input_tokens
+    metadata["usage_cache_creation_input_tokens"] = cache_creation_input_tokens
+    metadata["usage_tool_call_count"] = tool_call_count
+    metadata["usage_tool_names"] = tool_names
+    metadata[f"{provider_prefix}_cache_read_input_tokens"] = cache_read_input_tokens
+    metadata[f"{provider_prefix}_cache_creation_input_tokens"] = (
+        cache_creation_input_tokens
+    )
+    metadata[f"{provider_prefix}_tool_call_count"] = tool_call_count
+    metadata[f"{provider_prefix}_tool_names"] = tool_names
+
+    if reported_reasoning_tokens is not None:
+        metadata["usage_reasoning_tokens_reported"] = reported_reasoning_tokens
+        metadata["usage_reasoning_tokens_source"] = "provider_reported"
+        metadata[f"{provider_prefix}_reasoning_tokens_reported"] = (
+            reported_reasoning_tokens
+        )
+
+    tags_to_add = [f"{provider_prefix}-usage-breakout"]
+    if reported_reasoning_tokens is not None:
+        tags_to_add.extend(
+            ["reasoning-tokens-reported", f"{provider_prefix}-reasoning-tokens-reported"]
+        )
+    if cache_read_input_tokens > 0:
+        tags_to_add.extend(
+            ["cache-read-input-tokens", f"{provider_prefix}-cache-read-input-tokens"]
+        )
+    if cache_creation_input_tokens > 0:
+        tags_to_add.extend(
+            [
+                "cache-creation-input-tokens",
+                f"{provider_prefix}-cache-creation-input-tokens",
+            ]
+        )
+    if tool_call_count > 0:
+        tags_to_add.extend(["tool-calls-present", f"{provider_prefix}-tool-calls-present"])
+    _merge_tags(metadata, tags_to_add)
+
+    _append_langfuse_span(
+        metadata,
+        name=f"{provider_prefix}.usage_breakout",
+        span_metadata={
+            "reported_reasoning_tokens": reported_reasoning_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "tool_call_count": tool_call_count,
+            "tool_names": tool_names,
+        },
+        start_time=datetime.now(timezone.utc),
+        end_time=datetime.now(timezone.utc),
+    )
 
 
 def _extract_trace_id_from_spend_log_row(spend_log_row: Dict[str, Any]) -> Tuple[Optional[str], str]:
@@ -1042,10 +1256,13 @@ def _extract_langfuse_session_id(
 
 
 def _build_usage_object_from_langfuse_observation(observation: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = observation.get("metadata")
     usage = observation.get("usage")
     usage_details = observation.get("usageDetails")
 
     usage_object: Dict[str, Any] = {}
+    if isinstance(metadata, dict) and isinstance(metadata.get("usage_object"), dict):
+        usage_object.update(metadata["usage_object"])
     if isinstance(usage, dict):
         usage_object.update(usage)
     if isinstance(usage_details, dict):
@@ -1085,12 +1302,28 @@ def _build_usage_object_from_langfuse_observation(observation: Dict[str, Any]) -
     if total_tokens is not None:
         usage_object["total_tokens"] = total_tokens
 
+    prompt_tokens_details = _extract_prompt_tokens_details(usage_object)
+    if isinstance(prompt_tokens_details, dict):
+        usage_object.setdefault("prompt_tokens_details", prompt_tokens_details)
+
+    completion_tokens_details = _extract_completion_tokens_details(usage_object)
+    if isinstance(completion_tokens_details, dict):
+        usage_object.setdefault(
+            "completion_tokens_details", completion_tokens_details
+        )
+
     cache_read_tokens = _safe_int(usage_object.get("cache_read_input_tokens"))
+    if cache_read_tokens is None:
+        cache_read_tokens = _safe_int(usage_object.get("cachedContentTokenCount"))
     cache_creation_tokens = _safe_int(usage_object.get("cache_creation_input_tokens"))
     if cache_read_tokens is not None:
         usage_object["cache_read_input_tokens"] = cache_read_tokens
     if cache_creation_tokens is not None:
         usage_object["cache_creation_input_tokens"] = cache_creation_tokens
+    if usage_object.get("reasoning_tokens") is None:
+        thoughts_token_count = _safe_int(usage_object.get("thoughtsTokenCount"))
+        if thoughts_token_count is not None:
+            usage_object["reasoning_tokens"] = thoughts_token_count
 
     return usage_object
 
@@ -1284,6 +1517,36 @@ def _build_session_history_record_from_langfuse_trace_observation(
         )
 
     tool_call_count, tool_names = _extract_tool_call_info(message)
+    if tool_call_count == 0:
+        output_tool_call_count, output_tool_names = _extract_response_output_tool_call_info(
+            output_payload
+        )
+        if output_tool_call_count > 0:
+            tool_call_count, tool_names = output_tool_call_count, output_tool_names
+    if tool_call_count == 0:
+        fallback_tool_names = observation.get("toolCallNames") or observation.get(
+            "tool_call_names"
+        )
+        if isinstance(fallback_tool_names, list):
+            normalized_tool_names = [
+                str(tool_name)
+                for tool_name in fallback_tool_names
+                if isinstance(tool_name, str) and tool_name.strip()
+            ]
+            if normalized_tool_names:
+                tool_call_count = len(normalized_tool_names)
+                tool_names = normalized_tool_names
+    if tool_call_count == 0:
+        metadata_tool_names = metadata.get("usage_tool_names")
+        if isinstance(metadata_tool_names, list):
+            normalized_tool_names = [
+                str(tool_name)
+                for tool_name in metadata_tool_names
+                if isinstance(tool_name, str) and tool_name.strip()
+            ]
+            if normalized_tool_names:
+                tool_call_count = len(normalized_tool_names)
+                tool_names = normalized_tool_names
     agent_name, tenant_id = _extract_agent_context_from_langfuse_trace_observation(
         trace,
         observation,
@@ -1452,6 +1715,12 @@ def _build_session_history_record(
         )
 
     tool_call_count, tool_names = _extract_tool_call_info(message)
+    if tool_call_count == 0:
+        output_tool_call_count, output_tool_names = _extract_response_output_tool_call_info(
+            result
+        )
+        if output_tool_call_count > 0:
+            tool_call_count, tool_names = output_tool_call_count, output_tool_names
     agent_name, tenant_id = _extract_agent_context(kwargs)
 
     return {
@@ -1970,6 +2239,7 @@ def _enrich_trace_name_and_provider_metadata(
     if message is not None:
         _enrich_claude_thinking_metadata(metadata, message)
         _enrich_gemini_thought_signature_metadata(metadata, message)
+    _enrich_usage_breakout_metadata(kwargs, result)
 
     _sync_standard_logging_object(kwargs, metadata)
 

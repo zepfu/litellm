@@ -298,6 +298,64 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["metadata"]["cc_version"] == "2.1.112"
 
 
+def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.2-codex"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
+        "codex_responses"
+    )
+
+    result = {
+        "id": "resp-codex-1",
+        "usage": {
+            "input_tokens": 80,
+            "output_tokens": 24,
+            "total_tokens": 104,
+            "input_tokens_details": {"cached_tokens": 31},
+            "output_tokens_details": {"reasoning_tokens": 12},
+        },
+        "output": [
+            {
+                "type": "function_call",
+                "name": "apply_patch",
+                "arguments": "{}",
+                "call_id": "call_123",
+            }
+        ],
+        "choices": [],
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result=result,
+        call_type="pass_through_endpoint",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    request_tags = updated_kwargs["standard_logging_object"]["request_tags"]
+
+    assert metadata["usage_reasoning_tokens_reported"] == 12
+    assert metadata["usage_reasoning_tokens_source"] == "provider_reported"
+    assert metadata["usage_cache_read_input_tokens"] == 31
+    assert metadata["usage_cache_creation_input_tokens"] == 0
+    assert metadata["usage_tool_call_count"] == 1
+    assert metadata["usage_tool_names"] == ["apply_patch"]
+    assert metadata["codex_reasoning_tokens_reported"] == 12
+    assert metadata["codex_cache_read_input_tokens"] == 31
+    assert "codex-usage-breakout" in metadata["tags"]
+    assert "codex-reasoning-tokens-reported" in metadata["tags"]
+    assert "codex-cache-read-input-tokens" in metadata["tags"]
+    assert "codex-tool-calls-present" in metadata["tags"]
+    assert "reasoning-tokens-reported" in request_tags
+    assert "cache-read-input-tokens" in request_tags
+    span_names = [
+        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
+    ]
+    assert "codex.usage_breakout" in span_names
+
+
 def test_build_session_history_record_skips_without_session_id() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gemini/gemini-2.5-pro"
@@ -359,7 +417,7 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
 
     mock_pool.execute.assert_awaited_once()
     executed_args = mock_pool.execute.await_args.args
-    assert "INSERT INTO session_history" in executed_args[0]
+    assert "INSERT INTO public.session_history" in executed_args[0]
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
@@ -482,6 +540,63 @@ def test_build_session_history_record_from_spend_log_row_falls_back_to_legacy_tr
     assert record["metadata"]["session_id_source"] == "legacy_spend_log_session_field"
     assert record["metadata"]["trace_id_source"] == "legacy_spend_log_session_field"
     assert record["metadata"]["request_tags"] == ["route:codex_responses"]
+
+
+def test_build_session_history_record_from_spend_log_row_uses_responses_usage_details() -> None:
+    spend_log_row = {
+        "request_id": "req-codex-usage-1",
+        "call_type": "responses",
+        "custom_llm_provider": "openai",
+        "model": "gpt-5.2-codex",
+        "model_group": "gpt-5.2-codex",
+        "spend": 0.09,
+        "prompt_tokens": 50,
+        "completion_tokens": 20,
+        "total_tokens": 70,
+        "session_id": "codex-session-1",
+        "status": "success",
+        "request_tags": ["route:codex_responses"],
+        "metadata": {
+            "usage_object": {
+                "input_tokens": 50,
+                "output_tokens": 20,
+                "total_tokens": 70,
+                "input_tokens_details": {"cached_tokens": 19},
+                "output_tokens_details": {"reasoning_tokens": 7},
+            }
+        },
+        "proxy_server_request": {},
+        "messages": [],
+        "response": {
+            "id": "resp-codex-usage-1",
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 20,
+                "total_tokens": 70,
+                "input_tokens_details": {"cached_tokens": 19},
+                "output_tokens_details": {"reasoning_tokens": 7},
+            },
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "search",
+                    "arguments": "{}",
+                    "call_id": "call_search",
+                }
+            ],
+        },
+    }
+
+    record = _build_session_history_record_from_spend_log_row(spend_log_row)
+
+    assert record is not None
+    assert record["input_tokens"] == 50
+    assert record["output_tokens"] == 20
+    assert record["cache_read_input_tokens"] == 19
+    assert record["reasoning_tokens_reported"] == 7
+    assert record["reasoning_tokens_source"] == "provider_reported"
+    assert record["tool_call_count"] == 1
+    assert record["tool_names"] == ["search"]
 
 
 def test_derive_langfuse_trace_tags_from_spend_log_row_merges_derived_tags() -> None:
@@ -612,6 +727,111 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert "route:anthropic_messages" in record["metadata"]["request_tags"]
 
 
+def test_build_session_history_record_from_langfuse_trace_observation_uses_tool_name_fallback() -> None:
+    trace = {
+        "id": "trace-456",
+        "name": "codex",
+        "sessionId": "session-456",
+        "input": {},
+    }
+    observation = {
+        "id": "call-456",
+        "type": "GENERATION",
+        "name": "litellm-responses",
+        "model": "openai/responses/gpt-5.4",
+        "startTime": "2026-04-16T12:00:00Z",
+        "endTime": "2026-04-16T12:00:02Z",
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "reasoningTokens": 2,
+        },
+        "output": {},
+        "toolCallNames": ["search", "memory_save"],
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-2",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["tool_call_count"] == 2
+    assert record["tool_names"] == ["search", "memory_save"]
+    assert record["reasoning_tokens_reported"] == 2
+    assert record["reasoning_tokens_source"] == "provider_reported"
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_uses_metadata_usage_object_for_gemini() -> None:
+    trace = {
+        "id": "trace-gemini-1",
+        "name": "gemini",
+        "sessionId": "session-gemini-1",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-gemini-1",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gemini-2.5-pro",
+        "startTime": "2026-04-17T14:00:00Z",
+        "endTime": "2026-04-17T14:00:02Z",
+        "usage": {
+            "input": 120,
+            "output": 40,
+            "total": 160,
+        },
+        "costDetails": {"total": 0.03},
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "gemini result",
+                        "provider_specific_fields": {
+                            "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
+                        },
+                    }
+                }
+            ]
+        },
+        "metadata": {
+            "passthrough_route_family": "gemini_generate_content",
+            "usage_object": {
+                "prompt_tokens": 120,
+                "completion_tokens": 40,
+                "total_tokens": 160,
+                "cachedContentTokenCount": 55,
+                "thoughtsTokenCount": 18,
+                "prompt_tokens_details": {"cached_tokens": 55},
+            },
+            "usage_tool_names": ["google_search"],
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-gemini-1",
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["input_tokens"] == 120
+    assert record["output_tokens"] == 40
+    assert record["cache_read_input_tokens"] == 55
+    assert record["reasoning_tokens_reported"] == 18
+    assert record["reasoning_tokens_source"] == "provider_reported"
+    assert record["tool_call_count"] == 1
+    assert record["tool_names"] == ["google_search"]
+
+
 def test_derive_langfuse_trace_tags_from_langfuse_trace_merges_observation_metadata() -> None:
     trace = {
         "id": "trace-tags-123",
@@ -704,5 +924,5 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 
     mock_conn.executemany.assert_awaited_once()
     executed_args = mock_conn.executemany.await_args.args
-    assert "INSERT INTO session_history" in executed_args[0]
+    assert "INSERT INTO public.session_history" in executed_args[0]
     assert executed_args[1][0][0] == "call-1"
