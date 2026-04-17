@@ -1661,7 +1661,9 @@ def test_max_effort_rejected_for_opus_45():
 
     messages = [{"role": "user", "content": "Test"}]
 
-    with pytest.raises(ValueError, match="effort='max' is only supported by Claude Opus 4.6"):
+    with pytest.raises(
+        ValueError, match="effort='max' is only supported by Claude Opus 4.6/4.7"
+    ):
         optional_params = {"output_config": {"effort": "max"}}
         config.transform_request(
             model="claude-opus-4-5-20251101",
@@ -2213,11 +2215,13 @@ def test_reasoning_effort_does_not_set_output_config_for_older_models():
 
 
 def test_max_effort_rejected_for_sonnet_46():
-    """Test that effort='max' is rejected for Sonnet 4.6 (only Opus 4.6 supports max)."""
+    """Test that effort='max' is rejected for Sonnet 4.6 (only Opus 4.6/4.7 support max)."""
     config = AnthropicConfig()
     messages = [{"role": "user", "content": "Test"}]
 
-    with pytest.raises(ValueError, match="effort='max' is only supported by Claude Opus 4.6"):
+    with pytest.raises(
+        ValueError, match="effort='max' is only supported by Claude Opus 4.6/4.7"
+    ):
         config.transform_request(
             model="claude-sonnet-4-6-20260219",
             messages=messages,
@@ -2234,6 +2238,22 @@ def test_max_effort_accepted_for_opus_46():
 
     result = config.transform_request(
         model="claude-opus-4-6-20250514",
+        messages=messages,
+        optional_params={"output_config": {"effort": "max"}},
+        litellm_params={},
+        headers={},
+    )
+
+    assert result["output_config"]["effort"] == "max"
+
+
+def test_max_effort_accepted_for_opus_47():
+    """Test that effort='max' works for Opus 4.7."""
+    config = AnthropicConfig()
+    messages = [{"role": "user", "content": "Test"}]
+
+    result = config.transform_request(
+        model="claude-opus-4-7",
         messages=messages,
         optional_params={"output_config": {"effort": "max"}},
         litellm_params={},
@@ -2279,6 +2299,36 @@ def test_effort_beta_header_still_injected_for_older_models():
         model="claude-opus-4-5-20251101",
     )
     assert result is True
+
+
+def test_reasoning_effort_maps_to_adaptive_thinking_for_opus_47():
+    """Opus 4.7 should use the stable adaptive thinking + output_config path."""
+    config = AnthropicConfig()
+
+    result = config.map_openai_params(
+        non_default_params={"reasoning_effort": "high"},
+        optional_params={},
+        model="claude-opus-4-7",
+        drop_params=False,
+    )
+
+    assert result["thinking"]["type"] == "adaptive"
+    assert "budget_tokens" not in result["thinking"]
+    assert result["output_config"]["effort"] == "high"
+
+
+def test_effort_beta_header_not_injected_for_opus_47():
+    """Claude Opus 4.7 should not require the effort beta header."""
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+    model_info = AnthropicModelInfo()
+
+    result = model_info.is_effort_used(
+        optional_params={"output_config": {"effort": "high"}},
+        model="claude-opus-4-7",
+    )
+
+    assert result is False
 
 
 def test_code_execution_tool_results_extraction():

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )  # Adds the parent directory to the system path
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
@@ -370,4 +370,3 @@ def test_generic_api_compatible_callbacks_json_unknown_callback():
     # Should return the string unchanged
     assert result == "unknown_callback", "Unknown callback should be returned as-is"
     assert isinstance(result, str), "Unknown callback should remain a string"
-

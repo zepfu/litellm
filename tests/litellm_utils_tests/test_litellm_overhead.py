@@ -10,7 +10,7 @@ import pytest
 import asyncio
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )  # Adds the parent directory to the system path
 import litellm
 

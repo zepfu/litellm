@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )  # Adds the parent directory to the system path
 
 from litellm.llms.base_llm.base_utils import BaseTokenCounter

@@ -173,10 +173,20 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
     @staticmethod
     def _is_opus_4_6_model(model: str) -> bool:
-        """Check if the model is specifically Claude Opus 4.6."""
+        """Check if the model is specifically Claude Opus 4.6 or 4.7."""
         model_lower = model.lower()
         return any(
-            v in model_lower for v in ("opus-4-6", "opus_4_6", "opus-4.6", "opus_4.6")
+            v in model_lower
+            for v in (
+                "opus-4-6",
+                "opus_4_6",
+                "opus-4.6",
+                "opus_4.6",
+                "opus-4-7",
+                "opus_4_7",
+                "opus-4.7",
+                "opus_4.7",
+            )
         )
 
     def get_supported_openai_params(self, model: str):
@@ -1034,8 +1044,9 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 optional_params["thinking"] = AnthropicConfig._map_reasoning_effort(
                     reasoning_effort=value, model=model
                 )
-                # For Claude 4.6 models, effort is controlled via output_config,
-                # not thinking budget_tokens. Map reasoning_effort to output_config.
+                # For Claude 4.6 models and Claude Opus 4.7, effort is controlled
+                # via output_config, not thinking budget_tokens. Map
+                # reasoning_effort to output_config.
                 if AnthropicConfig._is_claude_4_6_model(model):
                     effort_map = {
                         "low": "low",
@@ -1437,7 +1448,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                     )
                 if effort == "max" and not self._is_opus_4_6_model(model):
                     raise ValueError(
-                        f"effort='max' is only supported by Claude Opus 4.6. Got model: {model}"
+                        f"effort='max' is only supported by Claude Opus 4.6/4.7. Got model: {model}"
                     )
                 data["output_config"] = output_config
 

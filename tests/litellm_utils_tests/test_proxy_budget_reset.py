@@ -13,7 +13,7 @@ import os
 from litellm.proxy._types import LiteLLM_BudgetTableFull
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )  # Adds the parent directory to the system path
 
 from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
