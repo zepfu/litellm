@@ -29,13 +29,12 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11` (10 active patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15` (14 active patches)
 
 **Version metadata note:** `pyproject.toml` should stay aligned to this
 registry's carried patch set. `litellm/_version.py` now reflects the installed
-distribution version directly. The current working tree includes `aawm.11`,
-but `pyproject.toml` still reports `1.82.3+aawm.7`; bump package/version
-metadata before the next release artifact/tag is cut.
+distribution version directly. The current working tree now aligns on
+`1.82.3+aawm.15`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -359,6 +358,138 @@ provider behavior.
 empty injection on `NULL`, failure replacement when required context is
 missing, persisted-output compatibility, and the now-async Anthropic request
 preparation path.
+
+---
+
+### aawm.12 — Claude Code system-prompt rewrites and file-backed prompt patching
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `context-replacement/claude-code/2.1.110/auto-memory-replacement.md`
+- `context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `scripts/local-ci/config.json`
+
+**Upstream issue:** Claude Code currently injects its own large `# auto memory`
+and other system instructions before Anthropic passthrough send. AAWM needs to
+replace portions of that prompt with file-backed fork-specific instructions
+without patching Claude Code itself, while keeping the rewrite observable and
+version-aware.
+
+**Fix:**
+1. Add Claude Code version-aware system-prompt override support on the
+   Anthropic passthrough path.
+2. Replace the `# auto memory` section with a file-backed AAWM-specific prompt
+   template while preserving selected upstream sections verbatim.
+3. Apply exact-match prompt patches from a JSON manifest when Claude sends
+   known upstream text fragments.
+4. Record rewrite tags/metadata and preserve post-rewrite context-file
+   detection for `MEMORY.md` / `CLAUDE.md`.
+
+**Why not upstream:** This is AAWM-specific Claude Code control-plane behavior.
+It depends on our local prompt-management direction, our context store, and our
+decision to rewrite Claude Code system prompt fragments at the LiteLLM seam
+rather than patching the client.
+
+**Validation status:** Focused passthrough tests cover the auto-memory
+replacement, prompt-patch manifest application, and post-rewrite context-file
+detection. Live Claude runs through `litellm-dev` showed the rewrite tags and
+replacement flow on current Claude Code builds.
+
+---
+
+### aawm.13 — Persist per-call session history to AAWM tristore
+
+**Files:**
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `scripts/backfill_session_history.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+
+**Upstream issue:** LiteLLM and Langfuse store call-level observability, but
+AAWM also needs a first-class per-call session ledger in its own Postgres store
+for session analytics, model-level token rollups, and historical repair/backfill
+independent of Langfuse retention.
+
+**Fix:**
+1. Add lazy creation and persistence of `public.session_history` through the
+   AAWM callback path.
+2. Store per-call session/model/provider lineage, token/cost fields, tool-call
+   counts, and reasoning-related metadata keyed by `litellm_call_id`.
+3. Add a historical backfill script that reconstructs rows from historical
+   LiteLLM/Langfuse sources and can also write derived Langfuse trace tags.
+
+**Why not upstream:** The table shape, target database, and callback/backfill
+workflow are specific to AAWM's tristore and session analytics model rather
+than generic LiteLLM provider behavior.
+
+**Validation status:** Focused callback tests cover record construction and DB
+write behavior, and the backfill path has already been used to populate the
+tristore session-history table.
+
+---
+
+### aawm.14 — Session-history upserts and Gemini/Codex usage breakout enrichment
+
+**Files:**
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `scripts/backfill_session_history.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+
+**Upstream issue:** The first session-history implementation wrote sparse rows
+and could not enrich existing records when richer data became available later.
+Gemini and Codex/OpenAI Responses usage also expose provider-specific cache,
+reasoning, and tool-call fields that were not being normalized into either
+session history or Langfuse metadata.
+
+**Fix:**
+1. Change session-history writes from insert-only to upsert-on-call-id so later
+   runs can enrich existing rows.
+2. Normalize Gemini `thoughtsTokenCount` / `cachedContentTokenCount` and Codex
+   Responses `input_tokens_details.cached_tokens` /
+   `output_tokens_details.reasoning_tokens`.
+3. Fall back to Responses-style `output` items and metadata-carried usage/tool
+   fields when reconstructing historical observations.
+4. Emit provider usage-breakout metadata/tags/spans from the callback path so
+   Langfuse and session history carry the same enriched token/tool view.
+
+**Why not upstream:** This is AAWM-specific observability normalization tied to
+our session-history table, Langfuse conventions, and the provider mix we are
+running through passthrough.
+
+**Validation status:** Focused callback tests cover the Gemini and Codex usage
+breakout cases, and the historical backfill has been rerun against tristore
+with the upsert/enrichment logic.
+
+---
+
+### aawm.15 — Treat forwarded-client-auth passthrough models as healthy without server API keys
+
+**Files:**
+- `litellm/proxy/health_check.py`
+- `tests/litellm_utils_tests/test_health_check.py`
+
+**Upstream issue:** `/health` marked passthrough routes unhealthy when the
+proxy itself did not have a server-side provider key, even if those routes are
+designed to rely on forwarded client OAuth/auth headers at request time. That
+produced false unhealthy signals for Claude passthrough deployments.
+
+**Fix:**
+1. Detect models configured to forward client headers to the upstream LLM API.
+2. Skip direct health probes for those models when no server-side credential is
+   configured.
+3. Mark the result as healthy with an explicit `health_check_skipped` reason so
+   the deployment is not shown as unhealthy solely because it depends on client
+   auth passthrough.
+
+**Why not upstream:** This behavior is coupled to our passthrough/OAuth usage
+pattern and current dev/prod routing expectations for client-authenticated
+provider traffic.
+
+**Validation status:** The live `/health` response on `litellm-dev` now reports
+the Anthropic passthrough model healthy with
+`health_check_skipped=forwarded_client_headers_required`.
 
 ---
 

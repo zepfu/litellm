@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aawm-litellm-callbacks"
-version = "0.0.3"
-description = "AAWM agent identity callback for LiteLLM Langfuse integration"
+version = "0.0.4"
+description = "AAWM LiteLLM callback for Langfuse enrichment and session history"
 requires-python = ">=3.10"
 dependencies = ["litellm"]
 
