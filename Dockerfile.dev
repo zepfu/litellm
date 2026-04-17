@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install litellm from source in editable mode
 COPY . .
 RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir asyncpg
 
 # Install langfuse for observability
 RUN pip install --no-cache-dir langfuse

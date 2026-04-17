@@ -22,21 +22,161 @@ Registration in litellm-config.yaml:
       success_callback: ["langfuse"]
 """
 
+import asyncio
 import base64
 import hashlib
+import importlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, urlencode
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.secret_managers.main import get_secret_str
 
 _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
+_AGENT_TENANT_RE = re.compile(
+    r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project"
+)
 _DEFAULT_AGENT = "orchestrator"
 _CLAUDE_EXPERIMENT_ID_RE = re.compile(
     rb"(?<![A-Za-z0-9._-])([A-Za-z][A-Za-z0-9._-]{11,})(?![A-Za-z0-9._-])"
 )
 _GEMINI_MARKER = bytes.fromhex("8f3d6b5f")
+_AAWM_DB_HOST_ENV_VARS = (
+    "AAWM_DB_HOST",
+    "AAWM_POSTGRES_SERVER",
+    "POSTGRES_SERVER",
+    "PGHOST",
+)
+_AAWM_DB_PORT_ENV_VARS = (
+    "AAWM_DB_PORT",
+    "AAWM_POSTGRES_PORT",
+    "POSTGRES_PORT",
+    "PGPORT",
+)
+_AAWM_DB_USER_ENV_VARS = (
+    "AAWM_DB_USER",
+    "AAWM_POSTGRES_USER",
+    "POSTGRES_USER",
+    "PGUSER",
+)
+_AAWM_DB_PASSWORD_ENV_VARS = (
+    "AAWM_DB_PASSWORD",
+    "AAWM_DB_PWD",
+    "AAWM_POSTGRES_PASSWORD",
+    "AAWM_POSTGRES_PWD",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_PWD",
+    "PGPASSWORD",
+)
+_AAWM_DB_NAME_ENV_VARS = (
+    "AAWM_DB_NAME",
+    "AAWM_POSTGRES_DATABASE",
+    "POSTGRES_DATABASE",
+    "PGDATABASE",
+)
+_AAWM_DB_SSLMODE_ENV_VARS = (
+    "AAWM_DB_SSLMODE",
+    "AAWM_POSTGRES_SSLMODE",
+    "POSTGRES_SSLMODE",
+    "PGSSLMODE",
+)
+_AAWM_DB_SSL_BOOL_ENV_VARS = (
+    "AAWM_DB_SSL",
+    "AAWM_POSTGRES_SSL",
+    "POSTGRES_SSL",
+)
+_AAWM_DB_URL_ENV_VARS = (
+    "AAWM_DB_URL",
+    "AAWM_DATABASE_URL",
+    "AAWM_POSTGRES_URL",
+)
+_AAWM_SESSION_HISTORY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS session_history (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    litellm_call_id TEXT UNIQUE,
+    session_id TEXT NOT NULL,
+    trace_id TEXT,
+    provider_response_id TEXT,
+    provider TEXT,
+    model TEXT NOT NULL,
+    model_group TEXT,
+    agent_name TEXT,
+    tenant_id TEXT,
+    call_type TEXT,
+    start_time TIMESTAMPTZ,
+    end_time TIMESTAMPTZ,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens_reported INTEGER,
+    reasoning_tokens_estimated INTEGER,
+    reasoning_tokens_source TEXT,
+    reasoning_present BOOLEAN NOT NULL DEFAULT FALSE,
+    thinking_signature_present BOOLEAN NOT NULL DEFAULT FALSE,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
+    response_cost_usd DOUBLE PRECISION,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+_AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON session_history (session_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON session_history (session_id, model, created_at DESC)",
+)
+_AAWM_SESSION_HISTORY_INSERT_SQL = """
+INSERT INTO session_history (
+    litellm_call_id,
+    session_id,
+    trace_id,
+    provider_response_id,
+    provider,
+    model,
+    model_group,
+    agent_name,
+    tenant_id,
+    call_type,
+    start_time,
+    end_time,
+    input_tokens,
+    output_tokens,
+    total_tokens,
+    cache_read_input_tokens,
+    cache_creation_input_tokens,
+    reasoning_tokens_reported,
+    reasoning_tokens_estimated,
+    reasoning_tokens_source,
+    reasoning_present,
+    thinking_signature_present,
+    tool_call_count,
+    tool_names,
+    response_cost_usd,
+    metadata
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+    $21, $22, $23, $24::jsonb, $25, $26::jsonb
+)
+ON CONFLICT (litellm_call_id) DO NOTHING
+"""
+_AAWM_SESSION_HISTORY_METADATA_KEYS = (
+    "trace_name",
+    "cc_version",
+    "cc_entrypoint",
+    "route_tag",
+    "reasoning_content_present",
+    "thinking_signature_present",
+)
+_aawm_session_history_pool: Optional[Any] = None
+_aawm_session_history_pool_lock = asyncio.Lock()
+_aawm_session_history_schema_ready = False
+_aawm_session_history_schema_lock = asyncio.Lock()
 
 
 def _content_to_text(content: Any) -> str:
@@ -54,17 +194,81 @@ def _content_to_text(content: Any) -> str:
     return str(content) if content else ""
 
 
-def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
-    """Extract agent name from request content.
+def _clean_secret_string(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
 
-    Checks four sources:
-    1. kwargs["messages"] - system messages only (standard LLM call path).
-    2. kwargs["system"] - Anthropic pass-through transforms system to top-level kwarg.
-    3. kwargs["passthrough_logging_payload"]["request_body"]["system"] - pass-through system field.
-    4. kwargs["passthrough_logging_payload"]["request_body"]["messages"] - first user message.
-       Claude Code SubagentStart hook injects identity into the task prompt (first user message),
-       not the system prompt. The tightened regex avoids false positives.
-    """
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned or None
+
+
+def _get_first_secret_value(secret_names: tuple[str, ...]) -> Optional[str]:
+    for secret_name in secret_names:
+        value = _clean_secret_string(get_secret_str(secret_name))
+        if value:
+            return value
+    return None
+
+
+def _normalize_aawm_sslmode(value: Optional[str]) -> Optional[str]:
+    cleaned = _clean_secret_string(value)
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return "require"
+    if lowered in {"0", "false", "no", "off"}:
+        return "disable"
+    return cleaned
+
+
+def _build_aawm_dsn() -> Optional[str]:
+    host = _get_first_secret_value(_AAWM_DB_HOST_ENV_VARS)
+    port = _get_first_secret_value(_AAWM_DB_PORT_ENV_VARS)
+    user = _get_first_secret_value(_AAWM_DB_USER_ENV_VARS)
+    password = _get_first_secret_value(_AAWM_DB_PASSWORD_ENV_VARS)
+    database = _get_first_secret_value(_AAWM_DB_NAME_ENV_VARS)
+    sslmode = _normalize_aawm_sslmode(
+        _get_first_secret_value(_AAWM_DB_SSLMODE_ENV_VARS)
+        or _get_first_secret_value(_AAWM_DB_SSL_BOOL_ENV_VARS)
+    )
+
+    has_component_config = any((host, port, user, password, database, sslmode))
+    if has_component_config:
+        if not host or not user or not database:
+            return None
+
+        credentials = quote(user, safe="")
+        if password:
+            credentials += f":{quote(password, safe='')}"
+        dsn = (
+            f"postgresql://{credentials}@{host}:{port or '5432'}/"
+            f"{quote(database, safe='')}"
+        )
+        if sslmode:
+            dsn += f"?{urlencode({'sslmode': sslmode})}"
+        return dsn
+
+    return _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
+
+
+def _extract_agent_context_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
+    tenant_match = _AGENT_TENANT_RE.search(text)
+    if tenant_match:
+        return tenant_match.group("agent"), tenant_match.group("tenant")
+
+    agent_match = _AGENT_RE.search(text)
+    if agent_match:
+        return agent_match.group(1), None
+
+    return None, None
+
+
+def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Extract agent/tenant from request content when present."""
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
         for message in messages:
@@ -73,16 +277,16 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
             if message.get("role") != "system":
                 continue
             text = _content_to_text(message.get("content", ""))
-            match = _AGENT_RE.search(text)
-            if match:
-                return match.group(1)
+            agent_name, tenant_id = _extract_agent_context_from_text(text)
+            if agent_name:
+                return agent_name, tenant_id
 
     system_direct = kwargs.get("system")
     if system_direct:
         text = _content_to_text(system_direct)
-        match = _AGENT_RE.search(text)
-        if match:
-            return match.group(1)
+        agent_name, tenant_id = _extract_agent_context_from_text(text)
+        if agent_name:
+            return agent_name, tenant_id
 
     payload = kwargs.get("passthrough_logging_payload")
     if isinstance(payload, dict):
@@ -91,9 +295,9 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
             system = request_body.get("system")
             if system:
                 text = _content_to_text(system)
-                match = _AGENT_RE.search(text)
-                if match:
-                    return match.group(1)
+                agent_name, tenant_id = _extract_agent_context_from_text(text)
+                if agent_name:
+                    return agent_name, tenant_id
 
             pt_messages = request_body.get("messages")
             if pt_messages and isinstance(pt_messages, list):
@@ -103,12 +307,17 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
                     if msg.get("role") != "user":
                         continue
                     text = _content_to_text(msg.get("content", ""))
-                    match = _AGENT_RE.search(text)
-                    if match:
-                        return match.group(1)
+                    agent_name, tenant_id = _extract_agent_context_from_text(text)
+                    if agent_name:
+                        return agent_name, tenant_id
                     break
 
-    return _DEFAULT_AGENT
+    return None, None
+
+
+def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
+    agent_name, _tenant_id = _extract_agent_context(kwargs)
+    return agent_name or _DEFAULT_AGENT
 
 
 def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict:
@@ -271,6 +480,1143 @@ def _append_langfuse_span(
 
     existing_spans.append(span_descriptor)
     metadata["langfuse_spans"] = existing_spans
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_non_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_json_load(value: Any, default: Any) -> Any:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return default
+
+
+def _normalize_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_datetime_value(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return _normalize_datetime(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            normalized = stripped.replace("Z", "+00:00")
+            return _normalize_datetime(datetime.fromisoformat(normalized))
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
+    usage_obj = _maybe_get(result, "usage")
+    if usage_obj is not None:
+        return usage_obj
+
+    standard_logging_object = kwargs.get("standard_logging_object")
+    if isinstance(standard_logging_object, dict):
+        response = standard_logging_object.get("response")
+        if isinstance(response, dict) and response.get("usage") is not None:
+            return response["usage"]
+
+        metadata = standard_logging_object.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("usage_object") is not None:
+            return metadata["usage_object"]
+
+    return None
+
+
+def _extract_prompt_tokens(usage_obj: Any) -> int:
+    return _safe_int(_maybe_get(usage_obj, "prompt_tokens")) or 0
+
+
+def _extract_completion_tokens(usage_obj: Any) -> int:
+    return (
+        _safe_int(_maybe_get(usage_obj, "completion_tokens"))
+        or _safe_int(_maybe_get(usage_obj, "output_tokens"))
+        or 0
+    )
+
+
+def _extract_total_tokens(usage_obj: Any, prompt_tokens: int, completion_tokens: int) -> int:
+    return (
+        _safe_int(_maybe_get(usage_obj, "total_tokens"))
+        or (prompt_tokens + completion_tokens)
+    )
+
+
+def _extract_cache_read_input_tokens(usage_obj: Any) -> int:
+    prompt_tokens_details = _maybe_get(usage_obj, "prompt_tokens_details")
+    return (
+        _safe_int(_maybe_get(usage_obj, "cache_read_input_tokens"))
+        or _safe_int(_maybe_get(usage_obj, "cacheReadInputTokens"))
+        or _safe_int(_maybe_get(prompt_tokens_details, "cached_tokens"))
+        or 0
+    )
+
+
+def _extract_cache_creation_input_tokens(usage_obj: Any) -> int:
+    return (
+        _safe_int(_maybe_get(usage_obj, "cache_creation_input_tokens"))
+        or _safe_int(_maybe_get(usage_obj, "cacheWriteInputTokens"))
+        or 0
+    )
+
+
+def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
+    completion_tokens_details = _maybe_get(usage_obj, "completion_tokens_details")
+    output_tokens_details = _maybe_get(usage_obj, "output_tokens_details")
+    return _first_non_none(
+        _safe_int(_maybe_get(usage_obj, "reasoning_tokens")),
+        _safe_int(_maybe_get(completion_tokens_details, "reasoning_tokens")),
+        _safe_int(_maybe_get(output_tokens_details, "reasoning_tokens")),
+    )
+
+
+def _estimate_reasoning_tokens(model: str, reasoning_text: str) -> Optional[int]:
+    stripped_reasoning = reasoning_text.strip()
+    if not stripped_reasoning:
+        return None
+
+    try:
+        import litellm
+
+        return litellm.token_counter(
+            model=model or "",
+            text=stripped_reasoning,
+            count_response_tokens=True,
+        )
+    except Exception as exc:
+        verbose_logger.debug(
+            "AawmAgentIdentity: failed to estimate reasoning tokens for model=%s: %s",
+            model,
+            exc,
+        )
+        return None
+
+
+def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
+    raw_tool_calls = _maybe_get(message, "tool_calls")
+    if isinstance(raw_tool_calls, list):
+        tool_names: List[str] = []
+        for tool_call in raw_tool_calls:
+            function_obj = _maybe_get(tool_call, "function")
+            tool_name = _maybe_get(function_obj, "name") or _maybe_get(
+                tool_call, "name"
+            )
+            if isinstance(tool_name, str) and tool_name:
+                tool_names.append(tool_name)
+        return len(raw_tool_calls), tool_names
+
+    content = _maybe_get(message, "content")
+    if isinstance(content, list):
+        tool_names = []
+        tool_call_count = 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") not in {"tool_use", "function_call"}:
+                continue
+            tool_call_count += 1
+            tool_name = block.get("name")
+            if isinstance(tool_name, str) and tool_name:
+                tool_names.append(tool_name)
+        if tool_call_count:
+            return tool_call_count, tool_names
+
+    provider_specific_fields = _extract_provider_specific_fields(message)
+    provider_tool_calls = provider_specific_fields.get("tool_calls")
+    if isinstance(provider_tool_calls, list):
+        tool_names = []
+        for tool_call in provider_tool_calls:
+            tool_name = _maybe_get(_maybe_get(tool_call, "function"), "name") or _maybe_get(
+                tool_call, "name"
+            )
+            if isinstance(tool_name, str) and tool_name:
+                tool_names.append(tool_name)
+        return len(provider_tool_calls), tool_names
+
+    return 0, []
+
+
+def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata = litellm_params.get("metadata") or {}
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    standard_metadata = standard_logging_object.get("metadata") or {}
+
+    for candidate in (
+        litellm_params.get("litellm_session_id"),
+        kwargs.get("litellm_session_id"),
+        metadata.get("session_id"),
+        standard_metadata.get("session_id"),
+        standard_logging_object.get("session_id"),
+    ):
+        if candidate is not None and str(candidate).strip():
+            return str(candidate)
+    return None
+
+
+def _extract_trace_id(kwargs: Dict[str, Any]) -> Optional[str]:
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata = litellm_params.get("metadata") or {}
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+
+    for candidate in (
+        litellm_params.get("litellm_trace_id"),
+        kwargs.get("litellm_trace_id"),
+        metadata.get("trace_id"),
+        standard_logging_object.get("trace_id"),
+    ):
+        if candidate is not None and str(candidate).strip():
+            return str(candidate)
+    return None
+
+
+def _extract_trace_id_from_spend_log_row(spend_log_row: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    metadata = _safe_json_load(spend_log_row.get("metadata"), {})
+    request_body = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
+
+    for candidate in (
+        metadata.get("trace_id") if isinstance(metadata, dict) else None,
+        request_body.get("trace_id") if isinstance(request_body, dict) else None,
+        spend_log_row.get("session_id"),
+        spend_log_row.get("request_id"),
+    ):
+        if candidate is not None and str(candidate).strip():
+            candidate_str = str(candidate).strip()
+            if candidate is spend_log_row.get("session_id"):
+                return candidate_str, "legacy_spend_log_session_field"
+            if candidate is spend_log_row.get("request_id"):
+                return candidate_str, "request_id_fallback"
+            return candidate_str, "metadata_or_request_body"
+
+    return None, "missing"
+
+
+def _coerce_nested_session_id(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        session_candidate = value.get("session_id") or value.get("sessionId")
+        if session_candidate is not None and str(session_candidate).strip():
+            return str(session_candidate).strip()
+        return None
+
+    if isinstance(value, str):
+        parsed = _safe_json_load(value, None)
+        if parsed is not None:
+            return _coerce_nested_session_id(parsed)
+        if value.strip():
+            return value.strip()
+
+    return None
+
+
+def _extract_session_id_from_spend_log_row(
+    spend_log_row: Dict[str, Any],
+) -> Tuple[Optional[str], str]:
+    metadata = _safe_json_load(spend_log_row.get("metadata"), {})
+    request_body = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
+    response_body = _safe_json_load(spend_log_row.get("response"), {})
+
+    if isinstance(request_body, dict):
+        metadata_payload = request_body.get("metadata")
+        if isinstance(metadata_payload, dict):
+            session_candidate = metadata_payload.get("session_id")
+            if session_candidate is not None and str(session_candidate).strip():
+                return str(session_candidate).strip(), "request_body.metadata.session_id"
+
+            user_id_payload = metadata_payload.get("user_id")
+            nested_session_id = _coerce_nested_session_id(user_id_payload)
+            if nested_session_id:
+                return nested_session_id, "request_body.metadata.user_id.session_id"
+
+        top_level_session_id = request_body.get("session_id")
+        if top_level_session_id is not None and str(top_level_session_id).strip():
+            return str(top_level_session_id).strip(), "request_body.session_id"
+
+        request_payload = request_body.get("request")
+        if isinstance(request_payload, dict):
+            request_session_id = request_payload.get("session_id")
+            if request_session_id is not None and str(request_session_id).strip():
+                return str(request_session_id).strip(), "request_body.request.session_id"
+
+    if isinstance(metadata, dict):
+        for key in ("session_id", "sessionId"):
+            session_candidate = metadata.get(key)
+            if session_candidate is not None and str(session_candidate).strip():
+                return str(session_candidate).strip(), f"metadata.{key}"
+
+    if isinstance(response_body, dict):
+        for key in ("session_id", "sessionId"):
+            session_candidate = response_body.get(key)
+            if session_candidate is not None and str(session_candidate).strip():
+                return str(session_candidate).strip(), f"response.{key}"
+
+    legacy_session_field = spend_log_row.get("session_id")
+    if legacy_session_field is not None and str(legacy_session_field).strip():
+        return str(legacy_session_field).strip(), "legacy_spend_log_session_field"
+
+    return None, "missing"
+
+
+def _coerce_spend_log_request_tags(value: Any) -> List[str]:
+    parsed = _safe_json_load(value, value)
+    if not isinstance(parsed, list):
+        return []
+    return [str(tag) for tag in parsed if isinstance(tag, str) and tag.strip()]
+
+
+def _synthesize_result_from_spend_log_row(
+    spend_log_row: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    result = _safe_json_load(spend_log_row.get("response"), {})
+    if not isinstance(result, dict):
+        result = {"response": result}
+
+    usage_object = metadata.get("usage_object")
+    if not isinstance(usage_object, dict):
+        usage_object = {}
+
+    if not isinstance(result.get("usage"), dict):
+        reconstructed_usage = dict(usage_object)
+        reconstructed_usage.setdefault(
+            "prompt_tokens", _safe_int(spend_log_row.get("prompt_tokens")) or 0
+        )
+        reconstructed_usage.setdefault(
+            "completion_tokens", _safe_int(spend_log_row.get("completion_tokens")) or 0
+        )
+        reconstructed_usage.setdefault(
+            "total_tokens", _safe_int(spend_log_row.get("total_tokens")) or 0
+        )
+        result["usage"] = reconstructed_usage
+
+    return result
+
+
+def _build_backfill_kwargs_from_spend_log_row(
+    spend_log_row: Dict[str, Any],
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]]:
+    request_id = spend_log_row.get("request_id")
+    model = spend_log_row.get("model")
+    if request_id is None or not str(request_id).strip():
+        return None
+    if model is None or not str(model).strip():
+        return None
+
+    metadata = _safe_json_load(spend_log_row.get("metadata"), {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    request_body = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
+    if not isinstance(request_body, dict):
+        request_body = {}
+    request_tags = _coerce_spend_log_request_tags(spend_log_row.get("request_tags"))
+
+    session_id, session_id_source = _extract_session_id_from_spend_log_row(spend_log_row)
+    trace_id, trace_id_source = _extract_trace_id_from_spend_log_row(spend_log_row)
+
+    litellm_metadata: Dict[str, Any] = dict(metadata)
+    if session_id:
+        litellm_metadata["session_id"] = session_id
+    if trace_id:
+        litellm_metadata["trace_id"] = trace_id
+    if spend_log_row.get("model_group"):
+        litellm_metadata["model_group"] = spend_log_row.get("model_group")
+
+    standard_logging_metadata = dict(litellm_metadata)
+    if isinstance(metadata.get("usage_object"), dict):
+        standard_logging_metadata["usage_object"] = metadata.get("usage_object")
+
+    standard_logging_object: Dict[str, Any] = {
+        "metadata": standard_logging_metadata,
+        "request_tags": list(request_tags),
+        "trace_id": trace_id,
+        "model": str(model),
+        "model_group": spend_log_row.get("model_group"),
+        "response_cost": _safe_float(spend_log_row.get("spend")),
+        "prompt_tokens": _safe_int(spend_log_row.get("prompt_tokens")) or 0,
+        "completion_tokens": _safe_int(spend_log_row.get("completion_tokens")) or 0,
+        "total_tokens": _safe_int(spend_log_row.get("total_tokens")) or 0,
+    }
+
+    kwargs: Dict[str, Any] = {
+        "model": str(model),
+        "custom_llm_provider": spend_log_row.get("custom_llm_provider"),
+        "call_type": spend_log_row.get("call_type"),
+        "litellm_call_id": str(request_id),
+        "litellm_trace_id": trace_id,
+        "litellm_session_id": session_id,
+        "litellm_params": {
+            "metadata": litellm_metadata,
+            "litellm_trace_id": trace_id,
+            "litellm_session_id": session_id,
+            "proxy_server_request": {"body": request_body},
+        },
+        "standard_logging_object": standard_logging_object,
+        "passthrough_logging_payload": {"request_body": request_body},
+        "response_cost": _safe_float(spend_log_row.get("spend")),
+    }
+
+    messages = _safe_json_load(spend_log_row.get("messages"), None)
+    if isinstance(messages, list):
+        kwargs["messages"] = messages
+
+    system = request_body.get("system")
+    if system is not None:
+        kwargs["system"] = system
+
+    result = _synthesize_result_from_spend_log_row(spend_log_row, metadata)
+
+    provenance = {
+        "session_id_source": session_id_source,
+        "trace_id_source": trace_id_source,
+        "source_request_id": str(request_id),
+        "source_spend_log_session_field": (
+            str(spend_log_row.get("session_id")).strip()
+            if spend_log_row.get("session_id") is not None
+            and str(spend_log_row.get("session_id")).strip()
+            else None
+        ),
+    }
+
+    return kwargs, result, provenance
+
+
+def _build_session_history_record_from_spend_log_row(
+    spend_log_row: Dict[str, Any],
+    *,
+    backfill_run_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    prepared = _build_backfill_kwargs_from_spend_log_row(spend_log_row)
+    if prepared is None:
+        return None
+
+    kwargs, result, provenance = prepared
+    kwargs, result = _enrich_trace_name_and_provider_metadata(kwargs, result)
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=_parse_datetime_value(spend_log_row.get("startTime")),
+        end_time=_parse_datetime_value(spend_log_row.get("endTime")),
+    )
+    if record is None:
+        return None
+
+    metadata = record.get("metadata") or {}
+    metadata.update(
+        {
+            "backfilled": True,
+            "backfill_source": "LiteLLM_SpendLogs",
+            "backfill_run_id": backfill_run_id,
+            "source_request_id": provenance["source_request_id"],
+            "source_spend_log_session_field": provenance["source_spend_log_session_field"],
+            "session_id_source": provenance["session_id_source"],
+            "trace_id_source": provenance["trace_id_source"],
+            "source_status": spend_log_row.get("status"),
+        }
+    )
+    if spend_log_row.get("agent_id") is not None:
+        metadata["source_agent_id"] = spend_log_row.get("agent_id")
+    record["metadata"] = metadata
+    record["trace_id"] = kwargs.get("litellm_trace_id") or record.get("trace_id")
+    return record
+
+
+def _derive_langfuse_trace_tags_from_spend_log_row(
+    spend_log_row: Dict[str, Any],
+) -> Tuple[Optional[str], List[str]]:
+    prepared = _build_backfill_kwargs_from_spend_log_row(spend_log_row)
+    if prepared is None:
+        return None, []
+
+    kwargs, result, _provenance = prepared
+    kwargs, result = _enrich_trace_name_and_provider_metadata(kwargs, result)
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    request_tags = standard_logging_object.get("request_tags") or []
+    if not isinstance(request_tags, list):
+        request_tags = []
+    trace_id = kwargs.get("litellm_trace_id")
+    if trace_id is not None and str(trace_id).strip():
+        trace_id = str(trace_id).strip()
+    else:
+        trace_id = None
+    return trace_id, [tag for tag in request_tags if isinstance(tag, str) and tag.strip()]
+
+
+def _serialize_searchable_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _extract_agent_context_from_langfuse_trace_observation(
+    trace: Dict[str, Any],
+    observation: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    for candidate in (
+        observation.get("input"),
+        trace.get("input"),
+        observation.get("output"),
+        trace.get("output"),
+    ):
+        agent_name, tenant_id = _extract_agent_context_from_text(
+            _serialize_searchable_text(candidate)
+        )
+        if agent_name:
+            return agent_name, tenant_id
+
+    trace_name = trace.get("name")
+    if isinstance(trace_name, str) and trace_name.startswith("claude-code."):
+        return trace_name.split(".", 1)[1], None
+
+    return None, None
+
+
+def _extract_langfuse_session_id(
+    trace: Dict[str, Any],
+    observation_metadata: Dict[str, Any],
+) -> Tuple[Optional[str], str]:
+    for candidate in (
+        trace.get("sessionId"),
+        trace.get("session_id"),
+        observation_metadata.get("session_id"),
+        _coerce_nested_session_id(observation_metadata.get("user_id")),
+        _coerce_nested_session_id(observation_metadata.get("user_api_key_end_user_id")),
+    ):
+        if candidate is not None and str(candidate).strip():
+            if candidate == trace.get("sessionId"):
+                return str(candidate).strip(), "trace.sessionId"
+            if candidate == trace.get("session_id"):
+                return str(candidate).strip(), "trace.session_id"
+            if candidate == observation_metadata.get("session_id"):
+                return str(candidate).strip(), "observation.metadata.session_id"
+            if candidate == _coerce_nested_session_id(observation_metadata.get("user_id")):
+                return str(candidate).strip(), "observation.metadata.user_id.session_id"
+            return (
+                str(candidate).strip(),
+                "observation.metadata.user_api_key_end_user_id.session_id",
+            )
+
+    return None, "missing"
+
+
+def _build_usage_object_from_langfuse_observation(observation: Dict[str, Any]) -> Dict[str, Any]:
+    usage = observation.get("usage")
+    usage_details = observation.get("usageDetails")
+
+    usage_object: Dict[str, Any] = {}
+    if isinstance(usage, dict):
+        usage_object.update(usage)
+    if isinstance(usage_details, dict):
+        usage_object.update(usage_details)
+
+    prompt_tokens = _safe_int(
+        _first_non_none(
+            observation.get("promptTokens"),
+            observation.get("inputTokens"),
+            usage_object.get("prompt_tokens"),
+            usage_object.get("input_tokens"),
+            usage_object.get("input"),
+        )
+    )
+    completion_tokens = _safe_int(
+        _first_non_none(
+            observation.get("completionTokens"),
+            observation.get("outputTokens"),
+            usage_object.get("completion_tokens"),
+            usage_object.get("output_tokens"),
+            usage_object.get("output"),
+        )
+    )
+    total_tokens = _safe_int(
+        _first_non_none(
+            observation.get("totalTokens"),
+            usage_object.get("total_tokens"),
+            usage_object.get("total"),
+        )
+    )
+
+    if prompt_tokens is not None:
+        usage_object["prompt_tokens"] = prompt_tokens
+    if completion_tokens is not None:
+        usage_object["completion_tokens"] = completion_tokens
+        usage_object.setdefault("output_tokens", completion_tokens)
+    if total_tokens is not None:
+        usage_object["total_tokens"] = total_tokens
+
+    cache_read_tokens = _safe_int(usage_object.get("cache_read_input_tokens"))
+    cache_creation_tokens = _safe_int(usage_object.get("cache_creation_input_tokens"))
+    if cache_read_tokens is not None:
+        usage_object["cache_read_input_tokens"] = cache_read_tokens
+    if cache_creation_tokens is not None:
+        usage_object["cache_creation_input_tokens"] = cache_creation_tokens
+
+    return usage_object
+
+
+def _extract_first_langfuse_response_message(output_payload: Any) -> Any:
+    if isinstance(output_payload, dict):
+        if isinstance(output_payload.get("choices"), list):
+            return _extract_first_response_message(output_payload)
+        if isinstance(output_payload.get("message"), dict):
+            return output_payload["message"]
+        if any(
+            key in output_payload
+            for key in ("content", "tool_calls", "reasoning_content", "thinking_blocks")
+        ):
+            return output_payload
+    return None
+
+
+def _infer_provider_from_langfuse_observation(
+    observation: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    route_family = metadata.get("passthrough_route_family")
+    if isinstance(route_family, str) and route_family.strip():
+        route_lower = route_family.lower()
+        if "anthropic" in route_lower:
+            return "anthropic"
+        if "gemini" in route_lower:
+            return "gemini"
+        if "codex" in route_lower:
+            return "openai"
+        if "openai" in route_lower:
+            return "openai"
+
+    request_route = metadata.get("user_api_key_request_route")
+    if isinstance(request_route, str) and request_route.strip():
+        route_lower = request_route.lower()
+        if route_lower.startswith("/anthropic/"):
+            return "anthropic"
+        if "gemini" in route_lower:
+            return "gemini"
+        if route_lower.startswith("/v1/"):
+            return "openai"
+
+    api_base = (
+        metadata.get("api_base")
+        or _maybe_get(metadata.get("hidden_params"), "api_base")
+        or observation.get("apiBase")
+    )
+    if isinstance(api_base, str) and api_base.strip():
+        api_base_lower = api_base.lower()
+        if "anthropic.com" in api_base_lower:
+            return "anthropic"
+        if "googleapis.com" in api_base_lower or "generativelanguage" in api_base_lower:
+            return "gemini"
+        if "openai.com" in api_base_lower:
+            return "openai"
+
+    model = observation.get("model")
+    if isinstance(model, str) and model.strip():
+        model_lower = model.lower()
+        if "claude" in model_lower:
+            return "anthropic"
+        if "gemini" in model_lower:
+            return "gemini"
+        if (
+            model_lower.startswith("gpt")
+            or model_lower.startswith("o1")
+            or model_lower.startswith("o3")
+            or model_lower.startswith("o4")
+            or "codex" in model_lower
+            or "text-embedding" in model_lower
+        ):
+            return "openai"
+
+    return None
+
+
+def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> List[str]:
+    request_tags = metadata.get("tags")
+    normalized_tags = [
+        str(tag) for tag in request_tags if isinstance(tag, str) and tag.strip()
+    ] if isinstance(request_tags, list) else []
+
+    route_family = metadata.get("passthrough_route_family")
+    if isinstance(route_family, str) and route_family.strip():
+        normalized_tags.append(f"route:{route_family.strip()}")
+
+    billing_header_fields = metadata.get("anthropic_billing_header_fields")
+    if isinstance(billing_header_fields, dict) and billing_header_fields:
+        normalized_tags.append("anthropic-billing-header")
+        for key, value in billing_header_fields.items():
+            if isinstance(key, str) and key.strip():
+                normalized_tags.append(f"anthropic-billing-header-key:{key}")
+                if value is not None and str(value).strip():
+                    normalized_tags.append(
+                        f"anthropic-billing-header:{key}={str(value).strip()}"
+                    )
+
+    thinking_type = metadata.get("claude_thinking_type")
+    if isinstance(thinking_type, str) and thinking_type.strip():
+        normalized_tags.append(f"claude-thinking-type:{thinking_type}")
+        normalized_tags.append(f"thinking-type:{thinking_type}")
+
+    effort = metadata.get("claude_effort")
+    if isinstance(effort, str) and effort.strip():
+        normalized_tags.append(f"claude-effort:{effort}")
+        normalized_tags.append(f"effort:{effort}")
+
+    if metadata.get("thinking_signature_present") is True:
+        normalized_tags.append("thinking-signature-present")
+    if metadata.get("claude_thinking_signature_present") is True:
+        normalized_tags.append("claude-thinking-signature")
+    if metadata.get("gemini_thought_signature_present") is True:
+        normalized_tags.append("gemini-thought-signature")
+    if metadata.get("thinking_signature_decoded") is True:
+        normalized_tags.append("thinking-signature-decoded")
+    if metadata.get("claude_thinking_signature_decoded") is True:
+        normalized_tags.append("claude-thinking-decoded")
+    if metadata.get("reasoning_content_present") is True:
+        normalized_tags.append("reasoning-present")
+    elif metadata.get("reasoning_content_present") is False:
+        normalized_tags.append("reasoning-empty")
+    if metadata.get("thinking_blocks_present") is True:
+        normalized_tags.append("thinking-blocks-present")
+    elif metadata.get("thinking_blocks_present") is False:
+        normalized_tags.append("thinking-blocks-empty")
+
+    return sorted({tag for tag in normalized_tags if isinstance(tag, str) and tag.strip()})
+
+
+def _build_session_history_record_from_langfuse_trace_observation(
+    trace: Dict[str, Any],
+    observation: Dict[str, Any],
+    *,
+    backfill_run_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if observation.get("type") != "GENERATION":
+        return None
+
+    metadata = observation.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    session_id, session_id_source = _extract_langfuse_session_id(trace, metadata)
+    if not session_id:
+        return None
+
+    trace_id = trace.get("id") or observation.get("traceId")
+    if trace_id is not None and str(trace_id).strip():
+        trace_id = str(trace_id).strip()
+    else:
+        trace_id = None
+
+    usage_object = _build_usage_object_from_langfuse_observation(observation)
+    prompt_tokens = _extract_prompt_tokens(usage_object)
+    completion_tokens = _extract_completion_tokens(usage_object)
+    total_tokens = _extract_total_tokens(usage_object, prompt_tokens, completion_tokens)
+    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_object)
+    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_object)
+    reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_object)
+
+    output_payload = observation.get("output")
+    message = _extract_first_langfuse_response_message(output_payload)
+    thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
+    reasoning_text = (
+        _extract_reasoning_content(message, thinking_blocks)
+        if message is not None
+        else ""
+    )
+
+    reasoning_present = bool(
+        (isinstance(reasoning_text, str) and reasoning_text.strip())
+        or thinking_blocks
+        or metadata.get("reasoning_content_present")
+        or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
+    )
+    estimated_reasoning_tokens = None
+    reasoning_tokens_source: Optional[str] = None
+    if reported_reasoning_tokens is not None:
+        reasoning_tokens_source = "provider_reported"
+    elif reasoning_present:
+        estimated_reasoning_tokens = _estimate_reasoning_tokens(
+            model=str(observation.get("model") or ""),
+            reasoning_text=reasoning_text,
+        )
+        reasoning_tokens_source = (
+            "estimated_from_reasoning_text"
+            if estimated_reasoning_tokens is not None
+            else "not_available"
+        )
+
+    tool_call_count, tool_names = _extract_tool_call_info(message)
+    agent_name, tenant_id = _extract_agent_context_from_langfuse_trace_observation(
+        trace,
+        observation,
+    )
+    request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
+    provider = _infer_provider_from_langfuse_observation(observation, metadata)
+
+    history_metadata = _build_session_history_metadata(
+        metadata=metadata,
+        request_tags=request_tags,
+        tenant_id=tenant_id,
+    )
+    history_metadata.update(
+        {
+            "backfilled": True,
+            "backfill_source": "LangfuseTraces",
+            "backfill_run_id": backfill_run_id,
+            "source_trace_id": trace_id,
+            "source_observation_id": observation.get("id"),
+            "session_id_source": session_id_source,
+            "trace_id_source": "trace.id" if trace_id else "missing",
+            "source_trace_environment": trace.get("environment"),
+            "source_status": "failure"
+            if observation.get("statusMessage")
+            else "success",
+        }
+    )
+
+    return {
+        "litellm_call_id": observation.get("id"),
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "provider_response_id": _maybe_get(output_payload, "id"),
+        "provider": provider,
+        "model": str(observation.get("model") or ""),
+        "model_group": metadata.get("model_group"),
+        "agent_name": agent_name,
+        "tenant_id": tenant_id,
+        "call_type": metadata.get("user_api_key_request_route") or observation.get("name"),
+        "start_time": _parse_datetime_value(observation.get("startTime")),
+        "end_time": _parse_datetime_value(observation.get("endTime")),
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "reasoning_tokens_reported": reported_reasoning_tokens,
+        "reasoning_tokens_estimated": estimated_reasoning_tokens,
+        "reasoning_tokens_source": reasoning_tokens_source,
+        "reasoning_present": reasoning_present,
+        "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
+        "tool_call_count": tool_call_count,
+        "tool_names": tool_names,
+        "response_cost_usd": _safe_float(
+            _first_non_none(
+                _maybe_get(observation.get("costDetails"), "total"),
+                observation.get("calculatedTotalCost"),
+                metadata.get("litellm_response_cost"),
+                trace.get("totalCost"),
+            )
+        ),
+        "metadata": history_metadata,
+    }
+
+
+def _derive_langfuse_trace_tags_from_langfuse_trace(
+    trace: Dict[str, Any],
+) -> Tuple[Optional[str], List[str]]:
+    trace_id = trace.get("id")
+    normalized_trace_id = (
+        str(trace_id).strip() if trace_id is not None and str(trace_id).strip() else None
+    )
+
+    derived_tags: List[str] = []
+    existing_trace_tags = trace.get("tags")
+    if isinstance(existing_trace_tags, list):
+        derived_tags.extend(
+            str(tag) for tag in existing_trace_tags if isinstance(tag, str) and tag.strip()
+        )
+
+    observations = trace.get("observations")
+    if isinstance(observations, list):
+        for observation in observations:
+            if not isinstance(observation, dict) or observation.get("type") != "GENERATION":
+                continue
+            metadata = observation.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            derived_tags.extend(_derive_request_tags_from_langfuse_metadata(metadata))
+
+    return normalized_trace_id, sorted(
+        {tag for tag in derived_tags if isinstance(tag, str) and tag.strip()}
+    )
+
+
+def _build_session_history_metadata(
+    *,
+    metadata: Dict[str, Any],
+    request_tags: List[str],
+    tenant_id: Optional[str],
+) -> Dict[str, Any]:
+    history_metadata: Dict[str, Any] = {"request_tags": request_tags}
+    if tenant_id:
+        history_metadata["tenant_id"] = tenant_id
+
+    for key in _AAWM_SESSION_HISTORY_METADATA_KEYS:
+        value = metadata.get(key)
+        if value is not None:
+            history_metadata[key] = value
+
+    return history_metadata
+
+
+def _build_session_history_record(
+    kwargs: Dict[str, Any],
+    result: Any,
+    start_time: Any,
+    end_time: Any,
+) -> Optional[Dict[str, Any]]:
+    session_id = _extract_session_id(kwargs)
+    if not session_id:
+        return None
+
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata = litellm_params.get("metadata") or {}
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    request_tags = standard_logging_object.get("request_tags") or metadata.get("tags") or []
+    if not isinstance(request_tags, list):
+        request_tags = []
+
+    usage_obj = _extract_usage_object(kwargs, result)
+    prompt_tokens = _extract_prompt_tokens(usage_obj)
+    completion_tokens = _extract_completion_tokens(usage_obj)
+    total_tokens = _extract_total_tokens(usage_obj, prompt_tokens, completion_tokens)
+    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
+    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
+    reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
+
+    message = _extract_first_response_message(result)
+    thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
+    reasoning_text = (
+        _extract_reasoning_content(message, thinking_blocks)
+        if message is not None
+        else ""
+    )
+
+    reasoning_present = bool(
+        (isinstance(reasoning_text, str) and reasoning_text.strip())
+        or thinking_blocks
+        or metadata.get("reasoning_content_present")
+        or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
+    )
+    estimated_reasoning_tokens = None
+    reasoning_tokens_source: Optional[str] = None
+    if reported_reasoning_tokens is not None:
+        reasoning_tokens_source = "provider_reported"
+    elif reasoning_present:
+        estimated_reasoning_tokens = _estimate_reasoning_tokens(
+            model=str(kwargs.get("model") or ""),
+            reasoning_text=reasoning_text,
+        )
+        reasoning_tokens_source = (
+            "estimated_from_reasoning_text"
+            if estimated_reasoning_tokens is not None
+            else "not_available"
+        )
+
+    tool_call_count, tool_names = _extract_tool_call_info(message)
+    agent_name, tenant_id = _extract_agent_context(kwargs)
+
+    return {
+        "litellm_call_id": kwargs.get("litellm_call_id"),
+        "session_id": session_id,
+        "trace_id": _extract_trace_id(kwargs),
+        "provider_response_id": _maybe_get(result, "id"),
+        "provider": kwargs.get("custom_llm_provider"),
+        "model": str(kwargs.get("model") or standard_logging_object.get("model") or ""),
+        "model_group": metadata.get("model_group") or standard_logging_object.get("model_group"),
+        "agent_name": agent_name,
+        "tenant_id": tenant_id,
+        "call_type": kwargs.get("call_type") or standard_logging_object.get("call_type"),
+        "start_time": _normalize_datetime(start_time),
+        "end_time": _normalize_datetime(end_time),
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "reasoning_tokens_reported": reported_reasoning_tokens,
+        "reasoning_tokens_estimated": estimated_reasoning_tokens,
+        "reasoning_tokens_source": reasoning_tokens_source,
+        "reasoning_present": reasoning_present,
+        "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
+        "tool_call_count": tool_call_count,
+        "tool_names": tool_names,
+        "response_cost_usd": _safe_float(
+            _first_non_none(
+                kwargs.get("response_cost"),
+                standard_logging_object.get("response_cost"),
+            )
+        ),
+        "metadata": _build_session_history_metadata(
+            metadata=metadata,
+            request_tags=[tag for tag in request_tags if isinstance(tag, str)],
+            tenant_id=tenant_id,
+        ),
+    }
+
+
+async def _get_aawm_session_history_pool() -> Any:
+    global _aawm_session_history_pool
+
+    if _aawm_session_history_pool is not None:
+        return _aawm_session_history_pool
+
+    async with _aawm_session_history_pool_lock:
+        if _aawm_session_history_pool is not None:
+            return _aawm_session_history_pool
+
+        dsn = _build_aawm_dsn()
+        if not dsn:
+            raise RuntimeError("AAWM session history database configuration is missing")
+
+        try:
+            asyncpg = importlib.import_module("asyncpg")
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "AAWM session history requires asyncpg to be installed"
+            ) from exc
+
+        _aawm_session_history_pool = await asyncpg.create_pool(
+            dsn=dsn,
+            min_size=1,
+            max_size=4,
+            command_timeout=10,
+        )
+        return _aawm_session_history_pool
+
+
+async def _ensure_session_history_schema(pool: Any) -> None:
+    global _aawm_session_history_schema_ready
+
+    if _aawm_session_history_schema_ready:
+        return
+
+    async with _aawm_session_history_schema_lock:
+        if _aawm_session_history_schema_ready:
+            return
+
+        async with pool.acquire() as conn:
+            await conn.execute(_AAWM_SESSION_HISTORY_TABLE_SQL)
+            for statement in _AAWM_SESSION_HISTORY_INDEX_STATEMENTS:
+                await conn.execute(statement)
+
+        _aawm_session_history_schema_ready = True
+
+
+async def _persist_session_history_record(record: Dict[str, Any]) -> None:
+    pool = await _get_aawm_session_history_pool()
+    await _ensure_session_history_schema(pool)
+
+    await pool.execute(
+        _AAWM_SESSION_HISTORY_INSERT_SQL,
+        record["litellm_call_id"],
+        record["session_id"],
+        record["trace_id"],
+        record["provider_response_id"],
+        record["provider"],
+        record["model"],
+        record["model_group"],
+        record["agent_name"],
+        record["tenant_id"],
+        record["call_type"],
+        record["start_time"],
+        record["end_time"],
+        record["input_tokens"],
+        record["output_tokens"],
+        record["total_tokens"],
+        record["cache_read_input_tokens"],
+        record["cache_creation_input_tokens"],
+        record["reasoning_tokens_reported"],
+        record["reasoning_tokens_estimated"],
+        record["reasoning_tokens_source"],
+        record["reasoning_present"],
+        record["thinking_signature_present"],
+        record["tool_call_count"],
+        json.dumps(record["tool_names"]),
+        record["response_cost_usd"],
+        json.dumps(record["metadata"]),
+    )
+
+
+async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
+    if not records:
+        return
+
+    pool = await _get_aawm_session_history_pool()
+    await _ensure_session_history_schema(pool)
+
+    payloads = [
+        (
+            record["litellm_call_id"],
+            record["session_id"],
+            record["trace_id"],
+            record["provider_response_id"],
+            record["provider"],
+            record["model"],
+            record["model_group"],
+            record["agent_name"],
+            record["tenant_id"],
+            record["call_type"],
+            record["start_time"],
+            record["end_time"],
+            record["input_tokens"],
+            record["output_tokens"],
+            record["total_tokens"],
+            record["cache_read_input_tokens"],
+            record["cache_creation_input_tokens"],
+            record["reasoning_tokens_reported"],
+            record["reasoning_tokens_estimated"],
+            record["reasoning_tokens_source"],
+            record["reasoning_present"],
+            record["thinking_signature_present"],
+            record["tool_call_count"],
+            json.dumps(record["tool_names"]),
+            record["response_cost_usd"],
+            json.dumps(record["metadata"]),
+        )
+        for record in records
+    ]
+
+    async with pool.acquire() as conn:
+        await conn.executemany(_AAWM_SESSION_HISTORY_INSERT_SQL, payloads)
 
 
 def _get_reasoning_state_tags(
@@ -666,6 +2012,48 @@ class AawmAgentIdentity(CustomLogger):
                 "AawmAgentIdentity.async_logging_hook failed: %s", exc
             )
             return kwargs, result
+
+    def log_success_event(self, kwargs, response_obj, start_time, end_time):
+        """Persist one finalized session-history row per completed LiteLLM call."""
+        try:
+            record = _build_session_history_record(
+                kwargs=kwargs,
+                result=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if record is None:
+                return
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(_persist_session_history_record(record))
+            else:
+                loop.create_task(_persist_session_history_record(record))
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity.log_success_event failed: %s", exc
+            )
+
+    async def async_log_success_event(
+        self, kwargs, response_obj, start_time, end_time
+    ) -> None:
+        try:
+            record = _build_session_history_record(
+                kwargs=kwargs,
+                result=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if record is None:
+                return
+
+            await _persist_session_history_record(record)
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity.async_log_success_event failed: %s", exc
+            )
 
 
 # Module-level instance for config registration via get_instance_fn().

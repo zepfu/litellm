@@ -3,12 +3,13 @@
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 )  # Adds the parent directory to the system path
 import asyncio
 
@@ -633,6 +634,41 @@ async def test_health_check_respects_concurrency_limit():
         await _perform_health_check(model_list, max_concurrency=2)
 
     assert max_active <= 2
+
+
+@pytest.mark.asyncio
+async def test_health_check_skips_forwarded_header_models_without_server_key(monkeypatch):
+    from litellm.proxy.health_check import _perform_health_check
+
+    model_list = [
+        {
+            "model_name": "claude-sonnet-4-6",
+            "litellm_params": {
+                "model": "anthropic/claude-sonnet-4-6",
+            },
+            "model_info": {
+                "mode": "chat",
+            },
+        }
+    ]
+
+    monkeypatch.setattr(
+        litellm,
+        "model_group_settings",
+        SimpleNamespace(forward_client_headers_to_llm_api=["claude-sonnet-4-6"]),
+        raising=False,
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(litellm, "anthropic_key", None, raising=False)
+    monkeypatch.setattr(litellm, "api_key", None, raising=False)
+
+    with patch("litellm.ahealth_check", new_callable=AsyncMock) as mock_health_check:
+        healthy_endpoints, unhealthy_endpoints = await _perform_health_check(model_list)
+
+    mock_health_check.assert_not_awaited()
+    assert len(unhealthy_endpoints) == 0
+    assert len(healthy_endpoints) == 1
+    assert healthy_endpoints[0]["health_check_skipped"] == "forwarded_client_headers_required"
 
 
 @pytest.mark.asyncio

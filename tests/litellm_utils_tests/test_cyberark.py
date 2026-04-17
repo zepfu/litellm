@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-sys.path.insert(0, os.path.abspath("../.."))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from unittest.mock import AsyncMock, MagicMock, patch
 from litellm._uuid import uuid
 
@@ -319,4 +319,3 @@ async def test_cyberark_rotate_secret_with_new_alias():
 
             print(f"\n✅ Alias rotation successful: {old_alias} → {new_alias}")
             print(f"   Note: Old alias still exists in CyberArk (expected behavior)")
-
