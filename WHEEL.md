@@ -82,6 +82,97 @@ are then installed on top of that pinned release:
 This keeps AAWM-specific overlays moving independently without forcing a full
 LiteLLM release cut for every prompt/tagging enhancement.
 
+## Activation points
+
+Installing the wheels is not sufficient by itself. Infra must also wire the
+runtime so the overlay code is actually exercised.
+
+### Callback overlay activation
+
+The callback wheel is not auto-discovered. It must be registered in LiteLLM
+config.
+
+Example proxy config:
+
+```yaml
+litellm_settings:
+  callbacks:
+    - "aawm_litellm_callbacks.agent_identity.AawmAgentIdentity"
+  success_callback:
+    - "langfuse"
+```
+
+Notes:
+
+- use the wheel module path above, not the in-repo development import path
+- keep `langfuse` enabled if you want the overlay trace tags, spans, and
+  metadata to actually be emitted upstream
+- `session_history` persistence requires AAWM DB connectivity through either:
+  - `AAWM_DB_URL` / `AAWM_DATABASE_URL`
+  - or the component vars:
+    - `AAWM_DB_HOST`
+    - `AAWM_DB_PORT`
+    - `AAWM_DB_NAME`
+    - `AAWM_DB_USER`
+    - `AAWM_DB_PASSWORD`
+    - optional SSL vars
+
+If the callback wheel is installed but not registered in `callbacks:`, none of
+the identity/session-history enrichment will run.
+
+### Control-plane overlay activation
+
+The Claude control-plane wheel is activated by installation order, not by a
+separate LiteLLM callback registration.
+
+The base fork imports:
+
+- `litellm.proxy.pass_through_endpoints.aawm_claude_control_plane`
+
+So infra must:
+
+1. install the pinned base LiteLLM fork release
+2. install the control-plane wheel after that
+
+The second install must happen last so the overlay module and packaged prompt
+assets are what end up on disk in site-packages.
+
+Notes:
+
+- there is no extra `callbacks:` or `success_callback:` entry for the
+  control-plane wheel itself
+- the control-plane overlay only applies on the Claude / Anthropic passthrough
+  request path
+- Langfuse must still be enabled if you want the control-plane tags/spans to be
+  visible in traces
+- AAWM dynamic memory injection requires the same `AAWM_DB_*` / `AAWM_DB_URL`
+  database settings; otherwise the directive-expansion path will fall back to
+  its failure behavior
+
+## Artifact resolution
+
+The current release model has two kinds of refs:
+
+- versioned wheel releases with assets:
+  - `cb-v*`
+  - `cp-v*`
+- moving git tags:
+  - `cb-latest`
+  - `cp-latest`
+
+Important: the installable wheel assets are currently attached to the versioned
+releases, not to separate `cb-latest` / `cp-latest` release objects.
+
+That means infra must currently do one of these:
+
+1. resolve the newest versioned callback/control-plane release and download that
+   wheel asset
+2. pin an exact wheel version tag
+
+Do not assume `cb-latest` or `cp-latest` is itself a directly installable wheel
+URL unless the workflows are later extended to publish release assets on those
+moving tags too.
+
 ## Infrastructure consumption
 
 The intended infrastructure pattern is:
@@ -106,9 +197,9 @@ release cadences.
 ### What infra should float
 
 - callback overlay wheel line:
-  - moving pointer tag: `cb-latest`
+  - resolve latest versioned `cb-v*` wheel release
 - control-plane overlay wheel line:
-  - moving pointer tag: `cp-latest`
+  - resolve latest versioned `cp-v*` wheel release
 
 If a deployment needs fully frozen behavior for incident response or rollback
 testing, pin the wheel tags too. But the normal operating model is:
