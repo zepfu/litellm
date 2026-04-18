@@ -23,6 +23,11 @@ jobs:
         run: |
           test "$(cat scripts/local-ci/harness-version.txt)" = "${GITHUB_REF_NAME#h-v}"
 
+      - name: Ensure tagged commit is on main
+        run: |
+          git fetch origin main --depth=1
+          git branch -r --contains "$GITHUB_SHA" | grep -q "origin/main"
+
       - name: Build harness archive
         run: python3 scripts/local-ci/build_harness_bundle.py --outdir dist
 
@@ -33,14 +38,14 @@ jobs:
           gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "litellm local acceptance harness v${GITHUB_REF_NAME#h-v}" \
+            --title "litellm local acceptance harness v$(cat scripts/local-ci/harness-version.txt)" \
             --notes "$(cat <<'EOF'
           LiteLLM local acceptance harness archive.
 
           **Download:**
           ```bash
           curl -L -o litellm-local-ci-harness.tar.gz \
-            https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/litellm-local-ci-harness-${{ github.ref_name#h-v }}.tar.gz
+            https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/litellm-local-ci-harness-$(cat scripts/local-ci/harness-version.txt).tar.gz
           ```
 
           **Extract:**
