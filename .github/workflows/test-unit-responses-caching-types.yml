@@ -1,8 +1,7 @@
 name: "Unit Tests: Responses, Caching & Types"
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

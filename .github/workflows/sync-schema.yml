@@ -1,13 +1,10 @@
 name: Sync schema.prisma copies
 
 on:
-  pull_request:
-    paths:
-      - 'schema.prisma'
+  workflow_dispatch:
 
 # Scoped to ONLY the permissions needed:
-# - contents:write to push the sync commit to the PR branch
-# - pull-requests:read is implicit (needed to check out the PR)
+# - contents:write to push the sync commit back to the selected branch
 permissions:
   contents: write
 
@@ -16,23 +13,14 @@ jobs:
     name: Copy root schema to proxy and proxy-extras
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Only run on PRs from branches in THIS repo (not forks).
-    # Fork PRs cannot push back to the head branch with GITHUB_TOKEN,
-    # and pull_request events from forks have read-only tokens anyway.
-    # Also reject PRs from branches named after protected branches to
-    # prevent pushing directly to main/master.
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository
-      && github.head_ref != 'main'
-      && github.head_ref != 'master'
+      github.ref_name != 'main'
+      && github.ref_name != 'master'
     steps:
-      - name: Checkout PR branch by SHA
+      - name: Checkout selected ref
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
-          # Use the merge commit SHA for safety — github.head_ref is an
-          # attacker-controlled string (the branch name) and could contain
-          # unusual characters that cause unexpected git behavior.
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.ref }}
           persist-credentials: true  # needed for git push
 
       - name: Reject symlinked schema files
@@ -63,11 +51,9 @@ jobs:
       - name: Commit synced schemas
         if: steps.diff.outputs.changed == 'true'
         run: |
-          # Push to the PR's head branch (need the branch name for git push).
-          # We checked out by SHA above for safety, so configure the push target explicitly.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$GITHUB_HEAD_REF"
+          git checkout -B "$GITHUB_REF_NAME"
           git add -- litellm/proxy/schema.prisma litellm-proxy-extras/litellm_proxy_extras/schema.prisma
           git commit -m "chore: sync schema.prisma copies from root"
-          git push origin "HEAD:$GITHUB_HEAD_REF"
+          git push origin "HEAD:$GITHUB_REF_NAME"

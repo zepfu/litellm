@@ -610,8 +610,10 @@ def _validate_trace_enrichment(
     traces: list[dict[str, Any]],
     required_tags: list[str] | None = None,
     required_tag_prefixes: list[str] | None = None,
-) -> tuple[dict[str, Any], list[str]]:
+    warning_tag_prefixes: list[str] | None = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
     failures: list[str] = []
+    warnings: list[str] = []
     all_tags = _collect_trace_tags(traces)
     metadata_items = _collect_trace_metadata(traces)
     metadata_keys = sorted({key for metadata in metadata_items for key in metadata.keys()})
@@ -624,11 +626,16 @@ def _validate_trace_enrichment(
         if not any(tag.startswith(prefix) for tag in all_tags):
             failures.append(f"{family} missing trace tag prefix: {prefix}")
 
+    for prefix in warning_tag_prefixes or []:
+        if not any(tag.startswith(prefix) for tag in all_tags):
+            warnings.append(f"{family} missing warning trace tag prefix: {prefix}")
+
     summary = {
         "trace_tags": all_tags,
         "trace_metadata_keys": metadata_keys,
+        "warning_tag_prefixes_checked": sorted(warning_tag_prefixes or []),
     }
-    return summary, failures
+    return summary, failures, warnings
 
 
 def _validate_generation_metadata(
@@ -694,6 +701,24 @@ def _extract_logged_request_body(observation: dict[str, Any]) -> dict[str, Any] 
     return parsed if isinstance(parsed, dict) else None
 
 
+def _extract_request_body_path_value(
+    request_body: dict[str, Any], path: str
+) -> Any | None:
+    current: Any = request_body
+    for segment in path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            return None
+        current = current.get(segment)
+    return current
+
+
+def _preview_request_body_path_value(value: Any) -> str:
+    preview = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if len(preview) > 160:
+        return preview[:157] + "..."
+    return preview
+
+
 def _extract_claude_agent_name_from_observation(observation: dict[str, Any]) -> str | None:
     request_body = _extract_logged_request_body(observation)
     if not isinstance(request_body, dict):
@@ -726,12 +751,18 @@ def _validate_logged_request_text_checks(
     observations: list[dict[str, Any]],
     required_substrings: list[str] | None = None,
     forbidden_substrings: list[str] | None = None,
-) -> tuple[dict[str, Any], list[str]]:
+    warning_required_substrings: list[str] | None = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
     failures: list[str] = []
+    warnings: list[str] = []
     required_substrings = required_substrings or []
     forbidden_substrings = forbidden_substrings or []
+    warning_required_substrings = warning_required_substrings or []
     matched_observation_id: str | None = None
     matched_required: dict[str, bool] = {value: False for value in required_substrings}
+    matched_warning_required: dict[str, bool] = {
+        value: False for value in warning_required_substrings
+    }
     forbidden_hits: dict[str, list[str]] = {value: [] for value in forbidden_substrings}
 
     for observation in observations:
@@ -746,6 +777,10 @@ def _validate_logged_request_text_checks(
             if value in request_text:
                 matched_required[value] = True
 
+        for value in warning_required_substrings:
+            if value in request_text:
+                matched_warning_required[value] = True
+
         current_forbidden_hits = [
             value for value in forbidden_substrings if value in request_text
         ]
@@ -758,6 +793,9 @@ def _validate_logged_request_text_checks(
     for value, matched in matched_required.items():
         if not matched:
             failures.append(f"{family} missing request substring: {value}")
+    for value, matched in matched_warning_required.items():
+        if not matched:
+            warnings.append(f"{family} missing warning request substring: {value}")
     for value, observation_ids in forbidden_hits.items():
         if observation_ids:
             failures.append(
@@ -769,9 +807,75 @@ def _validate_logged_request_text_checks(
     summary = {
         "matched_observation_id": matched_observation_id,
         "required_substrings_found": matched_required,
+        "warning_required_substrings_found": matched_warning_required,
         "forbidden_substring_hits": forbidden_hits,
     }
-    return summary, failures
+    return summary, failures, warnings
+
+
+def _validate_logged_request_payload_checks(
+    *,
+    family: str,
+    observations: list[dict[str, Any]],
+    required_paths: list[str] | None = None,
+    warning_present_paths: list[str] | None = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    required_paths = required_paths or []
+    warning_present_paths = warning_present_paths or []
+
+    required_path_found: dict[str, bool] = {path: False for path in required_paths}
+    required_path_values: dict[str, list[str]] = {path: [] for path in required_paths}
+    warning_path_hits: dict[str, list[dict[str, str]]] = {
+        path: [] for path in warning_present_paths
+    }
+
+    for observation in observations:
+        request_body = _extract_logged_request_body(observation)
+        if request_body is None:
+            continue
+
+        observation_id = str(observation.get("id"))
+        for path in required_paths:
+            value = _extract_request_body_path_value(request_body, path)
+            if value is None:
+                continue
+            required_path_found[path] = True
+            preview = _preview_request_body_path_value(value)
+            if preview not in required_path_values[path]:
+                required_path_values[path].append(preview)
+
+        for path in warning_present_paths:
+            value = _extract_request_body_path_value(request_body, path)
+            if value is None:
+                continue
+            warning_path_hits[path].append(
+                {
+                    "observation_id": observation_id,
+                    "value": _preview_request_body_path_value(value),
+                }
+            )
+
+    for path, found in required_path_found.items():
+        if not found:
+            failures.append(f"{family} missing request payload path: {path}")
+
+    for path, hits in warning_path_hits.items():
+        if not hits:
+            continue
+        observed_values = sorted({hit["value"] for hit in hits})
+        warnings.append(
+            f"{family} request payload includes warning path `{path}` with value(s): "
+            + ", ".join(observed_values)
+        )
+
+    summary = {
+        "required_paths_found": required_path_found,
+        "required_path_values": required_path_values,
+        "warning_present_path_hits": warning_path_hits,
+    }
+    return summary, failures, warnings
 
 
 def _validate_aawm_dynamic_injection(
@@ -1297,13 +1401,15 @@ def _validate_codex(
         allowed_request_routes=config.get("allowed_generation_routes"),
     )
     failures.extend(generation_failures)
-    trace_enrichment_summary, trace_enrichment_failures = _validate_trace_enrichment(
+    trace_enrichment_summary, trace_enrichment_failures, trace_enrichment_warnings = _validate_trace_enrichment(
         family="codex",
         traces=traces,
         required_tags=config.get("required_trace_tags"),
         required_tag_prefixes=config.get("required_trace_tag_prefixes"),
+        warning_tag_prefixes=config.get("warning_trace_tag_prefixes"),
     )
     failures.extend(trace_enrichment_failures)
+    warnings.extend(trace_enrichment_warnings)
     trace_context_summary, trace_context_failures = _validate_trace_context(
         family="codex",
         traces=traces,
@@ -1417,13 +1523,15 @@ def _validate_gemini(
     filtered_traces = [
         trace for trace in traces if trace.get("id") in set(filtered_trace_ids)
     ]
-    trace_enrichment_summary, trace_enrichment_failures = _validate_trace_enrichment(
+    trace_enrichment_summary, trace_enrichment_failures, trace_enrichment_warnings = _validate_trace_enrichment(
         family="gemini",
         traces=filtered_traces,
         required_tags=config.get("required_trace_tags"),
         required_tag_prefixes=config.get("required_trace_tag_prefixes"),
+        warning_tag_prefixes=config.get("warning_trace_tag_prefixes"),
     )
     failures.extend(trace_enrichment_failures)
+    warnings.extend(trace_enrichment_warnings)
     trace_context_summary, trace_context_failures = _validate_trace_context(
         family="gemini",
         traces=filtered_traces,
@@ -1595,13 +1703,15 @@ def _validate_claude(
     filtered_traces = [
         trace for trace in traces if trace.get("id") in set(filtered_trace_ids)
     ]
-    trace_enrichment_summary, trace_enrichment_failures = _validate_trace_enrichment(
+    trace_enrichment_summary, trace_enrichment_failures, trace_enrichment_warnings = _validate_trace_enrichment(
         family="claude",
         traces=filtered_traces,
         required_tags=effective_config.get("required_trace_tags"),
         required_tag_prefixes=effective_config.get("required_trace_tag_prefixes"),
+        warning_tag_prefixes=effective_config.get("warning_trace_tag_prefixes"),
     )
     failures.extend(trace_enrichment_failures)
+    warnings.extend(trace_enrichment_warnings)
     trace_context_summary, trace_context_failures = _validate_trace_context(
         family="claude",
         traces=filtered_traces,
@@ -1625,13 +1735,30 @@ def _validate_claude(
     )
     failures.extend(generation_metadata_failures)
     request_text_checks = effective_config.get("request_text_checks", {})
-    request_text_summary, request_text_failures = _validate_logged_request_text_checks(
+    request_text_summary, request_text_failures, request_text_warnings = _validate_logged_request_text_checks(
         family="claude",
         observations=raw_generation_observations,
         required_substrings=request_text_checks.get("required_substrings"),
         forbidden_substrings=request_text_checks.get("forbidden_substrings"),
+        warning_required_substrings=request_text_checks.get(
+            "warning_required_substrings"
+        ),
     )
     failures.extend(request_text_failures)
+    warnings.extend(request_text_warnings)
+    request_payload_checks = effective_config.get("request_payload_checks", {})
+    request_payload_summary, request_payload_failures, request_payload_warnings = (
+        _validate_logged_request_payload_checks(
+            family="claude",
+            observations=raw_generation_observations,
+            required_paths=request_payload_checks.get("required_paths"),
+            warning_present_paths=request_payload_checks.get(
+                "warning_present_paths"
+            ),
+        )
+    )
+    failures.extend(request_payload_failures)
+    warnings.extend(request_payload_warnings)
     aawm_dynamic_injection_config = effective_config.get("aawm_dynamic_injection", {})
     aawm_dynamic_injection_summary, aawm_dynamic_injection_failures, aawm_dynamic_injection_warnings = (
         _validate_aawm_dynamic_injection(
@@ -1705,6 +1832,7 @@ def _validate_claude(
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,
             "request_text_checks": request_text_summary,
+            "request_payload_checks": request_payload_summary,
             "aawm_dynamic_injection": aawm_dynamic_injection_summary,
             "request_source_file_verification": source_file_summary,
             "span_observations": span_observations,

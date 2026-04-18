@@ -26,8 +26,9 @@ _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH = (
     "context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json"
 )
 _CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION = (2, 1, 110)
-_CLAUDE_AUTO_MEMORY_SECTION_PATTERN = re.compile(
-    r"(?ms)^# auto memory\n.*?(?=^# Environment\b|\Z)"
+_CLAUDE_MEMORY_SECTION_PATTERN = re.compile(
+    r"(?ms)^(?P<section_heading># (?:auto memory|Persistent Agent Memory))\n"
+    r".*?(?=^# [^\n]+\n|\Z)"
 )
 _CLAUDE_TYPES_XML_BLOCK_PATTERN = re.compile(r"<types>\n.*?\n</types>", re.DOTALL)
 _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
@@ -290,7 +291,7 @@ def _extract_markdown_section(markdown_text: str, heading: str) -> str:
 
 
 def _render_claude_auto_memory_replacement(
-    auto_memory_section: str, cc_version: str
+    memory_section: str, cc_version: str, section_heading: str
 ) -> tuple[str, str]:
     template_path = _resolve_claude_auto_memory_template_path(cc_version)
     if template_path is None:
@@ -299,7 +300,7 @@ def _render_claude_auto_memory_replacement(
         )
 
     template_text = _load_claude_context_replacement_template(template_path)
-    types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(auto_memory_section)
+    types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(memory_section)
     if types_match is None:
         raise ValueError("Missing Claude auto-memory <types> block")
 
@@ -309,17 +310,15 @@ def _render_claude_auto_memory_replacement(
     )
     rendered_text = rendered_text.replace(
         "{{WHAT_NOT_TO_SAVE_SECTION}}",
-        _extract_markdown_section(auto_memory_section, "What NOT to save in memory"),
+        _extract_markdown_section(memory_section, "What NOT to save in memory"),
     )
     rendered_text = rendered_text.replace(
         "{{BEFORE_RECOMMENDING_SECTION}}",
-        _extract_markdown_section(auto_memory_section, "Before recommending from memory"),
+        _extract_markdown_section(memory_section, "Before recommending from memory"),
     )
     rendered_text = rendered_text.replace(
         "{{MEMORY_AND_PERSISTENCE_SECTION}}",
-        _extract_markdown_section(
-            auto_memory_section, "Memory and other forms of persistence"
-        ),
+        _extract_markdown_section(memory_section, "Memory and other forms of persistence"),
     )
 
     unresolved_placeholders = _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(
@@ -331,28 +330,34 @@ def _render_claude_auto_memory_replacement(
             + ", ".join(sorted(unresolved_placeholders))
         )
 
+    if section_heading != "# auto memory":
+        rendered_text = rendered_text.replace("# auto memory", section_heading, 1)
+
     return rendered_text.rstrip() + "\n", _CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH
 
 
 def _replace_claude_auto_memory_section_in_text(
     text: str, cc_version: str
 ) -> tuple[str, Optional[dict[str, Any]]]:
-    if "# auto memory" not in text:
+    if "# auto memory" not in text and "# Persistent Agent Memory" not in text:
         return text, None
 
-    section_match = _CLAUDE_AUTO_MEMORY_SECTION_PATTERN.search(text)
+    section_match = _CLAUDE_MEMORY_SECTION_PATTERN.search(text)
     if section_match is None:
         return text, None
 
+    section_heading = section_match.group("section_heading")
     replacement_text, logical_path = _render_claude_auto_memory_replacement(
         section_match.group(0),
         cc_version,
+        section_heading,
     )
     replacement_event: dict[str, Any] = {
         "id": "auto-memory",
         "status": "resolved",
         "cc_version": cc_version,
         "template_path": logical_path,
+        "section_heading": section_heading,
         "output_chars": len(replacement_text),
     }
     return (
@@ -366,7 +371,10 @@ def _replace_claude_system_prompt_override_in_value(
 ) -> tuple[Any, list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
-            if "# auto memory" not in value["text"]:
+            if (
+                "# auto memory" not in value["text"]
+                and "# Persistent Agent Memory" not in value["text"]
+            ):
                 return value, []
             try:
                 updated_text, event = _replace_claude_auto_memory_section_in_text(

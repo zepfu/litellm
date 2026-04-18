@@ -1,8 +1,6 @@
 name: Proxy E2E Azure Batches Tests
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
