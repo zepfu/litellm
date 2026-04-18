@@ -30,6 +30,11 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#cp-v}" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure tagged commit is on main
+        run: |
+          git fetch origin main --depth=1
+          git branch -r --contains "$GITHUB_SHA" | grep -q "origin/main"
+
       - name: Create release and upload wheel
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

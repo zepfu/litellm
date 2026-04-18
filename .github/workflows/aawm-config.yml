@@ -23,6 +23,11 @@ jobs:
         run: |
           test "$(cat model-config-version.txt)" = "${GITHUB_REF_NAME#cfg-v}"
 
+      - name: Ensure tagged commit is on main
+        run: |
+          git fetch origin main --depth=1
+          git branch -r --contains "$GITHUB_SHA" | grep -q "origin/main"
+
       - name: Build model config archive
         run: python3 scripts/build_model_config_bundle.py --outdir dist
 
@@ -33,14 +38,14 @@ jobs:
           gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "litellm model config v${GITHUB_REF_NAME#cfg-v}" \
+            --title "litellm model config v$(cat model-config-version.txt)" \
             --notes "$(cat <<'EOF'
           Standalone LiteLLM model pricing/capability config archive.
 
           **Download:**
           ```bash
           curl -L -o litellm-model-config.tar.gz \
-            https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/litellm-model-config-${{ github.ref_name#cfg-v }}.tar.gz
+            https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/litellm-model-config-$(cat model-config-version.txt).tar.gz
           ```
           EOF
           )" \
