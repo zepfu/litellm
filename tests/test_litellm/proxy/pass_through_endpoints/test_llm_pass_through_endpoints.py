@@ -629,6 +629,70 @@ class TestClaudePersistedOutputExpansion:
         assert "claude-system-prompt-override" in litellm_metadata["tags"]
 
     @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_replaces_persistent_agent_memory_section(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.113.50e; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "\n\n# Persistent Agent Memory\n\n"
+                        "You have a persistent, file-based memory system at `/home/zepfu/projects/aawm/.claude/agent-memory-local/eyes/`. "
+                        "This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).\n\n"
+                        "If the user explicitly asks you to remember something, save it immediately as whichever type fits best. "
+                        "If they ask you to forget something, find and remove the relevant entry.\n\n"
+                        "## Types of memory\n\n"
+                        "There are several discrete types of memory that you can store in your memory system:\n\n"
+                        "<types>\n"
+                        "<type><name>user</name></type>\n"
+                        "<type><name>feedback</name></type>\n"
+                        "</types>\n\n"
+                        "## What NOT to save in memory\n\n"
+                        "- Old exclusion text.\n\n"
+                        "## How to save memories\n\n"
+                        "Old save flow.\n\n"
+                        "## When to access memories\n\n"
+                        "- Old access rules.\n\n"
+                        "## Before recommending from memory\n\n"
+                        "Verify the named file still exists.\n\n"
+                        "## Memory and other forms of persistence\n"
+                        "Memory is one of several persistence mechanisms.\n\n"
+                    ),
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        updated_system_text = updated_body["system"][1]["text"]
+        assert "# Persistent Agent Memory" in updated_system_text
+        assert "persistent, file-based memory system at" not in updated_system_text
+        assert "write to it directly with the Write tool" not in updated_system_text
+        assert "memory_save(" in updated_system_text
+        assert "memory_forget(source_ids=[...])" in updated_system_text
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["claude_system_prompt_override_ids"] == ["auto-memory"]
+        assert litellm_metadata["claude_system_prompt_override_cc_versions"] == [
+            "2.1.113.50e"
+        ]
+        assert litellm_metadata["claude_system_prompt_override_events"][0][
+            "section_heading"
+        ] == "# Persistent Agent Memory"
+        assert "claude-system-prompt-override:auto-memory" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_applies_claude_prompt_patches(
         self,
     ):

@@ -5,6 +5,14 @@ description = "Library to easily interface with LLM API providers"
 authors = ["BerriAI"]
 license = "MIT"
 readme = "README.md"
+exclude = [
+    ".wheel-build/**",
+    ".control-plane-wheel-build/**",
+    "scripts/local-ci/**",
+    "litellm/integrations/aawm_agent_identity.py",
+    "litellm/integrations/aawm_payload_capture.py",
+    "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py",
+]
 packages = [
     { include = "litellm" },
     { include = "litellm/py.typed"},

@@ -1,0 +1,57 @@
+name: Build and release AAWM acceptance harness
+
+on:
+  push:
+    tags:
+      - "h-v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify harness version matches tag
+        run: |
+          test "$(cat scripts/local-ci/harness-version.txt)" = "${GITHUB_REF_NAME#h-v}"
+
+      - name: Build harness archive
+        run: python3 scripts/local-ci/build_harness_bundle.py --outdir dist
+
+      - name: Create release and upload archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "litellm local acceptance harness v${GITHUB_REF_NAME#h-v}" \
+            --notes "$(cat <<'EOF'
+          LiteLLM local acceptance harness archive.
+
+          **Download:**
+          ```bash
+          curl -L -o litellm-local-ci-harness.tar.gz \
+            https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/litellm-local-ci-harness-${{ github.ref_name#h-v }}.tar.gz
+          ```
+
+          **Extract:**
+          ```bash
+          tar -xzf litellm-local-ci-harness.tar.gz
+          ```
+          EOF
+          )" \
+            dist/litellm-local-ci-harness-*.tar.gz
+
+      - name: Move h-latest tag
+        run: |
+          git tag -f h-latest
+          git push origin h-latest --force

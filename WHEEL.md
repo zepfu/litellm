@@ -4,6 +4,11 @@ This fork now ships AAWM-specific non-core behavior as independent wheel lines
 so infrastructure can pin a specific LiteLLM fork release and still pull newer
 AAWM overlays during image rebuilds.
 
+The repo also ships the local acceptance harness as a separate compressed
+archive so validation tooling can move independently from the main codebase.
+The standalone model pricing/capability config is also published as its own
+archive so infrastructure can consume that data without pulling the full repo.
+
 ## Distinction
 
 - **LiteLLM fork release (`v*-aawm.*`)**
@@ -70,6 +75,63 @@ Current responsibilities:
 - post-rewrite `MEMORY.md` / `CLAUDE.md` trace tagging
 - related Langfuse metadata/span emission for the above control-plane actions
 
+## Acceptance Harness Archive
+
+Published source:
+
+- `scripts/local-ci/README.md`
+- `scripts/local-ci/run_acceptance.sh`
+- `scripts/local-ci/run_acceptance.py`
+- `scripts/local-ci/config.json`
+- `scripts/local-ci/build_harness_bundle.py`
+
+Release workflow:
+
+- `.github/workflows/aawm-harness.yml`
+
+Tag line:
+
+- `h-v*`
+- moving pointer: `h-latest`
+
+Artifact:
+
+- `litellm-local-ci-harness-<version>.tar.gz`
+
+Current responsibilities:
+
+- CLI routing and Langfuse trace verification across Codex, Gemini, and Claude
+- Claude request rewrite verification, including prompt-shape watchpoints like
+  future `verbosity` payload adoption
+- repeatable local regression validation outside the main repo checkout
+
+## Model Config Archive
+
+Published source:
+
+- `model_prices_and_context_window.json`
+- `litellm/model_prices_and_context_window_backup.json`
+- `scripts/build_model_config_bundle.py`
+
+Release workflow:
+
+- `.github/workflows/aawm-config.yml`
+
+Tag line:
+
+- `cfg-v*`
+- moving pointer: `cfg-latest`
+
+Artifact:
+
+- `litellm-model-config-<version>.tar.gz`
+
+Current responsibilities:
+
+- standalone pricing/capability/config distribution for infrastructure and tooling
+- versioned packaging of the model registry independent of the base fork image
+- fast drift checks when model metadata changes without a full base release
+
 ## Runtime model
 
 The base LiteLLM fork release provides the stable hook points. Overlay wheels
@@ -81,6 +143,10 @@ are then installed on top of that pinned release:
 
 This keeps AAWM-specific overlays moving independently without forcing a full
 LiteLLM release cut for every prompt/tagging enhancement.
+
+The base LiteLLM wheel now explicitly excludes the callback/control-plane
+overlay sources and the local harness sources. Those artifacts are published on
+their own release lines instead of riding inside the main LiteLLM package.
 
 ## Activation points
 
@@ -173,6 +239,11 @@ Do not assume `cb-latest` or `cp-latest` is itself a directly installable wheel
 URL unless the workflows are later extended to publish release assets on those
 moving tags too.
 
+The same rule applies to:
+
+- `h-latest`
+- `cfg-latest`
+
 ## Infrastructure consumption
 
 The intended infrastructure pattern is:
@@ -213,6 +284,23 @@ testing, pin the wheel tags too. But the normal operating model is:
 Do not treat callback/control-plane wheel updates as reasons to cut a new base
 LiteLLM fork release unless the change also requires a new core compatibility
 patch in the fork itself.
+
+## Main Push Automation
+
+Changes merged to `main` now auto-bump and tag the independently shipped AAWM
+artifacts:
+
+- callback wheel -> `cb-v*`
+- control-plane wheel -> `cp-v*`
+- harness archive -> `h-v*`
+- model config archive -> `cfg-v*`
+
+The workflow responsible for that is:
+
+- `.github/workflows/aawm-artifact-autobump.yml`
+
+This keeps the artifact release cadence tied to actual overlay/config changes
+without forcing a human to hand-bump versions on every merge.
 
 ## Rebase rule
 

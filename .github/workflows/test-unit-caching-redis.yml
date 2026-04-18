@@ -3,8 +3,7 @@ name: "Unit Tests: Caching (Redis)"
 # Uses cloud Redis credentials — only runs on trusted branches, not PRs.
 # This prevents external PRs from accessing Redis credentials.
 on:
-  push:
-    branches: [main, "litellm_*"]
+  workflow_dispatch:
 
 permissions:
   contents: read

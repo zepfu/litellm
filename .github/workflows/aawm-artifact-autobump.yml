@@ -1,0 +1,75 @@
+name: Auto bump AAWM artifact versions
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".wheel-build/**"
+      - ".control-plane-wheel-build/**"
+      - "scripts/local-ci/**"
+      - "model_prices_and_context_window.json"
+      - "litellm/model_prices_and_context_window_backup.json"
+      - "scripts/build_model_config_bundle.py"
+      - "litellm/integrations/aawm_agent_identity.py"
+      - "litellm/integrations/aawm_payload_capture.py"
+      - "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py"
+      - "context-replacement/**"
+
+jobs:
+  bump-and-tag:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bump artifact versions
+        id: bump
+        run: |
+          python3 scripts/bump_aawm_artifact_versions.py \
+            --before "${{ github.event.before }}" \
+            --after "${{ github.sha }}" \
+            --write > /tmp/aawm_artifact_bumps.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path("/tmp/aawm_artifact_bumps.json").read_text(encoding="utf-8"))
+          bumped = payload.get("bumped", [])
+          tags = " ".join(item["tag"] for item in bumped)
+          version_files = " ".join(item["version_file"] for item in bumped)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"has_bumps={'true' if bumped else 'false'}\n")
+              handle.write(f"tags={tags}\n")
+              handle.write(f"version_files={version_files}\n")
+          PY
+
+      - name: Commit version bumps
+        if: steps.bump.outputs.has_bumps == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ${{ steps.bump.outputs.version_files }}
+          git commit -m "chore(release): bump artifact versions"
+          git push origin HEAD:main
+
+      - name: Create and push versioned tags
+        if: steps.bump.outputs.has_bumps == 'true'
+        run: |
+          IFS=' ' read -ra TAGS <<< "${{ steps.bump.outputs.tags }}"
+          for tag in "${TAGS[@]}"; do
+            [ -n "$tag" ] || continue
+            git tag -a "$tag" -m "$tag"
+          done
+          git push origin "${TAGS[@]}"

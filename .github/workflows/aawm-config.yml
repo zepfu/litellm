@@ -1,0 +1,52 @@
+name: Build and release AAWM model config
+
+on:
+  push:
+    tags:
+      - "cfg-v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify config version matches tag
+        run: |
+          test "$(cat model-config-version.txt)" = "${GITHUB_REF_NAME#cfg-v}"
+
+      - name: Build model config archive
+        run: python3 scripts/build_model_config_bundle.py --outdir dist
+
+      - name: Create release and upload archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "litellm model config v${GITHUB_REF_NAME#cfg-v}" \
+            --notes "$(cat <<'EOF'
+          Standalone LiteLLM model pricing/capability config archive.
+
+          **Download:**
+          ```bash
+          curl -L -o litellm-model-config.tar.gz \
+            https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/litellm-model-config-${{ github.ref_name#cfg-v }}.tar.gz
+          ```
+          EOF
+          )" \
+            dist/litellm-model-config-*.tar.gz
+
+      - name: Move cfg-latest tag
+        run: |
+          git tag -f cfg-latest
+          git push origin cfg-latest --force
