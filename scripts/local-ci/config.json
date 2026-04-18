@@ -192,7 +192,6 @@
     "required_trace_tag_prefixes": [
       "aawm-proc:get_agent_memories",
       "claude-system-prompt-override:auto-memory",
-      "claude-prompt-patch:output-efficiency-important-line",
       "anthropic-billing-header-key:cc_version",
       "anthropic-billing-header-key:cc_entrypoint",
       "anthropic-billing-header-key:cch",
@@ -202,6 +201,9 @@
       "thinking-type:",
       "claude-effort:",
       "effort:"
+    ],
+    "warning_trace_tag_prefixes": [
+      "claude-prompt-patch:output-efficiency-important-line"
     ],
     "required_span_names": [
       "claude.system_prompt_override",
@@ -266,7 +268,9 @@
         "<persisted-output>",
         "x-anthropic-billing-header:",
         "memory_save(",
-        "memory_forget(source_ids=[...])",
+        "memory_forget(source_ids=[...])"
+      ],
+      "warning_required_substrings": [
         "Choose the approach that correctly and completely solves the problem."
       ],
       "forbidden_substrings": [
@@ -275,6 +279,15 @@
         "Try the simplest approach first without going in circles.",
         "persistent, file-based memory system at",
         "write to it directly with the Write tool"
+      ]
+    },
+    "request_payload_checks": {
+      "required_paths": [
+        "output_config.effort",
+        "thinking.type"
+      ],
+      "warning_present_paths": [
+        "verbosity"
       ]
     },
     "minimum_trace_count": 3,

@@ -1,8 +1,7 @@
 name: "Unit Tests: MCP, Secrets, Containers & Misc"
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

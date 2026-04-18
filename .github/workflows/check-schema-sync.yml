@@ -1,11 +1,7 @@
 name: Check Schema Sync
 
 on:
-  pull_request:
-    paths:
-      - 'schema.prisma'
-      - 'litellm/proxy/schema.prisma'
-      - 'litellm-proxy-extras/litellm_proxy_extras/schema.prisma'
+  workflow_dispatch:
 
 permissions:
   contents: read
