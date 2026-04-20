@@ -32,8 +32,6 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
     VertexPassthroughLoggingHandler,
 )
 
-cohere_passthrough_logging_handler = CoherePassthroughLoggingHandler()
-
 
 class PassThroughEndpointLogging:
     def __init__(self):
@@ -93,28 +91,41 @@ class PassThroughEndpointLogging:
         **kwargs,
     ):
         """Helper function to handle both sync and async logging operations"""
-        # Submit to thread pool for sync logging
-        thread_pool_executor.submit(
-            logging_obj.success_handler,
-            standard_logging_response_object,
-            start_time,
-            end_time,
-            cache_hit,
-            **kwargs,
+        # Submit all sync callbacks to thread pool for sync logging
+        sync_callbacks = logging_obj.get_combined_callback_list(
+            dynamic_success_callbacks=logging_obj.dynamic_success_callbacks,
+            global_callbacks=litellm.success_callback,
         )
+        for callback in sync_callbacks:
+            thread_pool_executor.submit(
+                callback.logging_hook,
+                kwargs,
+                standard_logging_response_object,
+                result,
+                start_time,
+                end_time,
+                cache_hit,
+                **kwargs,
+            )
 
-        # Handle async logging
-        await logging_obj.async_success_handler(
-            result=(
-                json.dumps(result)
-                if isinstance(result, dict)
-                else standard_logging_response_object
-            ),
-            start_time=start_time,
-            end_time=end_time,
-            cache_hit=False,
-            **kwargs,
+        # Handle async logging - get all async callbacks
+        async_callbacks = logging_obj.get_combined_callback_list(
+            dynamic_success_callbacks=logging_obj.dynamic_async_success_callbacks,
+            global_callbacks=litellm._async_success_callback,
         )
+        for callback in async_callbacks:
+            await callback.async_logging_hook(
+                kwargs,
+                result=(
+                    json.dumps(result)
+                    if isinstance(result, dict)
+                    else standard_logging_response_object
+                ),
+                start_time=start_time,
+                end_time=end_time,
+                cache_hit=False,
+                **kwargs,
+            )
 
     def normalize_llm_passthrough_logging_payload(
         self,
@@ -136,7 +147,7 @@ class PassThroughEndpointLogging:
         }
         standard_logging_response_object: Optional[Any] = None
 
-        if self.is_gemini_route(url_route, custom_llm_provider):
+        if custom_llm_provider == "gemini" or self.is_gemini_route(url_route, custom_llm_provider):
             gemini_passthrough_logging_handler_result = (
                 GeminiPassthroughLoggingHandler.gemini_passthrough_handler(
                     httpx_response=httpx_response,
@@ -237,7 +248,6 @@ class PassThroughEndpointLogging:
                 openai_passthrough_logging_handler_result["result"]
             )
             kwargs = openai_passthrough_logging_handler_result["kwargs"]
-
         elif self.is_cursor_route(url_route, custom_llm_provider):
             cursor_passthrough_logging_handler_result = (
                 CursorPassthroughLoggingHandler.cursor_passthrough_handler(
@@ -436,13 +446,18 @@ class PassThroughEndpointLogging:
         return False
 
     def is_openai_route(self, url_route: str):
-        """Check if the URL route is an OpenAI API route."""
+        """Check if the URL route is an OpenAI-compatible API route."""
         if not url_route:
             return False
         parsed_url = urlparse(url_route)
-        return parsed_url.hostname and (
-            "api.openai.com" in parsed_url.hostname
-            or "openai.azure.com" in parsed_url.hostname
+        return bool(
+            parsed_url.hostname
+            and (
+                "api.openai.com" in parsed_url.hostname
+                or "openai.azure.com" in parsed_url.hostname
+                or parsed_url.hostname == "openrouter.ai"
+                or parsed_url.hostname.endswith(".openrouter.ai")
+            )
         )
 
     def is_gemini_route(
