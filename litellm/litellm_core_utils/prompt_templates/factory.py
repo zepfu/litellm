@@ -63,6 +63,57 @@ BAD_MESSAGE_ERROR_STR = "Invalid Message "
 # See: https://ai.google.dev/gemini-api/docs/thought-signatures
 THOUGHT_SIGNATURE_SEPARATOR = "__thought__"
 
+_SYSTEM_REMINDER_BLOCK_RE = re.compile(
+    r"\s*<system-reminder>.*?</system-reminder>\s*",
+    re.DOTALL,
+)
+_EPHEMERAL_MESSAGE_BLOCK_RE = re.compile(
+    r"\s*This tool result contains the following ephemeral messages:\s*"
+    r"(?:<ephemeral_message>.*?</ephemeral_message>\s*)+",
+    re.DOTALL | re.IGNORECASE,
+)
+_EPHEMERAL_MESSAGE_TAG_RE = re.compile(
+    r"\s*</?ephemeral_message>\s*",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_gemini_tool_response_text(text: str) -> str:
+    """Remove Claude-side reminder wrappers from tool results before sending to Gemini."""
+    cleaned = _SYSTEM_REMINDER_BLOCK_RE.sub("\n", text)
+    cleaned = _EPHEMERAL_MESSAGE_BLOCK_RE.sub("\n", cleaned)
+    cleaned = _EPHEMERAL_MESSAGE_TAG_RE.sub("\n", cleaned)
+    cleaned = cleaned.replace("<tool_use_error>", "")
+    cleaned = cleaned.strip()
+    return cleaned or text.strip()
+
+
+def _coerce_gemini_tool_response_data(text: str) -> dict:
+    """
+    Normalize plain tool output into the response schema Gemini Code Assist uses natively.
+
+    Native requests observed on the wire use:
+    - {"output": "..."} for successful tool results
+    - {"error": "..."} for failed tool results
+    """
+    cleaned_text = _sanitize_gemini_tool_response_text(text)
+
+    try:
+        if cleaned_text.startswith("{") or cleaned_text.startswith("["):
+            parsed = json.loads(cleaned_text)
+            if isinstance(parsed, dict):
+                return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    lowered = cleaned_text.lower()
+    if lowered.startswith("error") or lowered.startswith("exception") or lowered.startswith(
+        "traceback"
+    ) or lowered.startswith("inputvalidationerror") or "failed due to the following issue" in lowered:
+        return {"error": cleaned_text}
+
+    return {"output": cleaned_text}
+
 # used to interweave user messages, to ensure user/assistant alternating
 DEFAULT_USER_CONTINUE_MESSAGE = {
     "role": "user",
@@ -1581,22 +1632,9 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
             )
         )
 
-    # Parse response data - support both JSON string and plain string
-    # For Computer Use, the response should contain structured data like {"url": "..."}
-    response_data: dict
-    try:
-        if content_str.strip().startswith("{") or content_str.strip().startswith("["):
-            # Try to parse as JSON (for Computer Use structured responses)
-            parsed = json.loads(content_str)
-            if isinstance(parsed, dict):
-                response_data = parsed  # Use the parsed JSON directly
-            else:
-                response_data = {"content": content_str}
-        else:
-            response_data = {"content": content_str}
-    except (json.JSONDecodeError, ValueError):
-        # Not valid JSON, wrap in content field
-        response_data = {"content": content_str}
+    # Parse response data - support structured JSON while normalizing plain text
+    # to the Gemini Code Assist output/error shape observed on the native wire.
+    response_data: dict = _coerce_gemini_tool_response_data(content_str)
 
     # We can't determine from openai message format whether it's a successful or
     # error call result so default to the successful result template

@@ -499,6 +499,66 @@ def test_convert_gemini_messages():
     )
 
 
+def test_convert_gemini_tool_call_result_wraps_plain_text_as_output_and_strips_reminder():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        convert_to_gemini_tool_call_result,
+    )
+
+    message = {
+        "role": "tool",
+        "tool_call_id": "call_plain_output",
+        "content": "Mon Apr 20 09:57:31 UTC 2026\n\n<system-reminder>\n## Auto Mode Active\n\nignore me\n</system-reminder>\n",
+    }
+    last_message_with_tool_calls = {
+        "tool_calls": [
+            {
+                "id": "call_plain_output",
+                "function": {"name": "Bash", "arguments": '{"command":"date -u"}'},
+            }
+        ]
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+
+    assert result["function_response"]["name"] == "Bash"
+    assert result["function_response"]["response"] == {
+        "output": "Mon Apr 20 09:57:31 UTC 2026"
+    }
+
+
+def test_convert_gemini_tool_call_result_maps_tool_use_error_to_error():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        convert_to_gemini_tool_call_result,
+    )
+
+    message = {
+        "role": "tool",
+        "tool_call_id": "call_tool_error",
+        "content": "<tool_use_error>InputValidationError: Bash failed due to the following issue:\nThe required parameter `command` is missing.\n",
+    }
+    last_message_with_tool_calls = {
+        "tool_calls": [
+            {
+                "id": "call_tool_error",
+                "function": {"name": "Bash", "arguments": '{"command":"date -u"}'},
+            }
+        ]
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+
+    assert result["function_response"]["name"] == "Bash"
+    assert result["function_response"]["response"] == {
+        "error": "InputValidationError: Bash failed due to the following issue:\nThe required parameter `command` is missing."
+    }
+
+
 def test_convert_gemini_tool_call_result_with_image_url():
     """
     Test that image_url content type in tool results is handled correctly for Gemini.

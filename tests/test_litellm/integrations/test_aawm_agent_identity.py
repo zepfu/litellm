@@ -230,6 +230,120 @@ AY89a19r/hypDnlNZTmQhYj/vLtBERR2L8wa4yt0Y+GwcOOi3fr3hsG8ovj6G2rfZypo/OPdkDOgU3IR
     assert "claude_thinking_signature_present" not in metadata
 
 
+def test_build_session_history_record_uses_passthrough_header_session_id() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-header-session"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-claude-code-session-id": "session-from-header"}
+    }
+
+    result = {
+        "id": "resp-header-session",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["session_id"] == "session-from-header"
+
+
+def test_build_session_history_record_handles_object_tool_use_blocks() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.3-codex-spark"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-tool-object"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-claude-code-session-id": "session-tool-object"}
+    }
+
+    class _ToolUseBlock:
+        def __init__(self):
+            self.type = "tool_use"
+            self.id = "call_pwd"
+            self.name = "Bash"
+            self.input = {
+                "command": "pwd",
+                "description": "Print current working directory.",
+            }
+
+    class _AssistantMessage:
+        def __init__(self):
+            self.role = "assistant"
+            self.content = [_ToolUseBlock()]
+
+    result = {
+        "id": "resp-tool-object",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": _AssistantMessage()}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["tool_call_count"] == 1
+    assert record["tool_names"] == ["Bash"]
+    assert len(record["tool_activity"]) == 1
+    assert record["tool_activity"][0]["tool_name"] == "Bash"
+    assert record["tool_activity"][0]["command_text"] == "pwd"
+
+
+def test_build_session_history_record_uses_hidden_responses_output_for_tool_activity() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.3-codex-spark"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-hidden-output"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-claude-code-session-id": "session-hidden-output"}
+    }
+
+    class _Result:
+        def __init__(self):
+            self.id = "resp-hidden-output"
+            self.usage = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            self.choices = [{"message": {"role": "assistant", "content": "/tmp/worktree"}}]
+            self._hidden_params = {
+                "responses_output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_pwd",
+                        "id": "call_pwd",
+                        "name": "Bash",
+                        "arguments": {"command": "pwd"},
+                    }
+                ]
+            }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_Result(),
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["tool_call_count"] == 1
+    assert record["tool_names"] == ["Bash"]
+    assert len(record["tool_activity"]) == 1
+    assert record["tool_activity"][0]["command_text"] == "pwd"
+
+
 def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -260,7 +374,17 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
                         {
                             "id": "tool-1",
                             "type": "function",
-                            "function": {"name": "search", "arguments": "{}"},
+                            "function": {"name": "Read", "arguments": '{"file_path":"README.md"}'},
+                        },
+                        {
+                            "id": "tool-2",
+                            "type": "function",
+                            "function": {"name": "Write", "arguments": '{"file_path":"litellm/proxy/proxy_server.py","content":"updated"}'},
+                        },
+                        {
+                            "id": "tool-3",
+                            "type": "function",
+                            "function": {"name": "Bash", "arguments": '{"command":"git commit -m msg && git push"}'},
                         }
                     ],
                 }
@@ -291,8 +415,16 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["reasoning_tokens_estimated"] is None
     assert record["reasoning_tokens_source"] == "provider_reported"
     assert record["reasoning_present"] is True
-    assert record["tool_call_count"] == 1
-    assert record["tool_names"] == ["search"]
+    assert record["tool_call_count"] == 3
+    assert record["tool_names"] == ["Read", "Write", "Bash"]
+    assert record["file_read_count"] == 1
+    assert record["file_modified_count"] == 1
+    assert record["git_commit_count"] == 1
+    assert record["git_push_count"] == 1
+    assert record["tool_activity"][0]["file_paths_read"] == ["README.md"]
+    assert record["tool_activity"][1]["file_paths_modified"] == ["litellm/proxy/proxy_server.py"]
+    assert record["tool_activity"][2]["git_commit_count"] == 1
+    assert record["tool_activity"][2]["git_push_count"] == 1
     assert record["metadata"]["request_tags"] == ["reasoning-present"]
     assert record["metadata"]["tenant_id"] == "aegis"
     assert record["metadata"]["cc_version"] == "2.1.112"
@@ -372,6 +504,63 @@ def test_build_session_history_record_skips_without_session_id() -> None:
     )
 
 
+def test_log_success_event_enqueues_session_history_record(monkeypatch) -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-enqueue-1"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-enqueue-1"
+
+    enqueue_mock = MagicMock()
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        enqueue_mock,
+    )
+
+    logger.log_success_event(
+        kwargs=kwargs,
+        response_obj={"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        start_time=None,
+        end_time=None,
+    )
+
+    enqueue_mock.assert_called_once()
+    queued_record = enqueue_mock.call_args.args[0]
+    assert queued_record["litellm_call_id"] == "call-enqueue-1"
+    assert queued_record["session_id"] == "session-enqueue-1"
+
+
+@pytest.mark.asyncio
+async def test_async_log_success_event_enqueues_session_history_record(monkeypatch) -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-enqueue-2"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-enqueue-2"
+
+    enqueue_mock = MagicMock()
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        enqueue_mock,
+    )
+
+    await logger.async_log_success_event(
+        kwargs=kwargs,
+        response_obj={"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}},
+        start_time=None,
+        end_time=None,
+    )
+
+    enqueue_mock.assert_called_once()
+    queued_record = enqueue_mock.call_args.args[0]
+    assert queued_record["litellm_call_id"] == "call-enqueue-2"
+    assert queued_record["session_id"] == "session-enqueue-2"
+
+
 @pytest.mark.asyncio
 async def test_persist_session_history_record_executes_insert(monkeypatch) -> None:
     record = {
@@ -399,14 +588,19 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
         "thinking_signature_present": True,
         "tool_call_count": 1,
         "tool_names": ["search"],
+        "file_read_count": 0,
+        "file_modified_count": 1,
+        "git_commit_count": 1,
+        "git_push_count": 0,
+        "tool_activity": [{"tool_index": 0, "tool_name": "search", "tool_kind": "other", "file_paths_read": [], "file_paths_modified": ["foo.py"], "git_commit_count": 1, "git_push_count": 0, "command_text": "git commit -m test", "arguments": {"command": "git commit -m test"}, "metadata": {"source": "message.tool_calls"}}],
         "response_cost_usd": 0.12,
         "metadata": {"request_tags": ["reasoning-present"]},
     }
 
-    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
     monkeypatch.setattr(
-        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
-        AsyncMock(return_value=mock_pool),
+        "litellm.integrations.aawm_agent_identity._open_aawm_session_history_connection",
+        AsyncMock(return_value=mock_conn),
     )
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
@@ -415,12 +609,17 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
 
     await _persist_session_history_record(record)
 
-    mock_pool.execute.assert_awaited_once()
-    executed_args = mock_pool.execute.await_args.args
+    mock_conn.execute.assert_awaited_once()
+    executed_args = mock_conn.execute.await_args.args
     assert "INSERT INTO public.session_history" in executed_args[0]
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
+    mock_conn.executemany.assert_awaited_once()
+    tool_args = mock_conn.executemany.await_args.args
+    assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
+    assert tool_args[1][0][0] == "call-123"
+    mock_conn.close.assert_awaited_once()
 
 
 def test_build_session_history_record_from_spend_log_row_recovers_real_session_id() -> None:
@@ -900,20 +1099,21 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
             "thinking_signature_present": True,
             "tool_call_count": 1,
             "tool_names": ["search"],
+            "file_read_count": 1,
+            "file_modified_count": 0,
+            "git_commit_count": 0,
+            "git_push_count": 0,
+            "tool_activity": [{"tool_index": 0, "tool_name": "Read", "tool_kind": "read", "file_paths_read": ["README.md"], "file_paths_modified": [], "git_commit_count": 0, "git_push_count": 0, "command_text": None, "arguments": {"file_path": "README.md"}, "metadata": {"source": "message.tool_calls"}}],
             "response_cost_usd": 0.01,
             "metadata": {"request_tags": ["reasoning-present"]},
         }
     ]
 
     mock_conn = AsyncMock()
-    mock_pool = AsyncMock()
-    acquire_context = AsyncMock()
-    acquire_context.__aenter__.return_value = mock_conn
-    mock_pool.acquire = MagicMock(return_value=acquire_context)
-
+    
     monkeypatch.setattr(
-        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
-        AsyncMock(return_value=mock_pool),
+        "litellm.integrations.aawm_agent_identity._open_aawm_session_history_connection",
+        AsyncMock(return_value=mock_conn),
     )
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
@@ -922,7 +1122,11 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 
     await _persist_session_history_records(records)
 
-    mock_conn.executemany.assert_awaited_once()
-    executed_args = mock_conn.executemany.await_args.args
-    assert "INSERT INTO public.session_history" in executed_args[0]
-    assert executed_args[1][0][0] == "call-1"
+    assert mock_conn.executemany.await_count == 2
+    history_args = mock_conn.executemany.await_args_list[0].args
+    assert "INSERT INTO public.session_history" in history_args[0]
+    assert history_args[1][0][0] == "call-1"
+    tool_args = mock_conn.executemany.await_args_list[1].args
+    assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
+    assert tool_args[1][0][0] == "call-1"
+    mock_conn.close.assert_awaited_once()

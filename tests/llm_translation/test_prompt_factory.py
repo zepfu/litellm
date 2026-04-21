@@ -1499,6 +1499,18 @@ def test_attempt_json_repair_trailing_comma():
     assert result == {"a": 1, "b": 2}
 
 
+def test_attempt_json_repair_missing_opening_key_quote():
+    """Repair tool-call JSON where the opening key quote is missing."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+    )
+
+    malformed = '{command": "date -u"}'
+    result = _attempt_json_repair(malformed)
+    assert result is not None
+    assert result == {"command": "date -u"}
+
+
 def test_attempt_json_repair_returns_none_for_unterminated_string():
     """Cannot repair an unterminated string — returns None."""
     from litellm.litellm_core_utils.prompt_templates.common_utils import (
@@ -1583,6 +1595,19 @@ def test_parse_tool_call_arguments_repairs_truncated_json():
         truncated, tool_name="shell", context="Anthropic tool invoke"
     )
     assert result == {"command": ["bash", "-lc", "find /x -type f"]}
+
+
+def test_parse_tool_call_arguments_repairs_missing_opening_key_quote():
+    """parse_tool_call_arguments should repair near-valid malformed tool JSON."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        parse_tool_call_arguments,
+    )
+
+    malformed = '{command": "date -u"}'
+    result = parse_tool_call_arguments(
+        malformed, tool_name="Bash", context="Anthropic pass-through adapter"
+    )
+    assert result == {"command": "date -u"}
 
 
 def test_parse_tool_call_arguments_still_raises_for_unrepairable():

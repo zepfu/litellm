@@ -2,6 +2,7 @@
 ## httpx client for vertex ai calls
 ## Initial implementation - covers gemini + image gen calls
 import json
+import os
 import time
 from copy import deepcopy
 from functools import partial
@@ -1869,10 +1870,20 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         annotations = chat_completion_message.get("annotations")  # type: ignore
         provider_specific_fields = chat_completion_message.get("provider_specific_fields")  # type: ignore
         # create a streaming choice object
+        raw_finish_reason = candidate.get("finishReason")
+        if chat_completion_message.get("function_call") or chat_completion_message.get("tool_calls"):
+            streaming_finish_reason = VertexGeminiConfig._check_finish_reason(
+                chat_completion_message, raw_finish_reason
+            )
+        elif raw_finish_reason is not None:
+            streaming_finish_reason = VertexGeminiConfig._check_finish_reason(
+                chat_completion_message, raw_finish_reason
+            )
+        else:
+            streaming_finish_reason = None
+
         choice = StreamingChoices(
-            finish_reason=VertexGeminiConfig._check_finish_reason(
-                chat_completion_message, candidate.get("finishReason")
-            ),
+            finish_reason=streaming_finish_reason,
             index=candidate.get("index", idx),
             delta=Delta(
                 content=chat_completion_message.get("content"),
@@ -2923,6 +2934,7 @@ class ModelResponseIterator:
         self.is_function_call = check_is_function_call(logging_obj)
         self.cumulative_tool_call_index: int = 0
         self.has_seen_tool_calls: bool = False
+        self.pending_model_response_chunks: list[ModelResponseStream] = []
 
     def chunk_parser(self, chunk: dict) -> Optional["ModelResponseStream"]:
         try:
@@ -3029,6 +3041,54 @@ class ModelResponseIterator:
 
             setattr(model_response, "usage", usage)  # type: ignore
 
+            pending_terminal_choices = []
+            for choice in model_response.choices:
+                delta = getattr(choice, "delta", None)
+                has_stream_payload = bool(
+                    delta
+                    and (
+                        getattr(delta, "content", None)
+                        or getattr(delta, "tool_calls", None)
+                        or getattr(delta, "function_call", None)
+                        or getattr(delta, "reasoning_content", None)
+                    )
+                )
+                if has_stream_payload and getattr(choice, "finish_reason", None) is not None:
+                    pending_choice = deepcopy(choice)
+                    pending_choice.delta.content = None
+                    pending_choice.delta.tool_calls = None
+                    pending_choice.delta.function_call = None
+                    pending_choice.delta.reasoning_content = None
+                    choice.finish_reason = None
+                    pending_terminal_choices.append(pending_choice)
+
+            if pending_terminal_choices:
+                pending_response = deepcopy(model_response)
+                pending_response.choices = pending_terminal_choices
+                self.pending_model_response_chunks.append(pending_response)
+                setattr(model_response, "usage", None)
+
+            if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
+                try:
+                    choice_summaries = []
+                    for choice in model_response.choices:
+                        delta = getattr(choice, "delta", None)
+                        choice_summaries.append({
+                            "finish_reason": getattr(choice, "finish_reason", None),
+                            "content": getattr(delta, "content", None) if delta is not None else None,
+                            "tool_calls": len(getattr(delta, "tool_calls", []) or []) if delta is not None else 0,
+                            "function_call": bool(getattr(delta, "function_call", None)) if delta is not None else False,
+                            "reasoning_content": getattr(delta, "reasoning_content", None) if delta is not None else None,
+                        })
+                    verbose_logger.warning(
+                        "Gemini iterator debug: choices=%s pending=%s usage_present=%s",
+                        choice_summaries,
+                        len(self.pending_model_response_chunks),
+                        getattr(model_response, "usage", None) is not None,
+                    )
+                except Exception:
+                    verbose_logger.exception("Gemini iterator debug logging failed")
+
             model_response._hidden_params["is_finished"] = False
             return model_response
 
@@ -3096,6 +3156,8 @@ class ModelResponseIterator:
             raise
 
     def __next__(self):
+        if self.pending_model_response_chunks:
+            return self.pending_model_response_chunks.pop(0)
         try:
             chunk = self.response_iterator.__next__()
         except StopIteration:
@@ -3118,6 +3180,8 @@ class ModelResponseIterator:
         return self
 
     async def __anext__(self):
+        if self.pending_model_response_chunks:
+            return self.pending_model_response_chunks.pop(0)
         try:
             chunk = await self.async_response_iterator.__anext__()
         except StopAsyncIteration:

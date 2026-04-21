@@ -3,6 +3,7 @@ import importlib
 import json
 import re
 from datetime import datetime, timezone
+from time import monotonic
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
@@ -39,9 +40,13 @@ _AAWM_DYNAMIC_DIRECTIVE_PATTERN = re.compile(
     r"|^[ \t]*AAWM(?=[ \t]+(?:p|proc)=)\s+(?P<line_attrs>[^\r\n]+?)\s*$",
     re.DOTALL | re.MULTILINE,
 )
+_AAWM_CONTEXT_MARKER_PATTERN = re.compile(r":#(?P<name>[^#\r\n]+?)\.ctx#:")
 _AAWM_DYNAMIC_DIRECTIVE_ATTR_PATTERN = re.compile(
     r'(?P<key>[A-Za-z_][A-Za-z0-9_-]*)='
     r'(?:"(?P<double>[^"]*)"|\'(?P<single>[^\']*)\'|(?P<bare>[^\s]+))'
+)
+_AAWM_SQL_IDENTIFIER_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
 )
 _CLAUDE_AGENT_TENANT_PATTERN = re.compile(
     r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project\b"
@@ -55,10 +60,18 @@ _AAWM_DYNAMIC_PROC_ALIASES = {"get_agent_memory": _AAWM_AGENT_MEMORY_PROC_NAME}
 _AAWM_DYNAMIC_PROC_DEFAULT_CTX_FIELDS: dict[str, tuple[str, ...]] = {
     _AAWM_AGENT_MEMORY_PROC_NAME: ("agent", "tenant"),
 }
+_AAWM_CONTEXT_GRAB_PROC_NAME_ENV_VARS = (
+    "AAWM_CONTEXT_GRAB_PROC_NAME",
+    "AAWM_DYNAMIC_CONTEXT_GRAB_PROC_NAME",
+)
+_AAWM_CONTEXT_GRAB_DEFAULT_PROC_NAME = "get_named_context"
 _AAWM_DYNAMIC_INJECTION_FAILURE_TEMPLATE = (
     "## AAWM Injection Status\n\n"
     'AAWM "{proc_name}" failed for this session.\n'
     "Alert the user or session orchestrator.\n"
+)
+_AAWM_CONTEXT_GRAB_FAILURE_TEMPLATE = (
+    "IMPORTANT: context grab for {name} returned no results. immediately inform the opperator."
 )
 _AAWM_NO_MEMORIES_TEMPLATE = (
     "# Memory Injection\n"
@@ -113,10 +126,88 @@ _AAWM_DB_URL_ENV_VARS = (
     "AAWM_DATABASE_URL",
     "AAWM_POSTGRES_URL",
 )
+_AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS = 15.0
+_AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE = 1
+_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE = 4
+_AAWM_DYNAMIC_INJECTION_COMMAND_TIMEOUT_SECONDS = 10
 _aawm_dynamic_injection_pool: Optional[Any] = None
 _aawm_dynamic_injection_pool_lock = asyncio.Lock()
+_aawm_dynamic_injection_cache: dict[tuple[str, str, str, str], tuple[float, Optional[str]]] = {}
+_aawm_dynamic_injection_cache_lock = asyncio.Lock()
+_aawm_context_grab_cache: dict[tuple[str, str, str, str], tuple[float, dict[str, str]]] = {}
+_aawm_context_grab_cache_lock = asyncio.Lock()
 _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
+
+
+def _get_aawm_dynamic_injection_cache_ttl_seconds() -> float:
+    raw_value = _clean_secret_string(_lp().get_secret_str("AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS"))
+    if not raw_value:
+        return _AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS
+    try:
+        return max(0.0, float(raw_value))
+    except (TypeError, ValueError):
+        return _AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS
+
+
+async def _get_cached_aawm_dynamic_injection_result(
+    cache_key: tuple[str, str, str, str],
+) -> tuple[bool, Optional[str]]:
+    async with _aawm_dynamic_injection_cache_lock:
+        cached_entry = _aawm_dynamic_injection_cache.get(cache_key)
+        if cached_entry is None:
+            return False, None
+
+        expires_at, cached_value = cached_entry
+        if expires_at < monotonic():
+            _aawm_dynamic_injection_cache.pop(cache_key, None)
+            return False, None
+        return True, cached_value
+
+
+async def _set_cached_aawm_dynamic_injection_result(
+    cache_key: tuple[str, str, str, str],
+    injected_text: Optional[str],
+) -> None:
+    ttl_seconds = _get_aawm_dynamic_injection_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        return
+
+    async with _aawm_dynamic_injection_cache_lock:
+        _aawm_dynamic_injection_cache[cache_key] = (
+            monotonic() + ttl_seconds,
+            injected_text,
+        )
+
+
+async def _get_cached_aawm_context_grab_result(
+    cache_key: tuple[str, str, str, str],
+) -> tuple[bool, Optional[dict[str, str]]]:
+    async with _aawm_context_grab_cache_lock:
+        cached_entry = _aawm_context_grab_cache.get(cache_key)
+        if cached_entry is None:
+            return False, None
+
+        expires_at, cached_value = cached_entry
+        if expires_at < monotonic():
+            _aawm_context_grab_cache.pop(cache_key, None)
+            return False, None
+        return True, dict(cached_value)
+
+
+async def _set_cached_aawm_context_grab_result(
+    cache_key: tuple[str, str, str, str],
+    cached_payload: dict[str, str],
+) -> None:
+    ttl_seconds = _get_aawm_dynamic_injection_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        return
+
+    async with _aawm_context_grab_cache_lock:
+        _aawm_context_grab_cache[cache_key] = (
+            monotonic() + ttl_seconds,
+            dict(cached_payload),
+        )
 
 
 def _lp():
@@ -505,6 +596,189 @@ def _add_claude_system_prompt_override_logging_metadata(
     )
 
 
+def _rewrite_claude_control_plane_text(
+    text: str,
+    *,
+    cc_version: str,
+    manifest: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    updated_text = text
+    override_events: list[dict[str, Any]] = []
+    patch_events: list[dict[str, Any]] = []
+
+    if (
+        ("# auto memory" in updated_text or "# Persistent Agent Memory" in updated_text)
+        and _resolve_claude_auto_memory_template_path(cc_version) is not None
+    ):
+        try:
+            updated_text, override_event = _replace_claude_auto_memory_section_in_text(
+                updated_text,
+                cc_version,
+            )
+        except Exception as exc:
+            override_events.append(
+                {
+                    "id": "auto-memory",
+                    "status": "failed",
+                    "cc_version": cc_version,
+                    "error": exc.__class__.__name__,
+                }
+            )
+        else:
+            if override_event is not None:
+                override_events.append(override_event)
+
+    try:
+        for patch_descriptor in manifest["patches"]:
+            before_text = patch_descriptor["before"]
+            if before_text not in updated_text:
+                continue
+            after_text = patch_descriptor["after"]
+            occurrences = updated_text.count(before_text)
+            updated_text = updated_text.replace(before_text, after_text)
+            patch_events.append(
+                {
+                    "id": patch_descriptor["id"],
+                    "status": "resolved",
+                    "cc_version": cc_version,
+                    "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
+                    "occurrences": occurrences,
+                }
+            )
+    except Exception as exc:
+        patch_events.append(
+            {
+                "id": "manifest-load",
+                "status": "failed",
+                "cc_version": cc_version,
+                "error": exc.__class__.__name__,
+            }
+        )
+
+    return updated_text, override_events, patch_events
+
+
+
+def _rewrite_claude_control_plane_in_value(
+    value: Any,
+    *,
+    cc_version: str,
+    manifest: dict[str, Any],
+) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
+    if isinstance(value, dict):
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            updated_text, override_events, patch_events = _rewrite_claude_control_plane_text(
+                value["text"],
+                cc_version=cc_version,
+                manifest=manifest,
+            )
+            if not override_events and not patch_events:
+                return value, [], []
+            updated_value = dict(value)
+            updated_value["text"] = updated_text
+            return updated_value, override_events, patch_events
+
+        updated_dict: dict[str, Any] = {}
+        combined_override_events: list[dict[str, Any]] = []
+        combined_patch_events: list[dict[str, Any]] = []
+        changed = False
+        for key, child in value.items():
+            updated_child, child_override_events, child_patch_events = _rewrite_claude_control_plane_in_value(
+                child,
+                cc_version=cc_version,
+                manifest=manifest,
+            )
+            updated_dict[key] = updated_child
+            combined_override_events.extend(child_override_events)
+            combined_patch_events.extend(child_patch_events)
+            if updated_child is not child:
+                changed = True
+        return (
+            updated_dict if changed else value,
+            combined_override_events,
+            combined_patch_events,
+        )
+
+    if isinstance(value, list):
+        updated_list = []
+        combined_override_events: list[dict[str, Any]] = []
+        combined_patch_events: list[dict[str, Any]] = []
+        changed = False
+        for child in value:
+            updated_child, child_override_events, child_patch_events = _rewrite_claude_control_plane_in_value(
+                child,
+                cc_version=cc_version,
+                manifest=manifest,
+            )
+            updated_list.append(updated_child)
+            combined_override_events.extend(child_override_events)
+            combined_patch_events.extend(child_patch_events)
+            if updated_child is not child:
+                changed = True
+        return (
+            updated_list if changed else value,
+            combined_override_events,
+            combined_patch_events,
+        )
+
+    return value, [], []
+
+
+
+def apply_claude_control_plane_rewrites_to_anthropic_request_body(
+    request_body: dict[str, Any], billing_header_fields: dict[str, str]
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    lp = _lp()
+    cc_version = billing_header_fields.get("cc_version")
+    if not cc_version:
+        return request_body, [], []
+
+    span_started_at = datetime.now(timezone.utc)
+    manifest_path = _resolve_claude_prompt_patch_manifest_path()
+    manifest = _load_claude_prompt_patch_manifest(manifest_path)
+    updated_body, override_events, patch_events = _rewrite_claude_control_plane_in_value(
+        request_body,
+        cc_version=cc_version,
+        manifest=manifest,
+    )
+    if not override_events and not patch_events:
+        return request_body, [], []
+
+    if not isinstance(updated_body, dict):
+        return request_body, [], []
+
+    if override_events:
+        updated_body = _add_claude_system_prompt_override_logging_metadata(
+            updated_body,
+            override_events,
+        )
+    if patch_events:
+        updated_body = _add_claude_prompt_patch_logging_metadata(
+            updated_body,
+            patch_events,
+        )
+
+    litellm_metadata = updated_body.get("litellm_metadata")
+    if isinstance(litellm_metadata, dict):
+        langfuse_spans = litellm_metadata.get("langfuse_spans")
+        if isinstance(langfuse_spans, list):
+            for span_descriptor in langfuse_spans:
+                if not isinstance(span_descriptor, dict):
+                    continue
+                if span_descriptor.get("name") in {
+                    "claude.system_prompt_override",
+                    "claude.prompt_patch",
+                }:
+                    span_descriptor["start_time"] = lp._format_langfuse_span_timestamp(
+                        span_started_at
+                    )
+                    span_descriptor["end_time"] = lp._format_langfuse_span_timestamp(
+                        datetime.now(timezone.utc)
+                    )
+
+    return updated_body, override_events, patch_events
+
+
 def replace_claude_system_prompt_in_anthropic_request_body(
     request_body: dict[str, Any], billing_header_fields: dict[str, str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -781,6 +1055,17 @@ def _get_aawm_directive_attrs_text(match: re.Match[str]) -> str:
     ).strip()
 
 
+def _get_nested_str_value(source: Any, path: tuple[str, ...]) -> Optional[str]:
+    current = source
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    if isinstance(current, str) and current.strip():
+        return current.strip()
+    return None
+
+
 def _iter_anthropic_text_fragments(value: Any):
     if isinstance(value, str):
         yield value
@@ -814,6 +1099,22 @@ def _extract_claude_agent_and_tenant_from_request_body(
     return None, None
 
 
+def _extract_aawm_session_id_from_request_body(
+    request_body: dict[str, Any]
+) -> Optional[str]:
+    for path in (
+        ("litellm_metadata", "session_id"),
+        ("metadata", "user_id", "session_id"),
+        ("metadata", "session_id"),
+        ("request", "session_id"),
+        ("session_id",),
+    ):
+        value = _get_nested_str_value(request_body, path)
+        if value:
+            return value
+    return None
+
+
 def _build_aawm_context_for_anthropic_request(
     request_body: dict[str, Any]
 ) -> dict[str, str]:
@@ -823,6 +1124,9 @@ def _build_aawm_context_for_anthropic_request(
         context["agent"] = agent
     if tenant:
         context["tenant"] = tenant
+    session_id = _extract_aawm_session_id_from_request_body(request_body)
+    if session_id:
+        context["session_id"] = session_id
     return context
 
 
@@ -871,6 +1175,10 @@ def _build_aawm_dynamic_injection_failure_text(proc_name: str) -> str:
     return _AAWM_DYNAMIC_INJECTION_FAILURE_TEMPLATE.format(
         proc_name=proc_name or "unknown"
     )
+
+
+def _build_aawm_context_grab_failure_text(name: str) -> str:
+    return _AAWM_CONTEXT_GRAB_FAILURE_TEMPLATE.format(name=name or "unknown")
 
 
 def _build_aawm_dynamic_injection_dsn() -> Optional[str]:
@@ -926,9 +1234,9 @@ async def _get_aawm_dynamic_injection_pool() -> Any:
 
         _aawm_dynamic_injection_pool = await asyncpg.create_pool(
             dsn=dsn,
-            min_size=1,
-            max_size=4,
-            command_timeout=10,
+            min_size=_AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE,
+            max_size=_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE,
+            command_timeout=_AAWM_DYNAMIC_INJECTION_COMMAND_TIMEOUT_SECONDS,
         )
         return _aawm_dynamic_injection_pool
 
@@ -942,6 +1250,43 @@ async def _call_aawm_get_agent_memories(
         agent_name,
         tenant_id,
     )
+    if isinstance(result, str):
+        stripped_result = result.strip()
+        if stripped_result:
+            return stripped_result
+    return None
+
+
+def _get_aawm_context_grab_proc_name() -> str:
+    proc_name = (
+        _get_first_secret_value(_AAWM_CONTEXT_GRAB_PROC_NAME_ENV_VARS)
+        or _AAWM_CONTEXT_GRAB_DEFAULT_PROC_NAME
+    )
+    if _AAWM_SQL_IDENTIFIER_PATTERN.fullmatch(proc_name) is None:
+        raise RuntimeError("AAWM context grab proc name is invalid")
+    return proc_name
+
+
+def _get_aawm_context_grab_proc_name_for_logging() -> str:
+    try:
+        return _get_aawm_context_grab_proc_name()
+    except Exception:
+        return "unknown"
+
+
+def _format_aawm_context_retrieved_at(retrieved_at: datetime) -> str:
+    return (
+        retrieved_at.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+async def _call_aawm_context_grab(*, name: str) -> Optional[str]:
+    proc_name = _get_aawm_context_grab_proc_name()
+    pool = await _get_aawm_dynamic_injection_pool()
+    result = await pool.fetchval(f"SELECT {proc_name}($1)", name)
     if isinstance(result, str):
         stripped_result = result.strip()
         if stripped_result:
@@ -1006,11 +1351,24 @@ async def _resolve_aawm_dynamic_directive(
         event["scope"] = scope
 
     if proc_name == _AAWM_AGENT_MEMORY_PROC_NAME:
-        resolver = getattr(lp, "_call_aawm_get_agent_memories", _call_aawm_get_agent_memories)
-        injected_text = await resolver(
-            agent_name=selected_context["agent"],
-            tenant_id=selected_context["tenant"],
+        cache_key = (
+            proc_name,
+            selected_context.get("session_id", ""),
+            selected_context["agent"],
+            selected_context["tenant"],
         )
+        cache_hit, injected_text = await _get_cached_aawm_dynamic_injection_result(
+            cache_key
+        )
+        event["cache_status"] = "hit" if cache_hit else "miss"
+        if not cache_hit:
+            resolver = getattr(lp, "_call_aawm_get_agent_memories", _call_aawm_get_agent_memories)
+            injected_text = await resolver(
+                agent_name=selected_context["agent"],
+                tenant_id=selected_context["tenant"],
+            )
+            await _set_cached_aawm_dynamic_injection_result(cache_key, injected_text)
+
         if injected_text is None:
             event["status"] = "empty"
             return _AAWM_NO_MEMORIES_TEMPLATE, event
@@ -1020,6 +1378,141 @@ async def _resolve_aawm_dynamic_directive(
         return injected_text, event
 
     raise ValueError(f"Unsupported AAWM proc: {proc_name}")
+
+
+async def _resolve_aawm_context_marker(
+    name: str, available_context: dict[str, str]
+) -> tuple[str, dict[str, Any]]:
+    lp = _lp()
+    proc_name = _get_aawm_context_grab_proc_name()
+    context_keys = [
+        context_key
+        for context_key in ("session_id", "tenant")
+        if available_context.get(context_key)
+    ]
+    cache_key = (
+        proc_name,
+        available_context.get("session_id", ""),
+        available_context.get("tenant", ""),
+        name,
+    )
+    event: dict[str, Any] = {
+        "proc": proc_name,
+        "status": "failed",
+        "context_keys": context_keys,
+        "context_name": name,
+        "placeholder_type": "ctx_marker",
+    }
+    cache_hit, cached_payload = await _get_cached_aawm_context_grab_result(cache_key)
+    event["cache_status"] = "hit" if cache_hit else "miss"
+    if not cache_hit:
+        retrieved_at = _format_aawm_context_retrieved_at(datetime.now(timezone.utc))
+        resolver = getattr(lp, "_call_aawm_context_grab", _call_aawm_context_grab)
+        content = await resolver(name=name)
+        cached_payload = {
+            "status": "empty",
+            "retrieved_at": retrieved_at,
+        }
+        if content is not None:
+            cached_payload["status"] = "resolved"
+            cached_payload["text"] = content
+        await _set_cached_aawm_context_grab_result(cache_key, cached_payload)
+
+    if cached_payload is None:
+        raise RuntimeError("AAWM context grab cache returned no payload")
+
+    event["status"] = cached_payload.get("status", "failed")
+    event["retrieved_at"] = cached_payload.get("retrieved_at")
+    resolved_text = cached_payload.get("text")
+    if event["status"] == "resolved" and resolved_text:
+        event["output_chars"] = len(resolved_text)
+        return (
+            f"{resolved_text}\n~retrieved at: {cached_payload['retrieved_at']}",
+            event,
+        )
+
+    return _build_aawm_context_grab_failure_text(name), event
+
+
+def _append_aawm_context_entries_to_text(text: str, entries: list[str]) -> str:
+    if not entries:
+        return text
+
+    if not text:
+        separator = ""
+    else:
+        trailing_newlines = len(text) - len(text.rstrip("\n"))
+        if trailing_newlines >= 2:
+            separator = ""
+        elif trailing_newlines == 1:
+            separator = "\n"
+        else:
+            separator = "\n\n"
+
+    return text + separator + "\n\n".join(entries)
+
+
+async def _expand_aawm_context_markers_in_text(
+    text: str, available_context: dict[str, str]
+) -> tuple[str, list[dict[str, Any]]]:
+    matches = list(_AAWM_CONTEXT_MARKER_PATTERN.finditer(text))
+    if not matches:
+        return text, []
+
+    rebuilt_parts: list[str] = []
+    ordered_names: list[str] = []
+    seen_names: set[str] = set()
+    cursor = 0
+
+    for match in matches:
+        rebuilt_parts.append(text[cursor:match.start()])
+        name = match.group("name").strip()
+        rebuilt_parts.append(name)
+        if name and name not in seen_names:
+            seen_names.add(name)
+            ordered_names.append(name)
+        cursor = match.end()
+
+    rebuilt_parts.append(text[cursor:])
+    updated_text = "".join(rebuilt_parts)
+    if not ordered_names:
+        return updated_text, []
+
+    semaphore = asyncio.Semaphore(_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE)
+
+    async def _resolve_with_limit(
+        name: str,
+    ) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                return await _resolve_aawm_context_marker(name, available_context)
+            except Exception as exc:
+                return (
+                    _build_aawm_context_grab_failure_text(name),
+                    {
+                        "proc": _get_aawm_context_grab_proc_name_for_logging(),
+                        "status": "failed",
+                        "error": exc.__class__.__name__,
+                        "context_keys": [
+                            context_key
+                            for context_key in ("session_id", "tenant")
+                            if available_context.get(context_key)
+                        ],
+                        "context_name": name,
+                        "placeholder_type": "ctx_marker",
+                    },
+                )
+
+    resolved_entries = await asyncio.gather(
+        *(_resolve_with_limit(name) for name in ordered_names)
+    )
+    appendix_entries: list[str] = []
+    context_events: list[dict[str, Any]] = []
+    for appendix_entry, event in resolved_entries:
+        appendix_entries.append(appendix_entry)
+        context_events.append(event)
+
+    return _append_aawm_context_entries_to_text(updated_text, appendix_entries), context_events
 
 
 async def _expand_aawm_dynamic_directives_in_text(
@@ -1079,10 +1572,15 @@ async def _expand_aawm_dynamic_directives_in_value(
                 value["text"],
                 available_context,
             )
-            if injection_events:
+            updated_text, context_events = await _expand_aawm_context_markers_in_text(
+                updated_text,
+                available_context,
+            )
+            combined_events = injection_events + context_events
+            if combined_events:
                 updated_value = dict(value)
                 updated_value["text"] = updated_text
-                return updated_value, injection_events
+                return updated_value, combined_events
             return value, []
 
         updated_dict: dict[str, Any] = {}
@@ -1145,11 +1643,26 @@ def _add_aawm_dynamic_injection_logging_metadata(
             if isinstance(context_key, str) and context_key
         }
     )
+    context_names = sorted(
+        {
+            context_name
+            for event in injection_events
+            for context_name in [event.get("context_name")]
+            if isinstance(context_name, str) and context_name
+        }
+    )
     status_values = [
         event["status"]
         for event in injection_events
         if isinstance(event.get("status"), str) and event["status"]
     ]
+    cache_status_values = [
+        event["cache_status"]
+        for event in injection_events
+        if isinstance(event.get("cache_status"), str) and event["cache_status"]
+    ]
+    cache_hit_count = sum(1 for status in cache_status_values if status == "hit")
+    cache_miss_count = sum(1 for status in cache_status_values if status == "miss")
 
     tags_to_add = ["aawm-dynamic-injection"]
     tags_to_add.extend(f"aawm-proc:{proc_name}" for proc_name in proc_names)
@@ -1159,11 +1672,15 @@ def _add_aawm_dynamic_injection_logging_metadata(
     span_metadata: dict[str, Any] = {
         "injection_count": len(injection_events),
         "failure_count": len(failure_procs),
+        "cache_hit_count": cache_hit_count,
+        "cache_miss_count": cache_miss_count,
     }
     if proc_names:
         span_metadata["procs"] = proc_names
     if context_keys:
         span_metadata["context_keys"] = context_keys
+    if context_names:
+        span_metadata["context_names"] = context_names
 
     return lp._merge_litellm_metadata(
         request_body,
@@ -1173,7 +1690,11 @@ def _add_aawm_dynamic_injection_logging_metadata(
             "aawm_dynamic_injection_procs": proc_names,
             "aawm_dynamic_injection_failure_procs": failure_procs,
             "aawm_dynamic_injection_context_keys": context_keys,
+            "aawm_dynamic_injection_context_names": context_names,
             "aawm_dynamic_injection_statuses": status_values,
+            "aawm_dynamic_injection_cache_statuses": cache_status_values,
+            "aawm_dynamic_injection_cache_hits": cache_hit_count,
+            "aawm_dynamic_injection_cache_misses": cache_miss_count,
             "aawm_dynamic_injection_events": injection_events,
             "langfuse_spans": [
                 lp._build_langfuse_span_descriptor(

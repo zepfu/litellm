@@ -2168,9 +2168,12 @@ class OpenAIRealtimeTurnDetection(TypedDict, total=False):
 class OpenAIMcpServerTool(TypedDict, total=False):
     type: Required[Literal["mcp"]]
     server_label: Required[str]
-    server_url: Required[str]
+    server_url: str
+    connector_id: str
+    authorization: str
     require_approval: str
     allowed_tools: Optional[List[str]]
+    server_description: str
     headers: Optional[Dict[str, str]]
 
 

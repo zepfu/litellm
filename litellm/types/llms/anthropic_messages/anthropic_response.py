@@ -3,6 +3,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from typing_extensions import TypeAlias, TypedDict
 
 from litellm.types.llms.anthropic import (
+    AnthropicResponseContentBlockMcpToolResult,
+    AnthropicResponseContentBlockMcpToolUse,
     AnthropicResponseContentBlockText,
     AnthropicResponseContentBlockToolUse,
 )
@@ -48,9 +50,26 @@ class AnthropicResponseRedactedThinkingBlock(TypedDict, total=False):
     type: Literal["redacted_thinking"]
 
 
+class AnthropicResponseMcpToolUseBlock(TypedDict, total=False):
+    id: Optional[str]
+    input: Optional[Dict[str, Any]]
+    name: Optional[str]
+    server_name: Optional[str]
+    type: Literal["mcp_tool_use"]
+
+
+class AnthropicResponseMcpToolResultBlock(TypedDict, total=False):
+    content: Optional[List[Dict[str, Any]]]
+    is_error: Optional[bool]
+    tool_use_id: Optional[str]
+    type: Literal["mcp_tool_result"]
+
+
 AnthropicResponseContentBlock: TypeAlias = Union[
     AnthropicResponseTextBlock,
     AnthropicResponseToolUseBlock,
+    AnthropicResponseMcpToolUseBlock,
+    AnthropicResponseMcpToolResultBlock,
     AnthropicResponseThinkingBlock,
     AnthropicResponseRedactedThinkingBlock,
 ]
@@ -80,6 +99,8 @@ class AnthropicMessagesResponse(TypedDict, total=False):
         List[
             Union[
                 AnthropicResponseContentBlock,
+                AnthropicResponseContentBlockMcpToolUse,
+                AnthropicResponseContentBlockMcpToolResult,
                 AnthropicResponseContentBlockText,
                 AnthropicResponseContentBlockToolUse,
             ]

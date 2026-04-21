@@ -300,6 +300,8 @@ def _validate_generation_observations(
     trace_ids: list[str],
     start_time: dt.datetime,
     allowed_request_routes: list[str] | None = None,
+    skip_quality_checks: bool = False,
+    allow_zero_cost: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     failures: list[str] = []
     if not trace_ids:
@@ -360,6 +362,9 @@ def _validate_generation_observations(
         }
         summaries.append(summary)
 
+        if skip_quality_checks:
+            continue
+
         if not isinstance(model, str) or not model.strip():
             failures.append(f"{family} generation missing model")
         elif model.strip().lower() == "unknown":
@@ -371,13 +376,22 @@ def _validate_generation_observations(
             failures.append(f"{family} generation missing completionTokens")
         if not isinstance(total_tokens, (int, float)) or total_tokens <= 0:
             failures.append(f"{family} generation missing totalTokens")
-        if not isinstance(cost_total, (int, float)) or cost_total <= 0:
-            failures.append(f"{family} generation missing costDetails.total")
-        if (
-            not isinstance(calculated_total_cost, (int, float))
-            or calculated_total_cost <= 0
-        ):
-            failures.append(f"{family} generation missing calculatedTotalCost")
+        if allow_zero_cost:
+            if not isinstance(cost_total, (int, float)) or cost_total < 0:
+                failures.append(f"{family} generation missing costDetails.total")
+            if (
+                not isinstance(calculated_total_cost, (int, float))
+                or calculated_total_cost < 0
+            ):
+                failures.append(f"{family} generation missing calculatedTotalCost")
+        else:
+            if not isinstance(cost_total, (int, float)) or cost_total <= 0:
+                failures.append(f"{family} generation missing costDetails.total")
+            if (
+                not isinstance(calculated_total_cost, (int, float))
+                or calculated_total_cost <= 0
+            ):
+                failures.append(f"{family} generation missing calculatedTotalCost")
 
     return route_filtered_observations, summaries, sorted(set(failures))
 

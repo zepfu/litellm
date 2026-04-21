@@ -180,7 +180,7 @@ def test_openai_model_with_thinking_converts_to_reasoning():
         assert "reasoning" in call_kwargs, "reasoning should be passed to litellm.responses"
 
         # budget_tokens=1024 -> effort="minimal" (< 2000 threshold)
-        expected_reasoning = {"effort": "minimal", "summary": "detailed"}
+        expected_reasoning = {"effort": "minimal"}
         assert call_kwargs["reasoning"] == expected_reasoning, (
             f"reasoning should be {expected_reasoning} for budget_tokens=1024, "
             f"got {call_kwargs.get('reasoning')}"

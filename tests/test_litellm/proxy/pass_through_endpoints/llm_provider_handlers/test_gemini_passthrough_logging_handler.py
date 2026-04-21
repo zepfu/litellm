@@ -301,6 +301,47 @@ class TestGeminiPassthroughLoggingHandler:
         assert response.model == "gemini-3-flash-preview"
         assert response.choices[0].message.content == "gemini routed"
 
+
+    def test_build_complete_streaming_response_code_assist_list_wrapped_sse_chunks(self):
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            [
+                {
+                    "traceId": "trace-456",
+                    "response": {
+                        "candidates": [
+                            {
+                                "content": {"parts": [{"text": "gemini wrapped"}], "role": "model"},
+                                "finishReason": "STOP",
+                                "index": 0,
+                            }
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 70295,
+                            "candidatesTokenCount": 3,
+                            "totalTokenCount": 70368,
+                            "thoughtsTokenCount": 70,
+                        },
+                        "modelVersion": "gemini-3.1-pro-preview",
+                    },
+                }
+            ]
+        )
+
+        response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=[chunk, "data: [DONE]"],
+            litellm_logging_obj=mock_logging_obj,
+            model="gemini-3.1-pro-preview",
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+        )
+
+        assert response is not None
+        assert response.model == "gemini-3.1-pro-preview"
+        assert response.choices[0].message.content == "gemini wrapped"
+        assert response.usage.prompt_tokens == 70295
+        assert response.usage.completion_tokens == 73
+        assert response.usage.completion_tokens_details.reasoning_tokens == 70
+
     @patch("litellm.completion_cost")
     def test_gemini_passthrough_handler_streaming(self, mock_completion_cost):
         """Test cost tracking for Gemini streaming endpoint"""
