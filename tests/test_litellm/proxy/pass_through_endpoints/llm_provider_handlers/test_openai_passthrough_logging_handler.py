@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+import litellm
+
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
@@ -99,6 +101,7 @@ class TestOpenAIPassthroughLoggingHandler:
         # Positive cases
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/chat/completions") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openai.azure.com/v1/chat/completions") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openrouter.ai/api/v1/chat/completions") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/models") == False
@@ -136,6 +139,7 @@ class TestOpenAIPassthroughLoggingHandler:
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openai.azure.com/v1/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/responses") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openrouter.ai/api/v1/responses") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/chat/completions") == False
@@ -373,7 +377,83 @@ class TestOpenAIPassthroughLoggingHandler:
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.123
 
-    @patch("litellm.completion_cost")
+    def test_openai_passthrough_handler_backfills_openrouter_responses_usage_and_model(self):
+        mock_httpx_response = self._create_mock_httpx_response(
+            {
+                "id": "resp-openrouter-usage-test",
+                "object": "response",
+                "created_at": 1775863780,
+                "model": "openrouter/free",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_123",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "free smoke", "annotations": []}
+                        ],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 95829,
+                    "output_tokens": 198,
+                    "total_tokens": 96027,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0, "text_tokens": 198},
+                },
+            }
+        )
+        mock_logging_obj = self._create_mock_logging_obj()
+        transformed_response = litellm.ModelResponse(
+            model="unknown",
+            choices=[
+                litellm.Choices(
+                    message=litellm.Message(role="assistant", content="free smoke"),
+                    finish_reason="stop",
+                    index=0,
+                )
+            ],
+            usage=litellm.Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        )
+        mock_provider_config = MagicMock()
+        mock_provider_config.transform_response.return_value = transformed_response
+
+        with patch.object(
+            OpenAIPassthroughLoggingHandler,
+            "get_provider_config",
+            return_value=mock_provider_config,
+        ), patch("litellm.completion_cost", return_value=0.484095):
+            result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+                httpx_response=mock_httpx_response,
+                response_body=mock_httpx_response.json(),
+                logging_obj=mock_logging_obj,
+                url_route="https://openrouter.ai/api/v1/responses",
+                result="",
+                start_time=self.start_time,
+                end_time=self.end_time,
+                cache_hit=False,
+                request_body={"model": "openrouter/free", "input": "free smoke"},
+                passthrough_logging_payload=PassthroughStandardLoggingPayload(
+                    url="https://openrouter.ai/api/v1/responses",
+                    request_body={"model": "openrouter/free", "input": "free smoke"},
+                    request_method="POST",
+                ),
+                custom_llm_provider="openrouter",
+                litellm_params={},
+            )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        assert result["result"].model == "openrouter/free"
+        assert usage.prompt_tokens == 95829
+        assert usage.completion_tokens == 198
+        assert usage.total_tokens == 96027
+        assert standard_logging_object["model"] == "openrouter/free"
+        assert standard_logging_object["prompt_tokens"] == 95829
+        assert standard_logging_object["completion_tokens"] == 198
+        assert standard_logging_object["total_tokens"] == 96027
+
     def test_openai_streaming_handler_rebuilds_codex_stream_with_empty_output(
         self, mock_completion_cost
     ):
@@ -842,6 +922,7 @@ class TestOpenAIPassthroughIntegration:
         assert self.handler.is_openai_route("https://api.openai.com/v1/chat/completions") == True
         assert self.handler.is_openai_route("https://openai.azure.com/v1/chat/completions") == True
         assert self.handler.is_openai_route("https://api.openai.com/v1/models") == True
+        assert self.handler.is_openai_route("https://openrouter.ai/api/v1/responses") == True
         
         # Negative cases
         assert self.handler.is_openai_route("http://localhost:4000/openai/v1/chat/completions") == False

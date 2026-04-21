@@ -96,6 +96,51 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - **Extract complex comprehensions to named helpers** — a set/dict comprehension that calls into the DB or manager (e.g. "which of these server IDs are OAuth2?") belongs in a named helper function, not inline in the caller.
 - **FastAPI parameter declarations** — mark required query/form params with `= Query(...)` / `= Form(...)` explicitly when other params in the same handler are optional. Mixing `str` (required) with `Optional[str] = None` in the same signature causes silent 422s when the required param is missing.
 
+### Anthropic adapter dev validation
+- `litellm-dev` on `:4001` is the only supported runtime for Anthropic-route adapter work.
+- Native Anthropic egress is enabled again on `:4001`, but top-level Claude runs without an adapted model are still not useful acceptance targets for this adapter work because they do not exercise the adapted lane.
+- Real-Claude adapter acceptance lives in:
+  - `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+  - `scripts/local-ci/anthropic_adapter_config.json`
+- Current real-Claude adapted baseline on `:4001`:
+  - OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.3-codex-spark`
+  - Google Code Assist canaries: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
+    - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist
+    - keep this warning-only in the harness because upstream quota windows produce real `429` responses
+  - OpenRouter hard gate: `openai/gpt-oss-120b:free`
+  - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
+  - OpenRouter preferred free targets under active validation: `openrouter/elephant-alpha`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+  - OpenRouter warning-only canaries: `openrouter/free`, `openrouter/elephant-alpha`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+- OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
+- Current upstream-rate-limited / unstable OpenRouter candidates:
+  - `openrouter/free` (moving router)
+  - `openrouter/elephant-alpha`
+  - `google/gemma-4-31b-it:free`
+  - `google/gemma-4-26b-a4b-it:free`
+  - `nvidia/nemotron-3-super-120b-a12b:free`
+  - `minimax/minimax-m2.5:free`
+  - `qwen/qwen3-coder:free`
+- For adapted models, treat LiteLLM / `session_history` / Langfuse as the cost source of truth, not Claude CLI display cost.
+- For Google Code Assist adapter work, treat successful real-Claude runs on `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` as proof of routing correctness. Do not treat `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED` on their own as authoritative upstream truth; only close those as provider issues after interactive Gemini CLI `/model` corroboration on the same account context.
+- `openrouter/elephant-alpha` intentionally stays on the Anthropic -> OpenRouter `chat/completions` lane. The other OpenRouter free models stay on the generic OpenRouter `Responses` lane unless real Claude behavior proves they need the same detour.
+- Dev OpenRouter pacing on `:4001` now uses:
+  - short hidden retry budget: `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
+  - longer per-model post-failure cooldown: `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
+  This keeps brief transient recovery local while preventing repeated manual retests from re-burning ~40 seconds on the same throttled backend.
+- The `elephant-alpha` completion lane now passes `proxy_server_request.headers/body` into `litellm.acompletion()`, so callback attribution (`AawmAgentIdentity`, Langfuse trace naming, `session_history`) has the same Claude subagent/session context as the passthrough lanes.
+
+### Runtime performance knobs
+- Payload capture is now intentionally gated for debug-only use. `litellm.integrations.aawm_payload_capture` will write captures only when both `AAWM_CAPTURE=1` and `LITELLM_LOG=DEBUG` are set. Normal work should leave this off.
+- `session_history` persistence now uses a background batch writer instead of inline per-call writes. Tune with:
+  - `AAWM_SESSION_HISTORY_BATCH_SIZE` (default `32`)
+  - `AAWM_SESSION_HISTORY_FLUSH_INTERVAL_MS` (default `250`)
+- Claude dynamic directive expansion now uses a short TTL cache to avoid repeated DB hits on the same `(session, agent, tenant)` context. Tune with:
+  - `AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS` (default `15`)
+- Current low-overhead instrumentation surfaces for these optimizations:
+  - DEBUG log: `AawmAgentIdentity: flushed N session_history records in Xms`
+  - Claude rewrite metadata: `aawm_dynamic_injection_cache_hits`, `aawm_dynamic_injection_cache_misses`, `aawm_dynamic_injection_cache_statuses`
+  - existing proxy metadata: `queue_time_seconds`, `completion_start_time`, `response_cost`
+
 ### Testing Strategy
 - Unit tests in `tests/test_litellm/`
 - Integration tests for each provider in `tests/llm_translation/`

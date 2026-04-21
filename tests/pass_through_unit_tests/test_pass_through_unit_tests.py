@@ -285,6 +285,14 @@ def test_get_endpoint_type_treats_chatgpt_codex_as_openai():
     assert endpoint_type == EndpointType.OPENAI
 
 
+def test_get_endpoint_type_treats_openrouter_responses_as_openai():
+    endpoint_type = HttpPassThroughEndpointHelpers.get_endpoint_type(
+        "https://openrouter.ai/api/v1/responses"
+    )
+
+    assert endpoint_type == EndpointType.OPENAI
+
+
 athropic_request_body = {
     "model": "claude-sonnet-4-5-20250929",
     "max_tokens": 256,

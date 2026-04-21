@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
     ModelResponseIterator,
+    VertexGeminiConfig,
 )
 
 
@@ -78,7 +79,7 @@ def test_streaming_tool_call_finish_reason_is_tool_calls():
     assert response1 is not None
     assert len(response1.choices) == 1
     assert response1.choices[0].delta.tool_calls is not None
-    assert response1.choices[0].finish_reason == "tool_calls"
+    assert response1.choices[0].finish_reason is None
     assert iterator.has_seen_tool_calls is True
 
     # Process chunk 2 (final chunk)
@@ -230,3 +231,88 @@ def test_streaming_content_filter_finish_reason_preserved():
     assert response is not None
     assert len(response.choices) == 1
     assert response.choices[0].finish_reason == "content_filter"
+
+
+def test_streaming_text_chunk_without_provider_finish_reason_has_no_finish_reason():
+    from litellm.types.utils import Delta
+
+    chat_completion_message = {"role": "assistant", "content": "adapter smoke"}
+    candidate = {
+        "index": 0,
+        "content": {"role": "model", "parts": [{"text": "adapter smoke"}]},
+    }
+
+    choice = VertexGeminiConfig._create_streaming_choice(
+        chat_completion_message=chat_completion_message,
+        candidate=candidate,
+        idx=0,
+        tools=None,
+        functions=None,
+        chat_completion_logprobs=None,
+        image_response=None,
+    )
+
+    assert isinstance(choice.delta, Delta)
+    assert choice.delta.content == "adapter smoke"
+    assert choice.finish_reason is None
+
+
+def test_streaming_text_chunk_with_provider_finish_reason_maps_to_stop():
+    chat_completion_message = {"role": "assistant", "content": "adapter smoke"}
+    candidate = {
+        "index": 0,
+        "content": {"role": "model", "parts": [{"text": "adapter smoke"}]},
+        "finishReason": "STOP",
+    }
+
+    choice = VertexGeminiConfig._create_streaming_choice(
+        chat_completion_message=chat_completion_message,
+        candidate=candidate,
+        idx=0,
+        tools=None,
+        functions=None,
+        chat_completion_logprobs=None,
+        image_response=None,
+    )
+
+    assert choice.delta.content == "adapter smoke"
+    assert choice.finish_reason == "stop"
+
+
+def test_streaming_iterator_splits_text_and_finish_reason_same_chunk():
+    import json
+
+    logging_obj = _make_logging_obj()
+    iterator = ModelResponseIterator(
+        streaming_response=iter([
+            "data: " + json.dumps({
+                "candidates": [{
+                    "content": {
+                        "parts": [{"text": "adapter smoke"}],
+                        "role": "model",
+                    },
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 2,
+                    "totalTokenCount": 12,
+                },
+            }) + "\n\n"
+        ]),
+        sync_stream=True,
+        logging_obj=logging_obj,
+    )
+
+    chunks = list(iterator)
+
+    assert len(chunks) == 2
+    assert chunks[0].choices[0].delta.content == "adapter smoke"
+    assert chunks[0].choices[0].finish_reason is None
+    assert getattr(chunks[0], "usage", None) is None
+
+    assert chunks[1].choices[0].delta.content is None
+    assert chunks[1].choices[0].finish_reason == "stop"
+    assert chunks[1].usage is not None
+    assert chunks[1].usage.completion_tokens == 2

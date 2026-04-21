@@ -121,31 +121,47 @@ def test_cost_calculator_with_usage(monkeypatch):
         {"gemini-2.0-flash-001": temp_model_info_object},
     )
 
-    # Invalidate caches after modifying litellm.model_cost
-    from litellm.utils import _invalidate_model_cost_lowercase_map
-    _invalidate_model_cost_lowercase_map()
 
-    result = response_cost_calculator(
-        response_object=mr,
-        model="",
-        custom_llm_provider="vertex_ai",
-        call_type="acompletion",
-        optional_params={},
-        cache_hit=None,
-        base_model=None,
+def test_chatgpt_gpt_5_4_cost_matches_openai_gpt_5_4():
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    response = ModelResponse(
+        model="gpt-5.4",
+        choices=[],
+        usage=Usage(prompt_tokens=70437, completion_tokens=7, total_tokens=70444),
+    )
+    response._hidden_params = {"custom_llm_provider": "chatgpt"}
+
+    cost = completion_cost(
+        completion_response=response,
+        model="gpt-5.4",
+        custom_llm_provider="chatgpt",
     )
 
-    expected_cost = (
-        usage.prompt_tokens_details.audio_tokens
-        * temp_model_info_object["input_cost_per_audio_token"]
-        + usage.prompt_tokens_details.text_tokens
-        * temp_model_info_object["input_cost_per_token"]
-        + usage.prompt_tokens_details.image_tokens
-        * temp_model_info_object["input_cost_per_image_token"]
-        + usage.completion_tokens * temp_model_info_object["output_cost_per_token"]
+    expected_cost = (70437 * 2.5e-06) + (7 * 1.5e-05)
+    assert pytest.approx(cost, rel=1e-9) == expected_cost
+
+
+def test_chatgpt_gpt_5_3_codex_spark_uses_provisional_codex_pricing():
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    response = ModelResponse(
+        model="gpt-5.3-codex-spark",
+        choices=[],
+        usage=Usage(prompt_tokens=1000, completion_tokens=10, total_tokens=1010),
+    )
+    response._hidden_params = {"custom_llm_provider": "chatgpt"}
+
+    cost = completion_cost(
+        completion_response=response,
+        model="gpt-5.3-codex-spark",
+        custom_llm_provider="chatgpt",
     )
 
-    assert result == expected_cost, f"Got {result}, Expected {expected_cost}"
+    expected_cost = (1000 * 1.75e-06) + (10 * 1.4e-05)
+    assert pytest.approx(cost, rel=1e-9) == expected_cost
 
 
 def test_transcription_cost_uses_token_pricing():
@@ -1997,3 +2013,39 @@ def test_gpt_realtime_mini_cached_text_input_cost():
 
     assert input_cost == pytest.approx(expected_input_cost, rel=1e-12)
     assert output_cost == pytest.approx(expected_output_cost, rel=1e-12)
+
+
+def test_cost_calculator_openrouter_elephant_alpha_free_alias():
+    os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] = 'True'
+    litellm.model_cost = litellm.get_model_cost_map(url='')
+
+    response_cost = litellm.cost_calculator.completion_cost(
+        model='openrouter/elephant-alpha',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        completion='world',
+    )
+    assert response_cost == 0
+
+
+def test_cost_calculator_openrouter_free_alias():
+    os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] = 'True'
+    litellm.model_cost = litellm.get_model_cost_map(url='')
+
+    response_cost = litellm.cost_calculator.completion_cost(
+        model='openrouter/free',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        completion='world',
+    )
+    assert response_cost == 0
+
+
+def test_cost_calculator_openrouter_gpt_oss_20b_free_alias():
+    os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] = 'True'
+    litellm.model_cost = litellm.get_model_cost_map(url='')
+
+    response_cost = litellm.cost_calculator.completion_cost(
+        model='openrouter/gpt-oss-20b:free',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        completion='world',
+    )
+    assert response_cost == 0

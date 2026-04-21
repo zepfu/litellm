@@ -1285,18 +1285,37 @@ def extract_images_from_message(message: AllMessageValues) -> List[str]:
 
 def _attempt_json_repair(s: str) -> Optional[Any]:
     """
-    Attempt to repair truncated JSON produced by LLM tool calls.
+    Attempt to repair malformed JSON produced by LLM tool calls.
 
     Handles the most common truncation patterns where the model generates
-    valid JSON that is cut short (missing closing brackets/braces).
+    valid JSON that is cut short (missing closing brackets/braces), plus
+    a narrow malformed-key pattern we see from some tool-calling providers
+    (for example ``{command": "date -u"}``).
 
     Returns the parsed value on success, or None if repair fails.
     """
     import json
 
+    def _repair_missing_key_quotes(candidate: str) -> Optional[Any]:
+        repaired_candidate = re.sub(
+            r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_.-]*)(")?(\s*:)',
+            r'\1"\2"\4',
+            candidate,
+        )
+        if repaired_candidate == candidate:
+            return None
+        try:
+            return json.loads(repaired_candidate)
+        except json.JSONDecodeError:
+            return None
+
     stripped = s.rstrip()
     if not stripped:
         return None
+
+    repaired_key_quotes = _repair_missing_key_quotes(stripped)
+    if repaired_key_quotes is not None:
+        return repaired_key_quotes
 
     # Track the stack of unmatched openers to respect nesting order
     opener_stack: list = []
@@ -1337,6 +1356,10 @@ def _attempt_json_repair(s: str) -> Optional[Any]:
         return json.loads(candidate)
     except json.JSONDecodeError:
         pass
+
+    repaired_key_quotes = _repair_missing_key_quotes(candidate)
+    if repaired_key_quotes is not None:
+        return repaired_key_quotes
 
     return None
 

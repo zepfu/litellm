@@ -19,7 +19,7 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
 )
 from litellm.types.utils import ModelResponse
-from litellm.utils import get_model_info
+from litellm.utils import get_model_info, supports_reasoning_summary
 
 if TYPE_CHECKING:
     pass
@@ -80,14 +80,21 @@ class LiteLLMMessagesToCompletionTransformationHandler:
 
         reasoning_effort = completion_kwargs.get("reasoning_effort")
         if isinstance(reasoning_effort, str) and reasoning_effort:
-            completion_kwargs["reasoning_effort"] = {
-                "effort": reasoning_effort,
-                "summary": "detailed",
-            }
+            mapped_reasoning_effort = {"effort": reasoning_effort}
+            if supports_reasoning_summary(
+                model=cast(str, model),
+                custom_llm_provider=custom_llm_provider,
+            ):
+                mapped_reasoning_effort["summary"] = "detailed"
+            completion_kwargs["reasoning_effort"] = mapped_reasoning_effort
         elif isinstance(reasoning_effort, dict):
             if (
                 "summary" not in reasoning_effort
                 and "generate_summary" not in reasoning_effort
+                and supports_reasoning_summary(
+                    model=cast(str, model),
+                    custom_llm_provider=custom_llm_provider,
+                )
             ):
                 updated_reasoning_effort = dict(reasoning_effort)
                 updated_reasoning_effort["summary"] = "detailed"
@@ -129,7 +136,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             "max_tokens": max_tokens,
         }
 
-        if metadata:
+        if metadata is not None:
             request_data["metadata"] = metadata
         if stop_sequences:
             request_data["stop_sequences"] = stop_sequences

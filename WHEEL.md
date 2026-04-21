@@ -8,6 +8,7 @@ The repo also ships the local acceptance harness as a separate compressed
 archive so validation tooling can move independently from the main codebase.
 The standalone model pricing/capability config is also published as its own
 archive so infrastructure can consume that data without pulling the full repo.
+See `TEST_HARNESS.md` for the actual validation process and interpretation.
 
 ## Distinction
 
@@ -48,6 +49,7 @@ Current responsibilities:
 - Langfuse trace naming and request-tag normalization
 - Claude/Gemini reasoning and signature enrichment
 - `public.session_history` persistence into the AAWM tristore
+- background batching for `session_history` writes with configurable batch/flush tuning
 - Gemini/Codex usage breakout normalization for cache, reasoning, and tool-call fields
 
 ### Claude control-plane wheel
@@ -72,6 +74,7 @@ Current responsibilities:
 - Claude Code `# auto memory` system-prompt replacement
 - exact-match prompt patch manifest application
 - AAWM dynamic directive expansion like `AAWM p=get_agent_memories ...`
+- short-TTL caching for dynamic directive expansion results on repeated session/agent/tenant contexts
 - post-rewrite `MEMORY.md` / `CLAUDE.md` trace tagging
 - related Langfuse metadata/span emission for the above control-plane actions
 
@@ -131,6 +134,8 @@ Current responsibilities:
 - standalone pricing/capability/config distribution for infrastructure and tooling
 - versioned packaging of the model registry independent of the base fork image
 - fast drift checks when model metadata changes without a full base release
+- current adapter-cost policy support, including paid-equivalent pricing for
+  selected OpenRouter `:free` aliases when OpenRouter publishes a non-free twin
 
 ## Runtime model
 
@@ -140,6 +145,9 @@ are then installed on top of that pinned release:
 1. install the pinned LiteLLM fork release or image
 2. install the latest callback wheel
 3. install the latest control-plane wheel
+4. optionally install the latest model-config archive payload into the runtime
+   image when infrastructure wants model/pricing changes without a base-fork
+   release cut
 
 This keeps AAWM-specific overlays moving independently without forcing a full
 LiteLLM release cut for every prompt/tagging enhancement.
@@ -215,6 +223,33 @@ Notes:
   database settings; otherwise the directive-expansion path will fall back to
   its failure behavior
 
+## Performance-related runtime defaults
+
+Recent AAWM runtime work also changed the default performance posture:
+
+- payload capture is now debug-only
+  - `litellm.integrations.aawm_payload_capture` only writes captures when both:
+    - `AAWM_CAPTURE=1`
+    - `LITELLM_LOG=DEBUG`
+- callback-side `session_history` persistence is now batched in the background
+  - tune with:
+    - `AAWM_SESSION_HISTORY_BATCH_SIZE`
+    - `AAWM_SESSION_HISTORY_FLUSH_INTERVAL_MS`
+- Claude dynamic injection now has a small TTL cache
+  - tune with:
+    - `AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS`
+
+Useful operator-visible instrumentation from those changes:
+
+- DEBUG log: `AawmAgentIdentity: flushed N session_history records in Xms`
+- Claude metadata / Langfuse span fields:
+  - `aawm_dynamic_injection_cache_hits`
+  - `aawm_dynamic_injection_cache_misses`
+  - `aawm_dynamic_injection_cache_statuses`
+
+These are runtime-behavior changes, not separate artifact lines, but they matter
+for how infra should evaluate tail latency on rebuilt images.
+
 ## Artifact resolution
 
 The current release model has two kinds of refs:
@@ -259,6 +294,25 @@ In other words:
 
 That keeps base compatibility changes and AAWM enhancement changes on separate
 release cadences.
+
+## Current adapter boundary
+
+The current Anthropic-route multi-provider adapter work is split intentionally:
+
+- base fork release:
+  - Anthropic-route adapter routing and translation logic
+  - provider-family egress guard
+  - adapted access-log labeling
+  - backend `session_history` / Langfuse plumbing needed for adapted traffic
+- callback wheel:
+  - callback-side enrichment and `session_history` persistence
+- control-plane wheel:
+  - Claude-specific prompt rewrites and dynamic context injection
+- harness/config artifacts:
+  - validation policy and model/pricing distribution
+
+In other words: OpenAI/Codex, Google Code Assist, and OpenRouter adaptation on
+`/anthropic/v1/messages` is currently base-fork behavior, not an overlay wheel.
 
 ### What infra should pin
 

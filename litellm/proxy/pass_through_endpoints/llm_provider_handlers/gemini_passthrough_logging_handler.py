@@ -39,12 +39,27 @@ class GeminiPassthroughLoggingHandler:
             parsed_chunk = json.loads(normalized_chunk)
         except json.JSONDecodeError:
             return None
+        if isinstance(parsed_chunk, list):
+            for item in reversed(parsed_chunk):
+                if isinstance(item, dict):
+                    parsed_chunk = item
+                    break
+            else:
+                return None
         if not isinstance(parsed_chunk, dict):
             return None
         return parsed_chunk
 
     @staticmethod
     def _unwrap_code_assist_response_body(response_body: Any) -> Any:
+        if isinstance(response_body, list):
+            for item in reversed(response_body):
+                unwrapped_item = GeminiPassthroughLoggingHandler._unwrap_code_assist_response_body(
+                    item
+                )
+                if isinstance(unwrapped_item, dict):
+                    return unwrapped_item
+            return response_body
         if isinstance(response_body, dict) and isinstance(response_body.get("response"), dict):
             return response_body["response"]
         return response_body
