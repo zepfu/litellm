@@ -1,6 +1,7 @@
 # What is this?
 ## Translates OpenAI call to Anthropic `/v1/messages` format
 import json
+import os
 import traceback
 from collections import deque
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterator, Literal, Optional
@@ -75,6 +76,34 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             cache_read_input_tokens=0,
         )
 
+    def _queue_synthetic_end_turn_if_needed(self) -> None:
+        """
+        Some upstream streaming providers can end a text response without a final
+        stop_reason chunk. Anthropic clients still expect the assistant turn to
+        close cleanly with `content_block_stop` and `message_delta(stop_reason=end_turn)`
+        before `message_stop`.
+        """
+        if self.sent_content_block_start is False:
+            return
+        if self.sent_content_block_finish is True:
+            return
+        if self.holding_stop_reason_chunk is not None:
+            return
+
+        self.chunk_queue.append(
+            {
+                "type": "content_block_stop",
+                "index": self.current_content_block_index,
+            }
+        )
+        self.chunk_queue.append(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            }
+        )
+        self.sent_content_block_finish = True
+
     def __next__(self):
         from .transformation import LiteLLMAnthropicMessagesAdapter
 
@@ -127,10 +156,28 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                     current_content_block_index=self.current_content_block_index,
                 )
 
+                if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and "gemini" in self.model:
+                    try:
+                        choice = chunk.choices[0]
+                        delta = getattr(choice, "delta", None)
+                        verbose_logger.warning(
+                            "Anthropic wrapper debug(sync): model=%s raw_finish=%s raw_content=%r raw_reasoning=%r raw_tool_calls=%s translated_type=%s translated_delta=%s",
+                            self.model,
+                            getattr(choice, "finish_reason", None),
+                            getattr(delta, "content", None),
+                            getattr(delta, "reasoning_content", None),
+                            len(getattr(delta, "tool_calls", None) or []),
+                            processed_chunk.get("type") if isinstance(processed_chunk, dict) else type(processed_chunk).__name__,
+                            processed_chunk.get("delta") if isinstance(processed_chunk, dict) else None,
+                        )
+                    except Exception:
+                        verbose_logger.exception("Anthropic wrapper sync debug logging failed")
+
                 if should_start_new_block and not self.sent_content_block_finish:
-                    # Queue the sequence: content_block_stop -> content_block_start
-                    # The trigger chunk itself is not emitted as a delta since the
-                    # content_block_start already carries the relevant information.
+                    # Queue the sequence: content_block_stop -> content_block_start.
+                    # For tool_use blocks we must also preserve the triggering
+                    # input_json_delta chunk; otherwise clients receive an empty
+                    # tool input and invoke the tool with missing arguments.
                     self.chunk_queue.append(
                         {
                             "type": "content_block_stop",
@@ -144,6 +191,13 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             "content_block": self.current_content_block_start,
                         }
                     )
+                    if (
+                        isinstance(processed_chunk, dict)
+                        and processed_chunk.get("type") == "content_block_delta"
+                        and isinstance(processed_chunk.get("delta"), dict)
+                        and processed_chunk["delta"].get("type") == "input_json_delta"
+                    ):
+                        self.chunk_queue.append(processed_chunk)
                     self.sent_content_block_finish = False
                     return self.chunk_queue.popleft()
 
@@ -174,6 +228,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             if self.holding_chunk is not None:
                 self.chunk_queue.append(self.holding_chunk)
                 self.holding_chunk = None
+
+            self._queue_synthetic_end_turn_if_needed()
 
             if not self.sent_last_message:
                 self.sent_last_message = True
@@ -249,6 +305,23 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                     current_content_block_index=self.current_content_block_index,
                 )
 
+                if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and "gemini" in self.model:
+                    try:
+                        choice = chunk.choices[0]
+                        delta = getattr(choice, "delta", None)
+                        verbose_logger.warning(
+                            "Anthropic wrapper debug(async): model=%s raw_finish=%s raw_content=%r raw_reasoning=%r raw_tool_calls=%s translated_type=%s translated_delta=%s",
+                            self.model,
+                            getattr(choice, "finish_reason", None),
+                            getattr(delta, "content", None),
+                            getattr(delta, "reasoning_content", None),
+                            len(getattr(delta, "tool_calls", None) or []),
+                            processed_chunk.get("type") if isinstance(processed_chunk, dict) else type(processed_chunk).__name__,
+                            processed_chunk.get("delta") if isinstance(processed_chunk, dict) else None,
+                        )
+                    except Exception:
+                        verbose_logger.exception("Anthropic wrapper async debug logging failed")
+
                 # Check if this is a usage chunk and we have a held stop_reason chunk
                 if (
                     self.holding_stop_reason_chunk is not None
@@ -304,9 +377,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                 if not self.queued_usage_chunk:
                     if should_start_new_block and not self.sent_content_block_finish:
-                        # Queue the sequence: content_block_stop -> content_block_start
-                        # The trigger chunk itself is not emitted as a delta since the
-                        # content_block_start already carries the relevant information.
+                        # Queue the sequence: content_block_stop -> content_block_start.
+                        # For tool_use blocks we must also preserve the triggering
+                        # input_json_delta chunk; otherwise clients receive an empty
+                        # tool input and invoke the tool with missing arguments.
 
                         # 1. Stop current content block
                         self.chunk_queue.append(
@@ -324,6 +398,13 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                                 "content_block": self.current_content_block_start,
                             }
                         )
+                        if (
+                            isinstance(processed_chunk, dict)
+                            and processed_chunk.get("type") == "content_block_delta"
+                            and isinstance(processed_chunk.get("delta"), dict)
+                            and processed_chunk["delta"].get("type") == "input_json_delta"
+                        ):
+                            self.chunk_queue.append(processed_chunk)
 
                         # Reset state for new block
                         self.sent_content_block_finish = False
@@ -371,6 +452,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if self.holding_chunk is not None:
                     self.chunk_queue.append(self.holding_chunk)
                     self.holding_chunk = None
+
+                self._queue_synthetic_end_turn_if_needed()
 
             if not self.sent_last_message:
                 self.sent_last_message = True

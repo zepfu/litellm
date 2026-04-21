@@ -9,12 +9,21 @@ import sys
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
+import pytest
+
 sys.path.insert(0, os.path.abspath("../../../../../../.."))
 
+import litellm
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
     LiteLLMAnthropicToResponsesAPIAdapter,
 )
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
+
+
+@pytest.fixture(autouse=True)
+def _use_local_model_cost_map(monkeypatch):
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    litellm.model_cost = litellm.get_model_cost_map(url="")
 
 
 def _make_request(**overrides) -> AnthropicMessagesRequest:
@@ -565,6 +574,87 @@ class TestTranslateToolsToResponsesAPI:
         assert _ADAPTER.translate_tools_to_responses_api([]) == []
 
 
+class TestTranslateMcpServersToResponsesTools:
+    def test_legacy_mcp_server_allowed_tools_maps_to_mcp_tool(self):
+        mcp_servers = [
+            {
+                "type": "url",
+                "url": "https://example.com/sse",
+                "name": "example-mcp",
+                "authorization_token": "oauth-token",
+                "tool_configuration": {"allowed_tools": ["search_docs", "get_page"]},
+            }
+        ]
+        result = _ADAPTER.translate_mcp_servers_to_responses_tools(mcp_servers)
+        assert result == [
+            {
+                "type": "mcp",
+                "server_label": "example-mcp",
+                "server_url": "https://example.com/sse",
+                "authorization": "oauth-token",
+                "allowed_tools": ["search_docs", "get_page"],
+                "require_approval": "never",
+            }
+        ]
+
+    def test_mcp_toolset_allowlist_maps_to_allowed_tools(self):
+        mcp_servers = [
+            {
+                "type": "url",
+                "url": "https://calendar.example.com/sse",
+                "name": "calendar-mcp",
+            }
+        ]
+        tools = [
+            {
+                "type": "mcp_toolset",
+                "mcp_server_name": "calendar-mcp",
+                "default_config": {"enabled": False},
+                "configs": {
+                    "search_events": {"enabled": True},
+                    "list_events": {"enabled": True},
+                },
+            }
+        ]
+        result = _ADAPTER.translate_mcp_servers_to_responses_tools(mcp_servers, tools)
+        assert result == [
+            {
+                "type": "mcp",
+                "server_label": "calendar-mcp",
+                "server_url": "https://calendar.example.com/sse",
+                "allowed_tools": ["search_events", "list_events"],
+                "require_approval": "never",
+            }
+        ]
+
+    def test_mcp_toolset_denylist_has_no_direct_allowlist_mapping(self):
+        mcp_servers = [
+            {
+                "type": "url",
+                "url": "https://calendar.example.com/sse",
+                "name": "calendar-mcp",
+            }
+        ]
+        tools = [
+            {
+                "type": "mcp_toolset",
+                "mcp_server_name": "calendar-mcp",
+                "configs": {
+                    "delete_events": {"enabled": False},
+                },
+            }
+        ]
+        result = _ADAPTER.translate_mcp_servers_to_responses_tools(mcp_servers, tools)
+        assert result == [
+            {
+                "type": "mcp",
+                "server_label": "calendar-mcp",
+                "server_url": "https://calendar.example.com/sse",
+                "require_approval": "never",
+            }
+        ]
+
+
 # ---------------------------------------------------------------------------
 # translate_tool_choice_to_responses_api
 # ---------------------------------------------------------------------------
@@ -574,14 +664,10 @@ class TestTranslateToolChoiceToResponsesAPI:
     """Anthropic tool_choice -> Responses API tool_choice."""
 
     def test_auto_maps_to_auto(self):
-        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "auto"}) == {
-            "type": "auto"
-        }
+        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "auto"}) == "auto"
 
     def test_any_maps_to_required(self):
-        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "any"}) == {
-            "type": "required"
-        }
+        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "any"}) == "required"
 
     def test_specific_tool_maps_to_function(self):
         result = _ADAPTER.translate_tool_choice_to_responses_api(
@@ -590,8 +676,37 @@ class TestTranslateToolChoiceToResponsesAPI:
         assert result == {"type": "function", "name": "get_weather"}
 
     def test_unknown_type_defaults_to_auto(self):
+        result = _ADAPTER.translate_tool_choice_to_responses_api({"type": "bogus"})
+        assert result == "auto"
+
+    def test_none_maps_to_none(self):
         result = _ADAPTER.translate_tool_choice_to_responses_api({"type": "none"})
-        assert result == {"type": "auto"}
+        assert result == "none"
+
+
+class TestTranslateParallelToolCallsToResponsesAPI:
+    """Anthropic disable_parallel_tool_use -> Responses parallel_tool_calls."""
+
+    def test_disable_parallel_tool_use_maps_to_false_for_function_tools(self):
+        result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
+            {"type": "auto", "disable_parallel_tool_use": True},
+            translated_tools=[{"type": "function", "name": "get_weather"}],
+        )
+        assert result is False
+
+    def test_disable_parallel_tool_use_ignored_without_tools(self):
+        result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
+            {"type": "auto", "disable_parallel_tool_use": True},
+            translated_tools=None,
+        )
+        assert result is None
+
+    def test_disable_parallel_tool_use_ignored_for_non_function_tools(self):
+        result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
+            {"type": "auto", "disable_parallel_tool_use": True},
+            translated_tools=[{"type": "web_search_preview"}],
+        )
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +719,9 @@ class TestTranslateThinkingToReasoning:
 
     def test_budget_high_effort(self):
         result = _ADAPTER.translate_thinking_to_reasoning(
-            {"type": "enabled", "budget_tokens": 10000}
+            {"type": "enabled", "budget_tokens": 10000},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
         )
         assert result == {"effort": "high", "summary": "detailed"}
 
@@ -617,19 +734,25 @@ class TestTranslateThinkingToReasoning:
 
     def test_budget_medium_effort(self):
         result = _ADAPTER.translate_thinking_to_reasoning(
-            {"type": "enabled", "budget_tokens": 7500}
+            {"type": "enabled", "budget_tokens": 7500},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
         )
         assert result == {"effort": "medium", "summary": "detailed"}
 
     def test_budget_low_effort(self):
         result = _ADAPTER.translate_thinking_to_reasoning(
-            {"type": "enabled", "budget_tokens": 3000}
+            {"type": "enabled", "budget_tokens": 3000},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
         )
         assert result == {"effort": "low", "summary": "detailed"}
 
     def test_budget_minimal_effort(self):
         result = _ADAPTER.translate_thinking_to_reasoning(
-            {"type": "enabled", "budget_tokens": 500}
+            {"type": "enabled", "budget_tokens": 500},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
         )
         assert result == {"effort": "minimal", "summary": "detailed"}
 
@@ -655,8 +778,54 @@ class TestTranslateThinkingToReasoning:
 
     def test_missing_budget_defaults_to_minimal(self):
         """Missing budget_tokens defaults to 0, which is < 2000 -> minimal."""
-        result = _ADAPTER.translate_thinking_to_reasoning({"type": "enabled"})
+        result = _ADAPTER.translate_thinking_to_reasoning(
+            {"type": "enabled"},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
+        )
         assert result == {"effort": "minimal", "summary": "detailed"}
+
+    def test_adaptive_thinking_defaults_to_medium_effort(self):
+        result = _ADAPTER.translate_thinking_to_reasoning(
+            {"type": "adaptive"},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
+        )
+        assert result == {"effort": "medium", "summary": "detailed"}
+
+    def test_output_config_effort_overrides_enabled_budget_mapping(self):
+        result = _ADAPTER.translate_thinking_to_reasoning(
+            {"type": "enabled", "budget_tokens": 500},
+            output_config={"effort": "high"},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
+        )
+        assert result == {"effort": "high", "summary": "detailed"}
+
+    def test_output_config_effort_clamps_max_to_high(self):
+        result = _ADAPTER.translate_thinking_to_reasoning(
+            {"type": "adaptive"},
+            output_config={"effort": "max"},
+            model="gpt-5.4",
+            custom_llm_provider="openai",
+        )
+        assert result == {"effort": "high", "summary": "detailed"}
+
+    def test_output_config_effort_without_thinking_maps_reasoning_without_summary(self):
+        result = _ADAPTER.translate_thinking_to_reasoning(
+            None,
+            output_config={"effort": "medium"},
+        )
+        assert result == {"effort": "medium"}
+
+    def test_summary_omitted_for_models_without_reasoning_summary_support(self):
+        result = _ADAPTER.translate_thinking_to_reasoning(
+            {"type": "adaptive"},
+            output_config={"effort": "high"},
+            model="gpt-5.3-codex-spark",
+            custom_llm_provider="chatgpt",
+        )
+        assert result == {"effort": "high"}
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +890,37 @@ class TestTranslateRequestBroaderCoverage:
         assert len(kwargs["tools"]) == 1
         assert kwargs["tools"][0]["name"] == "calculator"
 
+    def test_mcp_servers_and_toolset_translated(self):
+        req = _make_request(
+            mcp_servers=[
+                {
+                    "type": "url",
+                    "url": "https://docs.example.com/sse",
+                    "name": "docs-mcp",
+                    "authorization_token": "secret-token",
+                }
+            ],
+            tools=[
+                {
+                    "type": "mcp_toolset",
+                    "mcp_server_name": "docs-mcp",
+                    "default_config": {"enabled": False},
+                    "configs": {"search_docs": {"enabled": True}},
+                }
+            ],
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["tools"] == [
+            {
+                "type": "mcp",
+                "server_label": "docs-mcp",
+                "server_url": "https://docs.example.com/sse",
+                "authorization": "secret-token",
+                "allowed_tools": ["search_docs"],
+                "require_approval": "never",
+            }
+        ]
+
     def test_tool_choice_translated(self):
         req = _make_request(
             tools=[{"name": "do_thing"}],
@@ -729,10 +929,62 @@ class TestTranslateRequestBroaderCoverage:
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["tool_choice"] == {"type": "function", "name": "do_thing"}
 
-    def test_thinking_translated_to_reasoning(self):
-        req = _make_request(thinking={"type": "enabled", "budget_tokens": 12000})
+    def test_tool_choice_none_preserved(self):
+        req = _make_request(
+            tools=[{"name": "do_thing"}],
+            tool_choice={"type": "none"},
+        )
         kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["tool_choice"] == "none"
+
+    def test_tool_choice_none_without_tools_is_omitted(self):
+        req = _make_request(tool_choice={"type": "none"})
+        kwargs = _ADAPTER.translate_request(req)
+        assert "tool_choice" not in kwargs
+
+    def test_disable_parallel_tool_use_sets_parallel_tool_calls_false(self):
+        req = _make_request(
+            tools=[{"name": "do_thing"}],
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["parallel_tool_calls"] is False
+
+    def test_disable_parallel_tool_use_not_set_for_built_in_tools(self):
+        req = _make_request(
+            tools=[{"name": "web_search", "type": "web_search_20250305"}],
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert "parallel_tool_calls" not in kwargs
+
+    def test_thinking_translated_to_reasoning(self):
+        req = _make_request(model="gpt-5.4", thinking={"type": "enabled", "budget_tokens": 12000})
+        kwargs = _ADAPTER.translate_request(req, custom_llm_provider="openai")
         assert kwargs["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+    def test_adaptive_thinking_uses_output_config_effort(self):
+        req = _make_request(
+            model="gpt-5.4",
+            thinking={"type": "adaptive"},
+            output_config={"effort": "max"},
+        )
+        kwargs = _ADAPTER.translate_request(req, custom_llm_provider="openai")
+        assert kwargs["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+    def test_adaptive_thinking_omits_summary_for_chatgpt_spark(self):
+        req = _make_request(
+            model="gpt-5.3-codex-spark",
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high"},
+        )
+        kwargs = _ADAPTER.translate_request(req, custom_llm_provider="chatgpt")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_output_config_effort_without_thinking_still_maps_reasoning(self):
+        req = _make_request(output_config={"effort": "medium"})
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["reasoning"] == {"effort": "medium"}
 
     def test_disabled_thinking_not_included_in_kwargs(self):
         req = _make_request(thinking={"type": "disabled"})
@@ -754,7 +1006,8 @@ class TestTranslateRequestBroaderCoverage:
         req = _make_request()
         kwargs = _ADAPTER.translate_request(req)
         for key in ("instructions", "temperature", "top_p", "tools", "tool_choice",
-                    "reasoning", "text", "context_management", "user"):
+                    "reasoning", "text", "context_management", "user",
+                    "parallel_tool_calls"):
             assert key not in kwargs, f"unexpected key: {key}"
 
 
@@ -802,7 +1055,7 @@ def _make_output_message(texts: List[str]) -> MagicMock:
 
 
 def _make_function_call_item(
-    call_id: str, name: str, arguments: str
+    call_id: str, name: str, arguments: Any
 ) -> MagicMock:
     """Build a mock ResponseFunctionToolCall."""
     from openai.types.responses import ResponseFunctionToolCall  # type: ignore[import]
@@ -947,6 +1200,33 @@ class TestTranslateResponse:
         result: Any = _ADAPTER.translate_response(response)
         assert result["content"][0]["input"] == {}
 
+    def test_function_call_with_dict_arguments_preserved(self):
+        """Dict-shaped function_call arguments remain intact."""
+        fc = _make_function_call_item(
+            "call_dict_args",
+            "Bash",
+            {"command": "pwd", "description": "show cwd"},
+        )
+        response = _make_mock_response(output=[fc])
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"][0]["input"] == {
+            "command": "pwd",
+            "description": "show cwd",
+        }
+
+    def test_dict_function_call_item_with_dict_arguments(self):
+        """Dict-shaped function_call arguments can already be parsed objects."""
+        output_item = {
+            "type": "function_call",
+            "call_id": "call_dict_2",
+            "name": "Bash",
+            "arguments": {"command": "git status"},
+        }
+        response = _make_mock_response(output=[output_item])
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"][0]["input"] == {"command": "git status"}
+        assert result["stop_reason"] == "tool_use"
+
     def test_dict_output_message_item(self):
         """Dict-shaped output message (type=message) is also handled."""
         output_item = {
@@ -972,6 +1252,43 @@ class TestTranslateResponse:
         assert result["content"][0]["name"] == "search"
         assert result["content"][0]["input"] == {"query": "cats"}
         assert result["stop_reason"] == "tool_use"
+
+    def test_dict_mcp_call_item(self):
+        output_item = {
+            "type": "mcp_call",
+            "id": "mcp_123",
+            "name": "search_docs",
+            "server_label": "docs-mcp",
+            "arguments": '{"query":"adapter"}',
+            "output": "Found adapter docs",
+            "error": None,
+        }
+        response = _make_mock_response(output=[output_item])
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["stop_reason"] == "end_turn"
+        assert result["content"][0] == {
+            "type": "mcp_tool_use",
+            "id": "mcp_123",
+            "name": "search_docs",
+            "server_name": "docs-mcp",
+            "input": {"query": "adapter"},
+        }
+        assert result["content"][1] == {
+            "type": "mcp_tool_result",
+            "tool_use_id": "mcp_123",
+            "is_error": False,
+            "content": [{"type": "text", "text": "Found adapter docs"}],
+        }
+
+    def test_mcp_list_tools_item_is_ignored(self):
+        output_item = {
+            "type": "mcp_list_tools",
+            "server_label": "docs-mcp",
+            "tools": [{"name": "search_docs"}],
+        }
+        response = _make_mock_response(output=[output_item])
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"] == []
 
     def test_mixed_reasoning_text_and_tool_use(self):
         """Reasoning + text + tool_use in one response all convert correctly."""
