@@ -112,6 +112,13 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - Dynamic context hard gate: `claude_adapter_ctx_marker`
     - validates the canonical `:#port-allocation.ctx#:` stored-procedure
       rewrite path on `:4001`
+    - dispatched child-agent prompts also resolve single-backticked topics like
+      `` `port-allocation` `` and bare uppercase acronyms like `API` through the
+      same tristore path; misses stay silent and inline text remains unchanged
+    - the CommonMark formatting sentence in the general Claude system prompt now
+      gets rewritten with a tenant/agent-scoped technical-identifier list from
+      `ag_catalog.raw_content`; the raw query is temporary and will move to a
+      stored procedure later
   - Gemini fanout hard gate: `claude_adapter_gemini_fanout`
     - isolates the exact multi-Gemini subagent dispatch path on `:4001`
     - use it before re-running the full adapter suite when Gemini fanout is the suspected regression
