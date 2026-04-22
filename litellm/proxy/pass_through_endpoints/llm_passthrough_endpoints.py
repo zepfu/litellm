@@ -2440,7 +2440,7 @@ async def _perform_openrouter_adapter_pass_through_request(
         try:
             result = await pass_through_request(
                 **kwargs,
-                retryable_upstream_status_codes=[429],
+                retryable_upstream_status_codes=[429, 500, 502, 503, 504],
             )
             _clear_openrouter_adapter_failure_circuit(adapter_model)
             return result
