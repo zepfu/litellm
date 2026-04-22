@@ -128,6 +128,9 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
     - warning-only semantics include subprocess timeouts; those should surface
       as harness warnings / `soft_failures`, not hard suite failures
+    - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` are
+      no longer part of the default full suite; run them only by explicit
+      `--cases` selection when you want Gemma-specific coverage
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
 - Current upstream-rate-limited / unstable OpenRouter candidates:
   - `openrouter/free` (moving router)
