@@ -959,30 +959,39 @@ def _build_usage_object_from_metadata(metadata: Dict[str, Any]) -> Optional[Dict
     return reconstructed or None
 
 
+def _coerce_usage_object_to_dict(usage_obj: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(usage_obj, dict):
+        return dict(usage_obj)
 
-def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
-    usage_obj = _maybe_get(result, "usage")
-    if usage_obj is not None:
-        return usage_obj
+    model_dump = getattr(usage_obj, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(exclude_none=True)
+        except TypeError:
+            dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dumped
 
-    completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
-        _maybe_get(result, "response")
-    )
-    if isinstance(completed_payload, dict):
-        usage_obj = _maybe_get(completed_payload.get("response"), "usage")
-        if usage_obj is not None:
-            return usage_obj
+    dict_method = getattr(usage_obj, "dict", None)
+    if callable(dict_method):
+        try:
+            dumped = dict_method(exclude_none=True)
+        except TypeError:
+            dumped = dict_method()
+        if isinstance(dumped, dict):
+            return dumped
 
+    return None
+
+
+def _extract_metadata_usage_object(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     standard_logging_object = kwargs.get("standard_logging_object")
     if isinstance(standard_logging_object, dict):
-        response = standard_logging_object.get("response")
-        if isinstance(response, dict) and response.get("usage") is not None:
-            return response["usage"]
-
         metadata = standard_logging_object.get("metadata")
         if isinstance(metadata, dict):
-            if metadata.get("usage_object") is not None:
-                return metadata["usage_object"]
+            usage_object = metadata.get("usage_object")
+            if isinstance(usage_object, dict) and usage_object:
+                return dict(usage_object)
             reconstructed_usage = _build_usage_object_from_metadata(metadata)
             if reconstructed_usage is not None:
                 return reconstructed_usage
@@ -991,11 +1000,64 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
     if isinstance(litellm_params, dict):
         metadata = litellm_params.get("metadata")
         if isinstance(metadata, dict):
-            if metadata.get("usage_object") is not None:
-                return metadata["usage_object"]
+            usage_object = metadata.get("usage_object")
+            if isinstance(usage_object, dict) and usage_object:
+                return dict(usage_object)
             reconstructed_usage = _build_usage_object_from_metadata(metadata)
             if reconstructed_usage is not None:
                 return reconstructed_usage
+
+    return None
+
+
+def _merge_usage_object_with_metadata(
+    usage_obj: Any,
+    metadata_usage_object: Optional[Dict[str, Any]],
+) -> Any:
+    if metadata_usage_object is None:
+        return usage_obj
+
+    usage_dict = _coerce_usage_object_to_dict(usage_obj)
+    if usage_dict is None:
+        return metadata_usage_object
+
+    merged_usage = dict(usage_dict)
+    for key, value in metadata_usage_object.items():
+        if key not in merged_usage or merged_usage.get(key) in (None, {}, []):
+            merged_usage[key] = value
+
+    return merged_usage
+
+
+
+def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
+    usage_obj = _maybe_get(result, "usage")
+    metadata_usage_object = _extract_metadata_usage_object(kwargs)
+    if usage_obj is not None:
+        return _merge_usage_object_with_metadata(usage_obj, metadata_usage_object)
+
+    completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+        _maybe_get(result, "response")
+    )
+    if isinstance(completed_payload, dict):
+        usage_obj = _maybe_get(completed_payload.get("response"), "usage")
+        if usage_obj is not None:
+            return _merge_usage_object_with_metadata(
+                usage_obj,
+                metadata_usage_object,
+            )
+
+    standard_logging_object = kwargs.get("standard_logging_object")
+    if isinstance(standard_logging_object, dict):
+        response = standard_logging_object.get("response")
+        if isinstance(response, dict) and response.get("usage") is not None:
+            return _merge_usage_object_with_metadata(
+                response["usage"],
+                metadata_usage_object,
+            )
+
+    if metadata_usage_object is not None:
+        return metadata_usage_object
 
     if isinstance(standard_logging_object, dict):
         completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
@@ -1004,7 +1066,10 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
         if isinstance(completed_payload, dict):
             usage_obj = _maybe_get(completed_payload.get("response"), "usage")
             if usage_obj is not None:
-                return usage_obj
+                return _merge_usage_object_with_metadata(
+                    usage_obj,
+                    metadata_usage_object,
+                )
 
     return None
 
@@ -1079,7 +1144,7 @@ def _extract_cache_creation_input_tokens(usage_obj: Any) -> int:
 
 def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
     completion_tokens_details = _extract_completion_tokens_details(usage_obj)
-    return _first_non_none(
+    explicit_reasoning_tokens = _first_non_none(
         _safe_int(_maybe_get(usage_obj, "reasoning_tokens")),
         _safe_int(_maybe_get(usage_obj, "reasoningTokens")),
         _safe_int(_maybe_get(usage_obj, "reasoning_token_count")),
@@ -1087,6 +1152,83 @@ def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
         _safe_int(_maybe_get(completion_tokens_details, "reasoning_tokens")),
         _safe_int(_maybe_get(completion_tokens_details, "reasoningTokens")),
     )
+    if explicit_reasoning_tokens is not None and explicit_reasoning_tokens > 0:
+        return explicit_reasoning_tokens
+
+    modality_reasoning_counts: list[int] = []
+    for details in (
+        completion_tokens_details,
+        _maybe_get(usage_obj, "responseTokensDetails"),
+        _maybe_get(usage_obj, "candidatesTokensDetails"),
+    ):
+        if not isinstance(details, list):
+            continue
+        detail_reasoning_tokens = 0
+        has_reasoning_detail = False
+        for detail in details:
+            modality = _maybe_get(detail, "modality")
+            if not isinstance(modality, str):
+                continue
+            if modality.upper() not in {"THOUGHT", "REASONING"}:
+                continue
+            token_count = _safe_int(_maybe_get(detail, "tokenCount"))
+            if token_count is None or token_count <= 0:
+                continue
+            detail_reasoning_tokens += token_count
+            has_reasoning_detail = True
+        if has_reasoning_detail:
+            modality_reasoning_counts.append(detail_reasoning_tokens)
+
+    if modality_reasoning_counts:
+        return max(modality_reasoning_counts)
+
+    return None
+
+
+def _fallback_gemini_reasoning_tokens_from_signatures(
+    metadata: Dict[str, Any], message: Any = None
+) -> Optional[int]:
+    signature_count = _safe_int(metadata.get("gemini_thought_signature_count"))
+    if signature_count is not None and signature_count > 0:
+        return signature_count
+
+    provider_specific_fields = (
+        _extract_provider_specific_fields(message) if message is not None else {}
+    )
+    thought_signatures = provider_specific_fields.get("thought_signatures")
+    if isinstance(thought_signatures, list):
+        non_empty_signatures = [
+            signature
+            for signature in thought_signatures
+            if isinstance(signature, str) and signature.strip()
+        ]
+        if non_empty_signatures:
+            return len(non_empty_signatures)
+
+    if metadata.get("gemini_thought_signature_present") is True:
+        return 1
+    if metadata.get("thinking_signature_present") is True:
+        return 1
+
+    return None
+
+
+def _determine_reasoning_tokens_source(
+    *,
+    provider_reported_reasoning_tokens: Optional[int],
+    reported_reasoning_tokens: Optional[int],
+    estimated_reasoning_tokens: Optional[int],
+    reasoning_present: bool,
+) -> str:
+    if provider_reported_reasoning_tokens is not None and reported_reasoning_tokens is not None:
+        return "provider_reported"
+    if reported_reasoning_tokens is not None:
+        return "provider_signature_present"
+    if estimated_reasoning_tokens is not None:
+        return "estimated_from_reasoning_text"
+    if reasoning_present:
+        return "not_available"
+    return "not_applicable"
 
 
 def _estimate_reasoning_tokens(model: str, reasoning_text: str) -> Optional[int]:
@@ -1371,31 +1513,89 @@ def _extract_tool_activity_from_message(message: Any) -> List[Dict[str, Any]]:
 
     return activity
 
-def _extract_response_output_tool_activity(result: Any) -> List[Dict[str, Any]]:
-    output_items = result if isinstance(result, list) else _maybe_get(result, "output")
-    if not isinstance(output_items, list):
-        output_items = _maybe_get_path(result, "_hidden_params", "responses_output")
-    if not isinstance(output_items, list):
+_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES: Dict[str, str] = {
+    "apply_patch_call": "apply_patch",
+    "custom_tool_call": "custom_tool_call",
+    "computer_call": "computer_call",
+    "local_shell_call": "local_shell_call",
+    "mcp_call": "mcp_call",
+    "web_search_call": "web_search_call",
+    "file_search_call": "file_search_call",
+    "image_generation_call": "image_generation_call",
+}
+_RESPONSE_OUTPUT_TOOL_ITEM_TYPES = set(_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES) | {
+    "function_call"
+}
+
+
+def _extract_response_output_items(
+    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
+) -> List[Any]:
+    candidate_sources: List[Any] = [result]
+    if isinstance(standard_logging_object, dict):
+        candidate_sources.append(standard_logging_object.get("response"))
+
+    for source in candidate_sources:
+        if isinstance(source, list):
+            return source
+
+        output_items = _maybe_get(source, "output")
+        if isinstance(output_items, list):
+            return output_items
+
+        output_items = _maybe_get_path(source, "_hidden_params", "responses_output")
+        if isinstance(output_items, list):
+            return output_items
+
+        completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+            _maybe_get(source, "response")
+        )
+        if isinstance(completed_payload, dict):
+            output_items = _maybe_get(_maybe_get(completed_payload, "response"), "output")
+            if isinstance(output_items, list):
+                return output_items
+
+    return []
+
+
+def _resolve_response_output_tool_name(item: Any) -> Optional[str]:
+    tool_name = _maybe_get(item, "name")
+    if isinstance(tool_name, str) and tool_name.strip():
+        return tool_name.strip()
+
+    item_type = _maybe_get(item, "type")
+    if not isinstance(item_type, str) or not item_type.strip():
+        return None
+
+    fallback_name = _RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES.get(item_type)
+    if isinstance(fallback_name, str) and fallback_name.strip():
+        return fallback_name.strip()
+
+    return None
+
+
+def _extract_response_output_tool_activity(
+    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    output_items = _extract_response_output_items(result, standard_logging_object)
+    if not output_items:
         return []
 
     activity: List[Dict[str, Any]] = []
     for index, item in enumerate(output_items):
         item_type = _maybe_get(item, "type")
-        if item_type not in {"function_call", "apply_patch_call"}:
+        if item_type not in _RESPONSE_OUTPUT_TOOL_ITEM_TYPES:
             continue
-        tool_name = _maybe_get(item, "name")
-        if not isinstance(tool_name, str) or not tool_name.strip():
-            if item_type == "apply_patch_call":
-                tool_name = "apply_patch"
+        tool_name = _resolve_response_output_tool_name(item)
         if not isinstance(tool_name, str) or not tool_name.strip():
             continue
         arguments = _maybe_get(item, "arguments")
-        if arguments is None and item_type == "apply_patch_call":
+        if arguments is None and item_type in {"apply_patch_call", "custom_tool_call"}:
             arguments = _maybe_get(item, "patch") or _maybe_get(item, "input")
         activity.append(
             _build_tool_activity_entry(
                 tool_index=index,
-                tool_name=tool_name.strip(),
+                tool_name=tool_name,
                 arguments=arguments,
                 tool_call_id=_maybe_get(item, "call_id") or _maybe_get(item, "id"),
                 source="responses.output",
@@ -1489,24 +1689,21 @@ def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
     return current
 
 
-def _extract_response_output_tool_call_info(result: Any) -> Tuple[int, List[str]]:
-    output_items = result if isinstance(result, list) else _maybe_get(result, "output")
-    if not isinstance(output_items, list):
-        output_items = _maybe_get_path(result, "_hidden_params", "responses_output")
-    if not isinstance(output_items, list):
+def _extract_response_output_tool_call_info(
+    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
+) -> Tuple[int, List[str]]:
+    output_items = _extract_response_output_items(result, standard_logging_object)
+    if not output_items:
         return 0, []
 
     tool_call_count = 0
     tool_names: List[str] = []
     for item in output_items:
         item_type = _maybe_get(item, "type")
-        if item_type not in {"function_call", "apply_patch_call"}:
+        if item_type not in _RESPONSE_OUTPUT_TOOL_ITEM_TYPES:
             continue
         tool_call_count += 1
-        tool_name = _maybe_get(item, "name")
-        if not isinstance(tool_name, str) or not tool_name.strip():
-            if item_type == "apply_patch_call":
-                tool_name = "apply_patch"
+        tool_name = _resolve_response_output_tool_name(item)
         if isinstance(tool_name, str) and tool_name.strip():
             tool_names.append(tool_name)
 
@@ -1611,13 +1808,27 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
         return
 
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
+    reasoning_tokens_source: Optional[str] = None
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
 
     message = _extract_first_response_message(result)
+    if reported_reasoning_tokens is not None:
+        reasoning_tokens_source = "provider_reported"
+    elif provider_prefix == "gemini":
+        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
+            metadata,
+            message,
+        )
+        if reported_reasoning_tokens is not None:
+            reasoning_tokens_source = "provider_signature_present"
+
     tool_call_count, tool_names = _extract_tool_call_info(message)
     if tool_call_count == 0:
-        tool_call_count, tool_names = _extract_response_output_tool_call_info(result)
+        tool_call_count, tool_names = _extract_response_output_tool_call_info(
+            result,
+            kwargs.get("standard_logging_object"),
+        )
 
     metadata["usage_cache_read_input_tokens"] = cache_read_input_tokens
     metadata["usage_cache_creation_input_tokens"] = cache_creation_input_tokens
@@ -1632,7 +1843,9 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
 
     if reported_reasoning_tokens is not None:
         metadata["usage_reasoning_tokens_reported"] = reported_reasoning_tokens
-        metadata["usage_reasoning_tokens_source"] = "provider_reported"
+        metadata["usage_reasoning_tokens_source"] = (
+            reasoning_tokens_source or "provider_reported"
+        )
         metadata[f"{provider_prefix}_reasoning_tokens_reported"] = (
             reported_reasoning_tokens
         )
@@ -1662,6 +1875,7 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
         name=f"{provider_prefix}.usage_breakout",
         span_metadata={
             "reported_reasoning_tokens": reported_reasoning_tokens,
+            "reported_reasoning_tokens_source": reasoning_tokens_source,
             "cache_read_input_tokens": cache_read_input_tokens,
             "cache_creation_input_tokens": cache_creation_input_tokens,
             "tool_call_count": tool_call_count,
@@ -2235,9 +2449,16 @@ def _build_session_history_record_from_langfuse_trace_observation(
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_object)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_object)
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_object)
+    provider_reported_reasoning_tokens = reported_reasoning_tokens
+    provider = _infer_provider_from_langfuse_observation(observation, metadata)
 
     output_payload = observation.get("output")
     message = _extract_first_langfuse_response_message(output_payload)
+    if reported_reasoning_tokens is None and provider == "gemini":
+        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
+            metadata,
+            message,
+        )
     thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
     reasoning_text = (
         _extract_reasoning_content(message, thinking_blocks)
@@ -2252,19 +2473,17 @@ def _build_session_history_record_from_langfuse_trace_observation(
         or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
     )
     estimated_reasoning_tokens = None
-    reasoning_tokens_source: Optional[str] = None
-    if reported_reasoning_tokens is not None:
-        reasoning_tokens_source = "provider_reported"
-    elif reasoning_present:
+    if reported_reasoning_tokens is None and reasoning_present:
         estimated_reasoning_tokens = _estimate_reasoning_tokens(
             model=str(observation.get("model") or ""),
             reasoning_text=reasoning_text,
         )
-        reasoning_tokens_source = (
-            "estimated_from_reasoning_text"
-            if estimated_reasoning_tokens is not None
-            else "not_available"
-        )
+    reasoning_tokens_source = _determine_reasoning_tokens_source(
+        provider_reported_reasoning_tokens=provider_reported_reasoning_tokens,
+        reported_reasoning_tokens=reported_reasoning_tokens,
+        estimated_reasoning_tokens=estimated_reasoning_tokens,
+        reasoning_present=reasoning_present,
+    )
 
     tool_call_count, tool_names = _extract_tool_call_info(message)
     tool_activity = _extract_tool_activity_from_message(message) if message is not None else []
@@ -2306,7 +2525,6 @@ def _build_session_history_record_from_langfuse_trace_observation(
         observation,
     )
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
-    provider = _infer_provider_from_langfuse_observation(observation, metadata)
 
     history_metadata = _build_session_history_metadata(
         metadata=metadata,
@@ -2483,8 +2701,15 @@ def _build_session_history_record(
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
+    provider_reported_reasoning_tokens = reported_reasoning_tokens
+    provider_prefix = _infer_usage_breakout_provider_prefix(kwargs, metadata)
 
     message = _extract_first_response_message(result)
+    if reported_reasoning_tokens is None and provider_prefix == "gemini":
+        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
+            metadata,
+            message,
+        )
     thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
     reasoning_text = (
         _extract_reasoning_content(message, thinking_blocks)
@@ -2499,30 +2724,32 @@ def _build_session_history_record(
         or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
     )
     estimated_reasoning_tokens = None
-    reasoning_tokens_source: Optional[str] = None
-    if reported_reasoning_tokens is not None:
-        reasoning_tokens_source = "provider_reported"
-    elif reasoning_present:
+    if reported_reasoning_tokens is None and reasoning_present:
         estimated_reasoning_tokens = _estimate_reasoning_tokens(
             model=resolved_model,
             reasoning_text=reasoning_text,
         )
-        reasoning_tokens_source = (
-            "estimated_from_reasoning_text"
-            if estimated_reasoning_tokens is not None
-            else "not_available"
-        )
+    reasoning_tokens_source = _determine_reasoning_tokens_source(
+        provider_reported_reasoning_tokens=provider_reported_reasoning_tokens,
+        reported_reasoning_tokens=reported_reasoning_tokens,
+        estimated_reasoning_tokens=estimated_reasoning_tokens,
+        reasoning_present=reasoning_present,
+    )
 
     tool_call_count, tool_names = _extract_tool_call_info(message)
     tool_activity = _extract_tool_activity_from_message(message) if message is not None else []
     if tool_call_count == 0:
         output_tool_call_count, output_tool_names = _extract_response_output_tool_call_info(
-            result
+            result,
+            standard_logging_object,
         )
         if output_tool_call_count > 0:
             tool_call_count, tool_names = output_tool_call_count, output_tool_names
     if not tool_activity:
-        tool_activity = _extract_response_output_tool_activity(result)
+        tool_activity = _extract_response_output_tool_activity(
+            result,
+            standard_logging_object,
+        )
     tool_activity_summary = _summarize_tool_activity(tool_activity)
     agent_name, tenant_id = _extract_agent_context(kwargs)
 

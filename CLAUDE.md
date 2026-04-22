@@ -104,10 +104,21 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - `scripts/local-ci/anthropic_adapter_config.json`
 - Current real-Claude adapted baseline on `:4001`:
   - OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`
+  - Codex/OpenAI tool-activity hard gate: `claude_adapter_codex_tool_activity`
+    - validates the reconstructed `response.output_item.*` /
+      `response.function_call_arguments.*` stream path
+    - must persist a `Bash` / `pwd` row into
+      `public.session_history_tool_activity`
+  - Dynamic context hard gate: `claude_adapter_ctx_marker`
+    - validates the canonical `:#port-allocation.ctx#:` stored-procedure
+      rewrite path on `:4001`
   - Gemini fanout hard gate: `claude_adapter_gemini_fanout`
     - isolates the exact multi-Gemini subagent dispatch path on `:4001`
     - use it before re-running the full adapter suite when Gemini fanout is the suspected regression
     - the full suite runs this before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not polluted by the mixed fanout's short-window upstream pressure
+    - stable tool-activity invariant: expect session-wide delegated `Agent`
+      rows plus at least one Gemini command tool row; do not assume every
+      Gemini child model will emit its own command row on every run
   - Google Code Assist canaries: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
     - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist
     - keep this warning-only in the harness because upstream quota windows produce real `429` responses
@@ -142,6 +153,9 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/inclusionai/ling-2.6-flash:free`, `openrouter/google/gemma-4-31b-it:free`
   - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
   This keeps brief transient recovery local while preventing repeated manual retests from re-burning ~40 seconds on the same throttled backend.
+- Anthropic fanout prompts should still use the Claude agent `name:` values from
+  `~/.claude/agents` such as `gemini-3-flash-preview` and `gpt-5-4`. The
+  provider-prefixed routing lives in the agent file `model:` value.
 - `ling-2-6-flash` now validates on the generic OpenRouter `Responses` lane, so its Langfuse / `session_history` shaping should match the other free-model response adapters.
 
 ### Runtime performance knobs

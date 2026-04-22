@@ -66,7 +66,6 @@ from litellm.integrations.aawm_agent_identity import (
     _derive_request_tags_from_langfuse_metadata,
     _derive_langfuse_trace_tags_from_spend_log_row,
     _ensure_session_history_schema,
-    _get_aawm_session_history_pool,
     _persist_session_history_records,
     _safe_int,
 )
@@ -78,6 +77,7 @@ _LANGFUSE_DB_ENV_VARS = ("LANGFUSE_DATABASE_URL", "AAWM_LANGFUSE_DATABASE_URL")
 _CLICKHOUSE_URL_ENV_VARS = ("CLICKHOUSE_URL", "LANGFUSE_CLICKHOUSE_URL")
 _CLICKHOUSE_USER_ENV_VARS = ("CLICKHOUSE_USER", "LANGFUSE_CLICKHOUSE_USER")
 _CLICKHOUSE_PASSWORD_ENV_VARS = ("CLICKHOUSE_PASSWORD", "LANGFUSE_CLICKHOUSE_PASSWORD")
+_SESSION_HISTORY_POOL: Optional[asyncpg.Pool] = None
 
 
 def _clean_secret(value: Optional[str]) -> Optional[str]:
@@ -220,6 +220,30 @@ def _build_source_where(args: argparse.Namespace) -> Dict[str, Any]:
     return where
 
 
+async def _get_session_history_pool() -> asyncpg.Pool:
+    global _SESSION_HISTORY_POOL
+
+    if _SESSION_HISTORY_POOL is not None:
+        return _SESSION_HISTORY_POOL
+
+    dsn = _build_aawm_dsn()
+    if not dsn:
+        raise RuntimeError("AAWM/tristore database configuration is missing")
+
+    _SESSION_HISTORY_POOL = await asyncpg.create_pool(
+        dsn=dsn,
+        min_size=1,
+        max_size=4,
+        command_timeout=30,
+    )
+    return _SESSION_HISTORY_POOL
+
+
+async def _ensure_session_history_schema_with_pool(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await _ensure_session_history_schema(conn)
+
+
 async def _iter_spend_logs(
     prisma_client: PrismaClient,
     *,
@@ -257,8 +281,8 @@ async def _get_existing_call_ids(call_ids: Sequence[str]) -> Set[str]:
     if not call_ids:
         return set()
 
-    pool = await _get_aawm_session_history_pool()
-    await _ensure_session_history_schema(pool)
+    pool = await _get_session_history_pool()
+    await _ensure_session_history_schema_with_pool(pool)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT litellm_call_id FROM public.session_history WHERE litellm_call_id = ANY($1::text[])",
@@ -1008,8 +1032,8 @@ async def _run_spend_log_backfill(
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
-        pool = await _get_aawm_session_history_pool()
-        await _ensure_session_history_schema(pool)
+        pool = await _get_session_history_pool()
+        await _ensure_session_history_schema_with_pool(pool)
     else:
         target_dsn = target_dsn or "unresolved"
 
@@ -1131,8 +1155,8 @@ async def _run_langfuse_trace_backfill(
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
-        pool = await _get_aawm_session_history_pool()
-        await _ensure_session_history_schema(pool)
+        pool = await _get_session_history_pool()
+        await _ensure_session_history_schema_with_pool(pool)
     else:
         target_dsn = target_dsn or "unresolved"
 
@@ -1343,8 +1367,8 @@ async def _run_langfuse_db_backfill(
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
-        pool = await _get_aawm_session_history_pool()
-        await _ensure_session_history_schema(pool)
+        pool = await _get_session_history_pool()
+        await _ensure_session_history_schema_with_pool(pool)
     else:
         target_dsn = target_dsn or "unresolved"
 
@@ -1506,8 +1530,8 @@ async def _run_langfuse_clickhouse_backfill(
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
-        pool = await _get_aawm_session_history_pool()
-        await _ensure_session_history_schema(pool)
+        pool = await _get_session_history_pool()
+        await _ensure_session_history_schema_with_pool(pool)
     else:
         target_dsn = target_dsn or "unresolved"
 
@@ -1661,7 +1685,7 @@ async def _run_langfuse_clickhouse_backfill(
 async def _load_trace_tag_candidates_from_session_history(
     args: argparse.Namespace,
 ) -> Dict[str, Set[str]]:
-    pool = await _get_aawm_session_history_pool()
+    pool = await _get_session_history_pool()
     where_clauses = ["trace_id IS NOT NULL"]
     params: List[Any] = []
 
@@ -1763,9 +1787,7 @@ async def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
         args.source_mode in {"auto", "langfuse", "langfuse_clickhouse", "langfuse_db"}
         or (args.source_mode == "spendlogs")
     )
-    use_langfuse_http = bool(
-        args.source_mode == "langfuse" and not langfuse_database_url
-    ) or (
+    use_langfuse_http = bool(args.source_mode == "langfuse") or (
         args.source_mode == "auto"
         and not source_database_url
         and not langfuse_database_url

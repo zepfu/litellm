@@ -91,6 +91,66 @@ class GeminiPassthroughLoggingHandler:
         )
 
     @staticmethod
+    def _extract_usage_object_from_response_body(
+        response_body: Any,
+    ) -> Optional[Dict[str, Any]]:
+        unwrapped_response = GeminiPassthroughLoggingHandler._unwrap_code_assist_response_body(
+            response_body
+        )
+        if not isinstance(unwrapped_response, dict):
+            return None
+        usage_metadata = unwrapped_response.get("usageMetadata")
+        if not isinstance(usage_metadata, dict) or not usage_metadata:
+            return None
+        return dict(usage_metadata)
+
+    @staticmethod
+    def _extract_usage_object_from_stream_chunks(
+        all_chunks: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        usage_object: Optional[Dict[str, Any]] = None
+        for chunk in all_chunks:
+            parsed_chunk = GeminiPassthroughLoggingHandler._parse_stream_chunk_json(
+                chunk
+            )
+            if parsed_chunk is None:
+                continue
+            extracted_usage = GeminiPassthroughLoggingHandler._extract_usage_object_from_response_body(
+                parsed_chunk
+            )
+            if extracted_usage:
+                usage_object = extracted_usage
+        return usage_object
+
+    @staticmethod
+    def _store_usage_object_in_kwargs(
+        kwargs: dict,
+        usage_object: Optional[Dict[str, Any]],
+    ) -> dict:
+        if not isinstance(usage_object, dict) or not usage_object:
+            return kwargs
+
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+            kwargs["litellm_params"] = litellm_params
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            litellm_params["metadata"] = metadata
+        metadata["usage_object"] = dict(usage_object)
+
+        standard_logging_object = kwargs.get("standard_logging_object")
+        if isinstance(standard_logging_object, dict):
+            standard_logging_metadata = standard_logging_object.get("metadata")
+            if not isinstance(standard_logging_metadata, dict):
+                standard_logging_metadata = {}
+                standard_logging_object["metadata"] = standard_logging_metadata
+            standard_logging_metadata["usage_object"] = dict(usage_object)
+
+        return kwargs
+
+    @staticmethod
     def gemini_passthrough_handler(
         httpx_response: httpx.Response,
         response_body: dict,
@@ -178,6 +238,9 @@ class GeminiPassthroughLoggingHandler:
                 end_time=end_time,
                 logging_obj=logging_obj,
                 custom_llm_provider="gemini",
+                usage_object=GeminiPassthroughLoggingHandler._extract_usage_object_from_response_body(
+                    response_body
+                ),
             )
 
             return {
@@ -240,6 +303,9 @@ class GeminiPassthroughLoggingHandler:
             end_time=end_time,
             logging_obj=litellm_logging_obj,
             custom_llm_provider="gemini",
+            usage_object=GeminiPassthroughLoggingHandler._extract_usage_object_from_stream_chunks(
+                all_chunks
+            ),
         )
 
         return {
@@ -340,10 +406,15 @@ class GeminiPassthroughLoggingHandler:
         end_time: datetime,
         logging_obj: LiteLLMLoggingObj,
         custom_llm_provider: str,
+        usage_object: Optional[Dict[str, Any]] = None,
     ):
         """
         Create the standard logging object for Gemini passthrough generateContent (streaming and non-streaming)
         """
+        kwargs = GeminiPassthroughLoggingHandler._store_usage_object_in_kwargs(
+            kwargs,
+            usage_object,
+        )
 
         response_cost = litellm.completion_cost(
             completion_response=litellm_model_response,

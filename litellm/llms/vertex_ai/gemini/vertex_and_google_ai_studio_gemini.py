@@ -1642,10 +1642,15 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         if "responseTokensDetails" in usage_metadata:
             response_tokens_details = CompletionTokensDetailsWrapper()
             for detail in usage_metadata["responseTokensDetails"]:
-                if detail["modality"] == "TEXT":
-                    response_tokens_details.text_tokens = detail.get("tokenCount", 0)
-                elif detail["modality"] == "AUDIO":
-                    response_tokens_details.audio_tokens = detail.get("tokenCount", 0)
+                modality = detail.get("modality")
+                token_count = detail.get("tokenCount", 0)
+                if modality == "TEXT":
+                    response_tokens_details.text_tokens = token_count
+                elif modality == "AUDIO":
+                    response_tokens_details.audio_tokens = token_count
+                elif modality in {"THOUGHT", "REASONING"}:
+                    reasoning_tokens = token_count
+                    response_tokens_details.reasoning_tokens = token_count
 
         #########################################################
 
@@ -1664,6 +1669,9 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                     response_tokens_details.image_tokens = token_count
                 elif modality == "VIDEO":
                     response_tokens_details.video_tokens = token_count
+                elif modality in {"THOUGHT", "REASONING"}:
+                    reasoning_tokens = token_count
+                    response_tokens_details.reasoning_tokens = token_count
 
         # Calculate text_tokens if not explicitly provided in candidatesTokensDetails
         # candidatesTokenCount includes all modalities, so: text = total - (image + audio + video)
@@ -1675,11 +1683,15 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 completion_image_tokens = response_tokens_details.image_tokens or 0
                 completion_audio_tokens = response_tokens_details.audio_tokens or 0
                 completion_video_tokens = response_tokens_details.video_tokens or 0
+                completion_reasoning_tokens = (
+                    response_tokens_details.reasoning_tokens or 0
+                )
                 calculated_text_tokens = (
                     candidates_token_count
                     - completion_image_tokens
                     - completion_audio_tokens
                     - completion_video_tokens
+                    - completion_reasoning_tokens
                 )
                 response_tokens_details.text_tokens = calculated_text_tokens
         #########################################################

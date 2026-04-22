@@ -364,6 +364,48 @@ def test_build_session_history_record_uses_hidden_responses_output_for_tool_acti
     assert record["tool_activity"][0]["command_text"] == "pwd"
 
 
+def test_build_session_history_record_uses_standard_logging_response_output_for_tool_activity() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.3-codex-spark"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-standard-output"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-claude-code-session-id": "session-standard-output"}
+    }
+    kwargs["standard_logging_object"]["response"] = {
+        "output": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_ls",
+                "id": "call_ls",
+                "name": "Bash",
+                "input": {"command": "ls"},
+            }
+        ]
+    }
+
+    result = {
+        "id": "resp-standard-output",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "/tmp/worktree"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["tool_call_count"] == 1
+    assert record["tool_names"] == ["Bash"]
+    assert len(record["tool_activity"]) == 1
+    assert record["tool_activity"][0]["tool_name"] == "Bash"
+    assert record["tool_activity"][0]["command_text"] == "ls"
+
+
 def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -450,6 +492,94 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["metadata"]["cc_version"] == "2.1.112"
 
 
+def test_build_session_history_record_estimates_reasoning_when_provider_reports_zero() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-reasoning-zero"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-claude-reasoning-zero"
+
+    result = {
+        "id": "provider-response-reasoning-zero",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 30,
+            "total_tokens": 130,
+            "completion_tokens_details": {"reasoning_tokens": 0},
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Working.",
+                    "reasoning_content": "Need to inspect the current state before acting.",
+                    "thinking_blocks": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Need to inspect the current state before acting.",
+                            "signature": "EvMCCmwIDBgCKkAuqMZK8CbuNuz6LdJex7qr4ZB9T9OXQ6zOKvzTxK6SCYZUP3ageKCC1lr28wDIfpWyVJVPVGcFP+a5ScIJ6CsQMiJudW1iYXQtdjYtZWZmb3J0cy0yMC00MC04MC1hYi1wcm9kOAASDOBIjRsAoyR7Oe6UdhoMtmeDeP+RjpVIJjlYIjCq8O2tRhEP4C9HCx8SrqqE0v1cKQ6aiJBHzBOOdZZg92sNK/B/sL4ihlm+ptMA9NYqtAHTchkk3dthQhVBBayWWoOjP/IEZEhlzYHTdoTOzKkLUQNEeCmJQQst7E+ugv9gn+luB/SalmqboTM0FqmLYX8nWG5gMb8LI8ipTZwgLyYLoyvcg5NwaoWPqup1Wo4v85lJeoFam70xAyK7v2b1cDgNoYT+jVGRE4gUZy6W+ZOK7wxLdIkeObuEiAKjwKE6o8G6hfIB+AsW4mAOPymAOS8fm4JnYcz61kXO1MjvhtAqkjMNCPsYAQ==",
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["reasoning_tokens_reported"] is None
+    assert record["reasoning_tokens_estimated"] is not None
+    assert record["reasoning_tokens_estimated"] > 0
+    assert record["reasoning_tokens_source"] == "estimated_from_reasoning_text"
+    assert record["reasoning_present"] is True
+
+
+def test_build_session_history_record_sets_not_applicable_reasoning_source_when_absent() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-no-reasoning"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-no-reasoning"
+
+    result = {
+        "id": "provider-response-no-reasoning",
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 4,
+            "total_tokens": 16,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "plain output",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["reasoning_tokens_reported"] is None
+    assert record["reasoning_tokens_estimated"] is None
+    assert record["reasoning_present"] is False
+    assert record["reasoning_tokens_source"] == "not_applicable"
+
+
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="codex")
@@ -506,6 +636,119 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
         span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
     ]
     assert "codex.usage_breakout" in span_names
+
+
+def test_aawm_agent_identity_adds_codex_usage_breakout_tags_from_standard_logging_output() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.3-codex-spark"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
+        "codex_responses"
+    )
+    kwargs["standard_logging_object"]["response"] = {
+        "output": [
+            {
+                "type": "local_shell_call",
+                "call_id": "shell_123",
+                "id": "shell_123",
+                "input": {"command": "pwd"},
+            }
+        ]
+    }
+
+    result = {
+        "id": "resp-codex-usage-2",
+        "usage": {
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "total_tokens": 25,
+            "input_tokens_details": {"cached_tokens": 7},
+            "output_tokens_details": {"reasoning_tokens": 0, "text_tokens": 5},
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "/home/zepfu/projects/litellm",
+                }
+            }
+        ],
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result=result,
+        call_type="pass_through_endpoint",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+
+    assert metadata["usage_tool_call_count"] == 1
+    assert metadata["usage_tool_names"] == ["local_shell_call"]
+    assert metadata["codex_tool_call_count"] == 1
+    assert metadata["codex_tool_names"] == ["local_shell_call"]
+    assert "codex-tool-calls-present" in metadata["tags"]
+
+
+def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "google/gemini-3.1-flash"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
+        "gemini_generate_content"
+    )
+
+    result = {
+        "id": "resp-gemini-usage-1",
+        "usage": {
+            "prompt_tokens": 80,
+            "completion_tokens": 24,
+            "total_tokens": 104,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "gemini routed",
+                    "provider_specific_fields": {
+                        "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
+                    },
+                }
+            }
+        ],
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result=result,
+        call_type="pass_through_endpoint",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    request_tags = updated_kwargs["standard_logging_object"]["request_tags"]
+
+    assert metadata["usage_reasoning_tokens_reported"] == 1
+    assert metadata["usage_reasoning_tokens_source"] == "provider_signature_present"
+    assert metadata["gemini_reasoning_tokens_reported"] == 1
+    assert "gemini-usage-breakout" in metadata["tags"]
+    assert "gemini-reasoning-tokens-reported" in metadata["tags"]
+    assert "reasoning-tokens-reported" in request_tags
+    span_names = [
+        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
+    ]
+    assert "gemini.usage_breakout" in span_names
+    usage_span = next(
+        span
+        for span in metadata["langfuse_spans"]
+        if isinstance(span, dict) and span.get("name") == "gemini.usage_breakout"
+    )
+    assert usage_span["metadata"]["reported_reasoning_tokens"] == 1
+    assert (
+        usage_span["metadata"]["reported_reasoning_tokens_source"]
+        == "provider_signature_present"
+    )
 
 
 def test_build_session_history_record_skips_without_session_id() -> None:
@@ -1049,6 +1292,254 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_metad
     assert record["reasoning_tokens_source"] == "provider_reported"
     assert record["tool_call_count"] == 1
     assert record["tool_names"] == ["google_search"]
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_uses_gemini_thought_modality_details() -> None:
+    trace = {
+        "id": "trace-gemini-2",
+        "name": "gemini",
+        "sessionId": "session-gemini-2",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-gemini-2",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gemini-3-flash-preview",
+        "startTime": "2026-04-17T14:00:00Z",
+        "endTime": "2026-04-17T14:00:02Z",
+        "usage": {
+            "input": 20,
+            "output": 15,
+            "total": 35,
+        },
+        "costDetails": {"total": 0.002},
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "gemini flash result",
+                    }
+                }
+            ]
+        },
+        "metadata": {
+            "passthrough_route_family": "gemini_generate_content",
+            "usage_object": {
+                "prompt_tokens": 20,
+                "completion_tokens": 15,
+                "total_tokens": 35,
+                "candidatesTokensDetails": [
+                    {"modality": "THOUGHT", "tokenCount": 5},
+                    {"modality": "TEXT", "tokenCount": 10},
+                ],
+            },
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-gemini-2",
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["input_tokens"] == 20
+    assert record["output_tokens"] == 15
+    assert record["reasoning_tokens_reported"] == 5
+    assert record["reasoning_tokens_source"] == "provider_reported"
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_uses_gemini_signature_fallback() -> None:
+    trace = {
+        "id": "trace-gemini-3",
+        "name": "gemini",
+        "sessionId": "session-gemini-3",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-gemini-3",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "google/gemini-3.1-flash",
+        "startTime": "2026-04-17T14:00:00Z",
+        "endTime": "2026-04-17T14:00:02Z",
+        "usage": {
+            "input": 20,
+            "output": 15,
+            "total": 35,
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "gemini flash result",
+                        "provider_specific_fields": {
+                            "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
+                        },
+                    }
+                }
+            ]
+        },
+        "metadata": {
+            "passthrough_route_family": "gemini_generate_content",
+            "gemini_thought_signature_present": True,
+            "thinking_signature_present": True,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-gemini-3",
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["reasoning_tokens_reported"] == 1
+    assert record["reasoning_tokens_source"] == "provider_signature_present"
+    assert record["reasoning_present"] is True
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_sets_not_applicable_reasoning_source_when_absent() -> None:
+    trace = {
+        "id": "trace-no-reasoning",
+        "name": "gpt",
+        "sessionId": "session-no-reasoning",
+    }
+    observation = {
+        "id": "obs-no-reasoning",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.4",
+        "startTime": "2026-04-17T14:00:00Z",
+        "endTime": "2026-04-17T14:00:02Z",
+        "usage": {
+            "input": 20,
+            "output": 5,
+            "total": 25,
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "plain output",
+                    }
+                }
+            ]
+        },
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-no-reasoning",
+    )
+
+    assert record is not None
+    assert record["reasoning_tokens_reported"] is None
+    assert record["reasoning_tokens_estimated"] is None
+    assert record["reasoning_present"] is False
+    assert record["reasoning_tokens_source"] == "not_applicable"
+
+
+def test_build_session_history_record_prefers_metadata_usage_object_when_result_usage_is_sparse() -> None:
+    kwargs = _base_kwargs("gemini")
+    usage_object = {
+        "prompt_tokens": 20,
+        "completion_tokens": 15,
+        "total_tokens": 35,
+        "candidatesTokensDetails": [
+            {"modality": "THOUGHT", "tokenCount": 5},
+            {"modality": "TEXT", "tokenCount": 10},
+        ],
+    }
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-gemini-merge-1"
+    kwargs["litellm_params"]["metadata"]["usage_object"] = usage_object
+    kwargs["standard_logging_object"]["metadata"] = {"usage_object": usage_object}
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["model"] = "gemini-3-flash-preview"
+    result = {
+        "id": "provider-response-1",
+        "model": "gemini-3-flash-preview",
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 15,
+            "total_tokens": 35,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "gemini result",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-17T14:00:00Z",
+        end_time="2026-04-17T14:00:02Z",
+    )
+
+    assert record is not None
+    assert record["reasoning_tokens_reported"] == 5
+    assert record["reasoning_tokens_source"] == "provider_reported"
+
+
+def test_build_session_history_record_uses_gemini_signature_fallback_when_usage_sparse() -> None:
+    kwargs = _base_kwargs("gemini")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-gemini-signature-1",
+            "passthrough_route_family": "gemini_generate_content",
+            "gemini_thought_signature_present": True,
+            "thinking_signature_present": True,
+        }
+    )
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["model"] = "google/gemini-3.1-flash"
+    result = {
+        "id": "provider-response-gemini-signature-1",
+        "model": "google/gemini-3.1-flash",
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 15,
+            "total_tokens": 35,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "gemini result",
+                    "provider_specific_fields": {
+                        "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
+                    },
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-17T14:00:00Z",
+        end_time="2026-04-17T14:00:02Z",
+    )
+
+    assert record is not None
+    assert record["reasoning_tokens_reported"] == 1
+    assert record["reasoning_tokens_source"] == "provider_signature_present"
+    assert record["reasoning_present"] is True
 
 
 def test_derive_langfuse_trace_tags_from_langfuse_trace_merges_observation_metadata() -> None:
