@@ -161,6 +161,10 @@ Warning-only free-model canaries are still allowed to soft-fail on upstream
 timeouts or provider throttling. Those outcomes should remain warnings /
 `soft_failures` in the harness artifact rather than hard suite failures.
 
+`google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` stay in the
+config as opt-in canaries, but they are excluded from the default full suite
+and should only run when explicitly requested.
+
 Operational expectation:
 - adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may
   still appear as adapter warning/backoff lines in `litellm-dev` logs

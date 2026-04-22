@@ -802,7 +802,12 @@ def _write_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:
     path.write_text(json.dumps(artifact, indent=2) + '\n', encoding='utf-8')
 
 
-def _parse_selected_cases(raw: str | None, available: list[str]) -> list[str]:
+def _parse_selected_cases(
+    raw: str | None,
+    available: list[str],
+    *,
+    default_excluded_cases: list[str] | None = None,
+) -> list[str]:
     preferred_order = [
         'claude_adapter_gpt54',
         'claude_adapter_gpt54_mini',
@@ -812,10 +817,19 @@ def _parse_selected_cases(raw: str | None, available: list[str]) -> list[str]:
         'claude_adapter_peeromega_fanout',
     ]
     if not raw:
+        excluded = {
+            value
+            for value in (default_excluded_cases or [])
+            if isinstance(value, str) and value
+        }
+        default_available = [name for name in available if name not in excluded]
         priority = {name: index for index, name in enumerate(preferred_order)}
         return sorted(
-            available,
-            key=lambda name: (priority.get(name, len(preferred_order)), available.index(name)),
+            default_available,
+            key=lambda name: (
+                priority.get(name, len(preferred_order)),
+                available.index(name),
+            ),
         )
     requested = [value.strip() for value in raw.split(',') if value.strip()]
     invalid = [value for value in requested if value not in available]
@@ -849,7 +863,11 @@ def main() -> int:
 
     cases = config.get('cases') or {}
     available_cases = list(cases.keys())
-    selected_cases = _parse_selected_cases(args.cases, available_cases)
+    selected_cases = _parse_selected_cases(
+        args.cases,
+        available_cases,
+        default_excluded_cases=config.get('default_excluded_cases'),
+    )
 
     litellm_base_url = config.get('litellm_base_url', 'http://127.0.0.1:4001')
 
