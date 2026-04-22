@@ -1,0 +1,20 @@
+# TODO
+
+## In Progress
+
+- Keep `session_history` invariants enforced after the recent repair work.
+  Current target: `reasoning_tokens_source` should remain non-null for new rows, Gemini thought-signature fallback should persist as `provider_signature_present`, and Anthropic zero placeholders must not be labeled `provider_reported`.
+
+- Keep Codex/OpenAI streaming tool activity aligned across Langfuse and `session_history`.
+  Current target: `response.output_item.*` / `response.function_call_arguments.*` reconstruction should continue to yield `usage_tool_call_count`, `codex_tool_call_count`, and `session_history_tool_activity` rows for Claude-to-Codex tool runs on `:4001`.
+
+- Keep the adapter harness aligned with the real stored session shapes on `:4001`.
+  Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:`, and Gemini fanout should keep validating session-wide delegated `Agent` rows plus at least one Gemini command row without assuming every Gemini child emits its own command activity.
+
+## Next
+
+- Add literal ctx-marker escaping for prompts that need to mention `:#name.ctx#:` without triggering context injection.
+  Proposed syntax: `\\:#name.ctx#\\:`
+  Intended behavior: treat the wrapped marker text as literal prompt content, preserve the visible `:#name.ctx#:` form for the model, and skip stored-procedure lookup and appendix injection.
+
+- Extend the adapter harness to cover the escaped ctx-marker path after the current reasoning/429 fixes are fully validated.

@@ -157,6 +157,12 @@ This means a brief transient `429` can still be hidden locally, but repeated
 manual retests against the same persistently throttled free model should fail
 fast after the circuit opens instead of re-spending the full old retry window.
 
+Operational expectation:
+- retryable upstream `429`s may still appear as adapter warning/backoff lines in
+  `litellm-dev` logs
+- they should not emit the generic pass-through exception traceback for the
+  current request path
+
 ### Source of truth for Gemini routing
 
 The `gemini-3.1*` adapter lane does **not** go through OpenRouter. It routes
@@ -175,6 +181,34 @@ Do not treat Google `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED`
 responses as authoritative provider truth by themselves. Only close them as
 provider issues after interactive Gemini CLI `/model` corroboration on the same
 account context.
+
+Telemetry expectation:
+- when explicit Gemini reasoning token counts are missing but thought
+  signatures are present, Langfuse generation metadata and `session_history`
+  should still carry a non-null reasoning signal using the
+  `provider_signature_present` source
+- for Anthropic rows, only use `reasoning_tokens_source=provider_reported` when
+  the provider reported a positive count; zero-value placeholders must fall
+  through to estimation or remain unset
+- `reasoning_tokens_source` should never be left null in `public.session_history`
+  after backfill / repair passes; use `not_applicable` or `not_available` when
+  no positive provider or estimated reasoning count exists
+- for Codex/OpenAI streaming tool runs, `response.output_item.*` and
+  `response.function_call_arguments.*` events must roll up into
+  `usage_tool_call_count`, `codex_tool_call_count`, and at least one
+  `public.session_history_tool_activity` row when a real tool was invoked
+- the dedicated `claude_adapter_codex_tool_activity` case on `:4001` is the
+  hard gate for that behavior; it must persist a `Bash` / `pwd` tool row into
+  `public.session_history_tool_activity`
+- `claude_adapter_ctx_marker` is the hard gate for routed context markers and
+  must keep validating the literal `:#port-allocation.ctx#:` rewrite path
+- for Gemini fanout acceptance, do not assume every Gemini child model emits
+  its own command row; the stable invariant is:
+  - session-wide delegated `Agent` rows are present on the parent session
+  - at least one Gemini command tool row is present in
+    `public.session_history_tool_activity`
+  - `public.session_history` still contains provider/model/cost rows for each
+    expected Gemini child model
 
 ## Latency and lifecycle debugging
 
@@ -197,6 +231,14 @@ the round trip, use these surfaces together:
 
 Important: payload capture is no longer a normal always-on debugging surface. It
 only runs when both `AAWM_CAPTURE=1` and `LITELLM_LOG=DEBUG` are set.
+
+## Naming notes
+
+Anthropic fanout prompts should keep using the Claude agent names from
+`~/.claude/agents`, for example `gemini-3-flash-preview` or `gpt-5-4`.
+Those agent files now point at explicit provider-prefixed model values such as
+`google/gemini-3-flash-preview` and `openai/gpt-5.4`, so the prompt-side agent
+name and the underlying routed model string are intentionally different.
 
 ## Promotion rule for new adapted models
 

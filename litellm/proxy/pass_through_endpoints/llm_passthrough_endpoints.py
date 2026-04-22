@@ -1694,7 +1694,82 @@ def _extract_google_adapter_exception_detail(exc: Any) -> Any:
     return str(exc)
 
 
+def _extract_adapter_upstream_headers(exc: Any) -> dict[str, Any]:
+    upstream_headers = getattr(exc, "upstream_headers", None)
+    if isinstance(upstream_headers, dict):
+        return {
+            str(header_name): header_value
+            for header_name, header_value in upstream_headers.items()
+            if header_value is not None
+        }
+    response = getattr(exc, "response", None)
+    response_headers = getattr(response, "headers", None)
+    if response_headers is None:
+        return {}
+    return {
+        str(header_name): str(header_value)
+        for header_name, header_value in response_headers.items()
+    }
+
+
+def _get_adapter_header_value(
+    headers: dict[str, Any], header_name: str
+) -> Optional[str]:
+    if not headers:
+        return None
+    for key, value in headers.items():
+        if not isinstance(key, str):
+            continue
+        if key.lower() != header_name.lower():
+            continue
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
+    return None
+
+
+def _parse_retry_after_seconds_from_headers(
+    headers: dict[str, Any]
+) -> Optional[float]:
+    retry_after_value = _get_adapter_header_value(headers, "Retry-After")
+    if retry_after_value is None:
+        return None
+    try:
+        return max(0.0, float(retry_after_value))
+    except Exception:
+        return None
+
+
+def _parse_rate_limit_reset_wait_seconds_from_headers(
+    headers: dict[str, Any]
+) -> Optional[float]:
+    reset_value = _get_adapter_header_value(headers, "X-RateLimit-Reset")
+    if reset_value is None:
+        return None
+    try:
+        reset_number = float(reset_value)
+    except Exception:
+        return None
+    if reset_number > 1_000_000_000_000:
+        reset_epoch_seconds = reset_number / 1000.0
+    else:
+        reset_epoch_seconds = reset_number
+    return max(0.0, reset_epoch_seconds - time.time())
+
+
 def _parse_google_rate_limit_reset_seconds(exc: Any) -> float:
+    upstream_headers = _extract_adapter_upstream_headers(exc)
+    retry_after_seconds = _parse_retry_after_seconds_from_headers(upstream_headers)
+    if retry_after_seconds is not None:
+        return max(1.0, retry_after_seconds)
+    reset_wait_seconds = _parse_rate_limit_reset_wait_seconds_from_headers(
+        upstream_headers
+    )
+    if reset_wait_seconds is not None:
+        return max(1.0, reset_wait_seconds)
     detail = _extract_google_adapter_exception_detail(exc)
     if isinstance(detail, bytes):
         detail_text = detail.decode("utf-8", errors="ignore")
@@ -1853,6 +1928,7 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
         )
         await _wait_for_google_adapter_cooldown_if_needed(rate_limit_key)
         try:
+            passthrough_kwargs["retryable_upstream_status_codes"] = [429]
             return await pass_through_request(**passthrough_kwargs)
         except Exception as exc:
             status_code = _extract_google_adapter_exception_status_code(exc)
@@ -1997,18 +2073,18 @@ def _extract_openrouter_adapter_provider_name(exc: Any) -> Optional[str]:
 
 def _extract_openrouter_adapter_retry_after_seconds(exc: Any) -> Optional[float]:
     payload = _extract_openrouter_adapter_error_payload(exc)
-    if not isinstance(payload, dict):
-        return None
-    metadata = payload.get("error", {}).get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    retry_after_value = metadata.get("retry_after_seconds")
-    try:
-        if retry_after_value is not None:
-            return max(0.0, float(retry_after_value))
-    except Exception:
-        return None
-    return None
+    if isinstance(payload, dict):
+        metadata = payload.get("error", {}).get("metadata")
+        if isinstance(metadata, dict):
+            retry_after_value = metadata.get("retry_after_seconds")
+            try:
+                if retry_after_value is not None:
+                    return max(0.0, float(retry_after_value))
+            except Exception:
+                return None
+    return _parse_retry_after_seconds_from_headers(
+        _extract_openrouter_adapter_error_headers(exc)
+    )
 
 
 def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
@@ -2027,51 +2103,29 @@ def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
 
 
 def _extract_openrouter_adapter_error_headers(exc: Any) -> dict[str, Any]:
+    merged_headers = _extract_adapter_upstream_headers(exc)
     payload = _extract_openrouter_adapter_error_payload(exc)
     if not isinstance(payload, dict):
-        return {}
+        return merged_headers
     metadata = payload.get("error", {}).get("metadata")
     if not isinstance(metadata, dict):
-        return {}
+        return merged_headers
     headers = metadata.get("headers")
     if not isinstance(headers, dict):
-        return {}
-    return headers
+        return merged_headers
+    merged_headers.update(headers)
+    return merged_headers
 
 
 def _get_openrouter_adapter_header_value(
     headers: dict[str, Any], header_name: str
 ) -> Optional[str]:
-    if not headers:
-        return None
-    for key, value in headers.items():
-        if not isinstance(key, str):
-            continue
-        if key.lower() != header_name.lower():
-            continue
-        if value is None:
-            return None
-        if isinstance(value, str):
-            stripped = value.strip()
-            return stripped or None
-        return str(value)
-    return None
+    return _get_adapter_header_value(headers, header_name)
 
 
 def _extract_openrouter_adapter_reset_wait_seconds(exc: Any) -> Optional[float]:
     headers = _extract_openrouter_adapter_error_headers(exc)
-    reset_value = _get_openrouter_adapter_header_value(headers, "X-RateLimit-Reset")
-    if reset_value is None:
-        return None
-    try:
-        reset_number = float(reset_value)
-    except Exception:
-        return None
-    if reset_number > 1_000_000_000_000:
-        reset_epoch_seconds = reset_number / 1000.0
-    else:
-        reset_epoch_seconds = reset_number
-    return max(0.0, reset_epoch_seconds - time.time())
+    return _parse_rate_limit_reset_wait_seconds_from_headers(headers)
 
 
 def _is_openrouter_adapter_long_window_rate_limit(
@@ -2384,7 +2438,10 @@ async def _perform_openrouter_adapter_pass_through_request(
         )
         await _wait_for_openrouter_adapter_cooldown_if_needed(wait_keys)
         try:
-            result = await pass_through_request(**kwargs)
+            result = await pass_through_request(
+                **kwargs,
+                retryable_upstream_status_codes=[429],
+            )
             _clear_openrouter_adapter_failure_circuit(adapter_model)
             return result
         except Exception as exc:

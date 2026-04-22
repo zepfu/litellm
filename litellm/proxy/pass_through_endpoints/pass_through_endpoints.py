@@ -85,6 +85,33 @@ def get_response_body(response: httpx.Response) -> Optional[dict]:
         return None
 
 
+def _build_http_exception_from_upstream_status_error(
+    error: httpx.HTTPStatusError, detail: Any
+) -> HTTPException:
+    upstream_headers = {
+        str(header_name): str(header_value)
+        for header_name, header_value in error.response.headers.items()
+    }
+    return HTTPException(
+        status_code=error.response.status_code,
+        detail=detail,
+        headers=upstream_headers or None,
+    )
+
+
+def _extract_exception_status_code(exc: Exception) -> Optional[int]:
+    for attr_name in ("status_code", "code"):
+        value = getattr(exc, attr_name, None)
+        if isinstance(value, int):
+            return value
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            continue
+    return None
+
+
 def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
     if not isinstance(kwargs, dict):
         return {}
@@ -965,6 +992,7 @@ async def pass_through_request(  # noqa: PLR0915
     expected_target_family: Optional[str] = None,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
+    retryable_upstream_status_codes: Optional[list[int]] = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -985,6 +1013,8 @@ async def pass_through_request(  # noqa: PLR0915
         guardrails_config: Optional field - guardrails configuration for passthrough endpoint
         egress_credential_family: Optional provider family for sensitive local/client credentials
         expected_target_family: Optional provider family expected for the final egress target
+        retryable_upstream_status_codes: Optional upstream status codes that will be retried by the
+            caller, so generic passthrough failure logging should be deferred to the adapter layer
     """
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.pass_through_endpoints.passthrough_guardrails import (
@@ -1002,6 +1032,11 @@ async def pass_through_request(  # noqa: PLR0915
     _parsed_body: Optional[dict] = None
     # kwargs for pass through endpoint, contains metadata, litellm_params, call_type, litellm_call_id, passthrough_logging_payload
     kwargs: Optional[dict] = None
+    retryable_status_codes = {
+        status_code
+        for status_code in (retryable_upstream_status_codes or [])
+        if isinstance(status_code, int)
+    }
 
     #########################################################
     try:
@@ -1220,8 +1255,9 @@ async def pass_through_request(  # noqa: PLR0915
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
-                raise HTTPException(
-                    status_code=e.response.status_code, detail=await e.response.aread()
+                raise _build_http_exception_from_upstream_status_error(
+                    e,
+                    await e.response.aread(),
                 )
 
             return StreamingResponse(
@@ -1273,8 +1309,9 @@ async def pass_through_request(  # noqa: PLR0915
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
-                raise HTTPException(
-                    status_code=e.response.status_code, detail=await e.response.aread()
+                raise _build_http_exception_from_upstream_status_error(
+                    e,
+                    await e.response.aread(),
                 )
 
             return StreamingResponse(
@@ -1303,12 +1340,21 @@ async def pass_through_request(  # noqa: PLR0915
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=e.response.status_code, detail=e.response.text
+            raise _build_http_exception_from_upstream_status_error(
+                e,
+                e.response.text,
             )
 
         if response.status_code >= 300:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=response.text,
+                headers={
+                    str(header_name): str(header_value)
+                    for header_name, header_value in response.headers.items()
+                }
+                or None,
+            )
 
         finalize_started_at = datetime.now()
         content = await response.aread()
@@ -1374,11 +1420,21 @@ async def pass_through_request(  # noqa: PLR0915
             cache_key=None,
             api_base=str(url._uri_reference) if url else None,
         )
-        verbose_proxy_logger.exception(
-            "litellm.proxy.proxy_server.pass_through_endpoint(): Exception occured - {}".format(
-                str(e)
-            )
+        status_code = _extract_exception_status_code(e)
+        suppress_retryable_failure_logging = (
+            status_code in retryable_status_codes if status_code is not None else False
         )
+        if suppress_retryable_failure_logging:
+            verbose_proxy_logger.debug(
+                "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
+                status_code,
+            )
+        else:
+            verbose_proxy_logger.exception(
+                "litellm.proxy.proxy_server.pass_through_endpoint(): Exception occured - {}".format(
+                    str(e)
+                )
+            )
 
         #########################################################
         # Monitoring: Trigger post_call_failure_hook
@@ -1399,25 +1455,38 @@ async def pass_through_request(  # noqa: PLR0915
         if "custom_llm_provider" not in request_payload and custom_llm_provider:
             request_payload["custom_llm_provider"] = custom_llm_provider
 
-        await proxy_logging_obj.post_call_failure_hook(
-            user_api_key_dict=user_api_key_dict,
-            original_exception=e,
-            request_data=request_payload,
-            traceback_str=traceback.format_exc(
-                limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
-            ),
-        )
+        if not suppress_retryable_failure_logging:
+            await proxy_logging_obj.post_call_failure_hook(
+                user_api_key_dict=user_api_key_dict,
+                original_exception=e,
+                request_data=request_payload,
+                traceback_str=traceback.format_exc(
+                    limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
+                ),
+            )
 
         #########################################################
 
         if isinstance(e, HTTPException):
-            raise ProxyException(
+            proxy_exc = ProxyException(
                 message=getattr(e, "message", str(getattr(e, "detail", str(e)))),
                 type=getattr(e, "type", "None"),
                 param=getattr(e, "param", "None"),
                 code=getattr(e, "status_code", status.HTTP_400_BAD_REQUEST),
                 headers=custom_headers,
             )
+            setattr(proxy_exc, "detail", getattr(e, "detail", None))
+            upstream_headers = getattr(e, "headers", None)
+            if isinstance(upstream_headers, dict):
+                setattr(
+                    proxy_exc,
+                    "upstream_headers",
+                    {
+                        str(header_name): str(header_value)
+                        for header_name, header_value in upstream_headers.items()
+                    },
+                )
+            raise proxy_exc
         else:
             error_msg = f"{str(e)}"
             raise ProxyException(

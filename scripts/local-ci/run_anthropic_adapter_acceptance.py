@@ -161,6 +161,71 @@ def _validate_runtime_postcondition(*, family: str, litellm_base_url: str, check
     return summary, failures
 
 
+def _validate_runtime_logs(
+    *,
+    family: str,
+    started: Any,
+    checks: dict[str, Any],
+    runtime_postconditions: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    container_name = (
+        checks.get('docker_container_name')
+        or runtime_postconditions.get('docker_container_name')
+        or 'litellm-dev'
+    )
+    tail_lines = int(checks.get('tail_lines') or 400)
+    forbidden_substrings = list(checks.get('forbidden_substrings') or [])
+    if not bool(checks.get('disable_default_429_traceback_check')):
+        forbidden_substrings.extend(
+            [
+                'pass_through_endpoint(): Exception occured - 429:',
+            ]
+        )
+
+    summary: dict[str, Any] = {
+        'docker_container_name': container_name,
+        'tail_lines': tail_lines,
+        'forbidden_substrings': forbidden_substrings,
+        'matched_forbidden_substrings': [],
+    }
+    failures: list[str] = []
+    warnings: list[str] = []
+
+    if not container_name or not forbidden_substrings:
+        return summary, failures, warnings
+
+    since_value = started.isoformat() if hasattr(started, 'isoformat') else str(started)
+    result = subprocess.run(
+        ['docker', 'logs', '--since', since_value, '--tail', str(tail_lines), container_name],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    log_text = '\n'.join(
+        value for value in (result.stdout, result.stderr) if isinstance(value, str) and value
+    )
+    summary['docker_logs_exit_code'] = result.returncode
+    summary['log_excerpt'] = log_text[-4000:] if log_text else ''
+
+    if result.returncode != 0:
+        warnings.append(
+            f'{family} runtime log check could not read docker logs for `{container_name}` (exit {result.returncode})'
+        )
+        return summary, failures, warnings
+
+    matched = [
+        substring for substring in forbidden_substrings if substring and substring in log_text
+    ]
+    summary['matched_forbidden_substrings'] = matched
+    for substring in matched:
+        failures.append(
+            f'{family} runtime logs contained forbidden substring `{substring}`'
+        )
+
+    return summary, failures, warnings
+
+
 def _validate_session_history(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if not session_id:
         return {'record': None}, [f'{family} missing command session_id for session_history validation']
@@ -184,7 +249,8 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     query = '''
         select provider, model, session_id, input_tokens, output_tokens, total_tokens,
                cache_read_input_tokens, cache_creation_input_tokens,
-               reasoning_tokens_reported, reasoning_tokens_estimated, response_cost_usd,
+               reasoning_tokens_reported, reasoning_tokens_estimated,
+               reasoning_tokens_source, tool_call_count, tool_names, response_cost_usd,
                start_time, end_time
         from public.session_history
         where session_id = %s
@@ -207,6 +273,20 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         return {'record': None, 'records': []}, [f'{family} missing session_history row for session_id `{session_id}`']
 
     failures: list[str] = []
+
+    for row in records:
+        source = row.get('reasoning_tokens_source')
+        if not isinstance(source, str) or not source.strip():
+            failures.append(
+                f'{family} session_history row provider={row.get("provider")!r} model={row.get("model")!r} has null/empty `reasoning_tokens_source`'
+            )
+            continue
+        if source == 'provider_reported':
+            reported = row.get('reasoning_tokens_reported')
+            if not isinstance(reported, (int, float)) or reported <= 0:
+                failures.append(
+                    f'{family} session_history row provider={row.get("provider")!r} model={row.get("model")!r} has `reasoning_tokens_source=provider_reported` with non-positive `reasoning_tokens_reported`={reported!r}'
+                )
 
     def _normalize_record(row: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -267,6 +347,85 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
             failures.append(f'{family} session_history `{key}` below minimum: expected >= {minimum!r}, got {actual!r}')
 
     return {'record': normalized_record, 'records': [_normalize_record(row) for row in records]}, failures
+
+
+def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    if not session_id:
+        return {'record': None, 'records': []}, [f'{family} missing command session_id for tool_activity validation']
+
+    db_host = str(checks.get('db_host') or '127.0.0.1')
+    db_port = int(checks.get('db_port') or 5434)
+    db_name = str(checks.get('db_name') or 'aawm_tristore')
+    db_user = str(checks.get('db_user') or 'aawm')
+    db_password = None
+    if isinstance(checks.get('db_password_env'), str):
+        db_password = os.environ.get(str(checks['db_password_env']))
+    if db_password is None and isinstance(checks.get('db_password'), str):
+        db_password = str(checks['db_password'])
+    if db_password is None:
+        return {'record': None, 'records': []}, [f'{family} missing DB password for tool_activity validation']
+
+    query = '''
+        select provider, model, tool_index, tool_name, tool_kind, command_text,
+               arguments, metadata, created_at
+        from public.session_history_tool_activity
+        where session_id = %s
+        order by created_at asc, tool_index asc
+    '''
+    with psycopg.connect(
+        host=db_host,
+        port=db_port,
+        dbname=db_name,
+        user=db_user,
+        password=db_password,
+        connect_timeout=10,
+        row_factory=psycopg.rows.dict_row,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (session_id,))
+            records = cur.fetchall()
+
+    def _normalize_record(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: (value.isoformat() if hasattr(value, 'isoformat') else value)
+            for key, value in row.items()
+        }
+
+    failures: list[str] = []
+    expected_rows = checks.get('expected_rows') or []
+    matched_records: list[dict[str, Any]] = []
+    for expected_row in expected_rows:
+        row_provider = expected_row.get('provider')
+        row_model = expected_row.get('model')
+        row_tool_name = expected_row.get('tool_name')
+        row_tool_kind = expected_row.get('tool_kind')
+        matches = [
+            row
+            for row in records
+            if (row_provider is None or row.get('provider') == row_provider)
+            and (row_model is None or row.get('model') == row_model)
+            and (row_tool_name is None or row.get('tool_name') == row_tool_name)
+            and (row_tool_kind is None or row.get('tool_kind') == row_tool_kind)
+        ]
+        minimum_count = int(expected_row.get('minimum_count') or 1)
+        if len(matches) < minimum_count:
+            failures.append(
+                f'{family} missing tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} tool_kind={row_tool_kind!r}; expected >= {minimum_count}, got {len(matches)}'
+            )
+            continue
+        command_text_contains = expected_row.get('command_text_contains')
+        if isinstance(command_text_contains, str) and command_text_contains:
+            if not any(command_text_contains in str(row.get('command_text') or '') for row in matches):
+                failures.append(
+                    f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} did not include command text containing {command_text_contains!r}'
+                )
+        matched_records.extend(_normalize_record(row) for row in matches[:minimum_count])
+
+    return {
+        'record': matched_records[0] if matched_records else None,
+        'records': [_normalize_record(row) for row in records],
+        'matched_records': matched_records,
+    }, failures
 
 
 def _downgrade_configured_failures_to_warnings(
@@ -537,6 +696,12 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('session_history_validation') or {},
     )
     failures.extend(session_history_failures)
+    tool_activity_summary, tool_activity_failures = _validate_tool_activity(
+        family=name,
+        session_id=command_session_id,
+        checks=config.get('tool_activity_validation') or {},
+    ) if config.get('tool_activity_validation') else ({'record': None, 'records': []}, [])
+    failures.extend(tool_activity_failures)
 
     runtime_summary, runtime_failures = _validate_runtime_postcondition(
         family=name,
@@ -544,6 +709,14 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('runtime_postconditions') or {},
     )
     failures.extend(runtime_failures)
+    runtime_log_summary, runtime_log_failures, runtime_log_warnings = _validate_runtime_logs(
+        family=name,
+        started=started,
+        checks=config.get('runtime_log_checks') or {},
+        runtime_postconditions=runtime_summary,
+    )
+    failures.extend(runtime_log_failures)
+    warnings.extend(runtime_log_warnings)
     failures, downgraded_warnings = _downgrade_configured_failures_to_warnings(
         failures=failures,
         config=config,
@@ -587,7 +760,9 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         },
         'command_json': command_json_summary,
         'session_history': session_history_summary,
+        'tool_activity': tool_activity_summary,
         'runtime_postconditions': runtime_summary,
+        'runtime_logs': runtime_log_summary,
         'passed': (not unique_failures) or warning_only,
         'failures': [] if warning_only else unique_failures,
         'soft_failures': soft_failures,
@@ -615,6 +790,7 @@ def _parse_selected_cases(raw: str | None, available: list[str]) -> list[str]:
         'claude_adapter_gpt54',
         'claude_adapter_gpt54_mini',
         'claude_adapter_ctx_marker',
+        'claude_adapter_codex_tool_activity',
         'claude_adapter_gemini_fanout',
         'claude_adapter_peeromega_fanout',
     ]
