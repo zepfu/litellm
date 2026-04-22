@@ -116,9 +116,9 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
     - isolates the exact multi-Gemini subagent dispatch path on `:4001`
     - use it before re-running the full adapter suite when Gemini fanout is the suspected regression
     - the full suite runs this before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not polluted by the mixed fanout's short-window upstream pressure
-    - stable tool-activity invariant: expect session-wide delegated `Agent`
-      rows plus at least one Gemini command tool row; do not assume every
-      Gemini child model will emit its own command row on every run
+    - stable tool-activity invariant: expect the parent session to persist the
+      delegated `Agent` rows; do not assume every Gemini child model will emit
+      its own command row on every run
   - Google Code Assist canaries: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
     - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist
     - keep this warning-only in the harness because upstream quota windows produce real `429` responses

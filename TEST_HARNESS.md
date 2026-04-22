@@ -209,8 +209,9 @@ Telemetry expectation:
 - for Gemini fanout acceptance, do not assume every Gemini child model emits
   its own command row; the stable invariant is:
   - session-wide delegated `Agent` rows are present on the parent session
-  - at least one Gemini command tool row is present in
-    `public.session_history_tool_activity`
+  - `claude_adapter_gemini_fanout` should persist at least three parent-session
+    `Agent` rows and `claude_adapter_peeromega_fanout` should persist at least
+    eight
   - `public.session_history` still contains provider/model/cost rows for each
     expected Gemini child model
 
