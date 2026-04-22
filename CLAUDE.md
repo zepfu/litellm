@@ -156,7 +156,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. If standalone Gemini CLI use is healthy but `claude_adapter_gemini_fanout` fails, treat that first as a local pacing/serialization bug rather than authoritative provider-capacity proof.
 - For Google Code Assist adapter work, treat successful real-Claude runs on `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` as proof of routing correctness. Do not treat `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED` on their own as authoritative upstream truth; only close those as provider issues after interactive Gemini CLI `/model` corroboration on the same account context.
 - `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane with the other `vendor/model:free` targets.
-- `session_history` now also tracks normalized provider-cache state for Anthropic, OpenAI, Gemini, and OpenRouter rows. Use `provider_cache_status` / `provider_cache_miss_reason` when checking whether cache hints were attempted, hit, or missed on adapted calls.
+- `session_history` now also tracks normalized provider-cache state for Anthropic, OpenAI, Gemini, and OpenRouter rows. Use `provider_cache_status` / `provider_cache_miss_reason` when checking whether cache hints were attempted, hit, or missed on adapted calls. When the missed cache token count is explicit, `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` capture the extra write-vs-read cost of that miss.
 - Dev OpenRouter pacing on `:4001` now uses:
   - short hidden retry budget: `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - longer per-model post-failure cooldown: `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
@@ -182,7 +182,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - Current low-overhead instrumentation surfaces for these optimizations:
   - DEBUG log: `AawmAgentIdentity: flushed N session_history records in Xms`
   - Claude rewrite metadata: `aawm_dynamic_injection_cache_hits`, `aawm_dynamic_injection_cache_misses`, `aawm_dynamic_injection_cache_statuses`
-  - `session_history` provider-cache fields: `provider_cache_attempted`, `provider_cache_status`, `provider_cache_miss`, `provider_cache_miss_reason`
+  - `session_history` provider-cache fields: `provider_cache_attempted`, `provider_cache_status`, `provider_cache_miss`, `provider_cache_miss_reason`, `provider_cache_miss_token_count`, `provider_cache_miss_cost_usd`
   - existing proxy metadata: `queue_time_seconds`, `completion_start_time`, `response_cost`
 
 ### Testing Strategy

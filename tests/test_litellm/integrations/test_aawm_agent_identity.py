@@ -481,6 +481,8 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["provider_cache_status"] == "hit"
     assert record["provider_cache_miss"] is False
     assert record["provider_cache_miss_reason"] is None
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
     assert record["tool_call_count"] == 3
     assert record["tool_names"] == ["Read", "Write", "Bash"]
     assert record["file_read_count"] == 1
@@ -615,6 +617,8 @@ def test_build_session_history_record_marks_openai_provider_cache_miss_from_zero
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
@@ -661,6 +665,9 @@ def test_build_session_history_record_marks_anthropic_provider_cache_write_only(
     assert record["provider_cache_status"] == "write"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cache_write_only"
+    assert record["provider_cache_miss_token_count"] == 64
+    assert record["provider_cache_miss_cost_usd"] is not None
+    assert record["provider_cache_miss_cost_usd"] > 0
 
 
 def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cached_content_request() -> None:
@@ -697,6 +704,8 @@ def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cach
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_content_requested_without_hit"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
 
 
 def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_cache_control_request() -> None:
@@ -741,6 +750,8 @@ def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cache_control_requested_without_hit"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
 
 
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
@@ -790,6 +801,8 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     assert metadata["usage_provider_cache_attempted"] is True
     assert metadata["usage_provider_cache_status"] == "hit"
     assert metadata["usage_provider_cache_miss"] is False
+    assert "usage_provider_cache_miss_token_count" not in metadata
+    assert "usage_provider_cache_miss_cost_usd" not in metadata
     assert metadata["codex_reasoning_tokens_reported"] == 12
     assert metadata["codex_cache_read_input_tokens"] == 31
     assert "codex-usage-breakout" in metadata["tags"]
@@ -900,6 +913,8 @@ def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout()
     assert metadata["usage_provider_cache_attempted"] is False
     assert metadata["usage_provider_cache_status"] == "not_attempted"
     assert metadata["usage_provider_cache_miss"] is False
+    assert "usage_provider_cache_miss_token_count" not in metadata
+    assert "usage_provider_cache_miss_cost_usd" not in metadata
     assert metadata["gemini_reasoning_tokens_reported"] == 1
     assert "gemini-usage-breakout" in metadata["tags"]
     assert "gemini-reasoning-tokens-reported" in metadata["tags"]
@@ -1022,6 +1037,8 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
         "provider_cache_status": "write",
         "provider_cache_miss": True,
         "provider_cache_miss_reason": "cache_write_only",
+        "provider_cache_miss_token_count": 64,
+        "provider_cache_miss_cost_usd": 0.0001,
         "tool_call_count": 1,
         "tool_names": ["search"],
         "file_read_count": 0,
@@ -1353,6 +1370,8 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["provider_cache_status"] == "hit"
     assert record["provider_cache_miss"] is False
     assert record["provider_cache_miss_reason"] is None
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
     assert record["reasoning_present"] is True
     assert record["reasoning_tokens_source"] == "estimated_from_reasoning_text"
     assert record["tool_call_count"] == 1
@@ -1469,6 +1488,8 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_metad
     assert record["provider_cache_status"] == "hit"
     assert record["provider_cache_miss"] is False
     assert record["provider_cache_miss_reason"] is None
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
     assert record["reasoning_tokens_reported"] == 18
     assert record["reasoning_tokens_source"] == "provider_reported"
     assert record["tool_call_count"] == 1
@@ -1677,6 +1698,8 @@ def test_build_session_history_record_from_langfuse_trace_observation_marks_open
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
 
 
 def test_build_session_history_record_prefers_metadata_usage_object_when_result_usage_is_sparse() -> None:
@@ -1841,6 +1864,8 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
             "provider_cache_status": "not_attempted",
             "provider_cache_miss": False,
             "provider_cache_miss_reason": None,
+            "provider_cache_miss_token_count": None,
+            "provider_cache_miss_cost_usd": None,
             "tool_call_count": 1,
             "tool_names": ["search"],
             "file_read_count": 1,

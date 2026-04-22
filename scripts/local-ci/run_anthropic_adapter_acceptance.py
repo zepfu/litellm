@@ -255,6 +255,7 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
                cache_read_input_tokens, cache_creation_input_tokens,
                provider_cache_attempted, provider_cache_status,
                provider_cache_miss, provider_cache_miss_reason,
+               provider_cache_miss_token_count, provider_cache_miss_cost_usd,
                reasoning_tokens_reported, reasoning_tokens_estimated,
                reasoning_tokens_source, tool_call_count, tool_names, response_cost_usd,
                start_time, end_time
