@@ -107,10 +107,7 @@ Important notes:
 - For Codex/OpenAI streaming tool runs, the local source of truth is the reconstructed `response.output_item.*` / `response.function_call_arguments.*` stream state. Expect `usage_tool_call_count`, `codex_tool_call_count`, and `session_history_tool_activity` rows to reflect real tool invocations on `:4001`.
 - `claude_adapter_codex_tool_activity` is the hard gate for that path. It uses a single `Bash` / `pwd` tool call and must persist a matching `session_history_tool_activity` row.
 - `claude_adapter_ctx_marker` is the hard gate for dynamic-context marker rewriting and uses `:#port-allocation.ctx#:` as the canonical stored-procedure validation fixture.
-- For Gemini fanout, the stable tool-activity invariant is session-wide rather than per-child-model:
-  - the parent session should contain delegated `Agent` rows
-  - at least one Gemini command tool row should be present in `session_history_tool_activity`
-  - `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model
+- For Gemini fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_gemini_fanout` should persist at least three `Agent` rows, `claude_adapter_peeromega_fanout` should persist at least eight, and `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model.
 - Fanout prompts should continue using the Claude agent names from `~/.claude/agents` such as `gemini-3-flash-preview`; those agent files now carry explicit provider-prefixed `model:` values like `google/gemini-3-flash-preview`.
 - `openrouter/free` and `inclusionai/ling-2.6-flash:free` are canaries, not hard gates; upstream routing / rate limits can make them noisy even when the local adapter path is correct.
 - `warning_only` canaries stay non-gating even when the subprocess itself times out; those conditions should surface as `soft_failures` / warnings in the artifact, not as suite-stopping failures.
