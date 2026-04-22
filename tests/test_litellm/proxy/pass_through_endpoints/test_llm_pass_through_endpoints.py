@@ -1297,6 +1297,112 @@ class TestGoogleAdapterRequestShapePolicy:
         assert mock_pass_through.await_count == 3
         assert [await_call.args for await_call in set_cooldown.await_args_list] == [('__default__', 3.0), ('__default__', 5.0)]
 
+    @pytest.mark.asyncio
+    async def test_google_adapter_request_uses_upstream_retry_after_header(self, monkeypatch):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES", "1")
+
+        first_error = ProxyException(
+            message="quota throttled",
+            type="None",
+            param="None",
+            code=429,
+        )
+        first_error.upstream_headers = {"Retry-After": "9"}
+        successful_response = Response(
+            content='{"ok": true}', media_type="application/json"
+        )
+        set_cooldown = AsyncMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(side_effect=[first_error, successful_response]),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_google_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._set_google_adapter_cooldown",
+            new=set_cooldown,
+        ):
+            result = await _perform_google_adapter_pass_through_request(
+                request=MagicMock()
+            )
+
+        assert result is successful_response
+        assert mock_pass_through.await_count == 2
+        assert (
+            mock_pass_through.await_args_list[0].kwargs[
+                "retryable_upstream_status_codes"
+            ]
+            == [429]
+        )
+        set_cooldown.assert_awaited_once_with("__default__", 10.0)
+
+
+class TestPassThroughRequestRetryableFailures:
+    @pytest.mark.asyncio
+    async def test_pass_through_request_preserves_retry_headers_and_skips_failure_hook(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/test/endpoint"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.example.com/v1/test"
+        upstream_response = httpx.Response(
+            status_code=429,
+            headers={"Retry-After": "17", "X-RateLimit-Remaining": "0"},
+            content=b'{"error":"throttled"}',
+            request=httpx.Request("POST", target_url),
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"test": "data"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=AsyncMock(return_value=upstream_response),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.verbose_proxy_logger.exception"
+        ) as mock_log_exception:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value={"test": "data"})
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    stream=False,
+                    retryable_upstream_status_codes=[429],
+                )
+
+        assert exc_info.value.code == "429"
+        assert exc_info.value.detail == '{"error":"throttled"}'
+        normalized_upstream_headers = {
+            key.lower(): value
+            for key, value in exc_info.value.upstream_headers.items()
+        }
+        assert normalized_upstream_headers["retry-after"] == "17"
+        assert normalized_upstream_headers["x-ratelimit-remaining"] == "0"
+        mock_logging_obj.post_call_failure_hook.assert_not_awaited()
+        mock_log_exception.assert_not_called()
+
+
 class TestOpenRouterAdapterRetry:
     @pytest.mark.asyncio
     async def test_openrouter_adapter_request_retries_on_proxy_exception_code(self, monkeypatch):
@@ -1331,6 +1437,51 @@ class TestOpenRouterAdapterRetry:
         assert result is successful_response
         assert mock_pass_through.await_count == 2
         set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 2.0)
+
+    @pytest.mark.asyncio
+    async def test_openrouter_adapter_request_uses_upstream_retry_after_header(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_MAX_RETRIES", "1")
+        monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS", "2")
+        monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "45")
+
+        first_error = ProxyException(
+            message="Provider returned error",
+            type="None",
+            param="None",
+            code=429,
+        )
+        first_error.upstream_headers = {"Retry-After": "19"}
+        successful_response = Response(
+            content='{"ok": true}', media_type="application/json"
+        )
+        set_cooldown = AsyncMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(side_effect=[first_error, successful_response]),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_openrouter_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._set_openrouter_adapter_cooldown",
+            new=set_cooldown,
+        ):
+            result = await _perform_openrouter_adapter_pass_through_request(
+                adapter_model="google/gemma-4-31b-it:free",
+                request=MagicMock(),
+            )
+
+        assert result is successful_response
+        assert mock_pass_through.await_count == 2
+        assert (
+            mock_pass_through.await_args_list[0].kwargs[
+                "retryable_upstream_status_codes"
+            ]
+            == [429]
+        )
+        set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 20.0)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -80,6 +80,7 @@ Current first-wave adapted coverage:
   - `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
   This is meant to preserve short hidden retries for sporadic free-model recovery while preventing repeated manual retests from re-burning the same ~40s retry window on persistently throttled models.
+  Retryable upstream `429`s may still show up as adapter warning/backoff lines, but they should not produce the generic pass-through exception traceback for the current request path.
 
 Preferred Anthropic-adapter model spellings:
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
@@ -100,5 +101,16 @@ Important notes:
 - for adapted free models, LiteLLM / `session_history` are the source of truth for cost, not Claude CLI display cost. For OpenRouter free models, mirror the paid counterpart cost when a non-free twin exists; keep `openrouter/free` and `inclusionai/ling-2.6-flash:free` at zero because OpenRouter does not publish a paid twin for them.
 - The Google Code Assist lane is warning-only in the harness; the route works, but `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` can all hit real `429` / `RESOURCE_EXHAUSTED` responses from `cloudcode-pa.googleapis.com`.
 - The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. When standalone Gemini CLI use is healthy, treat `claude_adapter_gemini_fanout` failures first as local pacing/serialization bugs, not as authoritative provider-capacity proof.
+- When explicit Gemini reasoning token counts are absent but thought signatures are present, treat `provider_signature_present` as the expected fallback source in Langfuse generation metadata and `session_history`.
+- For Anthropic rows, `reasoning_tokens_source=provider_reported` is only valid when the provider supplied a positive count; zero placeholders should fall through to estimation or remain unset.
+- `reasoning_tokens_source` should not remain null in repaired or newly written `session_history` rows; use `not_applicable` when no reasoning is present and `not_available` when reasoning is present but no positive provider/estimated count exists.
+- For Codex/OpenAI streaming tool runs, the local source of truth is the reconstructed `response.output_item.*` / `response.function_call_arguments.*` stream state. Expect `usage_tool_call_count`, `codex_tool_call_count`, and `session_history_tool_activity` rows to reflect real tool invocations on `:4001`.
+- `claude_adapter_codex_tool_activity` is the hard gate for that path. It uses a single `Bash` / `pwd` tool call and must persist a matching `session_history_tool_activity` row.
+- `claude_adapter_ctx_marker` is the hard gate for dynamic-context marker rewriting and uses `:#port-allocation.ctx#:` as the canonical stored-procedure validation fixture.
+- For Gemini fanout, the stable tool-activity invariant is session-wide rather than per-child-model:
+  - the parent session should contain delegated `Agent` rows
+  - at least one Gemini command tool row should be present in `session_history_tool_activity`
+  - `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model
+- Fanout prompts should continue using the Claude agent names from `~/.claude/agents` such as `gemini-3-flash-preview`; those agent files now carry explicit provider-prefixed `model:` values like `google/gemini-3-flash-preview`.
 - `openrouter/free` and `inclusionai/ling-2.6-flash:free` are canaries, not hard gates; upstream routing / rate limits can make them noisy even when the local adapter path is correct.
 - `ling-2-6-flash` now validates on the generic OpenRouter `Responses` lane, so trace tags / metadata / `session_history` should match the other free-model response adapters.

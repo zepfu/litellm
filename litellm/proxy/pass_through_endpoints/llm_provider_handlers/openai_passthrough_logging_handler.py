@@ -6,7 +6,7 @@ Handles cost tracking and logging for OpenAI passthrough endpoints, specifically
 
 import json
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -184,7 +184,159 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             if current_usage is None or (current_total == 0 and transformed_total > 0):
                 model_response.usage = transformed_usage
 
+        response_output = response_body.get("output")
+        if isinstance(response_output, list):
+            hidden_params = getattr(model_response, "_hidden_params", None)
+            if not isinstance(hidden_params, dict):
+                hidden_params = {}
+                model_response._hidden_params = hidden_params
+            hidden_params["responses_output"] = response_output
+
         return model_response
+
+    @staticmethod
+    def _response_output_stream_key(
+        *,
+        item: Optional[dict] = None,
+        output_index: Any = None,
+        item_id: Any = None,
+        fallback_index: Optional[int] = None,
+    ) -> str:
+        if isinstance(item, dict):
+            for key in ("call_id", "id"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        if isinstance(item_id, str) and item_id.strip():
+            return item_id.strip()
+        if isinstance(output_index, int):
+            return f"output:{output_index}"
+        if fallback_index is not None:
+            return f"fallback:{fallback_index}"
+        return "fallback:0"
+
+    @staticmethod
+    def _merge_responses_output_lists(
+        completed_output: Optional[List[dict]],
+        streamed_output: Optional[List[dict]],
+    ) -> List[dict]:
+        merged_by_key: Dict[str, dict] = {}
+        ordered_keys: List[str] = []
+
+        for output_list in (streamed_output or [], completed_output or []):
+            for item in output_list:
+                if not isinstance(item, dict):
+                    continue
+                key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+                    item=item,
+                    fallback_index=len(ordered_keys),
+                )
+                if key not in ordered_keys:
+                    ordered_keys.append(key)
+                existing = merged_by_key.get(key, {})
+                merged_item = {**existing, **item}
+                if "arguments" in existing and "arguments" not in item:
+                    merged_item["arguments"] = existing["arguments"]
+                merged_by_key[key] = merged_item
+
+        return [merged_by_key[key] for key in ordered_keys if key in merged_by_key]
+
+    @staticmethod
+    def _reconstruct_responses_output_items_from_stream(
+        all_chunks: List[str],
+    ) -> List[dict]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        output_items: Dict[str, dict] = {}
+        ordered_keys: List[str] = []
+        key_aliases: Dict[str, str] = {}
+        key_by_output_index: Dict[int, str] = {}
+
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+
+            event_type = parsed_chunk.get("type")
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                item = parsed_chunk.get("item")
+                if not isinstance(item, dict):
+                    continue
+                raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+                    item=item,
+                    output_index=parsed_chunk.get("output_index"),
+                    fallback_index=len(ordered_keys),
+                )
+                output_index = parsed_chunk.get("output_index")
+                if isinstance(output_index, int) and output_index in key_by_output_index:
+                    key = key_by_output_index[output_index]
+                else:
+                    key = key_aliases.get(raw_key, raw_key)
+                if key not in ordered_keys:
+                    ordered_keys.append(key)
+                existing = output_items.get(key, {})
+                merged_item = {**existing, **item}
+                if "arguments" in existing and "arguments" not in item:
+                    merged_item["arguments"] = existing["arguments"]
+                output_items[key] = merged_item
+                if isinstance(output_index, int):
+                    key_by_output_index[output_index] = key
+                for alias in (
+                    raw_key,
+                    item.get("id"),
+                    item.get("call_id"),
+                ):
+                    if isinstance(alias, str) and alias.strip():
+                        key_aliases[alias.strip()] = key
+                continue
+
+            if event_type in {
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.mcp_call_arguments.delta",
+                "response.mcp_call_arguments.done",
+            }:
+                item_id = parsed_chunk.get("item_id")
+                output_index = parsed_chunk.get("output_index")
+                raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+                    output_index=parsed_chunk.get("output_index"),
+                    item_id=item_id,
+                    fallback_index=len(ordered_keys),
+                )
+                if isinstance(output_index, int) and output_index in key_by_output_index:
+                    key = key_by_output_index[output_index]
+                else:
+                    key = key_aliases.get(raw_key, raw_key)
+                if key not in ordered_keys:
+                    ordered_keys.append(key)
+                existing = output_items.get(key, {})
+                if not existing:
+                    item_type = "mcp_call" if "mcp_call" in str(event_type) else "function_call"
+                    existing = {
+                        "type": item_type,
+                        "id": item_id,
+                    }
+                    if item_type == "function_call" and isinstance(item_id, str) and item_id:
+                        existing["call_id"] = item_id
+                value = parsed_chunk.get("arguments")
+                if not isinstance(value, str):
+                    value = parsed_chunk.get("delta")
+                if isinstance(value, str):
+                    if str(event_type).endswith(".delta"):
+                        existing["arguments"] = f"{existing.get('arguments', '')}{value}"
+                    else:
+                        existing["arguments"] = value
+                output_items[key] = existing
+                if isinstance(output_index, int):
+                    key_by_output_index[output_index] = key
+                if isinstance(item_id, str) and item_id.strip():
+                    key_aliases[item_id.strip()] = key
+
+        return [output_items[key] for key in ordered_keys if key in output_items]
 
     @staticmethod
     def _calculate_image_generation_cost(
@@ -659,6 +811,15 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
             completed_response = ResponsesAPIResponse(**completed_response_payload)
             responses_output = completed_response_payload.get("output")
+            reconstructed_output = (
+                OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
+                    all_chunks
+                )
+            )
+            merged_output = OpenAIPassthroughLoggingHandler._merge_responses_output_lists(
+                responses_output if isinstance(responses_output, list) else [],
+                reconstructed_output,
+            )
             if len(getattr(completed_response, "output", []) or []) == 0:
                 model_response = litellm.ModelResponse()
                 model_response.model = getattr(completed_response, "model", None) or model
@@ -681,8 +842,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 )
                 if raw_response_hidden_params:
                     model_response._hidden_params.update(raw_response_hidden_params)
-                if isinstance(responses_output, list):
-                    model_response._hidden_params["responses_output"] = responses_output
+                if merged_output:
+                    model_response._hidden_params["responses_output"] = merged_output
                 return model_response
 
             model_response = responses_transformer.transform_response(
@@ -706,8 +867,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 getattr(backfilled_response, "_hidden_params", None), dict
             ):
                 backfilled_response._hidden_params = {}
-            if isinstance(responses_output, list):
-                backfilled_response._hidden_params["responses_output"] = responses_output
+            if merged_output:
+                backfilled_response._hidden_params["responses_output"] = merged_output
             return backfilled_response
         except Exception as e:
             verbose_proxy_logger.error(
