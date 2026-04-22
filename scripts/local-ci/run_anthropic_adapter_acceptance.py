@@ -65,6 +65,29 @@ def _parse_command_output_json(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def _resolve_env_placeholders(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _resolve_env_placeholders(child) for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_resolve_env_placeholders(child) for child in value]
+    if isinstance(value, str):
+        return os.path.expandvars(value)
+    return value
+
+
+def _missing_required_env(config: dict[str, Any]) -> list[str]:
+    required_env = config.get('required_env') or []
+    if not isinstance(required_env, list):
+        return []
+    return [
+        value
+        for value in required_env
+        if isinstance(value, str) and value and not os.environ.get(value)
+    ]
+
+
 def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     failures: list[str] = []
     parsed = _parse_command_output_json(stdout)
@@ -246,6 +269,44 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     return {'record': normalized_record, 'records': [_normalize_record(row) for row in records]}, failures
 
 
+def _downgrade_configured_failures_to_warnings(
+    *,
+    failures: list[str],
+    config: dict[str, Any],
+    command_json_summary: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    rules = config.get('downgrade_failures_to_warnings') or []
+    if not rules or not failures:
+        return failures, []
+
+    parsed_command = command_json_summary.get('parsed')
+    command_result_text = (
+        parsed_command.get('result')
+        if isinstance(parsed_command, dict)
+        and isinstance(parsed_command.get('result'), str)
+        else ''
+    )
+
+    remaining_failures: list[str] = []
+    warning_messages: list[str] = []
+    for failure in failures:
+        downgraded = False
+        for rule in rules:
+            failure_contains = rule.get('failure_contains')
+            result_contains = rule.get('if_command_result_contains')
+            if not isinstance(failure_contains, str) or failure_contains not in failure:
+                continue
+            if isinstance(result_contains, str) and result_contains not in command_result_text:
+                continue
+            warning_messages.append(f'downgraded failure: {failure}')
+            downgraded = True
+            break
+        if not downgraded:
+            remaining_failures.append(failure)
+
+    return remaining_failures, warning_messages
+
+
 
 def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
     retry_statuses = {int(value) for value in (config.get('retry_on_api_error_statuses') or [])}
@@ -304,17 +365,17 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
 
     expected_trace_names = config.get('required_trace_names', [])
     expected_user_ids = config.get('expected_user_ids', [])
-    if isinstance(command_session_id, str) and command_session_id.strip():
-        traces, lookup_error = RA._poll_langfuse_session_traces(
-            query_url=query_url,
-            public_key=public_key,
-            secret_key=secret_key,
-            user_id=expected_user_ids[0] if expected_user_ids else None,
-            start_time=started,
-            session_id=command_session_id.strip(),
-            timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
-        )
-    else:
+    use_session_trace_lookup = bool(config.get('use_session_trace_lookup', True))
+    can_session_trace_lookup = (
+        use_session_trace_lookup
+        and isinstance(command_session_id, str)
+        and command_session_id.strip()
+    )
+    if expected_trace_names:
+        # Prefer name-based lookup when the suite already knows which traces should exist.
+        # This avoids spending the full session lookup timeout on providers that log a
+        # null trace.sessionId; trace-context validation below still enforces sessionId
+        # requirements for the cases that care about them.
         traces, lookup_error = RA._poll_langfuse_required_name_traces(
             query_url=query_url,
             public_key=public_key,
@@ -325,6 +386,19 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             limit=100,
             timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
         )
+    elif can_session_trace_lookup:
+        traces, lookup_error = RA._poll_langfuse_session_traces(
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            user_id=expected_user_ids[0] if expected_user_ids else None,
+            start_time=started,
+            session_id=command_session_id.strip(),
+            timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
+        )
+    else:
+        traces = []
+        lookup_error = None
 
     actual_trace_names = sorted({trace.get('name') for trace in traces if trace.get('name')})
     actual_user_ids = sorted({trace.get('userId') for trace in traces if trace.get('userId')})
@@ -412,6 +486,33 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     failures.extend(request_text_failures)
     warnings.extend(request_text_warnings)
 
+    aawm_dynamic_injection_summary = None
+    aawm_dynamic_injection_config = config.get('aawm_dynamic_injection')
+    if isinstance(aawm_dynamic_injection_config, dict):
+        (
+            aawm_dynamic_injection_summary,
+            aawm_dynamic_injection_failures,
+            aawm_dynamic_injection_warnings,
+        ) = RA._validate_aawm_dynamic_injection(
+            family=name,
+            observations=raw_generation_observations,
+            required_proc=aawm_dynamic_injection_config.get(
+                'required_proc', 'get_agent_memories'
+            ),
+            required_context_keys=aawm_dynamic_injection_config.get(
+                'required_context_keys'
+            ),
+            acceptable_statuses=aawm_dynamic_injection_config.get(
+                'acceptable_statuses'
+            ),
+            warning_statuses=aawm_dynamic_injection_config.get('warning_statuses'),
+            no_memory_required_substrings=aawm_dynamic_injection_config.get(
+                'no_memory_required_substrings'
+            ),
+        )
+        failures.extend(aawm_dynamic_injection_failures)
+        warnings.extend(aawm_dynamic_injection_warnings)
+
     _, span_observations, span_failures = RA._validate_span_observations(
         family=name,
         query_url=query_url,
@@ -443,6 +544,12 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('runtime_postconditions') or {},
     )
     failures.extend(runtime_failures)
+    failures, downgraded_warnings = _downgrade_configured_failures_to_warnings(
+        failures=failures,
+        config=config,
+        command_json_summary=command_json_summary,
+    )
+    warnings.extend(downgraded_warnings)
 
     warning_only = bool(config.get('warning_only'))
     unique_failures = sorted(set(failures))
@@ -474,6 +581,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             'generation_metadata': generation_metadata_summary,
             'request_payload_checks': request_payload_summary,
             'request_text_checks': request_text_summary,
+            'aawm_dynamic_injection': aawm_dynamic_injection_summary,
             'span_observations': span_observations,
             'generation_observations': generation_observations,
         },
@@ -498,9 +606,24 @@ def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {'passed': not failures, 'failures': failures, 'warnings': warnings}
 
 
+def _write_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:
+    path.write_text(json.dumps(artifact, indent=2) + '\n', encoding='utf-8')
+
+
 def _parse_selected_cases(raw: str | None, available: list[str]) -> list[str]:
+    preferred_order = [
+        'claude_adapter_gpt54',
+        'claude_adapter_gpt54_mini',
+        'claude_adapter_ctx_marker',
+        'claude_adapter_gemini_fanout',
+        'claude_adapter_peeromega_fanout',
+    ]
     if not raw:
-        return available
+        priority = {name: index for index, name in enumerate(preferred_order)}
+        return sorted(
+            available,
+            key=lambda name: (priority.get(name, len(preferred_order)), available.index(name)),
+        )
     requested = [value.strip() for value in raw.split(',') if value.strip()]
     invalid = [value for value in requested if value not in available]
     if invalid:
@@ -519,7 +642,7 @@ def main() -> int:
     config_path = pathlib.Path(args.config)
     artifact_path = pathlib.Path(args.write_artifact)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    config = RA._load_json(config_path)
+    config = _resolve_env_placeholders(RA._load_json(config_path))
 
     public_key_env = config.get('langfuse_public_key_env', 'LANGFUSE_PUBLIC_KEY')
     secret_key_env = config.get('langfuse_secret_key_env', 'LANGFUSE_SECRET_KEY')
@@ -550,9 +673,24 @@ def main() -> int:
         'results': {},
         'summary': {},
     }
+    artifact['summary'] = _build_summary(artifact['results'])
+    _write_artifact(artifact_path, artifact)
 
     for case_name in selected_cases:
+        print(f'[start] {case_name}', file=sys.stderr, flush=True)
         try:
+            missing_required_env = _missing_required_env(cases[case_name])
+            if missing_required_env:
+                artifact['results'][case_name] = {
+                    'passed': True,
+                    'skipped': True,
+                    'failures': [],
+                    'soft_failures': [],
+                    'warnings': [
+                        f'missing required env: {", ".join(sorted(missing_required_env))}'
+                    ],
+                }
+                continue
             artifact['results'][case_name] = _validate_case(
                 case_name,
                 cases[case_name],
@@ -563,9 +701,21 @@ def main() -> int:
             )
         except Exception as exc:
             artifact['results'][case_name] = RA._family_error_result(case_name, exc)
+        finally:
+            artifact['summary'] = _build_summary(artifact['results'])
+            _write_artifact(artifact_path, artifact)
+            case_result = artifact['results'].get(case_name, {})
+            print(
+                f"[done] {case_name} passed={case_result.get('passed')} "
+                f"skipped={case_result.get('skipped', False)} "
+                f"failures={len(case_result.get('failures', []))} "
+                f"warnings={len(case_result.get('warnings', []))}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     artifact['summary'] = _build_summary(artifact['results'])
-    artifact_path.write_text(json.dumps(artifact, indent=2) + '\n', encoding='utf-8')
+    _write_artifact(artifact_path, artifact)
     print(json.dumps(artifact['summary'], indent=2))
     return 0 if artifact['summary']['passed'] else 1
 

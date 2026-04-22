@@ -12,8 +12,9 @@ services:
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
       - ./litellm/utils.py:/app/litellm/utils.py
+      - ./litellm/litellm_core_utils/get_model_cost_map.py:/app/litellm/litellm_core_utils/get_model_cost_map.py
       - ./litellm/litellm_core_utils/prompt_templates/factory.py:/app/litellm/litellm_core_utils/prompt_templates/factory.py
-      - ./litellm/model_prices_and_context_window_backup.json:/app/litellm/model_prices_and_context_window_backup.json
+      - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json
       - ./litellm/types/llms/anthropic.py:/app/litellm/types/llms/anthropic.py
       - ./litellm/types/llms/anthropic_messages/anthropic_response.py:/app/litellm/types/llms/anthropic_messages/anthropic_response.py
       - ./litellm/types/llms/openai.py:/app/litellm/types/llms/openai.py
@@ -29,6 +30,7 @@ services:
       - ./litellm/proxy/pass_through_endpoints/streaming_handler.py:/app/litellm/proxy/pass_through_endpoints/streaming_handler.py
       - ./litellm/proxy/pass_through_endpoints/success_handler.py:/app/litellm/proxy/pass_through_endpoints/success_handler.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py
+      - ./litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py:/app/litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py
       - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
@@ -41,6 +43,8 @@ services:
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
       # Gemini OAuth tokens for Anthropic->Google adapter testing
       - /home/zepfu/.gemini:/home/zepfu/.gemini:ro
+      # Gemini CLI install for OAuth client fallback during local adapter testing
+      - /home/zepfu/.nvm/versions/node:/home/zepfu/.nvm/versions/node:ro
       # Capture output — written to /tmp/captures inside container, visible on host
       - ./captures:/tmp/captures
     environment:
@@ -75,13 +79,16 @@ services:
       - AAWM_CAPTURE=${AAWM_CAPTURE:-0}
       - LITELLM_LOG=${LITELLM_LOG:-INFO}
       - AAWM_GEMINI_ROUTE_DEBUG=${AAWM_GEMINI_ROUTE_DEBUG:-0}
-      - AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS=${AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS:-300}
+      - AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS=${AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS:-30}
       - AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=${AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS:-20}
       - AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS=${AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS:-2,4,8,12}
       - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
       - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
       - LITELLM_CODEX_AUTH_FILE=${LITELLM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}
       - LITELLM_GEMINI_AUTH_FILE=${LITELLM_GEMINI_AUTH_FILE:-/home/zepfu/.gemini/oauth_creds.json}
+      - LITELLM_GEMINI_OAUTH_CLIENT_ID=${LITELLM_GEMINI_OAUTH_CLIENT_ID:-}
+      - LITELLM_GEMINI_OAUTH_CLIENT_SECRET=${LITELLM_GEMINI_OAUTH_CLIENT_SECRET:-}
+      - LITELLM_GEMINI_CLI_BUNDLE_PATH=${LITELLM_GEMINI_CLI_BUNDLE_PATH:-}
       - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api}

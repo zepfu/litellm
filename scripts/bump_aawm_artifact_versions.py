@@ -54,7 +54,7 @@ GROUPS = (
         name="config",
         paths=(
             "model_prices_and_context_window.json",
-            "litellm/model_prices_and_context_window_backup.json",
+            "litellm/bundled_model_prices_and_context_window_fallback.json",
             "scripts/build_model_config_bundle.py",
         ),
         version_file=ROOT / "model-config-version.txt",

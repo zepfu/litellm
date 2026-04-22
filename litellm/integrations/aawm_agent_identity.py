@@ -3085,6 +3085,7 @@ def _enrich_trace_name_and_provider_metadata(
     agent_name = _extract_agent_name(kwargs)
     headers = _ensure_mutable_headers(kwargs)
     metadata = _ensure_mutable_metadata(kwargs)
+    session_id = _extract_session_id(kwargs)
 
     if headers:
         current = headers.get("langfuse_trace_name")
@@ -3100,6 +3101,8 @@ def _enrich_trace_name_and_provider_metadata(
         metadata["trace_name"] = f"claude-code.{agent_name}"
     elif not current_trace_name:
         metadata["trace_name"] = agent_name
+    if session_id and not metadata.get("session_id"):
+        metadata["session_id"] = session_id
 
     message = _extract_first_response_message(result)
     if message is not None:

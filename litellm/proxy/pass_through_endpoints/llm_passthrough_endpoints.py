@@ -10,6 +10,7 @@ import ast
 import asyncio
 import base64
 import codecs
+import glob
 import importlib
 import hashlib
 import json
@@ -154,17 +155,21 @@ _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
 _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
     {
         "gpt-5.4",
+        "gpt-5.4-mini",
         "gpt-5.3-codex-spark",
     }
 )
 _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
     {
         "openrouter/free",
+        "inclusionai/ling-2.6-flash:free",
         "google/gemma-4-31b-it:free",
         "google/gemma-4-26b-a4b-it:free",
         "nvidia/nemotron-3-super-120b-a12b:free",
         "meta-llama/llama-3.3-70b-instruct:free",
         "minimax/minimax-m2.5:free",
+        "openai/gpt-oss-20b:free",
+        "openai/gpt-oss-120b:free",
         "gpt-oss-20b:free",
         "gpt-oss-120b:free",
         "qwen/qwen3-coder:free",
@@ -177,9 +182,7 @@ _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = frozenset(
 )
 _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES = (
     "gemini-3.1",
-    "gemini/gemini-3.1",
     "gemini-3-flash-preview",
-    "gemini/gemini-3-flash-preview",
 )
 _ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST = (
     "authorization",
@@ -232,7 +235,21 @@ _ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_SECRET_ENV_VARS = (
     "LITELLM_GEMINI_OAUTH_CLIENT_SECRET",
     "GEMINI_OAUTH_CLIENT_SECRET",
 )
+_ANTHROPIC_ADAPTER_GEMINI_CLI_BUNDLE_PATH_ENV_VARS = (
+    "LITELLM_GEMINI_CLI_BUNDLE_PATH",
+    "GEMINI_CLI_BUNDLE_PATH",
+)
+_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_CLI_BUNDLE_GLOBS = (
+    "/home/zepfu/.nvm/versions/node/*/lib/node_modules/@google/gemini-cli/bundle",
+    "~/.nvm/versions/node/*/lib/node_modules/@google/gemini-cli/bundle",
+)
 _ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN = re.compile(
+    r'OAUTH_CLIENT_ID\s*=\s*"(?P<value>[^"]+)"'
+)
+_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN = re.compile(
+    r'OAUTH_CLIENT_SECRET\s*=\s*"(?P<value>[^"]+)"'
+)
 _CLAUDE_AGENT_SPEC_DIR_ENV_VARS = (
     "LITELLM_CLAUDE_AGENTS_DIR",
     "CLAUDE_AGENTS_DIR",
@@ -402,119 +419,159 @@ def _has_direct_request_header(request: Request, header_name: str) -> bool:
     return isinstance(value, str) and len(value.strip()) > 0
 
 
-def _normalize_anthropic_responses_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
+def _normalize_anthropic_adapter_model_name(model: Any) -> Optional[str]:
     if not isinstance(model, str):
         return None
     normalized_model = model.strip()
-    if not normalized_model:
-        return None
-    for prefix in ("openai/", "chatgpt/"):
-        if normalized_model.startswith(prefix):
-            normalized_model = normalized_model[len(prefix) :]
-            break
-
-    openrouter_model_aliases = {
-        "elephant-alpha": "openrouter/elephant-alpha",
-        "meta-llama/llama-3.3-70b-instructfree": "meta-llama/llama-3.3-70b-instruct:free",
-    }
-    normalized_model = openrouter_model_aliases.get(normalized_model, normalized_model)
     return normalized_model or None
 
 
-def _resolve_anthropic_responses_adapter_model_from_allowlist(
-    request_body: dict[str, Any],
-    endpoint: str,
-    allowlist: frozenset[str],
-) -> Optional[str]:
-    normalized_endpoint = endpoint.strip()
-    if not normalized_endpoint.startswith("/"):
-        normalized_endpoint = f"/{normalized_endpoint}"
-    if normalized_endpoint not in _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS:
-        return None
+def _split_anthropic_adapter_provider_prefix(model: Any) -> tuple[Optional[str], Optional[str]]:
+    normalized_model = _normalize_anthropic_adapter_model_name(model)
+    if normalized_model is None:
+        return None, None
+    if "/" not in normalized_model:
+        return None, normalized_model
 
-    normalized_model = _normalize_anthropic_responses_adapter_model_name(
-        request_body.get("model")
-    )
-    if normalized_model in allowlist:
-        return normalized_model
+    prefix, remainder = normalized_model.split("/", 1)
+    provider = {
+        "chatgpt": "openai",
+        "gemini": "google",
+    }.get(prefix, prefix if prefix in ("openai", "google", "openrouter") else None)
+    if provider is None:
+        return None, normalized_model
+    return provider, remainder.strip()
+
+
+def _get_anthropic_adapter_model_candidates(request_body: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    requested_model = _normalize_anthropic_adapter_model_name(request_body.get("model"))
+    if requested_model is not None:
+        candidates.append(requested_model)
 
     agent_name, _tenant = _extract_claude_agent_and_tenant_from_request_body(request_body)
     if not agent_name:
+        return candidates
+
+    agent_model = _normalize_anthropic_adapter_model_name(
+        _load_claude_agent_declared_model(agent_name)
+    )
+    if agent_model is not None:
+        candidates.append(agent_model)
+    return candidates
+
+
+def _has_anthropic_responses_adapter_endpoint(endpoint: str) -> bool:
+    normalized_endpoint = endpoint.strip()
+    if not normalized_endpoint.startswith("/"):
+        normalized_endpoint = f"/{normalized_endpoint}"
+    return normalized_endpoint in _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS
+
+
+def _normalize_anthropic_openai_responses_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider not in (None, "openai") or candidate is None:
+        return None
+    if candidate in _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS:
+        return candidate
+    return None
+
+
+def _normalize_anthropic_openrouter_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    normalized_candidate = (
+        candidate
+        if explicit_provider == "openrouter"
+        else _normalize_anthropic_adapter_model_name(model)
+    )
+    if normalized_candidate is None:
         return None
 
-    agent_model = _load_claude_agent_declared_model(agent_name)
-    normalized_agent_model = _normalize_anthropic_responses_adapter_model_name(
-        agent_model
+    openrouter_model_aliases = {
+        "free": "openrouter/free",
+        "elephant-alpha": "openrouter/elephant-alpha",
+        "ling-2-6-flash": "inclusionai/ling-2.6-flash:free",
+        "meta-llama/llama-3.3-70b-instructfree": (
+            "meta-llama/llama-3.3-70b-instruct:free"
+        ),
+    }
+    normalized_candidate = openrouter_model_aliases.get(
+        normalized_candidate, normalized_candidate
     )
-    if normalized_agent_model in allowlist:
-        return normalized_agent_model
+    return normalized_candidate or None
+
+
+def _normalize_anthropic_google_completion_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider not in (None, "google") or candidate is None:
+        return None
+    normalized_candidate = _normalize_google_completion_adapter_model_name(candidate)
+    if normalized_candidate.startswith(
+        _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES
+    ):
+        return normalized_candidate
     return None
+
 
 def _resolve_anthropic_openai_responses_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
 ) -> Optional[str]:
-    return _resolve_anthropic_responses_adapter_model_from_allowlist(
-        request_body,
-        endpoint,
-        _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS,
-    )
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_openai_responses_adapter_model_name(
+            candidate
+        )
+        if normalized_model is not None:
+            return normalized_model
+    return None
 
 
 def _resolve_anthropic_openrouter_completion_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
 ) -> Optional[str]:
-    return _resolve_anthropic_responses_adapter_model_from_allowlist(
-        request_body,
-        endpoint,
-        _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS,
-    )
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
+        if normalized_model in _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS:
+            return normalized_model
+    return None
 
 
 def _resolve_anthropic_openrouter_responses_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
 ) -> Optional[str]:
-    return _resolve_anthropic_responses_adapter_model_from_allowlist(
-        request_body,
-        endpoint,
-        _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS,
-    )
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
+        if normalized_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS:
+            return normalized_model
+    return None
 
 
 def _resolve_anthropic_google_completion_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
 ) -> Optional[str]:
-    normalized_endpoint = endpoint.strip()
-    if not normalized_endpoint.startswith("/"):
-        normalized_endpoint = f"/{normalized_endpoint}"
-    if normalized_endpoint not in _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
         return None
-
-    normalized_model = _normalize_anthropic_responses_adapter_model_name(
-        request_body.get("model")
-    )
-    if isinstance(normalized_model, str) and normalized_model.startswith(
-        _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES
-    ):
-        return normalized_model
-
-    agent_name, _tenant = _extract_claude_agent_and_tenant_from_request_body(request_body)
-    if not agent_name:
-        return None
-
-    agent_model = _load_claude_agent_declared_model(agent_name)
-    normalized_agent_model = _normalize_anthropic_responses_adapter_model_name(
-        agent_model
-    )
-    if isinstance(normalized_agent_model, str) and normalized_agent_model.startswith(
-        _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES
-    ):
-        return normalized_agent_model
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_google_completion_adapter_model_name(
+            candidate
+        )
+        if normalized_model is not None:
+            return normalized_model
     return None
 
 
@@ -533,6 +590,100 @@ def _get_anthropic_adapter_google_auth_file_path() -> Optional[Path]:
             return candidate
 
     return None
+
+
+def _extract_google_oauth_client_values_from_bundle_text(
+    bundle_text: str,
+) -> tuple[Optional[str], Optional[str]]:
+    client_id_match = _ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN.search(
+        bundle_text
+    )
+    client_secret_match = (
+        _ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN.search(bundle_text)
+    )
+    client_id = (
+        _clean_codex_auth_value(client_id_match.group("value"))
+        if client_id_match is not None
+        else None
+    )
+    client_secret = (
+        _clean_codex_auth_value(client_secret_match.group("value"))
+        if client_secret_match is not None
+        else None
+    )
+    return client_id, client_secret
+
+
+def _add_google_cli_bundle_candidate_files(
+    raw_path: Path, candidate_files: list[Path], seen_paths: set[str]
+) -> None:
+    path = raw_path.expanduser()
+    if not path.exists():
+        return
+
+    if path.is_file():
+        resolved = str(path.resolve())
+        if resolved not in seen_paths:
+            seen_paths.add(resolved)
+            candidate_files.append(path)
+        return
+
+    bundle_dir = path
+    if (bundle_dir / "bundle").is_dir():
+        bundle_dir = bundle_dir / "bundle"
+    elif (
+        bundle_dir / "lib" / "node_modules" / "@google" / "gemini-cli" / "bundle"
+    ).is_dir():
+        bundle_dir = (
+            bundle_dir / "lib" / "node_modules" / "@google" / "gemini-cli" / "bundle"
+        )
+
+    chunk_files = sorted(bundle_dir.glob("chunk-*.js"))
+    gemini_bundle = bundle_dir / "gemini.js"
+    ordered_files = chunk_files + ([gemini_bundle] if gemini_bundle.is_file() else [])
+    for candidate in ordered_files:
+        resolved = str(candidate.resolve())
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        candidate_files.append(candidate)
+
+
+def _iter_google_oauth_client_bundle_candidates() -> list[Path]:
+    candidate_files: list[Path] = []
+    seen_paths: set[str] = set()
+
+    for env_name in _ANTHROPIC_ADAPTER_GEMINI_CLI_BUNDLE_PATH_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if raw_value:
+            _add_google_cli_bundle_candidate_files(
+                Path(raw_value), candidate_files, seen_paths
+            )
+
+    for bundle_glob in _ANTHROPIC_ADAPTER_GEMINI_DEFAULT_CLI_BUNDLE_GLOBS:
+        for matched_path in sorted(glob.glob(os.path.expanduser(bundle_glob)), reverse=True):
+            _add_google_cli_bundle_candidate_files(
+                Path(matched_path), candidate_files, seen_paths
+            )
+
+    return candidate_files
+
+
+def _load_google_oauth_client_values_from_local_gemini_cli_bundle(
+) -> tuple[Optional[str], Optional[str]]:
+    for candidate in _iter_google_oauth_client_bundle_candidates():
+        try:
+            bundle_text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        client_id, client_secret = _extract_google_oauth_client_values_from_bundle_text(
+            bundle_text
+        )
+        if client_id and client_secret:
+            return client_id, client_secret
+
+    return None, None
 
 
 async def _load_local_google_oauth_credentials() -> tuple[dict[str, Any], Path]:
@@ -608,10 +759,17 @@ async def _refresh_local_google_oauth_credentials(
         _ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_SECRET_ENV_VARS,
     )
     if client_id is None or client_secret is None:
+        (
+            bundle_client_id,
+            bundle_client_secret,
+        ) = _load_google_oauth_client_values_from_local_gemini_cli_bundle()
+        client_id = client_id or bundle_client_id
+        client_secret = client_secret or bundle_client_secret
+    if client_id is None or client_secret is None:
         raise HTTPException(
             status_code=500,
             detail=(
-                "Gemini OAuth credentials do not contain client_id/client_secret and no fallback env vars are set. "
+                "Gemini OAuth credentials do not contain client_id/client_secret and no fallback env vars or Gemini CLI bundle were found. "
                 "Re-authenticate Gemini CLI or configure Gemini OAuth client env vars before using Gemini Anthropic adapter models."
             ),
         )
@@ -837,14 +995,13 @@ def _get_google_code_assist_prime_ttl_seconds() -> float:
         os.getenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS")
     )
     if raw_value is None:
-        # Native Gemini CLI refreshes quota/admin preflight on each interaction.
-        # Default to no preflight caching so the Anthropic adapter follows the
-        # same behavior unless we explicitly opt back into caching.
-        return 0.0
+        # Current Gemini CLI caches Code Assist user/project setup for 30s.
+        # Match that default instead of re-priming on every adapted request.
+        return 30.0
     try:
         parsed = float(raw_value)
     except Exception:
-        return 0.0
+        return 30.0
     return max(0.0, parsed)
 
 
@@ -867,7 +1024,36 @@ def _get_google_adapter_max_concurrent() -> int:
     return max(1, parsed)
 
 
-def _get_google_adapter_rate_limit_key(model: Optional[str]) -> str:
+def _get_google_adapter_shared_lane_key(
+    *,
+    access_token: Optional[str],
+    companion_project: Optional[str],
+) -> Optional[str]:
+    # Gemini CLI's Code Assist envelope matches our request shape, but its
+    # actual traffic is serialized on the shared account/project lane instead of
+    # being split by model id. Mirror that here to avoid fanout-only 429s.
+    cleaned_access_token = _clean_codex_auth_value(access_token)
+    cleaned_companion_project = _clean_codex_auth_value(companion_project)
+    if cleaned_access_token is None or cleaned_companion_project is None:
+        return None
+    return _get_google_code_assist_prime_cache_key(
+        cleaned_access_token,
+        cleaned_companion_project,
+    )
+
+
+def _get_google_adapter_rate_limit_key(
+    model: Optional[str],
+    *,
+    access_token: Optional[str] = None,
+    companion_project: Optional[str] = None,
+) -> str:
+    shared_lane_key = _get_google_adapter_shared_lane_key(
+        access_token=access_token,
+        companion_project=companion_project,
+    )
+    if shared_lane_key is not None:
+        return shared_lane_key
     normalized = _clean_codex_auth_value(model)
     if normalized is None:
         return "__default__"
@@ -875,15 +1061,36 @@ def _get_google_adapter_rate_limit_key(model: Optional[str]) -> str:
 
 
 def _get_google_adapter_rate_limit_key_from_kwargs(kwargs: dict[str, Any]) -> str:
+    explicit_rate_limit_key = _clean_codex_auth_value(
+        cast(Optional[str], kwargs.get("google_adapter_rate_limit_key"))
+    )
+    if explicit_rate_limit_key is not None:
+        return explicit_rate_limit_key
     custom_body = kwargs.get("custom_body")
     model = custom_body.get("model") if isinstance(custom_body, dict) else None
-    return _get_google_adapter_rate_limit_key(cast(Optional[str], model))
+    project = custom_body.get("project") if isinstance(custom_body, dict) else None
+    access_token = cast(Optional[str], kwargs.get("google_access_token"))
+    return _get_google_adapter_rate_limit_key(
+        cast(Optional[str], model),
+        access_token=access_token,
+        companion_project=cast(Optional[str], project),
+    )
 
 
-def _get_google_adapter_semaphore(model: Optional[str] = None) -> asyncio.Semaphore:
+def _get_google_adapter_semaphore(
+    model: Optional[str] = None,
+    *,
+    access_token: Optional[str] = None,
+    companion_project: Optional[str] = None,
+    rate_limit_key: Optional[str] = None,
+) -> asyncio.Semaphore:
     max_concurrent = _get_google_adapter_max_concurrent()
-    rate_limit_key = _get_google_adapter_rate_limit_key(model)
-    semaphore_key = (rate_limit_key, max_concurrent)
+    resolved_rate_limit_key = _clean_codex_auth_value(rate_limit_key) or _get_google_adapter_rate_limit_key(
+        model,
+        access_token=access_token,
+        companion_project=companion_project,
+    )
+    semaphore_key = (resolved_rate_limit_key, max_concurrent)
     semaphore = _google_adapter_semaphores.get(semaphore_key)
     if semaphore is None:
         semaphore = asyncio.Semaphore(max_concurrent)
@@ -1627,12 +1834,15 @@ async def _set_google_adapter_cooldown(rate_limit_key: str, wait_seconds: float)
 
 
 async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Response:
+    passthrough_kwargs = dict(kwargs)
     max_retries = _get_google_adapter_max_retries()
     total_attempts = max_retries + 1
     capacity_total_attempts = _get_google_adapter_model_capacity_max_retries() + 1
     hidden_retry_budget_seconds = _get_google_adapter_hidden_retry_budget_seconds()
     accumulated_hidden_wait_seconds = 0.0
     rate_limit_key = _get_google_adapter_rate_limit_key_from_kwargs(kwargs)
+    passthrough_kwargs.pop("google_access_token", None)
+    passthrough_kwargs.pop("google_adapter_rate_limit_key", None)
     attempt = 0
     while True:
         attempt += 1
@@ -1643,7 +1853,7 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
         )
         await _wait_for_google_adapter_cooldown_if_needed(rate_limit_key)
         try:
-            return await pass_through_request(**kwargs)
+            return await pass_through_request(**passthrough_kwargs)
         except Exception as exc:
             status_code = _extract_google_adapter_exception_status_code(exc)
             error_reason = _extract_google_adapter_error_reason(exc)
@@ -2323,7 +2533,7 @@ def _get_anthropic_adapter_google_target_base() -> str:
 
 def _normalize_google_completion_adapter_model_name(model: str) -> str:
     normalized_model = model.strip()
-    if normalized_model.startswith("gemini/"):
+    if normalized_model.startswith(("gemini/", "google/")):
         normalized_model = normalized_model.split("/", 1)[1]
 
     # Claude-facing agent configs use stable shorthand names or newer naming
@@ -3006,7 +3216,12 @@ async def _translate_google_code_assist_response_to_anthropic(
     )
 
 
-async def _iterate_google_code_assist_unwrapped_stream(body_iterator: Any, *, adapter_model: Optional[str] = None) -> Any:
+async def _iterate_google_code_assist_unwrapped_stream(
+    body_iterator: Any,
+    *,
+    adapter_model: Optional[str] = None,
+    rate_limit_key: Optional[str] = None,
+) -> Any:
     from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 
     async def _iter_event_block_lines(event_block: str):
@@ -3038,7 +3253,11 @@ async def _iterate_google_code_assist_unwrapped_stream(body_iterator: Any, *, ad
             ):
                 cooldown_seconds = _get_google_adapter_post_tool_cooldown_seconds()
                 if cooldown_seconds > 0:
-                    await _set_google_adapter_cooldown(_get_google_adapter_rate_limit_key(adapter_model), cooldown_seconds)
+                    await _set_google_adapter_cooldown(
+                        _clean_codex_auth_value(rate_limit_key)
+                        or _get_google_adapter_rate_limit_key(adapter_model),
+                        cooldown_seconds,
+                    )
                     post_tool_cooldown_armed = True
                     verbose_proxy_logger.info(
                         "Google adapter post-tool cooldown armed for %.1fs",
@@ -3071,6 +3290,7 @@ def _build_anthropic_streaming_response_from_google_code_assist_stream(
     adapter_model: str,
     tool_name_mapping: dict[str, str],
     gemini_optional_params: dict[str, Any],
+    rate_limit_key: Optional[str] = None,
 ) -> StreamingResponse:
     from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
         AnthropicAdapter,
@@ -3081,7 +3301,11 @@ def _build_anthropic_streaming_response_from_google_code_assist_stream(
 
     logging_obj = SimpleNamespace(optional_params=gemini_optional_params, post_call=lambda **_: None)
     completion_stream = ModelResponseIterator(
-        streaming_response=_iterate_google_code_assist_unwrapped_stream(response.body_iterator, adapter_model=adapter_model),
+        streaming_response=_iterate_google_code_assist_unwrapped_stream(
+            response.body_iterator,
+            adapter_model=adapter_model,
+            rate_limit_key=rate_limit_key,
+        ),
         sync_stream=False,
         logging_obj=logging_obj,
     )
@@ -3890,6 +4114,11 @@ async def _handle_anthropic_google_completion_adapter_route(
     requested_model = prepared_request_body.get("model")
     google_target_base = _get_anthropic_adapter_google_target_base()
     google_model = _normalize_google_completion_adapter_model_name(adapter_model)
+    google_adapter_rate_limit_key = _get_google_adapter_rate_limit_key(
+        google_model,
+        access_token=google_access_token,
+        companion_project=google_project,
+    )
     client_requested_stream = bool(prepared_request_body.get("stream"))
     is_stream = True
     target_endpoint_label = "/v1internal:streamGenerateContent"
@@ -4031,7 +4260,9 @@ async def _handle_anthropic_google_completion_adapter_route(
     )
     _annotate_request_scope_for_adapted_access_log(request, annotated_target_url)
 
-    google_adapter_semaphore = _get_google_adapter_semaphore(google_model)
+    google_adapter_semaphore = _get_google_adapter_semaphore(
+        rate_limit_key=google_adapter_rate_limit_key
+    )
     await google_adapter_semaphore.acquire()
     semaphore_released = False
 
@@ -4068,6 +4299,7 @@ async def _handle_anthropic_google_completion_adapter_route(
             custom_llm_provider=litellm.LlmProviders.GEMINI.value,
             egress_credential_family="google",
             expected_target_family="google",
+            google_adapter_rate_limit_key=google_adapter_rate_limit_key,
         )
 
         if not isinstance(upstream_response, StreamingResponse):
@@ -4082,6 +4314,7 @@ async def _handle_anthropic_google_completion_adapter_route(
                 adapter_model=google_model,
                 tool_name_mapping=tool_name_mapping,
                 gemini_optional_params=gemini_optional_params,
+                rate_limit_key=google_adapter_rate_limit_key,
             )
             stream_release_attached = True
             return _wrap_streaming_response_with_release_callback(
