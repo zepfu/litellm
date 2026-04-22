@@ -3,7 +3,7 @@
 ## In Progress
 
 - Keep `session_history` invariants enforced after the recent repair work.
-  Current target: `reasoning_tokens_source` should remain non-null for new rows, Gemini thought-signature fallback should persist as `provider_signature_present`, Anthropic zero placeholders must not be labeled `provider_reported`, and Anthropic/OpenAI/Gemini/OpenRouter rows should keep a normalized `provider_cache_status` / `provider_cache_miss_reason` shape in `session_history`.
+  Current target: `reasoning_tokens_source` should remain non-null for new rows, Gemini thought-signature fallback should persist as `provider_signature_present`, Anthropic zero placeholders must not be labeled `provider_reported`, and Anthropic/OpenAI/Gemini/OpenRouter rows should keep a normalized `provider_cache_status` / `provider_cache_miss_reason` shape in `session_history`. When the missed cache token count is explicit, keep `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` backfilled as well.
 
 - Keep Codex/OpenAI streaming tool activity aligned across Langfuse and `session_history`.
   Current target: `response.output_item.*` / `response.function_call_arguments.*` reconstruction should continue to yield `usage_tool_call_count`, `codex_tool_call_count`, and `session_history_tool_activity` rows for Claude-to-Codex tool runs on `:4001`.

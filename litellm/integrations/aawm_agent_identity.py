@@ -129,6 +129,8 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     provider_cache_status TEXT,
     provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE,
     provider_cache_miss_reason TEXT,
+    provider_cache_miss_token_count INTEGER,
+    provider_cache_miss_cost_usd DOUBLE PRECISION,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
     tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
     file_read_count INTEGER NOT NULL DEFAULT 0,
@@ -148,6 +150,8 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_status TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_reason TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_token_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_cost_usd DOUBLE PRECISION",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
@@ -209,6 +213,8 @@ INSERT INTO public.session_history (
     provider_cache_status,
     provider_cache_miss,
     provider_cache_miss_reason,
+    provider_cache_miss_token_count,
+    provider_cache_miss_cost_usd,
     tool_call_count,
     tool_names,
     file_read_count,
@@ -220,7 +226,7 @@ INSERT INTO public.session_history (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24, $25, $26, $27, $28::jsonb, $29, $30, $31, $32, $33, $34::jsonb
+    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb, $31, $32, $33, $34, $35, $36::jsonb
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -273,6 +279,16 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     provider_cache_miss_reason = COALESCE(
         NULLIF(EXCLUDED.provider_cache_miss_reason, ''),
         session_history.provider_cache_miss_reason
+    ),
+    provider_cache_miss_token_count = COALESCE(
+        GREATEST(session_history.provider_cache_miss_token_count, EXCLUDED.provider_cache_miss_token_count),
+        session_history.provider_cache_miss_token_count,
+        EXCLUDED.provider_cache_miss_token_count
+    ),
+    provider_cache_miss_cost_usd = COALESCE(
+        GREATEST(session_history.provider_cache_miss_cost_usd, EXCLUDED.provider_cache_miss_cost_usd),
+        session_history.provider_cache_miss_cost_usd,
+        EXCLUDED.provider_cache_miss_cost_usd
     ),
     tool_call_count = GREATEST(session_history.tool_call_count, EXCLUDED.tool_call_count),
     tool_names = CASE
@@ -354,6 +370,9 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "usage_provider_cache_status",
     "usage_provider_cache_miss",
     "usage_provider_cache_miss_reason",
+    "usage_provider_cache_miss_token_count",
+    "usage_provider_cache_miss_cost_usd",
+    "usage_provider_cache_miss_cost_basis",
     "usage_provider_cache_source",
     "usage_tool_call_count",
     "usage_tool_names",
@@ -1290,6 +1309,108 @@ def _usage_has_gemini_style_cached_content_field(usage_obj: Any) -> bool:
     return _has_nested_path(usage_obj, "cachedContentTokenCount")
 
 
+def _extract_service_tier_hint(
+    usage_obj: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    metadata = metadata or {}
+    for candidate in (
+        _maybe_get(usage_obj, "service_tier"),
+        _maybe_get(usage_obj, "serviceTier"),
+        metadata.get("service_tier"),
+        metadata.get("serviceTier"),
+        metadata.get("openai_service_tier"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _compute_provider_cache_miss_cost_state(
+    *,
+    provider_family: Optional[str],
+    model: str,
+    usage_obj: Any,
+    cache_state: Optional[Dict[str, Any]],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "miss_token_count": None,
+        "miss_cost_usd": None,
+        "miss_cost_basis": None,
+    }
+    if provider_family is None or cache_state is None:
+        return result
+    if cache_state.get("status") != "write":
+        return result
+
+    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
+    if cache_creation_input_tokens <= 0:
+        return result
+
+    service_tier = _extract_service_tier_hint(usage_obj, metadata)
+    prompt_tokens = max(_extract_prompt_tokens(usage_obj), cache_creation_input_tokens)
+
+    try:
+        from litellm.litellm_core_utils.llm_cost_calc.utils import (
+            _get_token_base_cost,
+            calculate_cache_writing_cost,
+        )
+        from litellm.types.utils import CacheCreationTokenDetails, Usage
+        from litellm.utils import get_model_info
+
+        prompt_tokens_details = _extract_prompt_tokens_details(usage_obj)
+        cache_creation_token_details = None
+        if isinstance(prompt_tokens_details, dict):
+            detail_5m = _safe_int(
+                _maybe_get(prompt_tokens_details, "ephemeral_5m_input_tokens")
+            )
+            detail_1h = _safe_int(
+                _maybe_get(prompt_tokens_details, "ephemeral_1h_input_tokens")
+            )
+            if detail_5m is not None or detail_1h is not None:
+                cache_creation_token_details = CacheCreationTokenDetails(
+                    ephemeral_5m_input_tokens=detail_5m,
+                    ephemeral_1h_input_tokens=detail_1h,
+                )
+
+        usage_for_cost = Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=0,
+            total_tokens=prompt_tokens,
+        )
+        model_info = get_model_info(
+            model=model,
+            custom_llm_provider=provider_family,
+        )
+        (
+            _prompt_base_cost,
+            _completion_base_cost,
+            cache_creation_cost,
+            cache_creation_cost_above_1hr,
+            cache_read_cost,
+        ) = _get_token_base_cost(
+            model_info=model_info,
+            usage=usage_for_cost,
+            service_tier=service_tier,
+        )
+
+        write_cost = calculate_cache_writing_cost(
+            cache_creation_tokens=cache_creation_input_tokens,
+            cache_creation_token_details=cache_creation_token_details,
+            cache_creation_cost_above_1hr=cache_creation_cost_above_1hr,
+            cache_creation_cost=cache_creation_cost,
+        )
+        read_cost = float(cache_creation_input_tokens) * float(cache_read_cost or 0.0)
+        miss_cost = max(float(write_cost) - float(read_cost), 0.0)
+        result["miss_token_count"] = cache_creation_input_tokens
+        result["miss_cost_usd"] = miss_cost
+        result["miss_cost_basis"] = "write_vs_read_delta"
+        return result
+    except Exception:
+        return result
+
+
 def _provider_cache_state_from_metadata(
     metadata: Dict[str, Any],
     provider_family: Optional[str],
@@ -1306,10 +1427,28 @@ def _provider_cache_state_from_metadata(
     miss_reason = metadata.get("usage_provider_cache_miss_reason")
     if miss_reason is None and provider_family:
         miss_reason = metadata.get(f"{provider_family}_provider_cache_miss_reason")
+    miss_token_count = metadata.get("usage_provider_cache_miss_token_count")
+    if miss_token_count is None and provider_family:
+        miss_token_count = metadata.get(f"{provider_family}_provider_cache_miss_token_count")
+    miss_cost_usd = metadata.get("usage_provider_cache_miss_cost_usd")
+    if miss_cost_usd is None and provider_family:
+        miss_cost_usd = metadata.get(f"{provider_family}_provider_cache_miss_cost_usd")
+    miss_cost_basis = metadata.get("usage_provider_cache_miss_cost_basis")
+    if miss_cost_basis is None and provider_family:
+        miss_cost_basis = metadata.get(f"{provider_family}_provider_cache_miss_cost_basis")
     source = metadata.get("usage_provider_cache_source")
     if source is None and provider_family:
         source = metadata.get(f"{provider_family}_provider_cache_source")
-    if status is None and attempted is None and miss is None and miss_reason is None and source is None:
+    if (
+        status is None
+        and attempted is None
+        and miss is None
+        and miss_reason is None
+        and miss_token_count is None
+        and miss_cost_usd is None
+        and miss_cost_basis is None
+        and source is None
+    ):
         return None
     normalized_status = str(status).strip() if isinstance(status, str) and status.strip() else None
     return {
@@ -1319,6 +1458,13 @@ def _provider_cache_state_from_metadata(
         "miss_reason": (
             str(miss_reason).strip()
             if isinstance(miss_reason, str) and str(miss_reason).strip()
+            else None
+        ),
+        "miss_token_count": _safe_int(miss_token_count),
+        "miss_cost_usd": _safe_float(miss_cost_usd),
+        "miss_cost_basis": (
+            str(miss_cost_basis).strip()
+            if isinstance(miss_cost_basis, str) and str(miss_cost_basis).strip()
             else None
         ),
         "source": str(source).strip() if isinstance(source, str) and str(source).strip() else None,
@@ -2205,12 +2351,26 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
     )
     if provider_family is None or cache_state is None:
         return
+    cache_miss_cost_state = _compute_provider_cache_miss_cost_state(
+        provider_family=provider_family,
+        model=resolved_model,
+        usage_obj=usage_obj,
+        cache_state=cache_state,
+        metadata=metadata,
+    )
+    cache_state.update(cache_miss_cost_state)
 
     metadata["usage_provider_cache_attempted"] = cache_state["attempted"]
     metadata["usage_provider_cache_status"] = cache_state["status"]
     metadata["usage_provider_cache_miss"] = cache_state["miss"]
     if cache_state.get("miss_reason"):
         metadata["usage_provider_cache_miss_reason"] = cache_state["miss_reason"]
+    if cache_state.get("miss_token_count") is not None:
+        metadata["usage_provider_cache_miss_token_count"] = cache_state["miss_token_count"]
+    if cache_state.get("miss_cost_usd") is not None:
+        metadata["usage_provider_cache_miss_cost_usd"] = cache_state["miss_cost_usd"]
+    if cache_state.get("miss_cost_basis"):
+        metadata["usage_provider_cache_miss_cost_basis"] = cache_state["miss_cost_basis"]
     if cache_state.get("source"):
         metadata["usage_provider_cache_source"] = cache_state["source"]
 
@@ -2220,6 +2380,18 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
     if cache_state.get("miss_reason"):
         metadata[f"{provider_family}_provider_cache_miss_reason"] = cache_state[
             "miss_reason"
+        ]
+    if cache_state.get("miss_token_count") is not None:
+        metadata[f"{provider_family}_provider_cache_miss_token_count"] = cache_state[
+            "miss_token_count"
+        ]
+    if cache_state.get("miss_cost_usd") is not None:
+        metadata[f"{provider_family}_provider_cache_miss_cost_usd"] = cache_state[
+            "miss_cost_usd"
+        ]
+    if cache_state.get("miss_cost_basis"):
+        metadata[f"{provider_family}_provider_cache_miss_cost_basis"] = cache_state[
+            "miss_cost_basis"
         ]
     if cache_state.get("source"):
         metadata[f"{provider_family}_provider_cache_source"] = cache_state["source"]
@@ -2260,6 +2432,9 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
                 "status": cache_state["status"],
                 "miss": cache_state["miss"],
                 "miss_reason": cache_state.get("miss_reason"),
+                "miss_token_count": cache_state.get("miss_token_count"),
+                "miss_cost_usd": cache_state.get("miss_cost_usd"),
+                "miss_cost_basis": cache_state.get("miss_cost_basis"),
                 "source": cache_state.get("source"),
             },
             start_time=datetime.now(timezone.utc),
@@ -2913,6 +3088,17 @@ def _build_session_history_record_from_langfuse_trace_observation(
         metadata=metadata,
         request_body=None,
     )
+    provider_cache_state = dict(provider_cache_state or {})
+    if provider_cache_state:
+        provider_cache_state.update(
+            _compute_provider_cache_miss_cost_state(
+                provider_family=provider,
+                model=str(observation.get("model") or ""),
+                usage_obj=usage_object,
+                cache_state=provider_cache_state,
+                metadata=metadata,
+            )
+        )
 
     history_metadata = _build_session_history_metadata(
         metadata=metadata,
@@ -2969,6 +3155,12 @@ def _build_session_history_record_from_langfuse_trace_observation(
         ),
         "provider_cache_miss_reason": (
             provider_cache_state.get("miss_reason") if provider_cache_state else None
+        ),
+        "provider_cache_miss_token_count": (
+            provider_cache_state.get("miss_token_count") if provider_cache_state else None
+        ),
+        "provider_cache_miss_cost_usd": (
+            provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
         ),
         "tool_call_count": tool_call_count,
         "tool_names": tool_names,
@@ -3205,6 +3397,21 @@ def _build_session_history_record(
         metadata=metadata,
         request_body=_extract_provider_cache_request_body(kwargs),
     )
+    provider_cache_state = dict(provider_cache_state or {})
+    if provider_cache_state:
+        provider_cache_state.update(
+            _compute_provider_cache_miss_cost_state(
+                provider_family=_normalize_provider_cache_family(
+                    kwargs.get("custom_llm_provider"),
+                    resolved_model,
+                    metadata,
+                ),
+                model=resolved_model,
+                usage_obj=usage_obj,
+                cache_state=provider_cache_state,
+                metadata=metadata,
+            )
+        )
 
     return {
         "litellm_call_id": kwargs.get("litellm_call_id"),
@@ -3240,6 +3447,12 @@ def _build_session_history_record(
         ),
         "provider_cache_miss_reason": (
             provider_cache_state.get("miss_reason") if provider_cache_state else None
+        ),
+        "provider_cache_miss_token_count": (
+            provider_cache_state.get("miss_token_count") if provider_cache_state else None
+        ),
+        "provider_cache_miss_cost_usd": (
+            provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
         ),
         "tool_call_count": tool_call_count,
         "tool_names": tool_names,
@@ -3322,6 +3535,8 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("provider_cache_status"),
         record.get("provider_cache_miss", False),
         record.get("provider_cache_miss_reason"),
+        record.get("provider_cache_miss_token_count"),
+        record.get("provider_cache_miss_cost_usd"),
         record["tool_call_count"],
         json.dumps(record["tool_names"]),
         record.get("file_read_count", 0),
