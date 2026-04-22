@@ -4373,6 +4373,128 @@ class TestClaudePersistedOutputExpansion:
         assert "claude_prompt_patch_ids" not in litellm_metadata
 
     @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_rewrites_commonmark_prompt_with_reference_identifiers(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+        aawm_claude_control_plane._aawm_dynamic_injection_cache.clear()
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {"user_id": {"session_id": "session-identifiers-1"}},
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.112.abc; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "You are 'eyes' and you are working on the 'aawm' project.\n"
+                        "Your output will be displayed on a command line interface. "
+                        "Your responses should be short and concise. "
+                        "You can use Github-flavored markdown for formatting, and will be rendered in a "
+                        "monospace font using the CommonMark specification.\n"
+                    ),
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._call_aawm_reference_identifier_list",
+            new=AsyncMock(return_value="api, cli, dal"),
+        ) as mock_identifier_list:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        updated_system_text = updated_body["system"][1]["text"]
+        assert (
+            aawm_claude_control_plane._CLAUDE_COMMONMARK_PROMPT_SENTENCE
+            not in updated_system_text
+        )
+        assert (
+            "You can use Github-flavored markdown for formatting, and will be rendered in a monospace font "
+            "using the CommonMark specification plus the following as a custom known list of technical "
+            "identifiers: api, cli, dal."
+        ) in updated_system_text
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert "technical-identifiers-list" in litellm_metadata["claude_prompt_patch_ids"]
+        technical_identifiers_event = next(
+            event
+            for event in litellm_metadata["claude_prompt_patch_events"]
+            if event["id"] == "technical-identifiers-list"
+        )
+        assert technical_identifiers_event["status"] == "resolved"
+        assert technical_identifiers_event["cache_status"] == "miss"
+        assert technical_identifiers_event["identifier_count"] == 3
+        mock_identifier_list.assert_awaited_once_with(
+            tenant_id="aawm",
+            agent_id="eyes",
+        )
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_reuses_cached_reference_identifier_list(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+        aawm_claude_control_plane._aawm_dynamic_injection_cache.clear()
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {"user_id": {"session_id": "session-identifiers-2"}},
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.112.abc; cc_entrypoint=cli; cch=42aab;",
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "You are 'eyes' and you are working on the 'aawm' project.\n"
+                        "You can use Github-flavored markdown for formatting, and will be rendered in a "
+                        "monospace font using the CommonMark specification.\n"
+                    ),
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._call_aawm_reference_identifier_list",
+            new=AsyncMock(return_value="api, cli, dal"),
+        ) as mock_identifier_list:
+            first_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+            second_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        first_identifier_event = next(
+            event
+            for event in first_body["litellm_metadata"]["claude_prompt_patch_events"]
+            if event["id"] == "technical-identifiers-list"
+        )
+        second_identifier_event = next(
+            event
+            for event in second_body["litellm_metadata"]["claude_prompt_patch_events"]
+            if event["id"] == "technical-identifiers-list"
+        )
+        assert first_identifier_event["cache_status"] == "miss"
+        assert second_identifier_event["cache_status"] == "hit"
+        mock_identifier_list.assert_awaited_once_with(
+            tenant_id="aawm",
+            agent_id="eyes",
+        )
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_expands_aawm_dynamic_injection(
         self,
     ):
@@ -4834,6 +4956,240 @@ class TestClaudePersistedOutputExpansion:
             tenant_id="aawm",
             agent_id="eyes",
         )
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_dispatch_backticks_appendix_only_for_subagent_context(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+        aawm_claude_control_plane._aawm_context_grab_cache.clear()
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {"user_id": {"session_id": "session-backtick-1"}},
+            "litellm_metadata": {"claude_persisted_output_hooks": ["subagentstart"]},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "Check `dal`, then ```bash\n`ignored`\n```, then `cli`, then `api`, then `dal`.\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        async def _mock_context_grab(
+            *, name: str, tenant_id: str, agent_id: str
+        ) -> str:
+            return f"{name.title()} context line"
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._call_aawm_context_grab",
+            new=AsyncMock(side_effect=_mock_context_grab),
+        ) as mock_context_grab:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "Check `dal`, then ```bash\n`ignored`\n```, then `cli`, then `api`, then `dal`." in injected_text
+        assert injected_text.index("Dal context line") < injected_text.index(
+            "Cli context line"
+        )
+        assert injected_text.index("Cli context line") < injected_text.index(
+            "Api context line"
+        )
+        assert "`ignored`" in injected_text
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_context_names"] == ["api", "cli", "dal"]
+        assert litellm_metadata["aawm_dynamic_injection_statuses"] == [
+            "resolved",
+            "resolved",
+            "resolved",
+        ]
+        assert [
+            event["placeholder_type"]
+            for event in litellm_metadata["aawm_dynamic_injection_events"]
+        ] == [
+            "dispatch_backtick",
+            "dispatch_backtick",
+            "dispatch_backtick",
+        ]
+        assert [
+            call.kwargs["name"] for call in mock_context_grab.await_args_list
+        ] == ["dal", "cli", "api"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_dispatch_acronyms_appendix_only_for_subagent_context(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+        aawm_claude_control_plane._aawm_context_grab_cache.clear()
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {"user_id": {"session_id": "session-acronym-1"}},
+            "litellm_metadata": {"claude_persisted_output_hooks": ["subagentstart"]},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "<system-reminder>\nSubagentStart hook additional context: keep API hidden here.\n</system-reminder>\n"
+                                "Focus on DAL, then API, then ```text\nCLI\n```, then CLI, then DAL.\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        async def _mock_context_grab(
+            *, name: str, tenant_id: str, agent_id: str
+        ) -> str:
+            return f"{name} context line"
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._call_aawm_context_grab",
+            new=AsyncMock(side_effect=_mock_context_grab),
+        ) as mock_context_grab:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "Focus on DAL, then API, then ```text\nCLI\n```, then CLI, then DAL." in injected_text
+        assert injected_text.index("DAL context line") < injected_text.index(
+            "API context line"
+        )
+        assert injected_text.index("API context line") < injected_text.index(
+            "CLI context line"
+        )
+        assert "keep API hidden here" in injected_text
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_context_names"] == ["API", "CLI", "DAL"]
+        assert litellm_metadata["aawm_dynamic_injection_statuses"] == [
+            "resolved",
+            "resolved",
+            "resolved",
+        ]
+        assert [
+            event["placeholder_type"]
+            for event in litellm_metadata["aawm_dynamic_injection_events"]
+        ] == [
+            "dispatch_acronym",
+            "dispatch_acronym",
+            "dispatch_acronym",
+        ]
+        assert [
+            call.kwargs["name"] for call in mock_context_grab.await_args_list
+        ] == ["DAL", "API", "CLI"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_dispatch_backticks_are_silent_on_missing_context(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {"user_id": {"session_id": "session-backtick-2"}},
+            "litellm_metadata": {"claude_persisted_output_hooks": ["subagentstart"]},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "Keep `missing` literal.\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._call_aawm_context_grab",
+            new=AsyncMock(return_value=None),
+        ) as mock_context_grab:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "Keep `missing` literal." in injected_text
+        assert "~retrieved at: " not in injected_text
+        assert (
+            "IMPORTANT: context grab for missing returned no results. immediately inform the opperator."
+            not in injected_text
+        )
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_dynamic_injection_context_names"] == ["missing"]
+        assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["empty"]
+        assert litellm_metadata["aawm_dynamic_injection_events"][0]["placeholder_type"] == (
+            "dispatch_backtick"
+        )
+        mock_context_grab.assert_awaited_once_with(
+            name="missing",
+            tenant_id="aawm",
+            agent_id="eyes",
+        )
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_ignores_dispatch_backticks_without_subagent_context(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {"user_id": {"session_id": "session-backtick-3"}},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "Keep `alpha` unchanged.\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._call_aawm_context_grab",
+            new=AsyncMock(return_value="Alpha context line"),
+        ) as mock_context_grab:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "Keep `alpha` unchanged." in injected_text
+        assert "~retrieved at: " not in injected_text
+        assert updated_body.get("litellm_metadata", {}).get(
+            "aawm_dynamic_injection_context_names"
+        ) is None
+        mock_context_grab.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_expands_aawm_dynamic_injection_to_no_memories_block(
