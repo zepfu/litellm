@@ -16,10 +16,10 @@ def test_get_model_cost_map():
         pytest.fail(f"An exception occurred: {e}")
 
 
-def test_get_backup_model_cost_map():
+def test_get_bundled_fallback_model_cost_map():
     with importlib.resources.open_text(
-        "litellm", "model_prices_and_context_window_backup.json"
+        "litellm", "bundled_model_prices_and_context_window_fallback.json"
     ) as f:
-        print("inside backup")
+        print("inside bundled fallback")
         content = json.load(f)
         print("content", content)

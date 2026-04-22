@@ -74,8 +74,14 @@ This suite shells out to the real Claude CLI and then validates:
 These are expected to pass on the real Claude CLI path:
 
 - `gpt-5.4`
+- `gpt-5.4-mini`
 - `gpt-5.3-codex-spark`
+- `claude_adapter_gemini_fanout`
 - `openai/gpt-oss-120b:free`
+
+The full adapter suite intentionally runs `claude_adapter_gemini_fanout`
+before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not
+contaminated by the mixed fanout's short-window upstream pressure.
 
 ### Warning-only canaries
 
@@ -84,10 +90,10 @@ suite when the upstream provider is noisy:
 
 - `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
   - route to Google Code Assist directly
-  - repeated `429` / `RESOURCE_EXHAUSTED` responses are quota pressure, not a
-    local routing failure
+  - single-model `429` / `RESOURCE_EXHAUSTED` responses can still be upstream
+    noise, which is why the individual model cases remain warning-only
 - `openrouter/free`
-- `openrouter/elephant-alpha`
+- `inclusionai/ling-2.6-flash:free`
 - `openai/gpt-oss-20b:free`
 - `google/gemma-4-31b-it:free`
 - `google/gemma-4-26b-a4b-it:free`
@@ -99,6 +105,13 @@ Keep these out of the standard adapter harness run for now:
 
 - `meta-llama/llama-3.3-70b-instruct:free`
 - `minimax/minimax-m2.5:free`
+
+### Preferred Anthropic-adapter model spellings
+
+- direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
+- direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
+- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/inclusionai/ling-2.6-flash:free`, `openrouter/google/gemma-4-31b-it:free`
+- legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
 
 ## How to interpret results
 
@@ -117,7 +130,7 @@ OpenRouter twin whenever OpenRouter publishes one. Current true zero-cost
 exceptions remain:
 
 - `openrouter/free`
-- `openrouter/elephant-alpha`
+- `inclusionai/ling-2.6-flash:free`
 
 ### Source of truth for OpenRouter observability
 
@@ -131,10 +144,10 @@ Do not hard-gate on Langfuse generation usage fields yet; they are still too
 noisy on some OpenRouter-adapted runs.
 
 Important lane note:
-- `openrouter/elephant-alpha` is intentionally routed through the Anthropic ->
-  OpenRouter `chat/completions` completion lane
-- the other OpenRouter free models stay on the generic OpenRouter `Responses`
-  lane unless real Claude behavior proves they need the same detour
+- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic ->
+  OpenRouter `Responses` lane with the other `vendor/model:free` adapters
+- `openrouter/elephant-alpha` remains the special Anthropic -> OpenRouter
+  `chat/completions` detour for the legacy agent/model mapping
 
 Current dev pacing on `:4001` for OpenRouter free-model retries:
 - short hidden retry budget: `12s`
@@ -149,6 +162,14 @@ fast after the circuit opens instead of re-spending the full old retry window.
 The `gemini-3.1*` adapter lane does **not** go through OpenRouter. It routes
 directly to Google Code Assist using the local Google OAuth credentials mounted
 into `litellm-dev`.
+
+Current request-shape conclusion:
+- the Gemini CLI bundle and the Anthropic adapter both send the same Code
+  Assist envelope: `model`, `project`, `user_prompt_id`, and `request` with
+  `session_id` / `contents` / tools / generation config
+- if standalone Gemini CLI use is healthy but `claude_adapter_gemini_fanout`
+  fails, treat that first as a local pacing/serialization regression rather
+  than as authoritative provider-capacity evidence
 
 Do not treat Google `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED`
 responses as authoritative provider truth by themselves. Only close them as

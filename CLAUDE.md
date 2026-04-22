@@ -103,31 +103,46 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - `scripts/local-ci/run_anthropic_adapter_acceptance.py`
   - `scripts/local-ci/anthropic_adapter_config.json`
 - Current real-Claude adapted baseline on `:4001`:
-  - OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.3-codex-spark`
+  - OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`
+  - Gemini fanout hard gate: `claude_adapter_gemini_fanout`
+    - isolates the exact multi-Gemini subagent dispatch path on `:4001`
+    - use it before re-running the full adapter suite when Gemini fanout is the suspected regression
+    - the full suite runs this before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not polluted by the mixed fanout's short-window upstream pressure
   - Google Code Assist canaries: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
     - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist
     - keep this warning-only in the harness because upstream quota windows produce real `429` responses
   - OpenRouter hard gate: `openai/gpt-oss-120b:free`
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
-  - OpenRouter preferred free targets under active validation: `openrouter/elephant-alpha`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
-  - OpenRouter warning-only canaries: `openrouter/free`, `openrouter/elephant-alpha`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+  - OpenRouter preferred free targets under active validation: `inclusionai/ling-2.6-flash:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+  - OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
 - Current upstream-rate-limited / unstable OpenRouter candidates:
   - `openrouter/free` (moving router)
-  - `openrouter/elephant-alpha`
+
+### Model cost map process
+- `model_prices_and_context_window.json` is the only canonical editable model/cost map.
+- `litellm/bundled_model_prices_and_context_window_fallback.json` is the packaged fallback mirror used for `LITELLM_LOCAL_MODEL_COST_MAP=True`.
+- After changing the canonical file, run `make sync-model-cost-map` and avoid hand-editing the packaged fallback directly.
+  - `inclusionai/ling-2.6-flash:free`
   - `google/gemma-4-31b-it:free`
   - `google/gemma-4-26b-a4b-it:free`
   - `nvidia/nemotron-3-super-120b-a12b:free`
   - `minimax/minimax-m2.5:free`
   - `qwen/qwen3-coder:free`
 - For adapted models, treat LiteLLM / `session_history` / Langfuse as the cost source of truth, not Claude CLI display cost.
+- The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. If standalone Gemini CLI use is healthy but `claude_adapter_gemini_fanout` fails, treat that first as a local pacing/serialization bug rather than authoritative provider-capacity proof.
 - For Google Code Assist adapter work, treat successful real-Claude runs on `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` as proof of routing correctness. Do not treat `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED` on their own as authoritative upstream truth; only close those as provider issues after interactive Gemini CLI `/model` corroboration on the same account context.
-- `openrouter/elephant-alpha` intentionally stays on the Anthropic -> OpenRouter `chat/completions` lane. The other OpenRouter free models stay on the generic OpenRouter `Responses` lane unless real Claude behavior proves they need the same detour.
+- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane with the other `vendor/model:free` targets.
 - Dev OpenRouter pacing on `:4001` now uses:
   - short hidden retry budget: `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - longer per-model post-failure cooldown: `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
+- Preferred Anthropic-adapter model spellings:
+  - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
+  - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
+  - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/inclusionai/ling-2.6-flash:free`, `openrouter/google/gemma-4-31b-it:free`
+  - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
   This keeps brief transient recovery local while preventing repeated manual retests from re-burning ~40 seconds on the same throttled backend.
-- The `elephant-alpha` completion lane now passes `proxy_server_request.headers/body` into `litellm.acompletion()`, so callback attribution (`AawmAgentIdentity`, Langfuse trace naming, `session_history`) has the same Claude subagent/session context as the passthrough lanes.
+- `ling-2-6-flash` now validates on the generic OpenRouter `Responses` lane, so its Langfuse / `session_history` shaping should match the other free-model response adapters.
 
 ### Runtime performance knobs
 - Payload capture is now intentionally gated for debug-only use. `litellm.integrations.aawm_payload_capture` will write captures only when both `AAWM_CAPTURE=1` and `LITELLM_LOG=DEBUG` are set. Normal work should leave this off.
