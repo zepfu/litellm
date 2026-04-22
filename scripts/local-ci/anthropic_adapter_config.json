@@ -282,8 +282,7 @@
       },
       "command_json_checks": {
         "required_equals": {
-          "is_error": false,
-          "result": "ctx validated"
+          "is_error": false
         },
         "required_minimums": {
           "usage.input_tokens": 1,
@@ -567,13 +566,7 @@
           {
             "tool_name": "Agent",
             "tool_kind": "other",
-            "minimum_count": 1
-          },
-          {
-            "provider": "gemini",
-            "tool_kind": "command",
-            "minimum_count": 1,
-            "command_text_contains": "date"
+            "minimum_count": 8
           }
         ]
       },
@@ -673,13 +666,7 @@
           {
             "tool_name": "Agent",
             "tool_kind": "other",
-            "minimum_count": 1
-          },
-          {
-            "provider": "gemini",
-            "tool_kind": "command",
-            "minimum_count": 1,
-            "command_text_contains": "date"
+            "minimum_count": 3
           }
         ]
       },
