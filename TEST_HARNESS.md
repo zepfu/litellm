@@ -207,6 +207,9 @@ Telemetry expectation:
     `unsupported`, or `not_attempted`
   - `provider_cache_miss_reason` should be populated when a cache attempt or
     write is recognized as a miss-shaped outcome
+  - `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` are
+    best-effort fields and should only be populated when the missed cache token
+    count is explicit enough to price defensibly
   - current detection uses provider-native cache hints:
     `cache_control` for Anthropic/OpenRouter, `cachedContent` for Gemini, and
     `input_tokens_details.cached_tokens` for OpenAI-style usage
