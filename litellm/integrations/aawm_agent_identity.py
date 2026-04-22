@@ -125,6 +125,10 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     reasoning_tokens_source TEXT,
     reasoning_present BOOLEAN NOT NULL DEFAULT FALSE,
     thinking_signature_present BOOLEAN NOT NULL DEFAULT FALSE,
+    provider_cache_attempted BOOLEAN NOT NULL DEFAULT FALSE,
+    provider_cache_status TEXT,
+    provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE,
+    provider_cache_miss_reason TEXT,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
     tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
     file_read_count INTEGER NOT NULL DEFAULT 0,
@@ -140,6 +144,10 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_modified_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_commit_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_push_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_attempted BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_status TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_reason TEXT",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
@@ -197,6 +205,10 @@ INSERT INTO public.session_history (
     reasoning_tokens_source,
     reasoning_present,
     thinking_signature_present,
+    provider_cache_attempted,
+    provider_cache_status,
+    provider_cache_miss,
+    provider_cache_miss_reason,
     tool_call_count,
     tool_names,
     file_read_count,
@@ -208,7 +220,7 @@ INSERT INTO public.session_history (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24::jsonb, $25, $26, $27, $28, $29, $30::jsonb
+    $21, $22, $23, $24, $25, $26, $27, $28::jsonb, $29, $30, $31, $32, $33, $34::jsonb
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -252,6 +264,16 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     ),
     reasoning_present = session_history.reasoning_present OR EXCLUDED.reasoning_present,
     thinking_signature_present = session_history.thinking_signature_present OR EXCLUDED.thinking_signature_present,
+    provider_cache_attempted = session_history.provider_cache_attempted OR EXCLUDED.provider_cache_attempted,
+    provider_cache_status = COALESCE(
+        NULLIF(EXCLUDED.provider_cache_status, ''),
+        session_history.provider_cache_status
+    ),
+    provider_cache_miss = session_history.provider_cache_miss OR EXCLUDED.provider_cache_miss,
+    provider_cache_miss_reason = COALESCE(
+        NULLIF(EXCLUDED.provider_cache_miss_reason, ''),
+        session_history.provider_cache_miss_reason
+    ),
     tool_call_count = GREATEST(session_history.tool_call_count, EXCLUDED.tool_call_count),
     tool_names = CASE
         WHEN jsonb_array_length(EXCLUDED.tool_names) > jsonb_array_length(session_history.tool_names)
@@ -328,6 +350,11 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "usage_reasoning_tokens_source",
     "usage_cache_read_input_tokens",
     "usage_cache_creation_input_tokens",
+    "usage_provider_cache_attempted",
+    "usage_provider_cache_status",
+    "usage_provider_cache_miss",
+    "usage_provider_cache_miss_reason",
+    "usage_provider_cache_source",
     "usage_tool_call_count",
     "usage_tool_names",
     "aawm_local_prepare_ms",
@@ -1142,6 +1169,273 @@ def _extract_cache_creation_input_tokens(usage_obj: Any) -> int:
     )
 
 
+_PROVIDER_CACHE_TARGET_FAMILIES = {"anthropic", "openai", "openrouter", "gemini"}
+
+
+def _has_nested_path(obj: Any, *keys: str) -> bool:
+    sentinel = object()
+    return _maybe_get_path(obj, *keys, default=sentinel) is not sentinel
+
+
+def _normalize_provider_cache_family(
+    provider: Any,
+    model: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    route_family = (metadata or {}).get("passthrough_route_family")
+    if isinstance(route_family, str) and route_family.strip():
+        route_family_lower = route_family.lower()
+        if "openrouter" in route_family_lower:
+            return "openrouter"
+        if "gemini" in route_family_lower or "google" in route_family_lower:
+            return "gemini"
+        if "anthropic" in route_family_lower:
+            return "anthropic"
+        if "openai" in route_family_lower or "codex" in route_family_lower:
+            return "openai"
+
+    if isinstance(provider, str) and provider.strip():
+        provider_lower = provider.strip().lower()
+        if provider_lower == "google":
+            return "gemini"
+        if provider_lower in _PROVIDER_CACHE_TARGET_FAMILIES:
+            return provider_lower
+
+    model_lower = str(model or "").strip().lower()
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if "gemini" in model_lower:
+        return "gemini"
+    if "claude" in model_lower or model_lower.startswith("anthropic/"):
+        return "anthropic"
+    if model_lower.startswith("gpt") or model_lower.startswith("o1") or model_lower.startswith("o3"):
+        return "openai"
+    if model_lower.startswith("openai/") or "codex" in model_lower:
+        return "openai"
+    return None
+
+
+def _supports_prompt_caching_safe(
+    *,
+    model: str,
+    provider: Optional[str],
+) -> Optional[bool]:
+    normalized_model = str(model or "").strip()
+    if not normalized_model or normalized_model.lower() == "unknown":
+        return None
+    try:
+        import litellm
+
+        return bool(
+            litellm.supports_prompt_caching(
+                model=normalized_model,
+                custom_llm_provider=provider,
+            )
+        )
+    except Exception:
+        return None
+
+
+def _extract_provider_cache_request_body(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = (
+        _maybe_get(kwargs.get("passthrough_logging_payload"), "request_body"),
+        _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body"),
+        kwargs.get("request_body"),
+        _maybe_get(kwargs.get("standard_logging_object"), "request_body"),
+        _maybe_get_path(kwargs.get("standard_logging_object"), "request", "body"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _request_contains_cache_control(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        if payload.get("cache_control") is not None or payload.get("cacheControl") is not None:
+            return True
+        return any(_request_contains_cache_control(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_request_contains_cache_control(item) for item in payload)
+    return False
+
+
+def _request_contains_cached_content(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        cached_content = payload.get("cachedContent")
+        if isinstance(cached_content, str) and cached_content.strip():
+            return True
+        cached_content_alias = payload.get("cached_content")
+        if isinstance(cached_content_alias, str) and cached_content_alias.strip():
+            return True
+        return any(_request_contains_cached_content(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_request_contains_cached_content(item) for item in payload)
+    return False
+
+
+def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
+    return any(
+        _has_nested_path(usage_obj, *path)
+        for path in (
+            ("input_tokens_details", "cached_tokens"),
+            ("input_tokens_details", "cachedTokens"),
+            ("inputTokensDetails", "cached_tokens"),
+            ("inputTokensDetails", "cachedTokens"),
+        )
+    )
+
+
+def _usage_has_gemini_style_cached_content_field(usage_obj: Any) -> bool:
+    return _has_nested_path(usage_obj, "cachedContentTokenCount")
+
+
+def _provider_cache_state_from_metadata(
+    metadata: Dict[str, Any],
+    provider_family: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    status = metadata.get("usage_provider_cache_status")
+    if status is None and provider_family:
+        status = metadata.get(f"{provider_family}_provider_cache_status")
+    attempted = metadata.get("usage_provider_cache_attempted")
+    if attempted is None and provider_family:
+        attempted = metadata.get(f"{provider_family}_provider_cache_attempted")
+    miss = metadata.get("usage_provider_cache_miss")
+    if miss is None and provider_family:
+        miss = metadata.get(f"{provider_family}_provider_cache_miss")
+    miss_reason = metadata.get("usage_provider_cache_miss_reason")
+    if miss_reason is None and provider_family:
+        miss_reason = metadata.get(f"{provider_family}_provider_cache_miss_reason")
+    source = metadata.get("usage_provider_cache_source")
+    if source is None and provider_family:
+        source = metadata.get(f"{provider_family}_provider_cache_source")
+    if status is None and attempted is None and miss is None and miss_reason is None and source is None:
+        return None
+    normalized_status = str(status).strip() if isinstance(status, str) and status.strip() else None
+    return {
+        "attempted": bool(attempted) if attempted is not None else bool(normalized_status and normalized_status != "not_attempted"),
+        "status": normalized_status,
+        "miss": bool(miss) if miss is not None else normalized_status in {"miss", "write"},
+        "miss_reason": (
+            str(miss_reason).strip()
+            if isinstance(miss_reason, str) and str(miss_reason).strip()
+            else None
+        ),
+        "source": str(source).strip() if isinstance(source, str) and str(source).strip() else None,
+    }
+
+
+def _resolve_provider_cache_state(
+    *,
+    provider: Any,
+    model: str,
+    usage_obj: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+    request_body: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    metadata = metadata or {}
+    provider_family = _normalize_provider_cache_family(provider, model, metadata)
+    if provider_family is None:
+        return None
+
+    state_from_metadata = _provider_cache_state_from_metadata(metadata, provider_family)
+    if state_from_metadata is not None:
+        return state_from_metadata
+
+    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
+    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
+    request_has_cache_control = _request_contains_cache_control(request_body)
+    request_has_cached_content = _request_contains_cached_content(request_body)
+    usage_has_openai_cached_tokens = _usage_has_openai_style_cached_tokens_field(usage_obj)
+    usage_has_gemini_cached_content = _usage_has_gemini_style_cached_content_field(usage_obj)
+    supports_prompt_caching = _supports_prompt_caching_safe(
+        model=model,
+        provider=provider_family,
+    )
+
+    if cache_read_input_tokens > 0:
+        return {
+            "attempted": True,
+            "status": "hit",
+            "miss": False,
+            "miss_reason": None,
+            "source": "usage.cache_read_input_tokens",
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    if cache_creation_input_tokens > 0:
+        return {
+            "attempted": True,
+            "status": "write",
+            "miss": True,
+            "miss_reason": "cache_write_only",
+            "source": "usage.cache_creation_input_tokens",
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    attempted = False
+    miss_reason: Optional[str] = None
+    source: Optional[str] = None
+
+    if provider_family == "anthropic":
+        attempted = request_has_cache_control
+        if attempted:
+            miss_reason = "cache_control_requested_without_hit"
+            source = "request.cache_control"
+    elif provider_family == "openrouter":
+        if request_has_cache_control:
+            attempted = True
+            miss_reason = "cache_control_requested_without_hit"
+            source = "request.cache_control"
+        elif usage_has_openai_cached_tokens:
+            attempted = True
+            miss_reason = "cached_tokens_reported_zero"
+            source = "usage.input_tokens_details.cached_tokens"
+    elif provider_family == "gemini":
+        if request_has_cached_content:
+            attempted = True
+            miss_reason = "cached_content_requested_without_hit"
+            source = "request.cached_content"
+        elif usage_has_gemini_cached_content:
+            attempted = True
+            miss_reason = "cached_tokens_reported_zero"
+            source = "usage.cached_content_token_count"
+    elif provider_family == "openai":
+        if usage_has_openai_cached_tokens:
+            attempted = True
+            miss_reason = "cached_tokens_reported_zero"
+            source = "usage.input_tokens_details.cached_tokens"
+
+    if not attempted:
+        return {
+            "attempted": False,
+            "status": "not_attempted",
+            "miss": False,
+            "miss_reason": None,
+            "source": None,
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    if supports_prompt_caching is False and source and source.startswith("request."):
+        return {
+            "attempted": True,
+            "status": "unsupported",
+            "miss": False,
+            "miss_reason": None,
+            "source": source,
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    return {
+        "attempted": True,
+        "status": "miss",
+        "miss": True,
+        "miss_reason": miss_reason,
+        "source": source,
+        "supports_prompt_caching": supports_prompt_caching,
+    }
+
+
 def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
     completion_tokens_details = _extract_completion_tokens_details(usage_obj)
     explicit_reasoning_tokens = _first_non_none(
@@ -1886,6 +2180,93 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
     )
 
 
+def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None:
+    metadata = _ensure_mutable_metadata(kwargs)
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    resolved_model = _resolve_session_history_model(
+        kwargs=kwargs,
+        standard_logging_object=standard_logging_object,
+        metadata=metadata,
+        result=result,
+    )
+    usage_obj = _extract_usage_object(kwargs, result)
+    request_body = _extract_provider_cache_request_body(kwargs)
+    provider_family = _normalize_provider_cache_family(
+        kwargs.get("custom_llm_provider"),
+        resolved_model,
+        metadata,
+    )
+    cache_state = _resolve_provider_cache_state(
+        provider=kwargs.get("custom_llm_provider"),
+        model=resolved_model,
+        usage_obj=usage_obj,
+        metadata=metadata,
+        request_body=request_body,
+    )
+    if provider_family is None or cache_state is None:
+        return
+
+    metadata["usage_provider_cache_attempted"] = cache_state["attempted"]
+    metadata["usage_provider_cache_status"] = cache_state["status"]
+    metadata["usage_provider_cache_miss"] = cache_state["miss"]
+    if cache_state.get("miss_reason"):
+        metadata["usage_provider_cache_miss_reason"] = cache_state["miss_reason"]
+    if cache_state.get("source"):
+        metadata["usage_provider_cache_source"] = cache_state["source"]
+
+    metadata[f"{provider_family}_provider_cache_attempted"] = cache_state["attempted"]
+    metadata[f"{provider_family}_provider_cache_status"] = cache_state["status"]
+    metadata[f"{provider_family}_provider_cache_miss"] = cache_state["miss"]
+    if cache_state.get("miss_reason"):
+        metadata[f"{provider_family}_provider_cache_miss_reason"] = cache_state[
+            "miss_reason"
+        ]
+    if cache_state.get("source"):
+        metadata[f"{provider_family}_provider_cache_source"] = cache_state["source"]
+
+    tags_to_add = []
+    status = cache_state.get("status")
+    if isinstance(status, str) and status in {"hit", "write", "miss", "unsupported"}:
+        tags_to_add.extend(
+            [
+                f"provider-cache-status:{status}",
+                f"{provider_family}-provider-cache-status:{status}",
+            ]
+        )
+    if cache_state.get("miss") is True:
+        tags_to_add.extend(
+            [
+                "provider-cache-miss",
+                f"{provider_family}-provider-cache-miss",
+            ]
+        )
+    if status == "hit":
+        tags_to_add.extend(["provider-cache-hit", f"{provider_family}-provider-cache-hit"])
+    elif status == "write":
+        tags_to_add.extend(
+            ["provider-cache-write", f"{provider_family}-provider-cache-write"]
+        )
+    elif status == "unsupported":
+        tags_to_add.extend(
+            ["provider-cache-unsupported", f"{provider_family}-provider-cache-unsupported"]
+        )
+    if tags_to_add:
+        _merge_tags(metadata, tags_to_add)
+        _append_langfuse_span(
+            metadata,
+            name=f"{provider_family}.provider_cache",
+            span_metadata={
+                "attempted": cache_state["attempted"],
+                "status": cache_state["status"],
+                "miss": cache_state["miss"],
+                "miss_reason": cache_state.get("miss_reason"),
+                "source": cache_state.get("source"),
+            },
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+        )
+
+
 def _extract_trace_id_from_spend_log_row(spend_log_row: Dict[str, Any]) -> Tuple[Optional[str], str]:
     metadata = _safe_json_load(spend_log_row.get("metadata"), {})
     request_body = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
@@ -2525,6 +2906,13 @@ def _build_session_history_record_from_langfuse_trace_observation(
         observation,
     )
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
+    provider_cache_state = _resolve_provider_cache_state(
+        provider=provider,
+        model=str(observation.get("model") or ""),
+        usage_obj=usage_object,
+        metadata=metadata,
+        request_body=None,
+    )
 
     history_metadata = _build_session_history_metadata(
         metadata=metadata,
@@ -2570,6 +2958,18 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "reasoning_tokens_source": reasoning_tokens_source,
         "reasoning_present": reasoning_present,
         "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
+        "provider_cache_attempted": bool(
+            provider_cache_state and provider_cache_state.get("attempted")
+        ),
+        "provider_cache_status": (
+            provider_cache_state.get("status") if provider_cache_state else None
+        ),
+        "provider_cache_miss": bool(
+            provider_cache_state and provider_cache_state.get("miss")
+        ),
+        "provider_cache_miss_reason": (
+            provider_cache_state.get("miss_reason") if provider_cache_state else None
+        ),
         "tool_call_count": tool_call_count,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
@@ -2798,6 +3198,14 @@ def _build_session_history_record(
                 exc,
             )
 
+    provider_cache_state = _resolve_provider_cache_state(
+        provider=kwargs.get("custom_llm_provider"),
+        model=resolved_model,
+        usage_obj=usage_obj,
+        metadata=metadata,
+        request_body=_extract_provider_cache_request_body(kwargs),
+    )
+
     return {
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "session_id": session_id,
@@ -2821,6 +3229,18 @@ def _build_session_history_record(
         "reasoning_tokens_source": reasoning_tokens_source,
         "reasoning_present": reasoning_present,
         "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
+        "provider_cache_attempted": bool(
+            provider_cache_state and provider_cache_state.get("attempted")
+        ),
+        "provider_cache_status": (
+            provider_cache_state.get("status") if provider_cache_state else None
+        ),
+        "provider_cache_miss": bool(
+            provider_cache_state and provider_cache_state.get("miss")
+        ),
+        "provider_cache_miss_reason": (
+            provider_cache_state.get("miss_reason") if provider_cache_state else None
+        ),
         "tool_call_count": tool_call_count,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
@@ -2898,6 +3318,10 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record["reasoning_tokens_source"],
         record["reasoning_present"],
         record["thinking_signature_present"],
+        record.get("provider_cache_attempted", False),
+        record.get("provider_cache_status"),
+        record.get("provider_cache_miss", False),
+        record.get("provider_cache_miss_reason"),
         record["tool_call_count"],
         json.dumps(record["tool_names"]),
         record.get("file_read_count", 0),
@@ -3336,6 +3760,7 @@ def _enrich_trace_name_and_provider_metadata(
         _enrich_claude_thinking_metadata(metadata, message)
         _enrich_gemini_thought_signature_metadata(metadata, message)
     _enrich_usage_breakout_metadata(kwargs, result)
+    _enrich_provider_cache_metadata(kwargs, result)
 
     _sync_standard_logging_object(kwargs, metadata)
 
