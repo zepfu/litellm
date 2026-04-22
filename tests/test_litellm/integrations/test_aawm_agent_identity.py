@@ -477,6 +477,10 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["reasoning_tokens_estimated"] is None
     assert record["reasoning_tokens_source"] == "provider_reported"
     assert record["reasoning_present"] is True
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is False
+    assert record["provider_cache_miss_reason"] is None
     assert record["tool_call_count"] == 3
     assert record["tool_names"] == ["Read", "Write", "Bash"]
     assert record["file_read_count"] == 1
@@ -580,6 +584,165 @@ def test_build_session_history_record_sets_not_applicable_reasoning_source_when_
     assert record["reasoning_tokens_source"] == "not_applicable"
 
 
+def test_build_session_history_record_marks_openai_provider_cache_miss_from_zero_cached_tokens() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-openai-cache-miss"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openai-cache-miss"
+
+    result = {
+        "id": "provider-response-openai-cache-miss",
+        "usage": {
+            "input_tokens": 2048,
+            "output_tokens": 8,
+            "total_tokens": 2056,
+            "input_tokens_details": {"cached_tokens": 0},
+        },
+        "choices": [{"message": {"role": "assistant", "content": "plain output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
+
+
+def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-anthropic-cache-write"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-anthropic-cache-write"
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Warm this prompt cache.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ]
+
+    result = {
+        "id": "provider-response-anthropic-cache-write",
+        "usage": {
+            "prompt_tokens": 140,
+            "completion_tokens": 4,
+            "total_tokens": 144,
+            "cache_creation_input_tokens": 64,
+            "cache_read_input_tokens": 0,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "cached"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "write"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cache_write_only"
+
+
+def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cached_content_request() -> None:
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "openrouter/google/gemini-2.5-pro"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-gemini-cache-miss"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-gemini-cache-miss"
+    kwargs["passthrough_logging_payload"]["request_body"]["cachedContent"] = (
+        "projects/demo/locations/us-central1/cachedContents/test-cache"
+    )
+
+    result = {
+        "id": "provider-response-gemini-cache-miss",
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 6,
+            "total_tokens": 126,
+            "cachedContentTokenCount": 0,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "gemini output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cached_content_requested_without_hit"
+
+
+def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_cache_control_request() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/anthropic/claude-sonnet-4.5"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-openrouter-cache-miss"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-cache-miss"
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Long cached context block.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ]
+
+    result = {
+        "id": "provider-response-openrouter-cache-miss",
+        "usage": {
+            "input_tokens": 1536,
+            "output_tokens": 7,
+            "total_tokens": 1543,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "openrouter output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cache_control_requested_without_hit"
+
+
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="codex")
@@ -624,6 +787,9 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     assert metadata["usage_cache_creation_input_tokens"] == 0
     assert metadata["usage_tool_call_count"] == 1
     assert metadata["usage_tool_names"] == ["apply_patch"]
+    assert metadata["usage_provider_cache_attempted"] is True
+    assert metadata["usage_provider_cache_status"] == "hit"
+    assert metadata["usage_provider_cache_miss"] is False
     assert metadata["codex_reasoning_tokens_reported"] == 12
     assert metadata["codex_cache_read_input_tokens"] == 31
     assert "codex-usage-breakout" in metadata["tags"]
@@ -731,6 +897,9 @@ def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout()
 
     assert metadata["usage_reasoning_tokens_reported"] == 1
     assert metadata["usage_reasoning_tokens_source"] == "provider_signature_present"
+    assert metadata["usage_provider_cache_attempted"] is False
+    assert metadata["usage_provider_cache_status"] == "not_attempted"
+    assert metadata["usage_provider_cache_miss"] is False
     assert metadata["gemini_reasoning_tokens_reported"] == 1
     assert "gemini-usage-breakout" in metadata["tags"]
     assert "gemini-reasoning-tokens-reported" in metadata["tags"]
@@ -849,6 +1018,10 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
         "reasoning_tokens_source": "provider_reported",
         "reasoning_present": True,
         "thinking_signature_present": True,
+        "provider_cache_attempted": True,
+        "provider_cache_status": "write",
+        "provider_cache_miss": True,
+        "provider_cache_miss_reason": "cache_write_only",
         "tool_call_count": 1,
         "tool_names": ["search"],
         "file_read_count": 0,
@@ -1176,6 +1349,10 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["total_tokens"] == 165
     assert record["cache_read_input_tokens"] == 11
     assert record["cache_creation_input_tokens"] == 7
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is False
+    assert record["provider_cache_miss_reason"] is None
     assert record["reasoning_present"] is True
     assert record["reasoning_tokens_source"] == "estimated_from_reasoning_text"
     assert record["tool_call_count"] == 1
@@ -1288,6 +1465,10 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_metad
     assert record["input_tokens"] == 120
     assert record["output_tokens"] == 40
     assert record["cache_read_input_tokens"] == 55
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is False
+    assert record["provider_cache_miss_reason"] is None
     assert record["reasoning_tokens_reported"] == 18
     assert record["reasoning_tokens_source"] == "provider_reported"
     assert record["tool_call_count"] == 1
@@ -1450,6 +1631,54 @@ def test_build_session_history_record_from_langfuse_trace_observation_sets_not_a
     assert record["reasoning_tokens_source"] == "not_applicable"
 
 
+def test_build_session_history_record_from_langfuse_trace_observation_marks_openai_provider_cache_miss() -> None:
+    trace = {
+        "id": "trace-openai-cache-miss",
+        "name": "codex",
+        "sessionId": "session-openai-cache-miss",
+    }
+    observation = {
+        "id": "obs-openai-cache-miss",
+        "type": "GENERATION",
+        "name": "litellm-responses",
+        "model": "openai/gpt-5.4",
+        "startTime": "2026-04-22T10:00:00Z",
+        "endTime": "2026-04-22T10:00:01Z",
+        "usage": {
+            "prompt_tokens": 42,
+            "completion_tokens": 7,
+            "total_tokens": 49,
+            "input_tokens_details": {"cached_tokens": 0},
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "cache miss test",
+                    }
+                }
+            ]
+        },
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-openai-cache-miss",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
+
+
 def test_build_session_history_record_prefers_metadata_usage_object_when_result_usage_is_sparse() -> None:
     kwargs = _base_kwargs("gemini")
     usage_object = {
@@ -1608,6 +1837,10 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
             "reasoning_tokens_source": "provider_reported",
             "reasoning_present": True,
             "thinking_signature_present": True,
+            "provider_cache_attempted": False,
+            "provider_cache_status": "not_attempted",
+            "provider_cache_miss": False,
+            "provider_cache_miss_reason": None,
             "tool_call_count": 1,
             "tool_names": ["search"],
             "file_read_count": 1,

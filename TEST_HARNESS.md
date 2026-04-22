@@ -201,6 +201,15 @@ Telemetry expectation:
 - `reasoning_tokens_source` should never be left null in `public.session_history`
   after backfill / repair passes; use `not_applicable` or `not_available` when
   no positive provider or estimated reasoning count exists
+- for Anthropic, OpenAI, OpenRouter, and Gemini rows, `public.session_history`
+  should also carry normalized provider-cache telemetry:
+  - `provider_cache_status` should be one of `hit`, `write`, `miss`,
+    `unsupported`, or `not_attempted`
+  - `provider_cache_miss_reason` should be populated when a cache attempt or
+    write is recognized as a miss-shaped outcome
+  - current detection uses provider-native cache hints:
+    `cache_control` for Anthropic/OpenRouter, `cachedContent` for Gemini, and
+    `input_tokens_details.cached_tokens` for OpenAI-style usage
 - for Codex/OpenAI streaming tool runs, `response.output_item.*` and
   `response.function_call_arguments.*` events must roll up into
   `usage_tool_call_count`, `codex_tool_call_count`, and at least one
