@@ -253,6 +253,8 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     query = '''
         select provider, model, session_id, input_tokens, output_tokens, total_tokens,
                cache_read_input_tokens, cache_creation_input_tokens,
+               provider_cache_attempted, provider_cache_status,
+               provider_cache_miss, provider_cache_miss_reason,
                reasoning_tokens_reported, reasoning_tokens_estimated,
                reasoning_tokens_source, tool_call_count, tool_names, response_cost_usd,
                start_time, end_time
@@ -279,6 +281,20 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     failures: list[str] = []
 
     for row in records:
+        row_provider = row.get('provider')
+        if row_provider in {'anthropic', 'openai', 'openrouter', 'gemini'}:
+            cache_status = row.get('provider_cache_status')
+            if not isinstance(cache_status, str) or not cache_status.strip():
+                failures.append(
+                    f'{family} session_history row provider={row_provider!r} model={row.get("model")!r} has null/empty `provider_cache_status`'
+                )
+            if row.get('provider_cache_miss'):
+                miss_reason = row.get('provider_cache_miss_reason')
+                if not isinstance(miss_reason, str) or not miss_reason.strip():
+                    failures.append(
+                        f'{family} session_history row provider={row_provider!r} model={row.get("model")!r} has `provider_cache_miss=true` with null/empty `provider_cache_miss_reason`'
+                    )
+
         source = row.get('reasoning_tokens_source')
         if not isinstance(source, str) or not source.strip():
             failures.append(
