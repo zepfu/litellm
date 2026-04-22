@@ -1402,6 +1402,62 @@ class TestPassThroughRequestRetryableFailures:
         mock_logging_obj.post_call_failure_hook.assert_not_awaited()
         mock_log_exception.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_pass_through_request_skips_failure_hook_for_adapter_managed_502(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/test/endpoint"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.example.com/v1/test"
+        upstream_response = httpx.Response(
+            status_code=502,
+            content=b'{"error":"provider failed"}',
+            request=httpx.Request("POST", target_url),
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"test": "data"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=AsyncMock(return_value=upstream_response),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.verbose_proxy_logger.exception"
+        ) as mock_log_exception:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value={"test": "data"})
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    stream=False,
+                    retryable_upstream_status_codes=[429, 500, 502, 503, 504],
+                )
+
+        assert exc_info.value.code == "502"
+        assert exc_info.value.detail == '{"error":"provider failed"}'
+        mock_logging_obj.post_call_failure_hook.assert_not_awaited()
+        mock_log_exception.assert_not_called()
+
 
 class TestOpenRouterAdapterRetry:
     @pytest.mark.asyncio
@@ -1479,7 +1535,7 @@ class TestOpenRouterAdapterRetry:
             mock_pass_through.await_args_list[0].kwargs[
                 "retryable_upstream_status_codes"
             ]
-            == [429]
+            == [429, 500, 502, 503, 504]
         )
         set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 20.0)
 

@@ -126,6 +126,8 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - OpenRouter preferred free targets under active validation: `inclusionai/ling-2.6-flash:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
   - OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+    - warning-only semantics include subprocess timeouts; those should surface
+      as harness warnings / `soft_failures`, not hard suite failures
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
 - Current upstream-rate-limited / unstable OpenRouter candidates:
   - `openrouter/free` (moving router)
@@ -147,6 +149,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - Dev OpenRouter pacing on `:4001` now uses:
   - short hidden retry budget: `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - longer per-model post-failure cooldown: `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
+- Adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may still appear as adapter warning/backoff lines in `litellm-dev`, but they should not emit the generic `pass_through_endpoint(): Exception occured - ...` traceback for the current request path.
 - Preferred Anthropic-adapter model spellings:
   - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
   - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`

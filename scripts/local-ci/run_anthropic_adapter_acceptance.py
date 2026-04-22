@@ -179,6 +179,10 @@ def _validate_runtime_logs(
         forbidden_substrings.extend(
             [
                 'pass_through_endpoint(): Exception occured - 429:',
+                'pass_through_endpoint(): Exception occured - 500:',
+                'pass_through_endpoint(): Exception occured - 502:',
+                'pass_through_endpoint(): Exception occured - 503:',
+                'pass_through_endpoint(): Exception occured - 504:',
             ]
         )
 
@@ -781,6 +785,19 @@ def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {'passed': not failures, 'failures': failures, 'warnings': warnings}
 
 
+def _warning_only_error_result(family: str, exc: Exception) -> dict[str, Any]:
+    base = RA._family_error_result(family, exc)
+    failures = list(base.get('failures', []))
+    return {
+        **base,
+        'warning_only': True,
+        'passed': True,
+        'failures': [],
+        'soft_failures': failures,
+        'warnings': [f'warning-only failure: {failure}' for failure in failures],
+    }
+
+
 def _write_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:
     path.write_text(json.dumps(artifact, indent=2) + '\n', encoding='utf-8')
 
@@ -876,7 +893,14 @@ def main() -> int:
                 litellm_base_url=litellm_base_url,
             )
         except Exception as exc:
-            artifact['results'][case_name] = RA._family_error_result(case_name, exc)
+            if bool(cases[case_name].get('warning_only')):
+                artifact['results'][case_name] = _warning_only_error_result(
+                    case_name, exc
+                )
+            else:
+                artifact['results'][case_name] = RA._family_error_result(
+                    case_name, exc
+                )
         finally:
             artifact['summary'] = _build_summary(artifact['results'])
             _write_artifact(artifact_path, artifact)
