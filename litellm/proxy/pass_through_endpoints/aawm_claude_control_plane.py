@@ -34,6 +34,28 @@ _CLAUDE_MEMORY_SECTION_PATTERN = re.compile(
 _CLAUDE_TYPES_XML_BLOCK_PATTERN = re.compile(r"<types>\n.*?\n</types>", re.DOTALL)
 _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
 _CLAUDE_CC_VERSION_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)")
+_CLAUDE_COMMONMARK_PROMPT_SENTENCE = (
+    "You can use Github-flavored markdown for formatting, and will be rendered in a "
+    "monospace font using the CommonMark specification."
+)
+_CLAUDE_COMMONMARK_PROMPT_IDENTIFIER_TEMPLATE = (
+    "You can use Github-flavored markdown for formatting, and will be rendered in a "
+    "monospace font using the CommonMark specification plus the following as a custom "
+    "known list of technical identifiers: {identifiers}."
+)
+_AAWM_REFERENCE_IDENTIFIER_PATCH_ID = "technical-identifiers-list"
+_AAWM_REFERENCE_IDENTIFIER_CACHE_KEY = "reference-identifiers"
+_AAWM_REFERENCE_IDENTIFIER_LIST_QUERY = """
+SELECT DISTINCT rc.name
+FROM ag_catalog.raw_content rc
+WHERE rc.role = 'reference'
+  AND rc.valid_to IS NULL
+  AND ($1::text IS NULL OR rc.tenant_id IS NULL OR rc.tenant_id = $1::text)
+  AND ($2::text IS NULL OR rc.agent_id IS NULL OR rc.agent_id = $2::text)
+  AND rc.name NOT IN (SELECT name FROM public.agents)
+  AND rc.name NOT IN (SELECT name || '-instructions' FROM public.agents)
+ORDER BY rc.name
+"""
 _AAWM_DYNAMIC_DIRECTIVE_PATTERN = re.compile(
     r"<!--\s*AAWM(?=[ \t]+(?:p|proc)=)\s+(?P<html_attrs>.*?)\s*-->"
     r"|@@@\s*AAWM(?=[ \t]+(?:p|proc)=)\s+(?P<at_attrs>.*?)\s*@@@"
@@ -41,6 +63,10 @@ _AAWM_DYNAMIC_DIRECTIVE_PATTERN = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 _AAWM_CONTEXT_MARKER_PATTERN = re.compile(r":#(?P<name>[^#\r\n]+?)\.ctx#:")
+_AAWM_DISPATCH_CONTEXT_REFERENCE_PATTERN = re.compile(
+    r"(?<![\\`])`(?P<backtick>[^`\r\n]+?)`(?!`)"
+    r"|(?P<acronym>\b[A-Z][A-Z0-9]{1,}\b)"
+)
 _AAWM_DYNAMIC_DIRECTIVE_ATTR_PATTERN = re.compile(
     r'(?P<key>[A-Za-z_][A-Za-z0-9_-]*)='
     r'(?:"(?P<double>[^"]*)"|\'(?P<single>[^\']*)\'|(?P<bare>[^\s]+))'
@@ -72,6 +98,14 @@ _AAWM_DYNAMIC_INJECTION_FAILURE_TEMPLATE = (
 )
 _AAWM_CONTEXT_GRAB_FAILURE_TEMPLATE = (
     "IMPORTANT: context grab for {name} returned no results. immediately inform the opperator."
+)
+_AAWM_SUBAGENTSTART_CONTEXT_MARKERS = (
+    "SubagentStart hook additional context:",
+    "SubAgentStart hook additional context:",
+)
+_AAWM_SYSTEM_REMINDER_BLOCK_PATTERN = re.compile(
+    r"<system-reminder>.*?</system-reminder>\n*",
+    re.DOTALL,
 )
 _AAWM_NO_MEMORIES_TEMPLATE = (
     "# Memory Injection\n"
@@ -598,11 +632,12 @@ def _add_claude_system_prompt_override_logging_metadata(
     )
 
 
-def _rewrite_claude_control_plane_text(
+async def _rewrite_claude_control_plane_text(
     text: str,
     *,
     cc_version: str,
     manifest: dict[str, Any],
+    available_context: dict[str, str],
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     updated_text = text
     override_events: list[dict[str, Any]] = []
@@ -657,22 +692,74 @@ def _rewrite_claude_control_plane_text(
             }
         )
 
+    if _CLAUDE_COMMONMARK_PROMPT_SENTENCE in updated_text:
+        cache_key = (
+            _AAWM_REFERENCE_IDENTIFIER_CACHE_KEY,
+            available_context.get("session_id", ""),
+            available_context.get("tenant", ""),
+            available_context.get("agent", ""),
+        )
+        cache_hit, identifier_list = await _get_cached_aawm_dynamic_injection_result(
+            cache_key
+        )
+        patch_event: dict[str, Any] = {
+            "id": _AAWM_REFERENCE_IDENTIFIER_PATCH_ID,
+            "cc_version": cc_version,
+            "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
+            "cache_status": "hit" if cache_hit else "miss",
+            "context_keys": [
+                context_key
+                for context_key in ("session_id", "tenant", "agent")
+                if available_context.get(context_key)
+            ],
+        }
+        if not cache_hit:
+            resolver = getattr(
+                _lp(),
+                "_call_aawm_reference_identifier_list",
+                _call_aawm_reference_identifier_list,
+            )
+            identifier_list = await resolver(
+                tenant_id=available_context.get("tenant"),
+                agent_id=available_context.get("agent"),
+            )
+            await _set_cached_aawm_dynamic_injection_result(cache_key, identifier_list)
+
+        occurrences = updated_text.count(_CLAUDE_COMMONMARK_PROMPT_SENTENCE)
+        replacement_identifiers = identifier_list or "none"
+        updated_text = updated_text.replace(
+            _CLAUDE_COMMONMARK_PROMPT_SENTENCE,
+            _CLAUDE_COMMONMARK_PROMPT_IDENTIFIER_TEMPLATE.format(
+                identifiers=replacement_identifiers
+            ),
+        )
+        patch_event["status"] = "resolved" if identifier_list else "empty"
+        patch_event["occurrences"] = occurrences
+        patch_event["identifier_count"] = (
+            len([name for name in replacement_identifiers.split(", ") if name])
+            if identifier_list
+            else 0
+        )
+        patch_events.append(patch_event)
+
     return updated_text, override_events, patch_events
 
 
 
-def _rewrite_claude_control_plane_in_value(
+async def _rewrite_claude_control_plane_in_value(
     value: Any,
     *,
     cc_version: str,
     manifest: dict[str, Any],
+    available_context: dict[str, str],
 ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
-            updated_text, override_events, patch_events = _rewrite_claude_control_plane_text(
+            updated_text, override_events, patch_events = await _rewrite_claude_control_plane_text(
                 value["text"],
                 cc_version=cc_version,
                 manifest=manifest,
+                available_context=available_context,
             )
             if not override_events and not patch_events:
                 return value, [], []
@@ -685,10 +772,11 @@ def _rewrite_claude_control_plane_in_value(
         combined_patch_events: list[dict[str, Any]] = []
         changed = False
         for key, child in value.items():
-            updated_child, child_override_events, child_patch_events = _rewrite_claude_control_plane_in_value(
+            updated_child, child_override_events, child_patch_events = await _rewrite_claude_control_plane_in_value(
                 child,
                 cc_version=cc_version,
                 manifest=manifest,
+                available_context=available_context,
             )
             updated_dict[key] = updated_child
             combined_override_events.extend(child_override_events)
@@ -707,10 +795,11 @@ def _rewrite_claude_control_plane_in_value(
         combined_patch_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
-            updated_child, child_override_events, child_patch_events = _rewrite_claude_control_plane_in_value(
+            updated_child, child_override_events, child_patch_events = await _rewrite_claude_control_plane_in_value(
                 child,
                 cc_version=cc_version,
                 manifest=manifest,
+                available_context=available_context,
             )
             updated_list.append(updated_child)
             combined_override_events.extend(child_override_events)
@@ -727,7 +816,7 @@ def _rewrite_claude_control_plane_in_value(
 
 
 
-def apply_claude_control_plane_rewrites_to_anthropic_request_body(
+async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
     request_body: dict[str, Any], billing_header_fields: dict[str, str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     lp = _lp()
@@ -738,10 +827,12 @@ def apply_claude_control_plane_rewrites_to_anthropic_request_body(
     span_started_at = datetime.now(timezone.utc)
     manifest_path = _resolve_claude_prompt_patch_manifest_path()
     manifest = _load_claude_prompt_patch_manifest(manifest_path)
-    updated_body, override_events, patch_events = _rewrite_claude_control_plane_in_value(
+    available_context = _build_aawm_context_for_anthropic_request(request_body)
+    updated_body, override_events, patch_events = await _rewrite_claude_control_plane_in_value(
         request_body,
         cc_version=cc_version,
         manifest=manifest,
+        available_context=available_context,
     )
     if not override_events and not patch_events:
         return request_body, [], []
@@ -1312,6 +1403,31 @@ async def _call_aawm_context_grab(
     return None
 
 
+async def _call_aawm_reference_identifier_list(
+    *, tenant_id: Optional[str], agent_id: Optional[str]
+) -> Optional[str]:
+    pool = await _get_aawm_dynamic_injection_pool()
+    rows = await pool.fetch(
+        _AAWM_REFERENCE_IDENTIFIER_LIST_QUERY,
+        tenant_id,
+        agent_id,
+    )
+    identifier_names: list[str] = []
+    for row in rows:
+        identifier_name: Optional[str] = None
+        if isinstance(row, dict):
+            identifier_name = row.get("name")
+        elif hasattr(row, "get"):
+            identifier_name = row.get("name")
+        if isinstance(identifier_name, str):
+            stripped_identifier_name = identifier_name.strip()
+            if stripped_identifier_name:
+                identifier_names.append(stripped_identifier_name)
+    if identifier_names:
+        return ", ".join(identifier_names)
+    return None
+
+
 def _resolve_aawm_dynamic_context_fields(
     proc_name: str, directive_attrs: dict[str, str]
 ) -> tuple[str, ...]:
@@ -1401,6 +1517,22 @@ async def _resolve_aawm_dynamic_directive(
 async def _resolve_aawm_context_marker(
     name: str, available_context: dict[str, str]
 ) -> tuple[str, dict[str, Any]]:
+    appendix_entry, event = await _resolve_aawm_context_reference(
+        name,
+        available_context,
+        placeholder_type="ctx_marker",
+    )
+    if appendix_entry is not None:
+        return appendix_entry, event
+    return _build_aawm_context_grab_failure_text(name), event
+
+
+async def _resolve_aawm_context_reference(
+    name: str,
+    available_context: dict[str, str],
+    *,
+    placeholder_type: str,
+) -> tuple[Optional[str], dict[str, Any]]:
     lp = _lp()
     proc_name = _get_aawm_context_grab_proc_name()
     context_keys = [
@@ -1420,7 +1552,7 @@ async def _resolve_aawm_context_marker(
         "status": "failed",
         "context_keys": context_keys,
         "context_name": name,
-        "placeholder_type": "ctx_marker",
+        "placeholder_type": placeholder_type,
     }
     cache_hit, cached_payload = await _get_cached_aawm_context_grab_result(cache_key)
     event["cache_status"] = "hit" if cache_hit else "miss"
@@ -1454,7 +1586,7 @@ async def _resolve_aawm_context_marker(
             event,
         )
 
-    return _build_aawm_context_grab_failure_text(name), event
+    return None, event
 
 
 def _append_aawm_context_entries_to_text(text: str, entries: list[str]) -> str:
@@ -1538,6 +1670,88 @@ async def _expand_aawm_context_markers_in_text(
     return _append_aawm_context_entries_to_text(updated_text, appendix_entries), context_events
 
 
+def _extract_aawm_dispatch_context_references(
+    text: str,
+) -> list[tuple[str, str]]:
+    if not isinstance(text, str):
+        return []
+
+    scan_text = _AAWM_SYSTEM_REMINDER_BLOCK_PATTERN.sub("\n", text)
+    if "`" not in scan_text and re.search(r"\b[A-Z][A-Z0-9]{1,}\b", scan_text) is None:
+        return []
+
+    ordered_references: list[tuple[str, str]] = []
+    seen_names: set[str] = set()
+    for index, segment in enumerate(scan_text.split("```")):
+        if index % 2 == 1:
+            continue
+        for match in _AAWM_DISPATCH_CONTEXT_REFERENCE_PATTERN.finditer(segment):
+            if match.group("backtick") is not None:
+                name = match.group("backtick").strip()
+                placeholder_type = "dispatch_backtick"
+            else:
+                name = (match.group("acronym") or "").strip()
+                placeholder_type = "dispatch_acronym"
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            ordered_references.append((name, placeholder_type))
+    return ordered_references
+
+
+async def _expand_aawm_dispatch_context_references_in_text(
+    text: str, available_context: dict[str, str]
+) -> tuple[str, list[dict[str, Any]]]:
+    ordered_references = _extract_aawm_dispatch_context_references(text)
+    if not ordered_references:
+        return text, []
+
+    semaphore = asyncio.Semaphore(_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE)
+
+    async def _resolve_with_limit(
+        name: str,
+        placeholder_type: str,
+    ) -> tuple[Optional[str], dict[str, Any]]:
+        async with semaphore:
+            try:
+                return await _resolve_aawm_context_reference(
+                    name,
+                    available_context,
+                    placeholder_type=placeholder_type,
+                )
+            except Exception as exc:
+                return (
+                    None,
+                    {
+                        "proc": _get_aawm_context_grab_proc_name_for_logging(),
+                        "status": "failed",
+                        "error": exc.__class__.__name__,
+                        "context_keys": [
+                            context_key
+                            for context_key in ("session_id", "tenant", "agent")
+                            if available_context.get(context_key)
+                        ],
+                        "context_name": name,
+                        "placeholder_type": placeholder_type,
+                    },
+                )
+
+    resolved_entries = await asyncio.gather(
+        *(
+            _resolve_with_limit(name, placeholder_type)
+            for name, placeholder_type in ordered_references
+        )
+    )
+    appendix_entries: list[str] = []
+    context_events: list[dict[str, Any]] = []
+    for appendix_entry, event in resolved_entries:
+        if appendix_entry:
+            appendix_entries.append(appendix_entry)
+        context_events.append(event)
+
+    return _append_aawm_context_entries_to_text(text, appendix_entries), context_events
+
+
 async def _expand_aawm_dynamic_directives_in_text(
     text: str, available_context: dict[str, str]
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -1588,6 +1802,8 @@ async def _expand_aawm_dynamic_directives_in_text(
 async def _expand_aawm_dynamic_directives_in_value(
     value: Any,
     available_context: dict[str, str],
+    *,
+    enable_dispatch_backtick_context: bool = False,
 ) -> tuple[Any, list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
@@ -1600,6 +1816,15 @@ async def _expand_aawm_dynamic_directives_in_value(
                 available_context,
             )
             combined_events = injection_events + context_events
+            if enable_dispatch_backtick_context:
+                (
+                    updated_text,
+                    dispatch_context_events,
+                ) = await _expand_aawm_dispatch_context_references_in_text(
+                    updated_text,
+                    available_context,
+                )
+                combined_events.extend(dispatch_context_events)
             if combined_events:
                 updated_value = dict(value)
                 updated_value["text"] = updated_text
@@ -1613,6 +1838,7 @@ async def _expand_aawm_dynamic_directives_in_value(
             updated_child, child_events = await _expand_aawm_dynamic_directives_in_value(
                 child,
                 available_context,
+                enable_dispatch_backtick_context=enable_dispatch_backtick_context,
             )
             updated_dict[key] = updated_child
             combined_events.extend(child_events)
@@ -1628,6 +1854,7 @@ async def _expand_aawm_dynamic_directives_in_value(
             updated_child, child_events = await _expand_aawm_dynamic_directives_in_value(
                 child,
                 available_context,
+                enable_dispatch_backtick_context=enable_dispatch_backtick_context,
             )
             updated_list.append(updated_child)
             combined_events.extend(child_events)
@@ -1729,11 +1956,31 @@ def _add_aawm_dynamic_injection_logging_metadata(
     )
 
 
+def _request_uses_aawm_dispatch_backtick_context(request_body: dict[str, Any]) -> bool:
+    litellm_metadata = request_body.get("litellm_metadata")
+    if isinstance(litellm_metadata, dict):
+        hooks = litellm_metadata.get("claude_persisted_output_hooks")
+        if isinstance(hooks, list):
+            for hook in hooks:
+                if isinstance(hook, str) and hook.strip().lower() == "subagentstart":
+                    return True
+
+    for top_level_key in ("system", "messages"):
+        for fragment in _iter_anthropic_text_fragments(request_body.get(top_level_key)):
+            if any(marker in fragment for marker in _AAWM_SUBAGENTSTART_CONTEXT_MARKERS):
+                return True
+
+    return False
+
+
 async def expand_aawm_dynamic_directives_in_anthropic_request_body(
     request_body: dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     lp = _lp()
     available_context = _build_aawm_context_for_anthropic_request(request_body)
+    enable_dispatch_backtick_context = _request_uses_aawm_dispatch_backtick_context(
+        request_body
+    )
     span_started_at = datetime.now(timezone.utc)
     updated_body = dict(request_body)
     injection_events: list[dict[str, Any]] = []
@@ -1745,6 +1992,7 @@ async def expand_aawm_dynamic_directives_in_anthropic_request_body(
         updated_value, value_events = await _expand_aawm_dynamic_directives_in_value(
             request_body[top_level_key],
             available_context,
+            enable_dispatch_backtick_context=enable_dispatch_backtick_context,
         )
         if value_events:
             updated_body[top_level_key] = updated_value

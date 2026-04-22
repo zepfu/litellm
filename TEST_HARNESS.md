@@ -210,6 +210,13 @@ Telemetry expectation:
   `public.session_history_tool_activity`
 - `claude_adapter_ctx_marker` is the hard gate for routed context markers and
   must keep validating the literal `:#port-allocation.ctx#:` rewrite path
+- dispatched child-agent prompts may also auto-resolve single-backticked topics
+  and bare uppercase acronyms through the same `tristore_search_exact` path;
+  preserve the inline text exactly and keep no-result lookups silent
+- the general Claude CommonMark-formatting sentence should also carry the
+  tenant/agent-scoped technical-identifier list when that prompt fragment is
+  present; the current implementation uses a direct query until the stored
+  procedure lands
 - for Gemini fanout acceptance, do not assume every Gemini child model emits
   its own command row; the stable invariant is:
   - session-wide delegated `Agent` rows are present on the parent session

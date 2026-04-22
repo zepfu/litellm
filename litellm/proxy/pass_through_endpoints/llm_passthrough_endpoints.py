@@ -74,7 +74,7 @@ except ImportError:
     ) -> dict[str, Any]:
         return request_body
 
-    def _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
+    async def _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
         request_body: dict[str, Any],
         billing_header_fields: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -6973,7 +6973,7 @@ async def _prepare_anthropic_request_body_for_passthrough(
         updated_body,
         _claude_system_prompt_override_events,
         _claude_prompt_patch_events,
-    ) = _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
+    ) = await _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
         updated_body,
         billing_header_fields,
     )
