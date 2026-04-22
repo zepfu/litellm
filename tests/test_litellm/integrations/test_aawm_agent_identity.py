@@ -51,6 +51,26 @@ def test_aawm_agent_identity_enriches_trace_name() -> None:
     )
 
 
+def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-claude-code-session-id": "session-abc-123"}
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert updated_kwargs["litellm_params"]["metadata"]["session_id"] == "session-abc-123"
+    assert (
+        updated_kwargs["standard_logging_object"]["metadata"]["session_id"]
+        == "session-abc-123"
+    )
+
+
 def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()

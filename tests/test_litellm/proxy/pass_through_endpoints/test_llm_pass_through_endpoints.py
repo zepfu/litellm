@@ -26,7 +26,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_code_assist_native_tool_aliases,
     _build_google_code_assist_request_from_completion_kwargs,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
+    _get_google_adapter_rate_limit_key,
     _get_google_code_assist_prime_cache_key,
+    _get_google_code_assist_prime_ttl_seconds,
     _google_adapter_rate_limit_until_monotonic_by_key,
     _google_code_assist_prime_until_monotonic_by_key,
     _get_google_adapter_semaphore,
@@ -156,6 +158,11 @@ class TestGoogleNativeToolAliases:
 
 
 class TestGoogleCodeAssistPrimeCache:
+    def test_google_code_assist_prime_ttl_defaults_to_cli_cache_window(self, monkeypatch):
+        monkeypatch.delenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS", raising=False)
+
+        assert _get_google_code_assist_prime_ttl_seconds() == 30.0
+
     @pytest.mark.asyncio
     async def test_google_code_assist_prime_cache_skips_repeat_preflight(self, monkeypatch):
         monkeypatch.setenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS", "300")
@@ -178,6 +185,78 @@ class TestGoogleCodeAssistPrimeCache:
         assert mock_client.post.await_count == 3
         cache_key = _get_google_code_assist_prime_cache_key("token-123", "project-123")
         assert _google_code_assist_prime_until_monotonic_by_key.get(cache_key, 0.0) > time.monotonic()
+
+
+class TestGoogleOAuthFallbacks:
+    def test_load_google_oauth_client_values_from_local_gemini_cli_bundle(
+        self, tmp_path, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _load_google_oauth_client_values_from_local_gemini_cli_bundle,
+        )
+
+        bundle_dir = tmp_path / "bundle"
+        bundle_dir.mkdir()
+        (bundle_dir / "chunk-auth.js").write_text(
+            'var OAUTH_CLIENT_ID = "client-id-123";\n'
+            'var OAUTH_CLIENT_SECRET = "client-secret-456";\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LITELLM_GEMINI_CLI_BUNDLE_PATH", str(bundle_dir))
+        monkeypatch.delenv("LITELLM_GEMINI_OAUTH_CLIENT_ID", raising=False)
+        monkeypatch.delenv("LITELLM_GEMINI_OAUTH_CLIENT_SECRET", raising=False)
+
+        client_id, client_secret = (
+            _load_google_oauth_client_values_from_local_gemini_cli_bundle()
+        )
+
+        assert client_id == "client-id-123"
+        assert client_secret == "client-secret-456"
+
+    @pytest.mark.asyncio
+    async def test_refresh_local_google_oauth_credentials_falls_back_to_gemini_cli_bundle(
+        self, tmp_path, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _refresh_local_google_oauth_credentials,
+        )
+
+        bundle_dir = tmp_path / "bundle"
+        bundle_dir.mkdir()
+        (bundle_dir / "chunk-auth.js").write_text(
+            'var OAUTH_CLIENT_ID = "client-id-123";\n'
+            'var OAUTH_CLIENT_SECRET = "client-secret-456";\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LITELLM_GEMINI_CLI_BUNDLE_PATH", str(bundle_dir))
+        monkeypatch.delenv("LITELLM_GEMINI_OAUTH_CLIENT_ID", raising=False)
+        monkeypatch.delenv("LITELLM_GEMINI_OAUTH_CLIENT_SECRET", raising=False)
+        mock_client = AsyncMock()
+        mock_client.post.return_value = httpx.Response(
+            200,
+            json={"access_token": "ya29.refreshed", "expires_in": 3600},
+        )
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = mock_client
+        mock_context.__aexit__.return_value = False
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+            return_value=mock_context,
+        ):
+            refreshed = await _refresh_local_google_oauth_credentials(
+                {"refresh_token": "refresh-token-123"}
+            )
+
+        assert refreshed["access_token"] == "ya29.refreshed"
+        assert refreshed["refresh_token"] == "refresh-token-123"
+        assert isinstance(refreshed["expiry_date"], int)
+        assert mock_client.post.await_args.kwargs["data"] == {
+            "client_id": "client-id-123",
+            "client_secret": "client-secret-456",
+            "refresh_token": "refresh-token-123",
+            "grant_type": "refresh_token",
+        }
 
 
 class TestGoogleAdapterRequestShapePolicy:
@@ -899,25 +978,59 @@ class TestGoogleAdapterRequestShapePolicy:
         assert chunks == [b"chunk-1", b"chunk-2"]
         assert released == ["released"]
 
-    def test_google_adapter_semaphore_is_model_scoped(self, monkeypatch):
+    def test_google_adapter_semaphore_is_shared_by_account_project_lane(
+        self, monkeypatch
+    ):
         monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_CONCURRENT", "1")
 
-        same_model_a = _get_google_adapter_semaphore("gemini-3-flash-preview")
-        same_model_b = _get_google_adapter_semaphore("gemini-3-flash-preview")
-        other_model = _get_google_adapter_semaphore("gemini-3.1-pro-preview")
+        lane_key_a = _get_google_adapter_rate_limit_key(
+            "gemini-3-flash-preview",
+            access_token="token-123",
+            companion_project="project-123",
+        )
+        lane_key_b = _get_google_adapter_rate_limit_key(
+            "gemini-3.1-pro-preview",
+            access_token="token-123",
+            companion_project="project-123",
+        )
+        other_lane_key = _get_google_adapter_rate_limit_key(
+            "gemini-3.1-pro-preview",
+            access_token="token-456",
+            companion_project="project-123",
+        )
 
-        assert same_model_a is same_model_b
-        assert same_model_a is not other_model
+        same_lane_a = _get_google_adapter_semaphore(rate_limit_key=lane_key_a)
+        same_lane_b = _get_google_adapter_semaphore(rate_limit_key=lane_key_b)
+        other_lane = _get_google_adapter_semaphore(rate_limit_key=other_lane_key)
+
+        assert lane_key_a == lane_key_b
+        assert same_lane_a is same_lane_b
+        assert same_lane_a is not other_lane
 
     @pytest.mark.asyncio
-    async def test_google_adapter_cooldown_is_model_scoped(self):
+    async def test_google_adapter_cooldown_is_shared_by_account_project_lane(self):
         _google_adapter_rate_limit_until_monotonic_by_key.clear()
+        shared_lane_key = _get_google_adapter_rate_limit_key(
+            "gemini-3-flash-preview",
+            access_token="token-123",
+            companion_project="project-123",
+        )
+        same_lane_other_model_key = _get_google_adapter_rate_limit_key(
+            "gemini-3.1-pro-preview",
+            access_token="token-123",
+            companion_project="project-123",
+        )
+        different_lane_key = _get_google_adapter_rate_limit_key(
+            "gemini-3.1-pro-preview",
+            access_token="token-456",
+            companion_project="project-123",
+        )
 
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.time.monotonic",
             return_value=100.0,
         ):
-            await _set_google_adapter_cooldown("gemini-3-flash-preview", 7.0)
+            await _set_google_adapter_cooldown(shared_lane_key, 7.0)
 
         sleep_mock = AsyncMock()
         with patch(
@@ -927,7 +1040,7 @@ class TestGoogleAdapterRequestShapePolicy:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
             new=sleep_mock,
         ):
-            await _wait_for_google_adapter_cooldown_if_needed("gemini-3.1-pro-preview")
+            await _wait_for_google_adapter_cooldown_if_needed(different_lane_key)
 
         sleep_mock.assert_not_awaited()
 
@@ -938,7 +1051,9 @@ class TestGoogleAdapterRequestShapePolicy:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
             new=sleep_mock,
         ):
-            await _wait_for_google_adapter_cooldown_if_needed("gemini-3-flash-preview")
+            await _wait_for_google_adapter_cooldown_if_needed(
+                same_lane_other_model_key
+            )
 
         sleep_mock.assert_awaited_once_with(7.0)
 
@@ -971,6 +1086,33 @@ class TestGoogleAdapterRequestShapePolicy:
         assert result is successful_response
         assert mock_pass_through.await_count == 2
         set_cooldown.assert_awaited_once_with('__default__', 8.0)
+
+    @pytest.mark.asyncio
+    async def test_google_adapter_request_strips_internal_wrapper_kwargs(self):
+        successful_response = Response(
+            content='{"ok": true}', media_type="application/json"
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(return_value=successful_response),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_google_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ):
+            result = await _perform_google_adapter_pass_through_request(
+                request=MagicMock(),
+                target="https://example.com",
+                google_access_token="token-123",
+                google_adapter_rate_limit_key="lane-123",
+            )
+
+        assert result is successful_response
+        forwarded_kwargs = mock_pass_through.await_args.kwargs
+        assert forwarded_kwargs["request"] is not None
+        assert forwarded_kwargs["target"] == "https://example.com"
+        assert "google_access_token" not in forwarded_kwargs
+        assert "google_adapter_rate_limit_key" not in forwarded_kwargs
 
     @pytest.mark.asyncio
     async def test_google_adapter_request_stops_after_retry_budget(self, monkeypatch):
@@ -1167,7 +1309,7 @@ class TestOpenRouterAdapterRetry:
             param="None",
             code=429,
         )
-        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openrouter/elephant-alpha is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
+        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
         successful_response = Response(content='{"ok": true}', media_type="application/json")
         set_cooldown = AsyncMock()
 
@@ -1182,19 +1324,20 @@ class TestOpenRouterAdapterRetry:
             new=set_cooldown,
         ):
             result = await _perform_openrouter_adapter_pass_through_request(
-                adapter_model="openrouter/elephant-alpha",
+                adapter_model="inclusionai/ling-2.6-flash:free",
                 request=MagicMock(),
             )
 
         assert result is successful_response
         assert mock_pass_through.await_count == 2
-        set_cooldown.assert_awaited_once_with("openrouter/elephant-alpha", 2.0)
+        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 2.0)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "adapter_model",
         [
             "google/gemma-4-31b-it:free",
+            "inclusionai/ling-2.6-flash:free",
             "meta-llama/llama-3.3-70b-instruct:free",
             "minimax/minimax-m2.5:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
@@ -1239,6 +1382,34 @@ class TestOpenRouterAdapterRetry:
         assert mock_pass_through.await_count == 2
         set_cooldown.assert_awaited_once_with(adapter_model, 2.0)
 
+    def test_openrouter_ling_free_model_info_has_zero_cost(self):
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[4]
+        pricing_map_paths = [
+            repo_root / "model_prices_and_context_window.json",
+            repo_root
+            / "litellm"
+            / "bundled_model_prices_and_context_window_fallback.json",
+        ]
+
+        for pricing_map_path in pricing_map_paths:
+            pricing_map = json.loads(pricing_map_path.read_text())
+            model_info = pricing_map["inclusionai/ling-2.6-flash:free"]
+            prefixed_model_info = pricing_map[
+                "openrouter/inclusionai/ling-2.6-flash:free"
+            ]
+
+            assert "openrouter/elephant-alpha" not in pricing_map
+            assert "openrouter/openrouter/elephant-alpha" not in pricing_map
+            assert model_info["litellm_provider"] == "openrouter"
+            assert model_info["input_cost_per_token"] == 0
+            assert model_info["output_cost_per_token"] == 0
+            assert model_info["max_input_tokens"] == 262144
+            assert model_info["max_tokens"] == 262144
+            assert prefixed_model_info["input_cost_per_token"] == 0
+            assert prefixed_model_info["output_cost_per_token"] == 0
+
     @pytest.mark.asyncio
     async def test_openrouter_adapter_request_raises_after_retry_budget(self, monkeypatch):
         monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_MAX_RETRIES", "1")
@@ -1250,7 +1421,7 @@ class TestOpenRouterAdapterRetry:
             param="None",
             code=429,
         )
-        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openrouter/elephant-alpha is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
+        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
         second_error = ProxyException(
             message="Provider returned error",
             type="None",
@@ -1272,12 +1443,12 @@ class TestOpenRouterAdapterRetry:
         ):
             with pytest.raises(ProxyException):
                 await _perform_openrouter_adapter_pass_through_request(
-                    adapter_model="openrouter/elephant-alpha",
+                    adapter_model="inclusionai/ling-2.6-flash:free",
                     request=MagicMock(),
                 )
 
         assert mock_pass_through.await_count == 2
-        set_cooldown.assert_awaited_once_with("openrouter/elephant-alpha", 2.0)
+        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 2.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_adapter_request_fast_fails_when_failure_circuit_open(self, monkeypatch):
@@ -1341,7 +1512,7 @@ class TestOpenRouterAdapterRetry:
                 return (
                     'litellm.RateLimitError: RateLimitError: OpenrouterException - '
                     '{"error":{"message":"Provider returned error","code":429,'
-                    '"metadata":{"raw":"openrouter/elephant-alpha is temporarily rate-limited upstream. Please retry shortly.",'
+                    '"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.",'
                     '"provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'
                 )
 
@@ -1356,13 +1527,13 @@ class TestOpenRouterAdapterRetry:
             new=set_cooldown,
         ):
             result = await _perform_openrouter_completion_adapter_operation(
-                adapter_model="openrouter/elephant-alpha",
+                adapter_model="inclusionai/ling-2.6-flash:free",
                 operation=operation,
             )
 
         assert result == "ok"
         assert operation.await_count == 2
-        set_cooldown.assert_awaited_once_with("openrouter/elephant-alpha", 2.0)
+        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 2.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_adapter_request_fails_fast_on_long_window_rate_limit(self, monkeypatch):
@@ -1407,12 +1578,12 @@ class TestOpenRouterAdapterRetry:
         ):
             with pytest.raises(ProxyException):
                 await _perform_openrouter_adapter_pass_through_request(
-                    adapter_model="openrouter/elephant-alpha",
+                    adapter_model="inclusionai/ling-2.6-flash:free",
                     request=MagicMock(),
                 )
 
         assert mock_pass_through.await_count == 1
-        set_cooldown.assert_awaited_once_with("openrouter/elephant-alpha", 300.0)
+        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 300.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_free_model_request_uses_retry_after_and_shared_cooldown(self, monkeypatch):
@@ -1560,12 +1731,12 @@ class TestOpenRouterAdapterRetry:
         ):
             with pytest.raises(FakeRateLimitError):
                 await _perform_openrouter_completion_adapter_operation(
-                    adapter_model="openrouter/elephant-alpha",
+                    adapter_model="inclusionai/ling-2.6-flash:free",
                     operation=operation,
                 )
 
         assert operation.await_count == 1
-        set_cooldown.assert_awaited_once_with("openrouter/elephant-alpha", 300.0)
+        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 300.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_completion_adapter_uses_hidden_retry_budget_beyond_attempt_cap(self, monkeypatch):
@@ -1578,7 +1749,7 @@ class TestOpenRouterAdapterRetry:
                 return (
                     'litellm.RateLimitError: RateLimitError: OpenrouterException - '
                     '{"error":{"message":"Provider returned error","code":429,'
-                    '"metadata":{"raw":"openrouter/elephant-alpha is temporarily rate-limited upstream. Please retry shortly.",'
+                    '"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.",'
                     '"provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'
                 )
 
@@ -1593,15 +1764,15 @@ class TestOpenRouterAdapterRetry:
             new=set_cooldown,
         ):
             result = await _perform_openrouter_completion_adapter_operation(
-                adapter_model="openrouter/elephant-alpha",
+                adapter_model="inclusionai/ling-2.6-flash:free",
                 operation=operation,
             )
 
         assert result == "ok"
         assert operation.await_count == 3
         assert [await_call.args for await_call in set_cooldown.await_args_list] == [
-            ("openrouter/elephant-alpha", 2.0),
-            ("openrouter/elephant-alpha", 10.0),
+            ("inclusionai/ling-2.6-flash:free", 2.0),
+            ("inclusionai/ling-2.6-flash:free", 10.0),
         ]
 
 
@@ -2091,6 +2262,9 @@ class TestClaudePersistedOutputExpansion:
             ).encode("utf-8"),
             media_type="application/json",
         )
+        mock_streaming_response = StreamingResponse(
+            iter([b"data: [DONE]\n\n"]), media_type="text/event-stream"
+        )
 
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
@@ -2105,12 +2279,12 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
             new=AsyncMock(return_value="project_123"),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-            new=AsyncMock(return_value=Response(content=json.dumps({"traceId": "trace_123", "response": {}}).encode("utf-8"), media_type="application/json")),
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(return_value=mock_streaming_response),
         ) as mock_pass_through_request, patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._translate_google_code_assist_response_to_anthropic",
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_response_from_stream",
             new=AsyncMock(return_value=translated_response),
-        ) as mock_translate_response:
+        ) as mock_collect_response:
             result = await anthropic_proxy_route(
                 endpoint="v1/messages",
                 request=mock_request,
@@ -2122,14 +2296,14 @@ class TestClaudePersistedOutputExpansion:
         assert translated_body["model"] == "gemini-3.1-pro-preview"
         assert translated_body["content"][0]["text"] == "gemini ok"
         call_kwargs = mock_pass_through_request.await_args.kwargs
-        assert call_kwargs["target"] == "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        assert call_kwargs["target"] == "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.GEMINI.value
         assert call_kwargs["forward_headers"] is False
         assert call_kwargs["query_params"] == {"alt": "sse"}
+        assert call_kwargs["stream"] is True
         assert call_kwargs["egress_credential_family"] == "google"
         assert call_kwargs["expected_target_family"] == "google"
         assert call_kwargs["custom_headers"]["Authorization"] == "Bearer ya29.test-google-token"
-        assert call_kwargs["custom_headers"]["X-Goog-User-Project"] == "project_123"
         assert call_kwargs["custom_body"]["model"] == "gemini-3.1-pro-preview"
         assert call_kwargs["custom_body"]["project"] == "project_123"
         assert call_kwargs["custom_body"]["request"]["session_id"]
@@ -2140,11 +2314,11 @@ class TestClaudePersistedOutputExpansion:
         assert "anthropic-google-completion-adapter" in call_kwargs["custom_body"]["litellm_metadata"]["tags"]
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> cloudcode-pa.googleapis.com/v1internal:generateContent"
+            == b"beta=true -> cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
         )
-        translate_kwargs = mock_translate_response.await_args.kwargs
-        assert translate_kwargs["adapter_model"] == "gemini-3.1-pro-preview"
-        assert translate_kwargs["tool_name_mapping"] == {}
+        collect_kwargs = mock_collect_response.await_args.kwargs
+        assert collect_kwargs["adapter_model"] == "gemini-3.1-pro-preview"
+        assert collect_kwargs["tool_name_mapping"] == {}
 
 
     @pytest.mark.asyncio
@@ -2297,6 +2471,78 @@ class TestClaudePersistedOutputExpansion:
 
         assert _normalize_google_completion_adapter_model_name(declared_model) == translated_model
         assert _normalize_google_completion_adapter_model_name(f"gemini/{declared_model}") == translated_model
+        assert _normalize_google_completion_adapter_model_name(f"google/{declared_model}") == translated_model
+
+    def test_resolve_anthropic_openai_responses_adapter_model_supports_openai_prefix(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_openai_responses_adapter_model,
+        )
+
+        request_body = {"model": "openai/gpt-5.4-mini"}
+
+        assert (
+            _resolve_anthropic_openai_responses_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == "gpt-5.4-mini"
+        )
+
+    def test_resolve_anthropic_google_completion_adapter_model_supports_google_prefix(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_google_completion_adapter_model,
+        )
+
+        request_body = {"model": "google/gemini-3.1"}
+
+        assert (
+            _resolve_anthropic_google_completion_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == "gemini-3.1-pro-preview"
+        )
+
+    def test_resolve_anthropic_google_completion_adapter_model_skips_openrouter_google_namespace(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_google_completion_adapter_model,
+            _resolve_anthropic_openrouter_responses_adapter_model,
+        )
+
+        request_body = {"model": "google/gemma-4-31b-it:free"}
+
+        assert (
+            _resolve_anthropic_google_completion_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            is None
+        )
+        assert (
+            _resolve_anthropic_openrouter_responses_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == "google/gemma-4-31b-it:free"
+        )
+
+    def test_resolve_anthropic_openrouter_responses_adapter_model_supports_openrouter_prefix(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_openrouter_responses_adapter_model,
+        )
+
+        request_body = {"model": "openrouter/inclusionai/ling-2.6-flash:free"}
+
+        assert (
+            _resolve_anthropic_openrouter_responses_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == "inclusionai/ling-2.6-flash:free"
+        )
 
     def test_load_claude_agent_declared_model_tolerates_cp1252_agent_file(
         self, tmp_path, monkeypatch
@@ -2364,6 +2610,9 @@ class TestClaudePersistedOutputExpansion:
             ).encode("utf-8"),
             media_type="application/json",
         )
+        mock_streaming_response = StreamingResponse(
+            iter([b"data: [DONE]\n\n"]), media_type="text/event-stream"
+        )
 
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
@@ -2378,12 +2627,12 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
             new=AsyncMock(return_value="project_123"),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-            new=AsyncMock(return_value=Response(content=json.dumps({"traceId": "trace_123", "response": {}}).encode("utf-8"), media_type="application/json")),
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(return_value=mock_streaming_response),
         ) as mock_pass_through_request, patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._translate_google_code_assist_response_to_anthropic",
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_response_from_stream",
             new=AsyncMock(return_value=translated_response),
-        ) as mock_translate_response:
+        ) as mock_collect_response:
             result = await anthropic_proxy_route(
                 endpoint="v1/messages",
                 request=mock_request,
@@ -2395,8 +2644,11 @@ class TestClaudePersistedOutputExpansion:
         assert translated_body["model"] == "gemini-3.1-pro-preview"
         call_kwargs = mock_pass_through_request.await_args.kwargs
         assert call_kwargs["custom_body"]["model"] == "gemini-3.1-pro-preview"
-        translate_kwargs = mock_translate_response.await_args.kwargs
-        assert translate_kwargs["adapter_model"] == "gemini-3.1-pro-preview"
+        assert call_kwargs["target"] == "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+        assert call_kwargs["query_params"] == {"alt": "sse"}
+        assert call_kwargs["stream"] is True
+        collect_kwargs = mock_collect_response.await_args.kwargs
+        assert collect_kwargs["adapter_model"] == "gemini-3.1-pro-preview"
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_does_not_load_local_google_auth_for_native_anthropic_model(
@@ -2447,13 +2699,13 @@ class TestClaudePersistedOutputExpansion:
 
 
     @pytest.mark.asyncio
-    async def test_anthropic_proxy_route_adapts_plain_elephant_alias_to_openrouter(
+    async def test_anthropic_proxy_route_adapts_plain_ling_alias_to_openrouter_responses(
         self,
     ):
         request_body = {
-            "model": "elephant-alpha",
+            "model": "ling-2-6-flash",
             "max_tokens": 128,
-            "messages": [{"role": "user", "content": "Say elephant alias ok"}],
+            "messages": [{"role": "user", "content": "Say ling alias ok"}],
         }
 
         mock_request = MagicMock(spec=Request)
@@ -2484,26 +2736,29 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
             return_value="openrouter-test-key",
         ), patch(
-            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
             new=AsyncMock(
-                return_value={
-                    "id": "msg_elephant",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "openrouter/elephant-alpha",
-                    "content": [
+                return_value=Response(
+                    content=json.dumps(
                         {
-                            "type": "tool_use",
-                            "id": "tool_1",
-                            "name": "Bash",
-                            "input": {"command": "date -u"},
+                            "id": "resp_ling_alias",
+                            "object": "response",
+                            "created_at": 1744974432,
+                            "model": "inclusionai/ling-2.6-flash:free",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
                         }
-                    ],
-                    "stop_reason": "tool_use",
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                }
+                    ).encode("utf-8"),
+                    status_code=200,
+                    media_type="application/json",
+                )
             ),
-        ) as mock_completion_handler:
+        ) as mock_pass_through_request:
             result = await anthropic_proxy_route(
                 endpoint="v1/messages",
                 request=mock_request,
@@ -2512,31 +2767,30 @@ class TestClaudePersistedOutputExpansion:
             )
 
         translated_body = json.loads(result.body.decode("utf-8"))
-        assert translated_body["model"] == "openrouter/elephant-alpha"
-        call_kwargs = mock_completion_handler.await_args.kwargs
-        assert call_kwargs["model"] == "openrouter/elephant-alpha"
+        assert translated_body["model"] == "inclusionai/ling-2.6-flash:free"
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
-        assert call_kwargs["api_base"] == "https://openrouter.ai/api/v1"
-        assert call_kwargs["headers"]["HTTP-Referer"] == "https://litellm.ai"
-        assert call_kwargs["metadata"] == {}
-        assert call_kwargs["proxy_server_request"]["headers"]["authorization"] == "Bearer anthropic-cli-token"
-        assert call_kwargs["proxy_server_request"]["body"]["model"] == "elephant-alpha"
-        assert call_kwargs["standard_callback_dynamic_params"] == {}
-        assert call_kwargs["litellm_metadata"]["passthrough_route_family"] == "anthropic_openrouter_completion_adapter"
+        assert call_kwargs["forward_headers"] is False
+        assert call_kwargs["custom_body"]["model"] == "inclusionai/ling-2.6-flash:free"
+        assert (
+            call_kwargs["custom_body"]["litellm_metadata"]["passthrough_route_family"]
+            == "anthropic_openrouter_responses_adapter"
+        )
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> openrouter.ai/api/v1/chat/completions"
+            == b"beta=true -> openrouter.ai/api/v1/responses"
         )
 
     @pytest.mark.asyncio
-    async def test_anthropic_proxy_route_adapts_allowlisted_openrouter_model_to_responses(
+    async def test_anthropic_proxy_route_adapts_allowlisted_ling_model_to_responses(
         self,
     ):
         request_body = {
-            "model": "openrouter/elephant-alpha",
+            "model": "inclusionai/ling-2.6-flash:free",
             "max_tokens": 256,
             "system": "You are helpful.",
-            "messages": [{"role": "user", "content": "Say elephant ok"}],
+            "messages": [{"role": "user", "content": "Say ling ok"}],
         }
 
         mock_request = MagicMock(spec=Request)
@@ -2567,26 +2821,29 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
             return_value="openrouter-test-key",
         ), patch(
-            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
             new=AsyncMock(
-                return_value={
-                    "id": "msg_elephant",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "openrouter/elephant-alpha",
-                    "content": [
+                return_value=Response(
+                    content=json.dumps(
                         {
-                            "type": "tool_use",
-                            "id": "tool_1",
-                            "name": "Bash",
-                            "input": {"command": "date -u"},
+                            "id": "resp_ling",
+                            "object": "response",
+                            "created_at": 1744974432,
+                            "model": "inclusionai/ling-2.6-flash:free",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
                         }
-                    ],
-                    "stop_reason": "tool_use",
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                }
+                    ).encode("utf-8"),
+                    status_code=200,
+                    media_type="application/json",
+                )
             ),
-        ) as mock_completion_handler:
+        ) as mock_pass_through_request:
             result = await anthropic_proxy_route(
                 endpoint="v1/messages",
                 request=mock_request,
@@ -2595,24 +2852,19 @@ class TestClaudePersistedOutputExpansion:
             )
 
         translated_body = json.loads(result.body.decode("utf-8"))
-        assert translated_body["model"] == "openrouter/elephant-alpha"
-        call_kwargs = mock_completion_handler.await_args.kwargs
-        assert call_kwargs["model"] == "openrouter/elephant-alpha"
+        assert translated_body["model"] == "inclusionai/ling-2.6-flash:free"
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
-        assert call_kwargs["api_key"] == "openrouter-test-key"
-        assert call_kwargs["api_base"] == "https://openrouter.ai/api/v1"
-        assert call_kwargs["headers"]["HTTP-Referer"] == "https://litellm.ai"
-        assert call_kwargs["metadata"] == {}
-        assert call_kwargs["headers"]["X-Title"] == "liteLLM"
+        assert call_kwargs["custom_body"]["model"] == "inclusionai/ling-2.6-flash:free"
         assert (
-            call_kwargs["litellm_metadata"]["passthrough_route_family"]
-            == "anthropic_openrouter_completion_adapter"
+            call_kwargs["custom_body"]["litellm_metadata"]["passthrough_route_family"]
+            == "anthropic_openrouter_responses_adapter"
         )
-        assert "anthropic-openrouter-completion-adapter" in call_kwargs["litellm_metadata"]["tags"]
         assert mock_request.scope["path"] == "/anthropic/v1/messages"
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> openrouter.ai/api/v1/chat/completions"
+            == b"beta=true -> openrouter.ai/api/v1/responses"
         )
 
     @pytest.mark.asyncio
@@ -2689,7 +2941,7 @@ class TestClaudePersistedOutputExpansion:
         assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
         assert call_kwargs["forward_headers"] is False
-        assert call_kwargs["custom_body"]["model"] == "gpt-oss-20b:free"
+        assert call_kwargs["custom_body"]["model"] == "openai/gpt-oss-20b:free"
         assert (
             call_kwargs["custom_body"]["litellm_metadata"]["passthrough_route_family"]
             == "anthropic_openrouter_responses_adapter"
@@ -4139,6 +4391,39 @@ class TestClaudePersistedOutputExpansion:
         assert "aawm-proc:get_agent_memories" in litellm_metadata["tags"]
 
     @pytest.mark.asyncio
+    async def test_call_aawm_context_grab_uses_tristore_search_exact_scope(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+        mock_pool = AsyncMock()
+        mock_pool.fetch = AsyncMock(
+            return_value=[
+                {"content": "Primary reference"},
+                {"content": "Fallback reference"},
+                {"content": "   "},
+            ]
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._get_aawm_dynamic_injection_pool",
+            new=AsyncMock(return_value=mock_pool),
+        ):
+            result = await aawm_claude_control_plane._call_aawm_context_grab(
+                name="alpha",
+                tenant_id="aawm",
+                agent_id="eyes",
+            )
+
+        assert result == "Primary reference\n\nFallback reference"
+        mock_pool.fetch.assert_awaited_once_with(
+            "SELECT content FROM tristore_search_exact($1, $2, $3)",
+            "alpha",
+            "aawm",
+            "eyes",
+        )
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_expands_ctx_marker_appendix(
         self,
     ):
@@ -4181,7 +4466,11 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["resolved"]
         assert litellm_metadata["aawm_dynamic_injection_cache_hits"] == 0
         assert litellm_metadata["aawm_dynamic_injection_cache_misses"] == 1
-        mock_context_grab.assert_awaited_once_with(name="alpha")
+        mock_context_grab.assert_awaited_once_with(
+            name="alpha",
+            tenant_id="aawm",
+            agent_id="eyes",
+        )
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_ctx_marker_dedupes_and_preserves_append_order(
@@ -4208,7 +4497,9 @@ class TestClaudePersistedOutputExpansion:
             ],
         }
 
-        async def _mock_context_grab(*, name: str) -> str:
+        async def _mock_context_grab(
+            *, name: str, tenant_id: str, agent_id: str
+        ) -> str:
             return f"{name.title()} context line"
 
         with patch(
@@ -4230,6 +4521,10 @@ class TestClaudePersistedOutputExpansion:
         assert [
             call.kwargs["name"] for call in mock_context_grab.await_args_list
         ] == ["alpha", "beta"]
+        assert [
+            (call.kwargs["tenant_id"], call.kwargs["agent_id"])
+            for call in mock_context_grab.await_args_list
+        ] == [("aawm", "eyes"), ("aawm", "eyes")]
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_reuses_cached_ctx_marker_result(
@@ -4277,7 +4572,11 @@ class TestClaudePersistedOutputExpansion:
         assert second_metadata["aawm_dynamic_injection_cache_hits"] == 1
         assert second_metadata["aawm_dynamic_injection_cache_misses"] == 0
         assert second_metadata["aawm_dynamic_injection_cache_statuses"] == ["hit"]
-        mock_context_grab.assert_awaited_once_with(name="alpha")
+        mock_context_grab.assert_awaited_once_with(
+            name="alpha",
+            tenant_id="aawm",
+            agent_id="eyes",
+        )
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_ctx_marker_appends_warning_for_no_results(
@@ -4323,7 +4622,11 @@ class TestClaudePersistedOutputExpansion:
         litellm_metadata = updated_body["litellm_metadata"]
         assert litellm_metadata["aawm_dynamic_injection_context_names"] == ["missing"]
         assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["empty"]
-        mock_context_grab.assert_awaited_once_with(name="missing")
+        mock_context_grab.assert_awaited_once_with(
+            name="missing",
+            tenant_id="aawm",
+            agent_id="eyes",
+        )
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_expands_aawm_dynamic_injection_to_no_memories_block(

@@ -37261,8 +37261,20 @@
         "supports_response_schema": true,
         "supports_vision": true
     },
-    "openrouter/elephant-alpha": {
-        "max_tokens": 32000,
+    "inclusionai/ling-2.6-flash:free": {
+        "max_tokens": 262144,
+        "max_input_tokens": 262144,
+        "input_cost_per_token": 0,
+        "output_cost_per_token": 0,
+        "litellm_provider": "openrouter",
+        "mode": "chat",
+        "supports_function_calling": true,
+        "supports_tool_choice": true,
+        "supports_response_schema": true,
+        "supports_prompt_caching": true
+    },
+    "openrouter/inclusionai/ling-2.6-flash:free": {
+        "max_tokens": 262144,
         "max_input_tokens": 262144,
         "input_cost_per_token": 0,
         "output_cost_per_token": 0,
@@ -37399,18 +37411,6 @@
         "supports_response_schema": true,
         "supports_vision": true,
         "supports_reasoning": true
-    },
-    "openrouter/openrouter/elephant-alpha": {
-        "max_tokens": 32000,
-        "max_input_tokens": 262144,
-        "input_cost_per_token": 0,
-        "output_cost_per_token": 0,
-        "litellm_provider": "openrouter",
-        "mode": "chat",
-        "supports_function_calling": true,
-        "supports_tool_choice": true,
-        "supports_response_schema": true,
-        "supports_prompt_caching": true
     },
     "openai/gpt-oss-20b:free": {
         "max_tokens": 131072,

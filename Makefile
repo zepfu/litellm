@@ -6,7 +6,9 @@
 	test-proxy-unit-a test-proxy-unit-b test-integration test-unit-helm \
 	info lint lint-dev format \
 	install-dev install-proxy-dev install-test-deps \
-	install-helm-unittest check-circular-imports check-import-safety
+	install-helm-unittest check-circular-imports check-import-safety \
+	dev-proxy-up dev-proxy-restart dev-proxy-recreate dev-proxy-build dev-proxy-rebuild dev-proxy-down dev-proxy-logs dev-proxy-status \
+	check-model-cost-map-sync sync-model-cost-map
 
 # Default target
 help:
@@ -39,6 +41,16 @@ help:
 	@echo "  make test-proxy-unit-b  - Run proxy_unit_tests (p-z, ~28 files)"
 	@echo "  make test-integration   - Run integration tests"
 	@echo "  make test-unit-helm     - Run helm unit tests"
+	@echo "  make dev-proxy-up       - Start litellm-dev on :4001 without rebuilding"
+	@echo "  make dev-proxy-restart  - Restart the existing litellm-dev container only"
+	@echo "  make dev-proxy-recreate - Recreate litellm-dev to pick up .env/compose/mount changes"
+	@echo "  make dev-proxy-build    - Build the litellm-dev image only"
+	@echo "  make dev-proxy-rebuild  - Rebuild the litellm-dev image and recreate the container"
+	@echo "  make dev-proxy-down     - Stop and remove litellm-dev"
+	@echo "  make dev-proxy-logs     - Tail litellm-dev logs (TAIL=200 by default)"
+	@echo "  make dev-proxy-status   - Show litellm-dev container status"
+	@echo "  make check-model-cost-map-sync - Verify the packaged fallback mirrors the canonical root model map"
+	@echo "  make sync-model-cost-map - Copy the canonical root model map into the packaged fallback mirror"
 
 UV ?= $(shell command -v uv)
 UV_CACHE_DIR ?= /tmp/uv-cache
@@ -51,6 +63,9 @@ RUFF := $(VENV_BIN)/ruff
 BLACK := $(VENV_BIN)/black
 MYPY := $(VENV_BIN)/mypy
 PIP_RUNTIME := $(PYTHON) -m pip
+DEV_COMPOSE := docker compose -f docker-compose.dev.yml
+DEV_PROXY_SERVICE := litellm-dev
+TAIL ?= 200
 
 DEV_PACKAGES := \
 	"diff-cover>=9.0,<10" \
@@ -243,3 +258,34 @@ test-llm-translation-single: install-test-deps
 	$(PYTEST) tests/llm_translation/$(FILE) \
 		--junitxml=test-results/junit.xml \
 		-v --tb=short --maxfail=100 --timeout=300
+
+# Local dev proxy targets
+dev-proxy-up:
+	$(DEV_COMPOSE) up -d $(DEV_PROXY_SERVICE)
+
+dev-proxy-restart:
+	$(DEV_COMPOSE) restart $(DEV_PROXY_SERVICE)
+
+dev-proxy-recreate:
+	$(DEV_COMPOSE) up -d --force-recreate $(DEV_PROXY_SERVICE)
+
+dev-proxy-build:
+	$(DEV_COMPOSE) build $(DEV_PROXY_SERVICE)
+
+dev-proxy-rebuild:
+	$(DEV_COMPOSE) up -d --build $(DEV_PROXY_SERVICE)
+
+dev-proxy-down:
+	$(DEV_COMPOSE) rm -f -s $(DEV_PROXY_SERVICE)
+
+dev-proxy-logs:
+	docker logs --tail $(TAIL) -f $(DEV_PROXY_SERVICE)
+
+dev-proxy-status:
+	docker ps --filter name=$(DEV_PROXY_SERVICE)
+
+check-model-cost-map-sync: ensure-venv
+	$(PYTHON) ci_cd/check_files_match.py
+
+sync-model-cost-map: ensure-venv
+	$(PYTHON) ci_cd/check_files_match.py --write

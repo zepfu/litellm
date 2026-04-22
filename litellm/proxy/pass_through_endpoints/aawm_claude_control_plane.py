@@ -64,7 +64,7 @@ _AAWM_CONTEXT_GRAB_PROC_NAME_ENV_VARS = (
     "AAWM_CONTEXT_GRAB_PROC_NAME",
     "AAWM_DYNAMIC_CONTEXT_GRAB_PROC_NAME",
 )
-_AAWM_CONTEXT_GRAB_DEFAULT_PROC_NAME = "get_named_context"
+_AAWM_CONTEXT_GRAB_DEFAULT_PROC_NAME = "tristore_search_exact"
 _AAWM_DYNAMIC_INJECTION_FAILURE_TEMPLATE = (
     "## AAWM Injection Status\n\n"
     'AAWM "{proc_name}" failed for this session.\n'
@@ -134,7 +134,9 @@ _aawm_dynamic_injection_pool: Optional[Any] = None
 _aawm_dynamic_injection_pool_lock = asyncio.Lock()
 _aawm_dynamic_injection_cache: dict[tuple[str, str, str, str], tuple[float, Optional[str]]] = {}
 _aawm_dynamic_injection_cache_lock = asyncio.Lock()
-_aawm_context_grab_cache: dict[tuple[str, str, str, str], tuple[float, dict[str, str]]] = {}
+_aawm_context_grab_cache: dict[
+    tuple[str, str, str, str, str], tuple[float, dict[str, str]]
+] = {}
 _aawm_context_grab_cache_lock = asyncio.Lock()
 _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
@@ -181,7 +183,7 @@ async def _set_cached_aawm_dynamic_injection_result(
 
 
 async def _get_cached_aawm_context_grab_result(
-    cache_key: tuple[str, str, str, str],
+    cache_key: tuple[str, str, str, str, str],
 ) -> tuple[bool, Optional[dict[str, str]]]:
     async with _aawm_context_grab_cache_lock:
         cached_entry = _aawm_context_grab_cache.get(cache_key)
@@ -196,7 +198,7 @@ async def _get_cached_aawm_context_grab_result(
 
 
 async def _set_cached_aawm_context_grab_result(
-    cache_key: tuple[str, str, str, str],
+    cache_key: tuple[str, str, str, str, str],
     cached_payload: dict[str, str],
 ) -> None:
     ttl_seconds = _get_aawm_dynamic_injection_cache_ttl_seconds()
@@ -1283,14 +1285,30 @@ def _format_aawm_context_retrieved_at(retrieved_at: datetime) -> str:
     )
 
 
-async def _call_aawm_context_grab(*, name: str) -> Optional[str]:
+async def _call_aawm_context_grab(
+    *, name: str, tenant_id: Optional[str], agent_id: Optional[str]
+) -> Optional[str]:
     proc_name = _get_aawm_context_grab_proc_name()
     pool = await _get_aawm_dynamic_injection_pool()
-    result = await pool.fetchval(f"SELECT {proc_name}($1)", name)
-    if isinstance(result, str):
-        stripped_result = result.strip()
-        if stripped_result:
-            return stripped_result
+    rows = await pool.fetch(
+        f"SELECT content FROM {proc_name}($1, $2, $3)",
+        name,
+        tenant_id,
+        agent_id,
+    )
+    contents: list[str] = []
+    for row in rows:
+        content: Optional[str] = None
+        if isinstance(row, dict):
+            content = row.get("content")
+        elif hasattr(row, "get"):
+            content = row.get("content")
+        if isinstance(content, str):
+            stripped_content = content.strip()
+            if stripped_content:
+                contents.append(stripped_content)
+    if contents:
+        return "\n\n".join(contents)
     return None
 
 
@@ -1387,13 +1405,14 @@ async def _resolve_aawm_context_marker(
     proc_name = _get_aawm_context_grab_proc_name()
     context_keys = [
         context_key
-        for context_key in ("session_id", "tenant")
+        for context_key in ("session_id", "tenant", "agent")
         if available_context.get(context_key)
     ]
     cache_key = (
         proc_name,
         available_context.get("session_id", ""),
         available_context.get("tenant", ""),
+        available_context.get("agent", ""),
         name,
     )
     event: dict[str, Any] = {
@@ -1408,7 +1427,11 @@ async def _resolve_aawm_context_marker(
     if not cache_hit:
         retrieved_at = _format_aawm_context_retrieved_at(datetime.now(timezone.utc))
         resolver = getattr(lp, "_call_aawm_context_grab", _call_aawm_context_grab)
-        content = await resolver(name=name)
+        content = await resolver(
+            name=name,
+            tenant_id=available_context.get("tenant"),
+            agent_id=available_context.get("agent"),
+        )
         cached_payload = {
             "status": "empty",
             "retrieved_at": retrieved_at,
@@ -1495,7 +1518,7 @@ async def _expand_aawm_context_markers_in_text(
                         "error": exc.__class__.__name__,
                         "context_keys": [
                             context_key
-                            for context_key in ("session_id", "tenant")
+                            for context_key in ("session_id", "tenant", "agent")
                             if available_context.get(context_key)
                         ],
                         "context_name": name,

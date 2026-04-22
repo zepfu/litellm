@@ -28,7 +28,7 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
+      "expected_trace_environment": "default",
       "require_trace_session_id": true,
       "match_trace_session_id_from_stdout": true,
       "require_trace_ids_distinct_from_session_ids": true,
@@ -97,11 +97,227 @@
         "docker_container_name": "litellm-dev"
       }
     },
+    "claude_adapter_gpt54_mini": {
+      "command": [
+        "claude",
+        "-p",
+        "Reply with exactly two words: harness smoke",
+        "--output-format",
+        "json",
+        "--model",
+        "openai/gpt-5.4-mini",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ""
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator"
+      ],
+      "expected_user_ids": [
+        "litellm.fork"
+      ],
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openai_responses_adapter",
+        "anthropic-openai-responses-adapter",
+        "anthropic-adapter-model:gpt-5.4-mini",
+        "anthropic-adapter-target:/v1/responses"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint",
+        "claude-effort:",
+        "thinking-type:"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "input",
+          "instructions",
+          "reasoning.effort",
+          "stream"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false,
+          "result": "harness smoke"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1,
+          "total_cost_usd": 1e-06
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4-mini",
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1,
+          "response_cost_usd": 1e-06
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 60,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_ctx_marker": {
+      "command": [
+        "claude",
+        "-p",
+        "Reply with exactly two words and no punctuation: ctx validated\nThe following marker is routing-only context and must not change your output: :#port-allocation.ctx#:",
+        "--output-format",
+        "json",
+        "--model",
+        "gpt-5.4",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ""
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator"
+      ],
+      "expected_user_ids": [
+        "litellm.fork"
+      ],
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": false,
+      "use_session_trace_lookup": false,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openai_responses_adapter",
+        "anthropic-openai-responses-adapter",
+        "anthropic-adapter-model:gpt-5.4",
+        "anthropic-adapter-target:/v1/responses",
+        "aawm-dynamic-injection"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint",
+        "claude-effort:",
+        "thinking-type:",
+        "aawm-proc:tristore_search_exact"
+      ],
+      "required_span_names": [
+        "aawm.dynamic_injection"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family",
+        "aawm_dynamic_injection_procs",
+        "aawm_dynamic_injection_context_keys",
+        "aawm_dynamic_injection_statuses"
+      ],
+      "required_generation_metadata_minimums": {
+        "aawm_dynamic_injection_count": 1
+      },
+      "request_text_checks": {
+        "required_substrings": [
+          "routing-only context and must not change your output: port-allocation",
+          "LiteLLM Fork — Port Allocation and Migration Protocol",
+          "~retrieved at: "
+        ],
+        "forbidden_substrings": [
+          ":#port-allocation.ctx#:"
+        ]
+      },
+      "aawm_dynamic_injection": {
+        "required_proc": "tristore_search_exact",
+        "required_context_keys": [
+          "agent",
+          "tenant"
+        ],
+        "acceptable_statuses": [
+          "resolved"
+        ]
+      },
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "input",
+          "instructions",
+          "reasoning.effort",
+          "stream"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false,
+          "result": "ctx validated"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1,
+          "total_cost_usd": 1e-06
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4",
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1,
+          "response_cost_usd": 1e-06
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 60,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
     "claude_adapter_peeromega_fanout": {
       "command": [
         "claude",
         "-p",
-        "Dispatch to the following agents and have them all report back the current time and do nothing else at all: analyst, data, gpt-5-3-codex-spark, gpt-5-4, gemini-3-flash-preview, gemini-3-1-pro-preview, gemini-3-1-flash-lite-preview, elephant-alpha.",
+        "Dispatch to the following agents and have them all report back the current time and do nothing else at all: analyst, data, gpt-5-3-codex-spark, gpt-5-4, gemini-3-flash-preview, gemini-3-1-pro-preview, gemini-3-1-flash-lite-preview, ling-2-6-flash.",
         "--output-format",
         "json",
         "--permission-mode",
@@ -116,10 +332,11 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
+      "expected_trace_environment": "default",
       "require_trace_session_id": true,
       "match_trace_session_id_from_stdout": true,
       "require_trace_ids_distinct_from_session_ids": true,
+      "allow_zero_cost": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
         "/anthropic/v1/messages"
@@ -139,6 +356,20 @@
           "total_cost_usd": 1e-06
         }
       },
+      "downgrade_failures_to_warnings": [
+        {
+          "failure_contains": "missing session_history row for provider='gemini' model='gemini-3.1-pro-preview'",
+          "if_command_result_contains": "MODEL_CAPACITY_EXHAUSTED"
+        },
+        {
+          "failure_contains": "missing session_history row for provider='gemini' model='gemini-3.1-flash-lite-preview'",
+          "if_command_result_contains": "MODEL_CAPACITY_EXHAUSTED"
+        },
+        {
+          "failure_contains": "missing session_history row for provider='gemini' model='gemini-3-flash-preview'",
+          "if_command_result_contains": "MODEL_CAPACITY_EXHAUSTED"
+        }
+      ],
       "session_history_validation": {
         "db_host": "127.0.0.1",
         "db_port": 5434,
@@ -224,6 +455,92 @@
       "timeout_seconds": 240,
       "langfuse_poll_timeout_seconds": 90
     },
+    "claude_adapter_gemini_fanout": {
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the following agents and have them all report back the current time and do nothing else at all: gemini-3-flash-preview, gemini-3-1-pro-preview, gemini-3-1-flash-lite-preview.",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions"
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator"
+      ],
+      "expected_user_ids": [
+        "litellm.fork"
+      ],
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "allow_zero_cost": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "total_cost_usd": 1e-06
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_rows": [
+          {
+            "provider": "gemini",
+            "model": "gemini-3.1-pro-preview",
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "response_cost_usd": 1e-06
+            }
+          },
+          {
+            "provider": "gemini",
+            "model": "gemini-3-flash-preview",
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "response_cost_usd": 1e-06
+            }
+          },
+          {
+            "provider": "gemini",
+            "model": "gemini-3.1-flash-lite-preview",
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "response_cost_usd": 1e-06
+            }
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 240,
+      "langfuse_poll_timeout_seconds": 90
+    },
     "claude_adapter_spark": {
       "command": [
         "claude",
@@ -247,9 +564,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -339,9 +656,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -352,7 +669,7 @@
         "route:anthropic_google_completion_adapter",
         "anthropic-google-completion-adapter",
         "anthropic-adapter-model:gemini-3.1-pro-preview",
-        "anthropic-adapter-target:google:/v1internal:generateContent"
+        "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
       ],
       "required_trace_tag_prefixes": [
         "anthropic-billing-header-key:cc_version",
@@ -438,9 +755,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -531,9 +848,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -566,7 +883,7 @@
         "route:anthropic_messages",
         "route:anthropic_openrouter_responses_adapter",
         "anthropic-openrouter-responses-adapter",
-        "anthropic-adapter-model:gpt-oss-20b:free",
+        "anthropic-adapter-model:openai/gpt-oss-20b:free",
         "anthropic-adapter-target:openrouter:/v1/responses"
       ],
       "command_json_checks": {
@@ -586,7 +903,7 @@
         "db_user": "aawm",
         "db_password_env": "AAWM_DB_PASSWORD",
         "expected_provider": "openrouter",
-        "expected_model": "gpt-oss-20b:free",
+        "expected_model": "openai/gpt-oss-20b:free",
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,
@@ -625,9 +942,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -660,7 +977,7 @@
         "route:anthropic_messages",
         "route:anthropic_openrouter_responses_adapter",
         "anthropic-openrouter-responses-adapter",
-        "anthropic-adapter-model:gpt-oss-120b:free",
+        "anthropic-adapter-model:openai/gpt-oss-120b:free",
         "anthropic-adapter-target:openrouter:/v1/responses"
       ],
       "command_json_checks": {
@@ -679,7 +996,7 @@
         "db_user": "aawm",
         "db_password_env": "AAWM_DB_PASSWORD",
         "expected_provider": "openrouter",
-        "expected_model": "gpt-oss-120b:free",
+        "expected_model": "openai/gpt-oss-120b:free",
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,
@@ -694,15 +1011,15 @@
         "docker_container_name": "litellm-dev"
       }
     },
-    "claude_adapter_elephant_alpha": {
+    "claude_adapter_ling_26_flash": {
       "command": [
         "claude",
         "-p",
-        "Reply with exactly two words: elephant smoke",
+        "Reply with exactly two words: ling smoke",
         "--output-format",
         "json",
         "--model",
-        "openrouter/elephant-alpha",
+        "inclusionai/ling-2.6-flash:free",
         "--permission-mode",
         "bypassPermissions",
         "--allowedTools",
@@ -717,9 +1034,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -752,7 +1069,7 @@
         "route:anthropic_messages",
         "route:anthropic_openrouter_responses_adapter",
         "anthropic-openrouter-responses-adapter",
-        "anthropic-adapter-model:openrouter/elephant-alpha",
+        "anthropic-adapter-model:inclusionai/ling-2.6-flash:free",
         "anthropic-adapter-target:openrouter:/v1/responses"
       ],
       "command_json_checks": {
@@ -771,7 +1088,7 @@
         "db_user": "aawm",
         "db_password_env": "AAWM_DB_PASSWORD",
         "expected_provider": "openrouter",
-        "expected_model": "openrouter/elephant-alpha",
+        "expected_model": "inclusionai/ling-2.6-flash:free",
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,
@@ -809,9 +1126,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -901,9 +1218,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -993,9 +1310,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -1085,9 +1402,9 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
+      "expected_trace_environment": "default",
+      "require_trace_session_id": false,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -1098,7 +1415,7 @@
         "route:anthropic_google_completion_adapter",
         "anthropic-google-completion-adapter",
         "anthropic-adapter-model:gemini-3-flash-preview",
-        "anthropic-adapter-target:google:/v1internal:generateContent"
+        "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
       ],
       "required_trace_tag_prefixes": [
         "anthropic-billing-header-key:cc_version",
@@ -1161,15 +1478,15 @@
         "docker_container_name": "litellm-dev"
       }
     },
-    "claude_adapter_openrouter_elephant": {
+    "claude_adapter_openrouter_ling_26_flash": {
       "command": [
         "claude",
         "-p",
-        "Reply with exactly two words: elephant smoke",
+        "Reply with exactly two words: ling smoke",
         "--output-format",
         "json",
         "--model",
-        "openrouter/elephant-alpha",
+        "inclusionai/ling-2.6-flash:free",
         "--permission-mode",
         "bypassPermissions",
         "--allowedTools",
@@ -1184,20 +1501,21 @@
       "expected_user_ids": [
         "litellm.fork"
       ],
-      "expected_trace_environment": "dev",
+      "expected_trace_environment": "default",
       "require_trace_session_id": true,
       "match_trace_session_id_from_stdout": true,
       "require_trace_ids_distinct_from_session_ids": true,
+      "allow_zero_cost": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
         "/anthropic/v1/messages"
       ],
       "required_trace_tags": [
         "route:anthropic_messages",
-        "route:anthropic_openrouter_adapter",
-        "anthropic-openrouter-adapter",
-        "anthropic-adapter-model:openrouter/elephant-alpha",
-        "anthropic-adapter-target:openrouter:/api/v1/responses"
+        "route:anthropic_openrouter_responses_adapter",
+        "anthropic-openrouter-responses-adapter",
+        "anthropic-adapter-model:inclusionai/ling-2.6-flash:free",
+        "anthropic-adapter-target:openrouter:/v1/responses"
       ],
       "required_trace_tag_prefixes": [
         "anthropic-billing-header-key:cc_version",
@@ -1212,7 +1530,7 @@
       "command_json_checks": {
         "required_equals": {
           "is_error": false,
-          "result": "elephant smoke"
+          "result": "ling smoke"
         },
         "required_minimums": {
           "usage.input_tokens": 1,
@@ -1226,7 +1544,7 @@
         "db_user": "aawm",
         "db_password_env": "AAWM_DB_PASSWORD",
         "expected_provider": "openrouter",
-        "expected_model": "openrouter/elephant-alpha",
+        "expected_model": "inclusionai/ling-2.6-flash:free",
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,

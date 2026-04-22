@@ -113,7 +113,7 @@ Current responsibilities:
 Published source:
 
 - `model_prices_and_context_window.json`
-- `litellm/model_prices_and_context_window_backup.json`
+- `litellm/bundled_model_prices_and_context_window_fallback.json`
 - `scripts/build_model_config_bundle.py`
 
 Release workflow:
@@ -136,6 +136,13 @@ Current responsibilities:
 - fast drift checks when model metadata changes without a full base release
 - current adapter-cost policy support, including paid-equivalent pricing for
   selected OpenRouter `:free` aliases when OpenRouter publishes a non-free twin
+
+Source-of-truth rule:
+
+- `model_prices_and_context_window.json` is the canonical editable file
+- `litellm/bundled_model_prices_and_context_window_fallback.json` is the packaged
+  offline mirror used when `LITELLM_LOCAL_MODEL_COST_MAP=True`
+- after editing the canonical file, run `make sync-model-cost-map`
 
 ## Runtime model
 
