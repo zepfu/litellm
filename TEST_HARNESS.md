@@ -157,9 +157,13 @@ This means a brief transient `429` can still be hidden locally, but repeated
 manual retests against the same persistently throttled free model should fail
 fast after the circuit opens instead of re-spending the full old retry window.
 
+Warning-only free-model canaries are still allowed to soft-fail on upstream
+timeouts or provider throttling. Those outcomes should remain warnings /
+`soft_failures` in the harness artifact rather than hard suite failures.
+
 Operational expectation:
-- retryable upstream `429`s may still appear as adapter warning/backoff lines in
-  `litellm-dev` logs
+- adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may
+  still appear as adapter warning/backoff lines in `litellm-dev` logs
 - they should not emit the generic pass-through exception traceback for the
   current request path
 

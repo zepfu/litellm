@@ -80,7 +80,7 @@ Current first-wave adapted coverage:
   - `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
   This is meant to preserve short hidden retries for sporadic free-model recovery while preventing repeated manual retests from re-burning the same ~40s retry window on persistently throttled models.
-  Retryable upstream `429`s may still show up as adapter warning/backoff lines, but they should not produce the generic pass-through exception traceback for the current request path.
+  Adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may still show up as adapter warning/backoff lines, but they should not produce the generic pass-through exception traceback for the current request path.
 
 Preferred Anthropic-adapter model spellings:
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
@@ -113,4 +113,5 @@ Important notes:
   - `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model
 - Fanout prompts should continue using the Claude agent names from `~/.claude/agents` such as `gemini-3-flash-preview`; those agent files now carry explicit provider-prefixed `model:` values like `google/gemini-3-flash-preview`.
 - `openrouter/free` and `inclusionai/ling-2.6-flash:free` are canaries, not hard gates; upstream routing / rate limits can make them noisy even when the local adapter path is correct.
+- `warning_only` canaries stay non-gating even when the subprocess itself times out; those conditions should surface as `soft_failures` / warnings in the artifact, not as suite-stopping failures.
 - `ling-2-6-flash` now validates on the generic OpenRouter `Responses` lane, so trace tags / metadata / `session_history` should match the other free-model response adapters.
