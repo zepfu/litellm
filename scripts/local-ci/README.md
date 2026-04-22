@@ -74,6 +74,9 @@ Current first-wave adapted coverage:
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
 - OpenRouter preferred free targets under active validation: `inclusionai/ling-2.6-flash:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
 - OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+  - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain available in config but are excluded from the default full suite
+  - run them only by explicit selection, for example:
+    `--cases claude_adapter_gemma_31b,claude_adapter_gemma_26b_a4b`
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
 - `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane with the other `vendor/model:free` targets
 - current dev OpenRouter pacing on `:4001`:
