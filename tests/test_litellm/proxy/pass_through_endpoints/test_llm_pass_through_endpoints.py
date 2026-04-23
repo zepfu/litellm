@@ -3281,19 +3281,20 @@ class TestClaudePersistedOutputExpansion:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("requested_model", "expected_model"),
+        ("requested_model", "expected_model", "expected_timeout"),
         [
-            ("nvidia/deepseek-ai/deepseek-v3.2", "deepseek-ai/deepseek-v3.2"),
-            ("nvidia/deepseek-ai/deepseek-v3.1-terminus", "deepseek-ai/deepseek-v3.1-terminus"),
-            ("nvidia/mistralai/devstral-2-123b-instruct-2512", "mistralai/devstral-2-123b-instruct-2512"),
-            ("nvidia/z-ai/glm4.7", "z-ai/glm4.7"),
-            ("nvidia/minimax/minimax-m2.7", "minimaxai/minimax-m2.7"),
+            ("nvidia/deepseek-ai/deepseek-v3.2", "deepseek-ai/deepseek-v3.2", 120.0),
+            ("nvidia/deepseek-ai/deepseek-v3.1-terminus", "deepseek-ai/deepseek-v3.1-terminus", 120.0),
+            ("nvidia/mistralai/devstral-2-123b-instruct-2512", "mistralai/devstral-2-123b-instruct-2512", 120.0),
+            ("nvidia/z-ai/glm4.7", "z-ai/glm4.7", 120.0),
+            ("nvidia/minimax/minimax-m2.7", "minimaxai/minimax-m2.7", 240.0),
         ],
     )
     async def test_anthropic_proxy_route_adapts_selected_nvidia_models_to_completion_adapter(
         self,
         requested_model: str,
         expected_model: str,
+        expected_timeout: float,
     ):
         request_body = {
             "model": requested_model,
@@ -3358,7 +3359,8 @@ class TestClaudePersistedOutputExpansion:
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.NVIDIA_NIM.value
         assert call_kwargs["api_key"] == "nvidia-test-key"
         assert call_kwargs["api_base"] == "https://integrate.api.nvidia.com/v1"
-        assert call_kwargs["timeout"] == 75.0
+        assert call_kwargs["timeout"] == expected_timeout
+        assert call_kwargs["max_retries"] == 0
         assert "standard_callback_dynamic_params" not in call_kwargs
         assert call_kwargs["model"] == expected_model
         assert (
@@ -3456,6 +3458,145 @@ class TestClaudePersistedOutputExpansion:
         assert translated_body["model"] == "minimaxai/minimax-m2.7"
         assert mock_completion_adapter.await_count == 2
         mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_fake_streams_minimax_nvidia_model(self):
+        request_body = {
+            "model": "nvidia/minimaxai/minimax-m2.7",
+            "max_tokens": 256,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Say model ok"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer anthropic-cli-token",
+            "anthropic-version": "2023-06-01",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
+            return_value="nvidia-test-key",
+        ), patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+            new=AsyncMock(
+                return_value={
+                    "id": "msg_nvidia",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "minimaxai/minimax-m2.7",
+                    "content": [{"type": "text", "text": "model ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                    },
+                }
+            ),
+        ) as mock_completion_adapter:
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert isinstance(result, StreamingResponse)
+        call_kwargs = mock_completion_adapter.await_args.kwargs
+        assert call_kwargs["stream"] is False
+        streamed_chunks = []
+        async for chunk in result.body_iterator:
+            streamed_chunks.append(
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            )
+        streamed_payload = "".join(streamed_chunks)
+        assert "event: message_start" in streamed_payload
+        assert '"model": "minimaxai/minimax-m2.7"' in streamed_payload
+        assert '"text": "model ok"' in streamed_payload
+
+    @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_keeps_native_streaming_for_non_minimax_nvidia_model(
+        self,
+    ):
+        request_body = {
+            "model": "nvidia/z-ai/glm4.7",
+            "max_tokens": 256,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Say model ok"}],
+        }
+
+        async def _anthropic_stream():
+            yield b'event: message_start\ndata: {"type":"message_start"}\n\n'
+            yield b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"model ok"}}\n\n'
+            yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer anthropic-cli-token",
+            "anthropic-version": "2023-06-01",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
+            return_value="nvidia-test-key",
+        ), patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+            new=AsyncMock(return_value=_anthropic_stream()),
+        ) as mock_completion_adapter:
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert isinstance(result, StreamingResponse)
+        call_kwargs = mock_completion_adapter.await_args.kwargs
+        assert call_kwargs["stream"] is True
+        streamed_chunks = []
+        async for chunk in result.body_iterator:
+            streamed_chunks.append(
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            )
+        streamed_payload = "".join(streamed_chunks)
+        assert "event: message_start" in streamed_payload
+        assert "model ok" in streamed_payload
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_adapts_allowlisted_openai_model_to_responses(

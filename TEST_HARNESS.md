@@ -237,13 +237,14 @@ Telemetry expectation:
   - `nvidia/z-ai/glm4.7`
   - `nvidia/minimaxai/minimax-m2.7`
   - compatibility alias: `nvidia/minimax/minimax-m2.7`
-- current NVIDIA harness cases are `claude_adapter_nvidia_deepseek_v32` and
-  `claude_adapter_nvidia_glm47`; both are excluded from the default suite and
-  should be run explicitly with `--cases`
-- `claude_adapter_nvidia_minimax_m27` is manual-only for now; keep the exact
-  `nvidia/minimaxai/minimax-m2.7` spelling for ad hoc probes, but do not treat
-  it as a required live canary until the upstream/CLI stall behavior is
-  understood
+- current NVIDIA harness cases are `claude_adapter_nvidia_deepseek_v32`,
+  `claude_adapter_nvidia_glm47`, and `claude_adapter_nvidia_minimax_m27`; all
+  are excluded from the default suite and should be run explicitly with
+  `--cases`
+- `claude_adapter_nvidia_minimax_m27` is now an explicit opt-in harness case;
+  keep the exact `nvidia/minimaxai/minimax-m2.7` spelling and expect this case
+  to use upstream non-stream plus Anthropic-compatible fake streaming because
+  MiniMax is materially slower than the other NVIDIA targets
 - these cases validate the Anthropic -> NVIDIA completion adapter on
   `nvidia:/v1/chat/completions` via `provider=nvidia_nim`
 - for NVIDIA-adapted runs, expect the same parity as the other adapted
