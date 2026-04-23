@@ -213,6 +213,16 @@ Telemetry expectation:
   - current detection uses provider-native cache hints:
     `cache_control` for Anthropic/OpenRouter, `cachedContent` for Gemini, and
     `input_tokens_details.cached_tokens` for OpenAI-style usage
+- session-history writer changes must stay synced between the in-repo dev
+  callback (`litellm.integrations.aawm_agent_identity`) and the callback overlay
+  wheel source (`.wheel-build/aawm_litellm_callbacks/agent_identity.py`), because
+  the port-4000 `aawm-litellm` image imports the wheel module rather than the
+  in-repo dev module
+- `scripts/repair_session_history_provider_cache.py` is the local repair path
+  for existing rows when source spend logs are not available; despite its
+  historical name it now repairs inferred provider, reasoning source/count
+  normalization, provider-cache telemetry, cache miss token/cost fields, and git
+  commit/push rollups
 - for Codex/OpenAI streaming tool runs, `response.output_item.*` and
   `response.function_call_arguments.*` events must roll up into
   `usage_tool_call_count`, `codex_tool_call_count`, and at least one

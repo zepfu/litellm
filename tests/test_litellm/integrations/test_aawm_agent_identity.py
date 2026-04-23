@@ -6,6 +6,7 @@ from litellm.integrations.aawm_agent_identity import (
     AawmAgentIdentity,
     _build_session_history_record_from_langfuse_trace_observation,
     _build_session_history_record_from_spend_log_row,
+    _build_session_history_db_payload,
     _build_session_history_record,
     _derive_langfuse_trace_tags_from_langfuse_trace,
     _derive_langfuse_trace_tags_from_spend_log_row,
@@ -586,6 +587,74 @@ def test_build_session_history_record_sets_not_applicable_reasoning_source_when_
     assert record["reasoning_tokens_source"] == "not_applicable"
 
 
+def test_build_session_history_record_does_not_treat_zero_reasoning_as_reported() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-opus-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-zero-signature"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-claude-zero-signature"
+    kwargs["litellm_params"]["metadata"]["reasoning_content_present"] = True
+    kwargs["litellm_params"]["metadata"]["thinking_signature_present"] = True
+
+    result = {
+        "id": "provider-response-zero-signature",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "completion_tokens_details": {"reasoning_tokens": 0},
+        },
+        "choices": [{"message": {"role": "assistant", "content": "done"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["reasoning_present"] is True
+    assert record["thinking_signature_present"] is True
+    assert record["reasoning_tokens_reported"] is None
+    assert record["reasoning_tokens_estimated"] is None
+    assert record["reasoning_tokens_source"] == "not_available"
+
+
+def test_build_session_history_record_infers_provider_and_cache_from_model() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-provider-infer-cache"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-provider-infer-cache"
+
+    result = {
+        "id": "provider-response-provider-infer-cache",
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 4,
+            "total_tokens": 124,
+            "cache_read_input_tokens": 64,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "cached"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "anthropic"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is False
+
+
 def test_build_session_history_record_marks_openai_provider_cache_miss_from_zero_cached_tokens() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4"
@@ -619,6 +688,103 @@ def test_build_session_history_record_marks_openai_provider_cache_miss_from_zero
     assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
     assert record["provider_cache_miss_token_count"] is None
     assert record["provider_cache_miss_cost_usd"] is None
+
+
+def test_build_session_history_record_tracks_git_global_option_commit_and_push() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-git-global-options"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-git-global-options"
+
+    result = {
+        "id": "provider-response-git-global-options",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Working.",
+                    "tool_calls": [
+                        {
+                            "id": "tool-1",
+                            "type": "function",
+                            "function": {
+                                "name": "Bash",
+                                "arguments": (
+                                    '{"payload":{"script":"git -C /repo commit -m msg && '
+                                    'git --git-dir=/repo/.git push origin develop"}}'
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["git_commit_count"] == 1
+    assert record["git_push_count"] == 1
+    assert record["tool_activity"][0]["git_commit_count"] == 1
+    assert record["tool_activity"][0]["git_push_count"] == 1
+
+
+def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
+    record = {
+        "litellm_call_id": "call-zero-reasoning-payload",
+        "session_id": "session-zero-reasoning-payload",
+        "trace_id": "trace-zero-reasoning-payload",
+        "provider_response_id": "resp-zero",
+        "provider": None,
+        "model": "claude-opus-4-6",
+        "model_group": None,
+        "agent_name": "engineer",
+        "tenant_id": "aegis",
+        "call_type": "pass_through_endpoint",
+        "start_time": None,
+        "end_time": None,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 120,
+        "cache_read_input_tokens": 90,
+        "cache_creation_input_tokens": 0,
+        "reasoning_tokens_reported": 0,
+        "reasoning_tokens_estimated": None,
+        "reasoning_tokens_source": "provider_reported",
+        "reasoning_present": False,
+        "thinking_signature_present": False,
+        "provider_cache_attempted": False,
+        "provider_cache_status": None,
+        "provider_cache_miss": False,
+        "provider_cache_miss_reason": None,
+        "provider_cache_miss_token_count": None,
+        "provider_cache_miss_cost_usd": None,
+        "tool_call_count": 0,
+        "tool_names": [],
+        "file_read_count": 0,
+        "file_modified_count": 0,
+        "git_commit_count": 0,
+        "git_push_count": 0,
+        "response_cost_usd": None,
+        "metadata": {},
+    }
+
+    payload = _build_session_history_db_payload(record)
+
+    assert payload[4] == "anthropic"
+    assert payload[17] is None
+    assert payload[19] == "not_applicable"
+    assert payload[22] is True
+    assert payload[23] == "hit"
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:

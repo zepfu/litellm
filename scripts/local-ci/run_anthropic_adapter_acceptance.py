@@ -268,7 +268,9 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
                provider_cache_miss, provider_cache_miss_reason,
                provider_cache_miss_token_count, provider_cache_miss_cost_usd,
                reasoning_tokens_reported, reasoning_tokens_estimated,
-               reasoning_tokens_source, tool_call_count, tool_names, response_cost_usd,
+               reasoning_tokens_source, tool_call_count, tool_names,
+               file_read_count, file_modified_count, git_commit_count, git_push_count,
+               response_cost_usd,
                start_time, end_time
         from public.session_history
         where session_id = %s
@@ -294,6 +296,10 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
 
     for row in records:
         row_provider = row.get('provider')
+        if not isinstance(row_provider, str) or not row_provider.strip():
+            failures.append(
+                f'{family} session_history row model={row.get("model")!r} has null/empty `provider`'
+            )
         if row_provider in {'anthropic', 'openai', 'openrouter', 'gemini'}:
             cache_status = row.get('provider_cache_status')
             if not isinstance(cache_status, str) or not cache_status.strip():
