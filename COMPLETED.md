@@ -17,8 +17,11 @@
 - Hardened the NVIDIA completion adapter against provider-specific request and timeout issues.
   The route no longer forwards the empty `standard_callback_dynamic_params` payload into NVIDIA chat-completions requests, and it now applies a short per-attempt timeout plus hidden retry for transient `408` / `429` / `5xx` failures before surfacing an HTTP error.
 
-- Established stable live NVIDIA canaries on `:4001`.
-  `claude_adapter_nvidia_deepseek_v32` and `claude_adapter_nvidia_glm47` now pass end to end against `litellm-dev`, including `session_history` provider/model/cost validation, request-body/trace tag checks, and runtime-log traceback guards. `claude_adapter_nvidia_minimax_m27` remains supported via routing/unit coverage but is manual-only for now because the live Claude/NVIDIA path still stalls intermittently.
+- Stabilized the high-latency MiniMax path inside the NVIDIA Anthropic adapter.
+  The NVIDIA lane now avoids nested OpenAI-provider retries by forcing the inner provider `max_retries` to `0`, uses a higher default adapter timeout, and fake-streams `minimaxai/minimax-m2.7` through Anthropic SSE while keeping the upstream NVIDIA call non-streaming.
+
+- Established stable live NVIDIA spot checks on `:4001`.
+  `claude_adapter_nvidia_deepseek_v32`, `claude_adapter_nvidia_glm47`, and `claude_adapter_nvidia_minimax_m27` now pass explicit end-to-end validation against `litellm-dev`, including `session_history` provider/model/cost validation, request-body or adapted-request checks, trace tag checks, and runtime-log traceback guards. They remain excluded from the default suite because the NVIDIA lane is still opt-in and MiniMax is materially slower than the other NVIDIA targets.
 
 - Added normalized provider-cache telemetry to `public.session_history` for Anthropic, OpenAI, Gemini, and OpenRouter.
   Stored fields now include `provider_cache_attempted`, `provider_cache_status`, `provider_cache_miss`, and `provider_cache_miss_reason`.
