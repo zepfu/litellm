@@ -150,3 +150,84 @@ async def test_async_anthropic_sse_wrapper():
     chunk_str = first_chunk.decode("utf-8")
     assert "event: message_start" in chunk_str
     assert '"type": "message_start"' in chunk_str
+
+
+def test_sync_wrapper_synthesizes_end_turn_when_stream_ends_without_terminal_chunk():
+    class MockCompletionStreamNoTerminal:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="Hello"), index=0, finish_reason=None
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= len(self.responses):
+                raise StopIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStreamNoTerminal(), model="gemini-3-flash-preview"
+    )
+
+    chunks = list(wrapper)
+    chunk_types = [chunk["type"] for chunk in chunks]
+
+    assert "content_block_stop" in chunk_types
+    assert "message_delta" in chunk_types
+    assert chunk_types[-1] == "message_stop"
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_async_wrapper_synthesizes_end_turn_when_stream_ends_without_terminal_chunk():
+    class AsyncMockCompletionStreamNoTerminal:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="Hello"), index=0, finish_reason=None
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.index >= len(self.responses):
+                raise StopAsyncIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=AsyncMockCompletionStreamNoTerminal(), model="gemini-3-flash-preview"
+    )
+
+    chunks = []
+    async for chunk in wrapper:
+        chunks.append(chunk)
+
+    chunk_types = [chunk["type"] for chunk in chunks]
+    assert "content_block_stop" in chunk_types
+    assert "message_delta" in chunk_types
+    assert chunk_types[-1] == "message_stop"
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"

@@ -163,6 +163,12 @@ class TestGeminiPassthroughLoggingHandler:
         assert result["kwargs"]["response_cost"] == 0.000045
         assert result["kwargs"]["model"] == "gemini-1.5-flash"
         assert result["kwargs"]["custom_llm_provider"] == "gemini"
+        assert (
+            result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+                "promptTokenCount"
+            ]
+            == 10
+        )
 
         # Verify cost calculation was called
         mock_completion_cost.assert_called_once()
@@ -206,6 +212,12 @@ class TestGeminiPassthroughLoggingHandler:
         assert result["kwargs"]["response_cost"] == 0.000045
         assert result["kwargs"]["model"] == "gemini-3-flash-preview"
         assert mock_logging_obj.model_call_details["model"] == "gemini-3-flash-preview"
+        assert (
+            result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+                "totalTokenCount"
+            ]
+            == 18
+        )
 
     def test_response_for_transform_strips_compression_headers_for_code_assist(self):
         mock_httpx_response = MagicMock(spec=httpx.Response)
@@ -301,6 +313,47 @@ class TestGeminiPassthroughLoggingHandler:
         assert response.model == "gemini-3-flash-preview"
         assert response.choices[0].message.content == "gemini routed"
 
+
+    def test_build_complete_streaming_response_code_assist_list_wrapped_sse_chunks(self):
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            [
+                {
+                    "traceId": "trace-456",
+                    "response": {
+                        "candidates": [
+                            {
+                                "content": {"parts": [{"text": "gemini wrapped"}], "role": "model"},
+                                "finishReason": "STOP",
+                                "index": 0,
+                            }
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 70295,
+                            "candidatesTokenCount": 3,
+                            "totalTokenCount": 70368,
+                            "thoughtsTokenCount": 70,
+                        },
+                        "modelVersion": "gemini-3.1-pro-preview",
+                    },
+                }
+            ]
+        )
+
+        response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=[chunk, "data: [DONE]"],
+            litellm_logging_obj=mock_logging_obj,
+            model="gemini-3.1-pro-preview",
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+        )
+
+        assert response is not None
+        assert response.model == "gemini-3.1-pro-preview"
+        assert response.choices[0].message.content == "gemini wrapped"
+        assert response.usage.prompt_tokens == 70295
+        assert response.usage.completion_tokens == 73
+        assert response.usage.completion_tokens_details.reasoning_tokens == 70
+
     @patch("litellm.completion_cost")
     def test_gemini_passthrough_handler_streaming(self, mock_completion_cost):
         """Test cost tracking for Gemini streaming endpoint"""
@@ -310,7 +363,14 @@ class TestGeminiPassthroughLoggingHandler:
         # Mock streaming response chunks
         mock_chunks = [
             {"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]},
-            {"candidates": [{"content": {"parts": [{"text": " there!"}]}}]},
+            {
+                "candidates": [{"content": {"parts": [{"text": " there!"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 2,
+                    "totalTokenCount": 12,
+                },
+            },
         ]
 
         mock_httpx_response = self._create_mock_httpx_response()
@@ -346,6 +406,58 @@ class TestGeminiPassthroughLoggingHandler:
 
         # Verify cost calculation was called
         mock_completion_cost.assert_called_once()
+
+    @patch("litellm.completion_cost")
+    def test_handle_logging_gemini_collected_chunks_stores_usage_object(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.000030
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            {
+                "traceId": "trace-789",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": "gemini streamed"}],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 14,
+                        "candidatesTokenCount": 11,
+                        "totalTokenCount": 25,
+                        "candidatesTokensDetails": [
+                            {"modality": "THOUGHT", "tokenCount": 5},
+                            {"modality": "TEXT", "tokenCount": 6},
+                        ],
+                    },
+                },
+            }
+        )
+
+        result = GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            request_body={"model": "gemini-3-flash-preview"},
+            endpoint_type=MagicMock(),
+            start_time=self.start_time,
+            all_chunks=[chunk, "data: [DONE]"],
+            model="gemini-3-flash-preview",
+            end_time=self.end_time,
+        )
+
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "totalTokenCount"
+        ] == 25
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "candidatesTokensDetails"
+        ][0]["modality"] == "THOUGHT"
 
     def test_gemini_passthrough_handler_non_gemini_route(self):
         """Test that non-Gemini routes return None"""

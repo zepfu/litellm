@@ -29,12 +29,16 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17` (16 active patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25` (24 active carried patches)
 
-**Version metadata note:** `pyproject.toml` should stay aligned to this
-registry's carried patch set. `litellm/_version.py` now reflects the installed
-distribution version directly. The current working tree now aligns on
-`1.82.3+aawm.17`.
+**Working-tree note:** `develop` is the integration branch for the current
+carried patch set. Promotion to `main` should happen only after the full
+adapter harness and focused regression tests pass against the intended target.
+
+**Version metadata note:** `pyproject.toml` should stay aligned to the last
+carried patch set. `litellm/_version.py` now reflects the installed
+distribution version directly. The current promotion target is
+`1.82.3+aawm.25`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -553,6 +557,299 @@ patches and AAWM-managed enhancements that should ship independently.
 **Validation status:** Focused Anthropic passthrough tests still cover the live
 rewrite/injection path after the helper-module split, and the control-plane
 wheel build definition now exists as its own releaseable artifact line.
+
+---
+### aawm.18 — Anthropic-route native adapter lane for OpenAI/Codex, OpenRouter, and Google Code Assist
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py`
+- `litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py`
+
+**Upstream issue:** Claude Code only speaks the Anthropic Messages API. AAWM needs
+selected non-Anthropic models to be reachable through `/anthropic/v1/messages`
+without Claude suspecting it is talking to anything other than Anthropic.
+
+**Fix:**
+1. Add allowlisted Anthropic-route adapter handling for:
+   - OpenAI/Codex Responses models (`gpt-5.4`, `gpt-5.3-codex-spark`)
+   - Google Code Assist / Gemini 3.1 models (`gemini-3.1*`)
+   - OpenRouter-backed free-model targets
+2. Translate Anthropic request/stream shapes into the native target provider
+   request and translate the response/stream back into Anthropic-compatible
+   output for Claude Code.
+3. Reuse the provider-native local auth sources instead of inventing new
+   server-side auth flows:
+   - local Codex OAuth for OpenAI/Codex
+   - local Google OAuth / Code Assist project routing for Gemini 3.1
+   - `AAWM_OPENROUTER_API_KEY` for OpenRouter
+4. Preserve Anthropic-compatible access-log labeling, adapter trace tags, and
+   backend `session_history` attribution for the adapted calls.
+
+**Why not upstream:** This is AAWM-specific multi-provider routing at the
+Anthropic seam, driven by Claude Code compatibility and local-provider auth
+reuse. Upstream LiteLLM does not provide a generic “pretend Anthropic, route to
+other providers” control plane.
+
+**Validation status:** Real Claude CLI traffic on `litellm-dev` succeeded on the
+OpenAI/Codex lane, the OpenRouter lane, and the Google Code Assist Gemini lane
+(`gemini-3.1-pro-preview` as the current validated baseline).
+
+---
+
+### aawm.19 — Provider-family egress guard, adapted access-log labeling, and adapter harness hardening
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `litellm/_logging.py`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_pass_through_endpoints.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+
+**Upstream issue:** Once Anthropic-route traffic is adapted to other providers,
+AAWM needs a hard guarantee that local provider credentials never leak to the
+wrong egress target. It also needs operator-visible logging and a real-Claude
+acceptance suite that tests the actual CLI path instead of only synthetic curl
+traffic.
+
+**Fix:**
+1. Add a provider-family egress guard that pairs:
+   - credential family (`openai`, `google`, `openrouter`, `anthropic`)
+   - expected target family
+   and blocks cross-provider sends locally before egress.
+2. Add sticky local alerting and clearer adapted access-log labeling so a
+   request can read like:
+   `POST /anthropic/v1/messages?beta=true -> target native endpoint ...`
+3. Add the standalone Anthropic adapter harness that shells out to the real
+   Claude CLI on `:4001`, validates adapter trace tags/metadata, and checks
+   backend `session_history` rows.
+4. Treat upstream-volatile cases as warning-only canaries instead of forcing
+   false hard failures:
+   - Google Code Assist `gemini-3.1-pro-preview` due to quota windows
+   - unstable OpenRouter free-model candidates
+5. Mirror OpenRouter free-model cost to the paid OpenRouter twin wherever one
+   exists, while keeping true zero-cost exceptions (`openrouter/free`,
+   `openrouter/elephant-alpha`) at zero.
+
+**Why not upstream:** This is AAWM-specific safety and validation policy tied to
+local-provider auth reuse, our Anthropic-route adapter model, and our operator
+workflow.
+
+**Validation status:** Focused guard tests pass, real Claude CLI adapter runs on
+`litellm-dev` show adapted access-log labeling, and the current harness now uses
+hard-gate vs warning-canary semantics that match the real provider behavior.
+
+---
+
+
+
+### aawm.20 — Reduce local callback/control-plane latency and add lightweight runtime instrumentation
+
+**Files:**
+- `litellm/integrations/aawm_payload_capture.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+
+**Upstream issue:** AAWM-specific observability and Claude control-plane work added measurable local overhead on every request even when those debugging surfaces were not actively needed. The main offenders were always-on payload capture, inline `session_history` persistence, and repeated Claude dynamic-injection DB hits.
+
+**Fix:**
+1. Gate payload capture behind both `AAWM_CAPTURE=1` and `LITELLM_LOG=DEBUG` so normal work does not pay JSON-serialization and disk-write cost.
+2. Move `session_history` persistence to a background batch writer with tunables for batch size and flush interval.
+3. Collapse the Claude system-prompt override and prompt-patch phases into a single traversal on the Anthropic request-prep path.
+4. Add a short TTL cache for AAWM dynamic injection results keyed by proc/session/agent/tenant.
+5. Add low-overhead instrumentation for the new hot-path controls:
+   - batched `session_history` flush timing in DEBUG logs
+   - dynamic injection cache hit/miss metadata and Langfuse span fields
+
+**Why not upstream:** This is AAWM-specific performance tuning around our callback wheel, Claude control-plane rewrite path, and local observability workflow. It is not generic LiteLLM provider behavior.
+
+**Validation status:** Focused callback tests (`18 passed`) and Anthropic passthrough/control-plane tests (`13 passed`) cover the batched `session_history` path, cached dynamic injection reuse, and the preserved Claude rewrite behavior.
+
+---
+
+### aawm.21 — Stabilize Anthropic-route OpenRouter free-model pacing and completion-lane attribution
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `docker-compose.dev.yml`
+
+**Upstream issue:** The Anthropic-route OpenRouter free-model path had two AAWM-specific operational gaps:
+1. free-model `429` handling could consume too much local hidden-retry time on every fresh manual retest, even after it was clear the same model/backend was still throttled
+2. the special `openrouter/elephant-alpha` completion lane was not passing `proxy_server_request` context into `litellm.acompletion()`, so callback attribution could fall back to generic orchestrator traces instead of preserving Claude subagent/session context like the passthrough lanes
+
+**Fix:**
+1. Keep OpenRouter free-model retry/cooldown strictly model-scoped.
+2. Use a short hidden retry budget on `:4001` for sporadic recovery and then a longer per-model post-failure cooldown so repeated manual runs fail fast instead of re-spending the full retry window.
+3. Pass `proxy_server_request.headers/body` into the `elephant-alpha` completion lane so `AawmAgentIdentity`, Langfuse trace naming, and `session_history` enrichment have the same Claude subagent/session context as the passthrough routes.
+4. Add focused regression coverage for the failure-circuit fast-fail path and the completion-lane request-context propagation.
+
+**Why not upstream:** This is specific to AAWM's Anthropic-route OpenRouter control plane, free-model operator workflow, and Claude subagent attribution model.
+
+**Validation status:** Focused OpenRouter retry/route tests pass after the failure-circuit and completion-lane context work (`21 passed` in the targeted slice), and `litellm-dev` is running the updated dev pacing on `:4001`.
+
+---
+
+### aawm.22 — Search-exact prompt context expansion and identifier-list rewrites
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+
+**Upstream issue:** AAWM needs Claude prompts and dispatched child-agent prompts
+to receive tenant/agent-scoped reference context for known technical topics.
+The upstream Anthropic passthrough path has no concept of AAWM reference-store
+lookups, context-marker escaping, or dynamically injected technical identifier
+lists.
+
+**Fix:**
+1. Add `:#name.ctx#:` replacement backed by `tristore_search_exact`, preserving
+   only the visible `name` in the prompt and appending retrieved context once
+   per unique name in mention order.
+2. Add literal escaping with `\\:#name.ctx#\\:` so prompts can show marker
+   syntax without triggering a lookup.
+3. Apply the same search-exact context appendix to dispatched child-agent
+   prompts for single-backticked topics and bare all-caps acronyms while
+   keeping misses silent.
+4. Replace Claude Code's generic CommonMark system-prompt line with the
+   tenant/agent-scoped list of known technical identifiers.
+5. Extend the adapter harness to validate the `:#port-allocation.ctx#:` path,
+   escaped marker preservation, and child-agent topic lookup behavior.
+
+**Why not upstream:** This is AAWM-specific prompt enrichment tied to the local
+tristore schema, tenant/agent scoping, and Claude Code agent-dispatch
+conventions.
+
+**Validation status:** The default Anthropic adapter harness on `:4001` now
+includes hard gates for the ctx marker path, escaped marker path, and associated
+Langfuse/session-history metadata.
+
+---
+
+### aawm.23 — Normalize session-history cache, reasoning, tool, and git telemetry
+
+**Files:**
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `scripts/backfill_session_history.py`
+- `scripts/repair_session_history_provider_cache.py`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+
+**Upstream issue:** AAWM's `public.session_history` table is fork-local
+observability state. It needs normalized provider attribution, reasoning-token
+source semantics, provider-cache miss tracking, tool activity rollups, and git
+command counters across Anthropic, OpenAI/Codex, Google, OpenRouter, and NVIDIA
+traffic. Upstream LiteLLM does not persist or repair this AAWM-specific table.
+
+**Fix:**
+1. Infer missing providers from model/route metadata before persistence.
+2. Prevent invalid `provider_reported` reasoning-token rows with zero reported
+   reasoning tokens from being written.
+3. Populate provider-cache attempted/miss/status/reason/token/cost fields from
+   observed cache read/write counters and target-provider metadata.
+4. Broaden tool-activity extraction for Codex/OpenAI streams and parent rollups.
+5. Parse git command activity, including nested payloads and global options, so
+   `git_commit_count` and `git_push_count` are populated.
+6. Add repair/backfill scripts for existing rows and harden the harness checks
+   so regressions fail before promotion.
+
+**Why not upstream:** The `session_history` schema, repair policy, and AAWM
+cost/cache attribution rules are local operational requirements, not generic
+LiteLLM proxy behavior.
+
+**Validation status:** Local repair normalized existing rows, focused callback
+tests cover the writer changes, and the default harness now rejects null
+providers, invalid reasoning sources, missing provider-cache status, and missing
+tool/git rollups where expected.
+
+---
+
+### aawm.24 — NVIDIA NIM Anthropic-route adapter lane and cost mapping
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py`
+- `model_prices_and_context_window.json`
+- `litellm/bundled_model_prices_and_context_window_fallback.json`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/test_cost_calculator.py`
+
+**Upstream issue:** NVIDIA-hosted agent models from `~/.claude/agents` need to
+work through Claude Code's Anthropic Messages interface while preserving NVIDIA
+egress isolation, Langfuse metadata, session-history rows, and cost accounting.
+Upstream does not provide an Anthropic-compatible NVIDIA NIM adapter lane.
+
+**Fix:**
+1. Add `anthropic_nvidia_completion_adapter` for direct `nvidia/...` agent
+   models targeting NVIDIA's OpenAI-compatible `/v1/chat/completions` API.
+2. Enforce NVIDIA provider-family egress checks separately from OpenAI,
+   Google, OpenRouter, and Anthropic lanes.
+3. Normalize NVIDIA/NIM model names for logging, session history, and cost-map
+   lookup.
+4. Add NVIDIA model pricing entries and fallback pricing based on OpenRouter
+   equivalents when NVIDIA does not expose usable non-free pricing.
+5. Add focused harness cases for NVIDIA DeepSeek, GLM, and MiniMax models while
+   keeping high-latency MiniMax out of the default suite unless explicitly
+   requested.
+
+**Why not upstream:** This is AAWM-specific Anthropic-route provider adaptation
+for Claude Code agents using local NVIDIA API credentials and AAWM telemetry.
+
+**Validation status:** Focused `:4001` harness cases cover the NVIDIA lane,
+with MiniMax documented as a slower upstream path using non-stream upstream
+completion plus Anthropic-compatible fake streaming.
+
+---
+
+### aawm.25 — Dev/prod adapter harness targeting and promotion runtime process
+
+**Files:**
+- `Dockerfile.dev`
+- `Makefile`
+- `docker-compose.dev.yml`
+- `docker-compose.yml`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+- `scripts/local-ci/README.md`
+- `TEST_HARNESS.md`
+- `CLAUDE.md`
+- `GEMINI.md`
+
+**Upstream issue:** AAWM promotion needs repeatable dev/prod validation against
+the same harness without editing environment variables by hand. The fork also
+needs a consistent minimal-effort Docker rebuild/restart process for
+`litellm-dev` and clear defaults that avoid unnecessary paid-provider test
+traffic.
+
+**Fix:**
+1. Expose the dev proxy on `:4001` while reserving `:4000` for production.
+2. Add Docker management make targets for minimal rebuild/restart/log workflows.
+3. Add `--target dev` and `--target prod` harness profiles with port,
+   container, and Langfuse environment validation.
+4. Exclude unstable/high-cost optional canaries such as Gemma and MiniMax from
+   the default suite while keeping opt-in coverage available.
+5. Preserve trace context metadata (`session_id`, `trace_environment`) on
+   rewritten passthrough requests so prod/dev harness checks can validate the
+   expected Langfuse environment and parent-session linkage.
+
+**Why not upstream:** These are AAWM local-operations and promotion-process
+requirements for the forked proxy, not general LiteLLM release behavior.
+
+**Validation status:** The default adapter harness on `:4001` passed after the
+target-profile update, and focused regression tests cover trace context
+preservation for rewritten passthrough requests.
 
 ---
 

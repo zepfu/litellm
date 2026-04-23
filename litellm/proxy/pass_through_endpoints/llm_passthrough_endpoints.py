@@ -6,16 +6,22 @@ Provider-specific Pass-Through Endpoints
 Use litellm with Anthropic SDK, Vertex AI SDK, Cohere SDK, etc.
 """
 
+import ast
 import asyncio
+import base64
+import codecs
+import glob
 import importlib
 import hashlib
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Union, cast
-from urllib.parse import quote, urlencode
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple, Union, cast
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
@@ -25,6 +31,8 @@ from starlette.websockets import WebSocketState
 import litellm
 from litellm import get_llm_provider
 from litellm._logging import verbose_proxy_logger
+from uuid import NAMESPACE_URL, uuid5
+from litellm._uuid import uuid4
 from litellm.constants import (
     ALLOWED_VERTEX_AI_PASSTHROUGH_HEADERS,
     BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES,
@@ -47,6 +55,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
     create_pass_through_route,
     create_websocket_passthrough_route,
+    pass_through_request,
     websocket_passthrough_request,
 )
 try:
@@ -54,13 +63,10 @@ try:
         add_claude_post_rewrite_context_file_logging_metadata as _aawm_add_claude_post_rewrite_context_file_logging_metadata,
     )
     from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
-        apply_claude_prompt_patches_to_anthropic_request_body as _aawm_apply_claude_prompt_patches_to_anthropic_request_body,
+        apply_claude_control_plane_rewrites_to_anthropic_request_body as _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body,
     )
     from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
         expand_aawm_dynamic_directives_in_anthropic_request_body as _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body,
-    )
-    from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
-        replace_claude_system_prompt_in_anthropic_request_body as _aawm_replace_claude_system_prompt_in_anthropic_request_body,
     )
 except ImportError:
     def _aawm_add_claude_post_rewrite_context_file_logging_metadata(
@@ -68,20 +74,14 @@ except ImportError:
     ) -> dict[str, Any]:
         return request_body
 
-    def _aawm_apply_claude_prompt_patches_to_anthropic_request_body(
+    async def _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
         request_body: dict[str, Any],
         billing_header_fields: dict[str, str] | None = None,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        return request_body, []
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        return request_body, [], []
 
     async def _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body(
         request_body: dict[str, Any],
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        return request_body, []
-
-    def _aawm_replace_claude_system_prompt_in_anthropic_request_body(
-        request_body: dict[str, Any],
-        billing_header_fields: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         return request_body, []
 from litellm.proxy.utils import is_known_model
@@ -112,12 +112,168 @@ _CLAUDE_PERSISTED_OUTPUT_PATTERN = re.compile(
     r"\n</persisted-output>\n</system-reminder>\n?\Z",
     re.DOTALL,
 )
+_CLAUDE_EXPANDED_PERSISTED_OUTPUT_PATTERN = re.compile(
+    r"\A<system-reminder>\n"
+    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
+    r"(?P<content>.*)"
+    r"\n</persisted-output>\n</system-reminder>\n?\Z",
+    re.DOTALL,
+)
+_CLAUDE_PERSISTED_OUTPUT_INLINE_PATTERN = re.compile(
+    r"<system-reminder>\n"
+    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
+    r"Output too large \([^)]+\)\. Full output saved to: (?P<path>/[^\n]+)\n\n"
+    r"Preview \(first 2KB\):\n"
+    r"(?P<preview>.*?)"
+    r"\n</persisted-output>\n</system-reminder>\n?",
+    re.DOTALL,
+)
+_CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN = re.compile(
+    r"<system-reminder>\n"
+    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
+    r"(?P<content>.*?)"
+    r"\n</persisted-output>\n</system-reminder>\n?",
+    re.DOTALL,
+)
+_CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN = re.compile(
+    r"<system-reminder>\n"
+    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context:(?P<body>.*?)"
+    r"</system-reminder>\n?",
+    re.DOTALL,
+)
 _ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 _PASSTHROUGH_SESSION_ID_HEADER_NAMES = (
     "session_id",
     "Session_Id",
     "x-session-id",
     "X-Session-Id",
+)
+_PASS_THROUGH_HEADER_PREFIX = "x-pass-"
+_ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
+    {"/messages", "/v1/messages"}
+)
+_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+    }
+)
+_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "deepseek-ai/deepseek-v3.1-terminus",
+        "deepseek-ai/deepseek-v3.2",
+        "minimaxai/minimax-m2.7",
+        "mistralai/devstral-2-123b-instruct-2512",
+        "z-ai/glm4.7",
+    }
+)
+_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "openrouter/free",
+        "inclusionai/ling-2.6-flash:free",
+        "google/gemma-4-31b-it:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "minimax/minimax-m2.5:free",
+        "openai/gpt-oss-20b:free",
+        "openai/gpt-oss-120b:free",
+        "gpt-oss-20b:free",
+        "gpt-oss-120b:free",
+        "qwen/qwen3-coder:free",
+    }
+)
+_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "openrouter/elephant-alpha",
+    }
+)
+_ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES = (
+    "gemini-3.1",
+    "gemini-3-flash-preview",
+)
+_ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST = (
+    "authorization",
+    "api-key",
+    "chatgpt-account-id",
+    "originator",
+    "user-agent",
+    "session_id",
+    "session-id",
+)
+_ANTHROPIC_ADAPTER_OPENAI_XPASS_HEADER_ALLOWLIST = (
+    "authorization",
+    "api-key",
+    "chatgpt-account-id",
+    "originator",
+    "user-agent",
+    "session_id",
+    "session-id",
+)
+_ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS = (
+    "AAWM_OPENROUTER_API_KEY",
+    "OPENROUTER_API_KEY",
+)
+_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = (
+    "AAWM_NVIDIA_API_KEY",
+    "NVIDIA_NIM_API_KEY",
+    "NVIDIA_API_KEY",
+)
+_ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset(
+    {408, 429, 500, 502, 503, 504}
+)
+_ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS = (
+    "LITELLM_CODEX_AUTH_FILE",
+    "CHATGPT_AUTH_FILE",
+)
+_ANTHROPIC_ADAPTER_CODEX_TOKEN_DIR_ENV_VARS = (
+    "LITELLM_CODEX_TOKEN_DIR",
+    "CHATGPT_TOKEN_DIR",
+)
+_ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = (
+    "/home/zepfu/.codex/auth.json",
+    "~/.codex/auth.json",
+    "~/.config/litellm/chatgpt/auth.json",
+)
+_ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS = (
+    "LITELLM_GEMINI_AUTH_FILE",
+    "GEMINI_OAUTH_CREDS_FILE",
+)
+_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS = (
+    "/home/zepfu/.gemini/oauth_creds.json",
+    "~/.gemini/oauth_creds.json",
+)
+_ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_ID_ENV_VARS = (
+    "LITELLM_GEMINI_OAUTH_CLIENT_ID",
+    "GEMINI_OAUTH_CLIENT_ID",
+)
+_ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_SECRET_ENV_VARS = (
+    "LITELLM_GEMINI_OAUTH_CLIENT_SECRET",
+    "GEMINI_OAUTH_CLIENT_SECRET",
+)
+_ANTHROPIC_ADAPTER_GEMINI_CLI_BUNDLE_PATH_ENV_VARS = (
+    "LITELLM_GEMINI_CLI_BUNDLE_PATH",
+    "GEMINI_CLI_BUNDLE_PATH",
+)
+_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_CLI_BUNDLE_GLOBS = (
+    "/home/zepfu/.nvm/versions/node/*/lib/node_modules/@google/gemini-cli/bundle",
+    "~/.nvm/versions/node/*/lib/node_modules/@google/gemini-cli/bundle",
+)
+_ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN = re.compile(
+    r'OAUTH_CLIENT_ID\s*=\s*"(?P<value>[^"]+)"'
+)
+_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN = re.compile(
+    r'OAUTH_CLIENT_SECRET\s*=\s*"(?P<value>[^"]+)"'
+)
+_CLAUDE_AGENT_SPEC_DIR_ENV_VARS = (
+    "LITELLM_CLAUDE_AGENTS_DIR",
+    "CLAUDE_AGENTS_DIR",
+)
+_CLAUDE_AGENT_SPEC_DEFAULT_DIRS = (
+    "/home/zepfu/.claude/agents",
+    "~/.claude/agents",
 )
 _CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
     Path(__file__).resolve().parents[3] / "context-replacement" / "claude-code"
@@ -221,6 +377,18 @@ _aawm_dynamic_injection_pool: Optional[Any] = None
 _aawm_dynamic_injection_pool_lock = asyncio.Lock()
 _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
+_claude_agent_model_cache: dict[Path, tuple[Optional[int], Optional[str]]] = {}
+_google_code_assist_project_cache: dict[str, str] = {}
+_google_code_assist_prime_until_monotonic_by_key: dict[str, float] = {}
+_google_code_assist_prime_lock = asyncio.Lock()
+_google_adapter_semaphores: dict[tuple[str, int], asyncio.Semaphore] = {}
+_google_adapter_rate_limit_lock = asyncio.Lock()
+_google_adapter_rate_limit_until_monotonic_by_key: dict[str, float] = {}
+_google_adapter_user_prompt_turn_lock = asyncio.Lock()
+_google_adapter_user_prompt_turn_counters: dict[str, int] = {}
+_openrouter_adapter_rate_limit_lock = asyncio.Lock()
+_openrouter_adapter_rate_limit_until_monotonic_by_key: dict[str, float] = {}
+_openrouter_adapter_failure_circuit_until_monotonic_by_key: dict[str, float] = {}
 
 
 def _is_openai_responses_endpoint(endpoint: str) -> bool:
@@ -243,6 +411,4667 @@ def _request_has_openai_client_auth(request: Request) -> bool:
         or headers.get("api-key")
         or headers.get("Api-Key")
     )
+
+
+def _get_request_header_or_passthrough_alias(
+    request: Request, header_name: str
+) -> Optional[str]:
+    headers = _safe_get_request_headers(request)
+    candidates = (
+        header_name,
+        header_name.lower(),
+        f"{_PASS_THROUGH_HEADER_PREFIX}{header_name}",
+        f"{_PASS_THROUGH_HEADER_PREFIX}{header_name.lower()}",
+    )
+    for candidate in candidates:
+        value = headers.get(candidate)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _has_direct_request_header(request: Request, header_name: str) -> bool:
+    headers = _safe_get_request_headers(request)
+    value = headers.get(header_name) or headers.get(header_name.lower())
+    return isinstance(value, str) and len(value.strip()) > 0
+
+
+def _normalize_anthropic_adapter_model_name(model: Any) -> Optional[str]:
+    if not isinstance(model, str):
+        return None
+    normalized_model = model.strip()
+    return normalized_model or None
+
+
+def _split_anthropic_adapter_provider_prefix(model: Any) -> tuple[Optional[str], Optional[str]]:
+    normalized_model = _normalize_anthropic_adapter_model_name(model)
+    if normalized_model is None:
+        return None, None
+    if "/" not in normalized_model:
+        return None, normalized_model
+
+    prefix, remainder = normalized_model.split("/", 1)
+    provider = {
+        "chatgpt": "openai",
+        "gemini": "google",
+        "nvidia_nim": "nvidia",
+    }.get(
+        prefix,
+        prefix if prefix in ("openai", "google", "openrouter", "nvidia") else None,
+    )
+    if provider is None:
+        return None, normalized_model
+    return provider, remainder.strip()
+
+
+def _get_anthropic_adapter_model_candidates(request_body: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    requested_model = _normalize_anthropic_adapter_model_name(request_body.get("model"))
+    if requested_model is not None:
+        candidates.append(requested_model)
+
+    agent_name, _tenant = _extract_claude_agent_and_tenant_from_request_body(request_body)
+    if not agent_name:
+        return candidates
+
+    agent_model = _normalize_anthropic_adapter_model_name(
+        _load_claude_agent_declared_model(agent_name)
+    )
+    if agent_model is not None:
+        candidates.append(agent_model)
+    return candidates
+
+
+def _has_anthropic_responses_adapter_endpoint(endpoint: str) -> bool:
+    normalized_endpoint = endpoint.strip()
+    if not normalized_endpoint.startswith("/"):
+        normalized_endpoint = f"/{normalized_endpoint}"
+    return normalized_endpoint in _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS
+
+
+def _normalize_anthropic_openai_responses_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider not in (None, "openai") or candidate is None:
+        return None
+    if candidate in _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS:
+        return candidate
+    return None
+
+
+def _normalize_anthropic_nvidia_responses_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider not in (None, "nvidia") or candidate is None:
+        return None
+
+    normalized_candidate = candidate.strip()
+    nvidia_model_aliases = {
+        "minimax/minimax-m2.7": "minimaxai/minimax-m2.7",
+    }
+    normalized_candidate = nvidia_model_aliases.get(
+        normalized_candidate, normalized_candidate
+    )
+    if normalized_candidate in _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS:
+        return normalized_candidate
+    return None
+
+
+def _normalize_anthropic_openrouter_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    normalized_candidate = (
+        candidate
+        if explicit_provider == "openrouter"
+        else _normalize_anthropic_adapter_model_name(model)
+    )
+    if normalized_candidate is None:
+        return None
+
+    openrouter_model_aliases = {
+        "free": "openrouter/free",
+        "elephant-alpha": "openrouter/elephant-alpha",
+        "ling-2-6-flash": "inclusionai/ling-2.6-flash:free",
+        "meta-llama/llama-3.3-70b-instructfree": (
+            "meta-llama/llama-3.3-70b-instruct:free"
+        ),
+    }
+    normalized_candidate = openrouter_model_aliases.get(
+        normalized_candidate, normalized_candidate
+    )
+    return normalized_candidate or None
+
+
+def _normalize_anthropic_google_completion_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider not in (None, "google") or candidate is None:
+        return None
+    normalized_candidate = _normalize_google_completion_adapter_model_name(candidate)
+    if normalized_candidate.startswith(
+        _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES
+    ):
+        return normalized_candidate
+    return None
+
+
+def _resolve_anthropic_openai_responses_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_openai_responses_adapter_model_name(
+            candidate
+        )
+        if normalized_model is not None:
+            return normalized_model
+    return None
+
+
+def _resolve_anthropic_openrouter_completion_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
+        if normalized_model in _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS:
+            return normalized_model
+    return None
+
+
+def _resolve_anthropic_nvidia_responses_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_nvidia_responses_adapter_model_name(
+            candidate
+        )
+        if normalized_model is not None:
+            return normalized_model
+    return None
+
+
+def _resolve_anthropic_openrouter_responses_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
+        if normalized_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS:
+            return normalized_model
+    return None
+
+
+def _resolve_anthropic_google_completion_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_google_completion_adapter_model_name(
+            candidate
+        )
+        if normalized_model is not None:
+            return normalized_model
+    return None
+
+
+def _get_anthropic_adapter_google_auth_file_path() -> Optional[Path]:
+    for env_name in _ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if not raw_value:
+            continue
+        path = Path(raw_value).expanduser()
+        if path.exists():
+            return path
+
+    for candidate_str in _ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS:
+        candidate = Path(candidate_str).expanduser()
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def _extract_google_oauth_client_values_from_bundle_text(
+    bundle_text: str,
+) -> tuple[Optional[str], Optional[str]]:
+    client_id_match = _ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN.search(
+        bundle_text
+    )
+    client_secret_match = (
+        _ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN.search(bundle_text)
+    )
+    client_id = (
+        _clean_codex_auth_value(client_id_match.group("value"))
+        if client_id_match is not None
+        else None
+    )
+    client_secret = (
+        _clean_codex_auth_value(client_secret_match.group("value"))
+        if client_secret_match is not None
+        else None
+    )
+    return client_id, client_secret
+
+
+def _add_google_cli_bundle_candidate_files(
+    raw_path: Path, candidate_files: list[Path], seen_paths: set[str]
+) -> None:
+    path = raw_path.expanduser()
+    if not path.exists():
+        return
+
+    if path.is_file():
+        resolved = str(path.resolve())
+        if resolved not in seen_paths:
+            seen_paths.add(resolved)
+            candidate_files.append(path)
+        return
+
+    bundle_dir = path
+    if (bundle_dir / "bundle").is_dir():
+        bundle_dir = bundle_dir / "bundle"
+    elif (
+        bundle_dir / "lib" / "node_modules" / "@google" / "gemini-cli" / "bundle"
+    ).is_dir():
+        bundle_dir = (
+            bundle_dir / "lib" / "node_modules" / "@google" / "gemini-cli" / "bundle"
+        )
+
+    chunk_files = sorted(bundle_dir.glob("chunk-*.js"))
+    gemini_bundle = bundle_dir / "gemini.js"
+    ordered_files = chunk_files + ([gemini_bundle] if gemini_bundle.is_file() else [])
+    for candidate in ordered_files:
+        resolved = str(candidate.resolve())
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        candidate_files.append(candidate)
+
+
+def _iter_google_oauth_client_bundle_candidates() -> list[Path]:
+    candidate_files: list[Path] = []
+    seen_paths: set[str] = set()
+
+    for env_name in _ANTHROPIC_ADAPTER_GEMINI_CLI_BUNDLE_PATH_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if raw_value:
+            _add_google_cli_bundle_candidate_files(
+                Path(raw_value), candidate_files, seen_paths
+            )
+
+    for bundle_glob in _ANTHROPIC_ADAPTER_GEMINI_DEFAULT_CLI_BUNDLE_GLOBS:
+        for matched_path in sorted(glob.glob(os.path.expanduser(bundle_glob)), reverse=True):
+            _add_google_cli_bundle_candidate_files(
+                Path(matched_path), candidate_files, seen_paths
+            )
+
+    return candidate_files
+
+
+def _load_google_oauth_client_values_from_local_gemini_cli_bundle(
+) -> tuple[Optional[str], Optional[str]]:
+    for candidate in _iter_google_oauth_client_bundle_candidates():
+        try:
+            bundle_text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        client_id, client_secret = _extract_google_oauth_client_values_from_bundle_text(
+            bundle_text
+        )
+        if client_id and client_secret:
+            return client_id, client_secret
+
+    return None, None
+
+
+async def _load_local_google_oauth_credentials() -> tuple[dict[str, Any], Path]:
+    auth_path = _get_anthropic_adapter_google_auth_file_path()
+    if auth_path is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Anthropic adapter requests for Gemini models require local Google OAuth creds at "
+                "'~/.gemini/oauth_creds.json' or 'LITELLM_GEMINI_AUTH_FILE'."
+            ),
+        )
+
+    try:
+        auth_data = json.loads(auth_path.read_text())
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read Gemini OAuth credentials from {auth_path}: {exc}",
+        ) from exc
+
+    if not isinstance(auth_data, dict):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gemini OAuth credentials at {auth_path} are not a JSON object.",
+        )
+
+    return auth_data, auth_path
+
+
+def _google_oauth_token_is_valid(auth_data: dict[str, Any]) -> bool:
+    access_token = _clean_codex_auth_value(auth_data.get("access_token"))
+    expiry_date = auth_data.get("expiry_date")
+    if access_token is None:
+        return False
+    if not isinstance(expiry_date, (int, float)):
+        return False
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return int(expiry_date) > now_ms + 60_000
+
+
+def _get_google_oauth_client_value(
+    auth_data: dict[str, Any], candidate_keys: tuple[str, ...], env_var_names: tuple[str, ...]
+) -> Optional[str]:
+    for key in candidate_keys:
+        value = _clean_codex_auth_value(auth_data.get(key))
+        if value is not None:
+            return value
+    return _get_first_secret_value(env_var_names)
+
+
+async def _refresh_local_google_oauth_credentials(
+    auth_data: dict[str, Any],
+) -> dict[str, Any]:
+    refresh_token = _clean_codex_auth_value(auth_data.get("refresh_token"))
+    if refresh_token is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Gemini OAuth credentials do not contain a refresh_token. "
+                "Re-authenticate Gemini CLI before using Gemini Anthropic adapter models."
+            ),
+        )
+
+    client_id = _get_google_oauth_client_value(
+        auth_data,
+        ("client_id", "clientId"),
+        _ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_ID_ENV_VARS,
+    )
+    client_secret = _get_google_oauth_client_value(
+        auth_data,
+        ("client_secret", "clientSecret"),
+        _ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_SECRET_ENV_VARS,
+    )
+    if client_id is None or client_secret is None:
+        (
+            bundle_client_id,
+            bundle_client_secret,
+        ) = _load_google_oauth_client_values_from_local_gemini_cli_bundle()
+        client_id = client_id or bundle_client_id
+        client_secret = client_secret or bundle_client_secret
+    if client_id is None or client_secret is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Gemini OAuth credentials do not contain client_id/client_secret and no fallback env vars or Gemini CLI bundle were found. "
+                "Re-authenticate Gemini CLI or configure Gemini OAuth client env vars before using Gemini Anthropic adapter models."
+            ),
+        )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            _ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to refresh Gemini OAuth access token for Anthropic adapter models: "
+                f"{response.text}"
+            ),
+        )
+
+    refreshed = response.json()
+    expires_in = refreshed.get("expires_in")
+    expiry_date: Optional[int] = None
+    if isinstance(expires_in, (int, float)):
+        expiry_date = int(datetime.now(timezone.utc).timestamp() * 1000) + int(expires_in * 1000)
+
+    updated_auth_data = dict(auth_data)
+    updated_auth_data.update(refreshed)
+    updated_auth_data["refresh_token"] = refresh_token
+    if expiry_date is not None:
+        updated_auth_data["expiry_date"] = expiry_date
+
+    return updated_auth_data
+
+
+async def _load_valid_local_google_oauth_access_token() -> str:
+    auth_data, _auth_path = await _load_local_google_oauth_credentials()
+    if not _google_oauth_token_is_valid(auth_data):
+        auth_data = await _refresh_local_google_oauth_credentials(auth_data)
+
+    access_token = _clean_codex_auth_value(auth_data.get("access_token"))
+    if access_token is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Gemini OAuth credentials did not yield a valid access_token.",
+        )
+    return access_token
+
+
+def _extract_google_adapter_agent_name_from_completion_messages(
+    completion_messages: list[dict[str, Any]],
+) -> Optional[str]:
+    for message in completion_messages:
+        content = message.get('content')
+        if not isinstance(content, str) or not content:
+            continue
+        match = _CLAUDE_AGENT_TENANT_PATTERN.search(content)
+        if match:
+            agent_name = match.group('agent').strip()
+            if agent_name:
+                return agent_name
+    return None
+
+
+def _extract_google_adapter_latest_user_prompt_text(
+    completion_messages: list[dict[str, Any]],
+) -> Optional[str]:
+    for message in reversed(completion_messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _extract_completion_message_text(message).strip()
+        if not text:
+            continue
+        reminder_matches = list(
+            re.finditer(r"<system-reminder>.*?</system-reminder>\n*", text, re.DOTALL)
+        )
+        if reminder_matches:
+            trailing_text = text[reminder_matches[-1].end() :].strip()
+            if trailing_text:
+                return trailing_text
+            continue
+        return text
+    return None
+
+
+def _resolve_google_adapter_session_id(
+    request: Request,
+    completion_messages: list[dict[str, Any]],
+    *,
+    google_model: str,
+) -> tuple[str, str]:
+    direct_session_id = (
+        _get_request_header_or_passthrough_alias(request, 'session_id')
+        or _safe_get_request_headers(request).get('x-claude-code-session-id')
+        or _safe_get_request_headers(request).get('X-Claude-Code-Session-Id')
+    )
+    trace_id = (
+        _get_request_header_or_passthrough_alias(request, 'langfuse_trace_id')
+        or _get_request_header_or_passthrough_alias(request, 'langfuse_existing_trace_id')
+        or _get_request_header_or_passthrough_alias(request, 'trace_id')
+    )
+    trace_name = _get_request_header_or_passthrough_alias(request, 'langfuse_trace_name')
+    agent_name = _extract_google_adapter_agent_name_from_completion_messages(completion_messages)
+
+    if isinstance(direct_session_id, str) and direct_session_id:
+        seed = f"direct_session_id:{direct_session_id}|model:{google_model}"
+        return str(uuid5(NAMESPACE_URL, seed)), 'direct_session_id'
+
+    identity_name = None
+    identity_source = None
+    if isinstance(trace_name, str) and trace_name:
+        identity_name = trace_name
+        identity_source = 'trace_name'
+    elif isinstance(agent_name, str) and agent_name:
+        identity_name = agent_name
+        identity_source = 'agent_name'
+
+    if identity_name:
+        seed = f"{identity_source}:{identity_name}|model:{google_model}"
+        return str(uuid5(NAMESPACE_URL, seed)), identity_source or 'derived'
+
+    if isinstance(trace_id, str) and trace_id:
+        seed = f"trace_id:{trace_id}|model:{google_model}"
+        return str(uuid5(NAMESPACE_URL, seed)), 'trace_id'
+
+    return str(uuid4()), 'generated_uuid'
+
+
+def _resolve_google_adapter_user_prompt_id(
+    request: Request,
+    completion_messages: list[dict[str, Any]],
+    *,
+    google_model: str,
+    session_id: str,
+) -> str:
+    trace_id = (
+        _get_request_header_or_passthrough_alias(request, "langfuse_trace_id")
+        or _get_request_header_or_passthrough_alias(
+            request, "langfuse_existing_trace_id"
+        )
+        or _get_request_header_or_passthrough_alias(request, "trace_id")
+    )
+    if isinstance(trace_id, str) and trace_id:
+        seed = f"user_prompt_trace_id:{trace_id}|model:{google_model}"
+        return str(uuid5(NAMESPACE_URL, seed))
+
+    latest_user_prompt = _extract_google_adapter_latest_user_prompt_text(
+        completion_messages
+    )
+    if isinstance(latest_user_prompt, str) and latest_user_prompt:
+        prompt_hash = hashlib.sha1(latest_user_prompt.encode("utf-8")).hexdigest()[:16]
+        seed = (
+            f"user_prompt_hash:{prompt_hash}|session_id:{session_id}|model:{google_model}"
+        )
+        return str(uuid5(NAMESPACE_URL, seed))
+
+    seed = f"user_prompt_session:{session_id}|model:{google_model}"
+    return str(uuid5(NAMESPACE_URL, seed))
+
+
+async def _get_or_load_google_code_assist_project(
+    access_token: str,
+) -> str:
+    cache_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    cached_project = _google_code_assist_project_cache.get(cache_key)
+    if isinstance(cached_project, str) and cached_project:
+        return cached_project
+
+    target_base = _get_anthropic_adapter_google_target_base()
+    load_url = f"{target_base.rstrip('/')}/v1internal:loadCodeAssist"
+    request_body = {
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        },
+    }
+    headers = _build_google_adapter_native_headers(
+        access_token=access_token,
+        model=None,
+        accept="application/json",
+    )
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=load_url,
+        headers=headers,
+        credential_family="google",
+        expected_target_family="google",
+    )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(load_url, headers=headers, json=request_body)
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to load Google Code Assist project for Anthropic adapter models: "
+                f"{response.text}"
+            ),
+        )
+
+    response_body = response.json()
+    project = _clean_codex_auth_value(response_body.get("cloudaicompanionProject"))
+    if project is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Google Code Assist bootstrap did not return a cloudaicompanionProject."
+            ),
+        )
+
+    _google_code_assist_project_cache[cache_key] = project
+    return project
+
+
+def _get_google_code_assist_prime_ttl_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS")
+    )
+    if raw_value is None:
+        # Current Gemini CLI caches Code Assist user/project setup for 30s.
+        # Match that default instead of re-priming on every adapted request.
+        return 30.0
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        return 30.0
+    return max(0.0, parsed)
+
+
+def _get_google_code_assist_prime_cache_key(
+    access_token: str,
+    companion_project: str,
+) -> str:
+    token_hash = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:12]
+    return f"{token_hash}:{companion_project}"
+
+
+def _get_google_adapter_max_concurrent() -> int:
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONCURRENT"))
+    if raw_value is None:
+        return 1
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 1
+    return max(1, parsed)
+
+
+def _get_google_adapter_shared_lane_key(
+    *,
+    access_token: Optional[str],
+    companion_project: Optional[str],
+) -> Optional[str]:
+    # Gemini CLI's Code Assist envelope matches our request shape, but its
+    # actual traffic is serialized on the shared account/project lane instead of
+    # being split by model id. Mirror that here to avoid fanout-only 429s.
+    cleaned_access_token = _clean_codex_auth_value(access_token)
+    cleaned_companion_project = _clean_codex_auth_value(companion_project)
+    if cleaned_access_token is None or cleaned_companion_project is None:
+        return None
+    return _get_google_code_assist_prime_cache_key(
+        cleaned_access_token,
+        cleaned_companion_project,
+    )
+
+
+def _get_google_adapter_rate_limit_key(
+    model: Optional[str],
+    *,
+    access_token: Optional[str] = None,
+    companion_project: Optional[str] = None,
+) -> str:
+    shared_lane_key = _get_google_adapter_shared_lane_key(
+        access_token=access_token,
+        companion_project=companion_project,
+    )
+    if shared_lane_key is not None:
+        return shared_lane_key
+    normalized = _clean_codex_auth_value(model)
+    if normalized is None:
+        return "__default__"
+    return normalized
+
+
+def _get_google_adapter_rate_limit_key_from_kwargs(kwargs: dict[str, Any]) -> str:
+    explicit_rate_limit_key = _clean_codex_auth_value(
+        cast(Optional[str], kwargs.get("google_adapter_rate_limit_key"))
+    )
+    if explicit_rate_limit_key is not None:
+        return explicit_rate_limit_key
+    custom_body = kwargs.get("custom_body")
+    model = custom_body.get("model") if isinstance(custom_body, dict) else None
+    project = custom_body.get("project") if isinstance(custom_body, dict) else None
+    access_token = cast(Optional[str], kwargs.get("google_access_token"))
+    return _get_google_adapter_rate_limit_key(
+        cast(Optional[str], model),
+        access_token=access_token,
+        companion_project=cast(Optional[str], project),
+    )
+
+
+def _get_google_adapter_semaphore(
+    model: Optional[str] = None,
+    *,
+    access_token: Optional[str] = None,
+    companion_project: Optional[str] = None,
+    rate_limit_key: Optional[str] = None,
+) -> asyncio.Semaphore:
+    max_concurrent = _get_google_adapter_max_concurrent()
+    resolved_rate_limit_key = _clean_codex_auth_value(rate_limit_key) or _get_google_adapter_rate_limit_key(
+        model,
+        access_token=access_token,
+        companion_project=companion_project,
+    )
+    semaphore_key = (resolved_rate_limit_key, max_concurrent)
+    semaphore = _google_adapter_semaphores.get(semaphore_key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(max_concurrent)
+        _google_adapter_semaphores[semaphore_key] = semaphore
+    return semaphore
+
+
+def _get_google_adapter_max_retries() -> int:
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES"))
+    if raw_value is None:
+        return 1
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 1
+    return max(0, parsed)
+
+
+def _get_google_adapter_post_tool_cooldown_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_POST_TOOL_COOLDOWN_SECONDS")
+    )
+    if raw_value is None:
+        return 0.0
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        return 0.0
+    return max(0.0, parsed)
+
+
+def _google_code_assist_unwrapped_chunk_contains_tool_call(
+    unwrapped: dict[str, Any],
+) -> bool:
+    candidates = unwrapped.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if isinstance(part.get("functionCall"), dict):
+                return True
+    return False
+
+
+def _get_google_adapter_max_output_tokens_cap() -> Optional[int]:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP")
+    )
+    if raw_value is None:
+        return 8192
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 8192
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _get_google_adapter_default_thinking_level(model: Optional[str]) -> Optional[str]:
+    disabled = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG")
+    )
+    if isinstance(disabled, str) and disabled.lower() in {"1", "true", "yes", "on"}:
+        return None
+
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL")
+    )
+    if raw_value:
+        return raw_value
+
+    normalized_model = (model or "").lower()
+    if "flash-lite" in normalized_model:
+        return "minimal"
+    return "low"
+
+
+def _get_google_adapter_max_contents_window() -> int:
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW"))
+    if raw_value is None:
+        return 24
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 24
+    return max(2, parsed)
+
+
+def _get_google_adapter_max_contents_text_chars() -> int:
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_TEXT_CHARS"))
+    if raw_value is None:
+        return 12000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 12000
+    return max(1000, parsed)
+
+
+def _estimate_google_content_text_chars(content_block: Any) -> int:
+    if not isinstance(content_block, dict):
+        return 0
+    parts = content_block.get("parts")
+    if not isinstance(parts, list):
+        return 0
+    total = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            total += len(text)
+    return total
+
+
+def _google_content_has_text(content_block: Any) -> bool:
+    return _estimate_google_content_text_chars(content_block) > 0
+
+
+def _get_google_adapter_oversized_text_part_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_OVERSIZED_TEXT_PART_CHAR_CAP"))
+    if raw_value is None:
+        return 6000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 6000
+    return max(1500, parsed)
+
+
+
+def _get_google_adapter_pure_context_text_part_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_PURE_CONTEXT_TEXT_PART_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 6000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 6000
+    return max(512, parsed)
+
+
+def _get_google_adapter_subagent_context_text_part_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 2000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 2000
+    return max(512, parsed)
+
+
+def _get_google_adapter_followup_subagent_context_text_part_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 1200
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 1200
+    return max(256, parsed)
+
+
+def _get_google_adapter_followup_allowed_tool_names() -> set[str]:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_ALLOWED_TOOL_NAMES")
+    )
+    if raw_value:
+        allowed_tool_names = {
+            item.strip()
+            for item in raw_value.split(",")
+            if isinstance(item, str) and item.strip()
+        }
+    else:
+        allowed_tool_names = {"Read", "Write", "Edit", "Glob", "Grep", "Bash"}
+
+    aliases = _get_google_code_assist_native_tool_aliases()
+    expanded_tool_names = set(allowed_tool_names)
+    for tool_name in list(allowed_tool_names):
+        alias_name = aliases.get(tool_name)
+        if isinstance(alias_name, str) and alias_name:
+            expanded_tool_names.add(alias_name)
+
+    return expanded_tool_names
+
+
+def _request_block_has_google_function_response(request_block: dict[str, Any]) -> bool:
+    contents = request_block.get("contents")
+    if not isinstance(contents, list):
+        return False
+    for item in contents:
+        if not isinstance(item, dict):
+            continue
+        parts = item.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if isinstance(part.get("functionResponse"), dict) or isinstance(
+                part.get("function_response"), dict
+            ):
+                return True
+    return False
+
+
+def _trim_google_adapter_followup_tools(request_block: dict[str, Any]) -> dict[str, Any]:
+    if not _request_block_has_google_function_response(request_block):
+        return {}
+
+    allowed_tool_names = _get_google_adapter_followup_allowed_tool_names()
+    tools = request_block.get("tools")
+    if not isinstance(tools, list) or not allowed_tool_names:
+        return {}
+
+    original_decl_count = 0
+    trimmed_decl_count = 0
+    any_trimmed = False
+    updated_tools: list[Any] = []
+
+    for tool_entry in tools:
+        if not isinstance(tool_entry, dict):
+            updated_tools.append(tool_entry)
+            continue
+        key = None
+        decls = tool_entry.get("functionDeclarations")
+        if isinstance(decls, list):
+            key = "functionDeclarations"
+        else:
+            decls = tool_entry.get("function_declarations")
+            if isinstance(decls, list):
+                key = "function_declarations"
+        if key is None or not isinstance(decls, list):
+            updated_tools.append(tool_entry)
+            continue
+        original_decl_count += len(decls)
+        filtered_decls = []
+        for decl in decls:
+            if not isinstance(decl, dict):
+                continue
+            name = decl.get("name")
+            if isinstance(name, str) and name in allowed_tool_names:
+                filtered_decls.append(decl)
+        trimmed_decl_count += len(filtered_decls)
+        if len(filtered_decls) != len(decls):
+            any_trimmed = True
+        if filtered_decls:
+            copied_entry = dict(tool_entry)
+            copied_entry[key] = filtered_decls
+            updated_tools.append(copied_entry)
+
+    if not any_trimmed:
+        return {}
+
+    request_block["tools"] = updated_tools
+    return {
+        "trimmed_followup_function_declarations_from": original_decl_count,
+        "trimmed_followup_function_declarations_to": trimmed_decl_count,
+    }
+
+
+def _split_google_adapter_inline_context_and_prompt(request_block: dict[str, Any]) -> dict[str, Any]:
+    contents = request_block.get("contents")
+    if not isinstance(contents, list):
+        return {}
+
+    updated_contents: list[Any] = []
+    split_count = 0
+    split_prompt_chars = 0
+
+    for content in contents:
+        if not isinstance(content, dict):
+            updated_contents.append(content)
+            continue
+        if content.get("role") != "user":
+            updated_contents.append(content)
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list) or len(parts) != 1:
+            updated_contents.append(content)
+            continue
+        part = parts[0]
+        if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+            updated_contents.append(content)
+            continue
+        text_value = part["text"]
+        stripped_text = text_value.lstrip()
+        if not stripped_text.startswith("<system-reminder>"):
+            updated_contents.append(content)
+            continue
+
+        reminder_matches = list(re.finditer(r"<system-reminder>.*?</system-reminder>\n*", text_value, re.DOTALL))
+        if not reminder_matches:
+            updated_contents.append(content)
+            continue
+        trailing_text = text_value[reminder_matches[-1].end():].strip()
+        if not trailing_text:
+            updated_contents.append(content)
+            continue
+
+        split_count += 1
+        split_prompt_chars += len(trailing_text)
+        context_text = text_value[:reminder_matches[-1].end()].rstrip() + "\n"
+        updated_contents.append({"role": "user", "parts": [{"text": context_text}]})
+        updated_contents.append({"role": "user", "parts": [{"text": trailing_text}]})
+
+    if split_count == 0:
+        return {}
+
+    request_block["contents"] = updated_contents
+    return {
+        "split_inline_context_prompt_count": split_count,
+        "split_inline_context_prompt_chars": split_prompt_chars,
+    }
+
+
+def _compact_google_adapter_oversized_text_parts(request_block: dict[str, Any]) -> dict[str, Any]:
+    contents = request_block.get("contents")
+    if not isinstance(contents, list):
+        return {}
+
+    cap = _get_google_adapter_oversized_text_part_char_cap()
+    pure_context_cap = _get_google_adapter_pure_context_text_part_char_cap()
+    head_keep = max(512, cap // 3)
+    tail_keep = max(1024, cap - head_keep - 64)
+    updated_contents: list[Any] = []
+    compacted_count = 0
+    original_text_chars = 0
+    compacted_text_chars = 0
+    pure_context_compacted_count = 0
+    subagent_context_compacted_count = 0
+    is_followup_request = len(contents) > 2
+
+    for content in contents:
+        if not isinstance(content, dict):
+            updated_contents.append(content)
+            continue
+        parts = content.get("parts")
+        if content.get("role") != "user" or not isinstance(parts, list):
+            updated_contents.append(content)
+            continue
+
+        updated_parts: list[Any] = []
+        part_changed = False
+        for part in parts:
+            if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+                updated_parts.append(part)
+                continue
+            text_value = part["text"]
+            original_text_chars += len(text_value)
+            stripped_text = text_value.strip()
+            reminder_matches = list(
+                re.finditer(r"<system-reminder>.*?</system-reminder>\n*", text_value, re.DOTALL)
+            )
+            trailing_text = text_value[reminder_matches[-1].end():].strip() if reminder_matches else None
+            is_reminder_only_context = bool(reminder_matches) and stripped_text.startswith("<system-reminder>") and not trailing_text
+            is_subagent_context = (
+                "SubagentStart hook additional context:" in text_value
+                or "SubAgentStart hook additional context:" in text_value
+            )
+            reminder_only_context_cap = pure_context_cap if is_followup_request else cap
+            if is_subagent_context:
+                reminder_only_context_cap = (
+                    _get_google_adapter_followup_subagent_context_text_part_char_cap()
+                    if is_followup_request
+                    else _get_google_adapter_subagent_context_text_part_char_cap()
+                )
+            if is_reminder_only_context and len(text_value) > reminder_only_context_cap:
+                compacted_count += 1
+                pure_context_compacted_count += 1
+                if is_subagent_context:
+                    subagent_context_compacted_count += 1
+                part_changed = True
+                updated_part = dict(part)
+                updated_part["text"] = text_value[:reminder_only_context_cap].rstrip()
+                compacted_text_chars += len(updated_part["text"])
+                updated_parts.append(updated_part)
+                continue
+            if len(text_value) <= cap:
+                compacted_text_chars += len(text_value)
+                updated_parts.append(part)
+                continue
+            compacted_count += 1
+            part_changed = True
+            prefix = text_value[:head_keep].rstrip()
+            suffix = text_value[-tail_keep:].lstrip()
+            compacted_text = (
+                f"{prefix}\n\n"
+                f"[Gemini adapter compacted oversized user text from {len(text_value)} chars to preserve head/tail context.]\n\n"
+                f"{suffix}"
+            )
+            compacted_text_chars += len(compacted_text)
+            updated_part = dict(part)
+            updated_part["text"] = compacted_text
+            updated_parts.append(updated_part)
+
+        if part_changed:
+            if updated_parts:
+                updated_content = dict(content)
+                updated_content["parts"] = updated_parts
+                updated_contents.append(updated_content)
+            else:
+                continue
+        else:
+            updated_contents.append(content)
+
+    if compacted_count == 0:
+        return {}
+
+    request_block["contents"] = updated_contents
+    changes = {
+        "compacted_oversized_text_parts_count": compacted_count,
+        "compacted_oversized_text_parts_cap": cap,
+        "compacted_oversized_text_parts_before_chars": original_text_chars,
+        "compacted_oversized_text_parts_after_chars": compacted_text_chars,
+    }
+    if pure_context_compacted_count > 0:
+        changes["retained_followup_reminder_only_context_count"] = pure_context_compacted_count
+        changes["compacted_pure_context_text_parts_count"] = pure_context_compacted_count
+        changes["compacted_pure_context_text_parts_cap"] = (
+            _get_google_adapter_followup_subagent_context_text_part_char_cap()
+            if is_followup_request and subagent_context_compacted_count == pure_context_compacted_count
+            else pure_context_cap
+        )
+    if subagent_context_compacted_count > 0:
+        changes["subagent_context_text_parts_compacted_count"] = subagent_context_compacted_count
+        changes["subagent_context_text_parts_cap"] = (
+            _get_google_adapter_followup_subagent_context_text_part_char_cap()
+            if is_followup_request
+            else _get_google_adapter_subagent_context_text_part_char_cap()
+        )
+    return changes
+
+
+def _apply_google_adapter_contents_window_policy(request_block: dict[str, Any]) -> dict[str, Any]:
+    contents = request_block.get("contents")
+    if not isinstance(contents, list) or len(contents) <= 2:
+        return {}
+    session_id = request_block.get("session_id")
+    if not isinstance(session_id, str) or len(session_id) == 0:
+        return {}
+
+    original_count = len(contents)
+    original_text_chars = sum(_estimate_google_content_text_chars(item) for item in contents)
+    max_window = _get_google_adapter_max_contents_window()
+    max_text_chars = _get_google_adapter_max_contents_text_chars()
+
+    selected_indices = list(range(max(0, original_count - max_window), original_count))
+    text_indices = [idx for idx, item in enumerate(contents) if _google_content_has_text(item)]
+    protected_text_indices = text_indices[-2:]
+    if protected_text_indices:
+        selected_indices = sorted(set(protected_text_indices + selected_indices))
+        if len(selected_indices) > max_window:
+            selected_indices = selected_indices[-max_window:]
+            if not set(protected_text_indices).issubset(set(selected_indices)):
+                tail_count = max(0, max_window - len(protected_text_indices))
+                selected_indices = sorted(set(protected_text_indices + selected_indices[-tail_count:]))
+                if len(selected_indices) > max_window:
+                    selected_indices = selected_indices[-max_window:]
+
+    trimmed_contents = [contents[idx] for idx in selected_indices]
+    protected_positions = {
+        pos for pos, idx in enumerate(selected_indices) if idx in set(protected_text_indices)
+    }
+    trimmed_text_chars = sum(_estimate_google_content_text_chars(item) for item in trimmed_contents)
+    while len(trimmed_contents) > 2 and trimmed_text_chars > max_text_chars:
+        removable_pos = next(
+            (pos for pos in range(len(trimmed_contents)) if pos not in protected_positions),
+            None,
+        )
+        if removable_pos is None:
+            break
+        removed = trimmed_contents.pop(removable_pos)
+        trimmed_text_chars -= _estimate_google_content_text_chars(removed)
+        protected_positions = {
+            pos - 1 if pos > removable_pos else pos
+            for pos in protected_positions
+            if pos != removable_pos
+        }
+
+    if len(trimmed_contents) == original_count and trimmed_text_chars == original_text_chars:
+        return {}
+
+    request_block["contents"] = trimmed_contents
+    return {
+        "trimmed_contents_from_count": original_count,
+        "trimmed_contents_to_count": len(trimmed_contents),
+        "trimmed_contents_from_text_chars": original_text_chars,
+        "trimmed_contents_to_text_chars": trimmed_text_chars,
+        "trimmed_contents_max_window": max_window,
+        "trimmed_contents_max_text_chars": max_text_chars,
+        "trimmed_contents_preserved_text_entries": len(protected_text_indices),
+    }
+
+
+def _apply_google_adapter_request_shape_policy(payload: dict[str, Any]) -> dict[str, Any]:
+    request_block = payload.get("request") if isinstance(payload.get("request"), dict) else None
+    if not isinstance(request_block, dict):
+        return {}
+
+    changes: dict[str, Any] = {}
+    model = payload.get("model") if isinstance(payload.get("model"), str) else None
+    split_changes = _split_google_adapter_inline_context_and_prompt(request_block)
+    if split_changes:
+        changes.update(split_changes)
+    followup_content_changes = _compact_google_adapter_followup_request_contents(request_block)
+    if followup_content_changes:
+        changes.update(followup_content_changes)
+    followup_tool_changes = _trim_google_adapter_followup_tools(request_block)
+    if followup_tool_changes:
+        changes.update(followup_tool_changes)
+    oversized_text_changes = _compact_google_adapter_oversized_text_parts(request_block)
+    if oversized_text_changes:
+        changes.update(oversized_text_changes)
+    content_window_changes = _apply_google_adapter_contents_window_policy(request_block)
+    if content_window_changes:
+        changes.update(content_window_changes)
+
+    generation_config = request_block.get("generationConfig")
+    if not isinstance(generation_config, dict):
+        generation_config = {}
+        request_block["generationConfig"] = generation_config
+
+    if not isinstance(generation_config.get("thinkingConfig"), dict):
+        default_thinking_level = _get_google_adapter_default_thinking_level(model)
+        if default_thinking_level:
+            generation_config["thinkingConfig"] = {
+                "includeThoughts": False,
+                "thinkingLevel": default_thinking_level,
+            }
+            changes["injected_default_thinking_config"] = True
+            changes["injected_default_thinking_level"] = default_thinking_level
+
+    max_output_tokens = generation_config.get("max_output_tokens")
+    cap = _get_google_adapter_max_output_tokens_cap()
+    if isinstance(max_output_tokens, int) and cap is not None and max_output_tokens > cap:
+        generation_config.pop("max_output_tokens", None)
+        changes["removed_oversized_max_output_tokens_from"] = max_output_tokens
+        changes["removed_oversized_max_output_tokens_cap"] = cap
+
+    temperature = generation_config.get("temperature")
+    if isinstance(temperature, (int, float)) and float(temperature) == 1.0:
+        generation_config.pop("temperature", None)
+        changes["removed_default_temperature"] = True
+
+    if not generation_config:
+        request_block.pop("generationConfig", None)
+        changes["removed_empty_generation_config"] = True
+
+    return changes
+
+
+def _extract_google_adapter_exception_status_code(exc: Any) -> Optional[int]:
+    for attr_name in ("status_code", "code"):
+        raw_status = getattr(exc, attr_name, None)
+        if isinstance(raw_status, int):
+            return raw_status
+        if isinstance(raw_status, str):
+            try:
+                return int(raw_status)
+            except Exception:
+                pass
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+    return None
+
+
+def _extract_google_adapter_exception_detail(exc: Any) -> Any:
+    for attr_name in ("detail", "message"):
+        detail = getattr(exc, attr_name, None)
+        if detail is not None:
+            return detail
+    response = getattr(exc, "response", None)
+    if response is not None:
+        response_content = getattr(response, "content", None)
+        if response_content:
+            return response_content
+        response_text = getattr(response, "text", None)
+        if response_text:
+            return response_text
+    return str(exc)
+
+
+def _extract_adapter_upstream_headers(exc: Any) -> dict[str, Any]:
+    upstream_headers = getattr(exc, "upstream_headers", None)
+    if isinstance(upstream_headers, dict):
+        return {
+            str(header_name): header_value
+            for header_name, header_value in upstream_headers.items()
+            if header_value is not None
+        }
+    response = getattr(exc, "response", None)
+    response_headers = getattr(response, "headers", None)
+    if response_headers is None:
+        return {}
+    return {
+        str(header_name): str(header_value)
+        for header_name, header_value in response_headers.items()
+    }
+
+
+def _get_adapter_header_value(
+    headers: dict[str, Any], header_name: str
+) -> Optional[str]:
+    if not headers:
+        return None
+    for key, value in headers.items():
+        if not isinstance(key, str):
+            continue
+        if key.lower() != header_name.lower():
+            continue
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
+    return None
+
+
+def _parse_retry_after_seconds_from_headers(
+    headers: dict[str, Any]
+) -> Optional[float]:
+    retry_after_value = _get_adapter_header_value(headers, "Retry-After")
+    if retry_after_value is None:
+        return None
+    try:
+        return max(0.0, float(retry_after_value))
+    except Exception:
+        return None
+
+
+def _parse_rate_limit_reset_wait_seconds_from_headers(
+    headers: dict[str, Any]
+) -> Optional[float]:
+    reset_value = _get_adapter_header_value(headers, "X-RateLimit-Reset")
+    if reset_value is None:
+        return None
+    try:
+        reset_number = float(reset_value)
+    except Exception:
+        return None
+    if reset_number > 1_000_000_000_000:
+        reset_epoch_seconds = reset_number / 1000.0
+    else:
+        reset_epoch_seconds = reset_number
+    return max(0.0, reset_epoch_seconds - time.time())
+
+
+def _parse_google_rate_limit_reset_seconds(exc: Any) -> float:
+    upstream_headers = _extract_adapter_upstream_headers(exc)
+    retry_after_seconds = _parse_retry_after_seconds_from_headers(upstream_headers)
+    if retry_after_seconds is not None:
+        return max(1.0, retry_after_seconds)
+    reset_wait_seconds = _parse_rate_limit_reset_wait_seconds_from_headers(
+        upstream_headers
+    )
+    if reset_wait_seconds is not None:
+        return max(1.0, reset_wait_seconds)
+    detail = _extract_google_adapter_exception_detail(exc)
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    else:
+        detail_text = str(detail)
+    match = re.search(r"reset after\s+(\d+)s", detail_text)
+    if match is None:
+        return 5.0
+    try:
+        return max(1.0, float(match.group(1)))
+    except Exception:
+        return 5.0
+
+
+def _extract_google_adapter_error_reason(exc: Any) -> Optional[str]:
+    detail = _extract_google_adapter_exception_detail(exc)
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    else:
+        detail_text = str(detail)
+
+    candidate_payloads: list[str] = [detail_text]
+    brace_start = detail_text.find("{")
+    brace_end = detail_text.rfind("}")
+    if brace_start != -1 and brace_end > brace_start:
+        candidate_payloads.append(detail_text[brace_start : brace_end + 1])
+
+    bracket_start = detail_text.find("[")
+    bracket_end = detail_text.rfind("]")
+    if bracket_start != -1 and bracket_end > bracket_start:
+        candidate_payloads.append(detail_text[bracket_start : bracket_end + 1])
+
+    bytes_literal_match = re.search(r'b([\'"]).*\1', detail_text, re.DOTALL)
+    if bytes_literal_match is not None:
+        try:
+            literal_value = ast.literal_eval(bytes_literal_match.group(0))
+            if isinstance(literal_value, bytes):
+                candidate_payloads.append(
+                    literal_value.decode("utf-8", errors="ignore")
+                )
+            else:
+                candidate_payloads.append(str(literal_value))
+        except Exception:
+            pass
+
+    for candidate in candidate_payloads:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        error_blocks: list[dict[str, Any]] = []
+        if isinstance(parsed, dict):
+            error_block = parsed.get("error")
+            if isinstance(error_block, dict):
+                error_blocks.append(error_block)
+        elif isinstance(parsed, list):
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                error_block = item.get("error")
+                if isinstance(error_block, dict):
+                    error_blocks.append(error_block)
+        for error_block in error_blocks:
+            details = error_block.get("details")
+            if not isinstance(details, list):
+                continue
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                reason = item.get("reason")
+                if isinstance(reason, str) and reason:
+                    return reason
+    return None
+
+def _get_google_adapter_model_capacity_max_retries() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES")
+    )
+    if raw_value is None:
+        return 3
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 3
+    return max(0, parsed)
+
+
+def _get_google_adapter_capacity_backoff_seconds(attempt: int) -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS")
+    )
+    if raw_value:
+        try:
+            values = [max(1.0, float(item.strip())) for item in raw_value.split(",") if item.strip()]
+        except Exception:
+            values = []
+        if values:
+            index = min(max(1, attempt) - 1, len(values) - 1)
+            return values[index]
+    schedule = (5.0, 15.0, 30.0, 60.0)
+    index = min(max(1, attempt) - 1, len(schedule) - 1)
+    return schedule[index]
+
+
+
+
+def _get_google_adapter_hidden_retry_budget_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS")
+    )
+    if raw_value is None:
+        return 0.0
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        return 0.0
+    return max(0.0, parsed)
+async def _wait_for_google_adapter_cooldown_if_needed(rate_limit_key: str) -> None:
+    async with _google_adapter_rate_limit_lock:
+        now = time.monotonic()
+        wait_seconds = _google_adapter_rate_limit_until_monotonic_by_key.get(rate_limit_key, 0.0) - now
+    if wait_seconds > 0:
+        verbose_proxy_logger.warning(
+            "Google adapter cooldown active for %s; sleeping %.1fs before upstream request",
+            rate_limit_key,
+            wait_seconds,
+        )
+        await asyncio.sleep(wait_seconds)
+
+
+async def _set_google_adapter_cooldown(rate_limit_key: str, wait_seconds: float) -> None:
+    async with _google_adapter_rate_limit_lock:
+        until = time.monotonic() + max(0.0, wait_seconds)
+        current_until = _google_adapter_rate_limit_until_monotonic_by_key.get(rate_limit_key, 0.0)
+        if until > current_until:
+            _google_adapter_rate_limit_until_monotonic_by_key[rate_limit_key] = until
+
+
+async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Response:
+    passthrough_kwargs = dict(kwargs)
+    max_retries = _get_google_adapter_max_retries()
+    total_attempts = max_retries + 1
+    capacity_total_attempts = _get_google_adapter_model_capacity_max_retries() + 1
+    hidden_retry_budget_seconds = _get_google_adapter_hidden_retry_budget_seconds()
+    accumulated_hidden_wait_seconds = 0.0
+    rate_limit_key = _get_google_adapter_rate_limit_key_from_kwargs(kwargs)
+    passthrough_kwargs.pop("google_access_token", None)
+    passthrough_kwargs.pop("google_adapter_rate_limit_key", None)
+    attempt = 0
+    while True:
+        attempt += 1
+        verbose_proxy_logger.warning(
+            "Google adapter upstream attempt %s/%s",
+            attempt,
+            max(total_attempts, capacity_total_attempts),
+        )
+        await _wait_for_google_adapter_cooldown_if_needed(rate_limit_key)
+        try:
+            passthrough_kwargs["retryable_upstream_status_codes"] = [429]
+            return await pass_through_request(**passthrough_kwargs)
+        except Exception as exc:
+            status_code = _extract_google_adapter_exception_status_code(exc)
+            error_reason = _extract_google_adapter_error_reason(exc)
+            is_capacity_retry = error_reason == "MODEL_CAPACITY_EXHAUSTED"
+            retry_limit = capacity_total_attempts if is_capacity_retry else total_attempts
+            if is_capacity_retry:
+                wait_seconds = _get_google_adapter_capacity_backoff_seconds(attempt)
+            else:
+                wait_seconds = _parse_google_rate_limit_reset_seconds(exc)
+            projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
+            within_hidden_budget = (
+                hidden_retry_budget_seconds > 0
+                and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
+            )
+            if status_code != 429 or (attempt >= retry_limit and not within_hidden_budget):
+                verbose_proxy_logger.warning(
+                    "Google adapter upstream attempt %s failed with %s (%s, reason=%s) and will not be retried",
+                    attempt,
+                    status_code,
+                    exc.__class__.__name__,
+                    error_reason,
+                )
+                raise
+            if attempt >= retry_limit and within_hidden_budget:
+                verbose_proxy_logger.warning(
+                    "Google adapter keeping 429 hidden from client for %s; hidden retry wait %.1fs/%.1fs (reason=%s)",
+                    rate_limit_key,
+                    projected_hidden_wait_seconds,
+                    hidden_retry_budget_seconds,
+                    error_reason,
+                )
+            if is_capacity_retry:
+                verbose_proxy_logger.warning(
+                    "Google adapter upstream attempt %s hit 429 (%s, reason=%s); exponential backoff %.1fs",
+                    attempt,
+                    exc.__class__.__name__,
+                    error_reason,
+                    wait_seconds,
+                )
+            else:
+                verbose_proxy_logger.warning(
+                    "Google adapter upstream attempt %s hit 429 (%s, reason=%s); parsed reset %.1fs",
+                    attempt,
+                    exc.__class__.__name__,
+                    error_reason,
+                    wait_seconds,
+                )
+            accumulated_hidden_wait_seconds = projected_hidden_wait_seconds
+            await _set_google_adapter_cooldown(rate_limit_key, wait_seconds + 1.0)
+
+
+def _get_openrouter_adapter_rate_limit_key(model: Optional[str]) -> str:
+    cleaned_model = _clean_secret_string(model)
+    return cleaned_model or "__default__"
+
+
+def _is_openrouter_adapter_free_model(model: Optional[str]) -> bool:
+    cleaned_model = _clean_secret_string(model)
+    if not cleaned_model:
+        return False
+    return (
+        cleaned_model == "openrouter/elephant-alpha"
+        or cleaned_model == "openrouter/free"
+        or cleaned_model.endswith(":free")
+    )
+
+
+def _get_openrouter_adapter_wait_keys(model: Optional[str]) -> str:
+    return _get_openrouter_adapter_rate_limit_key(model)
+
+
+def _extract_openrouter_adapter_exception_status_code(exc: Any) -> Optional[int]:
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            continue
+    text_value = str(exc)
+    if "429" in text_value:
+        return 429
+    return None
+
+
+def _extract_openrouter_adapter_error_payload(exc: Any) -> Optional[dict[str, Any]]:
+    candidates = [getattr(exc, "detail", None), getattr(exc, "message", None), str(exc)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        payload_texts: list[str] = []
+        if isinstance(candidate, bytes):
+            payload_texts.append(candidate.decode("utf-8", errors="ignore"))
+        elif isinstance(candidate, str):
+            payload_text = candidate.strip()
+            if ": b'" in payload_text or ': b"' in payload_text:
+                payload_text = payload_text.split(": ", 1)[-1].strip()
+            if (payload_text.startswith("b'") and payload_text.endswith("'")) or (
+                payload_text.startswith('b"') and payload_text.endswith('"')
+            ):
+                try:
+                    literal_value = ast.literal_eval(payload_text)
+                except Exception:
+                    literal_value = None
+                if isinstance(literal_value, bytes):
+                    payload_text = literal_value.decode("utf-8", errors="ignore")
+                elif isinstance(literal_value, str):
+                    payload_text = literal_value
+            payload_texts.append(payload_text)
+            brace_start = payload_text.find("{")
+            brace_end = payload_text.rfind("}")
+            if brace_start != -1 and brace_end > brace_start:
+                payload_texts.append(payload_text[brace_start : brace_end + 1])
+        elif isinstance(candidate, dict):
+            return candidate
+        for payload_text in payload_texts:
+            if not payload_text:
+                continue
+            try:
+                parsed = json.loads(payload_text)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
+def _extract_openrouter_adapter_provider_name(exc: Any) -> Optional[str]:
+    payload = _extract_openrouter_adapter_error_payload(exc)
+    if not isinstance(payload, dict):
+        return None
+    metadata = payload.get("error", {}).get("metadata")
+    if isinstance(metadata, dict):
+        provider_name = metadata.get("provider_name")
+        if isinstance(provider_name, str) and provider_name:
+            return provider_name
+    return None
+
+
+def _extract_openrouter_adapter_retry_after_seconds(exc: Any) -> Optional[float]:
+    payload = _extract_openrouter_adapter_error_payload(exc)
+    if isinstance(payload, dict):
+        metadata = payload.get("error", {}).get("metadata")
+        if isinstance(metadata, dict):
+            retry_after_value = metadata.get("retry_after_seconds")
+            try:
+                if retry_after_value is not None:
+                    return max(0.0, float(retry_after_value))
+            except Exception:
+                return None
+    return _parse_retry_after_seconds_from_headers(
+        _extract_openrouter_adapter_error_headers(exc)
+    )
+
+
+def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
+    payload = _extract_openrouter_adapter_error_payload(exc)
+    if not isinstance(payload, dict):
+        return None
+    metadata = payload.get("error", {}).get("metadata")
+    if isinstance(metadata, dict):
+        raw_message = metadata.get("raw")
+        if isinstance(raw_message, str) and raw_message:
+            return raw_message
+    error_message = payload.get("error", {}).get("message")
+    if isinstance(error_message, str) and error_message:
+        return error_message
+    return None
+
+
+def _extract_openrouter_adapter_error_headers(exc: Any) -> dict[str, Any]:
+    merged_headers = _extract_adapter_upstream_headers(exc)
+    payload = _extract_openrouter_adapter_error_payload(exc)
+    if not isinstance(payload, dict):
+        return merged_headers
+    metadata = payload.get("error", {}).get("metadata")
+    if not isinstance(metadata, dict):
+        return merged_headers
+    headers = metadata.get("headers")
+    if not isinstance(headers, dict):
+        return merged_headers
+    merged_headers.update(headers)
+    return merged_headers
+
+
+def _get_openrouter_adapter_header_value(
+    headers: dict[str, Any], header_name: str
+) -> Optional[str]:
+    return _get_adapter_header_value(headers, header_name)
+
+
+def _extract_openrouter_adapter_reset_wait_seconds(exc: Any) -> Optional[float]:
+    headers = _extract_openrouter_adapter_error_headers(exc)
+    return _parse_rate_limit_reset_wait_seconds_from_headers(headers)
+
+
+def _is_openrouter_adapter_long_window_rate_limit(
+    exc: Any,
+    *,
+    hidden_retry_budget_seconds: float,
+) -> bool:
+    threshold_seconds = max(hidden_retry_budget_seconds, 30.0)
+    retry_after_seconds = _extract_openrouter_adapter_retry_after_seconds(exc)
+    if retry_after_seconds is not None:
+        return retry_after_seconds > threshold_seconds
+    headers = _extract_openrouter_adapter_error_headers(exc)
+    remaining_value = _get_openrouter_adapter_header_value(
+        headers, "X-RateLimit-Remaining"
+    )
+    if remaining_value not in {"0", "0.0"}:
+        return False
+    reset_wait_seconds = _extract_openrouter_adapter_reset_wait_seconds(exc)
+    if reset_wait_seconds is None:
+        return False
+    return reset_wait_seconds > threshold_seconds
+
+
+def _get_openrouter_adapter_cooldown_keys(
+    *, model: Optional[str], exc: Any
+) -> str:
+    return _get_openrouter_adapter_rate_limit_key(model)
+
+
+def _get_openrouter_adapter_retry_wait_seconds(exc: Any, attempt: int) -> float:
+    wait_seconds = _get_openrouter_adapter_backoff_seconds(attempt)
+    retry_after_seconds = _extract_openrouter_adapter_retry_after_seconds(exc)
+    if retry_after_seconds is not None:
+        retry_after_backoff_seconds = min(max(retry_after_seconds + 1.0, 1.0), 60.0)
+        return max(wait_seconds, retry_after_backoff_seconds)
+    headers = _extract_openrouter_adapter_error_headers(exc)
+    remaining_value = _get_openrouter_adapter_header_value(
+        headers, "X-RateLimit-Remaining"
+    )
+    reset_wait_seconds = _extract_openrouter_adapter_reset_wait_seconds(exc)
+    if remaining_value in {"0", "0.0"} and reset_wait_seconds is not None:
+        reset_backoff_seconds = min(max(reset_wait_seconds + 1.0, 1.0), 60.0)
+        return max(wait_seconds, reset_backoff_seconds)
+    return wait_seconds
+
+
+def _get_openrouter_adapter_max_retries() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_OPENROUTER_ADAPTER_MAX_RETRIES")
+    )
+    if raw_value is None:
+        return 3
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 3
+    return max(0, parsed)
+
+
+def _get_openrouter_adapter_backoff_seconds(attempt: int) -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS")
+    )
+    if raw_value:
+        try:
+            values = [max(1.0, float(item.strip())) for item in raw_value.split(",") if item.strip()]
+        except Exception:
+            values = []
+        if values:
+            index = min(max(1, attempt) - 1, len(values) - 1)
+            return values[index]
+    schedule = (2.0, 10.0, 20.0, 30.0)
+    index = min(max(1, attempt) - 1, len(schedule) - 1)
+    return schedule[index]
+
+
+def _get_openrouter_adapter_hidden_retry_budget_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS")
+    )
+    if raw_value is None:
+        return 0.0
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        return 0.0
+    return max(0.0, parsed)
+
+
+def _get_openrouter_adapter_post_failure_cooldown_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS")
+    )
+    if raw_value is None:
+        return 60.0
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        return 60.0
+    return max(0.0, parsed)
+
+
+async def _maybe_raise_openrouter_adapter_failure_circuit_open(
+    adapter_model: Optional[str],
+) -> None:
+    rate_limit_key = _get_openrouter_adapter_rate_limit_key(adapter_model)
+    async with _openrouter_adapter_rate_limit_lock:
+        now = time.monotonic()
+        wait_seconds = (
+            _openrouter_adapter_failure_circuit_until_monotonic_by_key.get(rate_limit_key, 0.0)
+            - now
+        )
+    if wait_seconds > 0:
+        rounded_wait = max(1, int(wait_seconds))
+        verbose_proxy_logger.warning(
+            "OpenRouter adapter failure circuit open for %s; failing fast for %ss",
+            rate_limit_key,
+            rounded_wait,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"OpenRouter model {rate_limit_key} is temporarily cooling down after repeated provider 429s. "
+                f"Retry after ~{rounded_wait}s."
+            ),
+        )
+
+
+async def _openrouter_adapter_open_failure_circuit(
+    adapter_model: Optional[str],
+    *,
+    exc: Any,
+) -> None:
+    rate_limit_key = _get_openrouter_adapter_rate_limit_key(adapter_model)
+    cooldown_seconds = _get_openrouter_adapter_post_failure_cooldown_seconds()
+    retry_after_seconds = _extract_openrouter_adapter_retry_after_seconds(exc)
+    reset_wait_seconds = _extract_openrouter_adapter_reset_wait_seconds(exc)
+    for candidate in (retry_after_seconds, reset_wait_seconds):
+        if candidate is not None:
+            cooldown_seconds = max(cooldown_seconds, candidate)
+    cooldown_seconds = min(max(cooldown_seconds, 0.0), 300.0)
+    async with _openrouter_adapter_rate_limit_lock:
+        until = time.monotonic() + cooldown_seconds
+        current_until = _openrouter_adapter_failure_circuit_until_monotonic_by_key.get(
+            rate_limit_key, 0.0
+        )
+        if until > current_until:
+            _openrouter_adapter_failure_circuit_until_monotonic_by_key[rate_limit_key] = until
+
+
+def _clear_openrouter_adapter_failure_circuit(adapter_model: Optional[str]) -> None:
+    rate_limit_key = _get_openrouter_adapter_rate_limit_key(adapter_model)
+    _openrouter_adapter_failure_circuit_until_monotonic_by_key.pop(rate_limit_key, None)
+
+
+async def _wait_for_openrouter_adapter_cooldown_if_needed(
+    rate_limit_keys: Union[str, list[str], tuple[str, ...]]
+) -> None:
+    if isinstance(rate_limit_keys, str):
+        normalized_keys = [rate_limit_keys]
+    else:
+        normalized_keys = [key for key in rate_limit_keys if isinstance(key, str) and key]
+    if not normalized_keys:
+        normalized_keys = ["__default__"]
+    async with _openrouter_adapter_rate_limit_lock:
+        now = time.monotonic()
+        wait_seconds = max(
+            (
+                _openrouter_adapter_rate_limit_until_monotonic_by_key.get(key, 0.0) - now
+                for key in normalized_keys
+            ),
+            default=0.0,
+        )
+    if wait_seconds > 0:
+        verbose_proxy_logger.warning(
+            "OpenRouter adapter cooldown active for %s; sleeping %.1fs before upstream request",
+            ", ".join(normalized_keys),
+            wait_seconds,
+        )
+        await asyncio.sleep(wait_seconds)
+
+
+async def _set_openrouter_adapter_cooldown(
+    rate_limit_keys: Union[str, list[str], tuple[str, ...]], wait_seconds: float
+) -> None:
+    if isinstance(rate_limit_keys, str):
+        normalized_keys = [rate_limit_keys]
+    else:
+        normalized_keys = [key for key in rate_limit_keys if isinstance(key, str) and key]
+    if not normalized_keys:
+        normalized_keys = ["__default__"]
+    async with _openrouter_adapter_rate_limit_lock:
+        until = time.monotonic() + max(0.0, wait_seconds)
+        for key in normalized_keys:
+            current_until = _openrouter_adapter_rate_limit_until_monotonic_by_key.get(key, 0.0)
+            if until > current_until:
+                _openrouter_adapter_rate_limit_until_monotonic_by_key[key] = until
+
+
+async def _perform_openrouter_completion_adapter_operation(
+    *,
+    adapter_model: Optional[str],
+    operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    max_retries = _get_openrouter_adapter_max_retries()
+    total_attempts = max_retries + 1
+    hidden_retry_budget_seconds = _get_openrouter_adapter_hidden_retry_budget_seconds()
+    accumulated_hidden_wait_seconds = 0.0
+    wait_keys = _get_openrouter_adapter_wait_keys(adapter_model)
+    await _maybe_raise_openrouter_adapter_failure_circuit_open(adapter_model)
+    attempt = 0
+    while True:
+        attempt += 1
+        verbose_proxy_logger.warning(
+            "OpenRouter completion adapter upstream attempt %s/%s for model=%s",
+            attempt,
+            total_attempts,
+            adapter_model,
+        )
+        await _wait_for_openrouter_adapter_cooldown_if_needed(wait_keys)
+        try:
+            result = await operation()
+            _clear_openrouter_adapter_failure_circuit(adapter_model)
+            return result
+        except Exception as exc:
+            status_code = _extract_openrouter_adapter_exception_status_code(exc)
+            provider_name = _extract_openrouter_adapter_provider_name(exc)
+            raw_message = _extract_openrouter_adapter_raw_message(exc)
+            reset_wait_seconds = _extract_openrouter_adapter_reset_wait_seconds(exc)
+            is_long_window_rate_limit = _is_openrouter_adapter_long_window_rate_limit(
+                exc,
+                hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+            )
+            wait_seconds = _get_openrouter_adapter_retry_wait_seconds(exc, attempt)
+            projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
+            within_hidden_budget = (
+                hidden_retry_budget_seconds > 0
+                and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
+            )
+            if status_code == 429 and is_long_window_rate_limit:
+                cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
+                verbose_proxy_logger.warning(
+                    "OpenRouter completion adapter upstream attempt %s hit long-window 429 (%s, provider=%s, raw=%s, reset_wait=%.1fs) and will not be hidden-retried",
+                    attempt,
+                    exc.__class__.__name__,
+                    provider_name,
+                    raw_message,
+                    reset_wait_seconds or 0.0,
+                )
+                await _set_openrouter_adapter_cooldown(
+                    _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
+                    cooldown_seconds,
+                )
+                await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
+                raise
+            if status_code != 429 or (attempt >= total_attempts and not within_hidden_budget):
+                verbose_proxy_logger.warning(
+                    "OpenRouter completion adapter upstream attempt %s failed with %s (%s, provider=%s, raw=%s) and will not be retried",
+                    attempt,
+                    status_code,
+                    exc.__class__.__name__,
+                    provider_name,
+                    raw_message,
+                )
+                if status_code == 429:
+                    await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
+                raise
+            if attempt >= total_attempts and within_hidden_budget:
+                verbose_proxy_logger.warning(
+                    "OpenRouter completion adapter keeping 429 hidden from client for model=%s; hidden retry wait %.1fs/%.1fs",
+                    adapter_model,
+                    projected_hidden_wait_seconds,
+                    hidden_retry_budget_seconds,
+                )
+            verbose_proxy_logger.warning(
+                "OpenRouter completion adapter upstream attempt %s hit 429 (%s, provider=%s, raw=%s); backoff %.1fs",
+                attempt,
+                exc.__class__.__name__,
+                provider_name,
+                raw_message,
+                wait_seconds,
+            )
+            accumulated_hidden_wait_seconds = projected_hidden_wait_seconds
+            await _set_openrouter_adapter_cooldown(
+                _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
+                wait_seconds,
+            )
+
+
+async def _perform_openrouter_adapter_pass_through_request(
+    *,
+    adapter_model: Optional[str],
+    **kwargs: Any,
+) -> Response:
+    max_retries = _get_openrouter_adapter_max_retries()
+    total_attempts = max_retries + 1
+    hidden_retry_budget_seconds = _get_openrouter_adapter_hidden_retry_budget_seconds()
+    accumulated_hidden_wait_seconds = 0.0
+    model_rate_limit_key = _get_openrouter_adapter_rate_limit_key(adapter_model)
+    wait_keys = _get_openrouter_adapter_wait_keys(adapter_model)
+    await _maybe_raise_openrouter_adapter_failure_circuit_open(adapter_model)
+    attempt = 0
+    while True:
+        attempt += 1
+        verbose_proxy_logger.warning(
+            "OpenRouter adapter upstream attempt %s/%s for model=%s",
+            attempt,
+            total_attempts,
+            model_rate_limit_key,
+        )
+        await _wait_for_openrouter_adapter_cooldown_if_needed(wait_keys)
+        try:
+            result = await pass_through_request(
+                **kwargs,
+                retryable_upstream_status_codes=[429, 500, 502, 503, 504],
+            )
+            _clear_openrouter_adapter_failure_circuit(adapter_model)
+            return result
+        except Exception as exc:
+            status_code = _extract_openrouter_adapter_exception_status_code(exc)
+            provider_name = _extract_openrouter_adapter_provider_name(exc)
+            raw_message = _extract_openrouter_adapter_raw_message(exc)
+            reset_wait_seconds = _extract_openrouter_adapter_reset_wait_seconds(exc)
+            is_long_window_rate_limit = _is_openrouter_adapter_long_window_rate_limit(
+                exc,
+                hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+            )
+            wait_seconds = _get_openrouter_adapter_retry_wait_seconds(exc, attempt)
+            projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
+            within_hidden_budget = (
+                hidden_retry_budget_seconds > 0
+                and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
+            )
+            if status_code == 429 and is_long_window_rate_limit:
+                cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
+                verbose_proxy_logger.warning(
+                    "OpenRouter adapter upstream attempt %s hit long-window 429 (%s, provider=%s, raw=%s, reset_wait=%.1fs) and will not be hidden-retried",
+                    attempt,
+                    exc.__class__.__name__,
+                    provider_name,
+                    raw_message,
+                    reset_wait_seconds or 0.0,
+                )
+                await _set_openrouter_adapter_cooldown(
+                    _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
+                    cooldown_seconds,
+                )
+                await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
+                raise
+            if status_code != 429 or (attempt >= total_attempts and not within_hidden_budget):
+                verbose_proxy_logger.warning(
+                    "OpenRouter adapter upstream attempt %s failed with %s (%s, provider=%s, raw=%s) and will not be retried",
+                    attempt,
+                    status_code,
+                    exc.__class__.__name__,
+                    provider_name,
+                    raw_message,
+                )
+                if status_code == 429:
+                    await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
+                raise
+            if attempt >= total_attempts and within_hidden_budget:
+                verbose_proxy_logger.warning(
+                    "OpenRouter adapter keeping 429 hidden from client for model=%s; hidden retry wait %.1fs/%.1fs",
+                    adapter_model,
+                    projected_hidden_wait_seconds,
+                    hidden_retry_budget_seconds,
+                )
+            verbose_proxy_logger.warning(
+                "OpenRouter adapter upstream attempt %s hit 429 (%s, provider=%s, raw=%s); backoff %.1fs",
+                attempt,
+                exc.__class__.__name__,
+                provider_name,
+                raw_message,
+                wait_seconds,
+            )
+            accumulated_hidden_wait_seconds = projected_hidden_wait_seconds
+            await _set_openrouter_adapter_cooldown(
+                _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
+                wait_seconds,
+            )
+
+
+async def _prime_google_code_assist_session(
+    access_token: str,
+    companion_project: str,
+) -> None:
+    ttl_seconds = _get_google_code_assist_prime_ttl_seconds()
+    cache_key = _get_google_code_assist_prime_cache_key(
+        access_token,
+        companion_project,
+    )
+    if ttl_seconds > 0:
+        async with _google_code_assist_prime_lock:
+            cached_until = _google_code_assist_prime_until_monotonic_by_key.get(
+                cache_key, 0.0
+            )
+        if cached_until > time.monotonic():
+            if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
+                verbose_proxy_logger.info(
+                    "Google adapter prime cache hit for project=%s",
+                    companion_project,
+                )
+            return
+
+    target_base = _get_anthropic_adapter_google_target_base().rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    metadata = {
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+        "duetProject": companion_project,
+    }
+    preflight_requests = (
+        (f"{target_base}/v1internal:retrieveUserQuota", {"project": companion_project}),
+        (f"{target_base}/v1internal:fetchAdminControls", {"project": companion_project}),
+        (f"{target_base}/v1internal:listExperiments", {"project": companion_project, "metadata": metadata}),
+    )
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        for url, body in preflight_requests:
+            HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+                url=url,
+                headers=headers,
+                credential_family="google",
+                expected_target_family="google",
+            )
+            try:
+                await client.post(url, headers=headers, json=body)
+            except Exception:
+                continue
+    if ttl_seconds > 0:
+        async with _google_code_assist_prime_lock:
+            _google_code_assist_prime_until_monotonic_by_key[cache_key] = (
+                time.monotonic() + ttl_seconds
+            )
+
+
+
+def _load_local_google_oauth_access_token() -> Optional[str]:
+    auth_path = _get_anthropic_adapter_google_auth_file_path()
+    if auth_path is None:
+        return None
+
+    try:
+        auth_data = json.loads(auth_path.read_text())
+    except Exception:
+        return None
+
+    access_token = _clean_codex_auth_value(auth_data.get("access_token"))
+    if access_token is None:
+        return None
+    return access_token
+
+
+def _get_anthropic_adapter_google_target_base() -> str:
+    return os.getenv("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com"
+
+
+def _normalize_google_completion_adapter_model_name(model: str) -> str:
+    normalized_model = model.strip()
+    if normalized_model.startswith(("gemini/", "google/")):
+        normalized_model = normalized_model.split("/", 1)[1]
+
+    # Claude-facing agent configs use stable shorthand names or newer naming
+    # variants; Google Code Assist currently serves the corresponding model ids.
+    google_model_aliases = {
+        "gemini-3.1": "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite": "gemini-3.1-flash-lite-preview",
+    }
+    return google_model_aliases.get(normalized_model, normalized_model)
+
+
+def _sanitize_google_schema_array_items(schema_node: Any) -> int:
+    fix_count = 0
+    if isinstance(schema_node, dict):
+        if schema_node.get("type") == "array":
+            items = schema_node.get("items")
+            if not isinstance(items, dict) or not items.get("type"):
+                schema_node["items"] = {"type": "string"}
+                fix_count += 1
+        for value in schema_node.values():
+            fix_count += _sanitize_google_schema_array_items(value)
+    elif isinstance(schema_node, list):
+        for item in schema_node:
+            fix_count += _sanitize_google_schema_array_items(item)
+    return fix_count
+
+
+def _extract_completion_message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _get_google_adapter_fallback_context_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 2000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 2000
+    return max(256, parsed)
+
+
+def _inject_google_adapter_fallback_text_context(
+    google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]]
+) -> dict[str, Any]:
+    contents = google_request_dict.get("contents")
+    if not isinstance(contents, list):
+        return {}
+    if any(_google_content_has_text(content) for content in contents):
+        return {}
+
+    text_snippets: list[str] = []
+    for message in reversed(completion_messages):
+        text = _extract_completion_message_text(message).strip()
+        if text:
+            text_snippets.append(text)
+        if len(text_snippets) >= 2:
+            break
+    if not text_snippets:
+        return {}
+
+    text_snippets.reverse()
+    fallback_text = "\n\n".join(text_snippets)
+    cap = _get_google_adapter_fallback_context_char_cap()
+    if len(fallback_text) > cap:
+        fallback_text = fallback_text[-cap:].lstrip()
+
+    google_request_dict["contents"] = [
+        {
+            "role": "user",
+            "parts": [{"text": fallback_text}],
+        },
+        *contents,
+    ]
+    return {
+        "inserted_fallback_text_context": True,
+        "inserted_fallback_text_context_chars": len(fallback_text),
+        "inserted_fallback_text_context_sources": len(text_snippets),
+    }
+
+
+async def _build_google_code_assist_request_from_completion_kwargs(
+    *,
+    completion_kwargs: dict[str, Any],
+    adapter_model: str,
+    project: str,
+    request: Request,
+) -> tuple[dict[str, Any], dict[str, str], list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler,
+    )
+    from litellm.llms.vertex_ai.gemini.transformation import _transform_request_body
+
+    google_model = _normalize_google_completion_adapter_model_name(adapter_model)
+    completion_kwargs, tool_name_mapping = (
+        LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            max_tokens=completion_kwargs["max_tokens"],
+            messages=completion_kwargs.get("messages") or [],
+            model=google_model,
+            metadata=completion_kwargs.get("metadata"),
+            stop_sequences=completion_kwargs.get("stop_sequences"),
+            stream=completion_kwargs.get("stream"),
+            system=completion_kwargs.get("system"),
+            temperature=completion_kwargs.get("temperature"),
+            thinking=completion_kwargs.get("thinking"),
+            tool_choice=completion_kwargs.get("tool_choice"),
+            tools=completion_kwargs.get("tools"),
+            top_k=completion_kwargs.get("top_k"),
+            top_p=completion_kwargs.get("top_p"),
+            output_format=completion_kwargs.get("output_format"),
+            extra_kwargs={
+                "metadata": completion_kwargs.get("metadata"),
+                "parallel_tool_calls": completion_kwargs.get("parallel_tool_calls"),
+                "response_format": completion_kwargs.get("response_format"),
+                "reasoning_effort": completion_kwargs.get("reasoning_effort"),
+                "frequency_penalty": completion_kwargs.get("frequency_penalty"),
+                "presence_penalty": completion_kwargs.get("presence_penalty"),
+                "seed": completion_kwargs.get("seed"),
+                "n": completion_kwargs.get("n"),
+            },
+        )
+    )
+    completion_messages = list(completion_kwargs.get("messages") or [])
+    (
+        completion_messages,
+        completion_message_window_changes,
+    ) = _apply_google_adapter_completion_message_window(completion_messages)
+    (
+        completion_messages,
+        tool_call_context_changes,
+    ) = _inject_google_adapter_tool_call_context_text(completion_messages)
+    if tool_call_context_changes:
+        completion_message_window_changes = {
+            **completion_message_window_changes,
+            **tool_call_context_changes,
+        }
+    completion_kwargs["messages"] = completion_messages
+    completion_kwargs, native_tool_alias_changes = _apply_google_code_assist_native_tool_aliases(
+        completion_kwargs,
+        tool_name_mapping,
+    )
+    completion_messages = list(completion_kwargs.get("messages") or [])
+
+    mappable_params = {
+        key: value
+        for key, value in completion_kwargs.items()
+        if key
+        not in {
+            "model",
+            "messages",
+            "metadata",
+            "stream",
+            "stream_options",
+            "litellm_logging_obj",
+            "custom_llm_provider",
+            "api_key",
+            "api_base",
+            "user",
+        }
+        and value is not None
+    }
+    gemini_optional_params = litellm.GoogleAIStudioGeminiConfig().map_openai_params(
+        non_default_params=mappable_params,
+        optional_params={},
+        model=google_model,
+        drop_params=False,
+    )
+    litellm_params: dict[str, Any] = {}
+    metadata = completion_kwargs.get("metadata")
+    if isinstance(metadata, dict):
+        litellm_params["metadata"] = metadata
+
+    google_request = _transform_request_body(
+        messages=completion_messages,
+        model=google_model,
+        optional_params=gemini_optional_params,
+        custom_llm_provider="gemini",
+        litellm_params=litellm_params,
+        cached_content=None,
+    )
+    google_request_dict = _normalize_google_code_assist_httpx_payload(dict(google_request))
+    fallback_context_changes = _inject_google_adapter_fallback_text_context(
+        google_request_dict,
+        completion_messages,
+    )
+    system_instruction = google_request_dict.pop("system_instruction", None)
+    if system_instruction is not None:
+        google_request_dict["systemInstruction"] = system_instruction
+    session_id, session_id_source = _resolve_google_adapter_session_id(
+        request,
+        completion_messages,
+        google_model=google_model,
+    )
+    google_request_dict["session_id"] = session_id
+    user_prompt_id = _resolve_google_adapter_user_prompt_id(
+        request,
+        completion_messages,
+        google_model=google_model,
+        session_id=session_id,
+    )
+
+    wrapped_request = {
+        "model": google_model,
+        "project": project,
+        "user_prompt_id": user_prompt_id,
+        "request": google_request_dict,
+    }
+    if fallback_context_changes:
+        completion_message_window_changes = {
+            **completion_message_window_changes,
+            **fallback_context_changes,
+        }
+    completion_message_window_changes = {
+        **completion_message_window_changes,
+        **native_tool_alias_changes,
+        'google_adapter_session_id_source': session_id_source,
+        'google_adapter_session_id_hash': hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8],
+    }
+    return wrapped_request, tool_name_mapping, completion_messages, gemini_optional_params, litellm_params, completion_message_window_changes
+
+
+def _get_google_code_assist_native_tool_aliases() -> dict[str, str]:
+    return {
+        "Bash": "run_shell_command",
+        "Read": "read_file",
+        "Write": "write_file",
+        "Edit": "replace",
+        "Glob": "glob",
+        "Grep": "grep_search",
+        "WebFetch": "web_fetch",
+        "WebSearch": "google_web_search",
+    }
+
+
+def _apply_google_code_assist_native_tool_aliases(
+    completion_kwargs: dict[str, Any],
+    tool_name_mapping: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    aliases = _get_google_code_assist_native_tool_aliases()
+    alias_count = 0
+    aliased_names: set[str] = set()
+
+    tools = completion_kwargs.get("tools")
+    if isinstance(tools, list):
+        updated_tools = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                updated_tools.append(tool)
+                continue
+            if tool.get("type") != "function" or not isinstance(tool.get("function"), dict):
+                updated_tools.append(tool)
+                continue
+            function_block = dict(tool["function"])
+            original_name = function_block.get("name")
+            alias_name = aliases.get(original_name)
+            if isinstance(alias_name, str) and alias_name:
+                function_block["name"] = alias_name
+                updated_tool = dict(tool)
+                updated_tool["function"] = function_block
+                updated_tools.append(updated_tool)
+                tool_name_mapping[alias_name] = tool_name_mapping.get(original_name, original_name)
+                alias_count += 1
+                aliased_names.add(alias_name)
+            else:
+                updated_tools.append(tool)
+        completion_kwargs["tools"] = updated_tools
+
+    messages = completion_kwargs.get("messages")
+    if isinstance(messages, list):
+        updated_messages = []
+        for message in messages:
+            if not isinstance(message, dict):
+                updated_messages.append(message)
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                updated_messages.append(message)
+                continue
+            updated_tool_calls = []
+            message_changed = False
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    updated_tool_calls.append(tool_call)
+                    continue
+                function_block = tool_call.get("function")
+                if not isinstance(function_block, dict):
+                    updated_tool_calls.append(tool_call)
+                    continue
+                original_name = function_block.get("name")
+                alias_name = aliases.get(original_name)
+                if isinstance(alias_name, str) and alias_name:
+                    updated_function = dict(function_block)
+                    updated_function["name"] = alias_name
+                    updated_tool_call = dict(tool_call)
+                    updated_tool_call["function"] = updated_function
+                    updated_tool_calls.append(updated_tool_call)
+                    tool_name_mapping[alias_name] = tool_name_mapping.get(original_name, original_name)
+                    message_changed = True
+                    aliased_names.add(alias_name)
+                else:
+                    updated_tool_calls.append(tool_call)
+            if message_changed:
+                updated_message = dict(message)
+                updated_message["tool_calls"] = updated_tool_calls
+                updated_messages.append(updated_message)
+            else:
+                updated_messages.append(message)
+        completion_kwargs["messages"] = updated_messages
+
+    tool_choice = completion_kwargs.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        updated_tool_choice = dict(tool_choice)
+        function_block = updated_tool_choice.get("function")
+        if isinstance(function_block, dict):
+            original_name = function_block.get("name")
+            alias_name = aliases.get(original_name)
+            if isinstance(alias_name, str) and alias_name:
+                updated_function = dict(function_block)
+                updated_function["name"] = alias_name
+                updated_tool_choice["function"] = updated_function
+                completion_kwargs["tool_choice"] = updated_tool_choice
+                tool_name_mapping[alias_name] = tool_name_mapping.get(original_name, original_name)
+                aliased_names.add(alias_name)
+                alias_count += 1
+
+    changes: dict[str, Any] = {}
+    if alias_count > 0 or aliased_names:
+        changes["google_native_tool_alias_count"] = alias_count
+        changes["google_native_tool_aliases"] = sorted(aliased_names)
+    return completion_kwargs, changes
+
+
+def _get_google_adapter_max_completion_messages_window() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW")
+    )
+    if raw_value is None:
+        return 12
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 12
+    return max(2, parsed)
+
+
+def _completion_message_has_visible_text(message: Any) -> bool:
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                return True
+    return False
+
+
+def _inject_google_adapter_tool_call_context_text(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    updated_messages: list[dict[str, Any]] = []
+    injected_count = 0
+
+    for message in messages:
+        if not isinstance(message, dict):
+            updated_messages.append(message)
+            continue
+        if message.get("role") != "assistant":
+            updated_messages.append(message)
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or len(tool_calls) == 0:
+            updated_messages.append(message)
+            continue
+        if _completion_message_has_visible_text(message):
+            updated_messages.append(message)
+            continue
+
+        tool_names: list[str] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function_block = tool_call.get("function")
+            if not isinstance(function_block, dict):
+                continue
+            tool_name = function_block.get("name")
+            if isinstance(tool_name, str) and tool_name:
+                tool_names.append(tool_name)
+        if tool_names:
+            if len(tool_names) == 1:
+                synthesized_text = f"Calling tool {tool_names[0]}."
+            else:
+                synthesized_text = f"Calling tools: {', '.join(tool_names)}."
+        else:
+            synthesized_text = "Calling tool."
+
+        updated_message = dict(message)
+        updated_message["content"] = synthesized_text
+        updated_messages.append(updated_message)
+        injected_count += 1
+
+    if injected_count == 0:
+        return messages, {}
+    return updated_messages, {
+        "google_adapter_injected_tool_call_context_count": injected_count,
+    }
+
+
+def _estimate_completion_message_text_chars(message: Any) -> int:
+    if not isinstance(message, dict):
+        return 0
+    content = message.get("content")
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                total += len(text)
+        return total
+    return 0
+
+
+def _apply_google_adapter_completion_message_window(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if len(messages) <= 2:
+        return messages, {}
+    max_window = _get_google_adapter_max_completion_messages_window()
+    original_count = len(messages)
+    original_text_chars = sum(_estimate_completion_message_text_chars(message) for message in messages)
+    trimmed_messages = list(messages[-max_window:])
+    trimmed_text_chars = sum(_estimate_completion_message_text_chars(message) for message in trimmed_messages)
+    if len(trimmed_messages) == original_count:
+        return messages, {}
+    return trimmed_messages, {
+        "trimmed_completion_messages_from_count": original_count,
+        "trimmed_completion_messages_to_count": len(trimmed_messages),
+        "trimmed_completion_messages_from_text_chars": original_text_chars,
+        "trimmed_completion_messages_to_text_chars": trimmed_text_chars,
+        "trimmed_completion_messages_max_window": max_window,
+    }
+
+
+def _normalize_google_code_assist_httpx_payload(value: Any) -> Any:
+    key_mapping = {
+        "function_call": "functionCall",
+        "function_response": "functionResponse",
+        "inline_data": "inlineData",
+        "file_data": "fileData",
+        "mime_type": "mimeType",
+        "file_uri": "fileUri",
+        "media_resolution": "mediaResolution",
+    }
+    if isinstance(value, list):
+        return [_normalize_google_code_assist_httpx_payload(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        normalized_key = key_mapping.get(key, key)
+        normalized[normalized_key] = _normalize_google_code_assist_httpx_payload(item)
+    return normalized
+
+
+def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
+    def _extract_text_metrics(content_block: Any) -> tuple[int, int]:
+        part_count = 0
+        char_count = 0
+        if not isinstance(content_block, dict):
+            return part_count, char_count
+        parts = content_block.get("parts")
+        if not isinstance(parts, list):
+            return part_count, char_count
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_count += 1
+            text = part.get("text")
+            if isinstance(text, str):
+                char_count += len(text)
+        return part_count, char_count
+
+    summary: dict[str, Any] = {}
+    if not isinstance(payload, dict):
+        summary["payload_type"] = type(payload).__name__
+        return summary
+
+    summary["top_level_keys"] = sorted(payload.keys())
+    for key in ("model", "project", "user_prompt_id", "session_id"):
+        if key in payload:
+            summary[key] = payload.get(key)
+
+    request_block = payload.get("request") if isinstance(payload.get("request"), dict) else payload
+    if isinstance(request_block, dict):
+        summary["request_keys"] = sorted(request_block.keys())
+        contents = request_block.get("contents")
+        if isinstance(contents, list):
+            summary["contents_count"] = len(contents)
+            content_part_count = 0
+            content_text_chars = 0
+            text_entry_count = 0
+            preview_entries = []
+            for content_entry in contents:
+                parts, chars = _extract_text_metrics(content_entry)
+                content_part_count += parts
+                content_text_chars += chars
+                if chars > 0:
+                    text_entry_count += 1
+            for content_entry in contents[-4:]:
+                if not isinstance(content_entry, dict):
+                    continue
+                role = content_entry.get("role")
+                parts = content_entry.get("parts")
+                part_kinds = []
+                text_preview = None
+                preview_parts, preview_chars = _extract_text_metrics(content_entry)
+                if isinstance(parts, list):
+                    for part in parts:
+                        if not isinstance(part, dict):
+                            continue
+                        keys = [key for key in ("text", "functionCall", "functionResponse", "thought") if key in part]
+                        if keys:
+                            part_kinds.extend(keys)
+                        if text_preview is None and isinstance(part.get("text"), str):
+                            text_preview = part.get("text")[:120].replace("\n", "\\n")
+                        function_response = part.get("functionResponse")
+                        if isinstance(function_response, dict):
+                            response_payload = function_response.get("response")
+                            if isinstance(response_payload, dict):
+                                response_keys = sorted(response_payload.keys())
+                                part_kinds.append(
+                                    f"functionResponseKeys:{','.join(response_keys)}"
+                                )
+                                if text_preview is None and isinstance(response_payload.get("content"), str):
+                                    text_preview = response_payload.get("content")[:120].replace("\n", "\\n")
+                preview_entries.append({
+                    "role": role,
+                    "part_count": preview_parts,
+                    "text_chars": preview_chars,
+                    "part_kinds": part_kinds,
+                    "text_preview": text_preview,
+                })
+            summary["contents_part_count"] = content_part_count
+            summary["contents_text_chars"] = content_text_chars
+            summary["contents_text_entry_count"] = text_entry_count
+            summary["contents_tail_preview"] = preview_entries
+        tools = request_block.get("tools")
+        if isinstance(tools, list):
+            summary["tools_count"] = len(tools)
+            function_declaration_count = 0
+            for tool_entry in tools:
+                if isinstance(tool_entry, dict):
+                    decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
+                    if isinstance(decls, list):
+                        function_declaration_count += len(decls)
+            summary["function_declaration_count"] = function_declaration_count
+        session_id = request_block.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            summary["session_id_hash"] = hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8]
+        generation_config = request_block.get("generationConfig")
+        if isinstance(generation_config, dict):
+            summary["generation_config_keys"] = sorted(generation_config.keys())
+            generation_config_summary = {}
+            for key in ("max_output_tokens", "temperature", "top_p", "candidate_count"):
+                if key in generation_config:
+                    generation_config_summary[key] = generation_config.get(key)
+            thinking_config = generation_config.get("thinkingConfig")
+            if isinstance(thinking_config, dict):
+                generation_config_summary["thinking_config_keys"] = sorted(thinking_config.keys())
+                if "thinkingBudgetTokens" in thinking_config:
+                    generation_config_summary["thinking_budget_tokens"] = thinking_config.get("thinkingBudgetTokens")
+            if generation_config_summary:
+                summary["generation_config_values"] = generation_config_summary
+        tool_config = request_block.get("toolConfig")
+        if isinstance(tool_config, dict):
+            summary["tool_config_keys"] = sorted(tool_config.keys())
+        system_instruction = request_block.get("systemInstruction")
+        if isinstance(system_instruction, dict):
+            summary["has_system_instruction"] = True
+            system_parts, system_chars = _extract_text_metrics(system_instruction)
+            summary["system_instruction_part_count"] = system_parts
+            summary["system_instruction_text_chars"] = system_chars
+    return summary
+
+
+def _unwrap_google_code_assist_response_payload(payload: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    response_payload = payload.get("response")
+    if not isinstance(response_payload, dict):
+        return None
+    unwrapped = dict(response_payload)
+    trace_id = payload.get("traceId")
+    if isinstance(trace_id, str) and trace_id and "responseId" not in unwrapped:
+        unwrapped["responseId"] = trace_id
+    return unwrapped
+
+
+async def _translate_google_code_assist_response_to_anthropic(
+    *,
+    response: Response,
+    adapter_model: str,
+    tool_name_mapping: dict[str, str],
+    completion_messages: list[dict[str, Any]],
+    gemini_optional_params: dict[str, Any],
+    litellm_params: dict[str, Any],
+    logging_obj: Any,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        AnthropicAdapter,
+    )
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        VertexGeminiConfig,
+    )
+    from litellm.main import _get_encoding
+    from litellm.utils import ModelResponse
+
+    try:
+        outer_payload = json.loads(response.body.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Google Code Assist adapter returned invalid JSON: {exc}",
+        ) from exc
+
+    unwrapped_payload = _unwrap_google_code_assist_response_payload(outer_payload)
+    if unwrapped_payload is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Google Code Assist adapter response did not contain a `response` payload.",
+        )
+
+    raw_response = httpx.Response(
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        content=json.dumps(unwrapped_payload).encode("utf-8"),
+    )
+    model_response = VertexGeminiConfig().transform_response(
+        model=_normalize_google_completion_adapter_model_name(adapter_model),
+        raw_response=raw_response,
+        model_response=ModelResponse(),
+        logging_obj=logging_obj,
+        request_data=unwrapped_payload,
+        messages=completion_messages,
+        optional_params=gemini_optional_params,
+        litellm_params=litellm_params,
+        encoding=_get_encoding(),
+        api_key="",
+    )
+    anthropic_response = AnthropicAdapter().translate_completion_output_params(
+        model_response,
+        tool_name_mapping=tool_name_mapping,
+    )
+    return _build_anthropic_response_from_completion_adapter_response(
+        anthropic_response
+    )
+
+
+async def _iterate_google_code_assist_unwrapped_stream(
+    body_iterator: Any,
+    *,
+    adapter_model: Optional[str] = None,
+    rate_limit_key: Optional[str] = None,
+) -> Any:
+    from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
+
+    async def _iter_event_block_lines(event_block: str):
+        nonlocal debug_logged, post_tool_cooldown_armed
+        for line in event_block.splitlines():
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(line)
+            if not isinstance(parsed_chunk, dict):
+                continue
+            unwrapped = _unwrap_google_code_assist_response_payload(parsed_chunk)
+            if unwrapped is None:
+                continue
+            if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and not debug_logged:
+                try:
+                    first_candidate = None
+                    candidates = unwrapped.get("candidates") if isinstance(unwrapped, dict) else None
+                    if isinstance(candidates, list) and candidates:
+                        first_candidate = candidates[0]
+                    verbose_proxy_logger.info(
+                        "Gemini adapter stream debug: first_unwrapped_keys=%s first_candidate=%s",
+                        sorted(unwrapped.keys()) if isinstance(unwrapped, dict) else type(unwrapped).__name__,
+                        first_candidate,
+                    )
+                    debug_logged = True
+                except Exception:
+                    verbose_proxy_logger.exception("Gemini adapter stream debug logging failed")
+            if (
+                not post_tool_cooldown_armed
+                and _google_code_assist_unwrapped_chunk_contains_tool_call(unwrapped)
+            ):
+                cooldown_seconds = _get_google_adapter_post_tool_cooldown_seconds()
+                if cooldown_seconds > 0:
+                    await _set_google_adapter_cooldown(
+                        _clean_codex_auth_value(rate_limit_key)
+                        or _get_google_adapter_rate_limit_key(adapter_model),
+                        cooldown_seconds,
+                    )
+                    post_tool_cooldown_armed = True
+                    verbose_proxy_logger.info(
+                        "Google adapter post-tool cooldown armed for %.1fs",
+                        cooldown_seconds,
+                    )
+            yield f"data: {json.dumps(unwrapped)}\n\n"
+
+    debug_logged = False
+    post_tool_cooldown_armed = False
+    buffer = ""
+    async for raw_chunk in body_iterator:
+        if isinstance(raw_chunk, bytes):
+            buffer += raw_chunk.decode("utf-8")
+        else:
+            buffer += str(raw_chunk)
+
+        while "\n\n" in buffer:
+            event_block, buffer = buffer.split("\n\n", 1)
+            async for emitted_chunk in _iter_event_block_lines(event_block):
+                yield emitted_chunk
+
+    if buffer.strip():
+        async for emitted_chunk in _iter_event_block_lines(buffer):
+            yield emitted_chunk
+
+
+def _build_anthropic_streaming_response_from_google_code_assist_stream(
+    *,
+    response: StreamingResponse,
+    adapter_model: str,
+    tool_name_mapping: dict[str, str],
+    gemini_optional_params: dict[str, Any],
+    rate_limit_key: Optional[str] = None,
+) -> StreamingResponse:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        AnthropicAdapter,
+    )
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        ModelResponseIterator,
+    )
+
+    logging_obj = SimpleNamespace(optional_params=gemini_optional_params, post_call=lambda **_: None)
+    completion_stream = ModelResponseIterator(
+        streaming_response=_iterate_google_code_assist_unwrapped_stream(
+            response.body_iterator,
+            adapter_model=adapter_model,
+            rate_limit_key=rate_limit_key,
+        ),
+        sync_stream=False,
+        logging_obj=logging_obj,
+    )
+    anthropic_stream = AnthropicAdapter().translate_completion_output_params_streaming(
+        completion_stream,
+        model=_normalize_google_completion_adapter_model_name(adapter_model),
+        tool_name_mapping=tool_name_mapping,
+    )
+    return _build_anthropic_streaming_response_from_completion_adapter_stream(
+        anthropic_stream
+    )
+
+
+async def _collect_google_code_assist_response_from_stream(
+    *,
+    response: StreamingResponse,
+    adapter_model: str,
+    tool_name_mapping: dict[str, str],
+    logging_obj: Any,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        AnthropicAdapter,
+    )
+    from litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrough_logging_handler import (
+        GeminiPassthroughLoggingHandler,
+    )
+
+    all_chunks: list[str] = []
+    body_iterator = response.body_iterator
+    try:
+        async for raw_chunk in body_iterator:
+            if isinstance(raw_chunk, bytes):
+                all_chunks.append(raw_chunk.decode("utf-8", errors="replace"))
+            else:
+                all_chunks.append(str(raw_chunk))
+    finally:
+        aclose = getattr(body_iterator, "aclose", None)
+        if callable(aclose):
+            await aclose()
+
+    model_response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+        all_chunks=all_chunks,
+        litellm_logging_obj=logging_obj,
+        model=_normalize_google_completion_adapter_model_name(adapter_model),
+        url_route="/v1internal:streamGenerateContent",
+    )
+    if model_response is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Google Code Assist streaming adapter could not build a complete response.",
+        )
+
+    anthropic_response = AnthropicAdapter().translate_completion_output_params(
+        model_response,
+        tool_name_mapping=tool_name_mapping,
+    )
+    return _build_anthropic_response_from_completion_adapter_response(
+        anthropic_response
+    )
+
+
+def _wrap_streaming_response_with_release_callback(
+    response: StreamingResponse,
+    release_callback: Any,
+) -> StreamingResponse:
+    original_iterator = response.body_iterator
+    released = False
+
+    def _release_once() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        try:
+            release_callback()
+        except Exception:
+            verbose_proxy_logger.exception(
+                "Failed to release adapted streaming response guard callback"
+            )
+
+    async def _wrapped_iterator():
+        try:
+            async for chunk in original_iterator:
+                yield chunk
+        finally:
+            _release_once()
+
+    response.body_iterator = _wrapped_iterator()
+    return response
+
+
+def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
+    return _get_first_secret_value(_ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS)
+
+
+def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
+    return _get_first_secret_value(_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS)
+
+
+def _get_anthropic_adapter_nvidia_target_base() -> str:
+    cleaned = (
+        _clean_secret_string(os.getenv("NVIDIA_NIM_API_BASE"))
+        or _clean_secret_string(os.getenv("AAWM_NVIDIA_API_BASE"))
+        or "https://integrate.api.nvidia.com/v1"
+    )
+    cleaned = cleaned.rstrip("/")
+    if cleaned.endswith("/v1"):
+        return cleaned[: -len("/v1")]
+    return cleaned
+
+
+def _get_nvidia_adapter_max_retries() -> int:
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_MAX_RETRIES"))
+    if raw_value is None:
+        return 1
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 1
+    return max(0, parsed)
+
+
+def _get_nvidia_adapter_request_timeout_seconds(
+    adapter_model: Optional[str] = None,
+) -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS")
+    )
+    if raw_value is None:
+        if _should_force_fake_stream_for_nvidia_adapter_model(adapter_model):
+            return 240.0
+        return 120.0
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        if _should_force_fake_stream_for_nvidia_adapter_model(adapter_model):
+            return 240.0
+        return 120.0
+    return max(5.0, parsed)
+
+
+def _get_nvidia_adapter_inner_max_retries() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES")
+    )
+    if raw_value is None:
+        return 0
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 0
+    return max(0, parsed)
+
+
+def _should_force_fake_stream_for_nvidia_adapter_model(
+    adapter_model: Optional[str],
+) -> bool:
+    configured_models = _clean_codex_auth_value(
+        os.getenv("AAWM_NVIDIA_ADAPTER_FORCE_FAKE_STREAM_MODELS")
+    )
+    if configured_models is None:
+        normalized_models = {"minimaxai/minimax-m2.7"}
+    else:
+        normalized_models = {
+            item.strip() for item in configured_models.split(",") if item.strip()
+        }
+    return bool(adapter_model and adapter_model in normalized_models)
+
+
+def _extract_nvidia_adapter_exception_status_code(exc: Any) -> Optional[int]:
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            continue
+
+    text_value = str(exc)
+    if "Timeout Error" in text_value or exc.__class__.__name__.lower() == "timeout":
+        return 504
+
+    match = re.search(r"\b(408|429|500|502|503|504)\b", text_value)
+    if match is not None:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _get_nvidia_adapter_retry_wait_seconds(attempt: int) -> float:
+    return min(float(2 ** max(0, attempt - 1)), 8.0)
+
+
+async def _perform_nvidia_completion_adapter_operation(
+    *,
+    adapter_model: Optional[str],
+    operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    max_retries = _get_nvidia_adapter_max_retries()
+    total_attempts = max_retries + 1
+    attempt = 0
+    while True:
+        attempt += 1
+        verbose_proxy_logger.warning(
+            "NVIDIA completion adapter upstream attempt %s/%s for model=%s",
+            attempt,
+            total_attempts,
+            adapter_model,
+        )
+        try:
+            return await operation()
+        except Exception as exc:
+            status_code = _extract_nvidia_adapter_exception_status_code(exc)
+            raw_message = str(exc)
+            if (
+                status_code not in _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES
+                or attempt >= total_attempts
+            ):
+                verbose_proxy_logger.warning(
+                    "NVIDIA completion adapter upstream attempt %s failed with %s (%s, raw=%s) and will not be retried",
+                    attempt,
+                    status_code,
+                    exc.__class__.__name__,
+                    raw_message,
+                )
+                raise HTTPException(
+                    status_code=status_code or 502,
+                    detail=raw_message,
+                )
+            wait_seconds = _get_nvidia_adapter_retry_wait_seconds(attempt)
+            verbose_proxy_logger.warning(
+                "NVIDIA completion adapter upstream attempt %s hit %s (%s, raw=%s); backoff %.1fs",
+                attempt,
+                status_code,
+                exc.__class__.__name__,
+                raw_message,
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
+
+
+def _get_anthropic_adapter_openrouter_target_base() -> str:
+    cleaned = _clean_secret_string(os.getenv("OPENROUTER_API_BASE")) or "https://openrouter.ai/api"
+    if cleaned.endswith("/api/v1"):
+        return cleaned[: -len("/v1")]
+    return cleaned
+
+
+def _build_openrouter_default_headers() -> dict[str, str]:
+    headers = {
+        "HTTP-Referer": _clean_secret_string(get_secret_str("OR_SITE_URL")) or "https://litellm.ai",
+        "X-Title": _clean_secret_string(get_secret_str("OR_APP_NAME")) or "liteLLM",
+    }
+    return headers
+
+
+def _get_claude_agent_spec_dir() -> Optional[Path]:
+    for env_var in _CLAUDE_AGENT_SPEC_DIR_ENV_VARS:
+        value = os.getenv(env_var)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        candidate = Path(value).expanduser()
+        if candidate.is_dir():
+            return candidate
+
+    for raw_path in _CLAUDE_AGENT_SPEC_DEFAULT_DIRS:
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_dir():
+            return candidate
+
+    return None
+
+
+def _extract_model_from_markdown_frontmatter(markdown_text: str) -> Optional[str]:
+    if not markdown_text.startswith("---\n"):
+        return None
+
+    closing_index = markdown_text.find("\n---", 4)
+    if closing_index == -1:
+        return None
+
+    frontmatter = markdown_text[4:closing_index]
+    match = re.search(r"(?m)^model:\s*(?P<model>.+?)\s*$", frontmatter)
+    if match is None:
+        return None
+
+    model_value = match.group("model").strip().strip('\"').strip("'")
+    return model_value or None
+
+
+def _read_claude_agent_markdown(candidate_path: Path) -> Optional[str]:
+    try:
+        markdown_bytes = candidate_path.read_bytes()
+    except OSError:
+        return None
+
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return markdown_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return markdown_bytes.decode("utf-8", errors="replace")
+
+
+def _load_claude_agent_declared_model(agent_name: str) -> Optional[str]:
+    normalized_agent_name = agent_name.strip()
+    if not normalized_agent_name:
+        return None
+
+    if normalized_agent_name != Path(normalized_agent_name).name:
+        return None
+
+    agents_dir = _get_claude_agent_spec_dir()
+    if agents_dir is None:
+        return None
+
+    candidate_path = agents_dir / f"{normalized_agent_name}.md"
+    if not candidate_path.is_file():
+        return None
+
+    try:
+        stat_result = candidate_path.stat()
+    except OSError:
+        return None
+
+    cache_entry = _claude_agent_model_cache.get(candidate_path)
+    cache_key = getattr(stat_result, "st_mtime_ns", None)
+    if cache_entry is not None and cache_entry[0] == cache_key:
+        return cache_entry[1]
+
+    markdown_text = _read_claude_agent_markdown(candidate_path)
+    if markdown_text is None:
+        return None
+
+    model_name = _extract_model_from_markdown_frontmatter(markdown_text)
+    _claude_agent_model_cache[candidate_path] = (cache_key, model_name)
+    return model_name
+
+
+def _anthropic_adapter_request_has_openai_client_auth(request: Request) -> bool:
+    # On the Anthropic route, direct Authorization headers are typically Anthropic auth
+    # from Claude clients, not OpenAI/Codex credentials. Treat direct auth as OpenAI
+    # client auth only when the request also carries Codex-native request markers.
+    if (
+        _get_request_header_or_passthrough_alias(request, "x-pass-authorization")
+        or _get_request_header_or_passthrough_alias(request, "x-pass-api-key")
+    ):
+        return True
+
+    if _anthropic_adapter_request_uses_codex_native_auth(request):
+        return bool(
+            _get_request_header_or_passthrough_alias(request, "authorization")
+            or _get_request_header_or_passthrough_alias(request, "api-key")
+        )
+
+    return False
+
+
+def _anthropic_adapter_request_uses_codex_native_auth(request: Request) -> bool:
+    chatgpt_account_id = _get_request_header_or_passthrough_alias(
+        request, "ChatGPT-Account-Id"
+    )
+    originator = _get_request_header_or_passthrough_alias(request, "originator")
+    user_agent = _get_request_header_or_passthrough_alias(request, "user-agent")
+    session_id = _get_request_header_or_passthrough_alias(request, "session_id")
+
+    if isinstance(chatgpt_account_id, str) and len(chatgpt_account_id) > 0:
+        return True
+    if isinstance(originator, str) and "codex" in originator.lower():
+        return True
+    return bool(
+        isinstance(user_agent, str)
+        and "codex" in user_agent.lower()
+        and isinstance(session_id, str)
+        and len(session_id) > 0
+    )
+
+
+def _anthropic_adapter_should_forward_direct_auth_headers(request: Request) -> bool:
+    return _anthropic_adapter_request_has_openai_client_auth(request)
+
+
+def _clean_codex_auth_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _build_google_debug_header_summary(headers: dict[str, Any]) -> dict[str, Any]:
+    interesting_keys = (
+        "authorization",
+        "user-agent",
+        "x-goog-api-client",
+        "x-client-info",
+        "x-goog-user-project",
+        "origin",
+        "referer",
+        "accept",
+    )
+    summary: dict[str, Any] = {}
+    for key in interesting_keys:
+        value = headers.get(key) or headers.get(key.title())
+        if not isinstance(value, str) or not value:
+            continue
+        if key == "authorization":
+            summary[key] = value[:12]
+        else:
+            summary[key] = value
+    return summary
+
+
+def _get_google_adapter_native_user_agent(model: Optional[str]) -> str:
+    configured = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_USER_AGENT"))
+    if configured:
+        return configured
+    model_name = model or "gemini-3-flash-preview"
+    return f"GeminiCLI/0.38.2/{model_name} (linux; x64; terminal) google-api-nodejs-client/9.15.1"
+
+
+def _get_google_adapter_native_api_client_header() -> str:
+    configured = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_X_GOOG_API_CLIENT"))
+    if configured:
+        return configured
+    return "gl-node/24.13.1"
+
+
+def _build_google_adapter_native_headers(*, access_token: str, model: Optional[str], accept: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": _get_google_adapter_native_user_agent(model),
+        "x-goog-api-client": _get_google_adapter_native_api_client_header(),
+        "Accept": accept,
+    }
+
+
+def _get_anthropic_adapter_codex_auth_file_path() -> Optional[Path]:
+    for env_name in _ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if not raw_value:
+            continue
+        path = Path(raw_value).expanduser()
+        if path.exists():
+            return path
+
+    token_dir: Optional[Path] = None
+    for env_name in _ANTHROPIC_ADAPTER_CODEX_TOKEN_DIR_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if not raw_value:
+            continue
+        candidate = Path(raw_value).expanduser()
+        if candidate.exists():
+            token_dir = candidate
+            break
+    if token_dir is not None:
+        candidate = token_dir / "auth.json"
+        if candidate.exists():
+            return candidate
+
+    for candidate_str in _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS:
+        candidate = Path(candidate_str).expanduser()
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def _decode_jwt_claims_without_validation(token: str) -> dict[str, Any]:
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _extract_codex_account_id_from_token(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    claims = _decode_jwt_claims_without_validation(token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict):
+        account_id = auth_claims.get("chatgpt_account_id")
+        if isinstance(account_id, str) and account_id:
+            return account_id
+    return None
+
+
+def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str, str]]:
+    auth_path = _get_anthropic_adapter_codex_auth_file_path()
+    if auth_path is None:
+        return None
+
+    try:
+        auth_data = json.loads(auth_path.read_text())
+    except Exception:
+        return None
+
+    token_data = auth_data.get("tokens")
+    if not isinstance(token_data, dict):
+        token_data = auth_data
+
+    access_token = _clean_codex_auth_value(token_data.get("access_token"))
+    if access_token is None:
+        return None
+
+    account_id = _clean_codex_auth_value(token_data.get("account_id")) or _extract_codex_account_id_from_token(
+        _clean_codex_auth_value(token_data.get("id_token")) or access_token
+    )
+
+    from litellm.llms.chatgpt.common_utils import get_chatgpt_default_headers
+
+    headers = _safe_get_request_headers(request)
+    session_id = (
+        _get_request_header_or_passthrough_alias(request, "session_id")
+        or headers.get("x-claude-code-session-id")
+        or headers.get("X-Claude-Code-Session-Id")
+    )
+
+    return get_chatgpt_default_headers(
+        access_token=access_token,
+        account_id=account_id,
+        session_id=session_id,
+    )
+
+
+def _get_anthropic_adapter_openai_target_base(
+    request: Request,
+    *,
+    prefer_chatgpt_codex_backend: bool = False,
+) -> str:
+    if prefer_chatgpt_codex_backend or _anthropic_adapter_request_uses_codex_native_auth(
+        request
+    ):
+        return os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
+    return os.getenv("OPENAI_API_BASE") or "https://api.openai.com/"
+
+
+def _build_anthropic_responses_adapter_request_body(
+    request_body: dict[str, Any],
+    *,
+    adapter_model: str,
+    route_family: str = "anthropic_openai_responses_adapter",
+    tag_prefix: str = "anthropic-openai-responses-adapter",
+    span_name: str = "anthropic.openai_responses_adapter",
+    target_endpoint: str = "/v1/responses",
+    use_chatgpt_codex_defaults: bool = False,
+) -> dict[str, Any]:
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+        LiteLLMAnthropicToResponsesAPIAdapter,
+    )
+    from litellm.types.llms.anthropic import AnthropicMessagesRequest
+
+    adapter = LiteLLMAnthropicToResponsesAPIAdapter()
+    minimal_adapter_instructions = "You are a helpful assistant."
+    request_fields = {
+        "model": adapter_model,
+        "messages": request_body.get("messages") or [],
+        "max_tokens": request_body.get("max_tokens"),
+    }
+    for field_name in (
+        "context_management",
+        "mcp_servers",
+        "metadata",
+        "output_config",
+        "output_format",
+        "stop_sequences",
+        "system",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "tools",
+        "top_p",
+    ):
+        if field_name in request_body:
+            request_fields[field_name] = request_body[field_name]
+
+    anthropic_request = AnthropicMessagesRequest(
+        **{k: v for k, v in request_fields.items() if v is not None}
+    )
+    translation_provider = litellm.LlmProviders.OPENAI.value
+    translated_body = adapter.translate_request(
+        anthropic_request,
+        custom_llm_provider=translation_provider,
+    )
+
+    if request_body.get("stream") is True:
+        translated_body["stream"] = True
+
+    if use_chatgpt_codex_defaults:
+        translated_body.pop("user", None)
+        existing_instructions = translated_body.get("instructions")
+        if not isinstance(existing_instructions, str) or not existing_instructions.strip():
+            translated_body["instructions"] = minimal_adapter_instructions
+        translated_body.setdefault("store", False)
+        translated_body["stream"] = True
+        include = list(translated_body.get("include") or [])
+        if "reasoning.encrypted_content" not in include:
+            include.append("reasoning.encrypted_content")
+        translated_body["include"] = include
+        for unsupported_field in ("max_output_tokens", "temperature", "top_p"):
+            translated_body.pop(unsupported_field, None)
+
+    existing_litellm_metadata = request_body.get("litellm_metadata")
+    if isinstance(existing_litellm_metadata, dict):
+        translated_body["litellm_metadata"] = dict(existing_litellm_metadata)
+
+    span_metadata = {
+        "requested_model": request_body.get("model"),
+        "adapter_model": adapter_model,
+        "stream": bool(request_body.get("stream")),
+    }
+    return _merge_litellm_metadata(
+        _add_route_family_logging_metadata(
+            translated_body,
+            route_family,
+        ),
+        tags_to_add=[
+            tag_prefix,
+            f"anthropic-adapter-model:{adapter_model}",
+            f"anthropic-adapter-target:{target_endpoint}",
+        ],
+        extra_fields={
+            "anthropic_adapter_model": adapter_model,
+            "anthropic_adapter_original_model": request_body.get("model"),
+            "anthropic_adapter_target_endpoint": target_endpoint,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name=span_name,
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _build_anthropic_response_from_responses_response(
+    response_body: dict[str, Any],
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+        LiteLLMAnthropicToResponsesAPIAdapter,
+    )
+    from litellm.types.llms.openai import ResponsesAPIResponse
+
+    adapter = LiteLLMAnthropicToResponsesAPIAdapter()
+    translated_response = adapter.translate_response(ResponsesAPIResponse(**response_body))
+    if hasattr(translated_response, "model_dump_json"):
+        serialized_response = translated_response.model_dump_json(exclude_none=True)
+    elif hasattr(translated_response, "json"):
+        serialized_response = translated_response.json(exclude_none=True)
+    else:
+        serialized_response = json.dumps(translated_response)
+    return Response(
+        content=serialized_response,
+        media_type="application/json",
+    )
+
+
+def _get_latest_adapter_user_prompt_text(request_body: dict[str, Any]) -> Optional[str]:
+    messages = request_body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return None
+
+
+def _prompt_explicitly_requests_bash_tool(prompt_text: Optional[str]) -> bool:
+    if not isinstance(prompt_text, str) or not prompt_text:
+        return False
+    lowered_prompt = prompt_text.lower()
+    return "bash tool" in lowered_prompt or "run the bash command" in lowered_prompt
+
+
+def _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
+    request_body: dict[str, Any],
+    translated_body: dict[str, Any],
+) -> dict[str, Any]:
+    if translated_body.get("tool_choice") is not None:
+        return {}
+
+    tools = translated_body.get("tools")
+    if not isinstance(tools, list):
+        return {}
+
+    latest_user_prompt = _get_latest_adapter_user_prompt_text(request_body)
+    if not _prompt_explicitly_requests_bash_tool(latest_user_prompt):
+        return {}
+
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        tool_name = tool.get("name")
+        if tool_name in {"Bash", "run_shell_command"}:
+            translated_body["tool_choice"] = {"type": "function", "name": tool_name}
+            return {"forced_explicit_bash_tool_choice": tool_name}
+    return {}
+
+
+def _maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    if request_body.get("tool_choice") is not None:
+        return {}
+
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return {}
+
+    latest_user_prompt = _get_latest_adapter_user_prompt_text(request_body)
+    if not _prompt_explicitly_requests_bash_tool(latest_user_prompt):
+        return {}
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_name = tool.get("name")
+        if tool_name in {"Bash", "run_shell_command"}:
+            request_body["tool_choice"] = {"type": "tool", "name": tool_name}
+            return {"forced_explicit_bash_tool_choice": tool_name}
+    return {}
+
+
+def _responses_request_contains_mcp_tools(request_body: dict[str, Any]) -> bool:
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "mcp":
+            return True
+    return False
+
+
+def _coerce_mapping_to_namespace(value: Any) -> Any:
+    if isinstance(value, dict):
+        return SimpleNamespace(
+            **{key: _coerce_mapping_to_namespace(val) for key, val in value.items()}
+        )
+    if isinstance(value, list):
+        return [_coerce_mapping_to_namespace(item) for item in value]
+    return value
+
+
+async def _iterate_responses_sse_events(
+    body_iterator: Any,
+) -> Any:
+    from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
+
+    buffer = ""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    async for raw_chunk in body_iterator:
+        if isinstance(raw_chunk, bytes):
+            buffer += decoder.decode(raw_chunk)
+        else:
+            buffer += str(raw_chunk)
+
+        while "\n\n" in buffer:
+            event_block, buffer = buffer.split("\n\n", 1)
+            for line in event_block.splitlines():
+                parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(line)
+                if parsed_chunk is not None:
+                    yield _coerce_mapping_to_namespace(parsed_chunk)
+
+    buffer += decoder.decode(b"", final=True)
+    if buffer.strip():
+        for line in buffer.splitlines():
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(line)
+            if parsed_chunk is not None:
+                yield _coerce_mapping_to_namespace(parsed_chunk)
+
+
+def _coerce_namespace_to_mapping(value: Any) -> Any:
+    if isinstance(value, SimpleNamespace):
+        return {
+            key: _coerce_namespace_to_mapping(val)
+            for key, val in vars(value).items()
+        }
+    if isinstance(value, list):
+        return [_coerce_namespace_to_mapping(item) for item in value]
+    return value
+
+
+async def _collect_responses_response_from_stream(
+    response: StreamingResponse,
+) -> dict[str, Any]:
+    output_text_parts: list[str] = []
+    event_iterator = _iterate_responses_sse_events(response.body_iterator)
+    try:
+        async for event in event_iterator:
+            event_type = getattr(event, "type", None)
+            if event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", None)
+                if isinstance(delta, str):
+                    output_text_parts.append(delta)
+            if event_type == "response.completed":
+                response_payload = getattr(event, "response", None)
+                if response_payload is None:
+                    continue
+                response_dict = _coerce_namespace_to_mapping(response_payload)
+                if isinstance(response_dict, dict):
+                    if not response_dict.get("output") and output_text_parts:
+                        response_dict["output"] = [
+                            {
+                                "type": "message",
+                                "id": "msg_adapter_0",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "".join(output_text_parts),
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ]
+                    return response_dict
+    finally:
+        await event_iterator.aclose()
+        body_iterator = getattr(response, "body_iterator", None)
+        aclose = getattr(body_iterator, "aclose", None)
+        if callable(aclose):
+            await aclose()
+    raise HTTPException(
+        status_code=502,
+        detail="OpenAI Responses stream completed without a response payload.",
+    )
+
+
+def _build_anthropic_streaming_response_from_responses_stream(
+    response: StreamingResponse,
+    *,
+    model: str,
+) -> StreamingResponse:
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
+        AnthropicResponsesStreamWrapper,
+    )
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_iterate_responses_sse_events(response.body_iterator),
+        model=model,
+    )
+    return StreamingResponse(
+        wrapper.async_anthropic_sse_wrapper(),
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type="text/event-stream",
+    )
+
+
+def _get_anthropic_adapter_access_log_target_label(
+    target_url: Union[str, httpx.URL],
+) -> str:
+    parsed_url = urlparse(str(target_url))
+    hostname = parsed_url.hostname or "unknown-target"
+    path = parsed_url.path or "/"
+    query = f"?{parsed_url.query}" if parsed_url.query else ""
+    return f"{hostname}{path}{query}"
+
+
+def _annotate_request_scope_for_adapted_access_log(
+    request: Request, target_url: Union[str, httpx.URL]
+) -> None:
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return
+
+    target_label = _get_anthropic_adapter_access_log_target_label(target_url)
+    existing_path = scope.get("path")
+    existing_query_string = scope.get("query_string", b"")
+    if isinstance(existing_path, str) and isinstance(existing_query_string, bytes):
+        if f" -> {target_label}".encode("utf-8") in existing_query_string:
+            return
+    if isinstance(existing_path, str) and f" -> {target_label}" in existing_path:
+        return
+
+    request_url = getattr(request, "url", None)
+    if request_url is not None:
+        original_path = getattr(request_url, "path", None) or scope.get("path", "")
+        original_query = getattr(request_url, "query", None) or ""
+    else:
+        original_path = scope.get("path", "")
+        raw_query_string = scope.get("query_string", b"")
+        if isinstance(raw_query_string, bytes):
+            original_query = raw_query_string.decode("utf-8", errors="replace")
+        else:
+            original_query = str(raw_query_string or "")
+
+    if isinstance(original_query, bytes):
+        original_query = original_query.decode("utf-8", errors="replace")
+
+    annotated_query = (
+        f"{original_query} -> {target_label}"
+        if original_query
+        else f"adapted_to={target_label}"
+    )
+    scope["path"] = str(original_path)
+    scope["query_string"] = annotated_query.encode("utf-8", errors="replace")
+
+
+def _serialize_anthropic_adapter_response(response_obj: Any) -> str:
+    if hasattr(response_obj, "model_dump_json"):
+        return response_obj.model_dump_json(exclude_none=True)
+    if hasattr(response_obj, "json"):
+        return response_obj.json(exclude_none=True)
+    return json.dumps(response_obj)
+
+
+def _build_anthropic_response_from_completion_adapter_response(
+    response_obj: Any,
+) -> Response:
+    return Response(
+        content=_serialize_anthropic_adapter_response(response_obj),
+        media_type="application/json",
+    )
+
+
+def _build_anthropic_streaming_response_from_completion_adapter_stream(
+    response_stream: Any,
+) -> StreamingResponse:
+    return StreamingResponse(
+        response_stream,
+        media_type="text/event-stream",
+    )
+
+
+async def _handle_anthropic_google_completion_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    google_access_token = await _load_valid_local_google_oauth_access_token()
+    google_project = await _get_or_load_google_code_assist_project(google_access_token)
+    await _prime_google_code_assist_session(google_access_token, google_project)
+
+    route_family = "anthropic_google_completion_adapter"
+    requested_model = prepared_request_body.get("model")
+    google_target_base = _get_anthropic_adapter_google_target_base()
+    google_model = _normalize_google_completion_adapter_model_name(adapter_model)
+    google_adapter_rate_limit_key = _get_google_adapter_rate_limit_key(
+        google_model,
+        access_token=google_access_token,
+        companion_project=google_project,
+    )
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    is_stream = True
+    target_endpoint_label = "/v1internal:streamGenerateContent"
+    target_query_params = {"alt": "sse"}
+    target_url = f"{google_target_base.rstrip('/')}{target_endpoint_label}"
+    annotated_target_url = httpx.URL(target_url).copy_with(params=target_query_params) if target_query_params else httpx.URL(target_url)
+
+    (
+        prepared_request_body,
+        google_persisted_output_compacted_count,
+        google_persisted_output_hooks,
+        google_persisted_output_metadata,
+    ) = _compact_google_adapter_persisted_output_in_anthropic_request_body(
+        prepared_request_body
+    )
+
+    prepared_request_body = _merge_litellm_metadata(
+        _add_route_family_logging_metadata(prepared_request_body, route_family),
+        tags_to_add=[
+            "anthropic-google-completion-adapter",
+            f"anthropic-adapter-model:{google_model}",
+            f"anthropic-adapter-target:google:{target_endpoint_label}",
+            *([
+                "google-adapter-persisted-output-compacted",
+                *[
+                    f"google-adapter-persisted-output-hook:{hook}"
+                    for hook in sorted(google_persisted_output_hooks)
+                    if hook
+                ],
+            ] if google_persisted_output_compacted_count else []),
+        ],
+        extra_fields={
+            "anthropic_adapter_model": google_model,
+            "anthropic_adapter_original_model": requested_model,
+            "anthropic_adapter_target_endpoint": f"google:{target_endpoint_label}",
+            "google_adapter_persisted_output_compacted": bool(
+                google_persisted_output_compacted_count
+            ),
+            "google_adapter_persisted_output_compacted_count": google_persisted_output_compacted_count,
+            "google_adapter_persisted_output_hooks": sorted(google_persisted_output_hooks),
+            "google_adapter_persisted_output_metadata": google_persisted_output_metadata,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="anthropic.google_completion_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": google_model,
+                        "stream": client_requested_stream,
+                        "upstream_stream": True,
+                        "persisted_output_compacted_count": google_persisted_output_compacted_count,
+                    },
+                )
+            ],
+        },
+    )
+
+    wrapped_request_body, tool_name_mapping, completion_messages, gemini_optional_params, litellm_params, completion_message_window_changes = await _build_google_code_assist_request_from_completion_kwargs(
+        completion_kwargs=prepared_request_body,
+        adapter_model=google_model,
+        project=google_project,
+        request=request,
+    )
+    if isinstance(prepared_request_body.get("litellm_metadata"), dict):
+        wrapped_request_body["litellm_metadata"] = dict(prepared_request_body["litellm_metadata"])
+
+    generation_policy_changes = _apply_google_adapter_request_shape_policy(wrapped_request_body)
+
+    adapter_headers = _build_google_adapter_native_headers(
+        access_token=google_access_token,
+        model=google_model,
+        accept="*/*",
+    )
+    if isinstance(wrapped_request_body.get("litellm_metadata"), dict):
+        if completion_message_window_changes:
+            wrapped_request_body["litellm_metadata"]["google_adapter_completion_message_window"] = completion_message_window_changes
+        if generation_policy_changes:
+            wrapped_request_body["litellm_metadata"]["google_adapter_request_shape_policy"] = generation_policy_changes
+
+    sanitized_schema_fix_count = 0
+    request_payload = wrapped_request_body.get("request") if isinstance(wrapped_request_body, dict) else None
+    request_tools = request_payload.get("tools") if isinstance(request_payload, dict) else None
+    if isinstance(request_tools, list):
+        for tool_entry in request_tools:
+            if not isinstance(tool_entry, dict):
+                continue
+            decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
+            if isinstance(decls, list):
+                for declaration in decls:
+                    if isinstance(declaration, dict):
+                        sanitized_schema_fix_count += _sanitize_google_schema_array_items(declaration.get("parameters"))
+
+    if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
+        try:
+            debug_shape = _summarize_google_code_assist_request_shape(wrapped_request_body)
+            request_payload = wrapped_request_body.get("request") if isinstance(wrapped_request_body, dict) else None
+            request_tools = request_payload.get("tools") if isinstance(request_payload, dict) else None
+            function_names: list[str] = []
+            if isinstance(request_tools, list):
+                for tool_entry in request_tools:
+                    if not isinstance(tool_entry, dict):
+                        continue
+                    decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
+                    if isinstance(decls, list):
+                        for declaration in decls:
+                            if isinstance(declaration, dict):
+                                name = declaration.get("name")
+                                if isinstance(name, str):
+                                    function_names.append(name)
+            litellm_metadata = prepared_request_body.get("litellm_metadata") if isinstance(prepared_request_body, dict) else None
+            google_persisted_output_compacted_count = (
+                litellm_metadata.get("google_adapter_persisted_output_compacted_count")
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+            completion_message_window_debug = (
+                litellm_metadata.get("google_adapter_completion_message_window")
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+            verbose_proxy_logger.info(
+                "Gemini adapter debug: model=%s upstream_headers=%s schema_fixes=%s google_persisted_output_compacted_count=%s completion_message_window=%s generation_policy_changes=%s body_shape=%s function_names=%s",
+                google_model,
+                _build_google_debug_header_summary(adapter_headers),
+                sanitized_schema_fix_count,
+                google_persisted_output_compacted_count,
+                completion_message_window_debug,
+                generation_policy_changes,
+                debug_shape,
+                function_names,
+            )
+        except Exception:
+            verbose_proxy_logger.exception("Gemini adapter debug logging failed")
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=str(annotated_target_url),
+        headers=adapter_headers,
+        credential_family="google",
+        expected_target_family="google",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, annotated_target_url)
+
+    google_adapter_semaphore = _get_google_adapter_semaphore(
+        rate_limit_key=google_adapter_rate_limit_key
+    )
+    await google_adapter_semaphore.acquire()
+    semaphore_released = False
+
+    def _release_google_adapter_semaphore() -> None:
+        nonlocal semaphore_released
+        if semaphore_released:
+            return
+        semaphore_released = True
+        google_adapter_semaphore.release()
+        if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
+            verbose_proxy_logger.info(
+                "Google adapter semaphore released for model=%s",
+                google_model,
+            )
+
+    if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
+        verbose_proxy_logger.info(
+            "Google adapter semaphore acquired for model=%s stream=%s",
+            google_model,
+            is_stream,
+        )
+
+    stream_release_attached = False
+    try:
+        upstream_response = await _perform_google_adapter_pass_through_request(
+            request=request,
+            target=target_url,
+            custom_headers=adapter_headers,
+            user_api_key_dict=user_api_key_dict,
+            custom_body=wrapped_request_body,
+            forward_headers=False,
+            query_params=target_query_params,
+            stream=is_stream,
+            custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+            egress_credential_family="google",
+            expected_target_family="google",
+            google_adapter_rate_limit_key=google_adapter_rate_limit_key,
+        )
+
+        if not isinstance(upstream_response, StreamingResponse):
+            raise HTTPException(
+                status_code=502,
+                detail="Google Code Assist adapter expected a streaming response.",
+            )
+
+        if client_requested_stream:
+            streaming_response = _build_anthropic_streaming_response_from_google_code_assist_stream(
+                response=upstream_response,
+                adapter_model=google_model,
+                tool_name_mapping=tool_name_mapping,
+                gemini_optional_params=gemini_optional_params,
+                rate_limit_key=google_adapter_rate_limit_key,
+            )
+            stream_release_attached = True
+            return _wrap_streaming_response_with_release_callback(
+                streaming_response,
+                _release_google_adapter_semaphore,
+            )
+
+        logging_obj = Logging(
+            model=google_model,
+            messages=completion_messages,
+            stream=False,
+            call_type="completion",
+            start_time=datetime.now(),
+            litellm_call_id=str(uuid4()),
+            function_id="anthropic_google_completion_adapter",
+        )
+        logging_obj.optional_params = gemini_optional_params
+
+        return await _collect_google_code_assist_response_from_stream(
+            response=upstream_response,
+            adapter_model=google_model,
+            tool_name_mapping=tool_name_mapping,
+            logging_obj=logging_obj,
+        )
+    finally:
+        if not is_stream or not stream_release_attached:
+            _release_google_adapter_semaphore()
+
+
+async def _handle_anthropic_openai_responses_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    local_codex_headers = None
+    has_client_auth = _anthropic_adapter_request_has_openai_client_auth(request)
+    uses_codex_native_auth = _anthropic_adapter_request_uses_codex_native_auth(request)
+    if not has_client_auth:
+        local_codex_headers = _load_local_codex_auth_headers(request)
+
+    use_chatgpt_codex_defaults = uses_codex_native_auth or local_codex_headers is not None
+    translated_request_body = _build_anthropic_responses_adapter_request_body(
+        prepared_request_body,
+        adapter_model=adapter_model,
+        use_chatgpt_codex_defaults=use_chatgpt_codex_defaults,
+    )
+    if _responses_request_contains_mcp_tools(translated_request_body):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Anthropic adapter does not currently support raw MCP server/toolset "
+                "requests (`mcp_servers` / `mcp_toolset`). Use Claude Code-exposed tools "
+                "such as `mcp__...` or call the native OpenAI Responses API directly."
+            ),
+        )
+
+    adapter_provider = litellm.LlmProviders.OPENAI.value
+    target_base_url = _get_anthropic_adapter_openai_target_base(
+        request,
+        prefer_chatgpt_codex_backend=use_chatgpt_codex_defaults,
+    )
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint="/v1/responses",
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.OPENAI.value,
+    )
+    forward_headers = _anthropic_adapter_should_forward_direct_auth_headers(request)
+    custom_headers: dict[str, Any] = {}
+
+    if local_codex_headers is not None:
+        custom_headers = local_codex_headers
+        forward_headers = False
+    elif not has_client_auth:
+        openai_api_key = passthrough_endpoint_router.get_credentials(
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            region_name=None,
+        )
+        if openai_api_key is None:
+            raise Exception(
+                "Anthropic adapter requests for OpenAI/Codex models require forwarded OpenAI/Codex auth headers or 'OPENAI_API_KEY' in environment."
+            )
+        custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+            api_key=openai_api_key,
+            request=request,
+        )
+        forward_headers = False
+
+    upstream_response = await pass_through_request(
+        request=request,
+        target=str(target_url),
+        custom_headers=custom_headers,
+        user_api_key_dict=user_api_key_dict,
+        custom_body=translated_request_body,
+        forward_headers=forward_headers,
+        allowed_forward_headers=list(_ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST),
+        allowed_pass_through_prefixed_headers=list(_ANTHROPIC_ADAPTER_OPENAI_XPASS_HEADER_ALLOWLIST),
+        stream=bool(translated_request_body.get("stream")),
+        custom_llm_provider=adapter_provider,
+        egress_credential_family="openai" if local_codex_headers is not None else None,
+        expected_target_family="openai",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    if isinstance(upstream_response, StreamingResponse):
+        if not client_requested_stream:
+            response_body = await _collect_responses_response_from_stream(
+                upstream_response
+            )
+            translated_response = _build_anthropic_response_from_responses_response(
+                response_body
+            )
+            translated_response.headers.update(dict(upstream_response.headers))
+            translated_response.status_code = upstream_response.status_code
+            return translated_response
+        return _build_anthropic_streaming_response_from_responses_stream(
+            upstream_response,
+            model=adapter_model,
+        )
+
+    if not isinstance(upstream_response, Response):
+        raise HTTPException(
+            status_code=502,
+            detail="Unexpected upstream response type from OpenAI Responses passthrough.",
+        )
+
+    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    translated_response = _build_anthropic_response_from_responses_response(
+        response_body
+    )
+    translated_response.headers.update(dict(upstream_response.headers))
+    translated_response.status_code = upstream_response.status_code
+    return translated_response
+
+
+
+async def _handle_anthropic_nvidia_completion_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler,
+    )
+    from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+        FakeAnthropicMessagesStreamIterator,
+    )
+
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    use_fake_stream = client_requested_stream and _should_force_fake_stream_for_nvidia_adapter_model(
+        adapter_model
+    )
+    upstream_stream = client_requested_stream and not use_fake_stream
+    requested_model = prepared_request_body.get("model")
+    route_family = "anthropic_nvidia_completion_adapter"
+    target_endpoint_label = "nvidia:/v1/chat/completions"
+
+    prepared_request_body = _merge_litellm_metadata(
+        _add_route_family_logging_metadata(prepared_request_body, route_family),
+        tags_to_add=[
+            "anthropic-nvidia-completion-adapter",
+            f"anthropic-adapter-model:{adapter_model}",
+            f"anthropic-adapter-target:{target_endpoint_label}",
+        ],
+        extra_fields={
+            "anthropic_adapter_model": adapter_model,
+            "anthropic_adapter_original_model": requested_model,
+            "anthropic_adapter_target_endpoint": target_endpoint_label,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="anthropic.nvidia_completion_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": adapter_model,
+                        "stream": client_requested_stream,
+                        "upstream_stream": upstream_stream,
+                        "fake_stream": use_fake_stream,
+                    },
+                )
+            ],
+        },
+    )
+    forced_tool_choice_changes = _maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+        prepared_request_body,
+    )
+    if forced_tool_choice_changes:
+        prepared_request_body = _merge_litellm_metadata(
+            prepared_request_body,
+            extra_fields=forced_tool_choice_changes,
+        )
+
+    nvidia_api_key = _get_anthropic_adapter_nvidia_api_key()
+    if nvidia_api_key is None:
+        raise Exception(
+            "Anthropic adapter requests for NVIDIA models require 'AAWM_NVIDIA_API_KEY', "
+            "'NVIDIA_NIM_API_KEY', or 'NVIDIA_API_KEY' in environment."
+        )
+
+    target_base_url = _get_anthropic_adapter_nvidia_target_base()
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint="/v1/chat/completions",
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.NVIDIA_NIM,
+    )
+    validation_headers = {"Authorization": f"Bearer {nvidia_api_key}"}
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=str(target_url),
+        headers=validation_headers,
+        credential_family="nvidia",
+        expected_target_family="nvidia",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    completion_response = await _perform_nvidia_completion_adapter_operation(
+        adapter_model=adapter_model,
+        operation=lambda: LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
+            max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
+            messages=prepared_request_body.get("messages") or [],
+            model=adapter_model,
+            metadata=prepared_request_body.get("metadata") or {},
+            stop_sequences=prepared_request_body.get("stop_sequences"),
+            stream=upstream_stream,
+            system=prepared_request_body.get("system"),
+            temperature=prepared_request_body.get("temperature"),
+            thinking=prepared_request_body.get("thinking"),
+            tool_choice=prepared_request_body.get("tool_choice"),
+            tools=prepared_request_body.get("tools"),
+            top_k=prepared_request_body.get("top_k"),
+            top_p=prepared_request_body.get("top_p"),
+            output_format=prepared_request_body.get("output_format"),
+            custom_llm_provider=litellm.LlmProviders.NVIDIA_NIM.value,
+            api_key=nvidia_api_key,
+            api_base=f"{target_base_url.rstrip('/')}/v1",
+            timeout=_get_nvidia_adapter_request_timeout_seconds(adapter_model),
+            max_retries=_get_nvidia_adapter_inner_max_retries(),
+            litellm_metadata=prepared_request_body.get("litellm_metadata") or {},
+            proxy_server_request={
+                "headers": dict(request.headers),
+                "body": prepared_request_body,
+            },
+        ),
+    )
+    if client_requested_stream:
+        if use_fake_stream:
+            return _build_anthropic_streaming_response_from_completion_adapter_stream(
+                FakeAnthropicMessagesStreamIterator(completion_response),
+            )
+        return _build_anthropic_streaming_response_from_completion_adapter_stream(
+            completion_response,
+        )
+    return _build_anthropic_response_from_completion_adapter_response(
+        completion_response,
+    )
+
+
+async def _handle_anthropic_openrouter_completion_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler,
+    )
+
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    requested_model = prepared_request_body.get("model")
+    route_family = "anthropic_openrouter_completion_adapter"
+    target_endpoint_label = "openrouter:/v1/chat/completions"
+
+    prepared_request_body = _merge_litellm_metadata(
+        _add_route_family_logging_metadata(prepared_request_body, route_family),
+        tags_to_add=[
+            "anthropic-openrouter-completion-adapter",
+            f"anthropic-adapter-model:{adapter_model}",
+            f"anthropic-adapter-target:{target_endpoint_label}",
+        ],
+        extra_fields={
+            "anthropic_adapter_model": adapter_model,
+            "anthropic_adapter_original_model": requested_model,
+            "anthropic_adapter_target_endpoint": target_endpoint_label,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="anthropic.openrouter_completion_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": adapter_model,
+                        "stream": client_requested_stream,
+                    },
+                )
+            ],
+        },
+    )
+    forced_tool_choice_changes = _maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+        prepared_request_body,
+    )
+    if forced_tool_choice_changes:
+        prepared_request_body = _merge_litellm_metadata(
+            prepared_request_body,
+            extra_fields=forced_tool_choice_changes,
+        )
+
+    openrouter_api_key = _get_anthropic_adapter_openrouter_api_key()
+    if openrouter_api_key is None:
+        raise Exception(
+            "Anthropic adapter requests for OpenRouter models require 'AAWM_OPENROUTER_API_KEY' or 'OPENROUTER_API_KEY' in environment."
+        )
+
+    target_base_url = _get_anthropic_adapter_openrouter_target_base()
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint="/v1/chat/completions",
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.OPENROUTER.value,
+    )
+    validation_headers = {
+        **_build_openrouter_default_headers(),
+        "Authorization": f"Bearer {openrouter_api_key}",
+    }
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=str(target_url),
+        headers=validation_headers,
+        credential_family="openrouter",
+        expected_target_family="openrouter",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    completion_response = await _perform_openrouter_completion_adapter_operation(
+        adapter_model=adapter_model,
+        operation=lambda: LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
+            max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
+            messages=prepared_request_body.get("messages") or [],
+            model=adapter_model,
+            metadata=prepared_request_body.get("metadata") or {},
+            stop_sequences=prepared_request_body.get("stop_sequences"),
+            stream=client_requested_stream,
+            system=prepared_request_body.get("system"),
+            temperature=prepared_request_body.get("temperature"),
+            thinking=prepared_request_body.get("thinking"),
+            tool_choice=prepared_request_body.get("tool_choice"),
+            tools=prepared_request_body.get("tools"),
+            top_k=prepared_request_body.get("top_k"),
+            top_p=prepared_request_body.get("top_p"),
+            output_format=prepared_request_body.get("output_format"),
+            custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
+            api_key=openrouter_api_key,
+            api_base=f"{target_base_url.rstrip('/')}/v1",
+            headers=_build_openrouter_default_headers(),
+            litellm_metadata=prepared_request_body.get("litellm_metadata") or {},
+            proxy_server_request={
+                "headers": dict(request.headers),
+                "body": prepared_request_body,
+            },
+        ),
+    )
+
+    if client_requested_stream:
+        return _build_anthropic_streaming_response_from_completion_adapter_stream(
+            completion_response,
+        )
+    return _build_anthropic_response_from_completion_adapter_response(
+        completion_response,
+    )
+
+
+async def _handle_anthropic_openrouter_responses_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    translated_request_body = _build_anthropic_responses_adapter_request_body(
+        prepared_request_body,
+        adapter_model=adapter_model,
+        route_family="anthropic_openrouter_responses_adapter",
+        tag_prefix="anthropic-openrouter-responses-adapter",
+        span_name="anthropic.openrouter_responses_adapter",
+        target_endpoint="openrouter:/v1/responses",
+    )
+    forced_tool_choice_changes = (
+        _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
+            prepared_request_body,
+            translated_request_body,
+        )
+    )
+    if forced_tool_choice_changes:
+        translated_request_body = _merge_litellm_metadata(
+            translated_request_body,
+            extra_fields=forced_tool_choice_changes,
+        )
+    if _responses_request_contains_mcp_tools(translated_request_body):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Anthropic adapter does not currently support raw MCP server/toolset "
+                "requests (`mcp_servers` / `mcp_toolset`). Use Claude Code-exposed tools "
+                "such as `mcp__...` or call the native OpenAI Responses API directly."
+            ),
+        )
+
+    openrouter_api_key = _get_anthropic_adapter_openrouter_api_key()
+    if openrouter_api_key is None:
+        raise Exception(
+            "Anthropic adapter requests for OpenRouter models require 'AAWM_OPENROUTER_API_KEY' or 'OPENROUTER_API_KEY' in environment."
+        )
+
+    adapter_provider = litellm.LlmProviders.OPENROUTER.value
+    target_base_url = _get_anthropic_adapter_openrouter_target_base()
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint="/v1/responses",
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.OPENROUTER.value,
+    )
+    custom_headers: dict[str, Any] = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=openrouter_api_key,
+        request=request,
+    )
+    custom_headers.update(_build_openrouter_default_headers())
+
+    upstream_response = await _perform_openrouter_adapter_pass_through_request(
+        adapter_model=adapter_model,
+        request=request,
+        target=str(target_url),
+        custom_headers=custom_headers,
+        user_api_key_dict=user_api_key_dict,
+        custom_body=translated_request_body,
+        forward_headers=False,
+        allowed_forward_headers=[],
+        allowed_pass_through_prefixed_headers=[],
+        stream=bool(translated_request_body.get("stream")),
+        custom_llm_provider=adapter_provider,
+        egress_credential_family="openrouter",
+        expected_target_family="openrouter",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    if isinstance(upstream_response, StreamingResponse):
+        if not client_requested_stream:
+            response_body = await _collect_responses_response_from_stream(
+                upstream_response
+            )
+            translated_response = _build_anthropic_response_from_responses_response(
+                response_body
+            )
+            translated_response.headers.update(dict(upstream_response.headers))
+            translated_response.status_code = upstream_response.status_code
+            return translated_response
+        return _build_anthropic_streaming_response_from_responses_stream(
+            upstream_response,
+            model=adapter_model,
+        )
+
+    if not isinstance(upstream_response, Response):
+        raise HTTPException(
+            status_code=502,
+            detail="Unexpected upstream response type from OpenRouter Responses passthrough.",
+        )
+
+    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    translated_response = _build_anthropic_response_from_responses_response(
+        response_body
+    )
+    translated_response.headers.update(dict(upstream_response.headers))
+    translated_response.status_code = upstream_response.status_code
+    return translated_response
 
 
 def _clean_secret_string(value: Optional[str]) -> Optional[str]:
@@ -319,6 +5148,428 @@ def _build_claude_persisted_output_source_metadata(
         "content_hash": hashlib.sha256(file_bytes).hexdigest(),
         "bytes": len(file_bytes),
     }
+
+
+def _get_google_adapter_persisted_output_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_PERSISTED_OUTPUT_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 2000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 2000
+    return max(256, parsed)
+
+
+def _get_google_adapter_auxiliary_context_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 4000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 4000
+    return max(512, parsed)
+
+
+def _get_google_adapter_followup_persisted_output_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_PERSISTED_OUTPUT_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 512
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 512
+    return max(128, parsed)
+
+
+def _get_google_adapter_followup_auxiliary_context_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_AUXILIARY_CONTEXT_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 1024
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 1024
+    return max(256, parsed)
+
+
+def _compact_expanded_claude_persisted_output_text_for_google_adapter(
+    text: str,
+    *,
+    persisted_output_char_cap: Optional[int] = None,
+    auxiliary_context_char_cap: Optional[int] = None,
+) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
+    cap = persisted_output_char_cap or _get_google_adapter_persisted_output_char_cap()
+    updated_text = text
+    compacted_count = 0
+    hooks: set[str] = set()
+    metadata_items: list[dict[str, Any]] = []
+
+    preview_matches = list(_CLAUDE_PERSISTED_OUTPUT_INLINE_PATTERN.finditer(text))
+    for match in reversed(preview_matches):
+        hook = match.group("hook")
+        resolved_path = match.group("path")
+        compacted_block = (
+            "<system-reminder>\n"
+            f"{hook} hook additional context: <persisted-output>\n"
+            f"[Gemini adapter compacted persisted-output preview. Full output saved to: {resolved_path}]\n"
+            "</persisted-output>\n"
+            "</system-reminder>\n"
+        )
+        updated_text = (
+            updated_text[: match.start()]
+            + compacted_block
+            + updated_text[match.end() :]
+        )
+        compacted_count += 1
+        hooks.add(hook.lower())
+        metadata_items.append(
+            {
+                "original_chars": len(match.group(0)),
+                "kept_chars": len(compacted_block),
+                "mode": "preview_block_cap",
+            }
+        )
+
+    matches = list(_CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN.finditer(updated_text))
+    for match in reversed(matches):
+        content = match.group("content")
+        if len(content) <= cap:
+            continue
+        hook = match.group("hook")
+        summary_lines = [line.strip() for line in content.splitlines() if line.strip()][:3]
+        summary_text = "\n".join(summary_lines)
+        truncated = summary_text[:cap].rstrip()
+        compacted_block = (
+            "<system-reminder>\n"
+            f"{hook} hook additional context: <persisted-output>\n"
+            f"{truncated}\n\n"
+            f"[Gemini adapter compacted persisted-output from {len(content)} chars to {len(truncated)} chars. Refer to current prompt and tools for full context.]\n"
+            "</persisted-output>\n"
+            "</system-reminder>\n"
+        )
+        updated_text = (
+            updated_text[: match.start()]
+            + compacted_block
+            + updated_text[match.end() :]
+        )
+        compacted_count += 1
+        hooks.add(hook.lower())
+        metadata_items.append(
+            {
+                "original_chars": len(content),
+                "kept_chars": len(truncated),
+            }
+        )
+
+    auxiliary_cap = auxiliary_context_char_cap or _get_google_adapter_auxiliary_context_char_cap()
+    auxiliary_matches = list(
+        _CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN.finditer(updated_text)
+    )
+    for match in reversed(auxiliary_matches):
+        auxiliary_block = match.group(0)
+        if len(auxiliary_block) <= auxiliary_cap:
+            continue
+        hook = match.group("hook")
+        body = match.group("body").lstrip("\n")
+        summary_lines = [line.strip() for line in body.splitlines() if line.strip()][:4]
+        summary_text = "\n".join(summary_lines).strip()
+        if not summary_text:
+            summary_text = "[Additional context omitted for Gemini adapter compaction.]"
+        truncated = summary_text[:auxiliary_cap].rstrip()
+        compacted_block = (
+            "<system-reminder>\n"
+            f"{hook} hook additional context:\n"
+            f"{truncated}\n\n"
+            f"[Gemini adapter compacted auxiliary context block from {len(auxiliary_block)} chars to {len(truncated)} chars. Refer to the current prompt, tools, and recent messages for full context.]\n"
+            "</system-reminder>\n"
+        )
+        updated_text = (
+            updated_text[: match.start()]
+            + compacted_block
+            + updated_text[match.end() :]
+        )
+        compacted_count += 1
+        hooks.add(hook.lower())
+        metadata_items.append(
+            {
+                "original_chars": len(auxiliary_block),
+                "kept_chars": len(truncated),
+                "mode": "auxiliary_context_block_cap",
+            }
+        )
+
+    marker = "hook additional context:"
+    stripped_updated_text = updated_text.strip()
+    if (
+        marker in updated_text
+        and len(updated_text) > auxiliary_cap
+        and stripped_updated_text.startswith("<system-reminder>")
+        and stripped_updated_text.endswith("</system-reminder>")
+        and stripped_updated_text.count("<system-reminder>") == 1
+    ):
+        hook_match = re.search(
+            r"(SubagentStart|SubAgentStart|SessionStart) hook additional context:",
+            updated_text,
+        )
+        fallback_hook = hook_match.group(1).lower() if hook_match else None
+        truncated_text = updated_text[:auxiliary_cap].rstrip()
+        updated_text = (
+            f"{truncated_text}\n\n"
+            f"[Gemini adapter compacted oversized additional context from {len(text)} chars to {len(truncated_text)} chars.]"
+        )
+        compacted_count += 1
+        if fallback_hook:
+            hooks.add(fallback_hook)
+        metadata_items.append(
+            {
+                "original_chars": len(text),
+                "kept_chars": len(truncated_text),
+                "mode": "fallback_text_cap",
+            }
+        )
+
+    metadata_items.reverse()
+    return updated_text, compacted_count, hooks, metadata_items
+
+
+def _compact_google_adapter_text_part_sequence(
+    parts: list[Any],
+) -> Tuple[list[Any], int, set[str], list[dict[str, Any]], bool]:
+    updated_parts: list[Any] = []
+    compacted_count = 0
+    hooks: set[str] = set()
+    metadata_items: list[dict[str, Any]] = []
+    changed = False
+    index = 0
+
+    while index < len(parts):
+        item = parts[index]
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+        ):
+            updated_parts.append(item)
+            index += 1
+            continue
+
+        group: list[dict[str, Any]] = []
+        while index < len(parts):
+            candidate = parts[index]
+            if not (
+                isinstance(candidate, dict)
+                and candidate.get("type") == "text"
+                and isinstance(candidate.get("text"), str)
+            ):
+                break
+            group.append(candidate)
+            index += 1
+
+        combined_text = "".join(str(part.get("text") or "") for part in group)
+        (
+            compacted_text,
+            child_count,
+            child_hooks,
+            child_metadata,
+        ) = _compact_expanded_claude_persisted_output_text_for_google_adapter(
+            combined_text
+        )
+        if child_count > 0 or len(group) > 1:
+            replacement = dict(group[0])
+            replacement["text"] = compacted_text
+            updated_parts.append(replacement)
+            compacted_count += child_count
+            hooks.update(child_hooks)
+            metadata_items.extend(child_metadata)
+            changed = True
+        else:
+            updated_parts.extend(group)
+
+    return updated_parts, compacted_count, hooks, metadata_items, changed
+
+
+def _compact_google_adapter_followup_request_contents(
+    request_block: dict[str, Any],
+) -> dict[str, Any]:
+    contents = request_block.get("contents")
+    if not isinstance(contents, list) or len(contents) <= 1:
+        return {}
+
+    followup_persisted_cap = _get_google_adapter_followup_persisted_output_char_cap()
+    followup_auxiliary_cap = _get_google_adapter_followup_auxiliary_context_char_cap()
+    original_text_chars = sum(_estimate_google_content_text_chars(item) for item in contents)
+    updated_contents: list[Any] = []
+    compacted_count = 0
+    hooks: set[str] = set()
+    metadata_items: list[dict[str, Any]] = []
+    changed = False
+
+    for content in contents:
+        if not isinstance(content, dict):
+            updated_contents.append(content)
+            continue
+        parts = content.get("parts")
+        if content.get("role") != "user" or not isinstance(parts, list):
+            updated_contents.append(content)
+            continue
+
+        updated_parts: list[Any] = []
+        part_changed = False
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                (
+                    compacted_text,
+                    child_count,
+                    child_hooks,
+                    child_metadata,
+                ) = _compact_expanded_claude_persisted_output_text_for_google_adapter(
+                    part["text"],
+                    persisted_output_char_cap=followup_persisted_cap,
+                    auxiliary_context_char_cap=followup_auxiliary_cap,
+                )
+                compacted_count += child_count
+                hooks.update(child_hooks)
+                metadata_items.extend(child_metadata)
+                if compacted_text != part["text"]:
+                    updated_part = dict(part)
+                    updated_part["text"] = compacted_text
+                    updated_parts.append(updated_part)
+                    part_changed = True
+                    changed = True
+                else:
+                    updated_parts.append(part)
+            else:
+                updated_parts.append(part)
+
+        if part_changed:
+            updated_content = dict(content)
+            updated_content["parts"] = updated_parts
+            updated_contents.append(updated_content)
+        else:
+            updated_contents.append(content)
+
+    if not changed:
+        return {}
+
+    request_block["contents"] = updated_contents
+    compacted_text_chars = sum(_estimate_google_content_text_chars(item) for item in updated_contents)
+    changes: dict[str, Any] = {
+        "followup_persisted_output_compacted_count": compacted_count,
+        "followup_persisted_output_text_chars_before": original_text_chars,
+        "followup_persisted_output_text_chars_after": compacted_text_chars,
+        "followup_persisted_output_char_cap": followup_persisted_cap,
+        "followup_auxiliary_context_char_cap": followup_auxiliary_cap,
+    }
+    if hooks:
+        changes["followup_persisted_output_hooks"] = sorted(hooks)
+    if metadata_items:
+        changes["followup_persisted_output_compaction"] = metadata_items
+    return changes
+
+
+def _compact_google_adapter_persisted_output_value(
+    value: Any,
+) -> Tuple[Any, int, set[str], list[dict[str, Any]]]:
+    if isinstance(value, dict):
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            (
+                compacted_text,
+                compacted_count,
+                compacted_hooks,
+                compact_metadata,
+            ) = _compact_expanded_claude_persisted_output_text_for_google_adapter(
+                value["text"]
+            )
+            if compacted_count > 0:
+                updated_value = dict(value)
+                updated_value["text"] = compacted_text
+                return (
+                    updated_value,
+                    compacted_count,
+                    compacted_hooks,
+                    compact_metadata,
+                )
+            return value, 0, set(), []
+
+        updated_dict: dict[str, Any] = {}
+        compacted_count = 0
+        hooks: set[str] = set()
+        metadata_items: list[dict[str, Any]] = []
+        changed = False
+        for key, child in value.items():
+            updated_child, child_count, child_hooks, child_metadata = (
+                _compact_google_adapter_persisted_output_value(child)
+            )
+            updated_dict[key] = updated_child
+            compacted_count += child_count
+            hooks.update(child_hooks)
+            metadata_items.extend(child_metadata)
+            changed = changed or updated_child is not child
+        if changed:
+            return updated_dict, compacted_count, hooks, metadata_items
+        return value, compacted_count, hooks, metadata_items
+
+    if isinstance(value, list):
+        updated_list: list[Any] = value
+        compacted_count = 0
+        hooks: set[str] = set()
+        metadata_items: list[dict[str, Any]] = []
+        changed = False
+
+        if any(
+            isinstance(child, dict)
+            and child.get("type") == "text"
+            and isinstance(child.get("text"), str)
+            for child in value
+        ):
+            (
+                updated_list,
+                sequence_count,
+                sequence_hooks,
+                sequence_metadata,
+                sequence_changed,
+            ) = _compact_google_adapter_text_part_sequence(value)
+            compacted_count += sequence_count
+            hooks.update(sequence_hooks)
+            metadata_items.extend(sequence_metadata)
+            changed = changed or sequence_changed
+
+        recursively_updated_list = []
+        for child in updated_list:
+            updated_child, child_count, child_hooks, child_metadata = (
+                _compact_google_adapter_persisted_output_value(child)
+            )
+            recursively_updated_list.append(updated_child)
+            compacted_count += child_count
+            hooks.update(child_hooks)
+            metadata_items.extend(child_metadata)
+            changed = changed or updated_child is not child
+        if changed:
+            return recursively_updated_list, compacted_count, hooks, metadata_items
+        return value, compacted_count, hooks, metadata_items
+
+    return value, 0, set(), []
+
+
+def _compact_google_adapter_persisted_output_in_anthropic_request_body(
+    request_body: dict[str, Any],
+) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
+    updated_body, compacted_count, hooks, metadata_items = (
+        _compact_google_adapter_persisted_output_value(request_body)
+    )
+    if not isinstance(updated_body, dict):
+        return request_body, 0, set(), []
+    return updated_body, compacted_count, hooks, metadata_items
 
 
 def _expand_claude_persisted_output_text(
@@ -400,8 +5651,7 @@ def _expand_claude_persisted_output_value(
             hooks.update(child_hooks)
             source_metadata_items.extend(child_source_metadata_items)
             if updated_child is not child:
-                changed = True
-        return (
+                return (
             updated_dict if changed else value,
             expanded_count,
             hooks,
@@ -426,8 +5676,7 @@ def _expand_claude_persisted_output_value(
             hooks.update(child_hooks)
             source_metadata_items.extend(child_source_metadata_items)
             if updated_child is not child:
-                changed = True
-        return (
+                return (
             updated_list if changed else value,
             expanded_count,
             hooks,
@@ -1171,8 +6420,7 @@ def _replace_claude_system_prompt_override_in_value(
             updated_dict[key] = updated_child
             combined_events.extend(child_events)
             if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined_events
+                return (updated_dict if changed else value), combined_events
 
     if isinstance(value, list):
         updated_list = []
@@ -1186,8 +6434,7 @@ def _replace_claude_system_prompt_override_in_value(
             updated_list.append(updated_child)
             combined_events.extend(child_events)
             if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), combined_events
+                return (updated_list if changed else value), combined_events
 
     return value, []
 
@@ -1376,8 +6623,7 @@ def _replace_claude_prompt_patches_in_value(
             updated_dict[key] = updated_child
             combined_events.extend(child_events)
             if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined_events
+                return (updated_dict if changed else value), combined_events
 
     if isinstance(value, list):
         updated_list = []
@@ -1391,8 +6637,7 @@ def _replace_claude_prompt_patches_in_value(
             updated_list.append(updated_child)
             combined_events.extend(child_events)
             if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), combined_events
+                return (updated_list if changed else value), combined_events
 
     return value, []
 
@@ -1916,8 +7161,7 @@ async def _expand_aawm_dynamic_directives_in_value(
             updated_dict[key] = updated_child
             combined_events.extend(child_events)
             if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined_events
+                return (updated_dict if changed else value), combined_events
 
     if isinstance(value, list):
         updated_list = []
@@ -1931,8 +7175,7 @@ async def _expand_aawm_dynamic_directives_in_value(
             updated_list.append(updated_child)
             combined_events.extend(child_events)
             if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), combined_events
+                return (updated_list if changed else value), combined_events
 
     return value, []
 
@@ -2023,8 +7266,7 @@ async def _expand_aawm_dynamic_directives_in_anthropic_request_body(
         if value_events:
             updated_body[top_level_key] = updated_value
             injection_events.extend(value_events)
-            changed = True
-
+    
     if not injection_events:
         return request_body, []
 
@@ -2060,17 +7302,13 @@ async def _prepare_anthropic_request_body_for_passthrough(
     billing_header_fields = _extract_anthropic_billing_header_fields_from_request_body(
         updated_body
     )
-    updated_body, _claude_system_prompt_override_events = (
-        _aawm_replace_claude_system_prompt_in_anthropic_request_body(
-            updated_body,
-            billing_header_fields,
-        )
-    )
-    updated_body, _claude_prompt_patch_events = (
-        _aawm_apply_claude_prompt_patches_to_anthropic_request_body(
-            updated_body,
-            billing_header_fields,
-        )
+    (
+        updated_body,
+        _claude_system_prompt_override_events,
+        _claude_prompt_patch_events,
+    ) = await _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
+        updated_body,
+        billing_header_fields,
     )
     updated_body, _aawm_injection_events = (
         await _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body(
@@ -2344,6 +7582,30 @@ async def gemini_proxy_route(
 
     if request.method == "POST":
         request_body = await get_request_body(request)
+        if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and _is_google_oauth:
+            debug_headers = _build_google_debug_header_summary(dict(request.headers))
+            debug_body_summary = _summarize_google_code_assist_request_shape(request_body)
+            request_block = request_body.get("request") if isinstance(request_body, dict) and isinstance(request_body.get("request"), dict) else request_body
+            request_tools = request_block.get("tools") if isinstance(request_block, dict) else None
+            function_names: list[str] = []
+            if isinstance(request_tools, list):
+                for tool_entry in request_tools:
+                    if not isinstance(tool_entry, dict):
+                        continue
+                    decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
+                    if isinstance(decls, list):
+                        for declaration in decls:
+                            if isinstance(declaration, dict):
+                                name = declaration.get("name")
+                                if isinstance(name, str):
+                                    function_names.append(name)
+            verbose_proxy_logger.info(
+                "Gemini passthrough debug: endpoint=%s headers=%s body_shape=%s function_names=%s",
+                endpoint,
+                debug_headers,
+                debug_body_summary,
+                function_names,
+            )
         prepared_request_body = _add_gemini_request_breakout_logging_metadata(
             request_body
         )
@@ -2757,6 +8019,75 @@ async def anthropic_proxy_route(
                 expanded_count,
                 sorted(hooks),
                 sorted(billing_header_fields),
+            )
+        adapter_model = _resolve_anthropic_openai_responses_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if adapter_model is not None:
+            return await _handle_anthropic_openai_responses_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=adapter_model,
+            )
+
+        google_adapter_model = _resolve_anthropic_google_completion_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if google_adapter_model is not None:
+            return await _handle_anthropic_google_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=google_adapter_model,
+            )
+
+        nvidia_adapter_model = _resolve_anthropic_nvidia_responses_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if nvidia_adapter_model is not None:
+            return await _handle_anthropic_nvidia_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=nvidia_adapter_model,
+            )
+
+        openrouter_completion_adapter_model = _resolve_anthropic_openrouter_completion_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if openrouter_completion_adapter_model is not None:
+            return await _handle_anthropic_openrouter_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=openrouter_completion_adapter_model,
+            )
+
+        openrouter_adapter_model = _resolve_anthropic_openrouter_responses_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if openrouter_adapter_model is not None:
+            return await _handle_anthropic_openrouter_responses_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=openrouter_adapter_model,
             )
 
     ## check for streaming

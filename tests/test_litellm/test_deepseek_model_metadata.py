@@ -30,10 +30,10 @@ from litellm.utils import (
 
 
 def _load_backup_json() -> dict:
-    """Load the backup JSON directly from disk."""
+    """Load the bundled fallback JSON directly from disk."""
     backup_path = os.path.join(
         os.path.dirname(litellm.__file__),
-        "model_prices_and_context_window_backup.json",
+        "bundled_model_prices_and_context_window_fallback.json",
     )
     with open(backup_path, encoding="utf-8") as f:
         return json.load(f)
