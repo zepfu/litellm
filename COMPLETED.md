@@ -8,7 +8,7 @@
 - Hardened the session-history writer against the same regressions.
   New writes now infer missing providers from model/route metadata, sanitize non-positive reasoning token placeholders before persistence, default target-provider cache telemetry from stored cache counters, and preserve valid Gemini `provider_signature_present` reasoning signals.
 
-- Synced the callback overlay source with the in-repo AAWM callback and bumped the callback wheel version to `0.0.5`.
+- Synced the callback overlay source with the in-repo AAWM callback and bumped the callback wheel version to `0.0.6`.
   This prevents future `aawm-litellm` image rebuilds from reinstalling the stale callback wheel that omitted provider-cache and tool-activity fields.
 
 - Broadened git tool-activity extraction.

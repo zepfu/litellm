@@ -14,4 +14,4 @@
 ## Next
 
 - Publish / rebuild the callback overlay wheel after the `session_history` repair hardening lands.
-  Current local runtime mitigation: `aawm-litellm` was patched in-place by copying the updated callback into both `/usr/lib/python3.13/site-packages/litellm/integrations/aawm_agent_identity.py` and `/usr/lib/python3.13/site-packages/aawm_litellm_callbacks/agent_identity.py`, then restarting the compose service. The durable fix is the checked-in `.wheel-build` source plus version `0.0.5`; the next image rebuild should consume a new `cb-v*` callback wheel instead of the old released wheel.
+  Current local runtime mitigation: `aawm-litellm` was patched in-place by copying the updated callback into both `/usr/lib/python3.13/site-packages/litellm/integrations/aawm_agent_identity.py` and `/usr/lib/python3.13/site-packages/aawm_litellm_callbacks/agent_identity.py`, then restarting the compose service. The durable fix is the checked-in `.wheel-build` source plus version `0.0.6`; the next image rebuild should consume `cb-v0.0.6` or newer instead of the old released wheel.
