@@ -96,8 +96,16 @@ Run it with repo env loaded so Langfuse and DB credentials are available:
 ```bash
 set -a
 source .env >/dev/null 2>&1
-python3 run_anthropic_adapter_acceptance.py   --write-artifact /tmp/anthropic-adapter-acceptance.json
+set +a
+python3 run_anthropic_adapter_acceptance.py \
+  --target dev \
+  --write-artifact /tmp/anthropic-adapter-dev.json
 ```
+
+Target profiles:
+- `--target dev` validates `http://127.0.0.1:4001/anthropic`, `litellm-dev`, and Langfuse trace environment `dev`.
+- `--target prod` validates `http://127.0.0.1:4000/anthropic`, `aawm-litellm`, and Langfuse trace environment `prod`.
+- Use `--litellm-base-url`, `--anthropic-base-url`, `--docker-container-name`, or `--expected-trace-environment` only for explicit one-off overrides.
 
 Important notes:
 - top-level Claude runs without an adapted model are not the acceptance target for this suite.

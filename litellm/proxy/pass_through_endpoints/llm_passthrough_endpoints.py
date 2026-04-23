@@ -5811,9 +5811,11 @@ def _add_passthrough_trace_context_metadata(
 
     if session_id and not litellm_metadata.get("session_id"):
         litellm_metadata["session_id"] = session_id
+        changed = True
 
     if trace_environment and not litellm_metadata.get("trace_environment"):
         litellm_metadata["trace_environment"] = trace_environment
+        changed = True
 
     if not changed:
         return request_body

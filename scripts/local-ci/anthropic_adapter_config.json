@@ -1,9 +1,24 @@
 {
   "suite_version": 1,
+  "default_target_profile": "dev",
   "litellm_base_url": "http://127.0.0.1:4001",
   "langfuse_query_url": "http://127.0.0.1:3000",
   "langfuse_public_key_env": "LANGFUSE_PUBLIC_KEY",
   "langfuse_secret_key_env": "LANGFUSE_SECRET_KEY",
+  "target_profiles": {
+    "dev": {
+      "litellm_base_url": "http://127.0.0.1:4001",
+      "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+      "docker_container_name": "litellm-dev",
+      "expected_trace_environment": "dev"
+    },
+    "prod": {
+      "litellm_base_url": "http://127.0.0.1:4000",
+      "anthropic_base_url": "http://127.0.0.1:4000/anthropic",
+      "docker_container_name": "aawm-litellm",
+      "expected_trace_environment": "prod"
+    }
+  },
   "default_excluded_cases": [
     "claude_adapter_gemma_31b",
     "claude_adapter_gemma_26b_a4b",
