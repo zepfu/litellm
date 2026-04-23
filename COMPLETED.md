@@ -23,6 +23,9 @@
 - Added default-suite harness coverage for escaped ctx markers and provider-cache activity.
   `claude_adapter_ctx_marker_escaped` validates the literal escape path, and `claude_adapter_peeromega_fanout` now requires at least one Anthropic child `session_history` row with `provider_cache_attempted=true` and `provider_cache_status` of `hit` or `write`.
 
+- Added dev/prod target profiles to the Anthropic adapter harness.
+  `--target dev` validates `:4001`, `litellm-dev`, and Langfuse trace environment `dev`; `--target prod` validates `:4000`, `aawm-litellm`, and Langfuse trace environment `prod`. The pass-through trace context helper now correctly preserves `session_id` and `trace_environment` metadata on rewritten requests.
+
 ## 2026-04-22
 
 - Started direct NVIDIA adapter support for Anthropic-routed agent models.
