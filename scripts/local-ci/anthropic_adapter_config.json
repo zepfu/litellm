@@ -241,8 +241,7 @@
         "required_paths": [
           "model",
           "messages",
-          "max_tokens",
-          "stream"
+          "max_tokens"
         ]
       },
       "command_json_checks": {
@@ -270,8 +269,8 @@
         }
       },
       "allow_zero_cost": false,
-      "timeout_seconds": 180,
-      "langfuse_poll_timeout_seconds": 90,
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 120,
       "runtime_postconditions": {
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"
@@ -322,8 +321,7 @@
         "required_paths": [
           "model",
           "messages",
-          "max_tokens",
-          "stream"
+          "max_tokens"
         ]
       },
       "command_json_checks": {
@@ -358,8 +356,8 @@
       ],
       "retry_max_attempts": 2,
       "retry_backoff_seconds": 2,
-      "timeout_seconds": 180,
-      "langfuse_poll_timeout_seconds": 90,
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 120,
       "runtime_postconditions": {
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"

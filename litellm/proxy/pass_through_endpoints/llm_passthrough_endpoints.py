@@ -3540,17 +3540,51 @@ def _get_nvidia_adapter_max_retries() -> int:
     return max(0, parsed)
 
 
-def _get_nvidia_adapter_request_timeout_seconds() -> float:
+def _get_nvidia_adapter_request_timeout_seconds(
+    adapter_model: Optional[str] = None,
+) -> float:
     raw_value = _clean_codex_auth_value(
         os.getenv("AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS")
     )
     if raw_value is None:
-        return 75.0
+        if _should_force_fake_stream_for_nvidia_adapter_model(adapter_model):
+            return 240.0
+        return 120.0
     try:
         parsed = float(raw_value)
     except Exception:
-        return 75.0
+        if _should_force_fake_stream_for_nvidia_adapter_model(adapter_model):
+            return 240.0
+        return 120.0
     return max(5.0, parsed)
+
+
+def _get_nvidia_adapter_inner_max_retries() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES")
+    )
+    if raw_value is None:
+        return 0
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 0
+    return max(0, parsed)
+
+
+def _should_force_fake_stream_for_nvidia_adapter_model(
+    adapter_model: Optional[str],
+) -> bool:
+    configured_models = _clean_codex_auth_value(
+        os.getenv("AAWM_NVIDIA_ADAPTER_FORCE_FAKE_STREAM_MODELS")
+    )
+    if configured_models is None:
+        normalized_models = {"minimaxai/minimax-m2.7"}
+    else:
+        normalized_models = {
+            item.strip() for item in configured_models.split(",") if item.strip()
+        }
+    return bool(adapter_model and adapter_model in normalized_models)
 
 
 def _extract_nvidia_adapter_exception_status_code(exc: Any) -> Optional[int]:
@@ -4699,8 +4733,15 @@ async def _handle_anthropic_nvidia_completion_adapter_route(
     from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
         LiteLLMMessagesToCompletionTransformationHandler,
     )
+    from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+        FakeAnthropicMessagesStreamIterator,
+    )
 
     client_requested_stream = bool(prepared_request_body.get("stream"))
+    use_fake_stream = client_requested_stream and _should_force_fake_stream_for_nvidia_adapter_model(
+        adapter_model
+    )
+    upstream_stream = client_requested_stream and not use_fake_stream
     requested_model = prepared_request_body.get("model")
     route_family = "anthropic_nvidia_completion_adapter"
     target_endpoint_label = "nvidia:/v1/chat/completions"
@@ -4723,6 +4764,8 @@ async def _handle_anthropic_nvidia_completion_adapter_route(
                         "requested_model": requested_model,
                         "adapter_model": adapter_model,
                         "stream": client_requested_stream,
+                        "upstream_stream": upstream_stream,
+                        "fake_stream": use_fake_stream,
                     },
                 )
             ],
@@ -4771,7 +4814,7 @@ async def _handle_anthropic_nvidia_completion_adapter_route(
             model=adapter_model,
             metadata=prepared_request_body.get("metadata") or {},
             stop_sequences=prepared_request_body.get("stop_sequences"),
-            stream=client_requested_stream,
+            stream=upstream_stream,
             system=prepared_request_body.get("system"),
             temperature=prepared_request_body.get("temperature"),
             thinking=prepared_request_body.get("thinking"),
@@ -4783,7 +4826,8 @@ async def _handle_anthropic_nvidia_completion_adapter_route(
             custom_llm_provider=litellm.LlmProviders.NVIDIA_NIM.value,
             api_key=nvidia_api_key,
             api_base=f"{target_base_url.rstrip('/')}/v1",
-            timeout=_get_nvidia_adapter_request_timeout_seconds(),
+            timeout=_get_nvidia_adapter_request_timeout_seconds(adapter_model),
+            max_retries=_get_nvidia_adapter_inner_max_retries(),
             litellm_metadata=prepared_request_body.get("litellm_metadata") or {},
             proxy_server_request={
                 "headers": dict(request.headers),
@@ -4792,6 +4836,10 @@ async def _handle_anthropic_nvidia_completion_adapter_route(
         ),
     )
     if client_requested_stream:
+        if use_fake_stream:
+            return _build_anthropic_streaming_response_from_completion_adapter_stream(
+                FakeAnthropicMessagesStreamIterator(completion_response),
+            )
         return _build_anthropic_streaming_response_from_completion_adapter_stream(
             completion_response,
         )

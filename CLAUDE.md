@@ -131,11 +131,11 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
     - keep this warning-only in the harness because upstream quota windows produce real `429` responses
   - OpenRouter hard gate: `openai/gpt-oss-120b:free`
   - NVIDIA optional spot checks: `nvidia/deepseek-ai/deepseek-v3.2`, `nvidia/deepseek-ai/deepseek-v3.1-terminus`, `nvidia/mistralai/devstral-2-123b-instruct-2512`, `nvidia/z-ai/glm4.7`, `nvidia/minimaxai/minimax-m2.7`
-    - current focused harness cases are `claude_adapter_nvidia_deepseek_v32` and `claude_adapter_nvidia_glm47`
+    - current focused harness cases are `claude_adapter_nvidia_deepseek_v32`, `claude_adapter_nvidia_glm47`, and `claude_adapter_nvidia_minimax_m27`
     - these validate the Anthropic -> NVIDIA completion adapter on `nvidia:/v1/chat/completions` via `provider=nvidia_nim`
     - these are excluded from the default full suite and should be run only by explicit `--cases` selection while the NVIDIA lane is still under active validation
     - compatibility alias: `nvidia/minimax/minimax-m2.7` should still resolve to `minimaxai/minimax-m2.7`
-    - use the exact `nvidia/minimaxai/minimax-m2.7` spelling for manual MiniMax probes; keep MiniMax out of the live canary set for now because the Claude->NVIDIA path still stalls intermittently even though the route itself resolves correctly
+    - use the exact `nvidia/minimaxai/minimax-m2.7` spelling for MiniMax probes; the Anthropic adapter intentionally uses upstream non-stream plus fake streaming for this model because its native stream latency is much higher than the other NVIDIA targets
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - OpenRouter preferred free targets under active validation: `inclusionai/ling-2.6-flash:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
   - OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
