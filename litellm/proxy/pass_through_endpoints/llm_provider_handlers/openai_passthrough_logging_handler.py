@@ -61,6 +61,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             "api.openai.com" in hostname
             or "openai.azure.com" in hostname
             or "chatgpt.com" in hostname
+            or hostname == "integrate.api.nvidia.com"
+            or hostname == "ai.api.nvidia.com"
             or hostname == "openrouter.ai"
             or hostname.endswith(".openrouter.ai")
         )

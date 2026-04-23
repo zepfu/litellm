@@ -95,9 +95,11 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
         return {'parsed': None}, [f'{family} command stdout did not contain JSON']
 
     required_equals = checks.get('required_equals', {}) or {}
+    required_contains = checks.get('required_contains', {}) or {}
     required_minimums = checks.get('required_minimums', {}) or {}
 
     equals_hits: dict[str, Any] = {}
+    contains_hits: dict[str, Any] = {}
     minimum_hits: dict[str, Any] = {}
 
     for path, expected in required_equals.items():
@@ -105,6 +107,14 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
         equals_hits[path] = actual
         if actual != expected:
             failures.append(f'{family} command JSON mismatch for `{path}`: expected {expected!r}, got {actual!r}')
+
+    for path, expected_substring in required_contains.items():
+        actual = _extract_path_value(parsed, path)
+        contains_hits[path] = actual
+        if not isinstance(actual, str) or not isinstance(expected_substring, str) or expected_substring not in actual:
+            failures.append(
+                f'{family} command JSON missing substring for `{path}`: expected to contain {expected_substring!r}, got {actual!r}'
+            )
 
     for path, minimum in required_minimums.items():
         actual = _extract_path_value(parsed, path)
@@ -115,6 +125,7 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
     return {
         'parsed': parsed,
         'required_equals_hits': equals_hits,
+        'required_contains_hits': contains_hits,
         'required_minimum_hits': minimum_hits,
     }, failures
 

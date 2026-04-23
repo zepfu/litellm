@@ -172,6 +172,45 @@ def test_validate_outgoing_egress_blocks_google_credentials_to_anthropic():
     reset_egress_guard_alert_state()
 
 
+def test_validate_outgoing_egress_allows_matching_nvidia_headers():
+    headers = {
+        "Authorization": "Bearer nvapi-test-token",
+        "api-key": "nvapi-test-token",
+    }
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url="https://integrate.api.nvidia.com/v1/responses",
+        headers=headers,
+        credential_family="nvidia",
+        expected_target_family="nvidia",
+    )
+
+
+def test_validate_outgoing_egress_blocks_nvidia_credentials_to_openai():
+    reset_egress_guard_alert_state()
+    headers = {
+        "Authorization": "Bearer nvapi-test-token",
+        "api-key": "nvapi-test-token",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url="https://api.openai.com/v1/responses",
+            headers=headers,
+            credential_family="nvidia",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "credential family nvidia cannot be sent to openai" in str(
+        exc_info.value.detail
+    )
+    alert_state = get_egress_guard_alert_state()
+    assert alert_state["trigger_count"] == 1
+    assert alert_state["last_credential_family"] == "nvidia"
+    assert alert_state["last_target_family"] == "openai"
+    reset_egress_guard_alert_state()
+
+
 def test_validate_outgoing_egress_blocks_anthropic_markers_to_openai():
     headers = {
         "x-api-key": "anthropic-secret",

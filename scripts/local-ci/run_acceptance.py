@@ -746,7 +746,17 @@ def _extract_logged_request_body(observation: dict[str, Any]) -> dict[str, Any] 
         return None
     content = first_message.get("content")
     if not isinstance(content, str):
-        return None
+        synthetic_request_body: dict[str, Any] = {}
+        if isinstance(observation.get("model"), str):
+            synthetic_request_body["model"] = observation["model"]
+        if isinstance(messages, list) and messages:
+            synthetic_request_body["messages"] = messages
+        model_parameters = observation.get("modelParameters")
+        if isinstance(model_parameters, dict):
+            for key in ("max_tokens", "stream", "stream_options", "reasoning_effort"):
+                if key in model_parameters:
+                    synthetic_request_body[key] = model_parameters[key]
+        return synthetic_request_body or None
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:

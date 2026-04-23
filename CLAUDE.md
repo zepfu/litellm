@@ -130,6 +130,12 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
     - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist
     - keep this warning-only in the harness because upstream quota windows produce real `429` responses
   - OpenRouter hard gate: `openai/gpt-oss-120b:free`
+  - NVIDIA optional spot checks: `nvidia/deepseek-ai/deepseek-v3.2`, `nvidia/deepseek-ai/deepseek-v3.1-terminus`, `nvidia/mistralai/devstral-2-123b-instruct-2512`, `nvidia/z-ai/glm4.7`, `nvidia/minimaxai/minimax-m2.7`
+    - current focused harness cases are `claude_adapter_nvidia_deepseek_v32` and `claude_adapter_nvidia_glm47`
+    - these validate the Anthropic -> NVIDIA completion adapter on `nvidia:/v1/chat/completions` via `provider=nvidia_nim`
+    - these are excluded from the default full suite and should be run only by explicit `--cases` selection while the NVIDIA lane is still under active validation
+    - compatibility alias: `nvidia/minimax/minimax-m2.7` should still resolve to `minimaxai/minimax-m2.7`
+    - use the exact `nvidia/minimaxai/minimax-m2.7` spelling for manual MiniMax probes; keep MiniMax out of the live canary set for now because the Claude->NVIDIA path still stalls intermittently even though the route itself resolves correctly
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - OpenRouter preferred free targets under active validation: `inclusionai/ling-2.6-flash:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
   - OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
@@ -164,9 +170,15 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - Preferred Anthropic-adapter model spellings:
   - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
   - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
+  - direct NVIDIA targets: `nvidia/deepseek-ai/deepseek-v3.2`, `nvidia/deepseek-ai/deepseek-v3.1-terminus`, `nvidia/mistralai/devstral-2-123b-instruct-2512`, `nvidia/z-ai/glm4.7`, `nvidia/minimaxai/minimax-m2.7`
   - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/inclusionai/ling-2.6-flash:free`, `openrouter/google/gemma-4-31b-it:free`
   - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
   This keeps brief transient recovery local while preventing repeated manual retests from re-burning ~40 seconds on the same throttled backend.
+- NVIDIA-adapted Anthropic runs should reach the same observability parity as the other adapted providers:
+  - `public.session_history` should persist `provider=nvidia_nim` rows with the normalized upstream model name and non-zero `response_cost_usd` when the model has mapped pricing
+  - `public.session_history_tool_activity` should populate when the NVIDIA-backed model performs tool or delegated-agent work
+  - Langfuse tags / metadata / spans should include `route:anthropic_nvidia_completion_adapter`, `anthropic-nvidia-completion-adapter`, `anthropic-adapter-target:nvidia:/v1/chat/completions`, and the `anthropic.nvidia_completion_adapter` span name
+  - long-term cost tracking should not stay unmapped; if NVIDIA does not expose usable non-free pricing for a target model, use the closest equivalent OpenRouter pricing as the fallback basis
 - Anthropic fanout prompts should still use the Claude agent `name:` values from
   `~/.claude/agents` such as `gemini-3-flash-preview` and `gpt-5-4`. The
   provider-prefixed routing lives in the agent file `model:` value.
