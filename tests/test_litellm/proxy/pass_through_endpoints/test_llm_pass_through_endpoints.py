@@ -5149,6 +5149,49 @@ class TestClaudePersistedOutputExpansion:
         )
 
     @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_preserves_escaped_ctx_marker_literal(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "metadata": {"user_id": {"session_id": "session-ctx-escaped-1"}},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are 'eyes' and you are working on the 'aawm' project.\n"
+                                "Use \\\\:#alpha.ctx#\\\\: as a literal marker.\n"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._call_aawm_context_grab",
+            new=AsyncMock(return_value="Alpha context line"),
+        ) as mock_context_grab:
+            updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        injected_text = updated_body["messages"][0]["content"][0]["text"]
+        assert "\\\\:#alpha.ctx#\\\\:" not in injected_text
+        assert "Use :#alpha.ctx#: as a literal marker." in injected_text
+        assert "Alpha context line" not in injected_text
+        assert "~retrieved at: " not in injected_text
+        assert "aawm_dynamic_injection_count" not in updated_body.get(
+            "litellm_metadata", {}
+        )
+        mock_context_grab.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_ctx_marker_dedupes_and_preserves_append_order(
         self,
     ):
