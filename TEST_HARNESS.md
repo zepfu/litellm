@@ -213,6 +213,10 @@ Telemetry expectation:
   - current detection uses provider-native cache hints:
     `cache_control` for Anthropic/OpenRouter, `cachedContent` for Gemini, and
     `input_tokens_details.cached_tokens` for OpenAI-style usage
+- the default Anthropic adapter suite includes a provider-cache canary in
+  `claude_adapter_peeromega_fanout`: at least one Anthropic child row must have
+  `provider_cache_attempted=true` and `provider_cache_status` equal to `hit` or
+  `write`
 - session-history writer changes must stay synced between the in-repo dev
   callback (`litellm.integrations.aawm_agent_identity`) and the callback overlay
   wheel source (`.wheel-build/aawm_litellm_callbacks/agent_identity.py`), because
@@ -232,6 +236,9 @@ Telemetry expectation:
   `public.session_history_tool_activity`
 - `claude_adapter_ctx_marker` is the hard gate for routed context markers and
   must keep validating the literal `:#port-allocation.ctx#:` rewrite path
+- `claude_adapter_ctx_marker_escaped` is the hard gate for literal marker
+  escaping; `\\:#name.ctx#\\:` should be rewritten to visible
+  `:#name.ctx#:` without stored-procedure lookup or appendix injection
 - dispatched child-agent prompts may also auto-resolve single-backticked topics
   and bare uppercase acronyms through the same `tristore_search_exact` path;
   preserve the inline text exactly and keep no-result lookups silent

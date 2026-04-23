@@ -564,6 +564,107 @@
         "docker_container_name": "litellm-dev"
       }
     },
+    "claude_adapter_ctx_marker_escaped": {
+      "command": [
+        "claude",
+        "-p",
+        "Reply with exactly two words and no punctuation: escaped validated\nThe following escaped marker must remain literal and must not trigger context injection: \\\\:#escaped-ctx-harness-never-lookup.ctx#\\\\:",
+        "--output-format",
+        "json",
+        "--model",
+        "openai/gpt-5.4-mini",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ""
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator"
+      ],
+      "expected_user_ids": [
+        "litellm.fork"
+      ],
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "use_session_trace_lookup": false,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openai_responses_adapter",
+        "anthropic-openai-responses-adapter",
+        "anthropic-adapter-model:gpt-5.4-mini",
+        "anthropic-adapter-target:/v1/responses"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint",
+        "claude-effort:",
+        "thinking-type:"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family"
+      ],
+      "request_text_checks": {
+        "required_substrings": [
+          "must remain literal and must not trigger context injection: :#escaped-ctx-harness-never-lookup.ctx#:"
+        ],
+        "forbidden_substrings": [
+          "\\\\:#escaped-ctx-harness-never-lookup.ctx#\\\\:",
+          "IMPORTANT: context grab for escaped-ctx-harness-never-lookup returned no results"
+        ]
+      },
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "input",
+          "instructions",
+          "reasoning.effort",
+          "stream"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1,
+          "total_cost_usd": 1e-06
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4-mini",
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1,
+          "response_cost_usd": 1e-06
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 60,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
     "claude_adapter_codex_tool_activity": {
       "command": [
         "claude",
@@ -740,6 +841,15 @@
           {
             "provider": "anthropic",
             "model": "claude-opus-4-7",
+            "required_equals": {
+              "provider_cache_attempted": true
+            },
+            "required_one_of": {
+              "provider_cache_status": [
+                "hit",
+                "write"
+              ]
+            },
             "minimums": {
               "input_tokens": 1,
               "output_tokens": 1

@@ -17,6 +17,12 @@
 - Tightened adapter harness validation for session-history rows.
   Harness validation now selects file/git rollup fields and fails rows with null providers, null reasoning sources, invalid `provider_reported` zero counts, or missing provider-cache status on target provider families.
 
+- Added literal ctx-marker escaping.
+  Prompts can now use `\\:#name.ctx#\\:` to preserve visible `:#name.ctx#:` text without triggering `tristore_search_exact`, context appendix injection, or AAWM dynamic-injection metadata.
+
+- Added default-suite harness coverage for escaped ctx markers and provider-cache activity.
+  `claude_adapter_ctx_marker_escaped` validates the literal escape path, and `claude_adapter_peeromega_fanout` now requires at least one Anthropic child `session_history` row with `provider_cache_attempted=true` and `provider_cache_status` of `hit` or `write`.
+
 ## 2026-04-22
 
 - Started direct NVIDIA adapter support for Anthropic-routed agent models.
