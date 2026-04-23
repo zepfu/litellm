@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Repair provider-cache telemetry on existing session_history rows.
+Repair observability telemetry on existing session_history rows.
 
-This is a best-effort repair for historical rows when the original proxy spend-log
-source is unavailable locally. It derives provider cache state from the stored
-session_history provider/model/cache counters plus persisted metadata and writes the
-normalized fields back to the same table.
+This is a best-effort repair for historical rows when the original proxy
+spend-log source is unavailable locally. It derives provider, reasoning source,
+provider-cache state, and git rollups from stored session_history rows plus
+session_history_tool_activity, then writes the normalized fields back to the same
+table.
 """
 
 import argparse
@@ -52,22 +53,32 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
     _AAWM_SESSION_HISTORY_ALTER_STATEMENTS,
     _AAWM_SESSION_HISTORY_INDEX_STATEMENTS,
     _AAWM_SESSION_HISTORY_TABLE_SQL,
+    _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS,
+    _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL,
     _build_aawm_dsn,
     _compute_provider_cache_miss_cost_state,
     _normalize_provider_cache_family,
+    _normalize_session_history_provider,
     _resolve_provider_cache_state,
+    _safe_int,
 )
 
 
 _REPAIR_UPDATE_SQL = """
 UPDATE public.session_history
 SET
+    provider = %s,
+    reasoning_tokens_reported = %s,
+    reasoning_tokens_estimated = %s,
+    reasoning_tokens_source = %s,
     provider_cache_attempted = %s,
     provider_cache_status = %s,
     provider_cache_miss = %s,
     provider_cache_miss_reason = %s,
     provider_cache_miss_token_count = %s,
     provider_cache_miss_cost_usd = %s,
+    git_commit_count = %s,
+    git_push_count = %s,
     metadata = %s::jsonb
 WHERE id = %s
 """
@@ -149,6 +160,52 @@ def _apply_cache_state_to_metadata(
     return updated
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    normalized = _safe_int(value)
+    if normalized is not None and normalized > 0:
+        return normalized
+    return None
+
+
+def _resolve_reasoning_state(row: Dict[str, Any]) -> tuple[Optional[int], Optional[int], str]:
+    reported = _positive_int_or_none(row.get("reasoning_tokens_reported"))
+    estimated = _positive_int_or_none(row.get("reasoning_tokens_estimated"))
+    source = row.get("reasoning_tokens_source")
+    reasoning_present = bool(
+        row.get("reasoning_present") or row.get("thinking_signature_present")
+    )
+
+    if source == "provider_signature_present" and reported is not None:
+        return reported, estimated, "provider_signature_present"
+    if source == "provider_reported" and reported is not None:
+        return reported, estimated, "provider_reported"
+    if estimated is not None:
+        return reported, estimated, "estimated_from_reasoning_text"
+    if reasoning_present:
+        return reported, estimated, "not_available"
+    return reported, estimated, "not_applicable"
+
+
+def _apply_reasoning_state_to_metadata(
+    metadata: Dict[str, Any],
+    *,
+    reported: Optional[int],
+    estimated: Optional[int],
+    source: str,
+) -> Dict[str, Any]:
+    updated = dict(metadata)
+    updated["usage_reasoning_tokens_source"] = source
+    if reported is not None:
+        updated["usage_reasoning_tokens_reported"] = reported
+    else:
+        updated.pop("usage_reasoning_tokens_reported", None)
+    if estimated is not None:
+        updated["usage_reasoning_tokens_estimated"] = estimated
+    else:
+        updated.pop("usage_reasoning_tokens_estimated", None)
+    return updated
+
+
 def _row_usage_object(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "prompt_tokens": int(row.get("input_tokens") or 0),
@@ -162,9 +219,12 @@ def _row_usage_object(row: Dict[str, Any]) -> Dict[str, Any]:
 def _ensure_session_history_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(_AAWM_SESSION_HISTORY_TABLE_SQL)
+        cur.execute(_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL)
         for statement in _AAWM_SESSION_HISTORY_ALTER_STATEMENTS:
             cur.execute(statement)
         for statement in _AAWM_SESSION_HISTORY_INDEX_STATEMENTS:
+            cur.execute(statement)
+        for statement in _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS:
             cur.execute(statement)
     conn.commit()
 
@@ -190,26 +250,43 @@ def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
 
             query = f"""
                 SELECT
-                    id,
-                    litellm_call_id,
-                    session_id,
-                    provider,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    total_tokens,
-                    cache_read_input_tokens,
-                    cache_creation_input_tokens,
-                    provider_cache_attempted,
-                    provider_cache_status,
-                    provider_cache_miss,
-                    provider_cache_miss_reason,
-                    provider_cache_miss_token_count,
-                    provider_cache_miss_cost_usd,
-                    metadata
-                FROM public.session_history
-                WHERE id > %s{' AND provider = %s' if args.provider else ''}{' AND session_id = %s' if args.session_id else ''}
-                ORDER BY id ASC
+                    sh.id,
+                    sh.litellm_call_id,
+                    sh.session_id,
+                    sh.provider,
+                    sh.model,
+                    sh.input_tokens,
+                    sh.output_tokens,
+                    sh.total_tokens,
+                    sh.cache_read_input_tokens,
+                    sh.cache_creation_input_tokens,
+                    sh.provider_cache_attempted,
+                    sh.provider_cache_status,
+                    sh.provider_cache_miss,
+                    sh.provider_cache_miss_reason,
+                    sh.provider_cache_miss_token_count,
+                    sh.provider_cache_miss_cost_usd,
+                    sh.reasoning_tokens_reported,
+                    sh.reasoning_tokens_estimated,
+                    sh.reasoning_tokens_source,
+                    sh.reasoning_present,
+                    sh.thinking_signature_present,
+                    sh.git_commit_count,
+                    sh.git_push_count,
+                    COALESCE(tool_activity.git_commit_count, 0) AS tool_git_commit_count,
+                    COALESCE(tool_activity.git_push_count, 0) AS tool_git_push_count,
+                    sh.metadata
+                FROM public.session_history sh
+                LEFT JOIN (
+                    SELECT
+                        litellm_call_id,
+                        SUM(git_commit_count)::integer AS git_commit_count,
+                        SUM(git_push_count)::integer AS git_push_count
+                    FROM public.session_history_tool_activity
+                    GROUP BY litellm_call_id
+                ) tool_activity ON tool_activity.litellm_call_id = sh.litellm_call_id
+                WHERE sh.id > %s{' AND sh.provider = %s' if args.provider else ''}{' AND sh.session_id = %s' if args.session_id else ''}
+                ORDER BY sh.id ASC
                 LIMIT {int(args.batch_size)}
             """
             with conn.cursor() as cur:
@@ -222,61 +299,112 @@ def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
             for row in rows:
                 scanned_rows += 1
                 cursor_id = int(row["id"])
-                provider = row.get("provider")
                 model = str(row.get("model") or "")
                 metadata = _safe_json_metadata(row.get("metadata"))
-                provider_family = _normalize_provider_cache_family(provider, model, metadata)
-                if provider_family is None:
-                    continue
-
-                cache_state = _resolve_provider_cache_state(
-                    provider=provider,
-                    model=model,
-                    usage_obj=_row_usage_object(row),
-                    metadata=metadata,
-                    request_body=None,
+                provider = _normalize_session_history_provider(
+                    row.get("provider"),
+                    model,
+                    metadata,
                 )
-                if cache_state is None:
-                    continue
-                cache_state = dict(cache_state)
-                cache_state.update(
-                    _compute_provider_cache_miss_cost_state(
-                        provider_family=provider_family,
+                reported, estimated, reasoning_source = _resolve_reasoning_state(row)
+                provider_family = _normalize_provider_cache_family(provider, model, metadata)
+
+                cache_state = None
+                if provider_family is not None:
+                    cache_state = _resolve_provider_cache_state(
+                        provider=provider,
                         model=model,
                         usage_obj=_row_usage_object(row),
-                        cache_state=cache_state,
                         metadata=metadata,
+                        request_body=None,
                     )
-                )
+                    if cache_state is not None:
+                        cache_state = dict(cache_state)
+                        cache_state.update(
+                            _compute_provider_cache_miss_cost_state(
+                                provider_family=provider_family,
+                                model=model,
+                                usage_obj=_row_usage_object(row),
+                                cache_state=cache_state,
+                                metadata=metadata,
+                            )
+                        )
 
-                provider_status_counts.setdefault(provider_family, {})
-                status_key = str(cache_state.get("status") or "unknown")
-                provider_status_counts[provider_family][status_key] = (
-                    provider_status_counts[provider_family].get(status_key, 0) + 1
-                )
+                        provider_status_counts.setdefault(provider_family, {})
+                        status_key = str(cache_state.get("status") or "unknown")
+                        provider_status_counts[provider_family][status_key] = (
+                            provider_status_counts[provider_family].get(status_key, 0) + 1
+                        )
 
-                updated_metadata = _apply_cache_state_to_metadata(
+                updated_metadata = _apply_reasoning_state_to_metadata(
                     metadata,
-                    provider_family=provider_family,
-                    cache_state=cache_state,
+                    reported=reported,
+                    estimated=estimated,
+                    source=reasoning_source,
+                )
+                if provider_family is not None and cache_state is not None:
+                    updated_metadata = _apply_cache_state_to_metadata(
+                        updated_metadata,
+                        provider_family=provider_family,
+                        cache_state=cache_state,
+                    )
+
+                git_commit_count = max(
+                    int(row.get("git_commit_count") or 0),
+                    int(row.get("tool_git_commit_count") or 0),
+                )
+                git_push_count = max(
+                    int(row.get("git_push_count") or 0),
+                    int(row.get("tool_git_push_count") or 0),
+                )
+
+                cache_attempted = bool(
+                    cache_state and cache_state.get("attempted")
+                )
+                cache_status = cache_state.get("status") if cache_state else row.get("provider_cache_status")
+                cache_miss = bool(cache_state and cache_state.get("miss"))
+                cache_miss_reason = (
+                    cache_state.get("miss_reason") if cache_state else row.get("provider_cache_miss_reason")
+                )
+                cache_miss_token_count = (
+                    cache_state.get("miss_token_count")
+                    if cache_state
+                    else row.get("provider_cache_miss_token_count")
+                )
+                cache_miss_cost_usd = (
+                    cache_state.get("miss_cost_usd")
+                    if cache_state
+                    else row.get("provider_cache_miss_cost_usd")
                 )
 
                 current_state = (
+                    row.get("provider"),
+                    _positive_int_or_none(row.get("reasoning_tokens_reported")),
+                    _positive_int_or_none(row.get("reasoning_tokens_estimated")),
+                    row.get("reasoning_tokens_source"),
                     bool(row.get("provider_cache_attempted")),
                     row.get("provider_cache_status"),
                     bool(row.get("provider_cache_miss")),
                     row.get("provider_cache_miss_reason"),
                     row.get("provider_cache_miss_token_count"),
                     row.get("provider_cache_miss_cost_usd"),
+                    int(row.get("git_commit_count") or 0),
+                    int(row.get("git_push_count") or 0),
                     metadata,
                 )
                 new_state = (
-                    bool(cache_state.get("attempted")),
-                    cache_state.get("status"),
-                    bool(cache_state.get("miss")),
-                    cache_state.get("miss_reason"),
-                    cache_state.get("miss_token_count"),
-                    cache_state.get("miss_cost_usd"),
+                    provider,
+                    reported,
+                    estimated,
+                    reasoning_source,
+                    cache_attempted,
+                    cache_status,
+                    cache_miss,
+                    cache_miss_reason,
+                    cache_miss_token_count,
+                    cache_miss_cost_usd,
+                    git_commit_count,
+                    git_push_count,
                     updated_metadata,
                 )
                 if current_state == new_state:
@@ -284,12 +412,18 @@ def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
 
                 updates.append(
                     (
-                        bool(cache_state.get("attempted")),
-                        cache_state.get("status"),
-                        bool(cache_state.get("miss")),
-                        cache_state.get("miss_reason"),
-                        cache_state.get("miss_token_count"),
-                        cache_state.get("miss_cost_usd"),
+                        provider,
+                        reported,
+                        estimated,
+                        reasoning_source,
+                        cache_attempted,
+                        cache_status,
+                        cache_miss,
+                        cache_miss_reason,
+                        cache_miss_token_count,
+                        cache_miss_cost_usd,
+                        git_commit_count,
+                        git_push_count,
                         json.dumps(updated_metadata),
                         int(row["id"]),
                     )
