@@ -1,5 +1,22 @@
 # Completed
 
+## 2026-04-23
+
+- Repaired `public.session_history` observability gaps in the local `aawm_tristore` database.
+  The repair normalized null providers, removed invalid `reasoning_tokens_source=provider_reported` rows with zero reported reasoning tokens, populated target-provider cache statuses, and recalculated cache miss token/cost fields where usage exposed cache-write tokens.
+
+- Hardened the session-history writer against the same regressions.
+  New writes now infer missing providers from model/route metadata, sanitize non-positive reasoning token placeholders before persistence, default target-provider cache telemetry from stored cache counters, and preserve valid Gemini `provider_signature_present` reasoning signals.
+
+- Synced the callback overlay source with the in-repo AAWM callback and bumped the callback wheel version to `0.0.5`.
+  This prevents future `aawm-litellm` image rebuilds from reinstalling the stale callback wheel that omitted provider-cache and tool-activity fields.
+
+- Broadened git tool-activity extraction.
+  Command parsing now handles nested command payloads and git global options such as `git -C /repo commit` / `git --git-dir=/repo/.git push`, with regression coverage for parent `git_commit_count` / `git_push_count` rollups.
+
+- Tightened adapter harness validation for session-history rows.
+  Harness validation now selects file/git rollup fields and fails rows with null providers, null reasoning sources, invalid `provider_reported` zero counts, or missing provider-cache status on target provider families.
+
 ## 2026-04-22
 
 - Started direct NVIDIA adapter support for Anthropic-routed agent models.

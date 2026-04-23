@@ -31,6 +31,7 @@ import importlib
 import json
 import queue
 import re
+import shlex
 import threading
 import time
 from datetime import datetime, timezone
@@ -255,14 +256,20 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         EXCLUDED.cache_creation_input_tokens
     ),
     reasoning_tokens_reported = COALESCE(
-        GREATEST(session_history.reasoning_tokens_reported, EXCLUDED.reasoning_tokens_reported),
-        session_history.reasoning_tokens_reported,
-        EXCLUDED.reasoning_tokens_reported
+        GREATEST(
+            NULLIF(session_history.reasoning_tokens_reported, 0),
+            NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
+        ),
+        NULLIF(session_history.reasoning_tokens_reported, 0),
+        NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
     ),
     reasoning_tokens_estimated = COALESCE(
-        GREATEST(session_history.reasoning_tokens_estimated, EXCLUDED.reasoning_tokens_estimated),
-        session_history.reasoning_tokens_estimated,
-        EXCLUDED.reasoning_tokens_estimated
+        GREATEST(
+            NULLIF(session_history.reasoning_tokens_estimated, 0),
+            NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
+        ),
+        NULLIF(session_history.reasoning_tokens_estimated, 0),
+        NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
     ),
     reasoning_tokens_source = COALESCE(
         NULLIF(EXCLUDED.reasoning_tokens_source, ''),
@@ -1234,6 +1241,95 @@ def _normalize_provider_cache_family(
     return None
 
 
+def _normalize_session_history_provider(
+    provider: Any,
+    model: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    metadata = metadata or {}
+
+    def _normalize_known_provider(candidate: Any) -> Optional[str]:
+        if not isinstance(candidate, str) or not candidate.strip():
+            return None
+        candidate_lower = candidate.strip().lower()
+        if candidate_lower in {"unknown", "none", "null"}:
+            return None
+        if candidate_lower == "google":
+            return "gemini"
+        if candidate_lower in {"nvidia", "nvidia_nim", "nvidia-nim"}:
+            return "nvidia_nim"
+        return candidate_lower
+
+    normalized_provider = _normalize_known_provider(provider)
+    if normalized_provider is not None:
+        return normalized_provider
+
+    for key in ("custom_llm_provider", "provider", "litellm_provider"):
+        normalized_provider = _normalize_known_provider(metadata.get(key))
+        if normalized_provider is not None:
+            return normalized_provider
+
+    route_family = metadata.get("passthrough_route_family")
+    if isinstance(route_family, str) and route_family.strip():
+        route_lower = route_family.lower()
+        if "nvidia" in route_lower:
+            return "nvidia_nim"
+        if "openrouter" in route_lower:
+            return "openrouter"
+        if "gemini" in route_lower or "google" in route_lower:
+            return "gemini"
+        if "codex" in route_lower or "openai" in route_lower:
+            return "openai"
+        if "anthropic" in route_lower:
+            return "anthropic"
+
+    request_route = metadata.get("user_api_key_request_route")
+    if isinstance(request_route, str) and request_route.strip():
+        route_lower = request_route.lower()
+        if route_lower.startswith("/anthropic/"):
+            return "anthropic"
+        if "gemini" in route_lower or "google" in route_lower:
+            return "gemini"
+        if route_lower.startswith("/v1/"):
+            return "openai"
+
+    api_base = metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base")
+    if isinstance(api_base, str) and api_base.strip():
+        api_base_lower = api_base.lower()
+        if "integrate.api.nvidia.com" in api_base_lower:
+            return "nvidia_nim"
+        if "openrouter.ai" in api_base_lower:
+            return "openrouter"
+        if "anthropic.com" in api_base_lower:
+            return "anthropic"
+        if "googleapis.com" in api_base_lower or "generativelanguage" in api_base_lower:
+            return "gemini"
+        if "openai.com" in api_base_lower:
+            return "openai"
+
+    model_lower = str(model or "").strip().lower()
+    if not model_lower or model_lower == "unknown":
+        return None
+    if model_lower.startswith("nvidia/"):
+        return "nvidia_nim"
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if "gemini" in model_lower or model_lower.startswith("google/"):
+        return "gemini"
+    if "claude" in model_lower or model_lower.startswith("anthropic/"):
+        return "anthropic"
+    if (
+        model_lower.startswith("gpt")
+        or model_lower.startswith("o1")
+        or model_lower.startswith("o3")
+        or model_lower.startswith("o4")
+        or model_lower.startswith("openai/")
+        or "codex" in model_lower
+    ):
+        return "openai"
+    return None
+
+
 def _supports_prompt_caching_safe(
     *,
     model: str,
@@ -1484,12 +1580,16 @@ def _resolve_provider_cache_state(
     if provider_family is None:
         return None
 
-    state_from_metadata = _provider_cache_state_from_metadata(metadata, provider_family)
-    if state_from_metadata is not None:
-        return state_from_metadata
-
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
+    state_from_metadata = _provider_cache_state_from_metadata(metadata, provider_family)
+    if state_from_metadata is not None:
+        if (
+            state_from_metadata.get("status") is not None
+            or (cache_read_input_tokens <= 0 and cache_creation_input_tokens <= 0)
+        ):
+            return state_from_metadata
+
     request_has_cache_control = _request_contains_cache_control(request_body)
     request_has_cached_content = _request_contains_cached_content(request_body)
     usage_has_openai_cached_tokens = _usage_has_openai_style_cached_tokens_field(usage_obj)
@@ -1693,6 +1793,160 @@ def _estimate_reasoning_tokens(model: str, reasoning_text: str) -> Optional[int]
         return None
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    normalized = _safe_int(value)
+    if normalized is not None and normalized > 0:
+        return normalized
+    return None
+
+
+def _normalize_reasoning_state(record: Dict[str, Any]) -> None:
+    reported = _positive_int_or_none(record.get("reasoning_tokens_reported"))
+    estimated = _positive_int_or_none(record.get("reasoning_tokens_estimated"))
+    source = record.get("reasoning_tokens_source")
+    reasoning_present = bool(
+        record.get("reasoning_present") or record.get("thinking_signature_present")
+    )
+
+    record["reasoning_tokens_reported"] = reported
+    record["reasoning_tokens_estimated"] = estimated
+
+    if source == "provider_signature_present" and reported is not None:
+        record["reasoning_tokens_source"] = "provider_signature_present"
+    elif source == "provider_reported" and reported is not None:
+        record["reasoning_tokens_source"] = "provider_reported"
+    elif estimated is not None:
+        record["reasoning_tokens_source"] = "estimated_from_reasoning_text"
+    elif reasoning_present:
+        record["reasoning_tokens_source"] = "not_available"
+    else:
+        record["reasoning_tokens_source"] = "not_applicable"
+
+
+def _row_usage_object_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "prompt_tokens": int(record.get("input_tokens") or 0),
+        "completion_tokens": int(record.get("output_tokens") or 0),
+        "total_tokens": int(record.get("total_tokens") or 0),
+        "cache_read_input_tokens": int(record.get("cache_read_input_tokens") or 0),
+        "cache_creation_input_tokens": int(record.get("cache_creation_input_tokens") or 0),
+    }
+
+
+def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    provider = _normalize_session_history_provider(
+        record.get("provider"),
+        str(record.get("model") or ""),
+        metadata,
+    )
+    if provider is not None:
+        record["provider"] = provider
+
+    provider_family = _normalize_provider_cache_family(
+        provider,
+        str(record.get("model") or ""),
+        metadata,
+    )
+    if provider_family is None:
+        return
+
+    cache_state = _resolve_provider_cache_state(
+        provider=provider,
+        model=str(record.get("model") or ""),
+        usage_obj=_row_usage_object_from_record(record),
+        metadata=metadata,
+        request_body=None,
+    )
+    if cache_state is None:
+        return
+
+    current_status = record.get("provider_cache_status")
+    should_override = (
+        not isinstance(current_status, str)
+        or not current_status.strip()
+        or bool(record.get("cache_read_input_tokens") or record.get("cache_creation_input_tokens"))
+    )
+    if not should_override:
+        return
+
+    cache_state = dict(cache_state)
+    cache_state.update(
+        _compute_provider_cache_miss_cost_state(
+            provider_family=provider_family,
+            model=str(record.get("model") or ""),
+            usage_obj=_row_usage_object_from_record(record),
+            cache_state=cache_state,
+            metadata=metadata,
+        )
+    )
+    record["provider_cache_attempted"] = bool(cache_state.get("attempted"))
+    record["provider_cache_status"] = cache_state.get("status")
+    record["provider_cache_miss"] = bool(cache_state.get("miss"))
+    record["provider_cache_miss_reason"] = cache_state.get("miss_reason")
+    record["provider_cache_miss_token_count"] = cache_state.get("miss_token_count")
+    record["provider_cache_miss_cost_usd"] = cache_state.get("miss_cost_usd")
+
+
+def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+
+    reasoning_source = record.get("reasoning_tokens_source")
+    if isinstance(reasoning_source, str) and reasoning_source.strip():
+        metadata["usage_reasoning_tokens_source"] = reasoning_source
+
+    if record.get("reasoning_tokens_reported") is not None:
+        metadata["usage_reasoning_tokens_reported"] = record["reasoning_tokens_reported"]
+    else:
+        metadata.pop("usage_reasoning_tokens_reported", None)
+
+    if record.get("reasoning_tokens_estimated") is not None:
+        metadata["usage_reasoning_tokens_estimated"] = record["reasoning_tokens_estimated"]
+    else:
+        metadata.pop("usage_reasoning_tokens_estimated", None)
+
+    provider_family = _normalize_provider_cache_family(
+        record.get("provider"),
+        str(record.get("model") or ""),
+        metadata,
+    )
+    cache_status = record.get("provider_cache_status")
+    if provider_family is not None and isinstance(cache_status, str) and cache_status.strip():
+        cache_values = {
+            "provider_cache_attempted": bool(record.get("provider_cache_attempted")),
+            "provider_cache_status": cache_status,
+            "provider_cache_miss": bool(record.get("provider_cache_miss")),
+            "provider_cache_miss_reason": record.get("provider_cache_miss_reason"),
+            "provider_cache_miss_token_count": record.get("provider_cache_miss_token_count"),
+            "provider_cache_miss_cost_usd": record.get("provider_cache_miss_cost_usd"),
+        }
+        for suffix, value in cache_values.items():
+            generic_key = f"usage_{suffix}"
+            provider_key = f"{provider_family}_{suffix}"
+            if value is None or value == "":
+                metadata.pop(generic_key, None)
+                metadata.pop(provider_key, None)
+            else:
+                metadata[generic_key] = value
+                metadata[provider_key] = value
+
+    record["metadata"] = metadata
+
+
+def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    _normalize_reasoning_state(record)
+    _normalize_provider_cache_state_on_record(record)
+    _sync_session_history_record_metadata(record)
+    return record
+
+
 _TOOL_ACTIVITY_READ_NAMES = {
     "read",
     "view",
@@ -1737,8 +1991,34 @@ _TOOL_ACTIVITY_SKIP_PATH_KEYS = {
 }
 _APPLY_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.MULTILINE)
 _APPLY_PATCH_MOVE_TO_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
-_GIT_COMMIT_RE = re.compile(r"(?<!\S)git\s+commit\b")
-_GIT_PUSH_RE = re.compile(r"(?<!\S)git\s+push\b")
+_GIT_COMMAND_RE = re.compile(r"(?<!\S)git\b(?P<args>[^;&|]*)")
+_GIT_GLOBAL_OPTIONS_WITH_VALUES = {
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+}
+_TOOL_ACTIVITY_COMMAND_TEXT_KEYS = (
+    "command",
+    "cmd",
+    "raw_text",
+    "input",
+    "script",
+    "shell",
+    "bash",
+    "code",
+    "text",
+)
+_TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS = {
+    "description",
+    "reason",
+    "thinking",
+    "title",
+    "summary",
+}
 
 
 def _dedupe_strings(values: List[str]) -> List[str]:
@@ -1804,14 +2084,66 @@ def _extract_file_paths_from_tool_arguments(arguments: Any) -> List[str]:
 
 def _extract_command_text_from_tool_arguments(arguments: Any) -> Optional[str]:
     parsed_arguments = _parse_tool_arguments(arguments)
-    if isinstance(parsed_arguments, dict):
-        for key in ("command", "cmd", "raw_text", "input"):
-            value = parsed_arguments.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    elif isinstance(parsed_arguments, str) and parsed_arguments.strip():
+    command_text = _find_command_text_in_value(parsed_arguments)
+    if command_text is not None:
+        return command_text
+    if isinstance(parsed_arguments, str) and parsed_arguments.strip():
         return parsed_arguments.strip()
     return None
+
+
+def _find_command_text_in_value(value: Any, *, depth: int = 0) -> Optional[str]:
+    if depth > 4:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        for item in value:
+            command_text = _find_command_text_in_value(item, depth=depth + 1)
+            if command_text is not None:
+                return command_text
+        return None
+    if not isinstance(value, dict):
+        return None
+
+    for key in _TOOL_ACTIVITY_COMMAND_TEXT_KEYS:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    for key, nested_value in value.items():
+        if str(key).lower() in _TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS:
+            continue
+        command_text = _find_command_text_in_value(nested_value, depth=depth + 1)
+        if command_text is not None:
+            return command_text
+    return None
+
+
+def _count_git_subcommand(command_text: str, subcommand: str) -> int:
+    count = 0
+    for match in _GIT_COMMAND_RE.finditer(command_text):
+        command = f"git{match.group('args') or ''}"
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
+                index += 2
+                continue
+            if any(token.startswith(f"{option}=") for option in _GIT_GLOBAL_OPTIONS_WITH_VALUES):
+                index += 1
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            if token == subcommand:
+                count += 1
+            break
+    return count
 
 
 def _classify_tool_kind(tool_name: str) -> str:
@@ -1866,8 +2198,8 @@ def _build_tool_activity_entry(
     git_commit_count = 0
     git_push_count = 0
     if isinstance(command_text, str) and command_text:
-        git_commit_count = len(_GIT_COMMIT_RE.findall(command_text))
-        git_push_count = len(_GIT_PUSH_RE.findall(command_text))
+        git_commit_count = _count_git_subcommand(command_text, "commit")
+        git_push_count = _count_git_subcommand(command_text, "push")
 
     return {
         "tool_index": tool_index,
@@ -2610,7 +2942,11 @@ def _build_backfill_kwargs_from_spend_log_row(
 
     kwargs: Dict[str, Any] = {
         "model": str(model),
-        "custom_llm_provider": spend_log_row.get("custom_llm_provider"),
+        "custom_llm_provider": _normalize_session_history_provider(
+            spend_log_row.get("custom_llm_provider"),
+            str(model),
+            metadata,
+        ),
         "call_type": spend_log_row.get("call_type"),
         "litellm_call_id": str(request_id),
         "litellm_trace_id": trace_id,
@@ -2919,7 +3255,11 @@ def _infer_provider_from_langfuse_observation(
         ):
             return "openai"
 
-    return None
+    return _normalize_session_history_provider(
+        metadata.get("custom_llm_provider"),
+        str(observation.get("model") or ""),
+        metadata,
+    )
 
 
 def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> List[str]:
@@ -3121,7 +3461,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         }
     )
 
-    return {
+    return _normalize_session_history_record({
         "litellm_call_id": observation.get("id"),
         "session_id": session_id,
         "trace_id": trace_id,
@@ -3178,7 +3518,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
             )
         ),
         "metadata": history_metadata,
-    }
+    })
 
 
 def _derive_langfuse_trace_tags_from_langfuse_trace(
@@ -3295,6 +3635,11 @@ def _build_session_history_record(
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
     provider_reported_reasoning_tokens = reported_reasoning_tokens
     provider_prefix = _infer_usage_breakout_provider_prefix(kwargs, metadata)
+    resolved_provider = _normalize_session_history_provider(
+        kwargs.get("custom_llm_provider"),
+        resolved_model,
+        metadata,
+    )
 
     message = _extract_first_response_message(result)
     if reported_reasoning_tokens is None and provider_prefix == "gemini":
@@ -3391,7 +3736,7 @@ def _build_session_history_record(
             )
 
     provider_cache_state = _resolve_provider_cache_state(
-        provider=kwargs.get("custom_llm_provider"),
+        provider=resolved_provider,
         model=resolved_model,
         usage_obj=usage_obj,
         metadata=metadata,
@@ -3402,7 +3747,7 @@ def _build_session_history_record(
         provider_cache_state.update(
             _compute_provider_cache_miss_cost_state(
                 provider_family=_normalize_provider_cache_family(
-                    kwargs.get("custom_llm_provider"),
+                    resolved_provider,
                     resolved_model,
                     metadata,
                 ),
@@ -3413,12 +3758,12 @@ def _build_session_history_record(
             )
         )
 
-    return {
+    return _normalize_session_history_record({
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "session_id": session_id,
         "trace_id": _extract_trace_id(kwargs),
         "provider_response_id": _maybe_get(result, "id"),
-        "provider": kwargs.get("custom_llm_provider"),
+        "provider": resolved_provider,
         "model": resolved_model,
         "model_group": metadata.get("model_group") or standard_logging_object.get("model_group"),
         "agent_name": agent_name,
@@ -3467,7 +3812,7 @@ def _build_session_history_record(
             request_tags=[tag for tag in request_tags if isinstance(tag, str)],
             tenant_id=tenant_id,
         ),
-    }
+    })
 
 
 async def _open_aawm_session_history_connection() -> Any:
@@ -3508,6 +3853,7 @@ async def _ensure_session_history_schema(conn: Any) -> None:
 
 
 def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    record = _normalize_session_history_record(dict(record))
     return (
         record["litellm_call_id"],
         record["session_id"],
