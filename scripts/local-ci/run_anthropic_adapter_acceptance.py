@@ -334,6 +334,37 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
 
     if expected_rows:
         matched_records: list[dict[str, Any]] = []
+
+        def _record_matches_expected(
+            row: dict[str, Any], expected_row: dict[str, Any]
+        ) -> bool:
+            row_provider = expected_row.get('provider')
+            row_model = expected_row.get('model')
+            if row_provider is not None and row.get('provider') != row_provider:
+                return False
+            if row_model is not None and row.get('model') != row_model:
+                return False
+            for key, expected in (expected_row.get('required_equals') or {}).items():
+                if row.get(key) != expected:
+                    return False
+            for key, allowed_values in (expected_row.get('required_one_of') or {}).items():
+                if row.get(key) not in set(allowed_values or []):
+                    return False
+            for key in expected_row.get('required_truthy') or []:
+                if not row.get(key):
+                    return False
+            for key, expected_substring in (
+                expected_row.get('required_contains') or {}
+            ).items():
+                actual = row.get(key)
+                if not isinstance(actual, str) or expected_substring not in actual:
+                    return False
+            for key, minimum in (expected_row.get('minimums') or {}).items():
+                actual = row.get(key)
+                if not isinstance(actual, (int, float)) or actual < minimum:
+                    return False
+            return True
+
         for expected_row in expected_rows:
             row_provider = expected_row.get('provider')
             row_model = expected_row.get('model')
@@ -341,8 +372,7 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
                 (
                     row
                     for row in records
-                    if (row_provider is None or row.get('provider') == row_provider)
-                    and (row_model is None or row.get('model') == row_model)
+                    if _record_matches_expected(row, expected_row)
                 ),
                 None,
             )
@@ -846,6 +876,7 @@ def _parse_selected_cases(
         'claude_adapter_gpt54',
         'claude_adapter_gpt54_mini',
         'claude_adapter_ctx_marker',
+        'claude_adapter_ctx_marker_escaped',
         'claude_adapter_codex_tool_activity',
         'claude_adapter_gemini_fanout',
         'claude_adapter_peeromega_fanout',

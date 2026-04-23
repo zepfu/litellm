@@ -63,6 +63,10 @@ _AAWM_DYNAMIC_DIRECTIVE_PATTERN = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 _AAWM_CONTEXT_MARKER_PATTERN = re.compile(r":#(?P<name>[^#\r\n]+?)\.ctx#:")
+_AAWM_ESCAPED_CONTEXT_MARKER_PATTERN = re.compile(
+    r"\\+:#(?P<name>[^#\r\n]+?)\.ctx#\\+:"
+)
+_AAWM_ESCAPED_CONTEXT_MARKER_PLACEHOLDER = "@@AAWM_ESCAPED_CTX_MARKER_{index}@@"
 _AAWM_DISPATCH_CONTEXT_REFERENCE_PATTERN = re.compile(
     r"(?<![\\`])`(?P<backtick>[^`\r\n]+?)`(?!`)"
     r"|(?P<acronym>\b[A-Z][A-Z0-9]{1,}\b)"
@@ -1607,12 +1611,34 @@ def _append_aawm_context_entries_to_text(text: str, entries: list[str]) -> str:
     return text + separator + "\n\n".join(entries)
 
 
+def _protect_escaped_aawm_context_markers(text: str) -> tuple[str, dict[str, str]]:
+    replacements: dict[str, str] = {}
+
+    def _replace(match: re.Match[str]) -> str:
+        placeholder = _AAWM_ESCAPED_CONTEXT_MARKER_PLACEHOLDER.format(
+            index=len(replacements)
+        )
+        replacements[placeholder] = f":#{match.group('name')}.ctx#:"
+        return placeholder
+
+    return _AAWM_ESCAPED_CONTEXT_MARKER_PATTERN.sub(_replace, text), replacements
+
+
+def _restore_escaped_aawm_context_markers(
+    text: str, replacements: dict[str, str]
+) -> str:
+    for placeholder, restored_marker in replacements.items():
+        text = text.replace(placeholder, restored_marker)
+    return text
+
+
 async def _expand_aawm_context_markers_in_text(
     text: str, available_context: dict[str, str]
 ) -> tuple[str, list[dict[str, Any]]]:
-    matches = list(_AAWM_CONTEXT_MARKER_PATTERN.finditer(text))
+    protected_text, escaped_markers = _protect_escaped_aawm_context_markers(text)
+    matches = list(_AAWM_CONTEXT_MARKER_PATTERN.finditer(protected_text))
     if not matches:
-        return text, []
+        return _restore_escaped_aawm_context_markers(protected_text, escaped_markers), []
 
     rebuilt_parts: list[str] = []
     ordered_names: list[str] = []
@@ -1620,7 +1646,7 @@ async def _expand_aawm_context_markers_in_text(
     cursor = 0
 
     for match in matches:
-        rebuilt_parts.append(text[cursor:match.start()])
+        rebuilt_parts.append(protected_text[cursor:match.start()])
         name = match.group("name").strip()
         rebuilt_parts.append(name)
         if name and name not in seen_names:
@@ -1628,8 +1654,11 @@ async def _expand_aawm_context_markers_in_text(
             ordered_names.append(name)
         cursor = match.end()
 
-    rebuilt_parts.append(text[cursor:])
-    updated_text = "".join(rebuilt_parts)
+    rebuilt_parts.append(protected_text[cursor:])
+    updated_text = _restore_escaped_aawm_context_markers(
+        "".join(rebuilt_parts),
+        escaped_markers,
+    )
     if not ordered_names:
         return updated_text, []
 
@@ -1807,8 +1836,9 @@ async def _expand_aawm_dynamic_directives_in_value(
 ) -> tuple[Any, list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
+            original_text = value["text"]
             updated_text, injection_events = await _expand_aawm_dynamic_directives_in_text(
-                value["text"],
+                original_text,
                 available_context,
             )
             updated_text, context_events = await _expand_aawm_context_markers_in_text(
@@ -1825,7 +1855,7 @@ async def _expand_aawm_dynamic_directives_in_value(
                     available_context,
                 )
                 combined_events.extend(dispatch_context_events)
-            if combined_events:
+            if combined_events or updated_text != original_text:
                 updated_value = dict(value)
                 updated_value["text"] = updated_text
                 return updated_value, combined_events
@@ -1994,13 +2024,14 @@ async def expand_aawm_dynamic_directives_in_anthropic_request_body(
             available_context,
             enable_dispatch_backtick_context=enable_dispatch_backtick_context,
         )
-        if value_events:
+        if updated_value is not request_body[top_level_key]:
             updated_body[top_level_key] = updated_value
-            injection_events.extend(value_events)
             changed = True
+        if value_events:
+            injection_events.extend(value_events)
 
     if not injection_events:
-        return request_body, []
+        return (updated_body if changed else request_body), []
 
     updated_body = _add_aawm_dynamic_injection_logging_metadata(
         updated_body,
