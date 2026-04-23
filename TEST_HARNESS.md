@@ -56,8 +56,19 @@ source .env >/dev/null 2>&1
 set +a
 python scripts/local-ci/run_anthropic_adapter_acceptance.py \
   --config scripts/local-ci/anthropic_adapter_config.json \
+  --target dev \
   --write-artifact /tmp/anthropic-adapter-acceptance.json
 ```
+
+Use `--target prod` for the production-style `:4000` instance. The target
+profile rewrites the Claude CLI `ANTHROPIC_BASE_URL`, runtime health URL,
+runtime Docker log container, and expected Langfuse trace environment:
+
+- `dev`: `http://127.0.0.1:4001/anthropic`, container `litellm-dev`, trace environment `dev`
+- `prod`: `http://127.0.0.1:4000/anthropic`, container `aawm-litellm`, trace environment `prod`
+
+The harness should fail if the selected target emits traces under the wrong
+Langfuse environment.
 
 This suite shells out to the real Claude CLI and then validates:
 

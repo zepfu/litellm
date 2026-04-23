@@ -18,6 +18,20 @@ import psycopg
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / 'scripts' / 'local-ci' / 'anthropic_adapter_config.json'
 RUN_ACCEPTANCE_PATH = ROOT / 'scripts' / 'local-ci' / 'run_acceptance.py'
+BUILT_IN_TARGET_PROFILES: dict[str, dict[str, str]] = {
+    'dev': {
+        'litellm_base_url': 'http://127.0.0.1:4001',
+        'anthropic_base_url': 'http://127.0.0.1:4001/anthropic',
+        'docker_container_name': 'litellm-dev',
+        'expected_trace_environment': 'dev',
+    },
+    'prod': {
+        'litellm_base_url': 'http://127.0.0.1:4000',
+        'anthropic_base_url': 'http://127.0.0.1:4000/anthropic',
+        'docker_container_name': 'aawm-litellm',
+        'expected_trace_environment': 'prod',
+    },
+}
 
 
 def _load_run_acceptance_module() -> Any:
@@ -75,6 +89,99 @@ def _resolve_env_placeholders(value: Any) -> Any:
     if isinstance(value, str):
         return os.path.expandvars(value)
     return value
+
+
+def _docker_status_for_container(container_name: str) -> str:
+    result = subprocess.run(
+        ['docker', 'ps', '--filter', f'name=^{container_name}$', '--format', '{{.Status}}'],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ''
+    return result.stdout.strip()
+
+
+def _target_profile_settings(
+    *,
+    config: dict[str, Any],
+    target: str,
+    litellm_base_url: str | None = None,
+    anthropic_base_url: str | None = None,
+    docker_container_name: str | None = None,
+    expected_trace_environment: str | None = None,
+) -> dict[str, str]:
+    configured_profiles = config.get('target_profiles')
+    profiles = dict(BUILT_IN_TARGET_PROFILES)
+    if isinstance(configured_profiles, dict):
+        for name, profile in configured_profiles.items():
+            if isinstance(name, str) and isinstance(profile, dict):
+                profiles[name] = {
+                    key: str(value)
+                    for key, value in profile.items()
+                    if isinstance(value, (str, int, float))
+                }
+
+    if target not in profiles:
+        valid = ', '.join(sorted(profiles))
+        raise SystemExit(f'Unknown adapter target `{target}`. Valid targets: {valid}')
+
+    profile = dict(profiles[target])
+    if litellm_base_url:
+        profile['litellm_base_url'] = litellm_base_url.rstrip('/')
+    if anthropic_base_url:
+        profile['anthropic_base_url'] = anthropic_base_url.rstrip('/')
+    if docker_container_name:
+        profile['docker_container_name'] = docker_container_name
+    if expected_trace_environment:
+        profile['expected_trace_environment'] = expected_trace_environment
+
+    profile.setdefault('litellm_base_url', config.get('litellm_base_url', 'http://127.0.0.1:4001'))
+    profile.setdefault('anthropic_base_url', f"{profile['litellm_base_url'].rstrip('/')}/anthropic")
+    profile.setdefault('docker_container_name', 'litellm-dev')
+    profile.setdefault('expected_trace_environment', target)
+    profile['litellm_base_url'] = profile['litellm_base_url'].rstrip('/')
+    profile['anthropic_base_url'] = profile['anthropic_base_url'].rstrip('/')
+    return profile
+
+
+def _apply_target_profile_to_config(
+    config: dict[str, Any],
+    *,
+    target: str,
+    profile: dict[str, str],
+) -> dict[str, Any]:
+    updated_config = dict(config)
+    updated_config['target_profile'] = target
+    updated_config['litellm_base_url'] = profile['litellm_base_url']
+    updated_config['expected_trace_environment'] = profile['expected_trace_environment']
+
+    cases = updated_config.get('cases') or {}
+    updated_cases: dict[str, Any] = {}
+    for case_name, case_config in cases.items():
+        if not isinstance(case_config, dict):
+            updated_cases[case_name] = case_config
+            continue
+
+        updated_case = dict(case_config)
+        case_env = dict(updated_case.get('env') or {})
+        if 'ANTHROPIC_BASE_URL' in case_env:
+            case_env['ANTHROPIC_BASE_URL'] = profile['anthropic_base_url']
+        updated_case['env'] = case_env
+
+        runtime_postconditions = dict(updated_case.get('runtime_postconditions') or {})
+        runtime_postconditions['healthcheck_url'] = (
+            f"{profile['litellm_base_url']}/health/liveliness"
+        )
+        runtime_postconditions['docker_container_name'] = profile['docker_container_name']
+        updated_case['runtime_postconditions'] = runtime_postconditions
+        updated_case['expected_trace_environment'] = profile['expected_trace_environment']
+        updated_cases[case_name] = updated_case
+
+    updated_config['cases'] = updated_cases
+    return updated_config
 
 
 def _missing_required_env(config: dict[str, Any]) -> list[str]:
@@ -904,17 +1011,40 @@ def _parse_selected_cases(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Run real-Claude Anthropic adapter acceptance checks through litellm-dev.')
+    parser = argparse.ArgumentParser(description='Run real-Claude Anthropic adapter acceptance checks through a target LiteLLM instance.')
     parser.add_argument('--config', default=str(DEFAULT_CONFIG), help='Path to adapter suite config JSON.')
     parser.add_argument('--write-artifact', required=True, help='Where to write the JSON artifact.')
     parser.add_argument('--langfuse-query-url', default=None, help='Override Langfuse query URL.')
     parser.add_argument('--cases', default=None, help='Comma-separated subset of adapter cases to run.')
+    parser.add_argument(
+        '--target',
+        default=os.environ.get('AAWM_ADAPTER_TARGET', None),
+        help='Target profile to test. Built-ins: dev (:4001/litellm-dev), prod (:4000/aawm-litellm).',
+    )
+    parser.add_argument('--litellm-base-url', default=None, help='Override the target LiteLLM base URL.')
+    parser.add_argument('--anthropic-base-url', default=None, help='Override ANTHROPIC_BASE_URL passed to Claude CLI.')
+    parser.add_argument('--docker-container-name', default=None, help='Override the Docker container used for health/log checks.')
+    parser.add_argument('--expected-trace-environment', default=None, help='Override expected Langfuse trace environment.')
     args = parser.parse_args()
 
     config_path = pathlib.Path(args.config)
     artifact_path = pathlib.Path(args.write_artifact)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     config = _resolve_env_placeholders(RA._load_json(config_path))
+    target = args.target or str(config.get('default_target_profile') or 'dev')
+    profile = _target_profile_settings(
+        config=config,
+        target=target,
+        litellm_base_url=args.litellm_base_url,
+        anthropic_base_url=args.anthropic_base_url,
+        docker_container_name=args.docker_container_name,
+        expected_trace_environment=args.expected_trace_environment,
+    )
+    config = _apply_target_profile_to_config(
+        config,
+        target=target,
+        profile=profile,
+    )
 
     public_key_env = config.get('langfuse_public_key_env', 'LANGFUSE_PUBLIC_KEY')
     secret_key_env = config.get('langfuse_secret_key_env', 'LANGFUSE_SECRET_KEY')
@@ -934,7 +1064,7 @@ def main() -> int:
         default_excluded_cases=config.get('default_excluded_cases'),
     )
 
-    litellm_base_url = config.get('litellm_base_url', 'http://127.0.0.1:4001')
+    litellm_base_url = config.get('litellm_base_url', profile['litellm_base_url'])
 
     artifact: dict[str, Any] = {
         'suite_version': config.get('suite_version', 1),
@@ -942,9 +1072,17 @@ def main() -> int:
         'git_commit': RA._git_value('rev-parse', 'HEAD'),
         'git_branch': RA._git_value('branch', '--show-current'),
         'environment': {
+            'target_profile': target,
             'litellm_base_url': litellm_base_url,
+            'anthropic_base_url': profile['anthropic_base_url'],
             'langfuse_query_url': query_url,
-            'docker_litellm_dev_status': RA._docker_status(),
+            'langfuse_public_key_env': public_key_env,
+            'langfuse_secret_key_env': secret_key_env,
+            'expected_trace_environment': profile['expected_trace_environment'],
+            'docker_container_name': profile['docker_container_name'],
+            'docker_container_status': _docker_status_for_container(
+                profile['docker_container_name']
+            ),
         },
         'results': {},
         'summary': {},
