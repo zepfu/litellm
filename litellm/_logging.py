@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from datetime import datetime
 from logging import Formatter
 from typing import Any, Dict, List, Optional
@@ -96,6 +97,84 @@ class SecretRedactionFilter(logging.Filter):
 
 _secret_filter = SecretRedactionFilter()
 
+_EGRESS_GUARD_ALERT_LOCK = threading.Lock()
+_EGRESS_GUARD_ALERT_STATE: Dict[str, Any] = {
+    "trigger_count": 0,
+    "last_triggered_at": None,
+    "last_reason": None,
+    "last_target": None,
+    "last_credential_family": None,
+    "last_target_family": None,
+}
+
+
+def _get_egress_guard_alert_suffix() -> str:
+    message = "EGRESS GUARD TRIGGERED - INVESTIGATE IMMEDIATELY"
+    if json_logs:
+        return message
+    return f"\033[91m{message}\033[0m"
+
+
+def get_egress_guard_alert_state() -> Dict[str, Any]:
+    with _EGRESS_GUARD_ALERT_LOCK:
+        return dict(_EGRESS_GUARD_ALERT_STATE)
+
+
+def reset_egress_guard_alert_state() -> None:
+    with _EGRESS_GUARD_ALERT_LOCK:
+        _EGRESS_GUARD_ALERT_STATE.update(
+            {
+                "trigger_count": 0,
+                "last_triggered_at": None,
+                "last_reason": None,
+                "last_target": None,
+                "last_credential_family": None,
+                "last_target_family": None,
+            }
+        )
+
+
+def trigger_egress_guard_alert(
+    *,
+    reason: str,
+    target: Optional[str] = None,
+    credential_family: Optional[str] = None,
+    target_family: Optional[str] = None,
+) -> Dict[str, Any]:
+    with _EGRESS_GUARD_ALERT_LOCK:
+        _EGRESS_GUARD_ALERT_STATE["trigger_count"] += 1
+        _EGRESS_GUARD_ALERT_STATE["last_triggered_at"] = datetime.utcnow().isoformat()
+        _EGRESS_GUARD_ALERT_STATE["last_reason"] = reason
+        _EGRESS_GUARD_ALERT_STATE["last_target"] = target
+        _EGRESS_GUARD_ALERT_STATE["last_credential_family"] = credential_family
+        _EGRESS_GUARD_ALERT_STATE["last_target_family"] = target_family
+        return dict(_EGRESS_GUARD_ALERT_STATE)
+
+
+class EgressGuardAlertFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        state = get_egress_guard_alert_state()
+        if state.get("trigger_count", 0) <= 0:
+            return True
+        if getattr(record, "_egress_guard_alert_suffix_applied", False):
+            return True
+
+        suffix = _get_egress_guard_alert_suffix()
+        try:
+            if isinstance(record.msg, str):
+                record.msg = f"{record.msg} [{suffix}]"
+            else:
+                record.msg = f"{record.getMessage()} [{suffix}]"
+                record.args = None
+        except Exception:
+            if isinstance(record.msg, str):
+                record.msg = f"{record.msg} [{suffix}]"
+        record._egress_guard_alert_suffix_applied = True
+        return True
+
+
+_egress_guard_alert_filter = EgressGuardAlertFilter()
+
 
 json_logs = bool(os.getenv("JSON_LOGS", False))
 # Create a handler for the logger (you may need to adapt this based on your needs)
@@ -104,6 +183,7 @@ numeric_level: str = getattr(logging, log_level.upper())
 handler = logging.StreamHandler()
 handler.setLevel(numeric_level)
 handler.addFilter(_secret_filter)
+handler.addFilter(_egress_guard_alert_filter)
 
 
 def _try_parse_json_message(message: str) -> Optional[Dict[str, Any]]:
@@ -210,6 +290,7 @@ def _setup_json_exception_handlers(formatter):
     error_handler = logging.StreamHandler()
     error_handler.setFormatter(formatter)
     error_handler.addFilter(_secret_filter)
+    error_handler.addFilter(_egress_guard_alert_filter)
 
     # Setup excepthook for uncaught exceptions
     def json_excepthook(exc_type, exc_value, exc_traceback):
@@ -295,7 +376,20 @@ ALL_LOGGERS = [
     verbose_logger,
     verbose_router_logger,
     verbose_proxy_logger,
+    logging.getLogger("uvicorn"),
+    logging.getLogger("uvicorn.error"),
+    logging.getLogger("uvicorn.access"),
 ]
+
+
+def _ensure_filter_on_logger(logger: logging.Logger, log_filter: logging.Filter) -> None:
+    if any(existing_filter is log_filter for existing_filter in logger.filters):
+        return
+    logger.addFilter(log_filter)
+
+
+for _logger in ALL_LOGGERS:
+    _ensure_filter_on_logger(_logger, _egress_guard_alert_filter)
 
 
 def _get_loggers_to_initialize():
@@ -326,8 +420,10 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
     - Prevents bubbling to parent/root (critical to prevent duplicate JSON logs)
     """
     handler.addFilter(_secret_filter)
+    handler.addFilter(_egress_guard_alert_filter)
     for lg in _get_loggers_to_initialize():
         lg.handlers.clear()  # remove any existing handlers
+        _ensure_filter_on_logger(lg, _egress_guard_alert_filter)
         lg.addHandler(handler)  # add JSON formatter handler
         lg.propagate = False  # prevent bubbling to parent/root
 

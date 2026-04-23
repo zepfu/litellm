@@ -4,15 +4,47 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     container_name: litellm-dev
+    command: ["litellm", "--config", "/app/litellm-dev-config.yaml", "--port", "4001"]
     ports:
       - "4001:4001"
     volumes:
       # Mount source for live code changes (key files only)
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
+      - ./litellm/utils.py:/app/litellm/utils.py
+      - ./litellm/litellm_core_utils/get_model_cost_map.py:/app/litellm/litellm_core_utils/get_model_cost_map.py
+      - ./litellm/litellm_core_utils/prompt_templates/factory.py:/app/litellm/litellm_core_utils/prompt_templates/factory.py
+      - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json
+      - ./litellm/types/llms/anthropic.py:/app/litellm/types/llms/anthropic.py
+      - ./litellm/types/llms/anthropic_messages/anthropic_response.py:/app/litellm/types/llms/anthropic_messages/anthropic_response.py
+      - ./litellm/types/llms/openai.py:/app/litellm/types/llms/openai.py
+      - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
+      - ./litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py:/app/litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py
+      - ./litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py:/app/litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py
+      - ./litellm/llms/anthropic/experimental_pass_through/adapters/handler.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/handler.py
+      - ./litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py
+      - ./litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py
+      - ./litellm/_logging.py:/app/litellm/_logging.py
+      - ./litellm/passthrough/utils.py:/app/litellm/passthrough/utils.py
+      - ./litellm/proxy/pass_through_endpoints/pass_through_endpoints.py:/app/litellm/proxy/pass_through_endpoints/pass_through_endpoints.py
+      - ./litellm/proxy/pass_through_endpoints/streaming_handler.py:/app/litellm/proxy/pass_through_endpoints/streaming_handler.py
+      - ./litellm/proxy/pass_through_endpoints/success_handler.py:/app/litellm/proxy/pass_through_endpoints/success_handler.py
+      - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py
+      - ./litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py:/app/litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py
+      - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
+      - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py
+      - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
       # Claude persisted-output files for local expansion
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
+      # Claude agent specs for subagent model resolution
+      - /home/zepfu/projects/aawm/agents:/home/zepfu/.claude/agents:ro
+      # Codex OAuth tokens for Anthropic->Codex adapter testing
+      - /home/zepfu/.codex:/home/zepfu/.codex:ro
+      # Gemini OAuth tokens for Anthropic->Google adapter testing
+      - /home/zepfu/.gemini:/home/zepfu/.gemini:ro
+      # Gemini CLI install for OAuth client fallback during local adapter testing
+      - /home/zepfu/.nvm/versions/node:/home/zepfu/.nvm/versions/node:ro
       # Capture output — written to /tmp/captures inside container, visible on host
       - ./captures:/tmp/captures
     environment:
@@ -21,6 +53,7 @@ services:
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
       - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
       - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=${LITELLM_LANGFUSE_TRACE_ENVIRONMENT:-dev}
+      - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
       # AAWM dynamic injection database access
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-postgres18}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-5432}
@@ -42,10 +75,32 @@ services:
       - AAWM_POSTGRES_SSL=${LITELLM_AAWM_POSTGRES_SSL:-}
       - AAWM_POSTGRES_URL=${LITELLM_AAWM_POSTGRES_URL:-}
       # No server-side ANTHROPIC_API_KEY — client provides via x-api-key header
-      # Enable payload capture to ./captures/
-      - AAWM_CAPTURE=1
+      # Payload capture stays off by default; enable explicitly for debug sessions
+      - AAWM_CAPTURE=${AAWM_CAPTURE:-0}
+      - LITELLM_LOG=${LITELLM_LOG:-INFO}
+      - AAWM_GEMINI_ROUTE_DEBUG=${AAWM_GEMINI_ROUTE_DEBUG:-0}
+      - AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS=${AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS:-30}
+      - AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=${AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS:-20}
+      - AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS=${AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS:-2,4,8,12}
       - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
       - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
+      - LITELLM_CODEX_AUTH_FILE=${LITELLM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}
+      - LITELLM_GEMINI_AUTH_FILE=${LITELLM_GEMINI_AUTH_FILE:-/home/zepfu/.gemini/oauth_creds.json}
+      - LITELLM_GEMINI_OAUTH_CLIENT_ID=${LITELLM_GEMINI_OAUTH_CLIENT_ID:-}
+      - LITELLM_GEMINI_OAUTH_CLIENT_SECRET=${LITELLM_GEMINI_OAUTH_CLIENT_SECRET:-}
+      - LITELLM_GEMINI_CLI_BUNDLE_PATH=${LITELLM_GEMINI_CLI_BUNDLE_PATH:-}
+      - AAWM_NVIDIA_API_KEY=${AAWM_NVIDIA_API_KEY:-}
+      - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - NVIDIA_NIM_API_BASE=${NVIDIA_NIM_API_BASE:-https://integrate.api.nvidia.com/v1}
+      - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api}
+      - OR_SITE_URL=${OR_SITE_URL:-https://litellm.ai}
+      - OR_APP_NAME=${OR_APP_NAME:-liteLLM}
+      - AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS=${AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS:-2,4,8,12}
+      - AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=${AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS:-12}
+      - AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=${AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS:-300}
     networks:
       - default
       - aawm_default

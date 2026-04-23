@@ -22,12 +22,18 @@ Registration in litellm-config.yaml:
       success_callback: ["langfuse"]
 """
 
+import ast
 import asyncio
+import atexit
 import base64
 import hashlib
 import importlib
 import json
+import queue
 import re
+import shlex
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
@@ -120,15 +126,65 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     reasoning_tokens_source TEXT,
     reasoning_present BOOLEAN NOT NULL DEFAULT FALSE,
     thinking_signature_present BOOLEAN NOT NULL DEFAULT FALSE,
+    provider_cache_attempted BOOLEAN NOT NULL DEFAULT FALSE,
+    provider_cache_status TEXT,
+    provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE,
+    provider_cache_miss_reason TEXT,
+    provider_cache_miss_token_count INTEGER,
+    provider_cache_miss_cost_usd DOUBLE PRECISION,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
     tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
+    file_read_count INTEGER NOT NULL DEFAULT 0,
+    file_modified_count INTEGER NOT NULL DEFAULT 0,
+    git_commit_count INTEGER NOT NULL DEFAULT 0,
+    git_push_count INTEGER NOT NULL DEFAULT 0,
     response_cost_usd DOUBLE PRECISION,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 )
 """
+_AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_read_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_modified_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_commit_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_push_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_attempted BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_status TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_reason TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_token_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_cost_usd DOUBLE PRECISION",
+)
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON public.session_history (session_id, model, created_at DESC)",
+)
+_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    litellm_call_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    trace_id TEXT,
+    provider TEXT,
+    model TEXT NOT NULL,
+    agent_name TEXT,
+    tool_index INTEGER NOT NULL,
+    tool_call_id TEXT,
+    tool_name TEXT NOT NULL,
+    tool_kind TEXT,
+    file_paths_read JSONB NOT NULL DEFAULT '[]'::jsonb,
+    file_paths_modified JSONB NOT NULL DEFAULT '[]'::jsonb,
+    git_commit_count INTEGER NOT NULL DEFAULT 0,
+    git_push_count INTEGER NOT NULL DEFAULT 0,
+    command_text TEXT,
+    arguments JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (litellm_call_id, tool_index)
+)
+"""
+_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS session_history_tool_activity_session_created_idx ON public.session_history_tool_activity (session_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_tool_activity_tool_name_idx ON public.session_history_tool_activity (tool_name)",
 )
 _AAWM_SESSION_HISTORY_INSERT_SQL = """
 INSERT INTO public.session_history (
@@ -154,14 +210,24 @@ INSERT INTO public.session_history (
     reasoning_tokens_source,
     reasoning_present,
     thinking_signature_present,
+    provider_cache_attempted,
+    provider_cache_status,
+    provider_cache_miss,
+    provider_cache_miss_reason,
+    provider_cache_miss_token_count,
+    provider_cache_miss_cost_usd,
     tool_call_count,
     tool_names,
+    file_read_count,
+    file_modified_count,
+    git_commit_count,
+    git_push_count,
     response_cost_usd,
     metadata
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24::jsonb, $25, $26::jsonb
+    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb, $31, $32, $33, $34, $35, $36::jsonb
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -190,14 +256,20 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         EXCLUDED.cache_creation_input_tokens
     ),
     reasoning_tokens_reported = COALESCE(
-        GREATEST(session_history.reasoning_tokens_reported, EXCLUDED.reasoning_tokens_reported),
-        session_history.reasoning_tokens_reported,
-        EXCLUDED.reasoning_tokens_reported
+        GREATEST(
+            NULLIF(session_history.reasoning_tokens_reported, 0),
+            NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
+        ),
+        NULLIF(session_history.reasoning_tokens_reported, 0),
+        NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
     ),
     reasoning_tokens_estimated = COALESCE(
-        GREATEST(session_history.reasoning_tokens_estimated, EXCLUDED.reasoning_tokens_estimated),
-        session_history.reasoning_tokens_estimated,
-        EXCLUDED.reasoning_tokens_estimated
+        GREATEST(
+            NULLIF(session_history.reasoning_tokens_estimated, 0),
+            NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
+        ),
+        NULLIF(session_history.reasoning_tokens_estimated, 0),
+        NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
     ),
     reasoning_tokens_source = COALESCE(
         NULLIF(EXCLUDED.reasoning_tokens_source, ''),
@@ -205,18 +277,90 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     ),
     reasoning_present = session_history.reasoning_present OR EXCLUDED.reasoning_present,
     thinking_signature_present = session_history.thinking_signature_present OR EXCLUDED.thinking_signature_present,
+    provider_cache_attempted = session_history.provider_cache_attempted OR EXCLUDED.provider_cache_attempted,
+    provider_cache_status = COALESCE(
+        NULLIF(EXCLUDED.provider_cache_status, ''),
+        session_history.provider_cache_status
+    ),
+    provider_cache_miss = session_history.provider_cache_miss OR EXCLUDED.provider_cache_miss,
+    provider_cache_miss_reason = COALESCE(
+        NULLIF(EXCLUDED.provider_cache_miss_reason, ''),
+        session_history.provider_cache_miss_reason
+    ),
+    provider_cache_miss_token_count = COALESCE(
+        GREATEST(session_history.provider_cache_miss_token_count, EXCLUDED.provider_cache_miss_token_count),
+        session_history.provider_cache_miss_token_count,
+        EXCLUDED.provider_cache_miss_token_count
+    ),
+    provider_cache_miss_cost_usd = COALESCE(
+        GREATEST(session_history.provider_cache_miss_cost_usd, EXCLUDED.provider_cache_miss_cost_usd),
+        session_history.provider_cache_miss_cost_usd,
+        EXCLUDED.provider_cache_miss_cost_usd
+    ),
     tool_call_count = GREATEST(session_history.tool_call_count, EXCLUDED.tool_call_count),
     tool_names = CASE
         WHEN jsonb_array_length(EXCLUDED.tool_names) > jsonb_array_length(session_history.tool_names)
             THEN EXCLUDED.tool_names
         ELSE session_history.tool_names
     END,
+    file_read_count = GREATEST(session_history.file_read_count, EXCLUDED.file_read_count),
+    file_modified_count = GREATEST(session_history.file_modified_count, EXCLUDED.file_modified_count),
+    git_commit_count = GREATEST(session_history.git_commit_count, EXCLUDED.git_commit_count),
+    git_push_count = GREATEST(session_history.git_push_count, EXCLUDED.git_push_count),
     response_cost_usd = COALESCE(
         GREATEST(session_history.response_cost_usd, EXCLUDED.response_cost_usd),
         session_history.response_cost_usd,
         EXCLUDED.response_cost_usd
     ),
     metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+"""
+_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL = """
+INSERT INTO public.session_history_tool_activity (
+    litellm_call_id,
+    session_id,
+    trace_id,
+    provider,
+    model,
+    agent_name,
+    tool_index,
+    tool_call_id,
+    tool_name,
+    tool_kind,
+    file_paths_read,
+    file_paths_modified,
+    git_commit_count,
+    git_push_count,
+    command_text,
+    arguments,
+    metadata
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17::jsonb
+)
+ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
+    session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history_tool_activity.session_id),
+    trace_id = COALESCE(NULLIF(EXCLUDED.trace_id, ''), session_history_tool_activity.trace_id),
+    provider = COALESCE(NULLIF(EXCLUDED.provider, ''), session_history_tool_activity.provider),
+    model = COALESCE(NULLIF(EXCLUDED.model, ''), session_history_tool_activity.model),
+    agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history_tool_activity.agent_name),
+    tool_call_id = COALESCE(NULLIF(EXCLUDED.tool_call_id, ''), session_history_tool_activity.tool_call_id),
+    tool_name = COALESCE(NULLIF(EXCLUDED.tool_name, ''), session_history_tool_activity.tool_name),
+    tool_kind = COALESCE(NULLIF(EXCLUDED.tool_kind, ''), session_history_tool_activity.tool_kind),
+    file_paths_read = CASE
+        WHEN jsonb_array_length(EXCLUDED.file_paths_read) > jsonb_array_length(session_history_tool_activity.file_paths_read)
+            THEN EXCLUDED.file_paths_read
+        ELSE session_history_tool_activity.file_paths_read
+    END,
+    file_paths_modified = CASE
+        WHEN jsonb_array_length(EXCLUDED.file_paths_modified) > jsonb_array_length(session_history_tool_activity.file_paths_modified)
+            THEN EXCLUDED.file_paths_modified
+        ELSE session_history_tool_activity.file_paths_modified
+    END,
+    git_commit_count = GREATEST(session_history_tool_activity.git_commit_count, EXCLUDED.git_commit_count),
+    git_push_count = GREATEST(session_history_tool_activity.git_push_count, EXCLUDED.git_push_count),
+    command_text = COALESCE(NULLIF(EXCLUDED.command_text, ''), session_history_tool_activity.command_text),
+    arguments = COALESCE(session_history_tool_activity.arguments, '{}'::jsonb) || COALESCE(EXCLUDED.arguments, '{}'::jsonb),
+    metadata = COALESCE(session_history_tool_activity.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "trace_name",
@@ -229,13 +373,165 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "usage_reasoning_tokens_source",
     "usage_cache_read_input_tokens",
     "usage_cache_creation_input_tokens",
+    "usage_provider_cache_attempted",
+    "usage_provider_cache_status",
+    "usage_provider_cache_miss",
+    "usage_provider_cache_miss_reason",
+    "usage_provider_cache_miss_token_count",
+    "usage_provider_cache_miss_cost_usd",
+    "usage_provider_cache_miss_cost_basis",
+    "usage_provider_cache_source",
     "usage_tool_call_count",
     "usage_tool_names",
+    "aawm_local_prepare_ms",
+    "aawm_upstream_wait_ms",
+    "aawm_time_to_first_token_ms",
+    "aawm_upstream_first_chunk_ms",
+    "aawm_first_emitted_chunk_ms",
+    "aawm_stream_emit_gap_ms",
+    "aawm_upstream_stream_complete_ms",
+    "aawm_local_stream_finalize_ms",
+    "aawm_local_finalize_ms",
+    "aawm_total_proxy_overhead_ms",
+    "aawm_total_proxy_duration_ms",
+    "aawm_stream_chunk_count",
+    "aawm_stream_total_bytes",
 )
-_aawm_session_history_pool: Optional[Any] = None
-_aawm_session_history_pool_lock = asyncio.Lock()
+_AAWM_SESSION_HISTORY_BATCH_SIZE = 32
+_AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
+_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS = 0.1
 _aawm_session_history_schema_ready = False
-_aawm_session_history_schema_lock = asyncio.Lock()
+_aawm_session_history_schema_lock = threading.Lock()
+_aawm_session_history_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=1024)
+_aawm_session_history_worker: Optional[threading.Thread] = None
+_aawm_session_history_worker_lock = threading.Lock()
+
+
+def _get_session_history_batch_size() -> int:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_BATCH_SIZE") or ""
+    try:
+        parsed_value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_BATCH_SIZE
+    return max(1, parsed_value)
+
+
+
+def _get_session_history_flush_interval_seconds() -> float:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_FLUSH_INTERVAL_MS") or ""
+    try:
+        parsed_value = float(str(raw_value).strip()) / 1000.0
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS
+    return max(0.01, parsed_value)
+
+
+
+def _flush_session_history_batch(records: List[Dict[str, Any]]) -> None:
+    if not records:
+        return
+
+    started_at = time.perf_counter()
+    try:
+        asyncio.run(_persist_session_history_records(records))
+    except Exception as exc:
+        verbose_logger.warning(
+            "AawmAgentIdentity: failed to flush %d session_history records: %s",
+            len(records),
+            exc,
+        )
+        return
+
+    verbose_logger.debug(
+        "AawmAgentIdentity: flushed %d session_history records in %.2fms",
+        len(records),
+        (time.perf_counter() - started_at) * 1000.0,
+    )
+
+
+
+def _session_history_worker_main() -> None:
+    flush_interval = _get_session_history_flush_interval_seconds()
+    batch_size = _get_session_history_batch_size()
+
+    while True:
+        try:
+            first_item = _aawm_session_history_queue.get(timeout=flush_interval)
+        except queue.Empty:
+            continue
+
+        if first_item is None:
+            break
+
+        batch: List[Dict[str, Any]] = [first_item]
+        deadline = time.monotonic() + flush_interval
+        while len(batch) < batch_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                next_item = _aawm_session_history_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if next_item is None:
+                _flush_session_history_batch(batch)
+                return
+            batch.append(next_item)
+
+        _flush_session_history_batch(batch)
+
+
+
+def _ensure_session_history_worker_started() -> None:
+    global _aawm_session_history_worker
+
+    if _aawm_session_history_worker is not None and _aawm_session_history_worker.is_alive():
+        return
+
+    with _aawm_session_history_worker_lock:
+        if _aawm_session_history_worker is not None and _aawm_session_history_worker.is_alive():
+            return
+
+        _aawm_session_history_worker = threading.Thread(
+            target=_session_history_worker_main,
+            name="aawm-session-history-writer",
+            daemon=True,
+        )
+        _aawm_session_history_worker.start()
+
+
+
+def _shutdown_session_history_worker() -> None:
+    worker = _aawm_session_history_worker
+    if worker is None:
+        return
+
+    try:
+        _aawm_session_history_queue.put_nowait(None)
+    except queue.Full:
+        pass
+
+    worker.join(timeout=1.0)
+
+
+
+def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
+    _ensure_session_history_worker_started()
+    try:
+        _aawm_session_history_queue.put(record, timeout=_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS)
+    except queue.Full:
+        verbose_logger.warning(
+            "AawmAgentIdentity: session_history queue full; flushing overflow record in background"
+        )
+        threading.Thread(
+            target=_flush_session_history_batch,
+            args=([record],),
+            name="aawm-session-history-overflow",
+            daemon=True,
+        ).start()
+
+
+atexit.register(_shutdown_session_history_worker)
 
 
 def _content_to_text(content: Any) -> str:
@@ -449,6 +745,19 @@ def _maybe_get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+
+def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
+    current = obj
+    for key in keys:
+        if current is None:
+            return default
+        current = _maybe_get(current, key, default)
+        if current is default:
+            return default
+    return current
+
+
+
 def _extract_first_response_message(result: Any) -> Any:
     choices = _maybe_get(result, "choices")
     if not isinstance(choices, list) or len(choices) == 0:
@@ -602,20 +911,218 @@ def _parse_datetime_value(value: Any) -> Optional[datetime]:
     return None
 
 
+def _extract_responses_completed_payload_from_passthrough_fallback_text(
+    response_text: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(response_text, str) or "Chunks=" not in response_text:
+        return None
+
+    try:
+        chunks = ast.literal_eval(response_text.split("Chunks=", 1)[1].strip())
+    except Exception:
+        return None
+    if not isinstance(chunks, list):
+        return None
+
+    try:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+    except Exception:
+        return None
+
+    completed_response = None
+    output_text_parts: List[str] = []
+    for chunk in chunks:
+        if not isinstance(chunk, str):
+            continue
+        parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(str_line=chunk)
+        if not isinstance(parsed_chunk, dict):
+            continue
+        chunk_type = parsed_chunk.get("type")
+        if chunk_type == "response.output_text.delta":
+            delta = parsed_chunk.get("delta")
+            if isinstance(delta, str):
+                output_text_parts.append(delta)
+        elif chunk_type == "response.completed":
+            response_payload = parsed_chunk.get("response")
+            if isinstance(response_payload, dict):
+                completed_response = response_payload
+
+    if not isinstance(completed_response, dict):
+        return None
+
+    return {
+        "response": completed_response,
+        "output_text": "".join(output_text_parts),
+    }
+
+
+
+def _build_usage_object_from_metadata(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return None
+
+    usage_object = metadata.get("usage_object")
+    if isinstance(usage_object, dict) and usage_object:
+        return dict(usage_object)
+
+    input_tokens = _safe_int(metadata.get("usage_input_tokens"))
+    output_tokens = _safe_int(metadata.get("usage_output_tokens"))
+    total_tokens = _safe_int(metadata.get("usage_total_tokens"))
+    cache_read_input_tokens = _safe_int(metadata.get("usage_cache_read_input_tokens"))
+    cache_creation_input_tokens = _safe_int(metadata.get("usage_cache_creation_input_tokens"))
+    reasoning_tokens_reported = _safe_int(metadata.get("usage_reasoning_tokens_reported"))
+
+    if not any(
+        value is not None
+        for value in (
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            reasoning_tokens_reported,
+        )
+    ):
+        return None
+
+    reconstructed: Dict[str, Any] = {}
+    if input_tokens is not None:
+        reconstructed["input_tokens"] = input_tokens
+        reconstructed["prompt_tokens"] = input_tokens
+    if output_tokens is not None:
+        reconstructed["output_tokens"] = output_tokens
+        reconstructed["completion_tokens"] = output_tokens
+    if total_tokens is not None:
+        reconstructed["total_tokens"] = total_tokens
+    if cache_read_input_tokens is not None:
+        reconstructed["cache_read_input_tokens"] = cache_read_input_tokens
+        reconstructed["input_tokens_details"] = {
+            "cached_tokens": cache_read_input_tokens
+        }
+    if cache_creation_input_tokens is not None:
+        reconstructed["cache_creation_input_tokens"] = cache_creation_input_tokens
+    if reasoning_tokens_reported is not None:
+        reconstructed["reasoning_tokens"] = reasoning_tokens_reported
+        output_tokens_details = dict(reconstructed.get("output_tokens_details") or {})
+        output_tokens_details["reasoning_tokens"] = reasoning_tokens_reported
+        reconstructed["output_tokens_details"] = output_tokens_details
+
+    return reconstructed or None
+
+
+def _coerce_usage_object_to_dict(usage_obj: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(usage_obj, dict):
+        return dict(usage_obj)
+
+    model_dump = getattr(usage_obj, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(exclude_none=True)
+        except TypeError:
+            dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+
+    dict_method = getattr(usage_obj, "dict", None)
+    if callable(dict_method):
+        try:
+            dumped = dict_method(exclude_none=True)
+        except TypeError:
+            dumped = dict_method()
+        if isinstance(dumped, dict):
+            return dumped
+
+    return None
+
+
+def _extract_metadata_usage_object(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    standard_logging_object = kwargs.get("standard_logging_object")
+    if isinstance(standard_logging_object, dict):
+        metadata = standard_logging_object.get("metadata")
+        if isinstance(metadata, dict):
+            usage_object = metadata.get("usage_object")
+            if isinstance(usage_object, dict) and usage_object:
+                return dict(usage_object)
+            reconstructed_usage = _build_usage_object_from_metadata(metadata)
+            if reconstructed_usage is not None:
+                return reconstructed_usage
+
+    litellm_params = kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        metadata = litellm_params.get("metadata")
+        if isinstance(metadata, dict):
+            usage_object = metadata.get("usage_object")
+            if isinstance(usage_object, dict) and usage_object:
+                return dict(usage_object)
+            reconstructed_usage = _build_usage_object_from_metadata(metadata)
+            if reconstructed_usage is not None:
+                return reconstructed_usage
+
+    return None
+
+
+def _merge_usage_object_with_metadata(
+    usage_obj: Any,
+    metadata_usage_object: Optional[Dict[str, Any]],
+) -> Any:
+    if metadata_usage_object is None:
+        return usage_obj
+
+    usage_dict = _coerce_usage_object_to_dict(usage_obj)
+    if usage_dict is None:
+        return metadata_usage_object
+
+    merged_usage = dict(usage_dict)
+    for key, value in metadata_usage_object.items():
+        if key not in merged_usage or merged_usage.get(key) in (None, {}, []):
+            merged_usage[key] = value
+
+    return merged_usage
+
+
+
 def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
     usage_obj = _maybe_get(result, "usage")
+    metadata_usage_object = _extract_metadata_usage_object(kwargs)
     if usage_obj is not None:
-        return usage_obj
+        return _merge_usage_object_with_metadata(usage_obj, metadata_usage_object)
+
+    completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+        _maybe_get(result, "response")
+    )
+    if isinstance(completed_payload, dict):
+        usage_obj = _maybe_get(completed_payload.get("response"), "usage")
+        if usage_obj is not None:
+            return _merge_usage_object_with_metadata(
+                usage_obj,
+                metadata_usage_object,
+            )
 
     standard_logging_object = kwargs.get("standard_logging_object")
     if isinstance(standard_logging_object, dict):
         response = standard_logging_object.get("response")
         if isinstance(response, dict) and response.get("usage") is not None:
-            return response["usage"]
+            return _merge_usage_object_with_metadata(
+                response["usage"],
+                metadata_usage_object,
+            )
 
-        metadata = standard_logging_object.get("metadata")
-        if isinstance(metadata, dict) and metadata.get("usage_object") is not None:
-            return metadata["usage_object"]
+    if metadata_usage_object is not None:
+        return metadata_usage_object
+
+    if isinstance(standard_logging_object, dict):
+        completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+            _maybe_get(standard_logging_object.get("response"), "response")
+        )
+        if isinstance(completed_payload, dict):
+            usage_obj = _maybe_get(completed_payload.get("response"), "usage")
+            if usage_obj is not None:
+                return _merge_usage_object_with_metadata(
+                    usage_obj,
+                    metadata_usage_object,
+                )
 
     return None
 
@@ -688,9 +1195,496 @@ def _extract_cache_creation_input_tokens(usage_obj: Any) -> int:
     )
 
 
+_PROVIDER_CACHE_TARGET_FAMILIES = {"anthropic", "openai", "openrouter", "gemini"}
+
+
+def _has_nested_path(obj: Any, *keys: str) -> bool:
+    sentinel = object()
+    return _maybe_get_path(obj, *keys, default=sentinel) is not sentinel
+
+
+def _normalize_provider_cache_family(
+    provider: Any,
+    model: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    route_family = (metadata or {}).get("passthrough_route_family")
+    if isinstance(route_family, str) and route_family.strip():
+        route_family_lower = route_family.lower()
+        if "openrouter" in route_family_lower:
+            return "openrouter"
+        if "gemini" in route_family_lower or "google" in route_family_lower:
+            return "gemini"
+        if "anthropic" in route_family_lower:
+            return "anthropic"
+        if "openai" in route_family_lower or "codex" in route_family_lower:
+            return "openai"
+
+    if isinstance(provider, str) and provider.strip():
+        provider_lower = provider.strip().lower()
+        if provider_lower == "google":
+            return "gemini"
+        if provider_lower in _PROVIDER_CACHE_TARGET_FAMILIES:
+            return provider_lower
+
+    model_lower = str(model or "").strip().lower()
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if "gemini" in model_lower:
+        return "gemini"
+    if "claude" in model_lower or model_lower.startswith("anthropic/"):
+        return "anthropic"
+    if model_lower.startswith("gpt") or model_lower.startswith("o1") or model_lower.startswith("o3"):
+        return "openai"
+    if model_lower.startswith("openai/") or "codex" in model_lower:
+        return "openai"
+    return None
+
+
+def _normalize_session_history_provider(
+    provider: Any,
+    model: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    metadata = metadata or {}
+
+    def _normalize_known_provider(candidate: Any) -> Optional[str]:
+        if not isinstance(candidate, str) or not candidate.strip():
+            return None
+        candidate_lower = candidate.strip().lower()
+        if candidate_lower in {"unknown", "none", "null"}:
+            return None
+        if candidate_lower == "google":
+            return "gemini"
+        if candidate_lower in {"nvidia", "nvidia_nim", "nvidia-nim"}:
+            return "nvidia_nim"
+        return candidate_lower
+
+    normalized_provider = _normalize_known_provider(provider)
+    if normalized_provider is not None:
+        return normalized_provider
+
+    for key in ("custom_llm_provider", "provider", "litellm_provider"):
+        normalized_provider = _normalize_known_provider(metadata.get(key))
+        if normalized_provider is not None:
+            return normalized_provider
+
+    route_family = metadata.get("passthrough_route_family")
+    if isinstance(route_family, str) and route_family.strip():
+        route_lower = route_family.lower()
+        if "nvidia" in route_lower:
+            return "nvidia_nim"
+        if "openrouter" in route_lower:
+            return "openrouter"
+        if "gemini" in route_lower or "google" in route_lower:
+            return "gemini"
+        if "codex" in route_lower or "openai" in route_lower:
+            return "openai"
+        if "anthropic" in route_lower:
+            return "anthropic"
+
+    request_route = metadata.get("user_api_key_request_route")
+    if isinstance(request_route, str) and request_route.strip():
+        route_lower = request_route.lower()
+        if route_lower.startswith("/anthropic/"):
+            return "anthropic"
+        if "gemini" in route_lower or "google" in route_lower:
+            return "gemini"
+        if route_lower.startswith("/v1/"):
+            return "openai"
+
+    api_base = metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base")
+    if isinstance(api_base, str) and api_base.strip():
+        api_base_lower = api_base.lower()
+        if "integrate.api.nvidia.com" in api_base_lower:
+            return "nvidia_nim"
+        if "openrouter.ai" in api_base_lower:
+            return "openrouter"
+        if "anthropic.com" in api_base_lower:
+            return "anthropic"
+        if "googleapis.com" in api_base_lower or "generativelanguage" in api_base_lower:
+            return "gemini"
+        if "openai.com" in api_base_lower:
+            return "openai"
+
+    model_lower = str(model or "").strip().lower()
+    if not model_lower or model_lower == "unknown":
+        return None
+    if model_lower.startswith("nvidia/"):
+        return "nvidia_nim"
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if "gemini" in model_lower or model_lower.startswith("google/"):
+        return "gemini"
+    if "claude" in model_lower or model_lower.startswith("anthropic/"):
+        return "anthropic"
+    if (
+        model_lower.startswith("gpt")
+        or model_lower.startswith("o1")
+        or model_lower.startswith("o3")
+        or model_lower.startswith("o4")
+        or model_lower.startswith("openai/")
+        or "codex" in model_lower
+    ):
+        return "openai"
+    return None
+
+
+def _supports_prompt_caching_safe(
+    *,
+    model: str,
+    provider: Optional[str],
+) -> Optional[bool]:
+    normalized_model = str(model or "").strip()
+    if not normalized_model or normalized_model.lower() == "unknown":
+        return None
+    try:
+        import litellm
+
+        return bool(
+            litellm.supports_prompt_caching(
+                model=normalized_model,
+                custom_llm_provider=provider,
+            )
+        )
+    except Exception:
+        return None
+
+
+def _extract_provider_cache_request_body(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = (
+        _maybe_get(kwargs.get("passthrough_logging_payload"), "request_body"),
+        _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body"),
+        kwargs.get("request_body"),
+        _maybe_get(kwargs.get("standard_logging_object"), "request_body"),
+        _maybe_get_path(kwargs.get("standard_logging_object"), "request", "body"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _request_contains_cache_control(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        if payload.get("cache_control") is not None or payload.get("cacheControl") is not None:
+            return True
+        return any(_request_contains_cache_control(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_request_contains_cache_control(item) for item in payload)
+    return False
+
+
+def _request_contains_cached_content(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        cached_content = payload.get("cachedContent")
+        if isinstance(cached_content, str) and cached_content.strip():
+            return True
+        cached_content_alias = payload.get("cached_content")
+        if isinstance(cached_content_alias, str) and cached_content_alias.strip():
+            return True
+        return any(_request_contains_cached_content(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_request_contains_cached_content(item) for item in payload)
+    return False
+
+
+def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
+    return any(
+        _has_nested_path(usage_obj, *path)
+        for path in (
+            ("input_tokens_details", "cached_tokens"),
+            ("input_tokens_details", "cachedTokens"),
+            ("inputTokensDetails", "cached_tokens"),
+            ("inputTokensDetails", "cachedTokens"),
+        )
+    )
+
+
+def _usage_has_gemini_style_cached_content_field(usage_obj: Any) -> bool:
+    return _has_nested_path(usage_obj, "cachedContentTokenCount")
+
+
+def _extract_service_tier_hint(
+    usage_obj: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    metadata = metadata or {}
+    for candidate in (
+        _maybe_get(usage_obj, "service_tier"),
+        _maybe_get(usage_obj, "serviceTier"),
+        metadata.get("service_tier"),
+        metadata.get("serviceTier"),
+        metadata.get("openai_service_tier"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _compute_provider_cache_miss_cost_state(
+    *,
+    provider_family: Optional[str],
+    model: str,
+    usage_obj: Any,
+    cache_state: Optional[Dict[str, Any]],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "miss_token_count": None,
+        "miss_cost_usd": None,
+        "miss_cost_basis": None,
+    }
+    if provider_family is None or cache_state is None:
+        return result
+    if cache_state.get("status") != "write":
+        return result
+
+    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
+    if cache_creation_input_tokens <= 0:
+        return result
+
+    service_tier = _extract_service_tier_hint(usage_obj, metadata)
+    prompt_tokens = max(_extract_prompt_tokens(usage_obj), cache_creation_input_tokens)
+
+    try:
+        from litellm.litellm_core_utils.llm_cost_calc.utils import (
+            _get_token_base_cost,
+            calculate_cache_writing_cost,
+        )
+        from litellm.types.utils import CacheCreationTokenDetails, Usage
+        from litellm.utils import get_model_info
+
+        prompt_tokens_details = _extract_prompt_tokens_details(usage_obj)
+        cache_creation_token_details = None
+        if isinstance(prompt_tokens_details, dict):
+            detail_5m = _safe_int(
+                _maybe_get(prompt_tokens_details, "ephemeral_5m_input_tokens")
+            )
+            detail_1h = _safe_int(
+                _maybe_get(prompt_tokens_details, "ephemeral_1h_input_tokens")
+            )
+            if detail_5m is not None or detail_1h is not None:
+                cache_creation_token_details = CacheCreationTokenDetails(
+                    ephemeral_5m_input_tokens=detail_5m,
+                    ephemeral_1h_input_tokens=detail_1h,
+                )
+
+        usage_for_cost = Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=0,
+            total_tokens=prompt_tokens,
+        )
+        model_info = get_model_info(
+            model=model,
+            custom_llm_provider=provider_family,
+        )
+        (
+            _prompt_base_cost,
+            _completion_base_cost,
+            cache_creation_cost,
+            cache_creation_cost_above_1hr,
+            cache_read_cost,
+        ) = _get_token_base_cost(
+            model_info=model_info,
+            usage=usage_for_cost,
+            service_tier=service_tier,
+        )
+
+        write_cost = calculate_cache_writing_cost(
+            cache_creation_tokens=cache_creation_input_tokens,
+            cache_creation_token_details=cache_creation_token_details,
+            cache_creation_cost_above_1hr=cache_creation_cost_above_1hr,
+            cache_creation_cost=cache_creation_cost,
+        )
+        read_cost = float(cache_creation_input_tokens) * float(cache_read_cost or 0.0)
+        miss_cost = max(float(write_cost) - float(read_cost), 0.0)
+        result["miss_token_count"] = cache_creation_input_tokens
+        result["miss_cost_usd"] = miss_cost
+        result["miss_cost_basis"] = "write_vs_read_delta"
+        return result
+    except Exception:
+        return result
+
+
+def _provider_cache_state_from_metadata(
+    metadata: Dict[str, Any],
+    provider_family: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    status = metadata.get("usage_provider_cache_status")
+    if status is None and provider_family:
+        status = metadata.get(f"{provider_family}_provider_cache_status")
+    attempted = metadata.get("usage_provider_cache_attempted")
+    if attempted is None and provider_family:
+        attempted = metadata.get(f"{provider_family}_provider_cache_attempted")
+    miss = metadata.get("usage_provider_cache_miss")
+    if miss is None and provider_family:
+        miss = metadata.get(f"{provider_family}_provider_cache_miss")
+    miss_reason = metadata.get("usage_provider_cache_miss_reason")
+    if miss_reason is None and provider_family:
+        miss_reason = metadata.get(f"{provider_family}_provider_cache_miss_reason")
+    miss_token_count = metadata.get("usage_provider_cache_miss_token_count")
+    if miss_token_count is None and provider_family:
+        miss_token_count = metadata.get(f"{provider_family}_provider_cache_miss_token_count")
+    miss_cost_usd = metadata.get("usage_provider_cache_miss_cost_usd")
+    if miss_cost_usd is None and provider_family:
+        miss_cost_usd = metadata.get(f"{provider_family}_provider_cache_miss_cost_usd")
+    miss_cost_basis = metadata.get("usage_provider_cache_miss_cost_basis")
+    if miss_cost_basis is None and provider_family:
+        miss_cost_basis = metadata.get(f"{provider_family}_provider_cache_miss_cost_basis")
+    source = metadata.get("usage_provider_cache_source")
+    if source is None and provider_family:
+        source = metadata.get(f"{provider_family}_provider_cache_source")
+    if (
+        status is None
+        and attempted is None
+        and miss is None
+        and miss_reason is None
+        and miss_token_count is None
+        and miss_cost_usd is None
+        and miss_cost_basis is None
+        and source is None
+    ):
+        return None
+    normalized_status = str(status).strip() if isinstance(status, str) and status.strip() else None
+    return {
+        "attempted": bool(attempted) if attempted is not None else bool(normalized_status and normalized_status != "not_attempted"),
+        "status": normalized_status,
+        "miss": bool(miss) if miss is not None else normalized_status in {"miss", "write"},
+        "miss_reason": (
+            str(miss_reason).strip()
+            if isinstance(miss_reason, str) and str(miss_reason).strip()
+            else None
+        ),
+        "miss_token_count": _safe_int(miss_token_count),
+        "miss_cost_usd": _safe_float(miss_cost_usd),
+        "miss_cost_basis": (
+            str(miss_cost_basis).strip()
+            if isinstance(miss_cost_basis, str) and str(miss_cost_basis).strip()
+            else None
+        ),
+        "source": str(source).strip() if isinstance(source, str) and str(source).strip() else None,
+    }
+
+
+def _resolve_provider_cache_state(
+    *,
+    provider: Any,
+    model: str,
+    usage_obj: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+    request_body: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    metadata = metadata or {}
+    provider_family = _normalize_provider_cache_family(provider, model, metadata)
+    if provider_family is None:
+        return None
+
+    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
+    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
+    state_from_metadata = _provider_cache_state_from_metadata(metadata, provider_family)
+    if state_from_metadata is not None:
+        if (
+            state_from_metadata.get("status") is not None
+            or (cache_read_input_tokens <= 0 and cache_creation_input_tokens <= 0)
+        ):
+            return state_from_metadata
+
+    request_has_cache_control = _request_contains_cache_control(request_body)
+    request_has_cached_content = _request_contains_cached_content(request_body)
+    usage_has_openai_cached_tokens = _usage_has_openai_style_cached_tokens_field(usage_obj)
+    usage_has_gemini_cached_content = _usage_has_gemini_style_cached_content_field(usage_obj)
+    supports_prompt_caching = _supports_prompt_caching_safe(
+        model=model,
+        provider=provider_family,
+    )
+
+    if cache_read_input_tokens > 0:
+        return {
+            "attempted": True,
+            "status": "hit",
+            "miss": False,
+            "miss_reason": None,
+            "source": "usage.cache_read_input_tokens",
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    if cache_creation_input_tokens > 0:
+        return {
+            "attempted": True,
+            "status": "write",
+            "miss": True,
+            "miss_reason": "cache_write_only",
+            "source": "usage.cache_creation_input_tokens",
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    attempted = False
+    miss_reason: Optional[str] = None
+    source: Optional[str] = None
+
+    if provider_family == "anthropic":
+        attempted = request_has_cache_control
+        if attempted:
+            miss_reason = "cache_control_requested_without_hit"
+            source = "request.cache_control"
+    elif provider_family == "openrouter":
+        if request_has_cache_control:
+            attempted = True
+            miss_reason = "cache_control_requested_without_hit"
+            source = "request.cache_control"
+        elif usage_has_openai_cached_tokens:
+            attempted = True
+            miss_reason = "cached_tokens_reported_zero"
+            source = "usage.input_tokens_details.cached_tokens"
+    elif provider_family == "gemini":
+        if request_has_cached_content:
+            attempted = True
+            miss_reason = "cached_content_requested_without_hit"
+            source = "request.cached_content"
+        elif usage_has_gemini_cached_content:
+            attempted = True
+            miss_reason = "cached_tokens_reported_zero"
+            source = "usage.cached_content_token_count"
+    elif provider_family == "openai":
+        if usage_has_openai_cached_tokens:
+            attempted = True
+            miss_reason = "cached_tokens_reported_zero"
+            source = "usage.input_tokens_details.cached_tokens"
+
+    if not attempted:
+        return {
+            "attempted": False,
+            "status": "not_attempted",
+            "miss": False,
+            "miss_reason": None,
+            "source": None,
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    if supports_prompt_caching is False and source and source.startswith("request."):
+        return {
+            "attempted": True,
+            "status": "unsupported",
+            "miss": False,
+            "miss_reason": None,
+            "source": source,
+            "supports_prompt_caching": supports_prompt_caching,
+        }
+
+    return {
+        "attempted": True,
+        "status": "miss",
+        "miss": True,
+        "miss_reason": miss_reason,
+        "source": source,
+        "supports_prompt_caching": supports_prompt_caching,
+    }
+
+
 def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
     completion_tokens_details = _extract_completion_tokens_details(usage_obj)
-    return _first_non_none(
+    explicit_reasoning_tokens = _first_non_none(
         _safe_int(_maybe_get(usage_obj, "reasoning_tokens")),
         _safe_int(_maybe_get(usage_obj, "reasoningTokens")),
         _safe_int(_maybe_get(usage_obj, "reasoning_token_count")),
@@ -698,6 +1692,83 @@ def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
         _safe_int(_maybe_get(completion_tokens_details, "reasoning_tokens")),
         _safe_int(_maybe_get(completion_tokens_details, "reasoningTokens")),
     )
+    if explicit_reasoning_tokens is not None and explicit_reasoning_tokens > 0:
+        return explicit_reasoning_tokens
+
+    modality_reasoning_counts: list[int] = []
+    for details in (
+        completion_tokens_details,
+        _maybe_get(usage_obj, "responseTokensDetails"),
+        _maybe_get(usage_obj, "candidatesTokensDetails"),
+    ):
+        if not isinstance(details, list):
+            continue
+        detail_reasoning_tokens = 0
+        has_reasoning_detail = False
+        for detail in details:
+            modality = _maybe_get(detail, "modality")
+            if not isinstance(modality, str):
+                continue
+            if modality.upper() not in {"THOUGHT", "REASONING"}:
+                continue
+            token_count = _safe_int(_maybe_get(detail, "tokenCount"))
+            if token_count is None or token_count <= 0:
+                continue
+            detail_reasoning_tokens += token_count
+            has_reasoning_detail = True
+        if has_reasoning_detail:
+            modality_reasoning_counts.append(detail_reasoning_tokens)
+
+    if modality_reasoning_counts:
+        return max(modality_reasoning_counts)
+
+    return None
+
+
+def _fallback_gemini_reasoning_tokens_from_signatures(
+    metadata: Dict[str, Any], message: Any = None
+) -> Optional[int]:
+    signature_count = _safe_int(metadata.get("gemini_thought_signature_count"))
+    if signature_count is not None and signature_count > 0:
+        return signature_count
+
+    provider_specific_fields = (
+        _extract_provider_specific_fields(message) if message is not None else {}
+    )
+    thought_signatures = provider_specific_fields.get("thought_signatures")
+    if isinstance(thought_signatures, list):
+        non_empty_signatures = [
+            signature
+            for signature in thought_signatures
+            if isinstance(signature, str) and signature.strip()
+        ]
+        if non_empty_signatures:
+            return len(non_empty_signatures)
+
+    if metadata.get("gemini_thought_signature_present") is True:
+        return 1
+    if metadata.get("thinking_signature_present") is True:
+        return 1
+
+    return None
+
+
+def _determine_reasoning_tokens_source(
+    *,
+    provider_reported_reasoning_tokens: Optional[int],
+    reported_reasoning_tokens: Optional[int],
+    estimated_reasoning_tokens: Optional[int],
+    reasoning_present: bool,
+) -> str:
+    if provider_reported_reasoning_tokens is not None and reported_reasoning_tokens is not None:
+        return "provider_reported"
+    if reported_reasoning_tokens is not None:
+        return "provider_signature_present"
+    if estimated_reasoning_tokens is not None:
+        return "estimated_from_reasoning_text"
+    if reasoning_present:
+        return "not_available"
+    return "not_applicable"
 
 
 def _estimate_reasoning_tokens(model: str, reasoning_text: str) -> Optional[int]:
@@ -722,6 +1793,613 @@ def _estimate_reasoning_tokens(model: str, reasoning_text: str) -> Optional[int]
         return None
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    normalized = _safe_int(value)
+    if normalized is not None and normalized > 0:
+        return normalized
+    return None
+
+
+def _normalize_reasoning_state(record: Dict[str, Any]) -> None:
+    reported = _positive_int_or_none(record.get("reasoning_tokens_reported"))
+    estimated = _positive_int_or_none(record.get("reasoning_tokens_estimated"))
+    source = record.get("reasoning_tokens_source")
+    reasoning_present = bool(
+        record.get("reasoning_present") or record.get("thinking_signature_present")
+    )
+
+    record["reasoning_tokens_reported"] = reported
+    record["reasoning_tokens_estimated"] = estimated
+
+    if source == "provider_signature_present" and reported is not None:
+        record["reasoning_tokens_source"] = "provider_signature_present"
+    elif source == "provider_reported" and reported is not None:
+        record["reasoning_tokens_source"] = "provider_reported"
+    elif estimated is not None:
+        record["reasoning_tokens_source"] = "estimated_from_reasoning_text"
+    elif reasoning_present:
+        record["reasoning_tokens_source"] = "not_available"
+    else:
+        record["reasoning_tokens_source"] = "not_applicable"
+
+
+def _row_usage_object_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "prompt_tokens": int(record.get("input_tokens") or 0),
+        "completion_tokens": int(record.get("output_tokens") or 0),
+        "total_tokens": int(record.get("total_tokens") or 0),
+        "cache_read_input_tokens": int(record.get("cache_read_input_tokens") or 0),
+        "cache_creation_input_tokens": int(record.get("cache_creation_input_tokens") or 0),
+    }
+
+
+def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    provider = _normalize_session_history_provider(
+        record.get("provider"),
+        str(record.get("model") or ""),
+        metadata,
+    )
+    if provider is not None:
+        record["provider"] = provider
+
+    provider_family = _normalize_provider_cache_family(
+        provider,
+        str(record.get("model") or ""),
+        metadata,
+    )
+    if provider_family is None:
+        return
+
+    cache_state = _resolve_provider_cache_state(
+        provider=provider,
+        model=str(record.get("model") or ""),
+        usage_obj=_row_usage_object_from_record(record),
+        metadata=metadata,
+        request_body=None,
+    )
+    if cache_state is None:
+        return
+
+    current_status = record.get("provider_cache_status")
+    should_override = (
+        not isinstance(current_status, str)
+        or not current_status.strip()
+        or bool(record.get("cache_read_input_tokens") or record.get("cache_creation_input_tokens"))
+    )
+    if not should_override:
+        return
+
+    cache_state = dict(cache_state)
+    cache_state.update(
+        _compute_provider_cache_miss_cost_state(
+            provider_family=provider_family,
+            model=str(record.get("model") or ""),
+            usage_obj=_row_usage_object_from_record(record),
+            cache_state=cache_state,
+            metadata=metadata,
+        )
+    )
+    record["provider_cache_attempted"] = bool(cache_state.get("attempted"))
+    record["provider_cache_status"] = cache_state.get("status")
+    record["provider_cache_miss"] = bool(cache_state.get("miss"))
+    record["provider_cache_miss_reason"] = cache_state.get("miss_reason")
+    record["provider_cache_miss_token_count"] = cache_state.get("miss_token_count")
+    record["provider_cache_miss_cost_usd"] = cache_state.get("miss_cost_usd")
+
+
+def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+
+    reasoning_source = record.get("reasoning_tokens_source")
+    if isinstance(reasoning_source, str) and reasoning_source.strip():
+        metadata["usage_reasoning_tokens_source"] = reasoning_source
+
+    if record.get("reasoning_tokens_reported") is not None:
+        metadata["usage_reasoning_tokens_reported"] = record["reasoning_tokens_reported"]
+    else:
+        metadata.pop("usage_reasoning_tokens_reported", None)
+
+    if record.get("reasoning_tokens_estimated") is not None:
+        metadata["usage_reasoning_tokens_estimated"] = record["reasoning_tokens_estimated"]
+    else:
+        metadata.pop("usage_reasoning_tokens_estimated", None)
+
+    provider_family = _normalize_provider_cache_family(
+        record.get("provider"),
+        str(record.get("model") or ""),
+        metadata,
+    )
+    cache_status = record.get("provider_cache_status")
+    if provider_family is not None and isinstance(cache_status, str) and cache_status.strip():
+        cache_values = {
+            "provider_cache_attempted": bool(record.get("provider_cache_attempted")),
+            "provider_cache_status": cache_status,
+            "provider_cache_miss": bool(record.get("provider_cache_miss")),
+            "provider_cache_miss_reason": record.get("provider_cache_miss_reason"),
+            "provider_cache_miss_token_count": record.get("provider_cache_miss_token_count"),
+            "provider_cache_miss_cost_usd": record.get("provider_cache_miss_cost_usd"),
+        }
+        for suffix, value in cache_values.items():
+            generic_key = f"usage_{suffix}"
+            provider_key = f"{provider_family}_{suffix}"
+            if value is None or value == "":
+                metadata.pop(generic_key, None)
+                metadata.pop(provider_key, None)
+            else:
+                metadata[generic_key] = value
+                metadata[provider_key] = value
+
+    record["metadata"] = metadata
+
+
+def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    _normalize_reasoning_state(record)
+    _normalize_provider_cache_state_on_record(record)
+    _sync_session_history_record_metadata(record)
+    return record
+
+
+_TOOL_ACTIVITY_READ_NAMES = {
+    "read",
+    "view",
+    "cat",
+    "grep",
+    "glob",
+    "ls",
+    "listdir",
+    "list_files",
+    "search",
+    "notebookread",
+}
+_TOOL_ACTIVITY_MODIFY_NAMES = {
+    "write",
+    "edit",
+    "multiedit",
+    "apply_patch",
+    "applypatch",
+    "notebookedit",
+    "notebookwrite",
+}
+_TOOL_ACTIVITY_COMMAND_NAMES = {
+    "bash",
+    "shell",
+    "terminal",
+    "run",
+    "exec",
+    "exec_command",
+    "browser_run_code",
+}
+_TOOL_ACTIVITY_SKIP_PATH_KEYS = {
+    "content",
+    "old_str",
+    "new_str",
+    "replacement",
+    "patch",
+    "command",
+    "cmd",
+    "description",
+    "thinking",
+    "reason",
+}
+_APPLY_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.MULTILINE)
+_APPLY_PATCH_MOVE_TO_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
+_GIT_COMMAND_RE = re.compile(r"(?<!\S)git\b(?P<args>[^;&|]*)")
+_GIT_GLOBAL_OPTIONS_WITH_VALUES = {
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+}
+_TOOL_ACTIVITY_COMMAND_TEXT_KEYS = (
+    "command",
+    "cmd",
+    "raw_text",
+    "input",
+    "script",
+    "shell",
+    "bash",
+    "code",
+    "text",
+)
+_TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS = {
+    "description",
+    "reason",
+    "thinking",
+    "title",
+    "summary",
+}
+
+
+def _dedupe_strings(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for value in values:
+        stripped = str(value).strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        result.append(stripped)
+    return result
+
+
+def _parse_tool_arguments(arguments: Any) -> Any:
+    if arguments is None or arguments == "":
+        return {}
+    if isinstance(arguments, (dict, list)):
+        return arguments
+    if isinstance(arguments, str):
+        stripped = arguments.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return {"raw_text": stripped}
+    return {"value": arguments}
+
+
+def _extract_paths_from_patch_text(text: str) -> List[str]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    paths = _APPLY_PATCH_FILE_RE.findall(text) + _APPLY_PATCH_MOVE_TO_RE.findall(text)
+    return _dedupe_strings(paths)
+
+
+def _collect_file_paths_from_value(value: Any) -> List[str]:
+    collected: List[str] = []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            collected.append(stripped)
+    elif isinstance(value, list):
+        for item in value:
+            collected.extend(_collect_file_paths_from_value(item))
+    elif isinstance(value, dict):
+        for nested_key, nested_value in value.items():
+            nested_key_lower = str(nested_key).lower()
+            if nested_key_lower in _TOOL_ACTIVITY_SKIP_PATH_KEYS:
+                continue
+            if any(token in nested_key_lower for token in ("path", "file")):
+                collected.extend(_collect_file_paths_from_value(nested_value))
+    return collected
+
+
+def _extract_file_paths_from_tool_arguments(arguments: Any) -> List[str]:
+    parsed_arguments = _parse_tool_arguments(arguments)
+    if isinstance(parsed_arguments, str):
+        return []
+    return _dedupe_strings(_collect_file_paths_from_value(parsed_arguments))
+
+
+def _extract_command_text_from_tool_arguments(arguments: Any) -> Optional[str]:
+    parsed_arguments = _parse_tool_arguments(arguments)
+    command_text = _find_command_text_in_value(parsed_arguments)
+    if command_text is not None:
+        return command_text
+    if isinstance(parsed_arguments, str) and parsed_arguments.strip():
+        return parsed_arguments.strip()
+    return None
+
+
+def _find_command_text_in_value(value: Any, *, depth: int = 0) -> Optional[str]:
+    if depth > 4:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        for item in value:
+            command_text = _find_command_text_in_value(item, depth=depth + 1)
+            if command_text is not None:
+                return command_text
+        return None
+    if not isinstance(value, dict):
+        return None
+
+    for key in _TOOL_ACTIVITY_COMMAND_TEXT_KEYS:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    for key, nested_value in value.items():
+        if str(key).lower() in _TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS:
+            continue
+        command_text = _find_command_text_in_value(nested_value, depth=depth + 1)
+        if command_text is not None:
+            return command_text
+    return None
+
+
+def _count_git_subcommand(command_text: str, subcommand: str) -> int:
+    count = 0
+    for match in _GIT_COMMAND_RE.finditer(command_text):
+        command = f"git{match.group('args') or ''}"
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
+                index += 2
+                continue
+            if any(token.startswith(f"{option}=") for option in _GIT_GLOBAL_OPTIONS_WITH_VALUES):
+                index += 1
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            if token == subcommand:
+                count += 1
+            break
+    return count
+
+
+def _classify_tool_kind(tool_name: str) -> str:
+    normalized_name = (tool_name or "").strip().lower()
+    if normalized_name.startswith("mcp__"):
+        return "mcp"
+    if normalized_name in _TOOL_ACTIVITY_COMMAND_NAMES or any(
+        token in normalized_name for token in ("bash", "shell", "terminal")
+    ):
+        return "command"
+    if normalized_name in _TOOL_ACTIVITY_MODIFY_NAMES or any(
+        token in normalized_name for token in ("write", "edit", "patch")
+    ):
+        return "modify"
+    if normalized_name in _TOOL_ACTIVITY_READ_NAMES or any(
+        token in normalized_name for token in ("read", "view", "grep", "glob", "search")
+    ):
+        return "read"
+    return "other"
+
+
+def _build_tool_activity_entry(
+    *,
+    tool_index: int,
+    tool_name: str,
+    arguments: Any,
+    tool_call_id: Optional[str] = None,
+    source: Optional[str] = None,
+) -> Dict[str, Any]:
+    parsed_arguments = _parse_tool_arguments(arguments)
+    tool_kind = _classify_tool_kind(tool_name)
+    file_paths_read: List[str] = []
+    file_paths_modified: List[str] = []
+    command_text: Optional[str] = None
+
+    if tool_kind == "read":
+        file_paths_read = _extract_file_paths_from_tool_arguments(parsed_arguments)
+    elif tool_kind == "modify":
+        file_paths_modified = _extract_file_paths_from_tool_arguments(parsed_arguments)
+        if tool_name.strip().lower() in {"apply_patch", "applypatch"}:
+            patch_text = _extract_command_text_from_tool_arguments(parsed_arguments)
+            if patch_text:
+                file_paths_modified = _dedupe_strings(
+                    file_paths_modified + _extract_paths_from_patch_text(patch_text)
+                )
+    elif tool_kind == "command":
+        command_text = _extract_command_text_from_tool_arguments(parsed_arguments)
+
+    if command_text is None and tool_name.strip().lower() in {"apply_patch", "applypatch"}:
+        command_text = _extract_command_text_from_tool_arguments(parsed_arguments)
+
+    git_commit_count = 0
+    git_push_count = 0
+    if isinstance(command_text, str) and command_text:
+        git_commit_count = _count_git_subcommand(command_text, "commit")
+        git_push_count = _count_git_subcommand(command_text, "push")
+
+    return {
+        "tool_index": tool_index,
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "tool_kind": tool_kind,
+        "file_paths_read": _dedupe_strings(file_paths_read),
+        "file_paths_modified": _dedupe_strings(file_paths_modified),
+        "git_commit_count": git_commit_count,
+        "git_push_count": git_push_count,
+        "command_text": command_text,
+        "arguments": parsed_arguments,
+        "metadata": {"source": source} if source else {},
+    }
+
+
+def _extract_tool_activity_from_message(message: Any) -> List[Dict[str, Any]]:
+    activity: List[Dict[str, Any]] = []
+    raw_tool_calls = _maybe_get(message, "tool_calls")
+    if isinstance(raw_tool_calls, list):
+        for index, tool_call in enumerate(raw_tool_calls):
+            function_obj = _maybe_get(tool_call, "function")
+            tool_name = _maybe_get(function_obj, "name") or _maybe_get(tool_call, "name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            activity.append(
+                _build_tool_activity_entry(
+                    tool_index=index,
+                    tool_name=tool_name.strip(),
+                    arguments=_maybe_get(function_obj, "arguments"),
+                    tool_call_id=_maybe_get(tool_call, "id"),
+                    source="message.tool_calls",
+                )
+            )
+        return activity
+
+    content = _maybe_get(message, "content")
+    if isinstance(content, list):
+        for index, block in enumerate(content):
+            if isinstance(block, dict):
+                block_type = block.get("type")
+                tool_name = block.get("name")
+                arguments = block.get("input") or block.get("arguments")
+                tool_call_id = block.get("id")
+            else:
+                block_type = getattr(block, "type", None)
+                tool_name = getattr(block, "name", None)
+                arguments = getattr(block, "input", None) or getattr(block, "arguments", None)
+                tool_call_id = getattr(block, "id", None)
+            if block_type not in {"tool_use", "function_call"}:
+                continue
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            activity.append(
+                _build_tool_activity_entry(
+                    tool_index=index,
+                    tool_name=tool_name.strip(),
+                    arguments=arguments,
+                    tool_call_id=tool_call_id,
+                    source="message.content",
+                )
+            )
+        if activity:
+            return activity
+
+    provider_specific_fields = _extract_provider_specific_fields(message)
+    provider_tool_calls = provider_specific_fields.get("tool_calls")
+    if isinstance(provider_tool_calls, list):
+        for index, tool_call in enumerate(provider_tool_calls):
+            function_obj = _maybe_get(tool_call, "function")
+            tool_name = _maybe_get(function_obj, "name") or _maybe_get(tool_call, "name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            activity.append(
+                _build_tool_activity_entry(
+                    tool_index=index,
+                    tool_name=tool_name.strip(),
+                    arguments=_maybe_get(function_obj, "arguments"),
+                    tool_call_id=_maybe_get(tool_call, "id"),
+                    source="provider_specific_fields.tool_calls",
+                )
+            )
+
+    return activity
+
+_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES: Dict[str, str] = {
+    "apply_patch_call": "apply_patch",
+    "custom_tool_call": "custom_tool_call",
+    "computer_call": "computer_call",
+    "local_shell_call": "local_shell_call",
+    "mcp_call": "mcp_call",
+    "web_search_call": "web_search_call",
+    "file_search_call": "file_search_call",
+    "image_generation_call": "image_generation_call",
+}
+_RESPONSE_OUTPUT_TOOL_ITEM_TYPES = set(_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES) | {
+    "function_call"
+}
+
+
+def _extract_response_output_items(
+    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
+) -> List[Any]:
+    candidate_sources: List[Any] = [result]
+    if isinstance(standard_logging_object, dict):
+        candidate_sources.append(standard_logging_object.get("response"))
+
+    for source in candidate_sources:
+        if isinstance(source, list):
+            return source
+
+        output_items = _maybe_get(source, "output")
+        if isinstance(output_items, list):
+            return output_items
+
+        output_items = _maybe_get_path(source, "_hidden_params", "responses_output")
+        if isinstance(output_items, list):
+            return output_items
+
+        completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+            _maybe_get(source, "response")
+        )
+        if isinstance(completed_payload, dict):
+            output_items = _maybe_get(_maybe_get(completed_payload, "response"), "output")
+            if isinstance(output_items, list):
+                return output_items
+
+    return []
+
+
+def _resolve_response_output_tool_name(item: Any) -> Optional[str]:
+    tool_name = _maybe_get(item, "name")
+    if isinstance(tool_name, str) and tool_name.strip():
+        return tool_name.strip()
+
+    item_type = _maybe_get(item, "type")
+    if not isinstance(item_type, str) or not item_type.strip():
+        return None
+
+    fallback_name = _RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES.get(item_type)
+    if isinstance(fallback_name, str) and fallback_name.strip():
+        return fallback_name.strip()
+
+    return None
+
+
+def _extract_response_output_tool_activity(
+    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    output_items = _extract_response_output_items(result, standard_logging_object)
+    if not output_items:
+        return []
+
+    activity: List[Dict[str, Any]] = []
+    for index, item in enumerate(output_items):
+        item_type = _maybe_get(item, "type")
+        if item_type not in _RESPONSE_OUTPUT_TOOL_ITEM_TYPES:
+            continue
+        tool_name = _resolve_response_output_tool_name(item)
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            continue
+        arguments = _maybe_get(item, "arguments")
+        if arguments is None and item_type in {"apply_patch_call", "custom_tool_call"}:
+            arguments = _maybe_get(item, "patch") or _maybe_get(item, "input")
+        activity.append(
+            _build_tool_activity_entry(
+                tool_index=index,
+                tool_name=tool_name,
+                arguments=arguments,
+                tool_call_id=_maybe_get(item, "call_id") or _maybe_get(item, "id"),
+                source="responses.output",
+            )
+        )
+
+    return activity
+
+def _summarize_tool_activity(tool_activity: List[Dict[str, Any]]) -> Dict[str, int]:
+    read_paths: List[str] = []
+    modified_paths: List[str] = []
+    git_commit_count = 0
+    git_push_count = 0
+    for item in tool_activity:
+        read_paths.extend(
+            value for value in (item.get("file_paths_read") or []) if isinstance(value, str)
+        )
+        modified_paths.extend(
+            value
+            for value in (item.get("file_paths_modified") or [])
+            if isinstance(value, str)
+        )
+        git_commit_count += _safe_int(item.get("git_commit_count")) or 0
+        git_push_count += _safe_int(item.get("git_push_count")) or 0
+    return {
+        "file_read_count": len(_dedupe_strings(read_paths)),
+        "file_modified_count": len(_dedupe_strings(modified_paths)),
+        "git_commit_count": git_commit_count,
+        "git_push_count": git_push_count,
+    }
+
+
 def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
     raw_tool_calls = _maybe_get(message, "tool_calls")
     if isinstance(raw_tool_calls, list):
@@ -740,12 +2418,14 @@ def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
         tool_names = []
         tool_call_count = 0
         for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") not in {"tool_use", "function_call"}:
+            if isinstance(block, dict):
+                block_type = block.get("type")
+            else:
+                block_type = getattr(block, "type", None)
+            if block_type not in {"tool_use", "function_call"}:
                 continue
             tool_call_count += 1
-            tool_name = block.get("name")
+            tool_name = block.get("name") if isinstance(block, dict) else getattr(block, "name", None)
             if isinstance(tool_name, str) and tool_name:
                 tool_names.append(tool_name)
         if tool_call_count:
@@ -766,22 +2446,36 @@ def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
     return 0, []
 
 
-def _extract_response_output_tool_call_info(result: Any) -> Tuple[int, List[str]]:
-    output_items = result if isinstance(result, list) else _maybe_get(result, "output")
-    if not isinstance(output_items, list):
+def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
+    """Safely traverse nested dict/object paths."""
+    current = obj
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key, default)
+        elif hasattr(current, key):
+            current = getattr(current, key)
+        else:
+            return default
+        if current is default:
+            return default
+    return current
+
+
+def _extract_response_output_tool_call_info(
+    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
+) -> Tuple[int, List[str]]:
+    output_items = _extract_response_output_items(result, standard_logging_object)
+    if not output_items:
         return 0, []
 
     tool_call_count = 0
     tool_names: List[str] = []
     for item in output_items:
         item_type = _maybe_get(item, "type")
-        if item_type not in {"function_call", "apply_patch_call"}:
+        if item_type not in _RESPONSE_OUTPUT_TOOL_ITEM_TYPES:
             continue
         tool_call_count += 1
-        tool_name = _maybe_get(item, "name")
-        if not isinstance(tool_name, str) or not tool_name.strip():
-            if item_type == "apply_patch_call":
-                tool_name = "apply_patch"
+        tool_name = _resolve_response_output_tool_name(item)
         if isinstance(tool_name, str) and tool_name.strip():
             tool_names.append(tool_name)
 
@@ -794,12 +2488,22 @@ def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
     standard_logging_object = kwargs.get("standard_logging_object") or {}
     standard_metadata = standard_logging_object.get("metadata") or {}
 
+    proxy_header_candidates = (
+        _maybe_get_path(litellm_params, "proxy_server_request", "headers", "x-claude-code-session-id"),
+        _maybe_get_path(litellm_params, "proxy_server_request", "headers", "X-Claude-Code-Session-Id"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers", "x-claude-code-session-id"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers", "X-Claude-Code-Session-Id"),
+    )
+
     for candidate in (
         litellm_params.get("litellm_session_id"),
         kwargs.get("litellm_session_id"),
         metadata.get("session_id"),
         standard_metadata.get("session_id"),
         standard_logging_object.get("session_id"),
+        _coerce_nested_session_id(metadata.get("user_id")),
+        _coerce_nested_session_id(metadata.get("user_api_key_end_user_id")),
+        *proxy_header_candidates,
     ):
         if candidate is not None and str(candidate).strip():
             return str(candidate)
@@ -820,6 +2524,21 @@ def _extract_trace_id(kwargs: Dict[str, Any]) -> Optional[str]:
         if candidate is not None and str(candidate).strip():
             return str(candidate)
     return None
+
+
+def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
+    """Safely traverse nested dict/object paths."""
+    current = obj
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key, default)
+        elif hasattr(current, key):
+            current = getattr(current, key)
+        else:
+            return default
+        if current is default:
+            return default
+    return current
 
 
 def _infer_usage_breakout_provider_prefix(
@@ -861,13 +2580,27 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
         return
 
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
+    reasoning_tokens_source: Optional[str] = None
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
 
     message = _extract_first_response_message(result)
+    if reported_reasoning_tokens is not None:
+        reasoning_tokens_source = "provider_reported"
+    elif provider_prefix == "gemini":
+        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
+            metadata,
+            message,
+        )
+        if reported_reasoning_tokens is not None:
+            reasoning_tokens_source = "provider_signature_present"
+
     tool_call_count, tool_names = _extract_tool_call_info(message)
     if tool_call_count == 0:
-        tool_call_count, tool_names = _extract_response_output_tool_call_info(result)
+        tool_call_count, tool_names = _extract_response_output_tool_call_info(
+            result,
+            kwargs.get("standard_logging_object"),
+        )
 
     metadata["usage_cache_read_input_tokens"] = cache_read_input_tokens
     metadata["usage_cache_creation_input_tokens"] = cache_creation_input_tokens
@@ -882,7 +2615,9 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
 
     if reported_reasoning_tokens is not None:
         metadata["usage_reasoning_tokens_reported"] = reported_reasoning_tokens
-        metadata["usage_reasoning_tokens_source"] = "provider_reported"
+        metadata["usage_reasoning_tokens_source"] = (
+            reasoning_tokens_source or "provider_reported"
+        )
         metadata[f"{provider_prefix}_reasoning_tokens_reported"] = (
             reported_reasoning_tokens
         )
@@ -912,6 +2647,7 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
         name=f"{provider_prefix}.usage_breakout",
         span_metadata={
             "reported_reasoning_tokens": reported_reasoning_tokens,
+            "reported_reasoning_tokens_source": reasoning_tokens_source,
             "cache_read_input_tokens": cache_read_input_tokens,
             "cache_creation_input_tokens": cache_creation_input_tokens,
             "tool_call_count": tool_call_count,
@@ -920,6 +2656,122 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
         start_time=datetime.now(timezone.utc),
         end_time=datetime.now(timezone.utc),
     )
+
+
+def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None:
+    metadata = _ensure_mutable_metadata(kwargs)
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    resolved_model = _resolve_session_history_model(
+        kwargs=kwargs,
+        standard_logging_object=standard_logging_object,
+        metadata=metadata,
+        result=result,
+    )
+    usage_obj = _extract_usage_object(kwargs, result)
+    request_body = _extract_provider_cache_request_body(kwargs)
+    provider_family = _normalize_provider_cache_family(
+        kwargs.get("custom_llm_provider"),
+        resolved_model,
+        metadata,
+    )
+    cache_state = _resolve_provider_cache_state(
+        provider=kwargs.get("custom_llm_provider"),
+        model=resolved_model,
+        usage_obj=usage_obj,
+        metadata=metadata,
+        request_body=request_body,
+    )
+    if provider_family is None or cache_state is None:
+        return
+    cache_miss_cost_state = _compute_provider_cache_miss_cost_state(
+        provider_family=provider_family,
+        model=resolved_model,
+        usage_obj=usage_obj,
+        cache_state=cache_state,
+        metadata=metadata,
+    )
+    cache_state.update(cache_miss_cost_state)
+
+    metadata["usage_provider_cache_attempted"] = cache_state["attempted"]
+    metadata["usage_provider_cache_status"] = cache_state["status"]
+    metadata["usage_provider_cache_miss"] = cache_state["miss"]
+    if cache_state.get("miss_reason"):
+        metadata["usage_provider_cache_miss_reason"] = cache_state["miss_reason"]
+    if cache_state.get("miss_token_count") is not None:
+        metadata["usage_provider_cache_miss_token_count"] = cache_state["miss_token_count"]
+    if cache_state.get("miss_cost_usd") is not None:
+        metadata["usage_provider_cache_miss_cost_usd"] = cache_state["miss_cost_usd"]
+    if cache_state.get("miss_cost_basis"):
+        metadata["usage_provider_cache_miss_cost_basis"] = cache_state["miss_cost_basis"]
+    if cache_state.get("source"):
+        metadata["usage_provider_cache_source"] = cache_state["source"]
+
+    metadata[f"{provider_family}_provider_cache_attempted"] = cache_state["attempted"]
+    metadata[f"{provider_family}_provider_cache_status"] = cache_state["status"]
+    metadata[f"{provider_family}_provider_cache_miss"] = cache_state["miss"]
+    if cache_state.get("miss_reason"):
+        metadata[f"{provider_family}_provider_cache_miss_reason"] = cache_state[
+            "miss_reason"
+        ]
+    if cache_state.get("miss_token_count") is not None:
+        metadata[f"{provider_family}_provider_cache_miss_token_count"] = cache_state[
+            "miss_token_count"
+        ]
+    if cache_state.get("miss_cost_usd") is not None:
+        metadata[f"{provider_family}_provider_cache_miss_cost_usd"] = cache_state[
+            "miss_cost_usd"
+        ]
+    if cache_state.get("miss_cost_basis"):
+        metadata[f"{provider_family}_provider_cache_miss_cost_basis"] = cache_state[
+            "miss_cost_basis"
+        ]
+    if cache_state.get("source"):
+        metadata[f"{provider_family}_provider_cache_source"] = cache_state["source"]
+
+    tags_to_add = []
+    status = cache_state.get("status")
+    if isinstance(status, str) and status in {"hit", "write", "miss", "unsupported"}:
+        tags_to_add.extend(
+            [
+                f"provider-cache-status:{status}",
+                f"{provider_family}-provider-cache-status:{status}",
+            ]
+        )
+    if cache_state.get("miss") is True:
+        tags_to_add.extend(
+            [
+                "provider-cache-miss",
+                f"{provider_family}-provider-cache-miss",
+            ]
+        )
+    if status == "hit":
+        tags_to_add.extend(["provider-cache-hit", f"{provider_family}-provider-cache-hit"])
+    elif status == "write":
+        tags_to_add.extend(
+            ["provider-cache-write", f"{provider_family}-provider-cache-write"]
+        )
+    elif status == "unsupported":
+        tags_to_add.extend(
+            ["provider-cache-unsupported", f"{provider_family}-provider-cache-unsupported"]
+        )
+    if tags_to_add:
+        _merge_tags(metadata, tags_to_add)
+        _append_langfuse_span(
+            metadata,
+            name=f"{provider_family}.provider_cache",
+            span_metadata={
+                "attempted": cache_state["attempted"],
+                "status": cache_state["status"],
+                "miss": cache_state["miss"],
+                "miss_reason": cache_state.get("miss_reason"),
+                "miss_token_count": cache_state.get("miss_token_count"),
+                "miss_cost_usd": cache_state.get("miss_cost_usd"),
+                "miss_cost_basis": cache_state.get("miss_cost_basis"),
+                "source": cache_state.get("source"),
+            },
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+        )
 
 
 def _extract_trace_id_from_spend_log_row(spend_log_row: Dict[str, Any]) -> Tuple[Optional[str], str]:
@@ -1090,7 +2942,11 @@ def _build_backfill_kwargs_from_spend_log_row(
 
     kwargs: Dict[str, Any] = {
         "model": str(model),
-        "custom_llm_provider": spend_log_row.get("custom_llm_provider"),
+        "custom_llm_provider": _normalize_session_history_provider(
+            spend_log_row.get("custom_llm_provider"),
+            str(model),
+            metadata,
+        ),
         "call_type": spend_log_row.get("call_type"),
         "litellm_call_id": str(request_id),
         "litellm_trace_id": trace_id,
@@ -1399,7 +3255,11 @@ def _infer_provider_from_langfuse_observation(
         ):
             return "openai"
 
-    return None
+    return _normalize_session_history_provider(
+        metadata.get("custom_llm_provider"),
+        str(observation.get("model") or ""),
+        metadata,
+    )
 
 
 def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> List[str]:
@@ -1485,9 +3345,16 @@ def _build_session_history_record_from_langfuse_trace_observation(
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_object)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_object)
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_object)
+    provider_reported_reasoning_tokens = reported_reasoning_tokens
+    provider = _infer_provider_from_langfuse_observation(observation, metadata)
 
     output_payload = observation.get("output")
     message = _extract_first_langfuse_response_message(output_payload)
+    if reported_reasoning_tokens is None and provider == "gemini":
+        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
+            metadata,
+            message,
+        )
     thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
     reasoning_text = (
         _extract_reasoning_content(message, thinking_blocks)
@@ -1502,27 +3369,28 @@ def _build_session_history_record_from_langfuse_trace_observation(
         or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
     )
     estimated_reasoning_tokens = None
-    reasoning_tokens_source: Optional[str] = None
-    if reported_reasoning_tokens is not None:
-        reasoning_tokens_source = "provider_reported"
-    elif reasoning_present:
+    if reported_reasoning_tokens is None and reasoning_present:
         estimated_reasoning_tokens = _estimate_reasoning_tokens(
             model=str(observation.get("model") or ""),
             reasoning_text=reasoning_text,
         )
-        reasoning_tokens_source = (
-            "estimated_from_reasoning_text"
-            if estimated_reasoning_tokens is not None
-            else "not_available"
-        )
+    reasoning_tokens_source = _determine_reasoning_tokens_source(
+        provider_reported_reasoning_tokens=provider_reported_reasoning_tokens,
+        reported_reasoning_tokens=reported_reasoning_tokens,
+        estimated_reasoning_tokens=estimated_reasoning_tokens,
+        reasoning_present=reasoning_present,
+    )
 
     tool_call_count, tool_names = _extract_tool_call_info(message)
+    tool_activity = _extract_tool_activity_from_message(message) if message is not None else []
     if tool_call_count == 0:
         output_tool_call_count, output_tool_names = _extract_response_output_tool_call_info(
             output_payload
         )
         if output_tool_call_count > 0:
             tool_call_count, tool_names = output_tool_call_count, output_tool_names
+    if not tool_activity:
+        tool_activity = _extract_response_output_tool_activity(output_payload)
     if tool_call_count == 0:
         fallback_tool_names = observation.get("toolCallNames") or observation.get(
             "tool_call_names"
@@ -1547,12 +3415,30 @@ def _build_session_history_record_from_langfuse_trace_observation(
             if normalized_tool_names:
                 tool_call_count = len(normalized_tool_names)
                 tool_names = normalized_tool_names
+    tool_activity_summary = _summarize_tool_activity(tool_activity)
     agent_name, tenant_id = _extract_agent_context_from_langfuse_trace_observation(
         trace,
         observation,
     )
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
-    provider = _infer_provider_from_langfuse_observation(observation, metadata)
+    provider_cache_state = _resolve_provider_cache_state(
+        provider=provider,
+        model=str(observation.get("model") or ""),
+        usage_obj=usage_object,
+        metadata=metadata,
+        request_body=None,
+    )
+    provider_cache_state = dict(provider_cache_state or {})
+    if provider_cache_state:
+        provider_cache_state.update(
+            _compute_provider_cache_miss_cost_state(
+                provider_family=provider,
+                model=str(observation.get("model") or ""),
+                usage_obj=usage_object,
+                cache_state=provider_cache_state,
+                metadata=metadata,
+            )
+        )
 
     history_metadata = _build_session_history_metadata(
         metadata=metadata,
@@ -1575,7 +3461,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         }
     )
 
-    return {
+    return _normalize_session_history_record({
         "litellm_call_id": observation.get("id"),
         "session_id": session_id,
         "trace_id": trace_id,
@@ -1598,8 +3484,31 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "reasoning_tokens_source": reasoning_tokens_source,
         "reasoning_present": reasoning_present,
         "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
+        "provider_cache_attempted": bool(
+            provider_cache_state and provider_cache_state.get("attempted")
+        ),
+        "provider_cache_status": (
+            provider_cache_state.get("status") if provider_cache_state else None
+        ),
+        "provider_cache_miss": bool(
+            provider_cache_state and provider_cache_state.get("miss")
+        ),
+        "provider_cache_miss_reason": (
+            provider_cache_state.get("miss_reason") if provider_cache_state else None
+        ),
+        "provider_cache_miss_token_count": (
+            provider_cache_state.get("miss_token_count") if provider_cache_state else None
+        ),
+        "provider_cache_miss_cost_usd": (
+            provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
+        ),
         "tool_call_count": tool_call_count,
         "tool_names": tool_names,
+        "file_read_count": tool_activity_summary["file_read_count"],
+        "file_modified_count": tool_activity_summary["file_modified_count"],
+        "git_commit_count": tool_activity_summary["git_commit_count"],
+        "git_push_count": tool_activity_summary["git_push_count"],
+        "tool_activity": tool_activity,
         "response_cost_usd": _safe_float(
             _first_non_none(
                 _maybe_get(observation.get("costDetails"), "total"),
@@ -1609,7 +3518,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
             )
         ),
         "metadata": history_metadata,
-    }
+    })
 
 
 def _derive_langfuse_trace_tags_from_langfuse_trace(
@@ -1660,6 +3569,39 @@ def _build_session_history_metadata(
     return history_metadata
 
 
+def _resolve_session_history_model(
+    kwargs: Dict[str, Any],
+    standard_logging_object: Dict[str, Any],
+    metadata: Dict[str, Any],
+    result: Any,
+) -> str:
+    result_completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+        _maybe_get(result, "response")
+    )
+    standard_completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+        _maybe_get(standard_logging_object.get("response"), "response")
+    )
+    candidates = (
+        kwargs.get("model"),
+        standard_logging_object.get("model"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
+        _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body", "model"),
+        metadata.get("anthropic_adapter_model"),
+        metadata.get("model"),
+        _maybe_get(result, "model"),
+        _maybe_get(_maybe_get(result_completed_payload, "response"), "model"),
+        _maybe_get(_maybe_get(standard_completed_payload, "response"), "model"),
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        normalized = str(candidate).strip()
+        if normalized and normalized.lower() != "unknown":
+            return normalized
+    return "unknown"
+
+
+
 def _build_session_history_record(
     kwargs: Dict[str, Any],
     result: Any,
@@ -1677,6 +3619,13 @@ def _build_session_history_record(
     if not isinstance(request_tags, list):
         request_tags = []
 
+    resolved_model = _resolve_session_history_model(
+        kwargs=kwargs,
+        standard_logging_object=standard_logging_object,
+        metadata=metadata,
+        result=result,
+    )
+
     usage_obj = _extract_usage_object(kwargs, result)
     prompt_tokens = _extract_prompt_tokens(usage_obj)
     completion_tokens = _extract_completion_tokens(usage_obj)
@@ -1684,8 +3633,20 @@ def _build_session_history_record(
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
+    provider_reported_reasoning_tokens = reported_reasoning_tokens
+    provider_prefix = _infer_usage_breakout_provider_prefix(kwargs, metadata)
+    resolved_provider = _normalize_session_history_provider(
+        kwargs.get("custom_llm_provider"),
+        resolved_model,
+        metadata,
+    )
 
     message = _extract_first_response_message(result)
+    if reported_reasoning_tokens is None and provider_prefix == "gemini":
+        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
+            metadata,
+            message,
+        )
     thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
     reasoning_text = (
         _extract_reasoning_content(message, thinking_blocks)
@@ -1700,36 +3661,110 @@ def _build_session_history_record(
         or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
     )
     estimated_reasoning_tokens = None
-    reasoning_tokens_source: Optional[str] = None
-    if reported_reasoning_tokens is not None:
-        reasoning_tokens_source = "provider_reported"
-    elif reasoning_present:
+    if reported_reasoning_tokens is None and reasoning_present:
         estimated_reasoning_tokens = _estimate_reasoning_tokens(
-            model=str(kwargs.get("model") or ""),
+            model=resolved_model,
             reasoning_text=reasoning_text,
         )
-        reasoning_tokens_source = (
-            "estimated_from_reasoning_text"
-            if estimated_reasoning_tokens is not None
-            else "not_available"
-        )
+    reasoning_tokens_source = _determine_reasoning_tokens_source(
+        provider_reported_reasoning_tokens=provider_reported_reasoning_tokens,
+        reported_reasoning_tokens=reported_reasoning_tokens,
+        estimated_reasoning_tokens=estimated_reasoning_tokens,
+        reasoning_present=reasoning_present,
+    )
 
     tool_call_count, tool_names = _extract_tool_call_info(message)
+    tool_activity = _extract_tool_activity_from_message(message) if message is not None else []
     if tool_call_count == 0:
         output_tool_call_count, output_tool_names = _extract_response_output_tool_call_info(
-            result
+            result,
+            standard_logging_object,
         )
         if output_tool_call_count > 0:
             tool_call_count, tool_names = output_tool_call_count, output_tool_names
+    if not tool_activity:
+        tool_activity = _extract_response_output_tool_activity(
+            result,
+            standard_logging_object,
+        )
+    tool_activity_summary = _summarize_tool_activity(tool_activity)
     agent_name, tenant_id = _extract_agent_context(kwargs)
 
-    return {
+    response_cost_usd = _safe_float(
+        _first_non_none(
+            kwargs.get("response_cost"),
+            standard_logging_object.get("response_cost"),
+            metadata.get("litellm_response_cost"),
+            metadata.get("response_cost"),
+        )
+    )
+    if (
+        (response_cost_usd is None or response_cost_usd == 0)
+        and prompt_tokens > 0
+        and resolved_model != "unknown"
+    ):
+        try:
+            import litellm
+            from litellm.responses.utils import ResponseAPILoggingUtils
+
+            usage_for_cost = None
+            if isinstance(usage_obj, dict) and {
+                "input_tokens",
+                "output_tokens",
+            }.issubset(usage_obj.keys()):
+                usage_for_cost = (
+                    ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+                        dict(usage_obj)
+                    )
+                )
+            prompt_cost, completion_cost = litellm.cost_per_token(
+                model=resolved_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                custom_llm_provider=kwargs.get("custom_llm_provider"),
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                usage_object=usage_for_cost,
+                call_type="responses",
+            )
+            response_cost_usd = prompt_cost + completion_cost
+        except Exception as exc:
+            verbose_logger.debug(
+                "AawmAgentIdentity: failed to backfill response cost for model=%s: %s",
+                resolved_model,
+                exc,
+            )
+
+    provider_cache_state = _resolve_provider_cache_state(
+        provider=resolved_provider,
+        model=resolved_model,
+        usage_obj=usage_obj,
+        metadata=metadata,
+        request_body=_extract_provider_cache_request_body(kwargs),
+    )
+    provider_cache_state = dict(provider_cache_state or {})
+    if provider_cache_state:
+        provider_cache_state.update(
+            _compute_provider_cache_miss_cost_state(
+                provider_family=_normalize_provider_cache_family(
+                    resolved_provider,
+                    resolved_model,
+                    metadata,
+                ),
+                model=resolved_model,
+                usage_obj=usage_obj,
+                cache_state=provider_cache_state,
+                metadata=metadata,
+            )
+        )
+
+    return _normalize_session_history_record({
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "session_id": session_id,
         "trace_id": _extract_trace_id(kwargs),
         "provider_response_id": _maybe_get(result, "id"),
-        "provider": kwargs.get("custom_llm_provider"),
-        "model": str(kwargs.get("model") or standard_logging_object.get("model") or ""),
+        "provider": resolved_provider,
+        "model": resolved_model,
         "model_group": metadata.get("model_group") or standard_logging_object.get("model_group"),
         "agent_name": agent_name,
         "tenant_id": tenant_id,
@@ -1746,76 +3781,80 @@ def _build_session_history_record(
         "reasoning_tokens_source": reasoning_tokens_source,
         "reasoning_present": reasoning_present,
         "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
+        "provider_cache_attempted": bool(
+            provider_cache_state and provider_cache_state.get("attempted")
+        ),
+        "provider_cache_status": (
+            provider_cache_state.get("status") if provider_cache_state else None
+        ),
+        "provider_cache_miss": bool(
+            provider_cache_state and provider_cache_state.get("miss")
+        ),
+        "provider_cache_miss_reason": (
+            provider_cache_state.get("miss_reason") if provider_cache_state else None
+        ),
+        "provider_cache_miss_token_count": (
+            provider_cache_state.get("miss_token_count") if provider_cache_state else None
+        ),
+        "provider_cache_miss_cost_usd": (
+            provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
+        ),
         "tool_call_count": tool_call_count,
         "tool_names": tool_names,
-        "response_cost_usd": _safe_float(
-            _first_non_none(
-                kwargs.get("response_cost"),
-                standard_logging_object.get("response_cost"),
-            )
-        ),
+        "file_read_count": tool_activity_summary["file_read_count"],
+        "file_modified_count": tool_activity_summary["file_modified_count"],
+        "git_commit_count": tool_activity_summary["git_commit_count"],
+        "git_push_count": tool_activity_summary["git_push_count"],
+        "tool_activity": tool_activity,
+        "response_cost_usd": response_cost_usd,
         "metadata": _build_session_history_metadata(
             metadata=metadata,
             request_tags=[tag for tag in request_tags if isinstance(tag, str)],
             tenant_id=tenant_id,
         ),
-    }
+    })
 
 
-async def _get_aawm_session_history_pool() -> Any:
-    global _aawm_session_history_pool
+async def _open_aawm_session_history_connection() -> Any:
+    dsn = _build_aawm_dsn()
+    if not dsn:
+        raise RuntimeError("AAWM session history database configuration is missing")
 
-    if _aawm_session_history_pool is not None:
-        return _aawm_session_history_pool
+    try:
+        asyncpg = importlib.import_module("asyncpg")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "AAWM session history requires asyncpg to be installed"
+        ) from exc
 
-    async with _aawm_session_history_pool_lock:
-        if _aawm_session_history_pool is not None:
-            return _aawm_session_history_pool
-
-        dsn = _build_aawm_dsn()
-        if not dsn:
-            raise RuntimeError("AAWM session history database configuration is missing")
-
-        try:
-            asyncpg = importlib.import_module("asyncpg")
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "AAWM session history requires asyncpg to be installed"
-            ) from exc
-
-        _aawm_session_history_pool = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=1,
-            max_size=4,
-            command_timeout=10,
-        )
-        return _aawm_session_history_pool
+    return await asyncpg.connect(dsn=dsn, command_timeout=10)
 
 
-async def _ensure_session_history_schema(pool: Any) -> None:
+async def _ensure_session_history_schema(conn: Any) -> None:
     global _aawm_session_history_schema_ready
 
     if _aawm_session_history_schema_ready:
         return
 
-    async with _aawm_session_history_schema_lock:
+    with _aawm_session_history_schema_lock:
         if _aawm_session_history_schema_ready:
             return
 
-        async with pool.acquire() as conn:
-            await conn.execute(_AAWM_SESSION_HISTORY_TABLE_SQL)
-            for statement in _AAWM_SESSION_HISTORY_INDEX_STATEMENTS:
-                await conn.execute(statement)
+        await conn.execute(_AAWM_SESSION_HISTORY_TABLE_SQL)
+        for statement in _AAWM_SESSION_HISTORY_ALTER_STATEMENTS:
+            await conn.execute(statement)
+        for statement in _AAWM_SESSION_HISTORY_INDEX_STATEMENTS:
+            await conn.execute(statement)
+        await conn.execute(_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL)
+        for statement in _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS:
+            await conn.execute(statement)
 
         _aawm_session_history_schema_ready = True
 
 
-async def _persist_session_history_record(record: Dict[str, Any]) -> None:
-    pool = await _get_aawm_session_history_pool()
-    await _ensure_session_history_schema(pool)
-
-    await pool.execute(
-        _AAWM_SESSION_HISTORY_INSERT_SQL,
+def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    record = _normalize_session_history_record(dict(record))
+    return (
         record["litellm_call_id"],
         record["session_id"],
         record["trace_id"],
@@ -1838,54 +3877,93 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
         record["reasoning_tokens_source"],
         record["reasoning_present"],
         record["thinking_signature_present"],
+        record.get("provider_cache_attempted", False),
+        record.get("provider_cache_status"),
+        record.get("provider_cache_miss", False),
+        record.get("provider_cache_miss_reason"),
+        record.get("provider_cache_miss_token_count"),
+        record.get("provider_cache_miss_cost_usd"),
         record["tool_call_count"],
         json.dumps(record["tool_names"]),
+        record.get("file_read_count", 0),
+        record.get("file_modified_count", 0),
+        record.get("git_commit_count", 0),
+        record.get("git_push_count", 0),
         record["response_cost_usd"],
         json.dumps(record["metadata"]),
     )
+
+
+def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, ...]]:
+    tool_activity = record.get("tool_activity") or []
+    if not isinstance(tool_activity, list):
+        return []
+
+    payloads: List[Tuple[Any, ...]] = []
+    for index, item in enumerate(tool_activity):
+        if not isinstance(item, dict):
+            continue
+        payloads.append(
+            (
+                record["litellm_call_id"],
+                record["session_id"],
+                record.get("trace_id"),
+                record.get("provider"),
+                record["model"],
+                record.get("agent_name"),
+                _safe_int(item.get("tool_index")) if _safe_int(item.get("tool_index")) is not None else index,
+                item.get("tool_call_id"),
+                item.get("tool_name"),
+                item.get("tool_kind"),
+                json.dumps(item.get("file_paths_read") or []),
+                json.dumps(item.get("file_paths_modified") or []),
+                _safe_int(item.get("git_commit_count")) or 0,
+                _safe_int(item.get("git_push_count")) or 0,
+                item.get("command_text"),
+                json.dumps(item.get("arguments") or {}),
+                json.dumps(item.get("metadata") or {}),
+            )
+        )
+    return payloads
+
+
+async def _persist_session_history_record(record: Dict[str, Any]) -> None:
+    conn = await _open_aawm_session_history_connection()
+    try:
+        await _ensure_session_history_schema(conn)
+
+        history_payload = _build_session_history_db_payload(record)
+        tool_activity_payloads = _build_tool_activity_db_payloads(record)
+
+        await conn.execute(_AAWM_SESSION_HISTORY_INSERT_SQL, *history_payload)
+        if tool_activity_payloads:
+            await conn.executemany(
+                _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
+            )
+    finally:
+        await conn.close()
 
 
 async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
     if not records:
         return
 
-    pool = await _get_aawm_session_history_pool()
-    await _ensure_session_history_schema(pool)
+    conn = await _open_aawm_session_history_connection()
+    try:
+        await _ensure_session_history_schema(conn)
 
-    payloads = [
-        (
-            record["litellm_call_id"],
-            record["session_id"],
-            record["trace_id"],
-            record["provider_response_id"],
-            record["provider"],
-            record["model"],
-            record["model_group"],
-            record["agent_name"],
-            record["tenant_id"],
-            record["call_type"],
-            record["start_time"],
-            record["end_time"],
-            record["input_tokens"],
-            record["output_tokens"],
-            record["total_tokens"],
-            record["cache_read_input_tokens"],
-            record["cache_creation_input_tokens"],
-            record["reasoning_tokens_reported"],
-            record["reasoning_tokens_estimated"],
-            record["reasoning_tokens_source"],
-            record["reasoning_present"],
-            record["thinking_signature_present"],
-            record["tool_call_count"],
-            json.dumps(record["tool_names"]),
-            record["response_cost_usd"],
-            json.dumps(record["metadata"]),
-        )
-        for record in records
-    ]
+        payloads = [_build_session_history_db_payload(record) for record in records]
+        tool_activity_payloads: List[Tuple[Any, ...]] = []
+        for record in records:
+            tool_activity_payloads.extend(_build_tool_activity_db_payloads(record))
 
-    async with pool.acquire() as conn:
         await conn.executemany(_AAWM_SESSION_HISTORY_INSERT_SQL, payloads)
+        if tool_activity_payloads:
+            await conn.executemany(
+                _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
+            )
+    finally:
+        await conn.close()
 
 
 def _get_reasoning_state_tags(
@@ -2219,6 +4297,7 @@ def _enrich_trace_name_and_provider_metadata(
     agent_name = _extract_agent_name(kwargs)
     headers = _ensure_mutable_headers(kwargs)
     metadata = _ensure_mutable_metadata(kwargs)
+    session_id = _extract_session_id(kwargs)
 
     if headers:
         current = headers.get("langfuse_trace_name")
@@ -2234,12 +4313,15 @@ def _enrich_trace_name_and_provider_metadata(
         metadata["trace_name"] = f"claude-code.{agent_name}"
     elif not current_trace_name:
         metadata["trace_name"] = agent_name
+    if session_id and not metadata.get("session_id"):
+        metadata["session_id"] = session_id
 
     message = _extract_first_response_message(result)
     if message is not None:
         _enrich_claude_thinking_metadata(metadata, message)
         _enrich_gemini_thought_signature_metadata(metadata, message)
     _enrich_usage_breakout_metadata(kwargs, result)
+    _enrich_provider_cache_metadata(kwargs, result)
 
     _sync_standard_logging_object(kwargs, metadata)
 
@@ -2284,7 +4366,7 @@ class AawmAgentIdentity(CustomLogger):
             return kwargs, result
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
-        """Persist one finalized session-history row per completed LiteLLM call."""
+        """Queue one finalized session-history row per completed LiteLLM call."""
         try:
             record = _build_session_history_record(
                 kwargs=kwargs,
@@ -2295,12 +4377,7 @@ class AawmAgentIdentity(CustomLogger):
             if record is None:
                 return
 
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                asyncio.run(_persist_session_history_record(record))
-            else:
-                loop.create_task(_persist_session_history_record(record))
+            _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.log_success_event failed: %s", exc
@@ -2319,7 +4396,7 @@ class AawmAgentIdentity(CustomLogger):
             if record is None:
                 return
 
-            await _persist_session_history_record(record)
+            _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.async_log_success_event failed: %s", exc

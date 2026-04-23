@@ -40,6 +40,8 @@ class BasePassthroughUtils:
         request_headers: dict,
         headers: dict,
         forward_headers: Optional[bool] = False,
+        allowed_forward_headers: Optional[list[str]] = None,
+        allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     ):
         """
         Helper to forward headers from original request.
@@ -48,19 +50,44 @@ class BasePassthroughUtils:
         with the prefix stripped, regardless of forward_headers setting.
         e.g., 'x-pass-anthropic-beta: value' becomes 'anthropic-beta: value'
         """
+        normalized_allowed_forward_headers = (
+            {header.lower() for header in allowed_forward_headers}
+            if allowed_forward_headers is not None
+            else None
+        )
+        normalized_allowed_pass_through_prefixed_headers = (
+            {header.lower() for header in allowed_pass_through_prefixed_headers}
+            if allowed_pass_through_prefixed_headers is not None
+            else None
+        )
+        original_request_headers = dict(request_headers)
+
         if forward_headers is True:
             # Header We Should NOT forward
             request_headers.pop("content-length", None)
             request_headers.pop("host", None)
 
+            if normalized_allowed_forward_headers is not None:
+                request_headers = {
+                    header_name: header_value
+                    for header_name, header_value in request_headers.items()
+                    if header_name.lower() in normalized_allowed_forward_headers
+                }
+
             # Combine request headers with custom headers
             headers = {**request_headers, **headers}
 
         # Always process x-pass- prefixed headers (strip prefix and forward)
-        for header_name, header_value in request_headers.items():
+        for header_name, header_value in original_request_headers.items():
             if header_name.lower().startswith(PASS_THROUGH_HEADER_PREFIX):
                 # Strip the 'x-pass-' prefix to get the actual header name
                 actual_header_name = header_name[len(PASS_THROUGH_HEADER_PREFIX) :]
+                if (
+                    normalized_allowed_pass_through_prefixed_headers is not None
+                    and actual_header_name.lower()
+                    not in normalized_allowed_pass_through_prefixed_headers
+                ):
+                    continue
                 headers[actual_header_name] = header_value
 
         return headers

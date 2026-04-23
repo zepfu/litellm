@@ -727,6 +727,27 @@ def test_vertex_ai_usage_metadata_response_token_count():
     assert result.completion_tokens_details.text_tokens == 74
 
 
+def test_vertex_ai_usage_metadata_extracts_reasoning_from_thought_modality():
+    v = VertexGeminiConfig()
+    usage_metadata = {
+        "promptTokenCount": 10,
+        "candidatesTokenCount": 25,
+        "totalTokenCount": 35,
+        "candidatesTokensDetails": [
+            {"modality": "THOUGHT", "tokenCount": 6},
+            {"modality": "TEXT", "tokenCount": 19},
+        ],
+    }
+    usage_metadata = UsageMetadata(**usage_metadata)
+    result = v._calculate_usage(completion_response={"usageMetadata": usage_metadata})
+
+    assert result.prompt_tokens == 10
+    assert result.completion_tokens == 25
+    assert result.total_tokens == 35
+    assert result.completion_tokens_details.reasoning_tokens == 6
+    assert result.completion_tokens_details.text_tokens == 19
+
+
 def test_vertex_ai_usage_metadata_with_image_tokens():
     """Test candidatesTokensDetails with IMAGE modality (e.g., Imagen models)
 

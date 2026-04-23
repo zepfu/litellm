@@ -2678,6 +2678,48 @@ def supports_reasoning(model: str, custom_llm_provider: Optional[str] = None) ->
     )
 
 
+def supports_reasoning_summary(
+    model: str, custom_llm_provider: Optional[str] = None
+) -> bool:
+    """
+    Check if the given model supports reasoning summaries on the Responses API.
+    """
+    try:
+        model, custom_llm_provider, _, _ = litellm.get_llm_provider(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+
+        potential_model_names = _get_potential_model_names(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+        candidate_keys = [
+            potential_model_names["combined_model_name"],
+            model,
+            potential_model_names["combined_stripped_model_name"],
+            potential_model_names["stripped_model_name"],
+            potential_model_names["split_model"],
+        ]
+
+        for candidate in candidate_keys:
+            matched_key = _get_model_cost_key(candidate)
+            if matched_key is None:
+                continue
+            model_entry = litellm.model_cost.get(matched_key) or {}
+            if not _check_provider_match(
+                model_info=model_entry, custom_llm_provider=custom_llm_provider
+            ):
+                continue
+            if "supports_reasoning_summary" in model_entry:
+                return model_entry.get("supports_reasoning_summary") is True
+
+        supported_by_provider = _supports_provider_info_factory(
+            model, custom_llm_provider, "supports_reasoning_summary"
+        )
+        return supported_by_provider is True
+    except Exception:
+        return False
+
+
 def get_supported_regions(
     model: str, custom_llm_provider: Optional[str] = None
 ) -> Optional[List[str]]:

@@ -38,9 +38,28 @@ class AnthropicResponsesStreamWrapper:
         self._pending_tool_ids: Dict[
             str, str
         ] = {}  # item_id -> call_id / name accumulator
+        self._tool_inputs_seeded: set[str] = set()
+        self._tool_argument_deltas_seen: set[str] = set()
         self._sent_message_start = False
         self._sent_message_stop = False
         self._chunk_queue: deque = deque()
+
+    @staticmethod
+    def _deserialize_tool_input(arguments: Any) -> Dict[str, Any]:
+        if arguments in (None, ""):
+            return {}
+        if isinstance(arguments, dict):
+            return arguments
+        if hasattr(arguments, "model_dump"):
+            dumped = arguments.model_dump()
+            return dumped if isinstance(dumped, dict) else {}
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
 
     def _make_message_start(self) -> Dict[str, Any]:
         return {
@@ -117,10 +136,16 @@ class AnthropicResponsesStreamWrapper:
                     or (item.get("name") if isinstance(item, dict) else None)
                     or ""
                 )
+                input_data = self._deserialize_tool_input(
+                    getattr(item, "arguments", None)
+                    or (item.get("arguments") if isinstance(item, dict) else None)
+                )
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
                     self._pending_tool_ids[item_id] = call_id
+                    if input_data:
+                        self._tool_inputs_seeded.add(item_id)
                 self._chunk_queue.append(
                     {
                         "type": "content_block_start",
@@ -129,7 +154,45 @@ class AnthropicResponsesStreamWrapper:
                             "type": "tool_use",
                             "id": call_id,
                             "name": name,
-                            "input": {},
+                            "input": input_data,
+                        },
+                    }
+                )
+            elif item_type == "mcp_call":
+                call_id = (
+                    getattr(item, "id", None)
+                    or (item.get("id") if isinstance(item, dict) else None)
+                    or ""
+                )
+                name = (
+                    getattr(item, "name", None)
+                    or (item.get("name") if isinstance(item, dict) else None)
+                    or ""
+                )
+                server_label = (
+                    getattr(item, "server_label", None)
+                    or (item.get("server_label") if isinstance(item, dict) else None)
+                    or ""
+                )
+                input_data = self._deserialize_tool_input(
+                    getattr(item, "arguments", None)
+                    or (item.get("arguments") if isinstance(item, dict) else None)
+                )
+                block_idx = self._next_block_index()
+                if item_id:
+                    self._item_id_to_block_index[item_id] = block_idx
+                    if input_data:
+                        self._tool_inputs_seeded.add(item_id)
+                self._chunk_queue.append(
+                    {
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {
+                            "type": "mcp_tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "server_name": server_label,
+                            "input": input_data,
                         },
                     }
                 )
@@ -195,6 +258,8 @@ class AnthropicResponsesStreamWrapper:
             item_id = getattr(event, "item_id", None) or (
                 event.get("item_id") if isinstance(event, dict) else None
             )
+            if item_id:
+                self._tool_argument_deltas_seen.add(item_id)
             delta = getattr(event, "delta", "") or (
                 event.get("delta", "") if isinstance(event, dict) else ""
             )
@@ -212,8 +277,32 @@ class AnthropicResponsesStreamWrapper:
             )
             return
 
-        # ---- output item done -> content_block_stop ----
-        if event_type == "response.output_item.done":
+        # ---- MCP call arguments delta ----
+        if event_type == "response.mcp_call_arguments.delta":
+            item_id = getattr(event, "item_id", None) or (
+                event.get("item_id") if isinstance(event, dict) else None
+            )
+            if item_id:
+                self._tool_argument_deltas_seen.add(item_id)
+            delta = getattr(event, "delta", "") or (
+                event.get("delta", "") if isinstance(event, dict) else ""
+            )
+            block_idx = (
+                self._item_id_to_block_index.get(item_id, self._current_block_index)
+                if item_id
+                else self._current_block_index
+            )
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "input_json_delta", "partial_json": delta},
+                }
+            )
+            return
+
+        # ---- MCP call completed -> close mcp_tool_use and emit mcp_tool_result ----
+        if event_type == "response.mcp_call.completed":
             item = getattr(event, "item", None) or (
                 event.get("item") if isinstance(event, dict) else None
             )
@@ -228,6 +317,88 @@ class AnthropicResponsesStreamWrapper:
                 if item_id
                 else self._current_block_index
             )
+            self._chunk_queue.append({"type": "content_block_stop", "index": block_idx})
+
+            output = getattr(item, "output", None) or (
+                item.get("output") if isinstance(item, dict) else None
+            )
+            error = getattr(item, "error", None) or (
+                item.get("error") if isinstance(item, dict) else None
+            )
+            if isinstance(output, list):
+                output_text = "\n".join(
+                    part.get("text", "")
+                    for part in output
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            elif output is None:
+                output_text = ""
+            elif isinstance(output, dict):
+                output_text = json.dumps(output)
+            else:
+                output_text = str(output)
+            if error is not None and not output_text:
+                output_text = str(error)
+
+            result_block_idx = self._next_block_index()
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_start",
+                    "index": result_block_idx,
+                    "content_block": {
+                        "type": "mcp_tool_result",
+                        "tool_use_id": str(item_id or ""),
+                        "is_error": error is not None,
+                        "content": [{"type": "text", "text": output_text}],
+                    },
+                }
+            )
+            self._chunk_queue.append(
+                {"type": "content_block_stop", "index": result_block_idx}
+            )
+            return
+
+        # ---- output item done -> content_block_stop ----
+        if event_type == "response.output_item.done":
+            item = getattr(event, "item", None) or (
+                event.get("item") if isinstance(event, dict) else None
+            )
+            item_type = getattr(item, "type", None) or (
+                item.get("type") if isinstance(item, dict) else None
+            )
+            item_id = (
+                getattr(item, "id", None)
+                or (item.get("id") if isinstance(item, dict) else None)
+                if item
+                else None
+            )
+            block_idx = (
+                self._item_id_to_block_index.get(item_id, self._current_block_index)
+                if item_id
+                else self._current_block_index
+            )
+            if item_type in {"function_call", "mcp_call"} and item_id:
+                input_data = self._deserialize_tool_input(
+                    getattr(item, "arguments", None)
+                    or (item.get("arguments") if isinstance(item, dict) else None)
+                )
+                if (
+                    input_data
+                    and item_id not in self._tool_argument_deltas_seen
+                    and item_id not in self._tool_inputs_seeded
+                ):
+                    self._chunk_queue.append(
+                        {
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(input_data),
+                            },
+                        }
+                    )
+            if item_type == "mcp_call":
+                return
             self._chunk_queue.append(
                 {
                     "type": "content_block_stop",
@@ -308,17 +479,19 @@ class AnthropicResponsesStreamWrapper:
         if self._chunk_queue:
             return self._chunk_queue.popleft()
 
-        # Emit message_start if not yet done (fallback if response.created wasn't fired)
-        if not self._sent_message_start:
-            self._sent_message_start = True
-            self._chunk_queue.append(self._make_message_start())
-            return self._chunk_queue.popleft()
-
         # Consume the upstream stream
         try:
             async for event in self.responses_stream:
                 self._process_event(event)
                 if self._chunk_queue:
+                    first_chunk = self._chunk_queue[0]
+                    if (
+                        not self._sent_message_start
+                        and isinstance(first_chunk, dict)
+                        and first_chunk.get("type") != "message_start"
+                    ):
+                        self._sent_message_start = True
+                        self._chunk_queue.appendleft(self._make_message_start())
                     return self._chunk_queue.popleft()
         except StopAsyncIteration:
             pass
@@ -330,6 +503,12 @@ class AnthropicResponsesStreamWrapper:
         # Drain any remaining queued chunks
         if self._chunk_queue:
             return self._chunk_queue.popleft()
+
+        # If the upstream stream never emitted response.created but did yield no data,
+        # synthesize a single message_start as the minimal Anthropic envelope.
+        if not self._sent_message_start and not self._sent_message_stop:
+            self._sent_message_start = True
+            return self._make_message_start()
 
         raise StopAsyncIteration
 

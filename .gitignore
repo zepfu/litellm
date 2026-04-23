@@ -9,6 +9,7 @@ litellm/proxy/myenv/*
 litellm_uuid.txt
 __pycache__/
 *.pyc
+*.bak
 bun.lockb
 **/.DS_Store
 .aider*

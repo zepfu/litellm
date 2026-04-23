@@ -160,6 +160,7 @@ AllAnthropicToolsValues = Union[
     AnthropicComputerTool,
     AnthropicHostedTools,
     AnthropicMessagesTool,
+    "AnthropicMcpToolset",
     AnthropicWebSearchTool,
     AnthropicCodeExecutionTool,
     AnthropicMemoryTool,
@@ -178,6 +179,19 @@ class AnthropicMcpServerTool(TypedDict, total=False):
     name: Required[str]
     tool_configuration: AnthropicMcpServerToolConfiguration
     authorization_token: str
+
+
+class AnthropicMcpToolConfig(TypedDict, total=False):
+    enabled: bool
+    defer_loading: bool
+
+
+class AnthropicMcpToolset(TypedDict, total=False):
+    type: Required[Literal["mcp_toolset"]]
+    mcp_server_name: Required[str]
+    default_config: AnthropicMcpToolConfig
+    configs: Dict[str, AnthropicMcpToolConfig]
+    cache_control: Optional[Union[dict, ChatCompletionCachedContent]]
 
 
 class AnthropicMessagesTextParam(TypedDict, total=False):
@@ -563,6 +577,21 @@ class AnthropicResponseContentBlockThinking(BaseModel):
     signature: Optional[str]
 
 
+class AnthropicResponseContentBlockMcpToolUse(BaseModel):
+    type: Literal["mcp_tool_use"]
+    id: str
+    name: str
+    server_name: str
+    input: dict
+
+
+class AnthropicResponseContentBlockMcpToolResult(BaseModel):
+    type: Literal["mcp_tool_result"]
+    tool_use_id: str
+    is_error: bool = False
+    content: List[Dict[str, Any]]
+
+
 class AnthropicResponseContentBlockRedactedThinking(BaseModel):
     type: Literal["redacted_thinking"]
     data: str
@@ -590,6 +619,8 @@ class AnthropicResponse(BaseModel):
         Union[
             AnthropicResponseContentBlockText,
             AnthropicResponseContentBlockToolUse,
+            AnthropicResponseContentBlockMcpToolUse,
+            AnthropicResponseContentBlockMcpToolResult,
             AnthropicResponseContentBlockThinking,
             AnthropicResponseContentBlockRedactedThinking,
         ]

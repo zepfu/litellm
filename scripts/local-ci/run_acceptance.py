@@ -215,16 +215,26 @@ def _recent_langfuse_generation_observations_for_trace_ids(
     observations: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for trace_id in trace_ids:
-        params = {
-            "traceId": trace_id,
-            "type": "GENERATION",
-            "limit": str(limit_per_trace),
-            "orderBy": "startTime.desc",
-            "fields": "core",
-        }
-        url = f"{query_url.rstrip('/')}/api/public/observations?{urllib.parse.urlencode(params)}"
+        url = f"{query_url.rstrip('/')}/api/public/traces/{urllib.parse.quote(trace_id, safe='')}"
         payload = _http_get_json(url, public_key, secret_key)
-        for observation in payload.get("data", []):
+        trace_observations = payload.get("observations", [])
+        if not isinstance(trace_observations, list):
+            continue
+        generation_observations = [
+            observation
+            for observation in trace_observations
+            if isinstance(observation, dict) and observation.get("type") == "GENERATION"
+        ]
+        generation_observations.sort(
+            key=lambda observation: _parse_langfuse_timestamp(
+                observation.get("startTime")
+                or observation.get("createdAt")
+                or observation.get("updatedAt")
+            )
+            or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            reverse=True,
+        )
+        for observation in generation_observations[:limit_per_trace]:
             observation_id = observation.get("id")
             if isinstance(observation_id, str) and observation_id in seen_ids:
                 continue
@@ -300,53 +310,84 @@ def _validate_generation_observations(
     trace_ids: list[str],
     start_time: dt.datetime,
     allowed_request_routes: list[str] | None = None,
+    skip_quality_checks: bool = False,
+    allow_zero_cost: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     failures: list[str] = []
     if not trace_ids:
         return [], [], [f"{family} missing trace ids for generation validation"]
 
-    try:
-        observations = _recent_langfuse_generation_observations_for_trace_ids(
-            query_url=query_url,
-            public_key=public_key,
-            secret_key=secret_key,
-            trace_ids=trace_ids,
-            start_time=start_time,
-        )
-    except (
-        urllib.error.HTTPError,
-        urllib.error.URLError,
-        http.client.RemoteDisconnected,
-        ConnectionResetError,
-        TimeoutError,
-    ) as exc:
-        return [], [], [f"{family} generation lookup failed: {exc}"]
+    allowed_request_routes = allowed_request_routes or []
+    observations: list[dict[str, Any]] = []
+    route_filtered_observations: list[dict[str, Any]] = []
+    deadline = time.time() + 45
+    last_error: Exception | None = None
 
+    while True:
+        try:
+            observations = _recent_langfuse_generation_observations_for_trace_ids(
+                query_url=query_url,
+                public_key=public_key,
+                secret_key=secret_key,
+                trace_ids=trace_ids,
+                start_time=start_time,
+            )
+            last_error = None
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            http.client.RemoteDisconnected,
+            ConnectionResetError,
+            TimeoutError,
+        ) as exc:
+            observations = []
+            route_filtered_observations = []
+            last_error = exc
+        else:
+            route_filtered_observations = observations
+            if allowed_request_routes:
+                route_filtered_observations = [
+                    observation
+                    for observation in observations
+                    if (observation.get("metadata") or {}).get(
+                        "user_api_key_request_route"
+                    )
+                    in allowed_request_routes
+                ]
+            if route_filtered_observations:
+                break
+
+        if time.time() >= deadline:
+            break
+        time.sleep(3.0)
+
+    if last_error is not None and not observations:
+        return [], [], [f"{family} generation lookup failed: {last_error}"]
     if not observations:
         return [], [], [f"{family} missing generation observations"]
-
-    route_filtered_observations = observations
-    allowed_request_routes = allowed_request_routes or []
-    if allowed_request_routes:
-        route_filtered_observations = [
-            observation
-            for observation in observations
-            if (observation.get("metadata") or {}).get("user_api_key_request_route")
-            in allowed_request_routes
+    if allowed_request_routes and not route_filtered_observations:
+        return [], [], [
+            f"{family} missing generation observations for routes: {', '.join(allowed_request_routes)}"
         ]
-        if not route_filtered_observations:
-            return [], [], [
-                f"{family} missing generation observations for routes: {', '.join(allowed_request_routes)}"
-            ]
 
     summaries: list[dict[str, Any]] = []
     for observation in route_filtered_observations:
-        model = observation.get("model")
+        model = observation.get("model") or observation.get("providedModelName")
         prompt_tokens = observation.get("promptTokens")
+        if prompt_tokens is None:
+            prompt_tokens = _extract_generation_metric(observation, "usageDetails", "input")
         completion_tokens = observation.get("completionTokens")
+        if completion_tokens is None:
+            completion_tokens = _extract_generation_metric(observation, "usageDetails", "output")
         total_tokens = observation.get("totalTokens")
+        if total_tokens is None:
+            total_tokens = _extract_generation_metric(observation, "usageDetails", "total")
         cost_total = _extract_generation_metric(observation, "costDetails", "total")
+        if cost_total is None:
+            cost_total = observation.get("totalCost")
         calculated_total_cost = observation.get("calculatedTotalCost")
+        if calculated_total_cost is None:
+            calculated_total_cost = observation.get("totalCost")
         summary = {
             "id": observation.get("id"),
             "traceId": observation.get("traceId"),
@@ -360,6 +401,9 @@ def _validate_generation_observations(
         }
         summaries.append(summary)
 
+        if skip_quality_checks:
+            continue
+
         if not isinstance(model, str) or not model.strip():
             failures.append(f"{family} generation missing model")
         elif model.strip().lower() == "unknown":
@@ -371,13 +415,22 @@ def _validate_generation_observations(
             failures.append(f"{family} generation missing completionTokens")
         if not isinstance(total_tokens, (int, float)) or total_tokens <= 0:
             failures.append(f"{family} generation missing totalTokens")
-        if not isinstance(cost_total, (int, float)) or cost_total <= 0:
-            failures.append(f"{family} generation missing costDetails.total")
-        if (
-            not isinstance(calculated_total_cost, (int, float))
-            or calculated_total_cost <= 0
-        ):
-            failures.append(f"{family} generation missing calculatedTotalCost")
+        if allow_zero_cost:
+            if not isinstance(cost_total, (int, float)) or cost_total < 0:
+                failures.append(f"{family} generation missing costDetails.total")
+            if (
+                not isinstance(calculated_total_cost, (int, float))
+                or calculated_total_cost < 0
+            ):
+                failures.append(f"{family} generation missing calculatedTotalCost")
+        else:
+            if not isinstance(cost_total, (int, float)) or cost_total <= 0:
+                failures.append(f"{family} generation missing costDetails.total")
+            if (
+                not isinstance(calculated_total_cost, (int, float))
+                or calculated_total_cost <= 0
+            ):
+                failures.append(f"{family} generation missing calculatedTotalCost")
 
     return route_filtered_observations, summaries, sorted(set(failures))
 
@@ -693,7 +746,17 @@ def _extract_logged_request_body(observation: dict[str, Any]) -> dict[str, Any] 
         return None
     content = first_message.get("content")
     if not isinstance(content, str):
-        return None
+        synthetic_request_body: dict[str, Any] = {}
+        if isinstance(observation.get("model"), str):
+            synthetic_request_body["model"] = observation["model"]
+        if isinstance(messages, list) and messages:
+            synthetic_request_body["messages"] = messages
+        model_parameters = observation.get("modelParameters")
+        if isinstance(model_parameters, dict):
+            for key in ("max_tokens", "stream", "stream_options", "reasoning_effort"):
+                if key in model_parameters:
+                    synthetic_request_body[key] = model_parameters[key]
+        return synthetic_request_body or None
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:

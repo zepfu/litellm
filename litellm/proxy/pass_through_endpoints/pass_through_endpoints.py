@@ -4,7 +4,7 @@ import copy
 import json
 import traceback
 from base64 import b64encode
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from urllib.parse import urlencode, urlparse
 
@@ -31,7 +31,7 @@ from websockets.exceptions import (
 )
 
 import litellm
-from litellm._logging import verbose_proxy_logger
+from litellm._logging import trigger_egress_guard_alert, verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG
 from litellm.integrations.custom_logger import CustomLogger
@@ -83,6 +83,111 @@ def get_response_body(response: httpx.Response) -> Optional[dict]:
         return response.json()
     except Exception:
         return None
+
+
+def _build_http_exception_from_upstream_status_error(
+    error: httpx.HTTPStatusError, detail: Any
+) -> HTTPException:
+    upstream_headers = {
+        str(header_name): str(header_value)
+        for header_name, header_value in error.response.headers.items()
+    }
+    return HTTPException(
+        status_code=error.response.status_code,
+        detail=detail,
+        headers=upstream_headers or None,
+    )
+
+
+def _extract_exception_status_code(exc: Exception) -> Optional[int]:
+    for attr_name in ("status_code", "code"):
+        value = getattr(exc, attr_name, None)
+        if isinstance(value, int):
+            return value
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            continue
+    return None
+
+
+def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
+    if not isinstance(kwargs, dict):
+        return {}
+
+    litellm_params = kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        litellm_params = {}
+        kwargs["litellm_params"] = litellm_params
+
+    metadata = litellm_params.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        litellm_params["metadata"] = metadata
+
+    return metadata
+
+
+def _format_passthrough_span_timestamp(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _append_passthrough_lifecycle_span(
+    kwargs: Optional[dict],
+    *,
+    name: str,
+    start_time: datetime,
+    end_time: datetime,
+    span_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    metadata = _ensure_passthrough_metadata(kwargs)
+    if not metadata:
+        return
+
+    langfuse_spans = metadata.get("langfuse_spans")
+    if not isinstance(langfuse_spans, list):
+        langfuse_spans = []
+        metadata["langfuse_spans"] = langfuse_spans
+
+    descriptor: Dict[str, Any] = {
+        "name": name,
+        "start_time": _format_passthrough_span_timestamp(start_time),
+        "end_time": _format_passthrough_span_timestamp(end_time),
+    }
+    if span_metadata:
+        descriptor["metadata"] = span_metadata
+    langfuse_spans.append(descriptor)
+
+
+def _record_passthrough_duration(
+    kwargs: Optional[dict],
+    *,
+    metric_key: str,
+    span_name: str,
+    start_time: datetime,
+    end_time: datetime,
+    span_metadata: Optional[Dict[str, Any]] = None,
+) -> float:
+    duration_ms = max(0.0, (end_time - start_time).total_seconds() * 1000.0)
+    metadata = _ensure_passthrough_metadata(kwargs)
+    if metadata:
+        metadata[metric_key] = round(duration_ms, 3)
+    _append_passthrough_lifecycle_span(
+        kwargs,
+        name=span_name,
+        start_time=start_time,
+        end_time=end_time,
+        span_metadata={
+            "duration_ms": round(duration_ms, 3),
+            **(span_metadata or {}),
+        },
+    )
+    return duration_ms
 
 
 async def set_env_variables_in_header(custom_headers: Optional[dict]) -> Optional[dict]:
@@ -315,6 +420,171 @@ async def chat_completion_pass_through_endpoint(  # noqa: PLR0915
 
 class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
     @staticmethod
+    def _raise_egress_guard_block(
+        *,
+        detail: str,
+        url: Union[str, httpx.URL],
+        credential_family: Optional[str],
+        target_family: Optional[str],
+        marker_families: Optional[set[str]] = None,
+    ) -> None:
+        alert_state = trigger_egress_guard_alert(
+            reason=detail,
+            target=str(url),
+            credential_family=credential_family,
+            target_family=target_family,
+        )
+        verbose_proxy_logger.critical(
+            "Egress guard blocked passthrough request: detail=%s target=%s credential_family=%s target_family=%s marker_families=%s trigger_count=%s",
+            detail,
+            str(url),
+            credential_family,
+            target_family,
+            sorted(marker_families) if marker_families else [],
+            alert_state.get("trigger_count"),
+        )
+        raise HTTPException(status_code=500, detail=detail)
+
+    @staticmethod
+    def get_target_provider_family(url: Union[str, httpx.URL]) -> str:
+        parsed_url = urlparse(str(url))
+        hostname = (parsed_url.hostname or "").lower()
+
+        if hostname == "api.anthropic.com" or hostname.endswith(".anthropic.com"):
+            return "anthropic"
+        if (
+            hostname == "api.openai.com"
+            or hostname.endswith(".openai.com")
+            or hostname == "chatgpt.com"
+            or hostname.endswith(".chatgpt.com")
+        ):
+            return "openai"
+        if (
+            hostname == "openrouter.ai"
+            or hostname.endswith(".openrouter.ai")
+        ):
+            return "openrouter"
+        if hostname in {"integrate.api.nvidia.com", "ai.api.nvidia.com"}:
+            return "nvidia"
+        if (
+            hostname == "generativelanguage.googleapis.com"
+            or hostname.endswith(".googleapis.com")
+            or hostname.endswith(".google.com")
+            or hostname.endswith(".googleusercontent.com")
+        ):
+            return "google"
+        return "generic"
+
+    @staticmethod
+    def get_credential_marker_families(
+        headers: Optional[dict], url: Optional[Union[str, httpx.URL]] = None
+    ) -> set[str]:
+        normalized_headers = {
+            str(key).lower(): value for key, value in dict(headers or {}).items()
+        }
+        marker_families: set[str] = set()
+
+        if (
+            "x-api-key" in normalized_headers
+            or "anthropic-version" in normalized_headers
+            or "anthropic-beta" in normalized_headers
+            or "anthropic-dangerous-direct-browser-access" in normalized_headers
+        ):
+            marker_families.add("anthropic")
+
+        originator = normalized_headers.get("originator")
+        user_agent = normalized_headers.get("user-agent")
+        if (
+            "chatgpt-account-id" in normalized_headers
+            or "session_id" in normalized_headers
+            or "session-id" in normalized_headers
+            or (
+                isinstance(originator, str)
+                and ("codex" in originator.lower() or "openai" in originator.lower())
+            )
+            or (
+                isinstance(user_agent, str)
+                and ("codex" in user_agent.lower() or "openai" in user_agent.lower())
+            )
+        ):
+            marker_families.add("openai")
+
+        if (
+            "x-goog-api-key" in normalized_headers
+            or "x-goog-api-client" in normalized_headers
+            or "goog-api-client" in normalized_headers
+        ):
+            marker_families.add("google")
+
+        if url is not None:
+            parsed_url = urlparse(str(url))
+            query_params = httpx.QueryParams(parsed_url.query)
+            if query_params.get("key"):
+                marker_families.add("google")
+
+        return marker_families
+
+    @staticmethod
+    def validate_outgoing_egress(
+        *,
+        url: Union[str, httpx.URL],
+        headers: Optional[dict],
+        credential_family: Optional[str] = None,
+        expected_target_family: Optional[str] = None,
+    ) -> None:
+        target_family = HttpPassThroughEndpointHelpers.get_target_provider_family(url)
+        if (
+            expected_target_family is not None
+            and target_family != "generic"
+            and target_family != expected_target_family
+        ):
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    f"Blocked passthrough egress: expected target family "
+                    f"{expected_target_family}, got {target_family}."
+                ),
+                url=url,
+                credential_family=credential_family,
+                target_family=target_family,
+            )
+
+        if (
+            credential_family is not None
+            and target_family != "generic"
+            and target_family != credential_family
+        ):
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    f"Blocked passthrough egress: credential family "
+                    f"{credential_family} cannot be sent to {target_family}."
+                ),
+                url=url,
+                credential_family=credential_family,
+                target_family=target_family,
+            )
+
+        marker_families = HttpPassThroughEndpointHelpers.get_credential_marker_families(
+            headers=headers,
+            url=url,
+        )
+        cross_provider_markers = {
+            marker
+            for marker in marker_families
+            if target_family != "generic" and marker != target_family
+        }
+        if cross_provider_markers:
+            HttpPassThroughEndpointHelpers._raise_egress_guard_block(
+                detail=(
+                    "Blocked passthrough egress due to cross-provider credential/header "
+                    f"markers: target={target_family}, markers={sorted(cross_provider_markers)}."
+                ),
+                url=url,
+                credential_family=credential_family,
+                target_family=target_family,
+                marker_families=cross_provider_markers,
+            )
+
+    @staticmethod
     def get_masked_passthrough_headers(headers: Optional[dict]) -> dict:
         masked_headers = dict(headers or {})
         sensitive_header_names = {
@@ -442,6 +712,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             parsed_url.hostname == "api.openai.com"
             or parsed_url.hostname == "openai.azure.com"
             or parsed_url.hostname == "chatgpt.com"
+            or parsed_url.hostname == "openrouter.ai"
+            or (parsed_url.hostname and parsed_url.hostname.endswith(".openrouter.ai"))
             or (parsed_url.hostname and "openai.com" in parsed_url.hostname)
         ):
             return EndpointType.OPENAI
@@ -718,6 +990,11 @@ async def pass_through_request(  # noqa: PLR0915
     cost_per_request: Optional[float] = None,
     custom_llm_provider: Optional[str] = None,
     guardrails_config: Optional[dict] = None,
+    egress_credential_family: Optional[str] = None,
+    expected_target_family: Optional[str] = None,
+    allowed_forward_headers: Optional[list[str]] = None,
+    allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
+    retryable_upstream_status_codes: Optional[list[int]] = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -736,6 +1013,10 @@ async def pass_through_request(  # noqa: PLR0915
         cost_per_request: Optional field - cost per request to the target endpoint
         custom_llm_provider: Optional field - custom LLM provider for the endpoint
         guardrails_config: Optional field - guardrails configuration for passthrough endpoint
+        egress_credential_family: Optional provider family for sensitive local/client credentials
+        expected_target_family: Optional provider family expected for the final egress target
+        retryable_upstream_status_codes: Optional upstream status codes that will be retried by the
+            caller, so generic passthrough failure logging should be deferred to the adapter layer
     """
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.pass_through_endpoints.passthrough_guardrails import (
@@ -753,15 +1034,23 @@ async def pass_through_request(  # noqa: PLR0915
     _parsed_body: Optional[dict] = None
     # kwargs for pass through endpoint, contains metadata, litellm_params, call_type, litellm_call_id, passthrough_logging_payload
     kwargs: Optional[dict] = None
+    retryable_status_codes = {
+        status_code
+        for status_code in (retryable_upstream_status_codes or [])
+        if isinstance(status_code, int)
+    }
 
     #########################################################
     try:
+        start_time = datetime.now()
         url = httpx.URL(target)
         headers = custom_headers
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
             headers=headers,
             forward_headers=forward_headers,
+            allowed_forward_headers=allowed_forward_headers,
+            allowed_pass_through_prefixed_headers=allowed_pass_through_prefixed_headers,
         )
 
         # Apply default query parameters if provided, regardless of merge_query_params setting
@@ -780,6 +1069,13 @@ async def pass_through_request(  # noqa: PLR0915
                 ).encode("ascii")
             )
 
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url=url,
+            headers=headers,
+            credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+        )
+
         endpoint_type: EndpointType = HttpPassThroughEndpointHelpers.get_endpoint_type(
             str(url)
         )
@@ -791,7 +1087,7 @@ async def pass_through_request(  # noqa: PLR0915
         )
 
         if custom_body:
-            _parsed_body = custom_body
+            _parsed_body = copy.deepcopy(custom_body)
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request
             _parsed_body = {}
@@ -826,7 +1122,6 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
         ## LOGGING OBJECT ## - initialize before pre_call_hook so guardrails can access it
-        start_time = datetime.now()
         logging_obj = Logging(
             model="unknown",
             messages=[{"role": "user", "content": safe_dumps(_parsed_body)}],
@@ -872,6 +1167,18 @@ async def pass_through_request(  # noqa: PLR0915
             request=request,
             logging_obj=logging_obj,
         )
+        local_prepare_completed_at = datetime.now()
+        local_prepare_ms = _record_passthrough_duration(
+            kwargs,
+            metric_key="aawm_local_prepare_ms",
+            span_name="proxy.pre_send_prepare",
+            start_time=start_time,
+            end_time=local_prepare_completed_at,
+            span_metadata={"stage": "pre_send_prepare"},
+        )
+
+        metadata = _ensure_passthrough_metadata(kwargs)
+        metadata["aawm_passthrough_endpoint_type"] = endpoint_type.value
 
         # Store custom_llm_provider in kwargs and logging object if provided
         if custom_llm_provider:
@@ -891,9 +1198,11 @@ async def pass_through_request(  # noqa: PLR0915
         logging_obj.model_call_details["litellm_call_id"] = litellm_call_id
 
         # combine url with query params for logging
-        requested_query_params: Optional[dict] = query_params or dict(
-            request.query_params
-        )
+        requested_query_params: Optional[dict]
+        if query_params is not None:
+            requested_query_params = query_params
+        else:
+            requested_query_params = dict(request.query_params)
 
         requested_query_params_str = None
         if requested_query_params:
@@ -925,6 +1234,7 @@ async def pass_through_request(  # noqa: PLR0915
         )
 
         if stream:
+            upstream_wait_started_at = datetime.now()
             req = async_client.build_request(
                 "POST",
                 url,
@@ -934,12 +1244,22 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
             response = await async_client.send(req, stream=stream)
+            upstream_wait_completed_at = datetime.now()
+            _record_passthrough_duration(
+                kwargs,
+                metric_key="aawm_upstream_wait_ms",
+                span_name="proxy.upstream_wait",
+                start_time=upstream_wait_started_at,
+                end_time=upstream_wait_completed_at,
+                span_metadata={"stage": "upstream_wait", "stream": True},
+            )
 
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
-                raise HTTPException(
-                    status_code=e.response.status_code, detail=await e.response.aread()
+                raise _build_http_exception_from_upstream_status_error(
+                    e,
+                    await e.response.aread(),
                 )
 
             return StreamingResponse(
@@ -954,6 +1274,9 @@ async def pass_through_request(  # noqa: PLR0915
                     passthrough_logging_payload=passthrough_logging_payload,
                     custom_llm_provider=custom_llm_provider,
                     success_handler_kwargs=kwargs,
+                    upstream_wait_started_at=upstream_wait_started_at,
+                    upstream_wait_completed_at=upstream_wait_completed_at,
+                    local_prepare_ms=local_prepare_ms,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
@@ -962,6 +1285,7 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=response.status_code,
             )
 
+        upstream_wait_started_at = datetime.now()
         response = (
             await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
                 request=request,
@@ -972,14 +1296,24 @@ async def pass_through_request(  # noqa: PLR0915
                 _parsed_body=_parsed_body,
             )
         )
+        upstream_wait_completed_at = datetime.now()
+        _record_passthrough_duration(
+            kwargs,
+            metric_key="aawm_upstream_wait_ms",
+            span_name="proxy.upstream_wait",
+            start_time=upstream_wait_started_at,
+            end_time=upstream_wait_completed_at,
+            span_metadata={"stage": "upstream_wait", "stream": False},
+        )
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
         if _is_streaming_response(response) is True:
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
-                raise HTTPException(
-                    status_code=e.response.status_code, detail=await e.response.aread()
+                raise _build_http_exception_from_upstream_status_error(
+                    e,
+                    await e.response.aread(),
                 )
 
             return StreamingResponse(
@@ -994,6 +1328,9 @@ async def pass_through_request(  # noqa: PLR0915
                     passthrough_logging_payload=passthrough_logging_payload,
                     custom_llm_provider=custom_llm_provider,
                     success_handler_kwargs=kwargs,
+                    upstream_wait_started_at=upstream_wait_started_at,
+                    upstream_wait_completed_at=upstream_wait_completed_at,
+                    local_prepare_ms=local_prepare_ms,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
@@ -1005,13 +1342,23 @@ async def pass_through_request(  # noqa: PLR0915
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=e.response.status_code, detail=e.response.text
+            raise _build_http_exception_from_upstream_status_error(
+                e,
+                e.response.text,
             )
 
         if response.status_code >= 300:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=response.text,
+                headers={
+                    str(header_name): str(header_value)
+                    for header_name, header_value in response.headers.items()
+                }
+                or None,
+            )
 
+        finalize_started_at = datetime.now()
         content = await response.aread()
 
         ## LOG SUCCESS
@@ -1033,6 +1380,22 @@ async def pass_through_request(  # noqa: PLR0915
                 **kwargs,
             )
         )
+        local_finalize_ms = _record_passthrough_duration(
+            kwargs,
+            metric_key="aawm_local_finalize_ms",
+            span_name="proxy.post_response_finalize",
+            start_time=finalize_started_at,
+            end_time=end_time,
+            span_metadata={"stage": "post_response_finalize", "stream": False},
+        )
+        metadata = _ensure_passthrough_metadata(kwargs)
+        if metadata:
+            metadata["aawm_total_proxy_overhead_ms"] = round(
+                local_prepare_ms + local_finalize_ms, 3
+            )
+            metadata["aawm_total_proxy_duration_ms"] = round(
+                max(0.0, (end_time - start_time).total_seconds() * 1000.0), 3
+            )
 
         ## CUSTOM HEADERS - `x-litellm-*`
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
@@ -1059,11 +1422,21 @@ async def pass_through_request(  # noqa: PLR0915
             cache_key=None,
             api_base=str(url._uri_reference) if url else None,
         )
-        verbose_proxy_logger.exception(
-            "litellm.proxy.proxy_server.pass_through_endpoint(): Exception occured - {}".format(
-                str(e)
-            )
+        status_code = _extract_exception_status_code(e)
+        suppress_retryable_failure_logging = (
+            status_code in retryable_status_codes if status_code is not None else False
         )
+        if suppress_retryable_failure_logging:
+            verbose_proxy_logger.debug(
+                "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
+                status_code,
+            )
+        else:
+            verbose_proxy_logger.exception(
+                "litellm.proxy.proxy_server.pass_through_endpoint(): Exception occured - {}".format(
+                    str(e)
+                )
+            )
 
         #########################################################
         # Monitoring: Trigger post_call_failure_hook
@@ -1084,25 +1457,38 @@ async def pass_through_request(  # noqa: PLR0915
         if "custom_llm_provider" not in request_payload and custom_llm_provider:
             request_payload["custom_llm_provider"] = custom_llm_provider
 
-        await proxy_logging_obj.post_call_failure_hook(
-            user_api_key_dict=user_api_key_dict,
-            original_exception=e,
-            request_data=request_payload,
-            traceback_str=traceback.format_exc(
-                limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
-            ),
-        )
+        if not suppress_retryable_failure_logging:
+            await proxy_logging_obj.post_call_failure_hook(
+                user_api_key_dict=user_api_key_dict,
+                original_exception=e,
+                request_data=request_payload,
+                traceback_str=traceback.format_exc(
+                    limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
+                ),
+            )
 
         #########################################################
 
         if isinstance(e, HTTPException):
-            raise ProxyException(
+            proxy_exc = ProxyException(
                 message=getattr(e, "message", str(getattr(e, "detail", str(e)))),
                 type=getattr(e, "type", "None"),
                 param=getattr(e, "param", "None"),
                 code=getattr(e, "status_code", status.HTTP_400_BAD_REQUEST),
                 headers=custom_headers,
             )
+            setattr(proxy_exc, "detail", getattr(e, "detail", None))
+            upstream_headers = getattr(e, "headers", None)
+            if isinstance(upstream_headers, dict):
+                setattr(
+                    proxy_exc,
+                    "upstream_headers",
+                    {
+                        str(header_name): str(header_value)
+                        for header_name, header_value in upstream_headers.items()
+                    },
+                )
+            raise proxy_exc
         else:
             error_msg = f"{str(e)}"
             raise ProxyException(

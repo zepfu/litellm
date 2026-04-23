@@ -4,8 +4,9 @@ OpenAI Passthrough Logging Handler
 Handles cost tracking and logging for OpenAI passthrough endpoints, specifically /chat/completions.
 """
 
+import json
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -21,7 +22,6 @@ from litellm.completion_extras.litellm_responses_transformation.transformation i
 )
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.llms.openai.openai import OpenAIConfig as OpenAIConfigType
-from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.responses.utils import ResponseAPILoggingUtils
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
@@ -53,6 +53,20 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     def llm_provider_name(self) -> LlmProviders:
         return LlmProviders.OPENAI
 
+    @staticmethod
+    def _is_openai_compatible_hostname(hostname: Optional[str]) -> bool:
+        if not hostname:
+            return False
+        return (
+            "api.openai.com" in hostname
+            or "openai.azure.com" in hostname
+            or "chatgpt.com" in hostname
+            or hostname == "integrate.api.nvidia.com"
+            or hostname == "ai.api.nvidia.com"
+            or hostname == "openrouter.ai"
+            or hostname.endswith(".openrouter.ai")
+        )
+
     def get_provider_config(self, model: str) -> OpenAIConfigType:
         """Get OpenAI provider configuration for the given model."""
         return OpenAIConfig()
@@ -64,11 +78,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             return False
         parsed_url = urlparse(url_route)
         return bool(
-            parsed_url.hostname
-            and (
-                "api.openai.com" in parsed_url.hostname
-                or "openai.azure.com" in parsed_url.hostname
-                or "chatgpt.com" in parsed_url.hostname
+            OpenAIPassthroughLoggingHandler._is_openai_compatible_hostname(
+                parsed_url.hostname
             )
             and "/v1/chat/completions" in parsed_url.path
         )
@@ -80,11 +91,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             return False
         parsed_url = urlparse(url_route)
         return bool(
-            parsed_url.hostname
-            and (
-                "api.openai.com" in parsed_url.hostname
-                or "openai.azure.com" in parsed_url.hostname
-                or "chatgpt.com" in parsed_url.hostname
+            OpenAIPassthroughLoggingHandler._is_openai_compatible_hostname(
+                parsed_url.hostname
             )
             and "/v1/images/generations" in parsed_url.path
         )
@@ -96,11 +104,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             return False
         parsed_url = urlparse(url_route)
         return bool(
-            parsed_url.hostname
-            and (
-                "api.openai.com" in parsed_url.hostname
-                or "openai.azure.com" in parsed_url.hostname
-                or "chatgpt.com" in parsed_url.hostname
+            OpenAIPassthroughLoggingHandler._is_openai_compatible_hostname(
+                parsed_url.hostname
             )
             and "/v1/images/edits" in parsed_url.path
         )
@@ -112,11 +117,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             return False
         parsed_url = urlparse(url_route)
         return bool(
-            parsed_url.hostname
-            and (
-                "api.openai.com" in parsed_url.hostname
-                or "openai.azure.com" in parsed_url.hostname
-                or "chatgpt.com" in parsed_url.hostname
+            OpenAIPassthroughLoggingHandler._is_openai_compatible_hostname(
+                parsed_url.hostname
             )
             and ("/v1/responses" in parsed_url.path or "/responses" in parsed_url.path)
         )
@@ -154,6 +156,189 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         metadata["langfuse_spans"] = langfuse_spans
         litellm_params["metadata"] = metadata
         kwargs["litellm_params"] = litellm_params
+
+
+    @staticmethod
+    def _backfill_responses_api_model_response(
+        model_response: Optional[ModelResponse],
+        response_body: Optional[dict],
+        fallback_model: str,
+    ) -> Optional[ModelResponse]:
+        if model_response is None or not isinstance(response_body, dict):
+            return model_response
+
+        response_model = response_body.get("model")
+        current_model = getattr(model_response, "model", None)
+        if not isinstance(current_model, str) or not current_model.strip() or current_model == "unknown":
+            if isinstance(response_model, str) and response_model.strip():
+                model_response.model = response_model
+            elif isinstance(fallback_model, str) and fallback_model.strip():
+                model_response.model = fallback_model
+
+        response_usage = response_body.get("usage")
+        if isinstance(response_usage, dict):
+            transformed_usage = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+                response_usage
+            )
+            transformed_total = getattr(transformed_usage, "total_tokens", None) or 0
+            current_usage = getattr(model_response, "usage", None)
+            current_total = getattr(current_usage, "total_tokens", None) or 0
+            if current_usage is None or (current_total == 0 and transformed_total > 0):
+                model_response.usage = transformed_usage
+
+        response_output = response_body.get("output")
+        if isinstance(response_output, list):
+            hidden_params = getattr(model_response, "_hidden_params", None)
+            if not isinstance(hidden_params, dict):
+                hidden_params = {}
+                model_response._hidden_params = hidden_params
+            hidden_params["responses_output"] = response_output
+
+        return model_response
+
+    @staticmethod
+    def _response_output_stream_key(
+        *,
+        item: Optional[dict] = None,
+        output_index: Any = None,
+        item_id: Any = None,
+        fallback_index: Optional[int] = None,
+    ) -> str:
+        if isinstance(item, dict):
+            for key in ("call_id", "id"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        if isinstance(item_id, str) and item_id.strip():
+            return item_id.strip()
+        if isinstance(output_index, int):
+            return f"output:{output_index}"
+        if fallback_index is not None:
+            return f"fallback:{fallback_index}"
+        return "fallback:0"
+
+    @staticmethod
+    def _merge_responses_output_lists(
+        completed_output: Optional[List[dict]],
+        streamed_output: Optional[List[dict]],
+    ) -> List[dict]:
+        merged_by_key: Dict[str, dict] = {}
+        ordered_keys: List[str] = []
+
+        for output_list in (streamed_output or [], completed_output or []):
+            for item in output_list:
+                if not isinstance(item, dict):
+                    continue
+                key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+                    item=item,
+                    fallback_index=len(ordered_keys),
+                )
+                if key not in ordered_keys:
+                    ordered_keys.append(key)
+                existing = merged_by_key.get(key, {})
+                merged_item = {**existing, **item}
+                if "arguments" in existing and "arguments" not in item:
+                    merged_item["arguments"] = existing["arguments"]
+                merged_by_key[key] = merged_item
+
+        return [merged_by_key[key] for key in ordered_keys if key in merged_by_key]
+
+    @staticmethod
+    def _reconstruct_responses_output_items_from_stream(
+        all_chunks: List[str],
+    ) -> List[dict]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        output_items: Dict[str, dict] = {}
+        ordered_keys: List[str] = []
+        key_aliases: Dict[str, str] = {}
+        key_by_output_index: Dict[int, str] = {}
+
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+
+            event_type = parsed_chunk.get("type")
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                item = parsed_chunk.get("item")
+                if not isinstance(item, dict):
+                    continue
+                raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+                    item=item,
+                    output_index=parsed_chunk.get("output_index"),
+                    fallback_index=len(ordered_keys),
+                )
+                output_index = parsed_chunk.get("output_index")
+                if isinstance(output_index, int) and output_index in key_by_output_index:
+                    key = key_by_output_index[output_index]
+                else:
+                    key = key_aliases.get(raw_key, raw_key)
+                if key not in ordered_keys:
+                    ordered_keys.append(key)
+                existing = output_items.get(key, {})
+                merged_item = {**existing, **item}
+                if "arguments" in existing and "arguments" not in item:
+                    merged_item["arguments"] = existing["arguments"]
+                output_items[key] = merged_item
+                if isinstance(output_index, int):
+                    key_by_output_index[output_index] = key
+                for alias in (
+                    raw_key,
+                    item.get("id"),
+                    item.get("call_id"),
+                ):
+                    if isinstance(alias, str) and alias.strip():
+                        key_aliases[alias.strip()] = key
+                continue
+
+            if event_type in {
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.mcp_call_arguments.delta",
+                "response.mcp_call_arguments.done",
+            }:
+                item_id = parsed_chunk.get("item_id")
+                output_index = parsed_chunk.get("output_index")
+                raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+                    output_index=parsed_chunk.get("output_index"),
+                    item_id=item_id,
+                    fallback_index=len(ordered_keys),
+                )
+                if isinstance(output_index, int) and output_index in key_by_output_index:
+                    key = key_by_output_index[output_index]
+                else:
+                    key = key_aliases.get(raw_key, raw_key)
+                if key not in ordered_keys:
+                    ordered_keys.append(key)
+                existing = output_items.get(key, {})
+                if not existing:
+                    item_type = "mcp_call" if "mcp_call" in str(event_type) else "function_call"
+                    existing = {
+                        "type": item_type,
+                        "id": item_id,
+                    }
+                    if item_type == "function_call" and isinstance(item_id, str) and item_id:
+                        existing["call_id"] = item_id
+                value = parsed_chunk.get("arguments")
+                if not isinstance(value, str):
+                    value = parsed_chunk.get("delta")
+                if isinstance(value, str):
+                    if str(event_type).endswith(".delta"):
+                        existing["arguments"] = f"{existing.get('arguments', '')}{value}"
+                    else:
+                        existing["arguments"] = value
+                output_items[key] = existing
+                if isinstance(output_index, int):
+                    key_by_output_index[output_index] = key
+                if isinstance(item_id, str) and item_id.strip():
+                    key_aliases[item_id.strip()] = key
+
+        return [output_items[key] for key in ordered_keys if key in output_items]
 
     @staticmethod
     def _calculate_image_generation_cost(
@@ -391,6 +576,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     json_mode=False,
                     litellm_params=existing_litellm_params,
                 )
+                litellm_model_response = handler_instance._backfill_responses_api_model_response(
+                    litellm_model_response,
+                    response_body,
+                    model,
+                )
 
                 # Calculate cost using LiteLLM's cost calculator with responses call type
                 response_cost = litellm.completion_cost(
@@ -583,49 +773,58 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         """
         Rebuild a complete response from Responses API streaming events.
 
-        Native Codex passthrough streams the ChatGPT backend's `/responses` SSE shape.
-        Replaying those chunks through the chat-completions stream builder drops the
-        `response.completed.response.usage` payload, which then zeros out cost logging.
+        For native Codex passthrough we only need the final `response.completed.response`
+        payload plus any `response.output_text.delta` text that was streamed before it.
+        Parsing the raw completed payload directly is more reliable than replaying the
+        event stream through the generic chunk transformer, which can drop usage for
+        some ChatGPT/Codex stream shapes.
         """
         try:
             from litellm.llms.base_llm.base_model_iterator import (
                 BaseModelResponseIterator,
             )
+            from litellm.types.llms.openai import ResponsesAPIResponse
 
-            responses_config = OpenAIResponsesAPIConfig()
             responses_transformer = LiteLLMResponsesTransformationHandler()
-            completed_response = None
+            completed_response_payload = None
             output_text_parts: List[str] = []
 
             for chunk_str in all_chunks:
                 parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
                     str_line=chunk_str
                 )
-                if not parsed_chunk:
+                if not isinstance(parsed_chunk, dict):
                     continue
-                if parsed_chunk.get("type") == "response.output_text.delta":
+                chunk_type = parsed_chunk.get("type")
+                if chunk_type == "response.output_text.delta":
                     delta = parsed_chunk.get("delta")
                     if isinstance(delta, str):
                         output_text_parts.append(delta)
-                transformed_chunk = responses_config.transform_streaming_response(
-                    model=model,
-                    parsed_chunk=parsed_chunk,
-                    logging_obj=litellm_logging_obj,
-                )
-                if getattr(transformed_chunk, "type", None) == "response.completed":
-                    completed_response = getattr(transformed_chunk, "response", None)
+                elif chunk_type == "response.completed":
+                    response_payload = parsed_chunk.get("response")
+                    if isinstance(response_payload, dict):
+                        completed_response_payload = response_payload
 
-            if completed_response is None:
+            if completed_response_payload is None:
                 verbose_proxy_logger.warning(
                     "No response.completed event found in OpenAI responses stream"
                 )
                 return None
 
+            completed_response = ResponsesAPIResponse(**completed_response_payload)
+            responses_output = completed_response_payload.get("output")
+            reconstructed_output = (
+                OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
+                    all_chunks
+                )
+            )
+            merged_output = OpenAIPassthroughLoggingHandler._merge_responses_output_lists(
+                responses_output if isinstance(responses_output, list) else [],
+                reconstructed_output,
+            )
             if len(getattr(completed_response, "output", []) or []) == 0:
-                # Codex streams can emit text only through response.output_text.delta
-                # while leaving response.completed.output empty.
                 model_response = litellm.ModelResponse()
-                model_response.model = model
+                model_response.model = getattr(completed_response, "model", None) or model
                 model_response.choices = [
                     Choices(
                         message=Message(
@@ -637,7 +836,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 ]
                 model_response.usage = (
                     ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
-                        completed_response.usage
+                        completed_response_payload.get("usage")
                     )
                 )
                 raw_response_hidden_params = getattr(
@@ -645,9 +844,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 )
                 if raw_response_hidden_params:
                     model_response._hidden_params.update(raw_response_hidden_params)
+                if merged_output:
+                    model_response._hidden_params["responses_output"] = merged_output
                 return model_response
 
-            return responses_transformer.transform_response(
+            model_response = responses_transformer.transform_response(
                 model=model,
                 raw_response=completed_response,
                 model_response=litellm.ModelResponse(),
@@ -659,6 +860,18 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 encoding=litellm.encoding,
                 json_mode=False,
             )
+            backfilled_response = self._backfill_responses_api_model_response(
+                model_response,
+                completed_response_payload,
+                model,
+            )
+            if not hasattr(backfilled_response, "_hidden_params") or not isinstance(
+                getattr(backfilled_response, "_hidden_params", None), dict
+            ):
+                backfilled_response._hidden_params = {}
+            if merged_output:
+                backfilled_response._hidden_params["responses_output"] = merged_output
+            return backfilled_response
         except Exception as e:
             verbose_proxy_logger.error(
                 f"Error rebuilding complete responses API stream: {str(e)}"
