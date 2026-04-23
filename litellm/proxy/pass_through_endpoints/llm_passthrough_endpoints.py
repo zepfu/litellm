@@ -159,6 +159,15 @@ _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
         "gpt-5.3-codex-spark",
     }
 )
+_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "deepseek-ai/deepseek-v3.1-terminus",
+        "deepseek-ai/deepseek-v3.2",
+        "minimaxai/minimax-m2.7",
+        "mistralai/devstral-2-123b-instruct-2512",
+        "z-ai/glm4.7",
+    }
+)
 _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
     {
         "openrouter/free",
@@ -205,6 +214,14 @@ _ANTHROPIC_ADAPTER_OPENAI_XPASS_HEADER_ALLOWLIST = (
 _ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS = (
     "AAWM_OPENROUTER_API_KEY",
     "OPENROUTER_API_KEY",
+)
+_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = (
+    "AAWM_NVIDIA_API_KEY",
+    "NVIDIA_NIM_API_KEY",
+    "NVIDIA_API_KEY",
+)
+_ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset(
+    {408, 429, 500, 502, 503, 504}
 )
 _ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS = (
     "LITELLM_CODEX_AUTH_FILE",
@@ -437,7 +454,11 @@ def _split_anthropic_adapter_provider_prefix(model: Any) -> tuple[Optional[str],
     provider = {
         "chatgpt": "openai",
         "gemini": "google",
-    }.get(prefix, prefix if prefix in ("openai", "google", "openrouter") else None)
+        "nvidia_nim": "nvidia",
+    }.get(
+        prefix,
+        prefix if prefix in ("openai", "google", "openrouter", "nvidia") else None,
+    )
     if provider is None:
         return None, normalized_model
     return provider, remainder.strip()
@@ -476,6 +497,25 @@ def _normalize_anthropic_openai_responses_adapter_model_name(
         return None
     if candidate in _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS:
         return candidate
+    return None
+
+
+def _normalize_anthropic_nvidia_responses_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider not in (None, "nvidia") or candidate is None:
+        return None
+
+    normalized_candidate = candidate.strip()
+    nvidia_model_aliases = {
+        "minimax/minimax-m2.7": "minimaxai/minimax-m2.7",
+    }
+    normalized_candidate = nvidia_model_aliases.get(
+        normalized_candidate, normalized_candidate
+    )
+    if normalized_candidate in _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS:
+        return normalized_candidate
     return None
 
 
@@ -543,6 +583,21 @@ def _resolve_anthropic_openrouter_completion_adapter_model(
     for candidate in _get_anthropic_adapter_model_candidates(request_body):
         normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
         if normalized_model in _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS:
+            return normalized_model
+    return None
+
+
+def _resolve_anthropic_nvidia_responses_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_anthropic_nvidia_responses_adapter_model_name(
+            candidate
+        )
+        if normalized_model is not None:
             return normalized_model
     return None
 
@@ -3458,6 +3513,122 @@ def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
     return _get_first_secret_value(_ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS)
 
 
+def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
+    return _get_first_secret_value(_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS)
+
+
+def _get_anthropic_adapter_nvidia_target_base() -> str:
+    cleaned = (
+        _clean_secret_string(os.getenv("NVIDIA_NIM_API_BASE"))
+        or _clean_secret_string(os.getenv("AAWM_NVIDIA_API_BASE"))
+        or "https://integrate.api.nvidia.com/v1"
+    )
+    cleaned = cleaned.rstrip("/")
+    if cleaned.endswith("/v1"):
+        return cleaned[: -len("/v1")]
+    return cleaned
+
+
+def _get_nvidia_adapter_max_retries() -> int:
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_MAX_RETRIES"))
+    if raw_value is None:
+        return 1
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 1
+    return max(0, parsed)
+
+
+def _get_nvidia_adapter_request_timeout_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS")
+    )
+    if raw_value is None:
+        return 75.0
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        return 75.0
+    return max(5.0, parsed)
+
+
+def _extract_nvidia_adapter_exception_status_code(exc: Any) -> Optional[int]:
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            continue
+
+    text_value = str(exc)
+    if "Timeout Error" in text_value or exc.__class__.__name__.lower() == "timeout":
+        return 504
+
+    match = re.search(r"\b(408|429|500|502|503|504)\b", text_value)
+    if match is not None:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _get_nvidia_adapter_retry_wait_seconds(attempt: int) -> float:
+    return min(float(2 ** max(0, attempt - 1)), 8.0)
+
+
+async def _perform_nvidia_completion_adapter_operation(
+    *,
+    adapter_model: Optional[str],
+    operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    max_retries = _get_nvidia_adapter_max_retries()
+    total_attempts = max_retries + 1
+    attempt = 0
+    while True:
+        attempt += 1
+        verbose_proxy_logger.warning(
+            "NVIDIA completion adapter upstream attempt %s/%s for model=%s",
+            attempt,
+            total_attempts,
+            adapter_model,
+        )
+        try:
+            return await operation()
+        except Exception as exc:
+            status_code = _extract_nvidia_adapter_exception_status_code(exc)
+            raw_message = str(exc)
+            if (
+                status_code not in _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES
+                or attempt >= total_attempts
+            ):
+                verbose_proxy_logger.warning(
+                    "NVIDIA completion adapter upstream attempt %s failed with %s (%s, raw=%s) and will not be retried",
+                    attempt,
+                    status_code,
+                    exc.__class__.__name__,
+                    raw_message,
+                )
+                raise HTTPException(
+                    status_code=status_code or 502,
+                    detail=raw_message,
+                )
+            wait_seconds = _get_nvidia_adapter_retry_wait_seconds(attempt)
+            verbose_proxy_logger.warning(
+                "NVIDIA completion adapter upstream attempt %s hit %s (%s, raw=%s); backoff %.1fs",
+                attempt,
+                status_code,
+                exc.__class__.__name__,
+                raw_message,
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
+
+
 def _get_anthropic_adapter_openrouter_target_base() -> str:
     cleaned = _clean_secret_string(os.getenv("OPENROUTER_API_BASE")) or "https://openrouter.ai/api"
     if cleaned.endswith("/api/v1"):
@@ -4516,6 +4687,119 @@ async def _handle_anthropic_openai_responses_adapter_route(
 
 
 
+async def _handle_anthropic_nvidia_completion_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler,
+    )
+
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    requested_model = prepared_request_body.get("model")
+    route_family = "anthropic_nvidia_completion_adapter"
+    target_endpoint_label = "nvidia:/v1/chat/completions"
+
+    prepared_request_body = _merge_litellm_metadata(
+        _add_route_family_logging_metadata(prepared_request_body, route_family),
+        tags_to_add=[
+            "anthropic-nvidia-completion-adapter",
+            f"anthropic-adapter-model:{adapter_model}",
+            f"anthropic-adapter-target:{target_endpoint_label}",
+        ],
+        extra_fields={
+            "anthropic_adapter_model": adapter_model,
+            "anthropic_adapter_original_model": requested_model,
+            "anthropic_adapter_target_endpoint": target_endpoint_label,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="anthropic.nvidia_completion_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": adapter_model,
+                        "stream": client_requested_stream,
+                    },
+                )
+            ],
+        },
+    )
+    forced_tool_choice_changes = _maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+        prepared_request_body,
+    )
+    if forced_tool_choice_changes:
+        prepared_request_body = _merge_litellm_metadata(
+            prepared_request_body,
+            extra_fields=forced_tool_choice_changes,
+        )
+
+    nvidia_api_key = _get_anthropic_adapter_nvidia_api_key()
+    if nvidia_api_key is None:
+        raise Exception(
+            "Anthropic adapter requests for NVIDIA models require 'AAWM_NVIDIA_API_KEY', "
+            "'NVIDIA_NIM_API_KEY', or 'NVIDIA_API_KEY' in environment."
+        )
+
+    target_base_url = _get_anthropic_adapter_nvidia_target_base()
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint="/v1/chat/completions",
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.NVIDIA_NIM,
+    )
+    validation_headers = {"Authorization": f"Bearer {nvidia_api_key}"}
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=str(target_url),
+        headers=validation_headers,
+        credential_family="nvidia",
+        expected_target_family="nvidia",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    completion_response = await _perform_nvidia_completion_adapter_operation(
+        adapter_model=adapter_model,
+        operation=lambda: LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
+            max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
+            messages=prepared_request_body.get("messages") or [],
+            model=adapter_model,
+            metadata=prepared_request_body.get("metadata") or {},
+            stop_sequences=prepared_request_body.get("stop_sequences"),
+            stream=client_requested_stream,
+            system=prepared_request_body.get("system"),
+            temperature=prepared_request_body.get("temperature"),
+            thinking=prepared_request_body.get("thinking"),
+            tool_choice=prepared_request_body.get("tool_choice"),
+            tools=prepared_request_body.get("tools"),
+            top_k=prepared_request_body.get("top_k"),
+            top_p=prepared_request_body.get("top_p"),
+            output_format=prepared_request_body.get("output_format"),
+            custom_llm_provider=litellm.LlmProviders.NVIDIA_NIM.value,
+            api_key=nvidia_api_key,
+            api_base=f"{target_base_url.rstrip('/')}/v1",
+            timeout=_get_nvidia_adapter_request_timeout_seconds(),
+            litellm_metadata=prepared_request_body.get("litellm_metadata") or {},
+            proxy_server_request={
+                "headers": dict(request.headers),
+                "body": prepared_request_body,
+            },
+        ),
+    )
+    if client_requested_stream:
+        return _build_anthropic_streaming_response_from_completion_adapter_stream(
+            completion_response,
+        )
+    return _build_anthropic_response_from_completion_adapter_response(
+        completion_response,
+    )
+
+
 async def _handle_anthropic_openrouter_completion_adapter_route(
     *,
     endpoint: str,
@@ -4620,7 +4904,6 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
                 "headers": dict(request.headers),
                 "body": prepared_request_body,
             },
-            standard_callback_dynamic_params={},
         ),
     )
 
@@ -7713,6 +7996,20 @@ async def anthropic_proxy_route(
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=prepared_request_body,
                 adapter_model=google_adapter_model,
+            )
+
+        nvidia_adapter_model = _resolve_anthropic_nvidia_responses_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if nvidia_adapter_model is not None:
+            return await _handle_anthropic_nvidia_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=nvidia_adapter_model,
             )
 
         openrouter_completion_adapter_model = _resolve_anthropic_openrouter_completion_adapter_model(

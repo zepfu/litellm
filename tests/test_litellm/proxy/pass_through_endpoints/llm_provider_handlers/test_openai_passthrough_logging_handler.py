@@ -102,6 +102,7 @@ class TestOpenAIPassthroughLoggingHandler:
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/chat/completions") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openai.azure.com/v1/chat/completions") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openrouter.ai/api/v1/chat/completions") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://integrate.api.nvidia.com/v1/chat/completions") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/models") == False
@@ -140,6 +141,7 @@ class TestOpenAIPassthroughLoggingHandler:
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openai.azure.com/v1/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openrouter.ai/api/v1/responses") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://integrate.api.nvidia.com/v1/responses") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/chat/completions") == False
