@@ -11,7 +11,8 @@ One directory is written per request:
         tools.json    — tool definitions array
         meta.json     — model, stream, timestamp, agent name, other fields
 
-Enable via AAWM_CAPTURE=1 environment variable. Disabled by default.
+Enable via AAWM_CAPTURE=1 environment variable, but only when LiteLLM
+debug logging is also enabled. Disabled by default.
 Truthy values: "1", "true", "True", "yes", "on" (case-insensitive).
 Falsy values:  "", "0", "false", "False", "no", "off" — all disabled.
 
@@ -36,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from litellm._logging import verbose_logger
+from litellm._logging import _is_debugging_on, verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 
 
@@ -50,7 +51,6 @@ def _is_truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-_CAPTURE_ENABLED = _is_truthy(os.environ.get("AAWM_CAPTURE", ""))
 _CAPTURE_DIR = Path("/tmp/captures")
 _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
 _DEFAULT_AGENT = "orchestrator"
@@ -210,7 +210,7 @@ def _build_meta(kwargs: Dict[str, Any], agent: str, ts: str) -> Dict[str, Any]:
 
 def _dump_capture(kwargs: Dict[str, Any]) -> None:
     """Write one capture directory with system/messages/tools/meta JSON files."""
-    if not _CAPTURE_ENABLED:
+    if not _is_truthy(os.environ.get("AAWM_CAPTURE", "")) or not _is_debugging_on():
         return
 
     try:

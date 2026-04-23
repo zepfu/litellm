@@ -1,12 +1,14 @@
+import asyncio
 import json
 import os
 import sys
+from datetime import datetime, timedelta
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from fastapi import Request, UploadFile
+from fastapi import HTTPException, Request, UploadFile
 from starlette.datastructures import Headers, QueryParams
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -14,13 +16,22 @@ sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
 
+from litellm._logging import (
+    get_egress_guard_alert_state,
+    reset_egress_guard_alert_state,
+)
+from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
     pass_through_request,
 )
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    PassThroughStreamingHandler,
+)
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
+from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
 # Test is_multipart
@@ -34,9 +45,211 @@ def test_is_multipart():
     request.headers = Headers({"content-type": "application/json"})
     assert HttpPassThroughEndpointHelpers.is_multipart(request) is False
 
-    # Test with no content type
-    request.headers = Headers({})
-    assert HttpPassThroughEndpointHelpers.is_multipart(request) is False
+
+def test_validate_outgoing_egress_allows_matching_openai_codex_headers():
+    headers = {
+        "Authorization": "Bearer codex-token",
+        "ChatGPT-Account-Id": "acct_123",
+        "originator": "codex_cli_rs",
+        "user-agent": "codex_cli_rs/0.0.0",
+        "session_id": "session_123",
+    }
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url="https://chatgpt.com/backend-api/codex/responses",
+        headers=headers,
+        credential_family="openai",
+        expected_target_family="openai",
+    )
+
+
+def test_validate_outgoing_egress_blocks_openai_markers_to_anthropic():
+    reset_egress_guard_alert_state()
+    headers = {
+        "Authorization": "Bearer codex-token",
+        "ChatGPT-Account-Id": "acct_123",
+        "originator": "codex_cli_rs",
+        "user-agent": "codex_cli_rs/0.0.0",
+        "session_id": "session_123",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url="https://api.anthropic.com/v1/messages",
+            headers=headers,
+            credential_family="openai",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "credential family openai cannot be sent to anthropic" in str(
+        exc_info.value.detail
+    )
+    alert_state = get_egress_guard_alert_state()
+    assert alert_state["trigger_count"] == 1
+    assert alert_state["last_credential_family"] == "openai"
+    assert alert_state["last_target_family"] == "anthropic"
+    reset_egress_guard_alert_state()
+
+
+
+def test_validate_outgoing_egress_allows_matching_openrouter_headers():
+    headers = {
+        "Authorization": "Bearer openrouter-token",
+        "HTTP-Referer": "https://litellm.ai",
+        "X-Title": "liteLLM",
+    }
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url="https://openrouter.ai/api/v1/responses",
+        headers=headers,
+        credential_family="openrouter",
+        expected_target_family="openrouter",
+    )
+
+
+def test_validate_outgoing_egress_blocks_openrouter_credentials_to_openai():
+    reset_egress_guard_alert_state()
+    headers = {
+        "Authorization": "Bearer openrouter-token",
+        "HTTP-Referer": "https://litellm.ai",
+        "X-Title": "liteLLM",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url="https://api.openai.com/v1/responses",
+            headers=headers,
+            credential_family="openrouter",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "credential family openrouter cannot be sent to openai" in str(
+        exc_info.value.detail
+    )
+    alert_state = get_egress_guard_alert_state()
+    assert alert_state["trigger_count"] == 1
+    assert alert_state["last_credential_family"] == "openrouter"
+    assert alert_state["last_target_family"] == "openai"
+    reset_egress_guard_alert_state()
+
+
+def test_validate_outgoing_egress_allows_matching_google_headers():
+    headers = {
+        "Authorization": "Bearer ya29.google-token",
+        "x-goog-api-client": "anthropic-google-adapter",
+    }
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
+        headers=headers,
+        credential_family="google",
+        expected_target_family="google",
+    )
+
+
+def test_validate_outgoing_egress_blocks_google_credentials_to_anthropic():
+    reset_egress_guard_alert_state()
+    headers = {
+        "Authorization": "Bearer ya29.google-token",
+        "x-goog-api-client": "anthropic-google-adapter",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url="https://api.anthropic.com/v1/messages",
+            headers=headers,
+            credential_family="google",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "credential family google cannot be sent to anthropic" in str(
+        exc_info.value.detail
+    )
+    alert_state = get_egress_guard_alert_state()
+    assert alert_state["trigger_count"] == 1
+    assert alert_state["last_credential_family"] == "google"
+    assert alert_state["last_target_family"] == "anthropic"
+    reset_egress_guard_alert_state()
+
+
+def test_validate_outgoing_egress_allows_matching_nvidia_headers():
+    headers = {
+        "Authorization": "Bearer nvapi-test-token",
+        "api-key": "nvapi-test-token",
+    }
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url="https://integrate.api.nvidia.com/v1/responses",
+        headers=headers,
+        credential_family="nvidia",
+        expected_target_family="nvidia",
+    )
+
+
+def test_validate_outgoing_egress_blocks_nvidia_credentials_to_openai():
+    reset_egress_guard_alert_state()
+    headers = {
+        "Authorization": "Bearer nvapi-test-token",
+        "api-key": "nvapi-test-token",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url="https://api.openai.com/v1/responses",
+            headers=headers,
+            credential_family="nvidia",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "credential family nvidia cannot be sent to openai" in str(
+        exc_info.value.detail
+    )
+    alert_state = get_egress_guard_alert_state()
+    assert alert_state["trigger_count"] == 1
+    assert alert_state["last_credential_family"] == "nvidia"
+    assert alert_state["last_target_family"] == "openai"
+    reset_egress_guard_alert_state()
+
+
+def test_validate_outgoing_egress_blocks_anthropic_markers_to_openai():
+    headers = {
+        "x-api-key": "anthropic-secret",
+        "anthropic-version": "2023-06-01",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url="https://api.openai.com/v1/responses",
+            headers=headers,
+            expected_target_family="openai",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "cross-provider credential/header markers" in str(exc_info.value.detail)
+
+
+def test_forward_headers_from_request_filters_to_allowlist():
+    request_headers = {
+        "authorization": "Bearer direct-token",
+        "anthropic-version": "2023-06-01",
+        "user-agent": "claude-cli/2.1.114",
+        "x-pass-chatgpt-account-id": "acct_123",
+        "x-pass-anthropic-beta": "tool-use-2026-01-01",
+    }
+
+    forwarded = HttpPassThroughEndpointHelpers.forward_headers_from_request(
+        request_headers=request_headers,
+        headers={},
+        forward_headers=True,
+        allowed_forward_headers=["authorization", "user-agent"],
+        allowed_pass_through_prefixed_headers=["chatgpt-account-id"],
+    )
+
+    assert forwarded == {
+        "authorization": "Bearer direct-token",
+        "user-agent": "claude-cli/2.1.114",
+        "chatgpt-account-id": "acct_123",
+    }
 
 
 # Test _build_request_files_from_upload_file
@@ -253,6 +466,14 @@ async def test_pass_through_request_failure_handler():
                     call_args["original_exception"], TypeError
                 )  # Now expecting TypeError
                 assert "traceback_str" in call_args
+
+
+def test_is_anthropic_route_excludes_count_tokens():
+    handler = PassThroughEndpointLogging()
+
+    assert handler.is_anthropic_route("http://localhost:4000/anthropic/v1/messages") is True
+    assert handler.is_anthropic_route("http://localhost:4000/anthropic/v1/messages/batches") is True
+    assert handler.is_anthropic_route("http://localhost:4000/anthropic/v1/messages/count_tokens?beta=true") is False
 
 
 def test_is_langfuse_route():
@@ -607,6 +828,130 @@ def test_set_cost_per_request():
     assert result_kwargs["response_cost"] == 0.50
     assert mock_logging_obj.model_call_details["response_cost"] == 0.50
     assert result_kwargs["some_existing_key"] == "value"  # Existing kwargs preserved
+
+
+@pytest.mark.asyncio
+async def test_handle_logging_skips_plain_function_callbacks():
+    handler = PassThroughEndpointLogging()
+    mock_logging_obj = MagicMock()
+    mock_logging_obj.get_combined_callback_list.side_effect = [
+        [lambda *args, **kwargs: None],
+        [lambda *args, **kwargs: None],
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.success_handler.thread_pool_executor.submit"
+    ) as mock_submit:
+        await handler._handle_logging(
+            logging_obj=mock_logging_obj,
+            standard_logging_response_object={"ok": True},
+            result="",
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            cache_hit=False,
+        )
+
+    mock_submit.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_handle_logging_uses_standard_callback_contracts():
+    handler = PassThroughEndpointLogging()
+    start_time = datetime.now()
+    end_time = start_time + timedelta(seconds=1)
+
+    class DummyAsyncCallback:
+        def __init__(self):
+            self.calls = []
+
+        async def async_logging_hook(self, kwargs, result, call_type):
+            self.calls.append((kwargs, result, call_type))
+            next_kwargs = dict(kwargs)
+            next_kwargs["mutated"] = True
+            return next_kwargs, {"mutated_result": True}
+
+        async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+            self.calls.append((kwargs, response_obj, start_time, end_time))
+
+    class DummySyncCallback:
+        def logging_hook(self, kwargs, result, call_type):
+            return kwargs, result
+
+        def log_success_event(self, kwargs, response_obj, start_time, end_time):
+            return None
+
+    async_callback = DummyAsyncCallback()
+    sync_callback = DummySyncCallback()
+    mock_logging_obj = MagicMock()
+    mock_logging_obj.call_type = "acompletion"
+    mock_logging_obj.get_combined_callback_list.side_effect = [
+        [sync_callback],
+        [async_callback],
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.success_handler.thread_pool_executor.submit"
+    ) as mock_submit:
+        await handler._handle_logging(
+            logging_obj=mock_logging_obj,
+            standard_logging_response_object={"ok": True},
+            result="",
+            start_time=start_time,
+            end_time=end_time,
+            cache_hit=False,
+            example="value",
+        )
+
+    assert mock_submit.call_count == 2
+    logging_call = mock_submit.call_args_list[0].args
+    success_call = mock_submit.call_args_list[1].args
+    assert logging_call[0] == sync_callback.logging_hook
+    assert logging_call[1:] == ({"example": "value", "standard_callback_dynamic_params": {}}, {"ok": True}, "acompletion")
+    assert success_call[0] == sync_callback.log_success_event
+    assert success_call[1:] == ({"example": "value", "standard_callback_dynamic_params": {}}, {"ok": True}, start_time, end_time)
+
+    assert async_callback.calls[0] == ({"example": "value", "standard_callback_dynamic_params": {}}, {"ok": True}, "acompletion")
+    assert async_callback.calls[1][0] == {"example": "value", "standard_callback_dynamic_params": {}, "mutated": True}
+    assert async_callback.calls[1][1] == {"mutated_result": True}
+    assert async_callback.calls[1][2] == start_time
+    assert async_callback.calls[1][3] == end_time
+
+
+
+
+def test_normalize_llm_passthrough_logging_payload_uses_openai_handler_for_adapted_openrouter_chat():
+    handler = PassThroughEndpointLogging()
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_logging_obj = MagicMock()
+    response_body = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "model": "openrouter/elephant-alpha",
+        "choices": [],
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler.OpenAIPassthroughLoggingHandler.openai_passthrough_handler",
+        return_value={"result": "openai-ok", "kwargs": {"marker": "openai"}},
+    ) as mock_openai_handler, patch(
+        "litellm.proxy.pass_through_endpoints.success_handler.AnthropicPassthroughLoggingHandler.anthropic_passthrough_handler"
+    ) as mock_anthropic_handler:
+        result = handler.normalize_llm_passthrough_logging_payload(
+            httpx_response=mock_response,
+            response_body=response_body,
+            request_body={"model": "openrouter/elephant-alpha"},
+            logging_obj=mock_logging_obj,
+            url_route="http://127.0.0.1:4001/anthropic/v1/messages",
+            result="",
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            cache_hit=False,
+            custom_llm_provider="openrouter",
+        )
+
+    assert result["standard_logging_response_object"] == "openai-ok"
+    assert result["kwargs"] == {"marker": "openai"}
+    assert mock_openai_handler.call_args.kwargs["url_route"] == "https://openrouter.ai/api/v1/chat/completions"
+    mock_anthropic_handler.assert_not_called()
 
 
 def test_set_cost_per_request_none():
@@ -1583,6 +1928,66 @@ async def test_pass_through_request_query_params_forwarding():
 
 
 @pytest.mark.asyncio
+async def test_pass_through_request_does_not_mutate_custom_body_on_failure():
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = Headers({"Content-Type": "application/json"})
+    mock_request.query_params = QueryParams("")
+    mock_request.body = AsyncMock(return_value=b"{}")
+
+    mock_user_api_key_dict = MagicMock()
+    custom_body = {"foo": "bar"}
+
+    mock_response = MagicMock()
+    mock_response.status_code = 429
+    mock_response.headers = {"content-type": "application/json"}
+    mock_response.text = '{"error": "quota"}'
+    request_for_error = httpx.Request("POST", "https://example.com/test")
+    response_for_error = httpx.Response(
+        status_code=429,
+        request=request_for_error,
+        content=b'{"error": "quota"}',
+    )
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "429",
+        request=request_for_error,
+        response=response_for_error,
+    )
+
+    mock_async_client = MagicMock()
+    mock_async_client_obj = MagicMock(client=mock_async_client)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=mock_async_client_obj,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=mock_response),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
+        new=AsyncMock(side_effect=lambda **kwargs: kwargs["data"]),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ):
+        with pytest.raises(ProxyException):
+            await pass_through_request(
+                request=mock_request,
+                target="https://example.com/test",
+                custom_headers={},
+                user_api_key_dict=mock_user_api_key_dict,
+                custom_body=custom_body,
+                stream=False,
+            )
+
+    assert custom_body == {"foo": "bar"}
+    assert "litellm_logging_obj" not in custom_body
+
+
+@pytest.mark.asyncio
 async def test_pass_through_with_httpbin_redirect():
     """
     Integration test using httpbin.org redirect endpoint to test real redirect handling.
@@ -2474,3 +2879,96 @@ async def test_multipart_passthrough_preserves_boundary():
     # Verify the response
     assert response.status_code == 200
     async_client.request.assert_called_once()
+
+
+class _FakeStreamingResponse:
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_records_segmented_streaming_metrics():
+    response = _FakeStreamingResponse([b"data: {\"delta\":1}\n\n", b"data: [DONE]\n\n"])
+    logging_obj = MagicMock()
+    success_handler_kwargs = {
+        "litellm_params": {"metadata": {}},
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+    }
+
+    chunks = []
+    async for chunk in PassThroughStreamingHandler.chunk_processor(
+        response=response,
+        request_body={"model": "gpt-5.4"},
+        litellm_logging_obj=logging_obj,
+        endpoint_type=EndpointType.OPENAI,
+        start_time=datetime.now() - timedelta(milliseconds=5),
+        passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+        url_route="https://chatgpt.com/backend-api/codex/responses",
+        custom_llm_provider="openai",
+        success_handler_kwargs=success_handler_kwargs,
+        upstream_wait_started_at=datetime.now() - timedelta(milliseconds=4),
+        upstream_wait_completed_at=datetime.now() - timedelta(milliseconds=3),
+        local_prepare_ms=2.5,
+    ):
+        chunks.append(chunk)
+
+    await asyncio.sleep(0)
+
+    assert chunks == [b"data: {\"delta\":1}\n\n", b"data: [DONE]\n\n"]
+    metadata = success_handler_kwargs["litellm_params"]["metadata"]
+    assert metadata["aawm_stream_chunk_count"] == 2
+    assert metadata["aawm_stream_total_bytes"] > 0
+    assert metadata["aawm_time_to_first_token_ms"] >= 0
+    assert metadata["aawm_upstream_first_chunk_ms"] >= 0
+    assert metadata["aawm_first_emitted_chunk_ms"] >= 0
+    assert metadata["aawm_upstream_stream_complete_ms"] >= 0
+    assert success_handler_kwargs["completion_start_time"] is not None
+    logging_obj._update_completion_start_time.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_route_streaming_logging_records_finalize_metrics():
+    logging_obj = MagicMock()
+    logging_obj.async_success_handler = AsyncMock()
+    logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
+    success_handler_kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "aawm_stream_emit_gap_ms": 3.0,
+            }
+        },
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks",
+        return_value={"result": {"response": "ok"}, "kwargs": {}},
+    ):
+        await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4"},
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now() - timedelta(milliseconds=10),
+            raw_bytes=[b"data: {}\n\n"],
+            end_time=datetime.now(),
+            custom_llm_provider="openai",
+            success_handler_kwargs=success_handler_kwargs,
+            local_prepare_ms=2.5,
+        )
+
+    call_kwargs = logging_obj.async_success_handler.await_args.kwargs
+    metadata = call_kwargs["litellm_params"]["metadata"]
+    assert metadata["aawm_local_stream_finalize_ms"] >= 0
+    assert metadata["aawm_total_proxy_overhead_ms"] >= 5.5
+    span_names = [
+        span["name"]
+        for span in metadata["langfuse_spans"]
+        if isinstance(span, dict)
+    ]
+    assert "proxy.post_response_finalize" in span_names

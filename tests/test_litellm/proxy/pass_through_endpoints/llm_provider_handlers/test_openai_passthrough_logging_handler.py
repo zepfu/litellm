@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+import litellm
+
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
@@ -99,6 +101,8 @@ class TestOpenAIPassthroughLoggingHandler:
         # Positive cases
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/chat/completions") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openai.azure.com/v1/chat/completions") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openrouter.ai/api/v1/chat/completions") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://integrate.api.nvidia.com/v1/chat/completions") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/models") == False
@@ -136,6 +140,8 @@ class TestOpenAIPassthroughLoggingHandler:
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openai.azure.com/v1/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/responses") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openrouter.ai/api/v1/responses") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://integrate.api.nvidia.com/v1/responses") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/chat/completions") == False
@@ -279,6 +285,15 @@ class TestOpenAIPassthroughLoggingHandler:
             "object": "response",
             "created": 1775863780,
             "model": "gpt-5.4",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "id": "call_123",
+                    "name": "apply_patch",
+                    "arguments": "{}",
+                }
+            ],
             "choices": [
                 {
                     "index": 0,
@@ -328,6 +343,52 @@ class TestOpenAIPassthroughLoggingHandler:
         assert standard_logging_object["total_tokens"] == 15544
         metadata = result["kwargs"]["litellm_params"].get("metadata", {})
         assert "langfuse_spans" not in metadata
+        assert result["result"]._hidden_params["responses_output"] == codex_response["output"]
+
+    def test_openai_passthrough_handler_preserves_non_streaming_codex_output_items(self):
+        codex_response = {
+            "id": "resp-codex-tool-test",
+            "object": "response",
+            "created": 1775863780,
+            "model": "gpt-5.4",
+            "output": [
+                {
+                    "type": "local_shell_call",
+                    "call_id": "shell_123",
+                    "id": "shell_123",
+                    "input": {"command": "pwd"},
+                }
+            ],
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 5,
+                "total_tokens": 25,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0, "text_tokens": 5},
+            },
+        }
+        mock_httpx_response = self._create_mock_httpx_response(codex_response)
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+            httpx_response=mock_httpx_response,
+            response_body=codex_response,
+            logging_obj=mock_logging_obj,
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            result="",
+            start_time=self.start_time,
+            end_time=self.end_time,
+            cache_hit=False,
+            request_body={"model": "gpt-5.4", "input": "run pwd once"},
+            passthrough_logging_payload=PassthroughStandardLoggingPayload(
+                url="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.4", "input": "run pwd once"},
+                request_method="POST",
+            ),
+            litellm_params={"metadata": {"passthrough_route_family": "codex_responses"}},
+        )
+
+        assert result["result"]._hidden_params["responses_output"] == codex_response["output"]
 
     @patch("litellm.completion_cost")
     def test_openai_streaming_handler_rebuilds_responses_api_usage(
@@ -373,7 +434,83 @@ class TestOpenAIPassthroughLoggingHandler:
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.123
 
-    @patch("litellm.completion_cost")
+    def test_openai_passthrough_handler_backfills_openrouter_responses_usage_and_model(self):
+        mock_httpx_response = self._create_mock_httpx_response(
+            {
+                "id": "resp-openrouter-usage-test",
+                "object": "response",
+                "created_at": 1775863780,
+                "model": "openrouter/free",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_123",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "free smoke", "annotations": []}
+                        ],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 95829,
+                    "output_tokens": 198,
+                    "total_tokens": 96027,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0, "text_tokens": 198},
+                },
+            }
+        )
+        mock_logging_obj = self._create_mock_logging_obj()
+        transformed_response = litellm.ModelResponse(
+            model="unknown",
+            choices=[
+                litellm.Choices(
+                    message=litellm.Message(role="assistant", content="free smoke"),
+                    finish_reason="stop",
+                    index=0,
+                )
+            ],
+            usage=litellm.Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        )
+        mock_provider_config = MagicMock()
+        mock_provider_config.transform_response.return_value = transformed_response
+
+        with patch.object(
+            OpenAIPassthroughLoggingHandler,
+            "get_provider_config",
+            return_value=mock_provider_config,
+        ), patch("litellm.completion_cost", return_value=0.484095):
+            result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+                httpx_response=mock_httpx_response,
+                response_body=mock_httpx_response.json(),
+                logging_obj=mock_logging_obj,
+                url_route="https://openrouter.ai/api/v1/responses",
+                result="",
+                start_time=self.start_time,
+                end_time=self.end_time,
+                cache_hit=False,
+                request_body={"model": "openrouter/free", "input": "free smoke"},
+                passthrough_logging_payload=PassthroughStandardLoggingPayload(
+                    url="https://openrouter.ai/api/v1/responses",
+                    request_body={"model": "openrouter/free", "input": "free smoke"},
+                    request_method="POST",
+                ),
+                custom_llm_provider="openrouter",
+                litellm_params={},
+            )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        assert result["result"].model == "openrouter/free"
+        assert usage.prompt_tokens == 95829
+        assert usage.completion_tokens == 198
+        assert usage.total_tokens == 96027
+        assert standard_logging_object["model"] == "openrouter/free"
+        assert standard_logging_object["prompt_tokens"] == 95829
+        assert standard_logging_object["completion_tokens"] == 198
+        assert standard_logging_object["total_tokens"] == 96027
+
     def test_openai_streaming_handler_rebuilds_codex_stream_with_empty_output(
         self, mock_completion_cost
     ):
@@ -388,6 +525,10 @@ class TestOpenAIPassthroughLoggingHandler:
         streaming_chunks = [
             'event: response.created',
             'data: {"type":"response.created","response":{"id":"resp-codex-stream","object":"response","created_at":1775868809,"status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.output_item.added',
+            'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pwd","id":"fc_pwd","name":"Bash","arguments":""}}',
+            'event: response.function_call_arguments.done',
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc_pwd","output_index":0,"arguments":"{\\"command\\":\\"pwd\\"}"}',
             'event: response.output_text.delta',
             'data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":1,"content_index":0,"delta":"langfuse "}',
             'event: response.output_text.delta',
@@ -418,6 +559,15 @@ class TestOpenAIPassthroughLoggingHandler:
         assert standard_logging_object["prompt_tokens"] == 15519
         assert standard_logging_object["completion_tokens"] == 29
         assert standard_logging_object["total_tokens"] == 15548
+        assert result["result"]._hidden_params["responses_output"] == [
+            {
+                "type": "function_call",
+                "call_id": "call_pwd",
+                "id": "fc_pwd",
+                "name": "Bash",
+                "arguments": '{"command":"pwd"}',
+            }
+        ]
         mock_completion_cost.assert_called_once()
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.456
@@ -842,6 +992,7 @@ class TestOpenAIPassthroughIntegration:
         assert self.handler.is_openai_route("https://api.openai.com/v1/chat/completions") == True
         assert self.handler.is_openai_route("https://openai.azure.com/v1/chat/completions") == True
         assert self.handler.is_openai_route("https://api.openai.com/v1/models") == True
+        assert self.handler.is_openai_route("https://openrouter.ai/api/v1/responses") == True
         
         # Negative cases
         assert self.handler.is_openai_route("http://localhost:4000/openai/v1/chat/completions") == False

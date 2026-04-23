@@ -97,6 +97,17 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - Proxy tests in `tests/proxy_unit_tests/`
 - Load tests in `tests/load_tests/`
 
+### Anthropic Adapter Validation
+- `litellm-dev` on `:4001` is the runtime for Anthropic -> Google Code Assist adapter work.
+- Use `scripts/local-ci/run_anthropic_adapter_acceptance.py --cases claude_adapter_gemini_fanout` for the isolated multi-Gemini fanout check before spending time on the full suite.
+- Current request-shape conclusion: the Gemini CLI bundle and the Anthropic adapter both send the same Code Assist envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config.
+- If standalone Gemini CLI use is healthy but the isolated Gemini fanout case fails, treat that first as a local pacing/serialization regression rather than as authoritative provider-capacity evidence.
+
+### Model Cost Map Process
+- `model_prices_and_context_window.json` is the canonical editable model/cost map.
+- `litellm/bundled_model_prices_and_context_window_fallback.json` is the packaged offline mirror for `LITELLM_LOCAL_MODEL_COST_MAP=True`.
+- After changing the canonical file, run `make sync-model-cost-map` instead of editing the bundled fallback directly.
+
 ### Database Migrations
 - Prisma handles schema migrations
 - Migration files auto-generated with `prisma migrate dev`
