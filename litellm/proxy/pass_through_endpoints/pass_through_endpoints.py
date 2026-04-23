@@ -464,6 +464,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             or hostname.endswith(".openrouter.ai")
         ):
             return "openrouter"
+        if hostname in {"integrate.api.nvidia.com", "ai.api.nvidia.com"}:
+            return "nvidia"
         if (
             hostname == "generativelanguage.googleapis.com"
             or hostname.endswith(".googleapis.com")

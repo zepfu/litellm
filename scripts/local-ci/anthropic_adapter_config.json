@@ -6,7 +6,10 @@
   "langfuse_secret_key_env": "LANGFUSE_SECRET_KEY",
   "default_excluded_cases": [
     "claude_adapter_gemma_31b",
-    "claude_adapter_gemma_26b_a4b"
+    "claude_adapter_gemma_26b_a4b",
+    "claude_adapter_nvidia_deepseek_v32",
+    "claude_adapter_nvidia_glm47",
+    "claude_adapter_nvidia_minimax_m27"
   ],
   "cases": {
     "claude_adapter_gpt54": {
@@ -188,6 +191,253 @@
       },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_nvidia_deepseek_v32": {
+      "command": [
+        "claude",
+        "-p",
+        "Reply with exactly two words: nvidia smoke",
+        "--output-format",
+        "json",
+        "--model",
+        "nvidia/deepseek-ai/deepseek-v3.2",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ""
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator"
+      ],
+      "expected_user_ids": [
+        "litellm.fork"
+      ],
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_nvidia_completion_adapter",
+        "anthropic-nvidia-completion-adapter",
+        "anthropic-adapter-model:deepseek-ai/deepseek-v3.2",
+        "anthropic-adapter-target:nvidia:/v1/chat/completions"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint",
+        "claude-effort:",
+        "thinking-type:"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "max_tokens",
+          "stream"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false,
+          "result": "nvidia smoke"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "nvidia_nim",
+        "expected_model": "deepseek-ai/deepseek-v3.2",
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "allow_zero_cost": false,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_nvidia_minimax_m27": {
+      "command": [
+        "claude",
+        "-p",
+        "Reply with exactly two words: nvidia smoke",
+        "--output-format",
+        "json",
+        "--model",
+        "nvidia/minimaxai/minimax-m2.7",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ""
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator"
+      ],
+      "expected_user_ids": [
+        "litellm.fork"
+      ],
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_nvidia_completion_adapter",
+        "anthropic-nvidia-completion-adapter",
+        "anthropic-adapter-model:minimaxai/minimax-m2.7",
+        "anthropic-adapter-target:nvidia:/v1/chat/completions"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint",
+        "claude-effort:",
+        "thinking-type:"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "max_tokens",
+          "stream"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_contains": {
+          "result": "nvidia smoke"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "nvidia_nim",
+        "expected_model": "minimaxai/minimax-m2.7",
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "allow_zero_cost": false,
+      "retry_on_api_error_statuses": [
+        504
+      ],
+      "retry_max_attempts": 2,
+      "retry_backoff_seconds": 2,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_nvidia_glm47": {
+      "command": [
+        "claude",
+        "-p",
+        "Reply with exactly two words: nvidia smoke",
+        "--output-format",
+        "json",
+        "--model",
+        "nvidia/z-ai/glm4.7",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ""
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator"
+      ],
+      "expected_user_ids": [
+        "litellm.fork"
+      ],
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_nvidia_completion_adapter",
+        "anthropic-nvidia-completion-adapter",
+        "anthropic-adapter-model:z-ai/glm4.7",
+        "anthropic-adapter-target:nvidia:/v1/chat/completions"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint",
+        "claude-effort:",
+        "thinking-type:"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "max_tokens",
+          "stream"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false,
+          "result": "nvidia smoke"
+        },
+        "required_minimums": {
+          "total_cost_usd": 0.000001
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "nvidia_nim",
+        "expected_model": "z-ai/glm4.7",
+        "minimums": {
+          "response_cost_usd": 0.000001
+        }
+      },
+      "allow_zero_cost": false,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90,
       "runtime_postconditions": {
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"

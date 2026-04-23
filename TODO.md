@@ -2,6 +2,9 @@
 
 ## In Progress
 
+- Finish the NVIDIA Anthropic-adapter lane and validation work.
+  Current target: direct `nvidia/...` agent models from `~/.claude/agents` should route through a dedicated `anthropic_nvidia_completion_adapter` lane with `nvidia` egress-family enforcement, OpenAI-compatible NVIDIA logging support, and `nvidia_nim/...` cost-map coverage. The end state should match the existing adapted providers: `session_history` rows with the normalized upstream model and non-zero cost when pricing is mapped, `session_history_tool_activity` rows when tool/agent dispatch occurs, and Langfuse tags / metadata / spans including `route:anthropic_nvidia_completion_adapter`, `anthropic-nvidia-completion-adapter`, `anthropic-adapter-target:nvidia:/v1/chat/completions`, and the `anthropic.nvidia_completion_adapter` span name. If NVIDIA does not expose usable non-free pricing for a target model, use the closest equivalent OpenRouter pricing as the fallback basis rather than leaving long-term cost tracking unmapped. The remaining work is to keep the focused `:4001` harness cases for `claude_adapter_nvidia_deepseek_v32` and `claude_adapter_nvidia_glm47` green while continuing to treat `claude_adapter_nvidia_minimax_m27` as a manual-only supported path until its upstream/CLI stall behavior is understood.
+
 - Keep `session_history` invariants enforced after the recent repair work.
   Current target: `reasoning_tokens_source` should remain non-null for new rows, Gemini thought-signature fallback should persist as `provider_signature_present`, Anthropic zero placeholders must not be labeled `provider_reported`, and Anthropic/OpenAI/Gemini/OpenRouter rows should keep a normalized `provider_cache_status` / `provider_cache_miss_reason` shape in `session_history`. When the missed cache token count is explicit, keep `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` backfilled as well.
 

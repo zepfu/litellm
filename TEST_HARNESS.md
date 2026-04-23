@@ -229,6 +229,37 @@ Telemetry expectation:
   tenant/agent-scoped technical-identifier list when that prompt fragment is
   present; the current implementation uses a direct query until the stored
   procedure lands
+- NVIDIA Anthropic-adapter targets are currently opt-in spot checks, not
+  default-suite coverage. Preferred spellings are:
+  - `nvidia/deepseek-ai/deepseek-v3.2`
+  - `nvidia/deepseek-ai/deepseek-v3.1-terminus`
+  - `nvidia/mistralai/devstral-2-123b-instruct-2512`
+  - `nvidia/z-ai/glm4.7`
+  - `nvidia/minimaxai/minimax-m2.7`
+  - compatibility alias: `nvidia/minimax/minimax-m2.7`
+- current NVIDIA harness cases are `claude_adapter_nvidia_deepseek_v32` and
+  `claude_adapter_nvidia_glm47`; both are excluded from the default suite and
+  should be run explicitly with `--cases`
+- `claude_adapter_nvidia_minimax_m27` is manual-only for now; keep the exact
+  `nvidia/minimaxai/minimax-m2.7` spelling for ad hoc probes, but do not treat
+  it as a required live canary until the upstream/CLI stall behavior is
+  understood
+- these cases validate the Anthropic -> NVIDIA completion adapter on
+  `nvidia:/v1/chat/completions` via `provider=nvidia_nim`
+- for NVIDIA-adapted runs, expect the same parity as the other adapted
+  providers:
+  - `public.session_history` should persist `provider=nvidia_nim` rows with the
+    normalized upstream model and non-zero cost when the model has mapped
+    pricing
+  - `public.session_history_tool_activity` should populate when tool or
+    delegated-agent activity occurs
+  - Langfuse should carry `route:anthropic_nvidia_completion_adapter`,
+    `anthropic-nvidia-completion-adapter`,
+    `anthropic-adapter-target:nvidia:/v1/chat/completions`, and the
+    `anthropic.nvidia_completion_adapter` span name
+  - cost tracking should not remain permanently zero or unmapped; if NVIDIA
+    lacks usable non-free pricing, use the closest equivalent OpenRouter
+    pricing as the fallback basis
 - for Gemini fanout acceptance, do not assume every Gemini child model emits
   its own command row; the stable invariant is:
   - session-wide delegated `Agent` rows are present on the parent session

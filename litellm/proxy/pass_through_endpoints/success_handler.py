@@ -458,6 +458,8 @@ class PassThroughEndpointLogging:
             and (
                 "api.openai.com" in parsed_url.hostname
                 or "openai.azure.com" in parsed_url.hostname
+                or parsed_url.hostname == "integrate.api.nvidia.com"
+                or parsed_url.hostname == "ai.api.nvidia.com"
                 or parsed_url.hostname == "openrouter.ai"
                 or parsed_url.hostname.endswith(".openrouter.ai")
             )
@@ -477,7 +479,7 @@ class PassThroughEndpointLogging:
         response_body: Optional[dict],
         custom_llm_provider: Optional[str],
     ) -> Optional[str]:
-        if custom_llm_provider not in {"openai", "openrouter"}:
+        if custom_llm_provider not in {"openai", "openrouter", "nvidia_nim"}:
             return None
         if not isinstance(response_body, dict):
             return None
@@ -491,6 +493,8 @@ class PassThroughEndpointLogging:
 
         if custom_llm_provider == "openrouter":
             base_url = "https://openrouter.ai/api"
+        elif custom_llm_provider == "nvidia_nim":
+            base_url = "https://integrate.api.nvidia.com"
         else:
             base_url = "https://api.openai.com"
 
