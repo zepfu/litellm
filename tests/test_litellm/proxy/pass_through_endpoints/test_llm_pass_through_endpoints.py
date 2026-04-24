@@ -69,6 +69,9 @@ from litellm.types.passthrough_endpoints.vertex_ai import VertexPassThroughCrede
 from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
     AnthropicStreamWrapper,
 )
+from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+    LiteLLMMessagesToCompletionTransformationHandler,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +79,29 @@ def clear_openrouter_adapter_failure_circuit_state():
     _openrouter_adapter_failure_circuit_until_monotonic_by_key.clear()
     yield
     _openrouter_adapter_failure_circuit_until_monotonic_by_key.clear()
+
+
+def test_anthropic_completion_adapter_preserves_trace_metadata():
+    completion_kwargs, _ = (
+        LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            max_tokens=32,
+            messages=[{"role": "user", "content": "Say ok"}],
+            model="deepseek-ai/deepseek-v3.2",
+            metadata={
+                "existing_key": "existing-value",
+                "session_id": "session-1",
+                "trace_environment": "prod",
+            },
+            stream=True,
+            extra_kwargs={
+                "custom_llm_provider": litellm.LlmProviders.NVIDIA_NIM.value,
+            },
+        )
+    )
+
+    assert completion_kwargs["metadata"]["existing_key"] == "existing-value"
+    assert completion_kwargs["metadata"]["session_id"] == "session-1"
+    assert completion_kwargs["metadata"]["trace_environment"] == "prod"
 
 
 class TestResponsesAdapterToolChoice:

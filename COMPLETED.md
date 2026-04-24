@@ -2,6 +2,12 @@
 
 ## 2026-04-24
 
+- Promoted the local prod `:4000` LiteLLM container to the `aawm.32` image and isolated the remaining NVIDIA blocker.
+  Prod readiness reported LiteLLM `1.82.3+aawm.32`; `claude_adapter_peeromega_fanout`, `claude_adapter_openrouter_ling_26_flash`, and `claude_adapter_gpt_oss_120b` passed. Focused NVIDIA validation showed DeepSeek and GLM still landing Langfuse trace `environment=default` despite correct `session_history.litellm_environment=prod`, and MiniMax timed out at 300s.
+
+- Fixed the NVIDIA trace-environment root cause for the next image release.
+  The Anthropic-to-completion transformer now preserves completion-adapter metadata through to the inner `litellm.acompletion()` call, so `trace_environment`, `session_id`, and related LiteLLM metadata are available to normal completion callbacks instead of being dropped after `metadata.user_id` conversion.
+
 - Promoted the local prod `:4000` LiteLLM container to the `aawm.31` image and isolated the remaining prod validation blockers.
   Prod readiness reported LiteLLM `1.82.3+aawm.31`; `claude_adapter_peeromega_fanout` and `claude_adapter_openrouter_ling_26_flash` passed. `claude_adapter_gpt_oss_120b` was blocked by OpenRouter `503 provider=OpenInference raw=no healthy upstream`, NVIDIA DeepSeek/GLM succeeded but exposed a Langfuse trace-environment propagation gap, and NVIDIA MiniMax remained too slow for the current 300s opt-in spot-check timeout.
 
