@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -1448,22 +1449,33 @@ def _run_command(
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    started = time.time()
-    completed = subprocess.run(
+    effective_command, settings_overlay_path = _append_claude_settings_overlay(
         command,
-        cwd=str(ROOT),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
+        extra_env=extra_env,
     )
+    started = time.time()
+    try:
+        completed = subprocess.run(
+            effective_command,
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    finally:
+        if settings_overlay_path is not None:
+            try:
+                settings_overlay_path.unlink()
+            except FileNotFoundError:
+                pass
     duration = round(time.time() - started, 3)
     stdout = completed.stdout.strip()
     stderr = completed.stderr.strip()
     return {
-        "command": command,
-        "command_string": " ".join(shlex.quote(part) for part in command),
+        "command": effective_command,
+        "command_string": " ".join(shlex.quote(part) for part in effective_command),
         "exit_code": completed.returncode,
         "duration_seconds": duration,
         "stdout": stdout,
@@ -1476,6 +1488,49 @@ def _response_excerpt(stdout: str, stderr: str, limit: int = 300) -> str:
     text = stdout or stderr
     text = text.replace("\n", " ").strip()
     return text[:limit]
+
+
+def _is_claude_command(command: list[str]) -> bool:
+    if not command:
+        return False
+    return pathlib.Path(command[0]).name == "claude"
+
+
+def _claude_settings_overlay_env(extra_env: dict[str, str] | None) -> dict[str, str]:
+    if not extra_env:
+        return {}
+    overlay_keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS")
+    return {
+        key: str(extra_env[key])
+        for key in overlay_keys
+        if key in extra_env and extra_env[key] is not None
+    }
+
+
+def _append_claude_settings_overlay(
+    command: list[str],
+    *,
+    extra_env: dict[str, str] | None,
+) -> tuple[list[str], pathlib.Path | None]:
+    if not _is_claude_command(command) or "--settings" in command:
+        return command, None
+
+    overlay_env = _claude_settings_overlay_env(extra_env)
+    if not overlay_env:
+        return command, None
+
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="litellm-claude-harness-",
+        suffix=".settings.json",
+        delete=False,
+    )
+    settings_path = pathlib.Path(handle.name)
+    with handle:
+        json.dump({"env": overlay_env}, handle, sort_keys=True)
+        handle.write("\n")
+    return [*command, "--settings", str(settings_path)], settings_path
 
 
 def _git_value(*args: str) -> str:

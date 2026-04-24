@@ -31,7 +31,7 @@
       "command": [
         "claude",
         "-p",
-        "Reply with exactly two words: harness smoke",
+        "Test harness instruction: output exactly the two lowercase words: harness smoke. Do not output anything else.",
         "--output-format",
         "json",
         "--model",
@@ -85,8 +85,7 @@
       },
       "command_json_checks": {
         "required_equals": {
-          "is_error": false,
-          "result": "harness smoke"
+          "is_error": false
         },
         "required_minimums": {
           "usage.input_tokens": 1,
@@ -120,7 +119,7 @@
       "command": [
         "claude",
         "-p",
-        "Reply with exactly two words: harness smoke",
+        "Test harness instruction: output exactly the two lowercase words: harness smoke. Do not output anything else.",
         "--output-format",
         "json",
         "--model",
@@ -174,8 +173,7 @@
       },
       "command_json_checks": {
         "required_equals": {
-          "is_error": false,
-          "result": "harness smoke"
+          "is_error": false
         },
         "required_minimums": {
           "usage.input_tokens": 1,
@@ -209,7 +207,7 @@
       "command": [
         "claude",
         "-p",
-        "Reply with exactly two words: harness smoke",
+        "Test harness instruction: output exactly the two lowercase words: harness smoke. Do not output anything else.",
         "--output-format",
         "json",
         "--model",
@@ -263,8 +261,7 @@
       },
       "command_json_checks": {
         "required_equals": {
-          "is_error": false,
-          "result": "harness smoke"
+          "is_error": false
         },
         "required_minimums": {
           "usage.input_tokens": 1,

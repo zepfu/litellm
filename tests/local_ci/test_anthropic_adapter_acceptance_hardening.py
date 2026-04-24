@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import pathlib
 import subprocess
 
@@ -122,3 +123,54 @@ def test_target_profile_sets_session_history_runtime_identity_expectations(monke
         "langfuse_trace_user_id: litellm-harness-test\n"
         "langfuse_trace_name: claude-code"
     )
+
+
+def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):
+    harness = _load_harness_module()
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        settings_path = pathlib.Path(command[command.index("--settings") + 1])
+        captured["command"] = command
+        captured["settings_path"] = settings_path
+        captured["settings"] = json.loads(settings_path.read_text())
+        captured["exists_during_run"] = settings_path.exists()
+        captured["env"] = kwargs["env"]
+        return Completed()
+
+    monkeypatch.setattr(harness.RA.subprocess, "run", fake_run)
+
+    result = harness.RA._run_command(
+        ["claude", "-p", "hi"],
+        extra_env={
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic",
+            "ANTHROPIC_CUSTOM_HEADERS": (
+                "x-litellm-end-user-id: litellm-harness-test\n"
+                "langfuse_trace_user_id: litellm-harness-test\n"
+                "langfuse_trace_name: claude-code"
+            ),
+            "AAWM_DB_PASSWORD": "not-written-to-settings",
+        },
+    )
+
+    assert "--settings" in captured["command"]
+    assert captured["exists_during_run"] is True
+    assert captured["settings"] == {
+        "env": {
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic",
+            "ANTHROPIC_CUSTOM_HEADERS": (
+                "x-litellm-end-user-id: litellm-harness-test\n"
+                "langfuse_trace_user_id: litellm-harness-test\n"
+                "langfuse_trace_name: claude-code"
+            ),
+        }
+    }
+    assert "AAWM_DB_PASSWORD" not in captured["settings"]["env"]
+    assert captured["env"]["AAWM_DB_PASSWORD"] == "not-written-to-settings"
+    assert not captured["settings_path"].exists()
+    assert result["command"] == captured["command"]
