@@ -1,6 +1,7 @@
 {
   "suite_version": 1,
   "default_target_profile": "dev",
+  "default_tenant_id": "adapter-harness-tenant",
   "litellm_base_url": "http://127.0.0.1:4001",
   "langfuse_query_url": "http://127.0.0.1:3000",
   "langfuse_public_key_env": "LANGFUSE_PUBLIC_KEY",
@@ -25,6 +26,8 @@
     "claude_adapter_gpt_oss_20b",
     "claude_adapter_gpt_oss_120b",
     "claude_adapter_openai_output_config_effort",
+    "claude_adapter_gemini_output_config_effort",
+    "claude_adapter_openrouter_output_config_effort_cache",
     "claude_adapter_nvidia_cache_control_strip",
     "claude_adapter_nvidia_deepseek_v32",
     "claude_adapter_nvidia_glm47",
@@ -683,6 +686,229 @@
       },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_gemini_output_config_effort": {
+      "http_request": {
+        "method": "POST",
+        "path": "/anthropic/v1/messages",
+        "headers": {
+          "user-agent": "AnthropicAdapterHarness/0.1",
+          "x-aawm-tenant-id": "adapter-harness-tenant"
+        },
+        "json": {
+          "model": "gemini-3-flash-preview",
+          "max_tokens": 16,
+          "system": "Reply with exactly two words: gemini effort",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with exactly two words: gemini effort"
+            }
+          ],
+          "output_config": {
+            "effort": "high"
+          }
+        }
+      },
+      "expected_trace_session_id": "harness-gemini-effort-session",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_google_completion_adapter",
+        "anthropic-google-completion-adapter",
+        "anthropic-adapter-model:gemini-3-flash-preview",
+        "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "project",
+          "user_prompt_id",
+          "request.contents",
+          "request.generationConfig.thinkingConfig"
+        ],
+        "required_equals": {
+          "request.generationConfig.thinkingConfig.thinkingLevel": "high",
+          "request.generationConfig.thinkingConfig.includeThoughts": true
+        },
+        "forbidden_paths": [
+          "output_config"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "status_code": 200
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "gemini",
+        "expected_model": "gemini-3-flash-preview",
+        "expected_tenant_id": "adapter-harness-tenant",
+        "metadata_required_equals": {
+          "tenant_id": "adapter-harness-tenant",
+          "reasoning_effort_requested": "high",
+          "reasoning_effort_source": "output_config.effort",
+          "reasoning_effort_native_provider": "gemini",
+          "reasoning_effort_native_value": "high",
+          "reasoning_effort_native_field": "reasoning_effort",
+          "gemini_reasoning_effort": "high"
+        },
+        "metadata_required_truthy": [
+          "tenant_id_source"
+        ],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1,
+          "response_cost_usd": 1e-06
+        }
+      },
+      "retry_on_api_error_statuses": [
+        429
+      ],
+      "retry_max_attempts": 3,
+      "retry_backoff_seconds": 25,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_openrouter_output_config_effort_cache": {
+      "http_request": {
+        "method": "POST",
+        "path": "/anthropic/v1/messages",
+        "headers": {
+          "user-agent": "AnthropicAdapterHarness/0.1",
+          "x-aawm-tenant-id": "adapter-harness-tenant"
+        },
+        "json": {
+          "model": "openai/gpt-oss-20b:free",
+          "max_tokens": 16,
+          "system": "Reply with exactly two words: openrouter effort",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Reply with exactly two words: openrouter effort",
+                  "cache_control": {
+                    "type": "ephemeral"
+                  }
+                }
+              ]
+            }
+          ],
+          "output_config": {
+            "effort": "high"
+          }
+        }
+      },
+      "expected_trace_session_id": "harness-openrouter-effort-cache-session",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openrouter_responses_adapter",
+        "anthropic-openrouter-responses-adapter",
+        "anthropic-adapter-model:openai/gpt-oss-20b:free",
+        "anthropic-adapter-target:openrouter:/v1/responses"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "status_code": 200
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openrouter",
+        "expected_model": "openai/gpt-oss-20b:free",
+        "expected_tenant_id": "adapter-harness-tenant",
+        "metadata_required_equals": {
+          "tenant_id": "adapter-harness-tenant",
+          "reasoning_effort_requested": "high",
+          "reasoning_effort_source": "output_config.effort",
+          "reasoning_effort_native_provider": "openai",
+          "reasoning_effort_native_value": "high",
+          "reasoning_effort_native_field": "reasoning.effort",
+          "openai_reasoning_effort": "high",
+          "usage_provider_cache_attempted": true,
+          "openrouter_provider_cache_attempted": true
+        },
+        "metadata_required_truthy": [
+          "tenant_id_source"
+        ],
+        "required_equals": {
+          "provider_cache_attempted": true
+        },
+        "required_one_of": {
+          "provider_cache_status": [
+            "hit",
+            "write",
+            "miss",
+            "unsupported"
+          ]
+        },
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "allow_zero_cost": true,
+      "skip_generation_quality_checks": true,
+      "retry_on_api_error_statuses": [
+        429,
+        503
+      ],
+      "retry_max_attempts": 3,
+      "retry_backoff_seconds": 25,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90,
       "runtime_postconditions": {
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"
