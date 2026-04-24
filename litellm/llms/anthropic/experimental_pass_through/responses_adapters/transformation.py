@@ -8,7 +8,6 @@ path used for OpenAI and Azure models.
 import json
 from typing import Any, Dict, List, Optional, Union, cast
 
-from litellm.utils import supports_reasoning_summary
 from litellm.types.llms.anthropic import (
     AllAnthropicToolsValues,
     AnthopicMessagesAssistantMessageParam,
@@ -29,6 +28,9 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicUsage,
 )
 from litellm.types.llms.openai import ResponsesAPIResponse
+from litellm.utils import supports_reasoning_summary
+
+from ..adapters.observability import normalize_reasoning_effort_for_provider
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -423,50 +425,23 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         as medium effort unless output_config.effort supplies a more precise value.
 
         output_config.effort is Anthropic's newer control surface. We map it to the
-        closest supported Responses effort. Anthropic's 'max' does not have a stable
-        cross-model equivalent on the OpenAI side, so we clamp it to 'high' rather
-        than assume all adapted targets support 'xhigh'.
+        closest supported Responses effort. Anthropic's 'max' / 'xhigh' maps to
+        OpenAI 'xhigh' only when model metadata says the target supports it.
         """
-        output_effort: Optional[str] = None
-        if isinstance(output_config, dict):
-            raw_output_effort = output_config.get("effort")
-            if isinstance(raw_output_effort, str):
-                output_effort = {
-                    "low": "low",
-                    "medium": "medium",
-                    "high": "high",
-                    "max": "high",
-                }.get(raw_output_effort.lower())
-
-        if not isinstance(thinking, dict):
-            if output_effort:
-                return {"effort": output_effort}
+        normalized_effort = normalize_reasoning_effort_for_provider(
+            thinking=thinking,
+            output_config=output_config,
+            model=model,
+            custom_llm_provider=custom_llm_provider,
+            native_provider="openai",
+            native_field="reasoning.effort",
+        )
+        if normalized_effort is None or normalized_effort.native_value is None:
             return None
-
-        thinking_type = thinking.get("type")
-        if thinking_type == "disabled":
-            return None
-
-        effort = output_effort
-        if effort is None and thinking_type == "enabled":
-            budget = thinking.get("budget_tokens", 0)
-            if budget >= 10000:
-                effort = "high"
-            elif budget >= 5000:
-                effort = "medium"
-            elif budget >= 2000:
-                effort = "low"
-            else:
-                effort = "minimal"
-        elif effort is None and thinking_type == "adaptive":
-            effort = "medium"
-
-        if effort is None:
-            return None
-
-        reasoning: Dict[str, Any] = {"effort": effort}
+        reasoning: Dict[str, Any] = {"effort": normalized_effort.native_value}
         if (
-            thinking_type in ("enabled", "adaptive")
+            isinstance(thinking, dict)
+            and thinking.get("type") in ("enabled", "adaptive")
             and isinstance(model, str)
             and model
             and supports_reasoning_summary(
@@ -477,7 +452,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             reasoning["summary"] = "detailed"
         return reasoning
 
-    def translate_request(
+    def translate_request(  # noqa: PLR0915
         self,
         anthropic_request: AnthropicMessagesRequest,
         *,

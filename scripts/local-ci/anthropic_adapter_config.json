@@ -24,6 +24,8 @@
     "claude_adapter_gemma_26b_a4b",
     "claude_adapter_gpt_oss_20b",
     "claude_adapter_gpt_oss_120b",
+    "claude_adapter_openai_output_config_effort",
+    "claude_adapter_nvidia_cache_control_strip",
     "claude_adapter_nvidia_deepseek_v32",
     "claude_adapter_nvidia_glm47",
     "claude_adapter_nvidia_minimax_m27",
@@ -594,6 +596,170 @@
       },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_openai_output_config_effort": {
+      "http_request": {
+        "method": "POST",
+        "path": "/anthropic/v1/messages",
+        "headers": {
+          "user-agent": "AnthropicAdapterHarness/0.1",
+          "x-pass-authorization": "Bearer $OPENAI_API_KEY",
+          "x-aawm-tenant-id": "adapter-harness-tenant"
+        },
+        "json": {
+          "model": "gpt-5.4",
+          "max_tokens": 16,
+          "system": "Reply with exactly two words: effort smoke",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with exactly two words: effort smoke"
+            }
+          ],
+          "output_config": {
+            "effort": "high"
+          }
+        }
+      },
+      "expected_trace_session_id": "harness-openai-effort-session",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openai_responses_adapter",
+        "anthropic-openai-responses-adapter",
+        "anthropic-adapter-model:gpt-5.4",
+        "anthropic-adapter-target:/v1/responses"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "status_code": 200
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4",
+        "expected_tenant_id": "adapter-harness-tenant",
+        "metadata_required_equals": {
+          "tenant_id": "adapter-harness-tenant",
+          "reasoning_effort_requested": "high",
+          "reasoning_effort_source": "output_config.effort",
+          "reasoning_effort_native_provider": "openai",
+          "reasoning_effort_native_value": "high",
+          "reasoning_effort_native_field": "reasoning.effort"
+        },
+        "metadata_required_truthy": [
+          "tenant_id_source"
+        ],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1,
+          "response_cost_usd": 1e-06
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 60,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_nvidia_cache_control_strip": {
+      "http_request": {
+        "method": "POST",
+        "path": "/anthropic/v1/messages",
+        "headers": {
+          "user-agent": "AnthropicAdapterHarness/0.1",
+          "x-aawm-tenant-id": "adapter-harness-tenant"
+        },
+        "json": {
+          "model": "nvidia/deepseek-ai/deepseek-v3.2",
+          "max_tokens": 16,
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Reply with exactly two words: cache smoke",
+                  "cache_control": {
+                    "type": "ephemeral"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "status_code": 200
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "nvidia_nim",
+        "expected_model": "deepseek-ai/deepseek-v3.2",
+        "expected_tenant_id": "adapter-harness-tenant",
+        "metadata_required_equals": {
+          "tenant_id": "adapter-harness-tenant",
+          "usage_provider_cache_attempted": true,
+          "usage_provider_cache_source": "anthropic_adapter.cache_control",
+          "usage_provider_cache_status": "miss",
+          "usage_provider_cache_miss": true,
+          "usage_provider_cache_miss_reason": "nvidia_no_native_prompt_cache",
+          "nvidia_provider_cache_attempted": true,
+          "nvidia_provider_cache_status": "miss",
+          "nvidia_provider_cache_miss": true,
+          "nvidia_provider_cache_miss_reason": "nvidia_no_native_prompt_cache"
+        },
+        "metadata_required_truthy": [
+          "tenant_id_source"
+        ],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "allow_zero_cost": false,
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 120,
       "runtime_postconditions": {
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"
