@@ -1113,6 +1113,27 @@ def test_streaming_chunk_with_both_text_and_tool_calls_issue_18238():
     assert content_block_start["id"] == "toolu_bdrk_013xRVejhv3ybmLEGCoZib2b"
 
 
+def test_output_config_effort_propagates_to_gemini_reasoning_effort():
+    """Gemini generic completion requests should receive output_config.effort."""
+    request = cast(
+        Any,
+        {
+            "model": "gemini/gemini-3-pro-preview",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+            "output_config": {"effort": "high"},
+        },
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, _ = adapter.translate_anthropic_to_openai(
+        request, custom_llm_provider="gemini"
+    )
+
+    assert openai_request["reasoning_effort"] == "high"
+    assert "output_config" not in openai_request
+
+
 # ============================================================================
 # Cache Control Transformation Tests
 # ============================================================================

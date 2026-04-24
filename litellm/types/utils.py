@@ -126,6 +126,7 @@ class ProviderSpecificModelInfo(TypedDict, total=False):
     supports_tool_choice: Optional[bool]
     supports_assistant_prefill: Optional[bool]
     supports_prompt_caching: Optional[bool]
+    supports_native_cache_control: Optional[bool]
     supports_computer_use: Optional[bool]
     supports_audio_input: Optional[bool]
     supports_embedding_image_input: Optional[bool]

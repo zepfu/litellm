@@ -117,6 +117,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         output_format: Optional[Dict] = None,
+        output_config: Optional[Dict] = None,
         extra_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, str]]:
         """Prepare kwargs for litellm.completion/acompletion.
@@ -156,12 +157,19 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             request_data["top_p"] = top_p
         if output_format:
             request_data["output_format"] = output_format
+        if output_config:
+            request_data["output_config"] = output_config
 
+        extra_kwargs = extra_kwargs or {}
+        custom_llm_provider = extra_kwargs.get("custom_llm_provider")
         (
             openai_request,
             tool_name_mapping,
         ) = ANTHROPIC_ADAPTER.translate_completion_input_params_with_tool_mapping(
-            request_data
+            request_data,
+            custom_llm_provider=(
+                str(custom_llm_provider) if custom_llm_provider is not None else None
+            ),
         )
 
         if openai_request is None:
@@ -176,7 +184,6 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             }
 
         excluded_keys = {"anthropic_messages"}
-        extra_kwargs = extra_kwargs or {}
         for key, value in extra_kwargs.items():
             if (
                 key == "litellm_logging_obj"
@@ -219,6 +226,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         output_format: Optional[Dict] = None,
+        output_config: Optional[Dict] = None,
         **kwargs,
     ) -> Union[AnthropicMessagesResponse, AsyncIterator]:
         """Handle non-Anthropic models asynchronously using the adapter"""
@@ -240,6 +248,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             top_k=top_k,
             top_p=top_p,
             output_format=output_format,
+            output_config=output_config,
             extra_kwargs=kwargs,
         )
 
@@ -281,6 +290,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         output_format: Optional[Dict] = None,
+        output_config: Optional[Dict] = None,
         _is_async: bool = False,
         **kwargs,
     ) -> Union[
@@ -305,6 +315,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
                 top_k=top_k,
                 top_p=top_p,
                 output_format=output_format,
+                output_config=output_config,
                 **kwargs,
             )
 
@@ -326,6 +337,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             top_k=top_k,
             top_p=top_p,
             output_format=output_format,
+            output_config=output_config,
             extra_kwargs=kwargs,
         )
 

@@ -8,6 +8,7 @@ This file only contains param mapping logic
 API calling is done using the OpenAI SDK with an api_base
 """
 from litellm.llms.openai.chat.gpt_transformation import OpenAIGPTConfig
+from litellm.utils import supports_reasoning
 
 
 class NvidiaNimConfig(OpenAIGPTConfig):
@@ -16,6 +17,12 @@ class NvidiaNimConfig(OpenAIGPTConfig):
 
     The class `NvidiaNimConfig` provides configuration for the Nvidia NIM's Chat Completions API interface. Below are the parameters:
     """
+
+    @staticmethod
+    def _add_reasoning_effort_if_supported(model: str, params: list) -> list:
+        if supports_reasoning(model=model, custom_llm_provider="nvidia_nim"):
+            return [*params, "reasoning_effort"]
+        return params
 
     def get_supported_openai_params(self, model: str) -> list:
         """
@@ -30,31 +37,43 @@ class NvidiaNimConfig(OpenAIGPTConfig):
             "google/gemma-2-9b-it",
             "gemma-2-9b-it",
         ]:
-            return ["stream", "temperature", "top_p", "max_tokens", "stop", "seed"]
+            return self._add_reasoning_effort_if_supported(
+                model,
+                ["stream", "temperature", "top_p", "max_tokens", "stop", "seed"],
+            )
         elif model == "nvidia/nemotron-4-340b-instruct":
-            return [
-                "stream",
-                "temperature",
-                "top_p",
-                "max_tokens",
-                "max_completion_tokens",
-            ]
+            return self._add_reasoning_effort_if_supported(
+                model,
+                [
+                    "stream",
+                    "temperature",
+                    "top_p",
+                    "max_tokens",
+                    "max_completion_tokens",
+                ],
+            )
         elif model == "nvidia/nemotron-4-340b-reward":
-            return [
-                "stream",
-            ]
+            return self._add_reasoning_effort_if_supported(
+                model,
+                [
+                    "stream",
+                ],
+            )
         elif model in ["google/codegemma-1.1-7b"]:
             # most params - but no 'seed' :(
-            return [
-                "stream",
-                "temperature",
-                "top_p",
-                "frequency_penalty",
-                "presence_penalty",
-                "max_tokens",
-                "max_completion_tokens",
-                "stop",
-            ]
+            return self._add_reasoning_effort_if_supported(
+                model,
+                [
+                    "stream",
+                    "temperature",
+                    "top_p",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "max_tokens",
+                    "max_completion_tokens",
+                    "stop",
+                ],
+            )
         else:
             # DEFAULT Case - The vast majority of Nvidia NIM Models lie here
             # "upstage/solar-10.7b-instruct",
@@ -78,21 +97,24 @@ class NvidiaNimConfig(OpenAIGPTConfig):
             # "meta/llama3-8b-instruct",
             # "meta/llama2-70b",
             # "meta/codellama-70b",
-            return [
-                "stream",
-                "temperature",
-                "top_p",
-                "frequency_penalty",
-                "presence_penalty",
-                "max_tokens",
-                "max_completion_tokens",
-                "stop",
-                "seed",
-                "tools",
-                "tool_choice",
-                "parallel_tool_calls",
-                "response_format",
-            ]
+            return self._add_reasoning_effort_if_supported(
+                model,
+                [
+                    "stream",
+                    "temperature",
+                    "top_p",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "max_tokens",
+                    "max_completion_tokens",
+                    "stop",
+                    "seed",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                    "response_format",
+                ],
+            )
 
     def map_openai_params(
         self,

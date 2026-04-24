@@ -2,6 +2,21 @@
 
 ## 2026-04-24
 
+- Completed the Claude `/anthropic` reasoning-effort and cache-translation implementation across OpenAI/Codex, Gemini, OpenRouter, and NVIDIA lanes.
+  Added a shared Anthropic adapter normalization helper for `output_config.effort`, direct `reasoning_effort`, and `thinking` budgets; OpenAI Responses now preserves `xhigh` when model metadata supports it, Gemini receives normalized `reasoning_effort`, OpenRouter and NVIDIA use config-driven capability checks, and unsupported raw Anthropic fields are stripped before provider egress. Cache intent from Anthropic `cache_control` is preserved as normalized metadata, OpenAI derives bounded `prompt_cache_key` values only when cache intent is present, OpenRouter native cache-control support is metadata-driven, and NVIDIA records an explicit miss state instead of forwarding unsupported cache controls.
+
+- Extended session-history and harness validation for the new adapter effort/cache paths.
+  `public.session_history.metadata` now persists normalized reasoning-effort fields, NVIDIA is included in provider-cache family handling, and the existing Anthropic adapter harness now supports `required_equals`, `required_one_of`, `forbidden_paths`, and tenant-id assertions. Focused live dev validation on `:4001` passed for `claude_adapter_openai_output_config_effort` and `claude_adapter_nvidia_cache_control_strip` with zero failures and zero warnings after installing the changed helper files into `litellm-dev`.
+
+- Updated GPT-5.5 pricing to official OpenAI API rates.
+  `gpt-5.5` and `chatgpt/gpt-5.5` now use `$5.00 / 1M` input tokens, `$0.50 / 1M` cached input tokens, and `$30.00 / 1M` output tokens in both the primary and bundled fallback model cost maps. Focused session-history coverage confirms GPT-5.5 cost calculation now produces the corrected output-token cost.
+
+- Preserved explicit tenant identity into `public.session_history`.
+  `AawmAgentIdentity` now resolves tenant ids from canonical metadata and request headers such as `tenant_id`, `aawm_tenant_id`, `user_api_key_org_id`, org/team aliases, and AAWM/LiteLLM tenant headers before falling back to prompt-text project extraction. Live and Langfuse/backfill records persist both `tenant_id` and `metadata.tenant_id_source`, and spend-log reconstruction now restores stored `proxy_server_request.headers` so historical header-derived tenants can be repaired.
+
+- Enhanced and ran the existing session-history backfill script for tenant and cost repair.
+  `scripts/backfill_session_history.py --repair-session-history` can now repair existing rows in place, with `--repair-costs`, `--repair-tenant-ids`, and existing request/session/trace/provider/model/time filters. Local repair updated GPT-5.5 costs for 2,579 rows across scoped apply passes, and filled 1,306 missing `tenant_id` values while synchronizing tenant metadata on 13,323 rows.
+
 - Completed native passthrough logging parity for Anthropic, OpenAI/Codex, and Gemini.
   Added a shared passthrough callback contract that preserves model/provider/cost fields, request headers, existing metadata, passthrough payloads, provider-native usage objects, and downstream `AawmAgentIdentity` derivability while keeping provider-specific parsing in the Anthropic, OpenAI, and Gemini handlers. OpenAI/Codex Responses and chat, Anthropic Messages, and Gemini `generateContent` / `streamGenerateContent` now all feed callbacks/session-history with consistent kwargs and metadata.
 

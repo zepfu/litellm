@@ -2805,7 +2805,9 @@ async def _build_google_code_assist_request_from_completion_kwargs(
             top_k=completion_kwargs.get("top_k"),
             top_p=completion_kwargs.get("top_p"),
             output_format=completion_kwargs.get("output_format"),
+            output_config=completion_kwargs.get("output_config"),
             extra_kwargs={
+                "custom_llm_provider": litellm.LlmProviders.GEMINI.value,
                 "metadata": completion_kwargs.get("metadata"),
                 "parallel_tool_calls": completion_kwargs.get("parallel_tool_calls"),
                 "response_format": completion_kwargs.get("response_format"),
@@ -2902,6 +2904,8 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         "user_prompt_id": user_prompt_id,
         "request": google_request_dict,
     }
+    if isinstance(metadata, dict) and metadata:
+        wrapped_request["litellm_metadata"] = dict(metadata)
     if fallback_context_changes:
         completion_message_window_changes = {
             **completion_message_window_changes,
@@ -4068,6 +4072,45 @@ def _build_anthropic_responses_adapter_request_body(
         for unsupported_field in ("max_output_tokens", "temperature", "top_p"):
             translated_body.pop(unsupported_field, None)
 
+    from litellm.llms.anthropic.experimental_pass_through.adapters.observability import (
+        derive_prompt_cache_key,
+        normalize_reasoning_effort_for_provider,
+        request_contains_cache_control,
+    )
+
+    normalized_effort = normalize_reasoning_effort_for_provider(
+        thinking=request_body.get("thinking"),
+        output_config=request_body.get("output_config"),
+        reasoning_effort=request_body.get("reasoning_effort"),
+        model=adapter_model,
+        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        native_provider="openai",
+        native_field="reasoning.effort",
+    )
+    adapter_tags: list[str] = []
+    adapter_extra_fields: dict[str, Any] = {}
+    if normalized_effort is not None:
+        adapter_tags.extend(normalized_effort.tags())
+        adapter_extra_fields.update(normalized_effort.metadata())
+
+    cache_requested = request_contains_cache_control(request_body)
+    if not cache_requested:
+        translated_body.pop("prompt_cache_key", None)
+
+    if cache_requested:
+        prompt_cache_key = request_body.get("prompt_cache_key")
+        if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
+            prompt_cache_key = derive_prompt_cache_key(request_body)
+        if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
+            if len(prompt_cache_key) > 64:
+                prompt_cache_key = derive_prompt_cache_key(
+                    {"prompt_cache_key": prompt_cache_key},
+                    prefix="anthropic-cache-key",
+                )
+            translated_body["prompt_cache_key"] = prompt_cache_key
+            adapter_extra_fields["openai_prompt_cache_key_present"] = True
+            adapter_extra_fields["anthropic_adapter_cache_control_present"] = True
+
     existing_litellm_metadata = request_body.get("litellm_metadata")
     if isinstance(existing_litellm_metadata, dict):
         translated_body["litellm_metadata"] = dict(existing_litellm_metadata)
@@ -4086,11 +4129,13 @@ def _build_anthropic_responses_adapter_request_body(
             tag_prefix,
             f"anthropic-adapter-model:{adapter_model}",
             f"anthropic-adapter-target:{target_endpoint}",
+            *adapter_tags,
         ],
         extra_fields={
             "anthropic_adapter_model": adapter_model,
             "anthropic_adapter_original_model": request_body.get("model"),
             "anthropic_adapter_target_endpoint": target_endpoint,
+            **adapter_extra_fields,
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
                     name=span_name,
@@ -4572,7 +4617,10 @@ async def _handle_anthropic_google_completion_adapter_route(
         request=request,
     )
     if isinstance(prepared_request_body.get("litellm_metadata"), dict):
-        wrapped_request_body["litellm_metadata"] = dict(prepared_request_body["litellm_metadata"])
+        wrapped_request_body["litellm_metadata"] = {
+            **dict(wrapped_request_body.get("litellm_metadata") or {}),
+            **dict(prepared_request_body["litellm_metadata"]),
+        }
 
     generation_policy_changes = _apply_google_adapter_request_shape_policy(wrapped_request_body)
 
@@ -4756,6 +4804,10 @@ async def _handle_anthropic_openai_responses_adapter_route(
         adapter_model=adapter_model,
         use_chatgpt_codex_defaults=use_chatgpt_codex_defaults,
     )
+    if use_chatgpt_codex_defaults:
+        translated_request_body = _add_codex_request_breakout_logging_metadata(
+            translated_request_body
+        )
     if _responses_request_contains_mcp_tools(translated_request_body):
         raise HTTPException(
             status_code=400,
@@ -4958,6 +5010,7 @@ async def _handle_anthropic_nvidia_completion_adapter_route(
             top_k=prepared_request_body.get("top_k"),
             top_p=prepared_request_body.get("top_p"),
             output_format=prepared_request_body.get("output_format"),
+            output_config=prepared_request_body.get("output_config"),
             custom_llm_provider=litellm.LlmProviders.NVIDIA_NIM.value,
             api_key=nvidia_api_key,
             api_base=f"{target_base_url.rstrip('/')}/v1",
@@ -5078,6 +5131,7 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
             top_k=prepared_request_body.get("top_k"),
             top_p=prepared_request_body.get("top_p"),
             output_format=prepared_request_body.get("output_format"),
+            output_config=prepared_request_body.get("output_config"),
             custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
             api_key=openrouter_api_key,
             api_base=f"{target_base_url.rstrip('/')}/v1",

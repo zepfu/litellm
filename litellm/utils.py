@@ -2628,6 +2628,24 @@ def supports_prompt_caching(
     )
 
 
+def supports_native_cache_control(
+    model: str, custom_llm_provider: Optional[str] = None
+) -> bool:
+    """
+    Check if the provider/model accepts native cache_control fields in the
+    outbound request shape.
+
+    This is narrower than supports_prompt_caching: providers such as OpenAI can
+    perform prompt caching without accepting Anthropic-style cache_control
+    content blocks.
+    """
+    return _supports_factory(
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        key="supports_native_cache_control",
+    )
+
+
 def supports_computer_use(
     model: str, custom_llm_provider: Optional[str] = None
 ) -> bool:
@@ -2675,6 +2693,32 @@ def supports_reasoning(model: str, custom_llm_provider: Optional[str] = None) ->
     """
     return _supports_factory(
         model=model, custom_llm_provider=custom_llm_provider, key="supports_reasoning"
+    )
+
+
+def supports_xhigh_reasoning_effort(
+    model: str, custom_llm_provider: Optional[str] = None
+) -> bool:
+    """
+    Check if the given model supports the xhigh reasoning effort value.
+    """
+    return _supports_factory(
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        key="supports_xhigh_reasoning_effort",
+    )
+
+
+def supports_none_reasoning_effort(
+    model: str, custom_llm_provider: Optional[str] = None
+) -> bool:
+    """
+    Check if the given model supports the none reasoning effort value.
+    """
+    return _supports_factory(
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        key="supports_none_reasoning_effort",
     )
 
 

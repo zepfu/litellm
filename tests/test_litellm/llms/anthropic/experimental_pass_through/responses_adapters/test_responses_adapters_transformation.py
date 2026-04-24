@@ -802,14 +802,34 @@ class TestTranslateThinkingToReasoning:
         )
         assert result == {"effort": "high", "summary": "detailed"}
 
-    def test_output_config_effort_clamps_max_to_high(self):
+    def test_output_config_effort_uses_xhigh_when_supported(self):
         result = _ADAPTER.translate_thinking_to_reasoning(
             {"type": "adaptive"},
             output_config={"effort": "max"},
             model="gpt-5.4",
             custom_llm_provider="openai",
         )
-        assert result == {"effort": "high", "summary": "detailed"}
+        assert result == {"effort": "xhigh", "summary": "detailed"}
+
+    @pytest.mark.parametrize(
+        ("effort", "expected_effort"),
+        [
+            ("max", "xhigh"),
+            ("xhigh", "xhigh"),
+            ("high", "high"),
+        ],
+    )
+    def test_output_config_effort_maps_openai_responses_effort(
+        self, effort, expected_effort
+    ):
+        result = _ADAPTER.translate_thinking_to_reasoning(
+            None,
+            output_config={"effort": effort},
+            model="gpt-5.1-codex-max",
+            custom_llm_provider="openai",
+        )
+
+        assert result == {"effort": expected_effort}
 
     def test_output_config_effort_without_thinking_maps_reasoning_without_summary(self):
         result = _ADAPTER.translate_thinking_to_reasoning(
@@ -970,7 +990,7 @@ class TestTranslateRequestBroaderCoverage:
             output_config={"effort": "max"},
         )
         kwargs = _ADAPTER.translate_request(req, custom_llm_provider="openai")
-        assert kwargs["reasoning"] == {"effort": "high", "summary": "detailed"}
+        assert kwargs["reasoning"] == {"effort": "xhigh", "summary": "detailed"}
 
     def test_adaptive_thinking_omits_summary_for_chatgpt_spark(self):
         req = _make_request(
@@ -985,6 +1005,7 @@ class TestTranslateRequestBroaderCoverage:
         req = _make_request(output_config={"effort": "medium"})
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["reasoning"] == {"effort": "medium"}
+        assert "output_config" not in kwargs
 
     def test_disabled_thinking_not_included_in_kwargs(self):
         req = _make_request(thinking={"type": "disabled"})

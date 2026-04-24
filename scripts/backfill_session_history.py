@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.client import RemoteDisconnected
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -66,7 +66,9 @@ from litellm.integrations.aawm_agent_identity import (
     _derive_request_tags_from_langfuse_metadata,
     _derive_langfuse_trace_tags_from_spend_log_row,
     _ensure_session_history_schema,
+    _extract_tenant_identity_from_metadata_sources,
     _persist_session_history_records,
+    _safe_float,
     _safe_int,
 )
 from litellm.proxy.utils import PrismaClient, ProxyLogging
@@ -205,6 +207,9 @@ def _build_source_where(args: argparse.Namespace) -> Dict[str, Any]:
 
     if args.provider:
         where["custom_llm_provider"] = args.provider
+
+    if args.model:
+        where["model"] = args.model
 
     if args.status:
         where["status"] = args.status
@@ -1006,6 +1011,8 @@ def _record_matches_filters(record: Dict[str, Any], args: argparse.Namespace) ->
         return False
     if args.provider and record.get("provider") != args.provider:
         return False
+    if args.model and record.get("model") != args.model:
+        return False
     if args.status and record.get("metadata", {}).get("source_status") != args.status:
         return False
 
@@ -1770,7 +1777,236 @@ async def _run_trace_tag_writeback_from_session_history(
     }
 
 
+def _recalculate_session_history_response_cost(row: Dict[str, Any]) -> Optional[float]:
+    model = str(row.get("model") or "").strip()
+    if not model or model.lower() == "unknown":
+        return None
+
+    prompt_tokens = _safe_int(row.get("input_tokens")) or 0
+    completion_tokens = _safe_int(row.get("output_tokens")) or 0
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return None
+
+    cache_creation_input_tokens = _safe_int(row.get("cache_creation_input_tokens")) or 0
+    cache_read_input_tokens = _safe_int(row.get("cache_read_input_tokens")) or 0
+    provider = str(row.get("provider") or "").strip() or None
+
+    try:
+        import litellm
+
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            custom_llm_provider=provider,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            call_type="responses",
+        )
+    except Exception:
+        try:
+            import litellm
+
+            prompt_cost, completion_cost = litellm.cost_per_token(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+            )
+        except Exception:
+            return None
+
+    return float(prompt_cost + completion_cost)
+
+
+def _derive_session_history_tenant_identity(
+    row: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = _parse_clickhouse_value(metadata)
+    return _extract_tenant_identity_from_metadata_sources(
+        ("session_history.metadata", metadata),
+    )
+
+
+async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any]:
+    pool = await _get_session_history_pool()
+    await _ensure_session_history_schema_with_pool(pool)
+
+    repair_costs = args.repair_costs or not args.repair_tenant_ids
+    repair_tenant_ids = args.repair_tenant_ids or not args.repair_costs
+
+    where_clauses = ["litellm_call_id IS NOT NULL"]
+    params: List[Any] = []
+    if args.request_id:
+        params.append(args.request_id)
+        where_clauses.append(f"litellm_call_id = ${len(params)}")
+    if args.trace_id:
+        params.append(args.trace_id)
+        where_clauses.append(f"trace_id = ${len(params)}")
+    if args.session_id:
+        params.append(args.session_id)
+        where_clauses.append(f"session_id = ${len(params)}")
+    if args.provider:
+        params.append(args.provider)
+        where_clauses.append(f"provider = ${len(params)}")
+    if args.model:
+        params.append(args.model)
+        where_clauses.append(f"model = ${len(params)}")
+    from_start = _parse_optional_datetime(args.from_start_time)
+    if from_start is not None:
+        params.append(from_start)
+        where_clauses.append(f"start_time >= ${len(params)}")
+    to_start = _parse_optional_datetime(args.to_start_time)
+    if to_start is not None:
+        params.append(to_start)
+        where_clauses.append(f"start_time <= ${len(params)}")
+
+    limit = args.limit
+    batch_size = max(1, args.batch_size)
+    scanned_rows = 0
+    rows_with_updates = 0
+    tenant_updates = 0
+    cost_candidates = 0
+    cost_updates = 0
+    cost_repair_errors = 0
+    offset = 0
+
+    while True:
+        page_params = [*params, batch_size, offset]
+        query = f"""
+            SELECT
+                litellm_call_id,
+                tenant_id,
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+                response_cost_usd,
+                metadata
+            FROM public.session_history
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY start_time ASC NULLS LAST, litellm_call_id ASC
+            LIMIT ${len(params) + 1}
+            OFFSET ${len(params) + 2}
+        """
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(query, *page_params)
+        if not rows:
+            break
+
+        for row in rows:
+            if limit is not None and scanned_rows >= limit:
+                break
+            scanned_rows += 1
+
+            row_dict = dict(row)
+            metadata = row_dict.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = _parse_clickhouse_value(metadata)
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            next_tenant_id = row_dict.get("tenant_id")
+            next_cost = _safe_float(row_dict.get("response_cost_usd"))
+            should_update = False
+
+            if repair_tenant_ids:
+                tenant_id, tenant_source = _derive_session_history_tenant_identity(
+                    {**row_dict, "metadata": metadata}
+                )
+                if tenant_id:
+                    if str(next_tenant_id or "").strip() != tenant_id:
+                        next_tenant_id = tenant_id
+                        tenant_updates += 1
+                        should_update = True
+                    if metadata.get("tenant_id") != tenant_id:
+                        metadata["tenant_id"] = tenant_id
+                        should_update = True
+                    if tenant_source and metadata.get("tenant_id_source") != tenant_source:
+                        metadata["tenant_id_source"] = tenant_source
+                        should_update = True
+                elif next_tenant_id and metadata.get("tenant_id") != next_tenant_id:
+                    metadata["tenant_id"] = next_tenant_id
+                    metadata.setdefault("tenant_id_source", "session_history.tenant_id")
+                    should_update = True
+
+            if repair_costs:
+                recalculated_cost = _recalculate_session_history_response_cost(row_dict)
+                if recalculated_cost is None:
+                    cost_repair_errors += 1
+                else:
+                    cost_candidates += 1
+                    if (
+                        next_cost is None
+                        or abs(float(next_cost) - recalculated_cost) > 0.000000001
+                    ):
+                        next_cost = recalculated_cost
+                        metadata["response_cost_source"] = "session_history_repair"
+                        cost_updates += 1
+                        should_update = True
+
+            if should_update:
+                rows_with_updates += 1
+                if args.apply:
+                    async with pool.acquire() as connection:
+                        await connection.execute(
+                            """
+                            UPDATE public.session_history
+                            SET
+                                tenant_id = $1,
+                                response_cost_usd = $2,
+                                metadata = $3::jsonb
+                            WHERE litellm_call_id = $4
+                            """,
+                            next_tenant_id,
+                            next_cost,
+                            json.dumps(metadata),
+                            row_dict["litellm_call_id"],
+                        )
+
+        if limit is not None and scanned_rows >= limit:
+            break
+        if len(rows) < batch_size:
+            break
+        offset += len(rows)
+
+    return {
+        "source_mode": "session_history_repair",
+        "source_where": {
+            "request_id": args.request_id,
+            "trace_id": args.trace_id,
+            "session_id": args.session_id,
+            "provider": args.provider,
+            "model": args.model,
+            "from_start_time": args.from_start_time,
+            "to_start_time": args.to_start_time,
+        },
+        "stats": {
+            "scanned_rows": scanned_rows,
+            "rows_with_updates": rows_with_updates,
+            "tenant_updates": tenant_updates,
+            "cost_candidates": cost_candidates,
+            "cost_updates": cost_updates,
+            "cost_repair_errors": cost_repair_errors,
+        },
+    }
+
+
 async def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.repair_session_history:
+        run_id = datetime.now(timezone.utc).strftime("repair-%Y%m%dT%H%M%SZ")
+        result = await _run_session_history_repair(args)
+        return {
+            "mode": "apply" if args.apply else "dry_run",
+            "run_id": run_id,
+            **result,
+        }
+
     source_database_url = _clean_secret(args.source_database_url) or _get_first_secret(
         _SOURCE_DB_ENV_VARS
     )
@@ -1886,6 +2122,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Skip event reconstruction and only write back historical trace tags derived from session_history.",
     )
     parser.add_argument(
+        "--repair-session-history",
+        action="store_true",
+        help="Repair existing session_history rows in place. By default repairs both tenant ids and response costs.",
+    )
+    parser.add_argument(
+        "--repair-costs",
+        action="store_true",
+        help="With --repair-session-history, only recalculate response_cost_usd from current model pricing.",
+    )
+    parser.add_argument(
+        "--repair-tenant-ids",
+        action="store_true",
+        help="With --repair-session-history, only fill tenant_id from stored session metadata.",
+    )
+    parser.add_argument(
         "--patch-langfuse-tags",
         action="store_true",
         help="Patch historical Langfuse trace tags from derived request tags.",
@@ -1897,6 +2148,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--session-id", help="Restrict to a single session id.")
     parser.add_argument("--provider", help="Restrict to a custom_llm_provider value.")
+    parser.add_argument("--model", help="Restrict to a single session_history model value.")
     parser.add_argument(
         "--status",
         choices=("success", "failure"),
