@@ -2,6 +2,12 @@
 
 ## 2026-04-24
 
+- Promoted the local prod `:4000` LiteLLM container to the `aawm.31` image and isolated the remaining prod validation blockers.
+  Prod readiness reported LiteLLM `1.82.3+aawm.31`; `claude_adapter_peeromega_fanout` and `claude_adapter_openrouter_ling_26_flash` passed. `claude_adapter_gpt_oss_120b` was blocked by OpenRouter `503 provider=OpenInference raw=no healthy upstream`, NVIDIA DeepSeek/GLM succeeded but exposed a Langfuse trace-environment propagation gap, and NVIDIA MiniMax remained too slow for the current 300s opt-in spot-check timeout.
+
+- Hardened the next prod validation release for the remaining adapter issues.
+  NVIDIA/OpenRouter completion adapters now mirror trace/session context from `litellm_metadata` into normal completion `metadata` so Langfuse trace environment matches session-history environment. Harness `0.0.12` adds a narrow soft-fail classifier for the exact OpenRouter provider-unavailable timeout signature while keeping other hard-gate timeouts hard.
+
 - Promoted the local prod `:4000` LiteLLM container to the durable `aawm.28` image.
   The running `aawm-litellm` container now reports LiteLLM `1.82.3+aawm.28` with callback wheel `0.0.8` and control-plane wheel `0.0.5`.
 

@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31` (30 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32` (31 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.31`.
+`1.82.3+aawm.32`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1032,6 +1032,50 @@ artifact and fork-image publishing workflow.
 OpenRouter stream fallback and `h-v0.0.11` harness artifact. Full prod `:4000`
 harness validation is required after publishing and promoting the `aawm.31`
 image.
+
+---
+
+### aawm.32 — Prod adapter validation hardening
+
+**Files:**
+- `pyproject.toml`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+- `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `TEST_HARNESS.md`
+- `PATCHES.md`
+- `TODO.md`
+- `COMPLETED.md`
+
+**Upstream issue:** The `aawm.31` prod promotion exposed two AAWM-specific
+validation gaps:
+
+1. NVIDIA completion-adapter calls wrote `session_history.litellm_environment`
+   correctly but left Langfuse trace `environment` as `default` because normal
+   completion callbacks only promote trace fields from `metadata.trace_*`, not
+   from `litellm_metadata`.
+2. `claude_adapter_gpt_oss_120b` remained the OpenRouter hard gate, but
+   OpenRouter/Provider returned repeated `503` / `provider=OpenInference` /
+   `raw=no healthy upstream` during prod validation. That provider-unavailable
+   condition should not be confused with the prior local missing
+   `response.completed` adapter bug.
+
+**Fix:** Mirror trace/session context from `litellm_metadata` into normal
+completion-adapter `metadata` for NVIDIA/OpenRouter completion adapters so
+Langfuse trace fields match session-history environment fields. Add a narrow
+harness classifier that soft-fails only timeout cases whose overlapping runtime
+logs contain the exact OpenRouter provider-unavailable signature; all other
+timeouts remain hard failures.
+
+**Why not upstream:** AAWM-specific Anthropic adapter routing, local prod/dev
+harness policy, and provider-free-model operational semantics.
+
+**Validation status:** Focused unit coverage passes for the NVIDIA metadata
+bridge and OpenRouter provider-unavailable timeout classifier. Full prod
+`:4000` harness validation is required after publishing and promoting the
+`aawm.32` image.
 
 ---
 
