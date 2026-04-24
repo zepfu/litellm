@@ -4,7 +4,9 @@ OpenAI Passthrough Logging Handler
 Handles cost tracking and logging for OpenAI passthrough endpoints, specifically /chat/completions.
 """
 
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
@@ -69,6 +71,101 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     def get_provider_config(self, model: str) -> OpenAIConfigType:
         """Get OpenAI provider configuration for the given model."""
         return OpenAIConfig()
+
+    @staticmethod
+    def _candidate_model_price_keys(
+        model: str,
+        custom_llm_provider: Optional[str],
+    ) -> List[str]:
+        candidates = [model]
+        if custom_llm_provider == "openrouter":
+            if not model.startswith("openrouter/"):
+                candidates.append(f"openrouter/{model}")
+            else:
+                candidates.append(model.removeprefix("openrouter/"))
+        return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+    @staticmethod
+    def _lookup_model_price_info(
+        model: str,
+        custom_llm_provider: Optional[str],
+    ) -> Optional[dict]:
+        candidates = OpenAIPassthroughLoggingHandler._candidate_model_price_keys(
+            model,
+            custom_llm_provider,
+        )
+
+        model_cost = getattr(litellm, "model_cost", None)
+        if isinstance(model_cost, dict):
+            for candidate in candidates:
+                model_info = model_cost.get(candidate)
+                if isinstance(model_info, dict):
+                    return model_info
+
+        package_root = Path(getattr(litellm, "__file__", "")).resolve().parent
+        price_files = (
+            package_root / "model_prices_and_context_window.json",
+            package_root / "bundled_model_prices_and_context_window_fallback.json",
+            package_root.parent / "model_prices_and_context_window.json",
+        )
+        for price_file in price_files:
+            if not price_file.is_file():
+                continue
+            try:
+                price_map = json.loads(price_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(price_map, dict):
+                continue
+            for candidate in candidates:
+                model_info = price_map.get(candidate)
+                if isinstance(model_info, dict):
+                    return model_info
+        return None
+
+    @staticmethod
+    def _completion_cost_with_model_price_fallback(
+        *,
+        completion_response: Any,
+        model: str,
+        custom_llm_provider: Optional[str],
+        call_type: Optional[str] = None,
+    ) -> float:
+        try:
+            return litellm.completion_cost(
+                completion_response=completion_response,
+                model=model,
+                custom_llm_provider=custom_llm_provider,
+                call_type=call_type,
+            )
+        except Exception as exc:
+            model_info = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+                model,
+                custom_llm_provider,
+            )
+            usage = getattr(completion_response, "usage", None)
+            if not isinstance(model_info, dict) or usage is None:
+                raise
+            input_cost_per_token = model_info.get("input_cost_per_token")
+            output_cost_per_token = model_info.get("output_cost_per_token")
+            if not isinstance(input_cost_per_token, (int, float)) or not isinstance(
+                output_cost_per_token,
+                (int, float),
+            ):
+                raise
+            prompt_tokens = getattr(usage, "prompt_tokens", None) or 0
+            completion_tokens = getattr(usage, "completion_tokens", None) or 0
+            fallback_cost = (
+                float(prompt_tokens) * float(input_cost_per_token)
+                + float(completion_tokens) * float(output_cost_per_token)
+            )
+            verbose_proxy_logger.warning(
+                "OpenAI passthrough cost fallback used for model=%s provider=%s after completion_cost error: %s",
+                model,
+                custom_llm_provider,
+                str(exc),
+            )
+            return fallback_cost
 
     @staticmethod
     def is_openai_chat_completions_route(url_route: str) -> bool:
@@ -364,6 +461,129 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             ),
             responses_output=response_output if isinstance(response_output, list) else None,
         )
+
+    @staticmethod
+    def _estimate_token_count_from_value(value: Any) -> int:
+        if value is None:
+            return 1
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                text = str(value)
+        return max(1, (len(text) + 3) // 4)
+
+    @staticmethod
+    def _extract_responses_api_stream_text(all_chunks: List[str]) -> str:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        text_parts: List[str] = []
+        delta_keys_seen: set[str] = set()
+
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+
+            chunk_type = parsed_chunk.get("type")
+            if chunk_type == "response.output_text.delta":
+                delta = parsed_chunk.get("delta")
+                if isinstance(delta, str) and delta:
+                    text_parts.append(delta)
+                    text_key = parsed_chunk.get("item_id")
+                    if not isinstance(text_key, str) or not text_key:
+                        output_index = parsed_chunk.get("output_index")
+                        text_key = (
+                            f"output:{output_index}"
+                            if isinstance(output_index, int)
+                            else "output:0"
+                        )
+                    delta_keys_seen.add(text_key)
+                continue
+
+            # Some OpenRouter Responses streams end with output_text.done plus
+            # [DONE], but omit response.completed. Preserve that text once.
+            if chunk_type == "response.output_text.done":
+                text = parsed_chunk.get("text")
+                if not isinstance(text, str) or not text:
+                    continue
+                text_key = parsed_chunk.get("item_id")
+                if not isinstance(text_key, str) or not text_key:
+                    output_index = parsed_chunk.get("output_index")
+                    text_key = (
+                        f"output:{output_index}"
+                        if isinstance(output_index, int)
+                        else "output:0"
+                    )
+                if text_key not in delta_keys_seen:
+                    text_parts.append(text)
+
+        return "".join(text_parts)
+
+    @staticmethod
+    def _build_responses_api_fallback_model_response_from_stream(
+        *,
+        all_chunks: List[str],
+        request_body: dict,
+        fallback_model: str,
+    ) -> ModelResponse:
+        assistant_content = (
+            OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
+                all_chunks
+            )
+        )
+        prompt_tokens = (
+            OpenAIPassthroughLoggingHandler._estimate_token_count_from_value(
+                request_body
+            )
+        )
+        completion_tokens = (
+            OpenAIPassthroughLoggingHandler._estimate_token_count_from_value(
+                assistant_content
+            )
+        )
+        response_body = {
+            "model": fallback_model,
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"text_tokens": completion_tokens},
+            },
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_openai_responses_stream_fallback",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": assistant_content,
+                            "annotations": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        model_response = OpenAIPassthroughLoggingHandler._build_responses_api_model_response_from_body(
+            response_body=response_body,
+            fallback_model=fallback_model,
+        )
+        hidden_params = getattr(model_response, "_hidden_params", None)
+        if not isinstance(hidden_params, dict):
+            hidden_params = {}
+            model_response._hidden_params = hidden_params
+        hidden_params["openai_responses_stream_missing_completed"] = True
+        hidden_params["openai_responses_stream_usage_estimated"] = True
+        return model_response
 
     @staticmethod
     def _response_output_stream_key(
@@ -673,7 +893,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 )
 
                 # Calculate cost using LiteLLM's cost calculator
-                response_cost = litellm.completion_cost(
+                response_cost = OpenAIPassthroughLoggingHandler._completion_cost_with_model_price_fallback(
                     completion_response=litellm_model_response,
                     model=model,
                     custom_llm_provider=custom_llm_provider,
@@ -763,7 +983,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 )
 
                 # Calculate cost using LiteLLM's cost calculator with responses call type
-                response_cost = litellm.completion_cost(
+                response_cost = OpenAIPassthroughLoggingHandler._completion_cost_with_model_price_fallback(
                     completion_response=litellm_model_response,
                     model=model,
                     custom_llm_provider=custom_llm_provider,
@@ -989,7 +1209,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 verbose_proxy_logger.warning(
                     "No response.completed event found in OpenAI responses stream"
                 )
-                return None
+                return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response_from_stream(
+                    all_chunks=all_chunks,
+                    request_body=request_body,
+                    fallback_model=model,
+                )
 
             completed_response = ResponsesAPIResponse(**completed_response_payload)
             responses_output = completed_response_payload.get("output")
@@ -1105,7 +1329,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 "custom_llm_provider", "openai"
             )
             # Calculate cost using LiteLLM's cost calculator
-            response_cost = litellm.completion_cost(
+            response_cost = OpenAIPassthroughLoggingHandler._completion_cost_with_model_price_fallback(
                 completion_response=complete_response,
                 model=model,
                 custom_llm_provider=custom_llm_provider,

@@ -4334,6 +4334,7 @@ def _build_anthropic_streaming_response_from_responses_stream(
     response: StreamingResponse,
     *,
     model: str,
+    request_body: Optional[dict[str, Any]] = None,
 ) -> StreamingResponse:
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
         AnthropicResponsesStreamWrapper,
@@ -4342,6 +4343,7 @@ def _build_anthropic_streaming_response_from_responses_stream(
     wrapper = AnthropicResponsesStreamWrapper(
         responses_stream=_iterate_responses_sse_events(response.body_iterator),
         model=model,
+        request_body=request_body,
     )
     return StreamingResponse(
         wrapper.async_anthropic_sse_wrapper(),
@@ -4776,6 +4778,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
         return _build_anthropic_streaming_response_from_responses_stream(
             upstream_response,
             model=adapter_model,
+            request_body=translated_request_body,
         )
 
     if not isinstance(upstream_response, Response):
@@ -5136,6 +5139,7 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
         return _build_anthropic_streaming_response_from_responses_stream(
             upstream_response,
             model=adapter_model,
+            request_body=translated_request_body,
         )
 
     if not isinstance(upstream_response, Response):

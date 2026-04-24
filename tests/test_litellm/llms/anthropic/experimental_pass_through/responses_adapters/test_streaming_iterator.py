@@ -224,3 +224,37 @@ async def test_stream_wrapper_emits_done_delta_when_function_call_arguments_arri
         "type": "input_json_delta",
         "partial_json": '{"command": "git status"}',
     }
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_synthesizes_stop_and_usage_when_completed_is_missing():
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.done",
+            item_id="msg_missing_completed",
+            output_index=0,
+            text="oss120 smoke",
+        ),
+    ]
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="openai/gpt-oss-120b:free",
+        request_body={"model": "openai/gpt-oss-120b:free", "input": "probe"},
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    assert [chunk["type"] for chunk in chunks] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "message_delta",
+        "message_stop",
+    ]
+    assert chunks[2]["delta"] == {
+        "type": "text_delta",
+        "text": "oss120 smoke",
+    }
+    assert chunks[3]["usage"]["input_tokens"] >= 1
+    assert chunks[3]["usage"]["output_tokens"] >= 1
