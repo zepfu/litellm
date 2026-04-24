@@ -617,6 +617,59 @@ class TestOpenAIPassthroughLoggingHandler:
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.333
 
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_estimates_usage_when_completed_is_missing(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.444
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openrouter",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-missing-completed","object":"response","created_at":1775869960,"status":"in_progress","model":"openai/gpt-oss-120b:free","output":[]}}',
+            'event: response.output_text.done',
+            'data: {"type":"response.output_text.done","item_id":"msg_123","output_index":0,"content_index":0,"text":"oss120 smoke"}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://openrouter.ai/api/v1/responses",
+            request_body={"model": "openai/gpt-oss-120b:free", "input": "probe"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        usage = result["result"].usage
+        message = result["result"].choices[0].message
+        assert message.content == "oss120 smoke"
+        assert usage.prompt_tokens >= 1
+        assert usage.completion_tokens >= 1
+        assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+        assert (
+            result["result"]._hidden_params[
+                "openai_responses_stream_missing_completed"
+            ]
+            is True
+        )
+        assert (
+            result["result"]._hidden_params[
+                "openai_responses_stream_usage_estimated"
+            ]
+            is True
+        )
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
+        assert result["kwargs"]["response_cost"] == 0.444
+
     def test_openai_passthrough_handler_backfills_openrouter_responses_usage_and_model(self):
         mock_httpx_response = self._create_mock_httpx_response(
             {

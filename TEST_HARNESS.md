@@ -93,6 +93,13 @@ do not hard-gate the exact natural-language result string. They hard-gate comman
 success, usage/cost, routing, request payload logging, Langfuse
 trace/user/session context, runtime logs, and `session_history` invariants.
 
+OpenRouter Responses hard gates must also catch streams that finish without a
+`response.completed` event. The adapter should still emit a valid Anthropic
+`message_delta` / `message_stop`, and passthrough logging should persist
+non-zero estimated usage/cost using the checked-in/bundled model-price JSON
+when LiteLLM's loaded runtime cost map does not yet include the OpenRouter free
+model alias.
+
 ## Current model policy
 
 ### Hard gates
@@ -367,3 +374,7 @@ their own evidence of a bad adapter route.
 The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
+
+Current minimum harness bundle version is `h-v0.0.9`; it includes the controlled
+Claude settings overlay and the longer peeromega fanout timeout for prod `:4000`
+validation.
