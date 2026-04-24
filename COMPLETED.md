@@ -2,6 +2,18 @@
 
 ## 2026-04-24
 
+- Extended the existing Anthropic adapter harness tenant assertions across native and adapted lanes.
+  The harness now carries a shared `default_tenant_id`, injects `x-aawm-tenant-id` through HTTP, Claude CLI, Codex CLI, and Gemini CLI context setup, and defaults `public.session_history.tenant_id`, `metadata.tenant_id`, and `metadata.tenant_id_source` assertions for every session-history case. Multi-row fanout validations now merge `required_equals.tenant_id` into each expected row. Live dev validation passed for the native Anthropic, OpenAI chat, OpenAI Responses, Codex Responses, Gemini generateContent, and Gemini streamGenerateContent cases with zero failures and zero warnings.
+
+- Broadened opt-in `/anthropic` effort/cache harness coverage.
+  Added default-excluded HTTP cases for Gemini `output_config.effort` translation and OpenRouter effort plus cache-control intent. The final opt-in dev bundle passed for `claude_adapter_openai_output_config_effort`, `claude_adapter_gemini_output_config_effort`, `claude_adapter_openrouter_output_config_effort_cache`, and `claude_adapter_nvidia_cache_control_strip` with zero failures and zero warnings. The OpenRouter case validates durable session-history reasoning/cache metadata and row-level provider-cache status; deeper outbound request-payload assertions remain pending until that lane exposes a stable parsed request shape.
+
+- Added a safe historical Gemini control-plane repair mode.
+  `scripts/backfill_session_history.py --repair-session-history --repair-gemini-control-plane {delete,mark}` now dry-runs by default, honors the existing request/session/trace/provider/model/time/limit filters, uses id-keyset pagination, deletes tool-activity rows before session rows when applying deletes, and only matches rows with explicit `loadCodeAssist`, `listExperiments`, `retrieveUserQuota`, or `fetchAdminControls` evidence. Local dry-run against `aawm_tristore` matched zero explicit-method rows; the 24 ambiguous `gemini/unknown` zero-token rows without method evidence were intentionally left untouched.
+
+- Validated the updated harness/backfill package on dev.
+  Focused tests passed for backfill repair helpers (`6 passed`), adapter/provider/session-history unit coverage (`79 passed` and `24 passed / 138 deselected` in the focused suites), JSON/compile checks passed, `git diff --check` passed, the full default Anthropic adapter harness on `:4001` passed with zero failures, native passthrough tenant validation passed with zero failures/warnings, and the new opt-in effort/cache bundle passed with zero failures/warnings.
+
 - Completed the Claude `/anthropic` reasoning-effort and cache-translation implementation across OpenAI/Codex, Gemini, OpenRouter, and NVIDIA lanes.
   Added a shared Anthropic adapter normalization helper for `output_config.effort`, direct `reasoning_effort`, and `thinking` budgets; OpenAI Responses now preserves `xhigh` when model metadata supports it, Gemini receives normalized `reasoning_effort`, OpenRouter and NVIDIA use config-driven capability checks, and unsupported raw Anthropic fields are stripped before provider egress. Cache intent from Anthropic `cache_control` is preserved as normalized metadata, OpenAI derives bounded `prompt_cache_key` values only when cache intent is present, OpenRouter native cache-control support is metadata-driven, and NVIDIA records an explicit miss state instead of forwarding unsupported cache controls.
 

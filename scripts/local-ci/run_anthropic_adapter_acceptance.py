@@ -272,6 +272,8 @@ def _apply_target_profile_to_config(
         updated_case.setdefault('require_trace_user_id', True)
         updated_case['target_profile'] = target
         updated_case['case_name'] = case_name
+        tenant_id = _resolve_harness_tenant_id(updated_config, updated_case)
+        updated_case['tenant_id'] = tenant_id
         session_history_validation = dict(
             updated_case.get('session_history_validation') or {}
         )
@@ -288,9 +290,25 @@ def _apply_target_profile_to_config(
         metadata_required_equals['litellm_environment'] = profile[
             'expected_trace_environment'
         ]
+        metadata_required_equals.setdefault('tenant_id', tenant_id)
         session_history_validation['metadata_required_equals'] = (
             metadata_required_equals
         )
+        metadata_required_truthy = list(
+            session_history_validation.get('metadata_required_truthy') or []
+        )
+        if 'tenant_id_source' not in metadata_required_truthy:
+            metadata_required_truthy.append('tenant_id_source')
+        session_history_validation['metadata_required_truthy'] = metadata_required_truthy
+        expected_rows = session_history_validation.get('expected_rows')
+        has_expected_rows = isinstance(expected_rows, list) and bool(expected_rows)
+        if has_expected_rows:
+            session_history_validation['expected_rows'] = [
+                _with_expected_row_tenant(row, tenant_id)
+                for row in expected_rows
+            ]
+        else:
+            session_history_validation.setdefault('expected_tenant_id', tenant_id)
         session_history_validation.setdefault('require_runtime_identity', True)
         updated_case['session_history_validation'] = session_history_validation
         if isinstance(updated_case.get('http_request'), dict):
@@ -308,6 +326,7 @@ def _apply_target_profile_to_config(
                 case_name=case_name,
             )
         else:
+            updated_case = _ensure_claude_tenant_header(updated_case, tenant_id)
             updated_case = RA._ensure_claude_harness_headers(
                 updated_case,
                 target=target,
@@ -317,6 +336,50 @@ def _apply_target_profile_to_config(
 
     updated_config['cases'] = updated_cases
     return updated_config
+
+
+def _resolve_harness_tenant_id(
+    suite_config: dict[str, Any],
+    case_config: dict[str, Any],
+) -> str:
+    value = case_config.get('tenant_id', suite_config.get('default_tenant_id'))
+    if isinstance(value, (str, int, float)) and str(value).strip():
+        return str(value).strip()
+    return 'adapter-harness-tenant'
+
+
+def _with_expected_row_tenant(row: Any, tenant_id: str) -> Any:
+    if not isinstance(row, dict):
+        return row
+    updated_row = dict(row)
+    required_equals = dict(updated_row.get('required_equals') or {})
+    required_equals.setdefault('tenant_id', tenant_id)
+    updated_row['required_equals'] = required_equals
+    return updated_row
+
+
+def _ensure_claude_tenant_header(config: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+    updated = dict(config)
+    env = dict(updated.get('env') or {})
+    headers = RA._parse_claude_custom_header_lines(env.get('ANTHROPIC_CUSTOM_HEADERS'))
+    if not any(key.lower() == 'x-aawm-tenant-id' for key, _ in headers):
+        headers.append(('x-aawm-tenant-id', tenant_id))
+    env['ANTHROPIC_CUSTOM_HEADERS'] = RA._format_claude_custom_header_lines(headers)
+    updated['env'] = env
+    return updated
+
+
+def _append_codex_tenant_config_arg(command: list[Any], tenant_id: str) -> list[Any]:
+    tenant_config = f'model_providers.{{codex_profile}}.http_headers.x-aawm-tenant-id="{tenant_id}"'
+    if any(str(item) == tenant_config for item in command):
+        return command
+    updated = list(command)
+    try:
+        insert_at = updated.index('--json')
+    except ValueError:
+        insert_at = max(0, len(updated) - 1)
+    updated[insert_at:insert_at] = ['-c', tenant_config]
+    return updated
 
 
 def _ensure_http_harness_context(
@@ -329,6 +392,7 @@ def _ensure_http_harness_context(
     updated = dict(config)
     request_config = dict(updated.get('http_request') or {})
     headers = dict(request_config.get('headers') or {})
+    tenant_id = str(updated.get('tenant_id') or 'adapter-harness-tenant')
     expected_user_ids = [
         str(value).strip()
         for value in (updated.get('expected_user_ids') or [])
@@ -350,6 +414,7 @@ def _ensure_http_harness_context(
     headers.setdefault('langfuse_trace_user_id', harness_user_id)
     headers.setdefault('langfuse_trace_name', case_name)
     headers.setdefault('session_id', session_id)
+    headers.setdefault('x-aawm-tenant-id', tenant_id)
     headers.setdefault('user-agent', 'AAWMNativePassthroughHarness/0.1')
 
     request_config['headers'] = headers
@@ -375,6 +440,7 @@ def _ensure_cli_harness_context(
     if cli_kind not in {'codex', 'gemini'}:
         return updated
 
+    tenant_id = str(updated.get('tenant_id') or 'adapter-harness-tenant')
     expected_user_ids = [
         str(value).strip()
         for value in (updated.get('expected_user_ids') or [])
@@ -405,9 +471,16 @@ def _ensure_cli_harness_context(
         ('x-litellm-end-user-id', harness_user_id),
         ('langfuse_trace_user_id', harness_user_id),
         ('langfuse_trace_name', case_name),
+        ('x-aawm-tenant-id', tenant_id),
     ]
     if cli_kind == 'codex':
         controlled_headers.append(('session_id', session_id))
+        command = updated.get('command')
+        if isinstance(command, list):
+            updated['command'] = _format_harness_template(
+                _append_codex_tenant_config_arg(command, tenant_id),
+                context,
+            )
     if cli_kind == 'gemini':
         env['CODE_ASSIST_ENDPOINT'] = f"{profile['litellm_base_url']}/gemini"
         env['GOOGLE_GENAI_USE_GCA'] = 'true'
