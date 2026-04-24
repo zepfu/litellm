@@ -2,6 +2,18 @@
 
 ## 2026-04-24
 
+- Completed native passthrough logging parity for Anthropic, OpenAI/Codex, and Gemini.
+  Added a shared passthrough callback contract that preserves model/provider/cost fields, request headers, existing metadata, passthrough payloads, provider-native usage objects, and downstream `AawmAgentIdentity` derivability while keeping provider-specific parsing in the Anthropic, OpenAI, and Gemini handlers. OpenAI/Codex Responses and chat, Anthropic Messages, and Gemini `generateContent` / `streamGenerateContent` now all feed callbacks/session-history with consistent kwargs and metadata.
+
+- Added native passthrough validation to the existing Anthropic adapter harness.
+  `scripts/local-ci/run_anthropic_adapter_acceptance.py` and `anthropic_adapter_config.json` now include selectable native HTTP and real-CLI cases for Anthropic, OpenAI/Codex, and Gemini without introducing a separate harness entrypoint. The CLI cases launch the actual `claude`, `codex`, and `gemini` binaries so local auth/config remains the source of truth, and the harness validates Langfuse plus `public.session_history` for the actual provider session id emitted by each client.
+
+- Fixed Gemini native CLI control-plane calls creating `gemini/unknown` session-history rows.
+  Gemini Code Assist startup/admin calls such as `loadCodeAssist`, `listExperiments`, `retrieveUserQuota`, and `fetchAdminControls` now skip model-call logging in both non-streaming and streaming passthrough paths. Only real Gemini model operations (`generateContent`, `streamGenerateContent`, and `predictLongRunning`) produce model `session_history` rows. Live dev validation after the fix produced one `gemini/gemini-2.5-flash` row for the Gemini CLI session and zero new `gemini/unknown` rows.
+
+- Validated the native passthrough logging work and pushed it to `develop`.
+  The committed change `1168a12e74 feat: align native passthrough logging` passed the shared passthrough/provider/session-history test set (`125 passed`), the broader passthrough endpoint suite (`212 passed`), compile checks, `git diff --check`, callback source parity, and the combined real-CLI harness on `:4001` for `native_anthropic_passthrough_claude`, `native_openai_passthrough_responses_codex`, and `native_gemini_passthrough_stream_generate_content`.
+
 - Finalized the production release process documentation.
   Added `PROD_RELEASE.md` with the dev/prod runtime split, pre-promotion validation, fork image tagging, overlay artifact handling, infrastructure promotion, prod harness validation, optional provider lanes, finalization, and rollback process. Updated `TEST_HARNESS.md`, `WHEEL.md`, and the bundled local-ci README so the prod process is discoverable and GPT-OSS 20B/120B are documented as explicit opt-in edge checks rather than default hard gates.
 
