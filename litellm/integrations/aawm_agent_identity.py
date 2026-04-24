@@ -839,6 +839,7 @@ def _parse_client_identity_from_user_agent(
     known_patterns = (
         (re.compile(r"\bclaude-code/(?P<version>[A-Za-z0-9.+_-]+)"), "claude-code"),
         (re.compile(r"\bcodex-tui/(?P<version>[A-Za-z0-9.+_-]+)"), "codex-tui"),
+        (re.compile(r"\bGeminiCLI/(?P<version>[A-Za-z0-9.+_-]+)"), "gemini-cli"),
         (re.compile(r"\bOpenAI/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "openai-python"),
         (re.compile(r"\bAnthropic/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "anthropic-python"),
     )
@@ -900,14 +901,18 @@ def _build_session_runtime_identity(
     if cc_entrypoint and client_name is None:
         client_name = cc_entrypoint
 
+    runtime_environment = (
+        _get_first_secret_value(_AAWM_LITELLM_ENVIRONMENT_ENV_VARS)
+        if allow_runtime
+        else None
+    )
     litellm_environment = _first_non_empty_string(
+        runtime_environment,
         metadata.get("litellm_environment"),
         metadata.get("trace_environment"),
         metadata.get("source_trace_environment"),
         trace_environment,
     )
-    if allow_runtime and litellm_environment is None:
-        litellm_environment = _get_first_secret_value(_AAWM_LITELLM_ENVIRONMENT_ENV_VARS)
 
     litellm_version = _first_non_empty_string(metadata.get("litellm_version"))
     if allow_runtime and litellm_version is None:
@@ -1734,6 +1739,13 @@ def _request_contains_cached_content(payload: Any) -> bool:
     return False
 
 
+def _request_contains_prompt_cache_key(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    prompt_cache_key = payload.get("prompt_cache_key")
+    return isinstance(prompt_cache_key, str) and bool(prompt_cache_key.strip())
+
+
 def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
     return any(
         _has_nested_path(usage_obj, *path)
@@ -1748,6 +1760,16 @@ def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
 
 def _usage_has_gemini_style_cached_content_field(usage_obj: Any) -> bool:
     return _has_nested_path(usage_obj, "cachedContentTokenCount")
+
+
+def _openai_cache_attempt_source(
+    usage_obj: Any, request_body: Optional[Dict[str, Any]]
+) -> Optional[Tuple[str, str]]:
+    if _request_contains_prompt_cache_key(request_body):
+        return "prompt_cache_key_requested_without_hit", "request.prompt_cache_key"
+    if _usage_has_openai_style_cached_tokens_field(usage_obj):
+        return "cached_tokens_reported_zero", "usage.input_tokens_details.cached_tokens"
+    return None
 
 
 def _extract_service_tier_hint(
@@ -1992,10 +2014,12 @@ def _resolve_provider_cache_state(
             miss_reason = "cached_tokens_reported_zero"
             source = "usage.cached_content_token_count"
     elif provider_family == "openai":
-        if usage_has_openai_cached_tokens:
+        openai_cache_attempt_source = _openai_cache_attempt_source(
+            usage_obj, request_body
+        )
+        if openai_cache_attempt_source:
             attempted = True
-            miss_reason = "cached_tokens_reported_zero"
-            source = "usage.input_tokens_details.cached_tokens"
+            miss_reason, source = openai_cache_attempt_source
 
     if not attempted:
         return {

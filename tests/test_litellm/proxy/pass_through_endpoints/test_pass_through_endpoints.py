@@ -2972,3 +2972,25 @@ async def test_route_streaming_logging_records_finalize_metrics():
         if isinstance(span, dict)
     ]
     assert "proxy.post_response_finalize" in span_names
+
+
+@pytest.mark.asyncio
+async def test_route_streaming_logging_skips_gemini_control_plane():
+    logging_obj = MagicMock()
+    logging_obj.async_success_handler = AsyncMock()
+    success_handler = PassThroughEndpointLogging()
+
+    await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+        litellm_logging_obj=logging_obj,
+        passthrough_success_handler_obj=success_handler,
+        url_route="https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+        request_body={"request": {"session_id": "gemini-session-123"}},
+        endpoint_type=EndpointType.VERTEX_AI,
+        start_time=datetime.now() - timedelta(milliseconds=10),
+        raw_bytes=[b'{"response":{"sessionId":"gemini-session-123"}}'],
+        end_time=datetime.now(),
+        custom_llm_provider="gemini",
+        success_handler_kwargs={},
+    )
+
+    logging_obj.async_success_handler.assert_not_awaited()

@@ -172,7 +172,7 @@ class PassThroughEndpointLogging:
             custom_llm_provider=custom_llm_provider,
         )
 
-        if custom_llm_provider == "gemini" or self.is_gemini_route(url_route, custom_llm_provider):
+        if self.is_gemini_route(url_route, custom_llm_provider):
             gemini_passthrough_logging_handler_result = (
                 GeminiPassthroughLoggingHandler.gemini_passthrough_handler(
                     httpx_response=httpx_response,
@@ -343,6 +343,13 @@ class PassThroughEndpointLogging:
         elif self.is_langfuse_route(url_route):
             # Don't log langfuse pass-through requests
             return
+        elif custom_llm_provider == "gemini" and not self.is_gemini_route(
+            url_route, custom_llm_provider
+        ):
+            # Gemini CLI performs Code Assist control-plane calls before model
+            # generation. They do not contain model/usage data and should not
+            # create fallback session_history rows.
+            return
         else:
             normalized_llm_passthrough_logging_payload = (
                 self.normalize_llm_passthrough_logging_payload(
@@ -469,8 +476,9 @@ class PassThroughEndpointLogging:
         self, url_route: str, custom_llm_provider: Optional[str] = None
     ):
         """Check if the URL route is a Gemini API route."""
+        normalized_url_route = url_route.lower()
         for route in self.TRACKED_GEMINI_ROUTES:
-            if route in url_route and custom_llm_provider == "gemini":
+            if route.lower() in normalized_url_route and custom_llm_provider == "gemini":
                 return True
         return False
 
@@ -514,6 +522,7 @@ class PassThroughEndpointLogging:
                 url_route
             )
             or OpenAIPassthroughLoggingHandler.is_openai_image_editing_route(url_route)
+            or OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
         )
 
     def _set_cost_per_request(

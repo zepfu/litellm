@@ -1,8 +1,6 @@
-import json
 import os
 import sys
 from datetime import datetime
-from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,6 +13,11 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.anthropic_passthrough_logging_handler import (
     AnthropicPassthroughLoggingHandler,
 )
+from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    EndpointType,
+    PassthroughStandardLoggingPayload,
+)
+from litellm.types.utils import ModelResponse
 
 
 class TestAnthropicLoggingHandlerModelFallback:
@@ -188,6 +191,83 @@ class TestAnthropicLoggingHandlerModelFallback:
             model = logging_obj.model_call_details.get('model')
             
         assert model == ""  # Should remain empty
+
+
+class TestAnthropicStreamingMetadataPreservation:
+    def test_streaming_logging_preserves_metadata_and_passthrough_headers(self):
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "anthropic-stream-call-id"
+        logging_obj.model_call_details = {}
+
+        response = ModelResponse(
+            id="msg_stream_123",
+            model="claude-3-5-sonnet-20240620",
+            usage={
+                "prompt_tokens": 5,
+                "completion_tokens": 7,
+                "total_tokens": 12,
+            },
+        )
+        request_body = {
+            "model": "claude-3-5-sonnet-20240620",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        request_headers = {
+            "x-claude-code-session-id": "session-123",
+            "x-aawm-agent-id": "agent-456",
+        }
+        passthrough_logging_payload = PassthroughStandardLoggingPayload(
+            url="https://api.anthropic.com/v1/messages",
+            request_method="POST",
+            request_body=request_body,
+            request_headers=request_headers,
+        )
+        existing_metadata = {
+            "aawm_session_id": "session-123",
+            "aawm_agent_id": "agent-456",
+            "aawm_stream_chunk_count": 4,
+        }
+        completion_start_time = datetime(2026, 1, 1, 12, 0, 0)
+        streaming_kwargs = {
+            "litellm_params": {"metadata": existing_metadata.copy()},
+            "completion_start_time": completion_start_time,
+        }
+
+        with (
+            patch.object(
+                AnthropicPassthroughLoggingHandler,
+                "_build_complete_streaming_response",
+                return_value=response,
+            ),
+            patch("litellm.completion_cost", return_value=0.000012),
+        ):
+            result = AnthropicPassthroughLoggingHandler._handle_logging_anthropic_collected_chunks(
+                litellm_logging_obj=logging_obj,
+                passthrough_success_handler_obj=MagicMock(),
+                url_route="/anthropic/v1/messages",
+                request_body=request_body,
+                endpoint_type=EndpointType.ANTHROPIC,
+                start_time=datetime(2026, 1, 1, 12, 0, 0),
+                all_chunks=["data: {}"],
+                end_time=datetime(2026, 1, 1, 12, 0, 1),
+                passthrough_logging_payload=passthrough_logging_payload,
+                kwargs=streaming_kwargs,
+            )
+
+        kwargs = result["kwargs"]
+        assert result["result"] is response
+        assert kwargs["completion_start_time"] == completion_start_time
+        assert kwargs["passthrough_logging_payload"] == passthrough_logging_payload
+        assert kwargs["litellm_params"]["metadata"] == existing_metadata
+        assert (
+            kwargs["litellm_params"]["proxy_server_request"]["headers"]
+            == request_headers
+        )
+        assert kwargs["model"] == "claude-3-5-sonnet-20240620"
+        assert kwargs["custom_llm_provider"] == "anthropic"
+        assert kwargs["response_cost"] == 0.000012
+        assert logging_obj.model_call_details["model"] == "claude-3-5-sonnet-20240620"
+        assert logging_obj.model_call_details["custom_llm_provider"] == "anthropic"
 
 
 class TestAzureAnthropicCostCalculation:
@@ -604,7 +684,11 @@ class TestAnthropicBatchPassthroughCostTracking:
             request_counts={"total": 1, "completed": 0, "failed": 0},
         )
         
-        with patch('asyncio.create_task'):
+        def consume_created_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch('asyncio.create_task', side_effect=consume_created_task):
             AnthropicPassthroughLoggingHandler._store_batch_managed_object(
                 unified_object_id="test-unified-id",
                 batch_object=batch_object,

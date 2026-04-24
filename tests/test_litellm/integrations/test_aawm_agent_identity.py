@@ -4,12 +4,14 @@ import pytest
 
 from litellm.integrations.aawm_agent_identity import (
     AawmAgentIdentity,
+    _build_session_runtime_identity,
     _build_session_history_record_from_langfuse_trace_observation,
     _build_session_history_record_from_spend_log_row,
     _build_session_history_db_payload,
     _build_session_history_record,
     _derive_langfuse_trace_tags_from_langfuse_trace,
     _derive_langfuse_trace_tags_from_spend_log_row,
+    _parse_client_identity_from_user_agent,
     _persist_session_history_records,
     _persist_session_history_record,
 )
@@ -327,6 +329,105 @@ def test_build_session_history_record_tracks_runtime_and_client_identity() -> No
     assert "codex-tui/0.124.0" in record["client_user_agent"]
     assert record["metadata"]["litellm_environment"] == "dev"
     assert record["metadata"]["client_name"] == "codex-tui"
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "expected_name", "expected_version"),
+    [
+        ("GeminiCLI/0.9.1 darwin arm64", "gemini-cli", "0.9.1"),
+        ("OpenAI/Python 1.99.0", "openai-python", "1.99.0"),
+        ("Anthropic/Python 0.67.0", "anthropic-python", "0.67.0"),
+        ("example-client/2.3.4 extra", "example-client", "2.3.4"),
+    ],
+)
+def test_parse_client_identity_from_user_agent_known_native_clients(
+    user_agent: str,
+    expected_name: str,
+    expected_version: str,
+) -> None:
+    assert _parse_client_identity_from_user_agent(user_agent) == (
+        expected_name,
+        expected_version,
+    )
+
+
+def test_build_session_runtime_identity_uses_native_gemini_user_agent_header() -> None:
+    identity = _build_session_runtime_identity(
+        metadata={
+            "trace_environment": "dev",
+            "litellm_version": "1.82.3+aawm.34",
+            "litellm_fork_version": "aawm.34",
+            "litellm_wheel_versions": {"aawm-litellm-callbacks": "0.0.14"},
+        },
+        kwargs={
+            "litellm_params": {
+                "proxy_server_request": {
+                    "headers": {
+                        "user-agent": "GeminiCLI/0.9.1 (darwin; arm64)"
+                    }
+                }
+            }
+        },
+        allow_runtime=False,
+    )
+
+    assert identity["litellm_environment"] == "dev"
+    assert identity["litellm_version"] == "1.82.3+aawm.34"
+    assert identity["litellm_fork_version"] == "aawm.34"
+    assert identity["litellm_wheel_versions"] == {"aawm-litellm-callbacks": "0.0.14"}
+    assert identity["client_name"] == "gemini-cli"
+    assert identity["client_version"] == "0.9.1"
+    assert identity["client_user_agent"] == "GeminiCLI/0.9.1 (darwin; arm64)"
+
+
+def test_build_session_runtime_identity_prefers_live_runtime_environment(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+    identity = _build_session_runtime_identity(
+        metadata={
+            "trace_environment": "prod",
+            "litellm_environment": "prod",
+        },
+        kwargs={},
+        allow_runtime=True,
+    )
+
+    assert identity["litellm_environment"] == "dev"
+
+
+def test_build_session_runtime_identity_uses_metadata_environment_for_backfill(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+    identity = _build_session_runtime_identity(
+        metadata={
+            "trace_environment": "prod",
+            "litellm_environment": "prod",
+        },
+        kwargs={},
+        allow_runtime=False,
+    )
+
+    assert identity["litellm_environment"] == "prod"
+
+
+def test_build_session_runtime_identity_prefers_explicit_metadata_client() -> None:
+    identity = _build_session_runtime_identity(
+        metadata={
+            "client_name": "configured-client",
+            "client_version": "9.8.7",
+            "client_user_agent": "GeminiCLI/0.9.1 (darwin; arm64)",
+        },
+        kwargs={},
+        allow_runtime=False,
+    )
+
+    assert identity["client_name"] == "configured-client"
+    assert identity["client_version"] == "9.8.7"
+    assert identity["client_user_agent"] == "GeminiCLI/0.9.1 (darwin; arm64)"
 
 
 def test_build_session_history_record_uses_claude_billing_header_client_identity() -> None:
@@ -971,6 +1072,178 @@ def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cach
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_content_requested_without_hit"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
+
+
+def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cached_content_alias_request() -> None:
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "gemini-3-flash-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-gemini-cache-alias-miss"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-gemini-cache-alias-miss"
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "cached_content": "cachedContents/test-cache",
+        "contents": [{"parts": [{"text": "Use cached content."}]}],
+    }
+
+    result = {
+        "id": "provider-response-gemini-cache-alias-miss",
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 6,
+            "total_tokens": 126,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "gemini output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cached_content_requested_without_hit"
+
+
+@pytest.mark.parametrize(
+    "usage_alias",
+    ["cacheWriteInputTokens", "cacheWriteInputTokenCount", "cacheCreationInputTokens"],
+)
+def test_build_session_history_record_maps_gemini_cache_write_aliases(
+    usage_alias: str,
+) -> None:
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "gemini-3-flash-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = f"call-gemini-{usage_alias}"
+    kwargs["litellm_params"]["metadata"]["session_id"] = f"session-gemini-{usage_alias}"
+
+    result = {
+        "id": f"provider-response-gemini-{usage_alias}",
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 6,
+            "total_tokens": 126,
+            usage_alias: 32,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "gemini output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["cache_creation_input_tokens"] == 32
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "write"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cache_write_only"
+
+
+def test_build_session_history_record_marks_openai_prompt_cache_key_as_cache_attempt_without_usage_details() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-openai-prompt-cache-key"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openai-prompt-cache-key",
+            "passthrough_route_family": "codex_responses",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4",
+        "input": "Use prompt cache key.",
+        "prompt_cache_key": "prompt-cache-key-123",
+    }
+
+    result = {
+        "id": "provider-response-openai-prompt-cache-key",
+        "usage": {
+            "input_tokens": 42,
+            "output_tokens": 7,
+            "total_tokens": 49,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "openai output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "prompt_cache_key_requested_without_hit"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
+
+
+def test_build_session_history_record_ignores_nested_openai_prompt_cache_key_without_cached_token_evidence() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-openai-nested-prompt-cache-key"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openai-nested-prompt-cache-key",
+            "passthrough_route_family": "codex_responses",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "role": "user",
+                "content": "Use prompt cache key.",
+                "metadata": {"prompt_cache_key": "nested-prompt-cache-key"},
+            }
+        ],
+        "metadata": {"prompt_cache_key": "nested-metadata-prompt-cache-key"},
+    }
+
+    result = {
+        "id": "provider-response-openai-nested-prompt-cache-key",
+        "usage": {
+            "input_tokens": 42,
+            "output_tokens": 7,
+            "total_tokens": 49,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "openai output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["provider_cache_attempted"] is False
+    assert record["provider_cache_status"] == "not_attempted"
+    assert record["provider_cache_miss"] is False
+    assert record["provider_cache_miss_reason"] is None
     assert record["provider_cache_miss_token_count"] is None
     assert record["provider_cache_miss_cost_usd"] is None
 
