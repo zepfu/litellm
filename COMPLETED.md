@@ -1,5 +1,19 @@
 # Completed
 
+## 2026-04-24
+
+- Promoted the local prod `:4000` LiteLLM container to the durable `aawm.28` image.
+  The running `aawm-litellm` container now reports LiteLLM `1.82.3+aawm.28` with callback wheel `0.0.8` and control-plane wheel `0.0.5`.
+
+- Completed prod Anthropic-adapter harness validation against `:4000`.
+  Isolated `claude_adapter_gpt54`, `claude_adapter_gpt55`, and `claude_adapter_gpt54_mini` runs passed, followed by a clean full default prod harness pass at `/tmp/litellm-prod-harness-aawm28.json` with zero failures and zero warnings.
+
+- Hardened Claude harness header injection against local Claude settings precedence.
+  Harness version `0.0.7` gives Claude CLI runs a temporary per-run `--settings` overlay for the harness-controlled `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, so `x-litellm-end-user-id` / `langfuse_trace_user_id` validation no longer depends on ambient user or project settings.
+
+- Removed brittle exact-response checks from basic OpenAI smoke cases.
+  `gpt-5.4`, `gpt-5.5`, and `gpt-5.4-mini` smoke cases now hard-gate successful command completion, token/cost reporting, adapted-route tags, request payload logging, Langfuse trace/user/session context, runtime logs, and `session_history` rows without failing on harmless natural-language variation from Claude Code context.
+
 ## 2026-04-23
 
 - Added LiteLLM runtime and initiating-client identity to `public.session_history`.
