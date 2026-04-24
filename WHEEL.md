@@ -288,6 +288,8 @@ The same rule applies to:
 
 ## Infrastructure consumption
 
+For the end-to-end production promotion checklist, see `PROD_RELEASE.md`.
+
 The intended infrastructure pattern is:
 
 1. pin a specific LiteLLM fork release or image for the runtime base
