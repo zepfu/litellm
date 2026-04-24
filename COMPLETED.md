@@ -2,6 +2,9 @@
 
 ## 2026-04-24
 
+- Finalized the production release process documentation.
+  Added `PROD_RELEASE.md` with the dev/prod runtime split, pre-promotion validation, fork image tagging, overlay artifact handling, infrastructure promotion, prod harness validation, optional provider lanes, finalization, and rollback process. Updated `TEST_HARNESS.md`, `WHEEL.md`, and the bundled local-ci README so the prod process is discoverable and GPT-OSS 20B/120B are documented as explicit opt-in edge checks rather than default hard gates.
+
 - Promoted the local prod `:4000` LiteLLM container to the `aawm.34` image and completed validation.
   Prod readiness reported LiteLLM `1.82.3+aawm.34`; focused `claude_adapter_openrouter_ling_26_flash`, `claude_adapter_peeromega_fanout`, NVIDIA GLM, and NVIDIA DeepSeek passed. `claude_adapter_gpt_oss_120b` hit the exact OpenRouter provider-unavailable signature (`503 provider=OpenInference raw=no healthy upstream`) and was classified as a soft warning during isolated validation.
 

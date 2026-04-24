@@ -8,6 +8,8 @@ This repository has two distinct local validation paths:
 The adapter suite is the one that matters for the Anthropic -> OpenAI/Codex,
 Anthropic -> Google Code Assist, and Anthropic -> OpenRouter work.
 
+For the production promotion process, see `PROD_RELEASE.md`.
+
 ## Runtimes
 
 - `:4000`
@@ -100,11 +102,12 @@ non-zero estimated usage/cost using the checked-in/bundled model-price JSON
 when LiteLLM's loaded runtime cost map does not yet include the OpenRouter free
 model alias.
 
-`claude_adapter_gpt_oss_120b` remains a hard OpenRouter gate. The only allowed
-timeout soft-fail is the narrow provider-unavailable case where the overlapping
-runtime logs contain the OpenRouter adapter attempt plus `503`,
-`provider=OpenInference`, and `raw=no healthy upstream`. Other timeouts still
-fail hard so local adapter or logging regressions are not hidden.
+OpenRouter GPT-OSS edge cases remain explicit opt-in checks, not default hard
+gates. When selected, `claude_adapter_gpt_oss_120b` has one narrow allowed
+soft-fail: the overlapping runtime logs must contain the OpenRouter adapter
+attempt plus `503`, `provider=OpenInference`, and `raw=no healthy upstream`.
+Other timeouts still fail hard so local adapter or logging regressions are not
+hidden.
 
 ## Current model policy
 
@@ -116,7 +119,6 @@ These are expected to pass on the real Claude CLI path:
 - `gpt-5.4-mini`
 - `gpt-5.3-codex-spark`
 - `claude_adapter_gemini_fanout`
-- `openai/gpt-oss-120b:free`
 
 The full adapter suite intentionally runs `claude_adapter_gemini_fanout`
 before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not
@@ -151,6 +153,8 @@ Keep these out of the standard adapter harness run for now:
 
 - `openai/gpt-oss-20b:free`
 - `openai/gpt-oss-120b:free`
+- `google/gemma-4-31b-it:free`
+- `google/gemma-4-26b-a4b-it:free`
 - `meta-llama/llama-3.3-70b-instruct:free`
 - `minimax/minimax-m2.5:free`
 

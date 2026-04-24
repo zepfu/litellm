@@ -3,7 +3,8 @@
 This bundle contains the standalone local acceptance harness used to validate
 LiteLLM routing, request rewrites, Langfuse traces, and provider-specific
 metadata across Codex, Gemini, and Claude. See `TEST_HARNESS.md` in the main
-repo for the full validation policy and runtime split.
+repo for the full validation policy and runtime split, and `PROD_RELEASE.md`
+for the production promotion runbook.
 
 ## Included Files
 
@@ -70,7 +71,7 @@ Current first-wave adapted coverage:
   - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist on `:4001`
   - `gemini-3.1-pro-preview` and `gemini-3-flash-preview` are the main real-Claude validation targets; `gemini-3.1-flash-lite-preview` remains quota-sensitive
   - keep them warning-only in the harness, but do not treat `429` / `RESOURCE_EXHAUSTED` as authoritative upstream truth without interactive Gemini CLI `/model` corroboration on the same account context
-- OpenRouter opt-in hard-lane check: `openai/gpt-oss-120b:free`
+- OpenRouter opt-in edge-lane check: `openai/gpt-oss-120b:free`
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - this case remains available by explicit `--cases claude_adapter_gpt_oss_120b`, but is excluded from the default suite because OpenRouter frequently returns provider-unavailable `503 provider=OpenInference raw=no healthy upstream`
 - OpenRouter preferred free targets under active validation: `inclusionai/ling-2.6-flash:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
