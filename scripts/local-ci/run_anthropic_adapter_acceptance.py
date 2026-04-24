@@ -196,6 +196,7 @@ def _apply_target_profile_to_config(
         runtime_postconditions['docker_container_name'] = profile['docker_container_name']
         updated_case['runtime_postconditions'] = runtime_postconditions
         updated_case['expected_trace_environment'] = profile['expected_trace_environment']
+        updated_case.setdefault('require_trace_user_id', True)
         session_history_validation = dict(
             updated_case.get('session_history_validation') or {}
         )
@@ -205,6 +206,11 @@ def _apply_target_profile_to_config(
         )
         session_history_validation.setdefault('require_runtime_identity', True)
         updated_case['session_history_validation'] = session_history_validation
+        updated_case = RA._ensure_claude_harness_headers(
+            updated_case,
+            target=target,
+            case_name=case_name,
+        )
         updated_cases[case_name] = updated_case
 
     updated_config['cases'] = updated_cases
@@ -846,6 +852,8 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     for user_id in expected_user_ids:
         if user_id not in actual_user_ids:
             failures.append(f'missing {name} user id: {user_id}')
+    if bool(config.get('require_trace_user_id')) and traces and not actual_user_ids:
+        failures.append(f'{name} traces did not include a Langfuse userId')
 
     raw_generation_observations, generation_observations, generation_failures = RA._validate_generation_observations(
         family=name,

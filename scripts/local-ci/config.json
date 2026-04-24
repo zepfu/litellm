@@ -163,9 +163,7 @@
         "minimum_trace_count": 14
       }
     },
-    "expected_user_ids": [
-      "litellm.fork"
-    ],
+    "require_trace_user_id": true,
     "expected_trace_environment": "prod",
     "require_trace_session_id": true,
     "require_trace_ids_distinct_from_session_ids": true,

@@ -163,6 +163,38 @@ def test_init_kwargs_for_pass_through_endpoint_basic(
     assert result["litellm_params"]["metadata"]["user_api_key_request_route"] is None
 
 
+def test_init_kwargs_for_pass_through_endpoint_uses_standard_end_user_header(
+    mock_request, mock_user_api_key_dict
+):
+    request = mock_request(headers={"x-litellm-end-user-id": "header-user"})
+    passthrough_payload = PassthroughStandardLoggingPayload(
+        url="https://test.com",
+        request_body={},
+        request_headers=dict(request.headers),
+    )
+
+    result = HttpPassThroughEndpointHelpers._init_kwargs_for_pass_through_endpoint(
+        request=request,
+        user_api_key_dict=mock_user_api_key_dict,
+        passthrough_logging_payload=passthrough_payload,
+        litellm_call_id="test-call-id",
+        logging_obj=LiteLLMLoggingObj(
+            model="test-model",
+            messages=[],
+            stream=False,
+            call_type="test-call-type",
+            start_time=datetime.now(),
+            litellm_call_id="test-call-id",
+            function_id="test-function-id",
+        ),
+    )
+
+    assert (
+        result["litellm_params"]["metadata"]["user_api_key_end_user_id"]
+        == "header-user"
+    )
+
+
 def test_init_kwargs_with_litellm_metadata(mock_request, mock_user_api_key_dict):
     """
     Expected behavior: litellm_metadata should be merged with default metadata

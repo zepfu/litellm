@@ -70,6 +70,12 @@ runtime Docker log container, and expected Langfuse trace environment:
 The harness should fail if the selected target emits traces under the wrong
 Langfuse environment.
 
+Claude trace-user checks are intentionally controlled by the harness rather than
+by ambient operator settings. Claude cases inject `ANTHROPIC_CUSTOM_HEADERS` with
+a generated `x-litellm-end-user-id` / `langfuse_trace_user_id` value and validate
+that exact value in Langfuse. Set `AAWM_CLAUDE_HARNESS_USER_ID` only when a run
+needs a stable known identity.
+
 This suite shells out to the real Claude CLI and then validates:
 
 - adapted route tags / metadata in Langfuse
