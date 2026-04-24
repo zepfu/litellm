@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30` (29 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31` (30 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.30`.
+`1.82.3+aawm.31`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1004,9 +1004,34 @@ force-moving the already-pushed `aawm.29` tag.
 **Why not upstream:** This is AAWM release-line bookkeeping for the guarded
 GHCR image publishing workflow.
 
+**Validation status:** Superseded by `aawm.31` after the next harness artifact
+autobump moved `main` again.
+
+---
+
+### aawm.31 — Release tag alignment after second harness artifact autobump
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `TODO.md`
+- `TEST_HARNESS.md`
+
+**Upstream issue:** Updating `scripts/local-ci/README.md` in the `aawm.30`
+alignment commit correctly triggered another harness artifact autobump, moving
+the main head to `h-v0.0.11`.
+
+**Fix:** Bump the fork-local version to `1.82.3+aawm.31` on the new main head
+without touching `scripts/local-ci/**`, so the image tag can be cut from the
+guarded publisher's expected commit.
+
+**Why not upstream:** AAWM release-line bookkeeping for the local harness
+artifact and fork-image publishing workflow.
+
 **Validation status:** Version/docs-only follow-up on top of the `aawm.29`
-OpenRouter stream fallback. Full prod `:4000` harness validation is required
-after publishing and promoting the `aawm.30` image.
+OpenRouter stream fallback and `h-v0.0.11` harness artifact. Full prod `:4000`
+harness validation is required after publishing and promoting the `aawm.31`
+image.
 
 ---
 
