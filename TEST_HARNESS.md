@@ -12,10 +12,10 @@ Anthropic -> Google Code Assist, and Anthropic -> OpenRouter work.
 
 - `:4000`
   - production-style LiteLLM runtime
-  - used for the main local acceptance suite
+  - used for prod-target adapter promotion checks and the main local acceptance suite
 - `:4001`
   - `litellm-dev`
-  - the only supported runtime for Anthropic-route adapter work
+  - primary development runtime for Anthropic-route adapter work
   - native Anthropic egress is enabled again, but the adapter suite still targets explicit adapted models and mixed fanout rather than plain top-level Claude traffic
 
 Because the adapter suite is validating the Anthropic-route adapter specifically,
@@ -73,8 +73,12 @@ Langfuse environment.
 Claude trace-user checks are intentionally controlled by the harness rather than
 by ambient operator settings. Claude cases inject `ANTHROPIC_CUSTOM_HEADERS` with
 a generated `x-litellm-end-user-id` / `langfuse_trace_user_id` value and validate
-that exact value in Langfuse. Set `AAWM_CLAUDE_HARNESS_USER_ID` only when a run
-needs a stable known identity.
+that exact value in Langfuse. The command runner also writes a temporary
+per-run Claude `--settings` overlay for `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_CUSTOM_HEADERS`; this is required because local Claude user/project
+settings can otherwise override process-level header env vars. The overlay must
+not contain secrets. Set `AAWM_CLAUDE_HARNESS_USER_ID` only when a run needs a
+stable known identity.
 
 This suite shells out to the real Claude CLI and then validates:
 
@@ -83,6 +87,11 @@ This suite shells out to the real Claude CLI and then validates:
 - backend `session_history` attribution and cost
 - provider-family egress separation
 - adapted access-log labeling
+
+Basic OpenAI smoke cases (`gpt-5.4`, `gpt-5.5`, and `gpt-5.4-mini`) intentionally
+do not hard-gate the exact natural-language result string. They hard-gate command
+success, usage/cost, routing, request payload logging, Langfuse
+trace/user/session context, runtime logs, and `session_history` invariants.
 
 ## Current model policy
 
