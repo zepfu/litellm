@@ -45,7 +45,15 @@ class TestGeminiPassthroughLoggingHandler:
                     ],
                 }
             ],
-            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 8, "totalTokenCount": 18},
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 18,
+                "cachedContentTokenCount": 4,
+                "cacheWriteInputTokens": 3,
+                "cacheWriteInputTokenCount": 2,
+                "cacheCreationInputTokens": 1,
+            },
         }
 
     def _create_mock_httpx_response(self) -> httpx.Response:
@@ -102,6 +110,13 @@ class TestGeminiPassthroughLoggingHandler:
         # Test non-Gemini endpoint
         assert (
             handler.is_gemini_route("https://api.openai.com/v1/chat/completions", custom_llm_provider="openai") is False
+        )
+        assert (
+            handler.is_gemini_route(
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                custom_llm_provider="gemini",
+            )
+            is False
         )
 
     def test_extract_model_from_url(self):
@@ -169,6 +184,15 @@ class TestGeminiPassthroughLoggingHandler:
             ]
             == 10
         )
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"] == {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 8,
+            "totalTokenCount": 18,
+            "cachedContentTokenCount": 4,
+            "cacheWriteInputTokens": 3,
+            "cacheWriteInputTokenCount": 2,
+            "cacheCreationInputTokens": 1,
+        }
 
         # Verify cost calculation was called
         mock_completion_cost.assert_called_once()
@@ -217,6 +241,18 @@ class TestGeminiPassthroughLoggingHandler:
                 "totalTokenCount"
             ]
             == 18
+        )
+        assert (
+            result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+                "cachedContentTokenCount"
+            ]
+            == 4
+        )
+        assert (
+            result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+                "cacheWriteInputTokens"
+            ]
+            == 3
         )
 
     def test_response_for_transform_strips_compression_headers_for_code_assist(self):
@@ -369,6 +405,10 @@ class TestGeminiPassthroughLoggingHandler:
                     "promptTokenCount": 10,
                     "candidatesTokenCount": 2,
                     "totalTokenCount": 12,
+                    "cachedContentTokenCount": 6,
+                    "cacheWriteInputTokens": 5,
+                    "cacheWriteInputTokenCount": 4,
+                    "cacheCreationInputTokens": 3,
                 },
             },
         ]
@@ -403,6 +443,15 @@ class TestGeminiPassthroughLoggingHandler:
         assert result["kwargs"]["response_cost"] == 0.000030
         assert result["kwargs"]["model"] == "gemini-1.5-flash"
         assert result["kwargs"]["custom_llm_provider"] == "gemini"
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"] == {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 2,
+            "totalTokenCount": 12,
+            "cachedContentTokenCount": 6,
+            "cacheWriteInputTokens": 5,
+            "cacheWriteInputTokenCount": 4,
+            "cacheCreationInputTokens": 3,
+        }
 
         # Verify cost calculation was called
         mock_completion_cost.assert_called_once()
@@ -431,6 +480,10 @@ class TestGeminiPassthroughLoggingHandler:
                         "promptTokenCount": 14,
                         "candidatesTokenCount": 11,
                         "totalTokenCount": 25,
+                        "cachedContentTokenCount": 8,
+                        "cacheWriteInputTokens": 7,
+                        "cacheWriteInputTokenCount": 6,
+                        "cacheCreationInputTokens": 5,
                         "candidatesTokensDetails": [
                             {"modality": "THOUGHT", "tokenCount": 5},
                             {"modality": "TEXT", "tokenCount": 6},
@@ -458,6 +511,18 @@ class TestGeminiPassthroughLoggingHandler:
         assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
             "candidatesTokensDetails"
         ][0]["modality"] == "THOUGHT"
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "cachedContentTokenCount"
+        ] == 8
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "cacheWriteInputTokens"
+        ] == 7
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "cacheWriteInputTokenCount"
+        ] == 6
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "cacheCreationInputTokens"
+        ] == 5
 
     def test_gemini_passthrough_handler_non_gemini_route(self):
         """Test that non-Gemini routes return None"""
@@ -539,6 +604,36 @@ class TestGeminiPassthroughLoggingHandler:
         assert call_kwargs["response_cost"] == 0.000050
         assert call_kwargs["model"] == "gemini-2.0-flash"
         assert call_kwargs["custom_llm_provider"] == "gemini"
+
+    @pytest.mark.asyncio
+    async def test_pass_through_success_handler_skips_gemini_control_plane_logging(self):
+        handler = PassThroughEndpointLogging()
+        handler._handle_logging = AsyncMock()
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_response = self._create_mock_httpx_response()
+        passthrough_logging_payload = PassthroughStandardLoggingPayload(
+            url="https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+            request_body={"request": {"session_id": "gemini-session-123"}},
+            request_method="POST",
+        )
+
+        result = await handler.pass_through_async_success_handler(
+            httpx_response=mock_response,
+            response_body={"response": {"sessionId": "gemini-session-123"}},
+            logging_obj=mock_logging_obj,
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+            result="",
+            start_time=self.start_time,
+            end_time=self.end_time,
+            cache_hit=False,
+            request_body={"request": {"session_id": "gemini-session-123"}},
+            passthrough_logging_payload=passthrough_logging_payload,
+            custom_llm_provider="gemini",
+        )
+
+        assert result is None
+        handler._handle_logging.assert_not_called()
+        assert "model" not in mock_logging_obj.model_call_details
 
     @patch("litellm.completion_cost")
     def test_veo3_passthrough_cost_tracking(self, mock_completion_cost):

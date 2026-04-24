@@ -1,6 +1,6 @@
 import json
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import httpx
 
@@ -88,11 +88,9 @@ class BasePassthroughLoggingHandler(ABC):
         self,
         passthrough_logging_payload: PassthroughStandardLoggingPayload,
     ) -> Optional[str]:
-        request_body = passthrough_logging_payload.get("request_body")
-        request_headers = passthrough_logging_payload.get("request_headers")
-        if request_body:
-            return get_end_user_id_from_request_body(request_body, request_headers)
-        return None
+        return _get_user_from_passthrough_logging_payload(
+            passthrough_logging_payload=passthrough_logging_payload
+        )
 
     def _create_response_logging_payload(
         self,
@@ -117,18 +115,13 @@ class BasePassthroughLoggingHandler(ABC):
 
             kwargs["response_cost"] = response_cost
             kwargs["model"] = model
-            passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = (  # type: ignore
-                kwargs.get("passthrough_logging_payload")
+            apply_passthrough_logging_contract(
+                litellm_response=litellm_model_response,
+                model=model,
+                kwargs=kwargs,
+                logging_obj=logging_obj,
+                response_cost=response_cost,
             )
-            if passthrough_logging_payload:
-                user = self._get_user_from_metadata(
-                    passthrough_logging_payload=passthrough_logging_payload,
-                )
-                if user:
-                    kwargs.setdefault("litellm_params", {})
-                    kwargs["litellm_params"].update(
-                        {"proxy_server_request": {"body": {"user": user}}}
-                    )
 
             # Make standard logging object for Anthropic
             standard_logging_object = get_standard_logging_object_payload(
@@ -150,7 +143,6 @@ class BasePassthroughLoggingHandler(ABC):
             # set litellm_call_id to logging response object
             litellm_model_response.id = logging_obj.litellm_call_id
             litellm_model_response.model = model
-            logging_obj.model_call_details["model"] = model
             return kwargs
         except Exception as e:
             verbose_proxy_logger.exception(
@@ -220,3 +212,120 @@ class BasePassthroughLoggingHandler(ABC):
             "result": complete_streaming_response,
             "kwargs": kwargs,
         }
+
+
+def _get_user_from_passthrough_logging_payload(
+    passthrough_logging_payload: PassthroughStandardLoggingPayload,
+) -> Optional[str]:
+    request_body = passthrough_logging_payload.get("request_body")
+    request_headers = passthrough_logging_payload.get("request_headers")
+    if request_body:
+        return get_end_user_id_from_request_body(request_body, request_headers)
+    return None
+
+
+def _ensure_litellm_params(kwargs: dict) -> Dict[str, Any]:
+    litellm_params = kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        litellm_params = {}
+        kwargs["litellm_params"] = litellm_params
+
+    metadata = litellm_params.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        litellm_params["metadata"] = metadata
+
+    return litellm_params
+
+
+def _merge_proxy_server_request(
+    kwargs: dict,
+    passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload],
+) -> None:
+    if not passthrough_logging_payload:
+        return
+
+    litellm_params = _ensure_litellm_params(kwargs)
+    proxy_server_request = litellm_params.get("proxy_server_request")
+    if not isinstance(proxy_server_request, dict):
+        proxy_server_request = {}
+        litellm_params["proxy_server_request"] = proxy_server_request
+
+    user = _get_user_from_passthrough_logging_payload(
+        passthrough_logging_payload=passthrough_logging_payload,
+    )
+    if user:
+        body = proxy_server_request.get("body")
+        if not isinstance(body, dict):
+            body = {}
+            proxy_server_request["body"] = body
+        body["user"] = user
+
+    request_headers = passthrough_logging_payload.get("request_headers")
+    if request_headers:
+        proxy_server_request["headers"] = request_headers
+
+
+def _store_native_usage_object(kwargs: dict, usage_object: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(usage_object, dict) or not usage_object:
+        return
+
+    litellm_params = _ensure_litellm_params(kwargs)
+    metadata = litellm_params["metadata"]
+    metadata["usage_object"] = dict(usage_object)
+
+    standard_logging_object = kwargs.get("standard_logging_object")
+    if isinstance(standard_logging_object, dict):
+        standard_logging_metadata = standard_logging_object.get("metadata")
+        if not isinstance(standard_logging_metadata, dict):
+            standard_logging_metadata = {}
+            standard_logging_object["metadata"] = standard_logging_metadata
+        standard_logging_metadata["usage_object"] = dict(usage_object)
+
+
+def apply_passthrough_logging_contract(
+    *,
+    litellm_response: Union[ModelResponse, TextCompletionResponse, Any],
+    model: str,
+    kwargs: dict,
+    logging_obj: LiteLLMLoggingObj,
+    response_cost: Optional[float],
+    custom_llm_provider: Optional[Union[str, LlmProviders]] = None,
+    native_usage_object: Optional[Dict[str, Any]] = None,
+    set_response_id: bool = False,
+) -> dict:
+    kwargs["model"] = model
+    if response_cost is not None:
+        kwargs["response_cost"] = response_cost
+
+    provider_value: Optional[str]
+    if isinstance(custom_llm_provider, LlmProviders):
+        provider_value = custom_llm_provider.value
+    else:
+        provider_value = custom_llm_provider
+    if provider_value:
+        kwargs["custom_llm_provider"] = provider_value
+
+    passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = (  # type: ignore
+        kwargs.get("passthrough_logging_payload")
+    )
+    _merge_proxy_server_request(
+        kwargs=kwargs,
+        passthrough_logging_payload=passthrough_logging_payload,
+    )
+    _store_native_usage_object(kwargs=kwargs, usage_object=native_usage_object)
+
+    if set_response_id and hasattr(litellm_response, "id"):
+        litellm_response.id = logging_obj.litellm_call_id
+    if hasattr(litellm_response, "model"):
+        litellm_response.model = getattr(litellm_response, "model", None) or model
+
+    logging_obj.model = model
+    logging_obj.model_call_details["model"] = model
+    if provider_value:
+        logging_obj.model_call_details["custom_llm_provider"] = provider_value
+        logging_obj.custom_llm_provider = provider_value
+    if response_cost is not None:
+        logging_obj.model_call_details["response_cost"] = response_cost
+
+    return kwargs

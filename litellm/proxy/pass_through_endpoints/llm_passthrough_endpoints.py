@@ -103,6 +103,16 @@ default_vertex_config = None
 
 passthrough_endpoint_router = PassthroughEndpointRouter()
 
+_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST = frozenset(
+    {
+        "accept",
+        "authorization",
+        "content-type",
+        "user-agent",
+        "x-goog-api-client",
+    }
+)
+
 _CLAUDE_PERSISTED_OUTPUT_PATTERN = re.compile(
     r"\A<system-reminder>\n"
     r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
@@ -402,6 +412,28 @@ def _is_openai_responses_endpoint(endpoint: str) -> bool:
         or normalized_path.startswith("/responses/")
         or normalized_path.startswith("/v1/responses/")
     )
+
+
+def _get_openai_passthrough_route_family(endpoint: str) -> str:
+    normalized_path = httpx.URL(endpoint).path.rstrip("/")
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    if _is_openai_responses_endpoint(endpoint):
+        return "openai_responses"
+    if normalized_path in {"/chat/completions", "/v1/chat/completions"}:
+        return "openai_chat_completions"
+    return "openai_passthrough"
+
+
+def _get_gemini_passthrough_route_family(endpoint: str) -> Optional[str]:
+    normalized_endpoint = endpoint.lower()
+    if "streamgeneratecontent" in normalized_endpoint:
+        return "gemini_stream_generate_content"
+    if "generatecontent" in normalized_endpoint:
+        return "gemini_generate_content"
+    if "predictlongrunning" in normalized_endpoint:
+        return "gemini_predict_long_running"
+    return None
 
 
 def _request_has_openai_client_auth(request: Request) -> bool:
@@ -5925,9 +5957,15 @@ def _add_passthrough_trace_context_metadata(
         litellm_metadata["session_id"] = session_id
         changed = True
 
-    if trace_environment and not litellm_metadata.get("trace_environment"):
-        litellm_metadata["trace_environment"] = trace_environment
-        changed = True
+    if trace_environment:
+        existing_trace_environment = litellm_metadata.get("trace_environment")
+        if existing_trace_environment != trace_environment:
+            if existing_trace_environment and not litellm_metadata.get(
+                "source_trace_environment"
+            ):
+                litellm_metadata["source_trace_environment"] = existing_trace_environment
+            litellm_metadata["trace_environment"] = trace_environment
+            changed = True
 
     if not changed:
         return request_body
@@ -7721,15 +7759,12 @@ async def gemini_proxy_route(
         prepared_request_body = _add_gemini_request_breakout_logging_metadata(
             request_body
         )
-        gemini_route_family = (
-            "gemini_stream_generate_content"
-            if "streamgeneratecontent" in endpoint.lower()
-            else "gemini_generate_content"
-        )
-        prepared_request_body = _add_route_family_logging_metadata(
-            prepared_request_body,
-            gemini_route_family,
-        )
+        gemini_route_family = _get_gemini_passthrough_route_family(endpoint)
+        if gemini_route_family is not None:
+            prepared_request_body = _add_route_family_logging_metadata(
+                prepared_request_body,
+                gemini_route_family,
+            )
         prepared_request_body = _prepare_request_body_for_passthrough_observability(
             request=request,
             request_body=prepared_request_body,
@@ -7745,6 +7780,13 @@ async def gemini_proxy_route(
         _forward_headers=_is_google_oauth,
         is_streaming_request=is_streaming_request,
         query_params=merged_params,
+        egress_credential_family="google" if _is_google_oauth else None,
+        expected_target_family="google",
+        allowed_forward_headers=(
+            list(_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST)
+            if _is_google_oauth
+            else None
+        ),
     )  # dynamically construct pass-through endpoint based on incoming path
     received_value = await endpoint_func(
         request,
@@ -9634,6 +9676,11 @@ class BaseOpenAIPassThroughHandler:
                 )
                 prepared_request_body = _add_codex_request_breakout_logging_metadata(
                     prepared_request_body
+                )
+            else:
+                prepared_request_body = _add_route_family_logging_metadata(
+                    prepared_request_body,
+                    _get_openai_passthrough_route_family(endpoint),
                 )
             prepared_request_body = _prepare_request_body_for_passthrough_observability(
                 request=request,

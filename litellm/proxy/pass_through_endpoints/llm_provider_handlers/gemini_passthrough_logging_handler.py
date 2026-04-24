@@ -13,6 +13,9 @@ from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
     ModelResponseIterator as GeminiModelResponseIterator,
 )
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
+from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
+    apply_passthrough_logging_contract,
+)
 from litellm.types.utils import (
     ModelResponse,
     TextCompletionResponse,
@@ -193,10 +196,15 @@ class GeminiPassthroughLoggingHandler:
                 litellm_video_response._hidden_params = {}
             litellm_video_response._hidden_params["response_cost"] = response_cost
 
-            kwargs["response_cost"] = response_cost
-            kwargs["model"] = model
-            kwargs["custom_llm_provider"] = "gemini"
-            logging_obj.model_call_details["response_cost"] = response_cost
+            apply_passthrough_logging_contract(
+                litellm_response=litellm_video_response,
+                model=model,
+                kwargs=kwargs,
+                logging_obj=logging_obj,
+                response_cost=response_cost,
+                custom_llm_provider="gemini",
+                set_response_id=True,
+            )
             return {
                 "result": litellm_video_response,
                 "kwargs": kwargs,
@@ -264,6 +272,7 @@ class GeminiPassthroughLoggingHandler:
         all_chunks: List[str],
         model: Optional[str],
         end_time: datetime,
+        kwargs: Optional[Dict[str, Any]] = None,
     ) -> PassThroughEndpointLoggingTypedDict:
         """
         Takes raw chunks from Gemini passthrough endpoint and logs them in litellm callbacks
@@ -272,7 +281,7 @@ class GeminiPassthroughLoggingHandler:
         - Creates standard logging object
         - Logs in litellm callbacks
         """
-        kwargs: Dict[str, Any] = {}
+        kwargs = kwargs or {}
         model = model or GeminiPassthroughLoggingHandler.extract_model_from_url(
             url=url_route,
             request_body=request_body,
@@ -422,17 +431,18 @@ class GeminiPassthroughLoggingHandler:
             custom_llm_provider="gemini",
         )
 
-        kwargs["response_cost"] = response_cost
-        kwargs["model"] = model
-        kwargs["custom_llm_provider"] = custom_llm_provider
+        apply_passthrough_logging_contract(
+            litellm_response=litellm_model_response,
+            model=model,
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+            response_cost=response_cost,
+            custom_llm_provider=custom_llm_provider,
+            native_usage_object=usage_object,
+            set_response_id=True,
+        )
 
         # pretty print standard logging object
         verbose_proxy_logger.debug("kwargs= %s", kwargs)
 
-        # set litellm_call_id to logging response object
-        litellm_model_response.id = logging_obj.litellm_call_id
-        logging_obj.model = litellm_model_response.model or model
-        logging_obj.model_call_details["model"] = logging_obj.model
-        logging_obj.model_call_details["custom_llm_provider"] = custom_llm_provider
-        logging_obj.model_call_details["response_cost"] = response_cost
         return kwargs

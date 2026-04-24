@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -97,6 +98,35 @@ def _parse_command_output_json(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def _extract_command_session_id(stdout: str) -> str | None:
+    direct = RA._extract_command_session_id(stdout)
+    if direct:
+        return direct
+
+    def _walk(value: Any) -> str | None:
+        if isinstance(value, dict):
+            for key in ('session_id', 'sessionId', 'thread_id', 'threadId'):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            for child in value.values():
+                found = _walk(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = _walk(child)
+                if found:
+                    return found
+        return None
+
+    for obj in RA._parse_stdout_json_objects(stdout):
+        found = _walk(obj)
+        if found:
+            return found
+    return None
+
+
 def _resolve_env_placeholders(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -107,6 +137,49 @@ def _resolve_env_placeholders(value: Any) -> Any:
     if isinstance(value, str):
         return os.path.expandvars(value)
     return value
+
+
+def _load_dotenv_into_environment(path: pathlib.Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, raw_value = line.split('=', 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = raw_value.strip()
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {'"', "'"}
+        ):
+            value = value[1:-1]
+        os.environ[key] = os.path.expandvars(value)
+
+
+def _format_harness_template(value: Any, context: dict[str, str]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _format_harness_template(child, context)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_format_harness_template(child, context) for child in value]
+    if isinstance(value, str):
+        try:
+            return value.format(**context)
+        except (KeyError, ValueError):
+            return value
+    return value
+
+
+def _append_comma_headers(existing: str | None, headers: list[tuple[str, str]]) -> str:
+    parts = [existing.strip()] if isinstance(existing, str) and existing.strip() else []
+    parts.extend(f'{key}: {value}' for key, value in headers)
+    return ', '.join(parts)
 
 
 def _docker_status_for_container(container_name: str) -> str:
@@ -197,6 +270,8 @@ def _apply_target_profile_to_config(
         updated_case['runtime_postconditions'] = runtime_postconditions
         updated_case['expected_trace_environment'] = profile['expected_trace_environment']
         updated_case.setdefault('require_trace_user_id', True)
+        updated_case['target_profile'] = target
+        updated_case['case_name'] = case_name
         session_history_validation = dict(
             updated_case.get('session_history_validation') or {}
         )
@@ -204,17 +279,152 @@ def _apply_target_profile_to_config(
             'expected_litellm_environment',
             profile['expected_trace_environment'],
         )
+        metadata_required_equals = dict(
+            session_history_validation.get('metadata_required_equals') or {}
+        )
+        metadata_required_equals['trace_environment'] = profile[
+            'expected_trace_environment'
+        ]
+        metadata_required_equals['litellm_environment'] = profile[
+            'expected_trace_environment'
+        ]
+        session_history_validation['metadata_required_equals'] = (
+            metadata_required_equals
+        )
         session_history_validation.setdefault('require_runtime_identity', True)
         updated_case['session_history_validation'] = session_history_validation
-        updated_case = RA._ensure_claude_harness_headers(
-            updated_case,
-            target=target,
-            case_name=case_name,
-        )
+        if isinstance(updated_case.get('http_request'), dict):
+            updated_case = _ensure_http_harness_context(
+                updated_case,
+                profile=profile,
+                target=target,
+                case_name=case_name,
+            )
+        elif isinstance(updated_case.get('cli_passthrough'), str):
+            updated_case = _ensure_cli_harness_context(
+                updated_case,
+                profile=profile,
+                target=target,
+                case_name=case_name,
+            )
+        else:
+            updated_case = RA._ensure_claude_harness_headers(
+                updated_case,
+                target=target,
+                case_name=case_name,
+            )
         updated_cases[case_name] = updated_case
 
     updated_config['cases'] = updated_cases
     return updated_config
+
+
+def _ensure_http_harness_context(
+    config: dict[str, Any],
+    *,
+    profile: dict[str, str],
+    target: str,
+    case_name: str,
+) -> dict[str, Any]:
+    updated = dict(config)
+    request_config = dict(updated.get('http_request') or {})
+    headers = dict(request_config.get('headers') or {})
+    expected_user_ids = [
+        str(value).strip()
+        for value in (updated.get('expected_user_ids') or [])
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    ]
+    harness_user_id = (
+        expected_user_ids[0]
+        if expected_user_ids
+        else RA._build_claude_harness_user_id(target=target, case_name=case_name)
+    )
+    session_id = str(
+        request_config.get('session_id')
+        or updated.get('expected_trace_session_id')
+        or f'{harness_user_id}.session'
+    )
+    if request_config.get('add_default_authorization') is not False:
+        headers.setdefault('authorization', 'Bearer sk-1234')
+    headers.setdefault('x-litellm-end-user-id', harness_user_id)
+    headers.setdefault('langfuse_trace_user_id', harness_user_id)
+    headers.setdefault('langfuse_trace_name', case_name)
+    headers.setdefault('session_id', session_id)
+    headers.setdefault('user-agent', 'AAWMNativePassthroughHarness/0.1')
+
+    request_config['headers'] = headers
+    request_config['session_id'] = session_id
+    request_config['litellm_base_url'] = profile['litellm_base_url']
+    updated['http_request'] = request_config
+    updated['expected_user_ids'] = [harness_user_id]
+    updated['expected_trace_session_id'] = session_id
+    if updated.get('match_trace_session_id_from_stdout') is None:
+        updated['match_trace_session_id_from_stdout'] = True
+    return updated
+
+
+def _ensure_cli_harness_context(
+    config: dict[str, Any],
+    *,
+    profile: dict[str, str],
+    target: str,
+    case_name: str,
+) -> dict[str, Any]:
+    updated = dict(config)
+    cli_kind = str(updated.get('cli_passthrough') or '').strip().lower()
+    if cli_kind not in {'codex', 'gemini'}:
+        return updated
+
+    expected_user_ids = [
+        str(value).strip()
+        for value in (updated.get('expected_user_ids') or [])
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    ]
+    harness_user_id = (
+        expected_user_ids[0]
+        if expected_user_ids
+        else RA._build_claude_harness_user_id(target=target, case_name=case_name)
+    )
+    session_id = str(
+        updated.get('expected_trace_session_id') or f'{harness_user_id}.session'
+    )
+    codex_profile = 'litellm' if target == 'prod' else 'litellm-dev'
+    context = {
+        'target': target,
+        'case_name': case_name,
+        'harness_user_id': harness_user_id,
+        'session_id': session_id,
+        'litellm_base_url': profile['litellm_base_url'],
+        'anthropic_base_url': profile['anthropic_base_url'],
+        'codex_profile': codex_profile,
+    }
+
+    updated = _format_harness_template(updated, context)
+    env = dict(updated.get('env') or {})
+    controlled_headers = [
+        ('x-litellm-end-user-id', harness_user_id),
+        ('langfuse_trace_user_id', harness_user_id),
+        ('langfuse_trace_name', case_name),
+    ]
+    if cli_kind == 'codex':
+        controlled_headers.append(('session_id', session_id))
+    if cli_kind == 'gemini':
+        env['CODE_ASSIST_ENDPOINT'] = f"{profile['litellm_base_url']}/gemini"
+        env['GOOGLE_GENAI_USE_GCA'] = 'true'
+        env['GEMINI_CLI_CUSTOM_HEADERS'] = _append_comma_headers(
+            env.get('GEMINI_CLI_CUSTOM_HEADERS'),
+            controlled_headers,
+        )
+    updated['env'] = env
+    updated['expected_user_ids'] = [harness_user_id]
+    if cli_kind == 'codex':
+        updated['expected_trace_session_id'] = session_id
+    else:
+        updated.pop('expected_trace_session_id', None)
+    if updated.get('match_trace_session_id_from_stdout') is None:
+        updated['match_trace_session_id_from_stdout'] = True
+    updated.setdefault('require_trace_user_id', True)
+    return updated
 
 
 def _missing_required_env(config: dict[str, Any]) -> list[str]:
@@ -447,7 +657,7 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
                response_cost_usd,
                litellm_environment, litellm_version, litellm_fork_version,
                litellm_wheel_versions, client_name, client_version, client_user_agent,
-               start_time, end_time
+               metadata, start_time, end_time
         from public.session_history
         where session_id = %s
         order by start_time desc
@@ -608,6 +818,53 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
 
     if expected_model is not None and record.get('model') != expected_model:
         failures.append(f'{family} session_history model mismatch: expected `{expected_model}`, got `{record.get("model")}`')
+
+    expected_client_name = checks.get('expected_client_name')
+    if expected_client_name is not None and record.get('client_name') != expected_client_name:
+        failures.append(
+            f'{family} session_history client_name mismatch: expected `{expected_client_name}`, got `{record.get("client_name")}`'
+        )
+
+    expected_client_version = checks.get('expected_client_version')
+    if expected_client_version is not None and record.get('client_version') != expected_client_version:
+        failures.append(
+            f'{family} session_history client_version mismatch: expected `{expected_client_version}`, got `{record.get("client_version")}`'
+        )
+
+    client_user_agent_contains = checks.get('client_user_agent_contains')
+    if client_user_agent_contains is not None:
+        actual_user_agent = record.get('client_user_agent')
+        if not isinstance(actual_user_agent, str) or str(client_user_agent_contains) not in actual_user_agent:
+            failures.append(
+                f'{family} session_history client_user_agent missing substring `{client_user_agent_contains}`: got `{actual_user_agent}`'
+            )
+
+    metadata = record.get('metadata')
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        failures.append(
+            f'{family} session_history metadata is not an object: got `{type(metadata).__name__}`'
+        )
+        metadata = {}
+
+    for key, expected in (checks.get('metadata_required_equals') or {}).items():
+        actual = metadata.get(key)
+        if actual != expected:
+            failures.append(
+                f'{family} session_history metadata `{key}` mismatch: expected `{expected}`, got `{actual}`'
+            )
+
+    for key in checks.get('metadata_required_truthy') or []:
+        if not metadata.get(key):
+            failures.append(f'{family} session_history metadata `{key}` is not truthy')
+
+    for key, expected_substring in (checks.get('metadata_required_contains') or {}).items():
+        actual = metadata.get(key)
+        if not isinstance(actual, str) or str(expected_substring) not in actual:
+            failures.append(
+                f'{family} session_history metadata `{key}` missing substring `{expected_substring}`: got `{actual}`'
+            )
 
     for key, minimum in (checks.get('minimums') or {}).items():
         actual = record.get(key)
@@ -775,6 +1032,130 @@ def _is_warning_only_hard_exception(
     return any(substring and substring in error_text for substring in hard_substrings)
 
 
+def _inject_http_litellm_metadata(
+    body: Any,
+    *,
+    session_id: str,
+    trace_name: str,
+) -> Any:
+    if not isinstance(body, dict):
+        return body
+    updated = dict(body)
+    metadata = dict(updated.get('litellm_metadata') or {})
+    metadata.setdefault('session_id', session_id)
+    metadata.setdefault('trace_name', trace_name)
+    updated['litellm_metadata'] = metadata
+    return updated
+
+
+def _summarize_http_response_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    usage = payload.get('usage')
+    if not isinstance(usage, dict):
+        usage = payload.get('usageMetadata')
+    summary: dict[str, Any] = {}
+    if isinstance(usage, dict):
+        summary['usage'] = usage
+    if isinstance(payload.get('id'), str):
+        summary['id'] = payload['id']
+    if isinstance(payload.get('model'), str):
+        summary['model'] = payload['model']
+    return summary
+
+
+def _run_http_request(config: dict[str, Any]) -> dict[str, Any]:
+    request_config = dict(config.get('http_request') or {})
+    method = str(request_config.get('method') or 'POST').upper()
+    base_url = str(request_config.get('litellm_base_url') or '').rstrip('/')
+    path = str(request_config.get('path') or '')
+    if not base_url or not path.startswith('/'):
+        raise RuntimeError('http_request requires litellm_base_url and absolute path')
+
+    query = dict(request_config.get('query') or {})
+    if request_config.get('auth_query_param'):
+        auth_query_value = request_config.get('auth_query_param_value')
+        auth_query_env = request_config.get('auth_query_param_env')
+        if auth_query_value is None and isinstance(auth_query_env, str):
+            auth_query_value = os.environ.get(auth_query_env)
+        query.setdefault(
+            str(request_config['auth_query_param']),
+            str(auth_query_value or 'sk-1234'),
+        )
+    url = f'{base_url}{path}'
+    if query:
+        separator = '&' if '?' in url else '?'
+        url = f'{url}{separator}{urllib.parse.urlencode(query)}'
+
+    headers = {str(key): str(value) for key, value in (request_config.get('headers') or {}).items()}
+    body = request_config.get('json')
+    session_id = str(request_config.get('session_id') or '')
+    if session_id:
+        body = _inject_http_litellm_metadata(
+            body,
+            session_id=session_id,
+            trace_name=str(headers.get('langfuse_trace_name') or config.get('case_name') or 'native-passthrough'),
+        )
+
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode('utf-8')
+        headers.setdefault('content-type', 'application/json')
+
+    started = time.time()
+    status_code: int | None = None
+    response_text = ''
+    parsed_response: Any = None
+    error_text: str | None = None
+    try:
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        with urllib.request.urlopen(
+            request,
+            timeout=int(request_config.get('timeout_seconds') or config.get('timeout_seconds') or 300),
+        ) as response:
+            status_code = int(response.status)
+            response_text = response.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as exc:
+        status_code = int(exc.code)
+        response_text = exc.read().decode('utf-8', errors='replace')
+        error_text = str(exc)
+    except urllib.error.URLError as exc:
+        error_text = str(exc)
+    if response_text:
+        try:
+            parsed_response = json.loads(response_text)
+        except json.JSONDecodeError:
+            parsed_response = None
+
+    is_error = error_text is not None or status_code is None or status_code >= 400
+    stdout_payload = {
+        'session_id': session_id,
+        'status_code': status_code,
+        'is_error': is_error,
+        'url': url,
+        **_summarize_http_response_payload(parsed_response),
+    }
+    if error_text:
+        stdout_payload['error'] = error_text
+    if parsed_response is None and response_text:
+        stdout_payload['response_excerpt'] = response_text[:1000]
+
+    return {
+        'command': [method, url],
+        'command_string': f'{method} {url}',
+        'exit_code': 1 if is_error else 0,
+        'duration_seconds': round(time.time() - started, 3),
+        'stdout': json.dumps(stdout_payload),
+        'stderr': error_text or '',
+        'response_excerpt': response_text[:300],
+    }
+
+
 def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
     retry_statuses = {int(value) for value in (config.get('retry_on_api_error_statuses') or [])}
     max_attempts = max(1, int(config.get('retry_max_attempts', 1) or 1))
@@ -786,11 +1167,14 @@ def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, A
 
     for attempt in range(1, max_attempts + 1):
         started = RA._utcnow()
-        run = RA._run_command(
-            config['command'],
-            extra_env=config.get('env'),
-            timeout_seconds=int(config.get('timeout_seconds', 300)),
-        )
+        if isinstance(config.get('http_request'), dict):
+            run = _run_http_request(config)
+        else:
+            run = RA._run_command(
+                config['command'],
+                extra_env=config.get('env'),
+                timeout_seconds=int(config.get('timeout_seconds', 300)),
+            )
         parsed = _parse_command_output_json(run['stdout'])
         api_error_status = None
         is_error = None
@@ -825,7 +1209,13 @@ def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, A
 
 def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_key: str, secret_key: str, litellm_base_url: str) -> dict[str, Any]:
     started, run, command_attempts = _run_command_with_retry(config=config)
-    command_session_id = RA._extract_command_session_id(run['stdout'])
+    command_session_id = _extract_command_session_id(run['stdout'])
+    if (
+        not config.get('match_trace_session_id_from_stdout')
+        and isinstance(config.get('expected_trace_session_id'), str)
+        and str(config.get('expected_trace_session_id')).strip()
+    ):
+        command_session_id = str(config['expected_trace_session_id']).strip()
     post_run_wait_seconds = float(config.get('post_run_wait_seconds', 0) or 0)
     if post_run_wait_seconds > 0:
         time.sleep(post_run_wait_seconds)
@@ -1291,6 +1681,7 @@ def main() -> int:
     config_path = pathlib.Path(args.config)
     artifact_path = pathlib.Path(args.write_artifact)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    _load_dotenv_into_environment(ROOT / '.env')
     config = _resolve_env_placeholders(RA._load_json(config_path))
     target = args.target or str(config.get('default_target_profile') or 'dev')
     profile = _target_profile_settings(

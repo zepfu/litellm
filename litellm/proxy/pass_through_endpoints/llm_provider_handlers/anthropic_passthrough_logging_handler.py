@@ -13,6 +13,9 @@ from litellm.llms.anthropic.chat.handler import (
 )
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
 from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
+from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
+    apply_passthrough_logging_contract,
+)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     PassthroughStandardLoggingPayload,
 )
@@ -131,26 +134,16 @@ class AnthropicPassthroughLoggingHandler:
                 custom_llm_provider=custom_llm_provider,
             )
 
-            kwargs["response_cost"] = response_cost
-            kwargs["model"] = model
-            passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = (  # type: ignore
-                kwargs.get("passthrough_logging_payload")
+            apply_passthrough_logging_contract(
+                litellm_response=litellm_model_response,
+                model=model,
+                kwargs=kwargs,
+                logging_obj=logging_obj,
+                response_cost=response_cost,
+                custom_llm_provider=custom_llm_provider
+                or litellm.LlmProviders.ANTHROPIC.value,
+                set_response_id=True,
             )
-            if passthrough_logging_payload:
-                user = AnthropicPassthroughLoggingHandler._get_user_from_metadata(
-                    passthrough_logging_payload=passthrough_logging_payload,
-                )
-                _proxy_server_request: dict = {}
-                if user:
-                    _proxy_server_request["body"] = {"user": user}
-                request_headers = passthrough_logging_payload.get("request_headers")
-                if request_headers:
-                    _proxy_server_request["headers"] = request_headers
-                if _proxy_server_request:
-                    kwargs.setdefault("litellm_params", {})
-                    kwargs["litellm_params"]["proxy_server_request"] = (
-                        _proxy_server_request
-                    )
 
             # pretty print standard logging object
             verbose_proxy_logger.debug(
@@ -158,14 +151,6 @@ class AnthropicPassthroughLoggingHandler:
                 json.dumps(kwargs, indent=4, default=str),
             )
 
-            # set litellm_call_id to logging response object
-            litellm_model_response.id = logging_obj.litellm_call_id
-            litellm_model_response.model = model
-            logging_obj.model_call_details["model"] = model
-            if not logging_obj.model_call_details.get("custom_llm_provider"):
-                logging_obj.model_call_details[
-                    "custom_llm_provider"
-                ] = litellm.LlmProviders.ANTHROPIC.value
             return kwargs
         except Exception as e:
             verbose_proxy_logger.exception(
@@ -184,6 +169,7 @@ class AnthropicPassthroughLoggingHandler:
         all_chunks: List[str],
         end_time: datetime,
         passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = None,
+        kwargs: Optional[dict] = None,
     ) -> PassThroughEndpointLoggingTypedDict:
         """
         Takes raw chunks from Anthropic passthrough endpoint and logs them in litellm callbacks
@@ -217,14 +203,13 @@ class AnthropicPassthroughLoggingHandler:
                 "result": None,
                 "kwargs": {},
             }
+        logging_kwargs = dict(kwargs or {})
+        if passthrough_logging_payload:
+            logging_kwargs["passthrough_logging_payload"] = passthrough_logging_payload
         kwargs = AnthropicPassthroughLoggingHandler._create_anthropic_response_logging_payload(
             litellm_model_response=complete_streaming_response,
             model=model,
-            kwargs=(
-                {"passthrough_logging_payload": passthrough_logging_payload}
-                if passthrough_logging_payload
-                else {}
-            ),
+            kwargs=logging_kwargs,
             start_time=start_time,
             end_time=end_time,
             logging_obj=litellm_logging_obj,
