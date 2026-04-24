@@ -27,6 +27,7 @@ from litellm.responses.utils import ResponseAPILoggingUtils
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
     BasePassthroughLoggingHandler,
+    apply_passthrough_logging_contract,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
@@ -870,7 +871,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             ] = None
             handler_instance = OpenAIPassthroughLoggingHandler()
 
-            custom_llm_provider = kwargs.get("custom_llm_provider", "openai")
+            custom_llm_provider = kwargs.get("custom_llm_provider") or "openai"
 
             if is_chat_completions:
                 # Handle chat completions with existing logic
@@ -990,28 +991,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     call_type="responses",
                 )
 
-            # Update kwargs with cost information
-            kwargs["response_cost"] = response_cost
-            kwargs["model"] = model
-            kwargs["custom_llm_provider"] = custom_llm_provider
-
-            # Extract user information for tracking
-            passthrough_logging_payload: Optional[
-                PassthroughStandardLoggingPayload
-            ] = kwargs.get("passthrough_logging_payload")
-            if passthrough_logging_payload:
-                user = handler_instance._get_user_from_metadata(
-                    passthrough_logging_payload=passthrough_logging_payload,
-                )
-                if user:
-                    kwargs["litellm_params"].setdefault(
-                        "proxy_server_request", {}
-                    ).setdefault("body", {})["user"] = user
-                request_headers = passthrough_logging_payload.get("request_headers")
-                if request_headers:
-                    kwargs["litellm_params"].setdefault(
-                        "proxy_server_request", {}
-                    )["headers"] = request_headers
+            apply_passthrough_logging_contract(
+                litellm_response=litellm_model_response,
+                model=model,
+                kwargs=kwargs,
+                logging_obj=logging_obj,
+                response_cost=response_cost,
+                custom_llm_provider=custom_llm_provider,
+            )
 
             # Create standard logging object
             if litellm_model_response is not None:
@@ -1042,11 +1029,6 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     logging_obj=logging_obj,
                     status="success",
                 )
-
-            # Update logging object with cost information
-            logging_obj.model_call_details["model"] = model
-            logging_obj.model_call_details["custom_llm_provider"] = custom_llm_provider
-            logging_obj.model_call_details["response_cost"] = response_cost
 
             endpoint_type = (
                 "chat_completions"
@@ -1302,7 +1284,6 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
             # Build complete response from chunks using our streaming handler
             handler = OpenAIPassthroughLoggingHandler()
-            handler_instance = handler
             is_responses = handler.is_openai_responses_route(url_route)
             existing_litellm_params = (
                 litellm_logging_obj.model_call_details.get("litellm_params", {}) or {}
@@ -1344,26 +1325,20 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 "custom_llm_provider": custom_llm_provider,
                 "litellm_params": existing_litellm_params.copy(),
             }
-
-            # Extract user information for tracking
-            passthrough_logging_payload: Optional[
-                PassthroughStandardLoggingPayload
-            ] = litellm_logging_obj.model_call_details.get(
+            passthrough_logging_payload = litellm_logging_obj.model_call_details.get(
                 "passthrough_logging_payload"
             )
             if passthrough_logging_payload:
-                user = handler_instance._get_user_from_metadata(
-                    passthrough_logging_payload=passthrough_logging_payload,
-                )
-                if user:
-                    kwargs["litellm_params"].setdefault(
-                        "proxy_server_request", {}
-                    ).setdefault("body", {})["user"] = user
-                request_headers = passthrough_logging_payload.get("request_headers")
-                if request_headers:
-                    kwargs["litellm_params"].setdefault(
-                        "proxy_server_request", {}
-                    )["headers"] = request_headers
+                kwargs["passthrough_logging_payload"] = passthrough_logging_payload
+
+            apply_passthrough_logging_contract(
+                litellm_response=complete_response,
+                model=model,
+                kwargs=kwargs,
+                logging_obj=litellm_logging_obj,
+                response_cost=response_cost,
+                custom_llm_provider=custom_llm_provider,
+            )
 
             # Create standard logging object
             if (
@@ -1392,13 +1367,6 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 logging_obj=litellm_logging_obj,
                 status="success",
             )
-
-            # Update logging object with cost information
-            litellm_logging_obj.model_call_details["model"] = model
-            litellm_logging_obj.model_call_details[
-                "custom_llm_provider"
-            ] = custom_llm_provider
-            litellm_logging_obj.model_call_details["response_cost"] = response_cost
 
             verbose_proxy_logger.debug(
                 f"OpenAI streaming passthrough cost tracking - Model: {model}, Cost: ${response_cost:.6f}"

@@ -1783,6 +1783,10 @@ def create_pass_through_route(
     query_params: Optional[dict] = None,
     default_query_params: Optional[dict] = None,
     guardrails: Optional[Dict[str, Any]] = None,
+    egress_credential_family: Optional[str] = None,
+    expected_target_family: Optional[str] = None,
+    allowed_forward_headers: Optional[list[str]] = None,
+    allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
 ):
     # check if target is an adapter.py or a url
     from litellm._uuid import uuid
@@ -1858,6 +1862,10 @@ def create_pass_through_route(
                 "merge_query_params": _merge_query_params,
                 "cost_per_request": cost_per_request,
                 "guardrails": None,
+                "egress_credential_family": egress_credential_family,
+                "expected_target_family": expected_target_family,
+                "allowed_forward_headers": allowed_forward_headers,
+                "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
             }
 
             if passthrough_params is not None:
@@ -1877,6 +1885,19 @@ def create_pass_through_route(
             )
             param_guardrails = target_params.get("guardrails", None)
             param_default_query_params = target_params.get("default_query_params", None)
+            param_egress_credential_family = target_params.get(
+                "egress_credential_family", egress_credential_family
+            )
+            param_expected_target_family = target_params.get(
+                "expected_target_family", expected_target_family
+            )
+            param_allowed_forward_headers = target_params.get(
+                "allowed_forward_headers", allowed_forward_headers
+            )
+            param_allowed_pass_through_prefixed_headers = target_params.get(
+                "allowed_pass_through_prefixed_headers",
+                allowed_pass_through_prefixed_headers,
+            )
 
             # Construct the full target URL with subpath if needed
             full_target = (
@@ -1919,6 +1940,16 @@ def create_pass_through_route(
                 cost_per_request=cast(Optional[float], param_cost_per_request),
                 custom_llm_provider=custom_llm_provider,
                 guardrails_config=cast(Optional[dict], param_guardrails),
+                egress_credential_family=cast(
+                    Optional[str], param_egress_credential_family
+                ),
+                expected_target_family=cast(Optional[str], param_expected_target_family),
+                allowed_forward_headers=cast(
+                    Optional[list[str]], param_allowed_forward_headers
+                ),
+                allowed_pass_through_prefixed_headers=cast(
+                    Optional[list[str]], param_allowed_pass_through_prefixed_headers
+                ),
             )
 
     return endpoint_func

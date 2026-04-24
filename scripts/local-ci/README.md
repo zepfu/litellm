@@ -108,6 +108,43 @@ python3 run_anthropic_adapter_acceptance.py \
 Target profiles:
 - `--target dev` validates `http://127.0.0.1:4001/anthropic`, `litellm-dev`, and Langfuse trace environment `dev`.
 - `--target prod` validates `http://127.0.0.1:4000/anthropic`, `aawm-litellm`, and Langfuse trace environment `prod`.
+
+Native passthrough checks live in the same harness and are opt-in. HTTP cases
+send direct requests through the provider passthrough routes. CLI cases launch
+the real local provider CLIs (`claude`, `codex`, `gemini`) so they use the same
+authentication state as normal operator traffic. All cases validate Langfuse
+plus `public.session_history` for the actual provider session id emitted or
+derived by that client.
+
+```bash
+python3 run_anthropic_adapter_acceptance.py \
+  --target dev \
+  --cases native_openai_passthrough_chat,native_openai_passthrough_responses \
+  --write-artifact /tmp/native-openai-dev.json
+```
+
+Current native cases:
+- `native_openai_passthrough_chat`
+- `native_openai_passthrough_responses`
+- `native_openai_passthrough_responses_codex`
+- `native_anthropic_passthrough_claude`
+- `native_gemini_passthrough_generate_content`
+- `native_gemini_passthrough_stream_generate_content`
+
+Provider credentials:
+- OpenAI chat/responses use the proxy runtime OpenAI key.
+- Codex-native Responses launches `codex exec` against the configured
+  `litellm` / `litellm-dev` profile and validates the Codex `thread_id` that
+  the CLI emits.
+- Native Anthropic launches `claude` with the harness settings overlay and
+  validates the Claude CLI `session_id`.
+- Native Gemini launches `gemini` with `CODE_ASSIST_ENDPOINT` and
+  `GEMINI_CLI_CUSTOM_HEADERS` injected for the selected target. The Google
+  OAuth token stays owned by the CLI; LiteLLM keeps the harness metadata for
+  logging while forwarding only Google-safe headers upstream. Gemini Code
+  Assist control-plane calls are expected during CLI startup, but only model
+  calls such as `generateContent`, `streamGenerateContent`, and
+  `predictLongRunning` should create `session_history` rows.
 - Use `--litellm-base-url`, `--anthropic-base-url`, `--docker-container-name`, or `--expected-trace-environment` only for explicit one-off overrides.
 
 Important notes:

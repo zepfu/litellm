@@ -336,6 +336,18 @@ class TestOpenAIPassthroughLoggingHandler:
         assert usage.total_tokens == 15544
         assert usage.prompt_tokens_details.cached_tokens == 3456
         assert usage.completion_tokens_details.text_tokens == 27
+        assert (
+            standard_logging_object["metadata"]["usage_object"][
+                "prompt_tokens_details"
+            ]["cached_tokens"]
+            == 3456
+        )
+        assert (
+            standard_logging_object["response"]["usage"]["prompt_tokens_details"][
+                "cached_tokens"
+            ]
+            == 3456
+        )
         assert standard_logging_object["model"] == "gpt-5.4"
         assert standard_logging_object["prompt_tokens"] == 15517
         assert standard_logging_object["completion_tokens"] == 27
@@ -491,6 +503,18 @@ class TestOpenAIPassthroughLoggingHandler:
         assert usage.total_tokens == 15543
         assert usage.prompt_tokens_details.cached_tokens == 6528
         assert usage.completion_tokens_details.text_tokens == 25
+        assert (
+            standard_logging_object["metadata"]["usage_object"][
+                "prompt_tokens_details"
+            ]["cached_tokens"]
+            == 6528
+        )
+        assert (
+            standard_logging_object["response"]["usage"]["prompt_tokens_details"][
+                "cached_tokens"
+            ]
+            == 6528
+        )
         assert standard_logging_object["model"] == "gpt-5.4"
         assert standard_logging_object["prompt_tokens"] == 15518
         assert standard_logging_object["completion_tokens"] == 25
@@ -1306,7 +1330,7 @@ class TestOpenAIPassthroughIntegration:
         self.handler._handle_logging = AsyncMock()
 
         # Act
-        result = await self.handler.pass_through_async_success_handler(
+        await self.handler.pass_through_async_success_handler(
             httpx_response=mock_httpx_response,
             response_body={"status": "success"},
             logging_obj=mock_logging_obj,

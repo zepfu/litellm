@@ -285,6 +285,10 @@ class PassThroughStreamingHandler:
             ] = None
             kwargs: dict = copy.deepcopy(success_handler_kwargs or {})
             if custom_llm_provider == "gemini":
+                if not passthrough_success_handler_obj.is_gemini_route(
+                    url_route, custom_llm_provider
+                ):
+                    return
                 gemini_passthrough_logging_handler_result = GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
                     litellm_logging_obj=litellm_logging_obj,
                     passthrough_success_handler_obj=passthrough_success_handler_obj,
@@ -295,6 +299,7 @@ class PassThroughStreamingHandler:
                     all_chunks=all_chunks,
                     model=model,
                     end_time=end_time,
+                    kwargs=kwargs,
                 )
                 standard_logging_response_object = (
                     gemini_passthrough_logging_handler_result["result"]
@@ -326,6 +331,7 @@ class PassThroughStreamingHandler:
                     all_chunks=all_chunks,
                     end_time=end_time,
                     passthrough_logging_payload=passthrough_logging_payload,
+                    kwargs=kwargs,
                 )
                 standard_logging_response_object = (
                     anthropic_passthrough_logging_handler_result["result"]

@@ -30,6 +30,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_google_adapter_rate_limit_key,
     _get_google_code_assist_prime_cache_key,
     _get_google_code_assist_prime_ttl_seconds,
+    _get_gemini_passthrough_route_family,
+    _get_openai_passthrough_route_family,
     _google_adapter_rate_limit_until_monotonic_by_key,
     _google_code_assist_prime_until_monotonic_by_key,
     _get_google_adapter_semaphore,
@@ -5940,6 +5942,67 @@ class TestClaudePersistedOutputExpansion:
         litellm_metadata = updated_body["litellm_metadata"]
         assert litellm_metadata["session_id"] == "header-session-abc"
         assert litellm_metadata["trace_environment"] == "dev"
+
+    def test_prepare_request_body_for_passthrough_observability_overrides_stale_environment(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "header-session-abc"}
+        request_body = {
+            "model": "gpt-5.4",
+            "input": "hello",
+            "litellm_metadata": {"trace_environment": "prod"},
+        }
+
+        updated_body = _prepare_request_body_for_passthrough_observability(
+            mock_request,
+            request_body,
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert litellm_metadata["source_trace_environment"] == "prod"
+
+    @pytest.mark.parametrize(
+        ("endpoint", "expected_route_family"),
+        [
+            ("v1/chat/completions", "openai_chat_completions"),
+            ("v1/responses", "openai_responses"),
+            ("v1/models", "openai_passthrough"),
+        ],
+    )
+    def test_openai_passthrough_route_family(
+        self,
+        endpoint,
+        expected_route_family,
+    ):
+        assert _get_openai_passthrough_route_family(endpoint) == expected_route_family
+
+    @pytest.mark.parametrize(
+        ("endpoint", "expected_route_family"),
+        [
+            ("v1beta/models/gemini-2.5-flash:generateContent", "gemini_generate_content"),
+            (
+                "v1beta/models/gemini-2.5-flash:streamGenerateContent",
+                "gemini_stream_generate_content",
+            ),
+            (
+                "v1beta/models/veo-2.0-generate-001:predictLongRunning",
+                "gemini_predict_long_running",
+            ),
+            ("v1internal:loadCodeAssist", None),
+            ("v1internal:listExperiments", None),
+            ("v1internal:retrieveUserQuota", None),
+            ("v1internal:fetchAdminControls", None),
+        ],
+    )
+    def test_gemini_passthrough_route_family(
+        self,
+        endpoint,
+        expected_route_family,
+    ):
+        assert _get_gemini_passthrough_route_family(endpoint) == expected_route_family
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_extracts_billing_header_before_passthrough(

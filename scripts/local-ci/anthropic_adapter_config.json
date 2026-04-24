@@ -26,9 +26,315 @@
     "claude_adapter_gpt_oss_120b",
     "claude_adapter_nvidia_deepseek_v32",
     "claude_adapter_nvidia_glm47",
-    "claude_adapter_nvidia_minimax_m27"
+    "claude_adapter_nvidia_minimax_m27",
+    "native_anthropic_passthrough_claude",
+    "native_openai_passthrough_chat",
+    "native_openai_passthrough_responses",
+    "native_openai_passthrough_responses_codex",
+    "native_gemini_passthrough_generate_content",
+    "native_gemini_passthrough_stream_generate_content"
   ],
   "cases": {
+    "native_anthropic_passthrough_claude": {
+      "command": [
+        "claude",
+        "-p",
+        "Reply with exactly two words: native anthropic",
+        "--output-format",
+        "json",
+        "--model",
+        "claude-opus-4-6",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ""
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": ["claude-code.orchestrator"],
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": ["/anthropic/v1/messages"],
+      "required_trace_tags": ["route:anthropic_messages"],
+      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "command_json_checks": {
+        "required_equals": {"is_error": false}
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "anthropic",
+        "expected_model": "claude-opus-4-6",
+        "expected_client_name": "claude-cli",
+        "client_user_agent_contains": "claude-cli/",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "claude-cli"
+        },
+        "metadata_required_truthy": ["request_tags", "client_version"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "timeout_seconds": 120,
+      "langfuse_poll_timeout_seconds": 60
+    },
+    "native_openai_passthrough_chat": {
+      "http_request": {
+        "method": "POST",
+        "path": "/openai_passthrough/v1/chat/completions",
+        "headers": {
+          "user-agent": "OpenAI/Python 1.99.0"
+        },
+        "json": {
+          "model": "gpt-5.4-mini",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with exactly two words: native openai"
+            }
+          ]
+        }
+      },
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": ["/openai_passthrough/v1/chat/completions"],
+      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "command_json_checks": {
+        "required_equals": {"is_error": false},
+        "required_minimums": {"status_code": 200}
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4-mini",
+        "expected_client_name": "openai-python",
+        "expected_client_version": "1.99.0",
+        "client_user_agent_contains": "OpenAI/Python 1.99.0",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "openai-python",
+          "client_version": "1.99.0"
+        },
+        "metadata_required_truthy": ["request_tags"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "timeout_seconds": 120,
+      "langfuse_poll_timeout_seconds": 60
+    },
+    "native_openai_passthrough_responses": {
+      "http_request": {
+        "method": "POST",
+        "path": "/openai_passthrough/v1/responses",
+        "add_default_authorization": false,
+        "headers": {
+          "user-agent": "OpenAI/Python 1.99.0"
+        },
+        "json": {
+          "model": "gpt-5.4-mini",
+          "input": "Reply with exactly two words: native responses"
+        }
+      },
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses"
+      ],
+      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "command_json_checks": {
+        "required_equals": {"is_error": false},
+        "required_minimums": {"status_code": 200}
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4-mini",
+        "expected_client_name": "openai-python",
+        "expected_client_version": "1.99.0",
+        "client_user_agent_contains": "OpenAI/Python 1.99.0",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "openai-python",
+          "client_version": "1.99.0"
+        },
+        "metadata_required_truthy": ["request_tags"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "timeout_seconds": 120,
+      "langfuse_poll_timeout_seconds": 60
+    },
+    "native_openai_passthrough_responses_codex": {
+      "cli_passthrough": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "-p",
+        "{codex_profile}",
+        "-m",
+        "gpt-5.4-mini",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-litellm-end-user-id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_user_id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "Reply with exactly two words: native codex"
+      ],
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses"
+      ],
+      "required_trace_tags": ["route:codex_responses"],
+      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4-mini",
+        "expected_client_name": "codex_exec",
+        "client_user_agent_contains": "codex_exec/",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "codex_exec"
+        },
+        "metadata_required_truthy": ["request_tags", "client_version"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 60
+    },
+    "native_gemini_passthrough_generate_content": {
+      "cli_passthrough": "gemini",
+      "command": [
+        "gemini",
+        "--skip-trust",
+        "--model",
+        "gemini-2.5-flash",
+        "--output-format",
+        "json",
+        "--prompt",
+        "Reply with exactly two words: native gemini"
+      ],
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 4,
+      "allowed_generation_routes": ["/gemini/v1internal:streamGenerateContent"],
+      "required_trace_tags": ["route:gemini_stream_generate_content"],
+      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "gemini",
+        "expected_model": "gemini-2.5-flash",
+        "expected_client_name": "gemini-cli",
+        "client_user_agent_contains": "GeminiCLI/",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "gemini-cli"
+        },
+        "metadata_required_truthy": ["request_tags", "client_version"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90
+    },
+    "native_gemini_passthrough_stream_generate_content": {
+      "cli_passthrough": "gemini",
+      "command": [
+        "gemini",
+        "--skip-trust",
+        "--model",
+        "gemini-2.5-flash",
+        "--output-format",
+        "stream-json",
+        "--prompt",
+        "Reply with exactly two words: native stream"
+      ],
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 4,
+      "allowed_generation_routes": ["/gemini/v1internal:streamGenerateContent"],
+      "required_trace_tags": ["route:gemini_stream_generate_content"],
+      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "gemini",
+        "expected_model": "gemini-2.5-flash",
+        "expected_client_name": "gemini-cli",
+        "client_user_agent_contains": "GeminiCLI/",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "gemini-cli"
+        },
+        "metadata_required_truthy": ["request_tags", "client_version"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "streaming_checked": true,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90
+    },
     "claude_adapter_gpt54": {
       "command": [
         "claude",
