@@ -80,6 +80,17 @@ _CLICKHOUSE_URL_ENV_VARS = ("CLICKHOUSE_URL", "LANGFUSE_CLICKHOUSE_URL")
 _CLICKHOUSE_USER_ENV_VARS = ("CLICKHOUSE_USER", "LANGFUSE_CLICKHOUSE_USER")
 _CLICKHOUSE_PASSWORD_ENV_VARS = ("CLICKHOUSE_PASSWORD", "LANGFUSE_CLICKHOUSE_PASSWORD")
 _SESSION_HISTORY_POOL: Optional[asyncpg.Pool] = None
+_GEMINI_CONTROL_PLANE_METHODS = frozenset(
+    (
+        "loadCodeAssist",
+        "listExperiments",
+        "retrieveUserQuota",
+        "fetchAdminControls",
+    )
+)
+_GEMINI_CONTROL_PLANE_METHODS_BY_LOWER = {
+    method.lower(): method for method in _GEMINI_CONTROL_PLANE_METHODS
+}
 
 
 def _clean_secret(value: Optional[str]) -> Optional[str]:
@@ -1831,7 +1842,267 @@ def _derive_session_history_tenant_identity(
     )
 
 
+def _extract_gemini_control_plane_method(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        value_lower = value.lower()
+        for method_lower, method in _GEMINI_CONTROL_PLANE_METHODS_BY_LOWER.items():
+            if method_lower in value_lower:
+                return method
+        return None
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            method = _extract_gemini_control_plane_method(nested_value)
+            if method is not None:
+                return method
+        return None
+    if isinstance(value, list):
+        for nested_value in value:
+            method = _extract_gemini_control_plane_method(nested_value)
+            if method is not None:
+                return method
+    return None
+
+
+def _is_gemini_control_plane_session_history_row(
+    row: Dict[str, Any],
+) -> Tuple[bool, Optional[str]]:
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = _parse_clickhouse_value(metadata)
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    method = _extract_gemini_control_plane_method(
+        {
+            "call_type": row.get("call_type"),
+            "model": row.get("model"),
+            "model_group": row.get("model_group"),
+            "metadata": metadata,
+        }
+    )
+    if method is None:
+        return False, None
+
+    provider_candidates = (
+        row.get("provider"),
+        metadata.get("custom_llm_provider"),
+        metadata.get("provider"),
+        metadata.get("litellm_provider"),
+    )
+    provider_is_gemini = any(
+        isinstance(candidate, str)
+        and candidate.strip().lower() in {"gemini", "google"}
+        for candidate in provider_candidates
+    )
+
+    hidden_params = metadata.get("hidden_params")
+    hidden_api_base = (
+        hidden_params.get("api_base") if isinstance(hidden_params, dict) else None
+    )
+    route_candidates = (
+        row.get("call_type"),
+        metadata.get("user_api_key_request_route"),
+        metadata.get("passthrough_route_family"),
+        metadata.get("api_base"),
+        hidden_api_base,
+    )
+    route_is_gemini = any(
+        isinstance(candidate, str)
+        and (
+            "gemini" in candidate.lower()
+            or "googleapis.com" in candidate.lower()
+            or "generativelanguage" in candidate.lower()
+            or "v1internal:" in candidate.lower()
+        )
+        for candidate in route_candidates
+    )
+    method_on_route = _extract_gemini_control_plane_method(route_candidates) is not None
+
+    # Historical bad rows may have provider/model gaps. The four Code Assist
+    # method names are only accepted when the row also looks like a Gemini route.
+    if provider_is_gemini or route_is_gemini or method_on_route:
+        return True, method
+    return False, None
+
+
+async def _run_gemini_control_plane_session_history_repair(  # noqa: PLR0915
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    pool = await _get_session_history_pool()
+    await _ensure_session_history_schema_with_pool(pool)
+
+    action = args.repair_gemini_control_plane
+    where_clauses = ["id > $1"]
+    params: List[Any] = []
+    if args.request_id:
+        params.append(args.request_id)
+        where_clauses.append(f"litellm_call_id = ${len(params) + 1}")
+    if args.trace_id:
+        params.append(args.trace_id)
+        where_clauses.append(f"trace_id = ${len(params) + 1}")
+    if args.session_id:
+        params.append(args.session_id)
+        where_clauses.append(f"session_id = ${len(params) + 1}")
+    if args.provider:
+        params.append(args.provider)
+        where_clauses.append(f"provider = ${len(params) + 1}")
+    if args.model:
+        params.append(args.model)
+        where_clauses.append(f"model = ${len(params) + 1}")
+    from_start = _parse_optional_datetime(args.from_start_time)
+    if from_start is not None:
+        params.append(from_start)
+        where_clauses.append(f"start_time >= ${len(params) + 1}")
+    to_start = _parse_optional_datetime(args.to_start_time)
+    if to_start is not None:
+        params.append(to_start)
+        where_clauses.append(f"start_time <= ${len(params) + 1}")
+
+    method_predicates = []
+    for method in sorted(_GEMINI_CONTROL_PLANE_METHODS):
+        params.append(f"%{method}%")
+        placeholder = f"${len(params) + 1}"
+        method_predicates.append(
+            f"(call_type ILIKE {placeholder} OR model ILIKE {placeholder} OR metadata::text ILIKE {placeholder})"
+        )
+    where_clauses.append(f"({' OR '.join(method_predicates)})")
+
+    limit = args.limit
+    batch_size = max(1, args.batch_size)
+    scanned_rows = 0
+    matched_rows = 0
+    deleted_rows = 0
+    updated_rows = 0
+    deleted_tool_activity_rows = 0
+    matched_methods: Counter[str] = Counter()
+    cursor_id = 0
+
+    while True:
+        page_params = [cursor_id, *params, batch_size]
+        query = f"""
+            SELECT
+                id,
+                litellm_call_id,
+                provider,
+                model,
+                model_group,
+                call_type,
+                start_time,
+                metadata
+            FROM public.session_history
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY id ASC
+            LIMIT ${len(page_params)}
+        """
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(query, *page_params)
+        if not rows:
+            break
+
+        for row in rows:
+            cursor_id = max(cursor_id, int(row["id"]))
+            if limit is not None and scanned_rows >= limit:
+                break
+            scanned_rows += 1
+            row_dict = dict(row)
+            is_match, method = _is_gemini_control_plane_session_history_row(row_dict)
+            if not is_match or method is None:
+                continue
+            matched_rows += 1
+            matched_methods[method] += 1
+
+            if not args.apply:
+                continue
+
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    if action == "delete":
+                        litellm_call_id = row_dict.get("litellm_call_id")
+                        if litellm_call_id:
+                            tool_result = await connection.execute(
+                                """
+                                DELETE FROM public.session_history_tool_activity
+                                WHERE litellm_call_id = $1
+                                """,
+                                litellm_call_id,
+                            )
+                            try:
+                                deleted_tool_activity_rows += int(
+                                    tool_result.rsplit(" ", 1)[-1]
+                                )
+                            except Exception:
+                                pass
+                        result = await connection.execute(
+                            "DELETE FROM public.session_history WHERE id = $1",
+                            row_dict["id"],
+                        )
+                        try:
+                            deleted_rows += int(result.rsplit(" ", 1)[-1])
+                        except Exception:
+                            deleted_rows += 1
+                    elif action == "mark":
+                        metadata = row_dict.get("metadata")
+                        if not isinstance(metadata, dict):
+                            metadata = _parse_clickhouse_value(metadata)
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+                        metadata.update(
+                            {
+                                "session_history_repair": "gemini_control_plane",
+                                "gemini_control_plane_repair_action": "mark",
+                                "gemini_control_plane_excluded": True,
+                                "gemini_control_plane_method": method,
+                            }
+                        )
+                        result = await connection.execute(
+                            """
+                            UPDATE public.session_history
+                            SET metadata = $1::jsonb
+                            WHERE id = $2
+                            """,
+                            json.dumps(metadata),
+                            row_dict["id"],
+                        )
+                        try:
+                            updated_rows += int(result.rsplit(" ", 1)[-1])
+                        except Exception:
+                            updated_rows += 1
+                    else:
+                        raise RuntimeError(f"Unsupported Gemini repair action: {action}")
+
+        if limit is not None and scanned_rows >= limit:
+            break
+        if len(rows) < batch_size:
+            break
+
+    return {
+        "source_mode": "session_history_repair",
+        "repair": "gemini_control_plane",
+        "repair_action": action,
+        "source_where": {
+            "request_id": args.request_id,
+            "trace_id": args.trace_id,
+            "session_id": args.session_id,
+            "provider": args.provider,
+            "model": args.model,
+            "from_start_time": args.from_start_time,
+            "to_start_time": args.to_start_time,
+        },
+        "stats": {
+            "scanned_rows": scanned_rows,
+            "matched_rows": matched_rows,
+            "deleted_rows": deleted_rows,
+            "updated_rows": updated_rows,
+            "deleted_tool_activity_rows": deleted_tool_activity_rows,
+            "matched_methods": dict(sorted(matched_methods.items())),
+        },
+    }
+
+
 async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.repair_gemini_control_plane:
+        return await _run_gemini_control_plane_session_history_repair(args)
+
     pool = await _get_session_history_pool()
     await _ensure_session_history_schema_with_pool(pool)
 
@@ -2137,6 +2408,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="With --repair-session-history, only fill tenant_id from stored session metadata.",
     )
     parser.add_argument(
+        "--repair-gemini-control-plane",
+        choices=("delete", "mark"),
+        help=(
+            "With --repair-session-history, repair historical Gemini Code Assist "
+            "control-plane rows for loadCodeAssist/listExperiments/"
+            "retrieveUserQuota/fetchAdminControls. Choose delete or mark; "
+            "requires --apply to persist changes."
+        ),
+    )
+    parser.add_argument(
         "--patch-langfuse-tags",
         action="store_true",
         help="Patch historical Langfuse trace tags from derived request tags.",
@@ -2197,6 +2478,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
+    if args.repair_gemini_control_plane and not args.repair_session_history:
+        parser.error("--repair-gemini-control-plane requires --repair-session-history")
+    if args.repair_gemini_control_plane and (
+        args.repair_costs or args.repair_tenant_ids
+    ):
+        parser.error(
+            "--repair-gemini-control-plane cannot be combined with --repair-costs "
+            "or --repair-tenant-ids"
+        )
     result = asyncio.run(_run_backfill(args))
     print(json.dumps(result, indent=2, default=str))
 
