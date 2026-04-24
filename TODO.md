@@ -21,4 +21,4 @@
 ## Next
 
 - Publish / rebuild the callback overlay wheel after the latest `session_history` identity hardening lands.
-  Prior prod runtime mitigation patched `aawm-litellm` in-place by copying updated callback sources into both installed module paths, but the durable fix is the checked-in `.wheel-build` source plus version `0.0.7`; the next image rebuild should consume `cb-v0.0.7` or newer so prod rows include `litellm_environment`, LiteLLM/fork/wheel versions, and initiating client name/version/user-agent.
+  Prior prod runtime mitigation patched `aawm-litellm` in-place by copying updated callback sources into both installed module paths, but the durable fix is the checked-in `.wheel-build` source plus version `0.0.8`; the next image rebuild should consume `cb-v0.0.8` or newer so prod rows include `litellm_environment`, LiteLLM/fork/wheel versions, and initiating client name/version/user-agent.

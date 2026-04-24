@@ -6,7 +6,10 @@
   New rows now persist `litellm_environment`, `litellm_version`, `litellm_fork_version`, `litellm_wheel_versions`, `client_name`, `client_version`, and `client_user_agent`; the same values are mirrored into row metadata for Langfuse/backfill context. Live writes derive these from trace environment metadata, installed package versions, associated overlay/config version env vars, request User-Agent, and Claude Code billing headers. Backfill paths only use values already present in spend-log/Langfuse metadata.
 
 - Hardened the Anthropic adapter harness around the new runtime/client identity fields.
-  Dev/prod target profile selection now injects `expected_litellm_environment` into session-history checks, and the harness fails rows missing runtime version, fork version, wheel-version JSON, client name, or client version. The callback overlay source remains byte-for-byte synced with the in-repo dev callback and its wheel version is now `0.0.7`.
+  Dev/prod target profile selection now injects `expected_litellm_environment` into session-history checks, and the harness fails rows missing runtime version, fork version, wheel-version JSON, client name, or client version. The callback overlay source remains byte-for-byte synced with the in-repo dev callback and its wheel version is now `0.0.8`.
+
+- Advanced the callback, harness, and model-config artifact versions after branch promotion.
+  Remote `cb-v0.0.7`, `h-v0.0.4`, and `cfg-v0.0.4` already existed on a release-only commit, so the durable release artifacts now use fresh non-rewritten versions: callback `0.0.8`, harness `0.0.5`, and model config `0.0.5`.
 
 - Repaired `public.session_history` observability gaps in the local `aawm_tristore` database.
   The repair normalized null providers, removed invalid `reasoning_tokens_source=provider_reported` rows with zero reported reasoning tokens, populated target-provider cache statuses, and recalculated cache miss token/cost fields where usage exposed cache-write tokens.
