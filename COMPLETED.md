@@ -2,6 +2,9 @@
 
 ## 2026-04-24
 
+- Purged the 24 operator-approved ambiguous historical Gemini `unknown` zero-token rows from local `aawm_tristore`.
+  The cleanup was deliberately scoped to old dev harness sessions for `native_gemini_passthrough_stream_generate_content` between `2026-04-24 16:21:36+00` and `2026-04-24 16:25:16+00`, with `provider=gemini`, `model=unknown`, zero input/output tokens, and `litellm_environment=dev`. No matching `session_history_tool_activity` rows existed, the delete returned 24 rows, and the post-delete verification count for `gemini/unknown` zero-token rows is zero.
+
 - Extended the existing Anthropic adapter harness tenant assertions across native and adapted lanes.
   The harness now carries a shared `default_tenant_id`, injects `x-aawm-tenant-id` through HTTP, Claude CLI, Codex CLI, and Gemini CLI context setup, and defaults `public.session_history.tenant_id`, `metadata.tenant_id`, and `metadata.tenant_id_source` assertions for every session-history case. Multi-row fanout validations now merge `required_equals.tenant_id` into each expected row. Live dev validation passed for the native Anthropic, OpenAI chat, OpenAI Responses, Codex Responses, Gemini generateContent, and Gemini streamGenerateContent cases with zero failures and zero warnings.
 
