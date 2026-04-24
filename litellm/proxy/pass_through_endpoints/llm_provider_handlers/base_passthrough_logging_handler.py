@@ -89,8 +89,9 @@ class BasePassthroughLoggingHandler(ABC):
         passthrough_logging_payload: PassthroughStandardLoggingPayload,
     ) -> Optional[str]:
         request_body = passthrough_logging_payload.get("request_body")
+        request_headers = passthrough_logging_payload.get("request_headers")
         if request_body:
-            return get_end_user_id_from_request_body(request_body)
+            return get_end_user_id_from_request_body(request_body, request_headers)
         return None
 
     def _create_response_logging_payload(

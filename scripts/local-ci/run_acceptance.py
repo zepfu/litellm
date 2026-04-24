@@ -23,6 +23,11 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "scripts" / "local-ci" / "config.json"
 _CLAUDE_AGENT_NAME_RE = re.compile(r"You are '([^']+)' and you are working")
+_CLAUDE_HARNESS_HEADER_KEYS = {
+    "x-litellm-end-user-id",
+    "langfuse_trace_user_id",
+    "langfuse_trace_name",
+}
 
 
 def _utcnow() -> dt.datetime:
@@ -42,6 +47,92 @@ def _resolve_litellm_base_url(config: dict[str, Any]) -> str:
     return os.environ.get("LITELLM_BASE_URL") or config.get(
         "litellm_base_url", "http://127.0.0.1:4001"
     )
+
+
+def _build_claude_harness_user_id(
+    *, target: str | None = None, case_name: str | None = None
+) -> str:
+    override = os.environ.get("AAWM_CLAUDE_HARNESS_USER_ID")
+    if override and override.strip():
+        return override.strip()
+
+    run_id = os.environ.get("AAWM_HARNESS_RUN_ID")
+    if not run_id or not run_id.strip():
+        run_id = f"{int(time.time())}-{os.getpid()}"
+    scope = ".".join(
+        re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+        for value in (target or "local", case_name or "claude")
+        if value and value.strip()
+    )
+    return f"litellm-harness.{scope}.{run_id}"
+
+
+def _parse_claude_custom_header_lines(value: Any) -> list[tuple[str, str]]:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    headers: list[tuple[str, str]] = []
+    for line in value.splitlines():
+        if ":" not in line:
+            continue
+        key, header_value = line.split(":", 1)
+        key = key.strip()
+        header_value = header_value.strip()
+        if key and header_value:
+            headers.append((key, header_value))
+    return headers
+
+
+def _format_claude_custom_header_lines(headers: list[tuple[str, str]]) -> str:
+    return "\n".join(f"{key}: {value}" for key, value in headers)
+
+
+def _ensure_claude_harness_headers(
+    config: dict[str, Any],
+    *,
+    target: str | None = None,
+    case_name: str | None = None,
+) -> dict[str, Any]:
+    updated = dict(config)
+    env = dict(updated.get("env") or {})
+    expected_user_ids = [
+        str(value).strip()
+        for value in (updated.get("expected_user_ids") or [])
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    ]
+    harness_user_id = (
+        expected_user_ids[0]
+        if expected_user_ids
+        else _build_claude_harness_user_id(target=target, case_name=case_name)
+    )
+
+    existing_headers = _parse_claude_custom_header_lines(
+        env.get("ANTHROPIC_CUSTOM_HEADERS")
+    )
+    existing_trace_name = next(
+        (
+            value
+            for key, value in existing_headers
+            if key.lower() == "langfuse_trace_name"
+        ),
+        "claude-code",
+    )
+    controlled_headers = [
+        ("x-litellm-end-user-id", harness_user_id),
+        ("langfuse_trace_user_id", harness_user_id),
+        ("langfuse_trace_name", existing_trace_name),
+    ]
+    passthrough_headers = [
+        (key, value)
+        for key, value in existing_headers
+        if key.lower() not in _CLAUDE_HARNESS_HEADER_KEYS
+    ]
+    env["ANTHROPIC_CUSTOM_HEADERS"] = _format_claude_custom_header_lines(
+        controlled_headers + passthrough_headers
+    )
+    updated["env"] = env
+    updated["expected_user_ids"] = expected_user_ids or [harness_user_id]
+    updated.setdefault("require_trace_user_id", True)
+    return updated
 
 
 def _http_get_json(url: str, public_key: str, secret_key: str, timeout: float = 20.0) -> dict[str, Any]:
@@ -1450,6 +1541,8 @@ def _validate_codex(
     for user_id in expected_user_ids:
         if user_id not in actual_user_ids:
             failures.append(f"missing Codex user id: {user_id}")
+    if bool(config.get("require_trace_user_id")) and traces and not actual_user_ids:
+        failures.append("Codex traces did not include a Langfuse userId")
     (
         _raw_generation_observations,
         generation_observations,
@@ -1671,6 +1764,11 @@ def _validate_claude(
     effective_config = dict(config)
     if selected_mode:
         effective_config.update(selected_mode)
+    effective_config = _ensure_claude_harness_headers(
+        effective_config,
+        target=str(effective_config.get("target_profile") or "local"),
+        case_name=f"claude_{fanout_mode}",
+    )
 
     started = _utcnow()
     run = _run_command(
@@ -1721,6 +1819,8 @@ def _validate_claude(
     for user_id in expected_user_ids:
         if user_id not in actual_user_ids:
             failures.append(f"missing Claude user id: {user_id}")
+    if bool(effective_config.get("require_trace_user_id")) and traces and not actual_user_ids:
+        failures.append("Claude traces did not include a Langfuse userId")
     (
         raw_generation_observations,
         generation_observations,

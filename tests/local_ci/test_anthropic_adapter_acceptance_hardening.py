@@ -83,7 +83,8 @@ def test_runtime_log_defaults_catch_async_and_content_length_errors(monkeypatch)
     )
 
 
-def test_target_profile_sets_session_history_runtime_identity_expectations():
+def test_target_profile_sets_session_history_runtime_identity_expectations(monkeypatch):
+    monkeypatch.setenv("AAWM_CLAUDE_HARNESS_USER_ID", "litellm-harness-test")
     harness = _load_harness_module()
 
     config = {
@@ -108,6 +109,16 @@ def test_target_profile_sets_session_history_runtime_identity_expectations():
     validation = updated["cases"]["claude_adapter_gpt55"][
         "session_history_validation"
     ]
+    case_env = updated["cases"]["claude_adapter_gpt55"]["env"]
     assert validation["expected_provider"] == "openai"
     assert validation["expected_litellm_environment"] == "dev"
     assert validation["require_runtime_identity"] is True
+    assert updated["cases"]["claude_adapter_gpt55"]["require_trace_user_id"] is True
+    assert updated["cases"]["claude_adapter_gpt55"]["expected_user_ids"] == [
+        "litellm-harness-test"
+    ]
+    assert case_env["ANTHROPIC_CUSTOM_HEADERS"] == (
+        "x-litellm-end-user-id: litellm-harness-test\n"
+        "langfuse_trace_user_id: litellm-harness-test\n"
+        "langfuse_trace_name: claude-code"
+    )
