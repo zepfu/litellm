@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26` (25 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27` (26 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.26`.
+`1.82.3+aawm.27`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -892,6 +892,29 @@ upstream LiteLLM.
 **Validation status:** Focused callback, OpenAI passthrough, Responses, and
 adapter-harness hardening tests pass locally. Full prod `:4000` harness
 validation is required after promoting this patch set into the prod container.
+
+---
+
+### aawm.27 — Release tag alignment for main-head image promotion
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `WHEEL.md`
+
+**Upstream issue:** The initial `v1.82.3-aawm.26` fork tag was created before
+`main` had advanced to the final promotion merge, and the image publisher
+intentionally rejects tags whose commit is not the current `main` head.
+
+**Fix:** Bump the fork-local version to `1.82.3+aawm.27` so the production
+image release tag can be cut from the converged `develop` / `main` head without
+force-moving the already-published `aawm.26` tag.
+
+**Why not upstream:** This is AAWM release-line bookkeeping for our guarded
+GHCR image publishing workflow.
+
+**Validation status:** Version/docs-only follow-up on top of the already
+validated `aawm.26` code patch set.
 
 ---
 
