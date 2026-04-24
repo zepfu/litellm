@@ -481,6 +481,208 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
 
 
 
+def _as_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        item
+        for item in value
+        if isinstance(item, str) and item.strip()
+    ]
+
+
+def _extract_request_payload_path_values(value: Any, path: str) -> list[Any]:
+    segments = [segment for segment in path.split('.') if segment]
+    if not segments:
+        return [value]
+
+    def _walk(current: Any, remaining: list[str]) -> list[Any]:
+        if not remaining:
+            return [current]
+
+        segment = remaining[0]
+        rest = remaining[1:]
+        if segment == '**':
+            matches = _walk(current, rest)
+            if isinstance(current, dict):
+                for child in current.values():
+                    matches.extend(_walk(child, remaining))
+            elif isinstance(current, list):
+                for child in current:
+                    matches.extend(_walk(child, remaining))
+            return matches
+
+        if isinstance(current, dict):
+            if segment not in current:
+                return []
+            return _walk(current[segment], rest)
+
+        if isinstance(current, list):
+            if segment.isdigit():
+                index = int(segment)
+                if 0 <= index < len(current):
+                    return _walk(current[index], rest)
+                return []
+            matches: list[Any] = []
+            for child in current:
+                matches.extend(_walk(child, remaining))
+            return matches
+
+        return []
+
+    return _walk(value, segments)
+
+
+def _preview_request_payload_value(value: Any) -> str:
+    return RA._preview_request_body_path_value(value)
+
+
+def _validate_logged_request_payload_checks(
+    *,
+    family: str,
+    observations: list[dict[str, Any]],
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    failures: list[str] = []
+    warnings: list[str] = []
+
+    required_paths = _as_string_list(checks.get('required_paths'))
+    warning_present_paths = _as_string_list(checks.get('warning_present_paths'))
+    forbidden_paths = _as_string_list(checks.get('forbidden_paths'))
+    required_equals = checks.get('required_equals') or {}
+    required_one_of = checks.get('required_one_of') or {}
+    if not isinstance(required_equals, dict):
+        required_equals = {}
+    if not isinstance(required_one_of, dict):
+        required_one_of = {}
+
+    required_path_found: dict[str, bool] = {path: False for path in required_paths}
+    required_path_values: dict[str, list[str]] = {path: [] for path in required_paths}
+    warning_path_hits: dict[str, list[dict[str, str]]] = {
+        path: [] for path in warning_present_paths
+    }
+    forbidden_path_hits: dict[str, list[dict[str, str]]] = {
+        path: [] for path in forbidden_paths
+    }
+    required_equals_found: dict[str, bool] = {
+        str(path): False for path in required_equals
+    }
+    required_equals_observed: dict[str, list[str]] = {
+        str(path): [] for path in required_equals
+    }
+    required_one_of_found: dict[str, bool] = {
+        str(path): False for path in required_one_of
+    }
+    required_one_of_observed: dict[str, list[str]] = {
+        str(path): [] for path in required_one_of
+    }
+
+    for observation in observations:
+        request_body = RA._extract_logged_request_body(observation)
+        if request_body is None:
+            continue
+
+        observation_id = str(observation.get('id'))
+        for path in required_paths:
+            values = _extract_request_payload_path_values(request_body, path)
+            if not values:
+                continue
+            required_path_found[path] = True
+            for value in values:
+                preview = _preview_request_payload_value(value)
+                if preview not in required_path_values[path]:
+                    required_path_values[path].append(preview)
+
+        for path in warning_present_paths:
+            for value in _extract_request_payload_path_values(request_body, path):
+                warning_path_hits[path].append(
+                    {
+                        'observation_id': observation_id,
+                        'value': _preview_request_payload_value(value),
+                    }
+                )
+
+        for path in forbidden_paths:
+            for value in _extract_request_payload_path_values(request_body, path):
+                forbidden_path_hits[path].append(
+                    {
+                        'observation_id': observation_id,
+                        'value': _preview_request_payload_value(value),
+                    }
+                )
+
+        for raw_path, expected in required_equals.items():
+            path = str(raw_path)
+            for value in _extract_request_payload_path_values(request_body, path):
+                preview = _preview_request_payload_value(value)
+                if preview not in required_equals_observed[path]:
+                    required_equals_observed[path].append(preview)
+                if value == expected:
+                    required_equals_found[path] = True
+
+        for raw_path, allowed_values in required_one_of.items():
+            path = str(raw_path)
+            allowed_list = allowed_values if isinstance(allowed_values, list) else []
+            for value in _extract_request_payload_path_values(request_body, path):
+                preview = _preview_request_payload_value(value)
+                if preview not in required_one_of_observed[path]:
+                    required_one_of_observed[path].append(preview)
+                if any(value == allowed for allowed in allowed_list):
+                    required_one_of_found[path] = True
+
+    for path, found in required_path_found.items():
+        if not found:
+            failures.append(f'{family} missing request payload path: {path}')
+
+    for path, found in required_equals_found.items():
+        if found:
+            continue
+        observed = required_equals_observed.get(path) or ['<missing>']
+        failures.append(
+            f'{family} request payload `{path}` did not equal '
+            f'{required_equals[path]!r}; observed: {", ".join(observed)}'
+        )
+
+    for path, found in required_one_of_found.items():
+        if found:
+            continue
+        observed = required_one_of_observed.get(path) or ['<missing>']
+        failures.append(
+            f'{family} request payload `{path}` was not one of '
+            f'{required_one_of[path]!r}; observed: {", ".join(observed)}'
+        )
+
+    for path, hits in forbidden_path_hits.items():
+        if not hits:
+            continue
+        observed_values = sorted({hit['value'] for hit in hits})
+        failures.append(
+            f'{family} request payload includes forbidden path `{path}` '
+            f'with value(s): {", ".join(observed_values)}'
+        )
+
+    for path, hits in warning_path_hits.items():
+        if not hits:
+            continue
+        observed_values = sorted({hit['value'] for hit in hits})
+        warnings.append(
+            f'{family} request payload includes warning path `{path}` with value(s): '
+            + ', '.join(observed_values)
+        )
+
+    summary = {
+        'required_paths_found': required_path_found,
+        'required_path_values': required_path_values,
+        'required_equals_found': required_equals_found,
+        'required_equals_observed': required_equals_observed,
+        'required_one_of_found': required_one_of_found,
+        'required_one_of_observed': required_one_of_observed,
+        'forbidden_path_hits': forbidden_path_hits,
+        'warning_present_path_hits': warning_path_hits,
+    }
+    return summary, failures, warnings
+
+
 
 def _validate_runtime_postcondition(*, family: str, litellm_base_url: str, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     health_url = str(checks.get('healthcheck_url') or f"{litellm_base_url.rstrip('/')}/health/liveliness")
@@ -641,12 +843,14 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
 
     expected_provider = checks.get('expected_provider')
     expected_model = checks.get('expected_model')
+    expected_tenant_id = checks.get('expected_tenant_id')
     expected_rows = checks.get('expected_rows') or []
     expected_litellm_environment = checks.get('expected_litellm_environment')
     require_runtime_identity = checks.get('require_runtime_identity', True) is not False
 
     query = '''
-        select provider, model, session_id, input_tokens, output_tokens, total_tokens,
+        select provider, model, session_id, tenant_id,
+               input_tokens, output_tokens, total_tokens,
                cache_read_input_tokens, cache_creation_input_tokens,
                provider_cache_attempted, provider_cache_status,
                provider_cache_miss, provider_cache_miss_reason,
@@ -819,6 +1023,11 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     if expected_model is not None and record.get('model') != expected_model:
         failures.append(f'{family} session_history model mismatch: expected `{expected_model}`, got `{record.get("model")}`')
 
+    if expected_tenant_id is not None and record.get('tenant_id') != expected_tenant_id:
+        failures.append(
+            f'{family} session_history tenant_id mismatch: expected `{expected_tenant_id}`, got `{record.get("tenant_id")}`'
+        )
+
     expected_client_name = checks.get('expected_client_name')
     if expected_client_name is not None and record.get('client_name') != expected_client_name:
         failures.append(
@@ -864,6 +1073,32 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         if not isinstance(actual, str) or str(expected_substring) not in actual:
             failures.append(
                 f'{family} session_history metadata `{key}` missing substring `{expected_substring}`: got `{actual}`'
+            )
+
+    for key, expected in (checks.get('required_equals') or {}).items():
+        actual = record.get(key)
+        if actual != expected:
+            failures.append(
+                f'{family} session_history `{key}` mismatch: expected `{expected}`, got `{actual}`'
+            )
+
+    for key, allowed_values in (checks.get('required_one_of') or {}).items():
+        actual = record.get(key)
+        allowed_list = allowed_values if isinstance(allowed_values, list) else []
+        if not any(actual == allowed for allowed in allowed_list):
+            failures.append(
+                f'{family} session_history `{key}` expected one of {allowed_values!r}, got `{actual}`'
+            )
+
+    for key in checks.get('required_truthy') or []:
+        if not record.get(key):
+            failures.append(f'{family} session_history `{key}` is not truthy')
+
+    for key, expected_substring in (checks.get('required_contains') or {}).items():
+        actual = record.get(key)
+        if not isinstance(actual, str) or str(expected_substring) not in actual:
+            failures.append(
+                f'{family} session_history `{key}` missing substring `{expected_substring}`: got `{actual}`'
             )
 
     for key, minimum in (checks.get('minimums') or {}).items():
@@ -1326,11 +1561,10 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     )
     failures.extend(generation_metadata_failures)
 
-    request_payload_summary, request_payload_failures, request_payload_warnings = RA._validate_logged_request_payload_checks(
+    request_payload_summary, request_payload_failures, request_payload_warnings = _validate_logged_request_payload_checks(
         family=name,
         observations=raw_generation_observations,
-        required_paths=(config.get('request_payload_checks') or {}).get('required_paths'),
-        warning_present_paths=(config.get('request_payload_checks') or {}).get('warning_present_paths'),
+        checks=config.get('request_payload_checks') or {},
     )
     failures.extend(request_payload_failures)
     warnings.extend(request_payload_warnings)

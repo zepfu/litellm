@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS public.session_history (
 )
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tenant_id TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_read_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_modified_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_commit_count INTEGER NOT NULL DEFAULT 0",
@@ -459,6 +460,7 @@ ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
     metadata = COALESCE(session_history_tool_activity.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
+    "tenant_id_source",
     "trace_name",
     "trace_environment",
     "cc_version",
@@ -475,6 +477,17 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "thinking_signature_present",
     "usage_reasoning_tokens_reported",
     "usage_reasoning_tokens_source",
+    "reasoning_effort_requested",
+    "reasoning_effort_source",
+    "reasoning_effort_native_provider",
+    "reasoning_effort_native_value",
+    "reasoning_effort_native_field",
+    "reasoning_effort_clamped_from",
+    "reasoning_effort_clamp_reason",
+    "openai_reasoning_effort",
+    "gemini_reasoning_effort",
+    "openrouter_reasoning_effort",
+    "nvidia_reasoning_effort",
     "usage_cache_read_input_tokens",
     "usage_cache_creation_input_tokens",
     "usage_provider_cache_attempted",
@@ -500,6 +513,28 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "aawm_total_proxy_duration_ms",
     "aawm_stream_chunk_count",
     "aawm_stream_total_bytes",
+)
+_AAWM_TENANT_ID_METADATA_KEYS = (
+    "tenant_id",
+    "aawm_tenant_id",
+    "user_api_key_org_id",
+    "organization_id",
+    "org_id",
+    "litellm_organization_id",
+    "litellm_org_id",
+    "user_api_key_team_id",
+    "team_id",
+    "litellm_team_id",
+)
+_AAWM_TENANT_ID_HEADER_NAMES = (
+    "x-aawm-tenant-id",
+    "x-litellm-tenant-id",
+    "x-litellm-organization-id",
+    "x-litellm-org-id",
+    "x-organization-id",
+    "x-org-id",
+    "x-litellm-team-id",
+    "x-team-id",
 )
 _AAWM_SESSION_HISTORY_BATCH_SIZE = 32
 _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
@@ -779,6 +814,85 @@ def _extract_request_headers_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, An
     return merged
 
 
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    parsed_value = _safe_json_load(value, value)
+    return parsed_value if isinstance(parsed_value, dict) else {}
+
+
+def _extract_tenant_identity_from_metadata_sources(
+    *sources: Tuple[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    for source_name, raw_source in sources:
+        source = _coerce_mapping(raw_source)
+        if not source:
+            continue
+        for key in _AAWM_TENANT_ID_METADATA_KEYS:
+            tenant_id = _clean_non_empty_string(source.get(key))
+            if tenant_id:
+                return tenant_id, f"{source_name}.{key}"
+
+        for nested_key in ("metadata", "request_metadata", "user_api_key_metadata"):
+            nested_source = _coerce_mapping(source.get(nested_key))
+            if not nested_source:
+                continue
+            for key in _AAWM_TENANT_ID_METADATA_KEYS:
+                tenant_id = _clean_non_empty_string(nested_source.get(key))
+                if tenant_id:
+                    return tenant_id, f"{source_name}.{nested_key}.{key}"
+
+    return None, None
+
+
+def _extract_tenant_identity_from_kwargs(
+    kwargs: Dict[str, Any],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    standard_logging_object: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    litellm_params = kwargs.get("litellm_params") or {}
+    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
+    passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
+    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
+    proxy_body = _coerce_mapping(proxy_request.get("body"))
+    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
+
+    tenant_id, source = _extract_tenant_identity_from_metadata_sources(
+        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
+        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
+        ("kwargs.metadata", kwargs.get("metadata")),
+        ("litellm_params.proxy_server_request.body", proxy_body),
+        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
+        ("passthrough_logging_payload", passthrough_payload),
+        ("passthrough_logging_payload.request_body", passthrough_body),
+        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
+        ("standard_logging_object", standard_logging_object),
+        ("kwargs", kwargs),
+    )
+    if tenant_id:
+        return tenant_id, source
+
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    tenant_id = _get_header_value(headers, *_AAWM_TENANT_ID_HEADER_NAMES)
+    if tenant_id:
+        return tenant_id, "request_headers"
+
+    return None, None
+
+
+def _extract_tenant_identity_from_langfuse_trace_observation(
+    trace: Dict[str, Any],
+    observation: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
+    return _extract_tenant_identity_from_metadata_sources(
+        ("observation.metadata", metadata or observation.get("metadata")),
+        ("trace.metadata", trace_metadata),
+        ("observation", observation),
+        ("trace", trace),
+    )
+
+
 @lru_cache(maxsize=1)
 def _resolve_runtime_litellm_version() -> Optional[str]:
     env_version = _get_first_secret_value(_AAWM_LITELLM_VERSION_ENV_VARS)
@@ -974,6 +1088,7 @@ def _extract_agent_context_from_text(text: str) -> Tuple[Optional[str], Optional
 
 def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """Extract agent/tenant from request content when present."""
+    explicit_tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(kwargs)
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
         for message in messages:
@@ -984,14 +1099,14 @@ def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optio
             text = _content_to_text(message.get("content", ""))
             agent_name, tenant_id = _extract_agent_context_from_text(text)
             if agent_name:
-                return agent_name, tenant_id
+                return agent_name, explicit_tenant_id or tenant_id
 
     system_direct = kwargs.get("system")
     if system_direct:
         text = _content_to_text(system_direct)
         agent_name, tenant_id = _extract_agent_context_from_text(text)
         if agent_name:
-            return agent_name, tenant_id
+            return agent_name, explicit_tenant_id or tenant_id
 
     payload = kwargs.get("passthrough_logging_payload")
     if isinstance(payload, dict):
@@ -1002,7 +1117,7 @@ def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optio
                 text = _content_to_text(system)
                 agent_name, tenant_id = _extract_agent_context_from_text(text)
                 if agent_name:
-                    return agent_name, tenant_id
+                    return agent_name, explicit_tenant_id or tenant_id
 
             pt_messages = request_body.get("messages")
             if pt_messages and isinstance(pt_messages, list):
@@ -1014,10 +1129,10 @@ def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optio
                     text = _content_to_text(msg.get("content", ""))
                     agent_name, tenant_id = _extract_agent_context_from_text(text)
                     if agent_name:
-                        return agent_name, tenant_id
+                        return agent_name, explicit_tenant_id or tenant_id
                     break
 
-    return None, None
+    return None, explicit_tenant_id
 
 
 def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
@@ -1545,7 +1660,13 @@ def _extract_cache_creation_input_tokens(usage_obj: Any) -> int:
     )
 
 
-_PROVIDER_CACHE_TARGET_FAMILIES = {"anthropic", "openai", "openrouter", "gemini"}
+_PROVIDER_CACHE_TARGET_FAMILIES = {
+    "anthropic",
+    "openai",
+    "openrouter",
+    "gemini",
+    "nvidia",
+}
 
 
 def _has_nested_path(obj: Any, *keys: str) -> bool:
@@ -1561,6 +1682,8 @@ def _normalize_provider_cache_family(
     route_family = (metadata or {}).get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
         route_family_lower = route_family.lower()
+        if "nvidia" in route_family_lower:
+            return "nvidia"
         if "openrouter" in route_family_lower:
             return "openrouter"
         if "gemini" in route_family_lower or "google" in route_family_lower:
@@ -1574,10 +1697,14 @@ def _normalize_provider_cache_family(
         provider_lower = provider.strip().lower()
         if provider_lower == "google":
             return "gemini"
+        if provider_lower in {"nvidia_nim", "nvidia-nim"}:
+            return "nvidia"
         if provider_lower in _PROVIDER_CACHE_TARGET_FAMILIES:
             return provider_lower
 
     model_lower = str(model or "").strip().lower()
+    if model_lower.startswith("nvidia_nim/") or model_lower.startswith("nvidia/"):
+        return "nvidia"
     if model_lower.startswith("openrouter/"):
         return "openrouter"
     if "gemini" in model_lower:
@@ -1950,12 +2077,8 @@ def _resolve_provider_cache_state(
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
     state_from_metadata = _provider_cache_state_from_metadata(metadata, provider_family)
-    if state_from_metadata is not None:
-        if (
-            state_from_metadata.get("status") is not None
-            or (cache_read_input_tokens <= 0 and cache_creation_input_tokens <= 0)
-        ):
-            return state_from_metadata
+    if state_from_metadata is not None and state_from_metadata.get("status") is not None:
+        return state_from_metadata
 
     request_has_cache_control = _request_contains_cache_control(request_body)
     request_has_cached_content = _request_contains_cached_content(request_body)
@@ -3189,9 +3312,28 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
         )
 
 
+def _split_spend_log_proxy_server_request(
+    spend_log_row: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    proxy_server_request = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
+    if not isinstance(proxy_server_request, dict):
+        return {}, {}
+
+    request_headers = proxy_server_request.get("headers")
+    if not isinstance(request_headers, dict):
+        request_headers = {}
+
+    for body_key in ("body", "request"):
+        request_body = proxy_server_request.get(body_key)
+        if isinstance(request_body, dict):
+            return request_body, request_headers
+
+    return proxy_server_request, request_headers
+
+
 def _extract_trace_id_from_spend_log_row(spend_log_row: Dict[str, Any]) -> Tuple[Optional[str], str]:
     metadata = _safe_json_load(spend_log_row.get("metadata"), {})
-    request_body = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
+    request_body, _request_headers = _split_spend_log_proxy_server_request(spend_log_row)
 
     for candidate in (
         metadata.get("trace_id") if isinstance(metadata, dict) else None,
@@ -3231,7 +3373,7 @@ def _extract_session_id_from_spend_log_row(
     spend_log_row: Dict[str, Any],
 ) -> Tuple[Optional[str], str]:
     metadata = _safe_json_load(spend_log_row.get("metadata"), {})
-    request_body = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
+    request_body, _request_headers = _split_spend_log_proxy_server_request(spend_log_row)
     response_body = _safe_json_load(spend_log_row.get("response"), {})
 
     if isinstance(request_body, dict):
@@ -3323,9 +3465,7 @@ def _build_backfill_kwargs_from_spend_log_row(
     metadata = _safe_json_load(spend_log_row.get("metadata"), {})
     if not isinstance(metadata, dict):
         metadata = {}
-    request_body = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
-    if not isinstance(request_body, dict):
-        request_body = {}
+    request_body, request_headers = _split_spend_log_proxy_server_request(spend_log_row)
     request_tags = _coerce_spend_log_request_tags(spend_log_row.get("request_tags"))
 
     session_id, session_id_source = _extract_session_id_from_spend_log_row(spend_log_row)
@@ -3345,6 +3485,7 @@ def _build_backfill_kwargs_from_spend_log_row(
 
     standard_logging_object: Dict[str, Any] = {
         "metadata": standard_logging_metadata,
+        "request_headers": request_headers,
         "request_tags": list(request_tags),
         "trace_id": trace_id,
         "model": str(model),
@@ -3370,10 +3511,16 @@ def _build_backfill_kwargs_from_spend_log_row(
             "metadata": litellm_metadata,
             "litellm_trace_id": trace_id,
             "litellm_session_id": session_id,
-            "proxy_server_request": {"body": request_body},
+            "proxy_server_request": {
+                "body": request_body,
+                "headers": request_headers,
+            },
         },
         "standard_logging_object": standard_logging_object,
-        "passthrough_logging_payload": {"request_body": request_body},
+        "passthrough_logging_payload": {
+            "request_body": request_body,
+            "request_headers": request_headers,
+        },
         "response_cost": _safe_float(spend_log_row.get("spend")),
     }
 
@@ -3480,6 +3627,10 @@ def _extract_agent_context_from_langfuse_trace_observation(
     trace: Dict[str, Any],
     observation: Dict[str, Any],
 ) -> Tuple[Optional[str], Optional[str]]:
+    explicit_tenant_id, _tenant_source = _extract_tenant_identity_from_langfuse_trace_observation(
+        trace,
+        observation,
+    )
     for candidate in (
         observation.get("input"),
         trace.get("input"),
@@ -3490,13 +3641,13 @@ def _extract_agent_context_from_langfuse_trace_observation(
             _serialize_searchable_text(candidate)
         )
         if agent_name:
-            return agent_name, tenant_id
+            return agent_name, explicit_tenant_id or tenant_id
 
     trace_name = trace.get("name")
     if isinstance(trace_name, str) and trace_name.startswith("claude-code."):
-        return trace_name.split(".", 1)[1], None
+        return trace_name.split(".", 1)[1], explicit_tenant_id
 
-    return None, None
+    return None, explicit_tenant_id
 
 
 def _extract_langfuse_session_id(
@@ -3836,6 +3987,17 @@ def _build_session_history_record_from_langfuse_trace_observation(
         trace,
         observation,
     )
+    explicit_tenant_id, tenant_source = _extract_tenant_identity_from_langfuse_trace_observation(
+        trace,
+        observation,
+        metadata,
+    )
+    if explicit_tenant_id:
+        tenant_id = explicit_tenant_id
+    if tenant_id and tenant_source:
+        metadata["tenant_id_source"] = tenant_source
+    elif tenant_id:
+        metadata["tenant_id_source"] = "agent_context_text"
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
     provider_cache_state = _resolve_provider_cache_state(
         provider=provider,
@@ -4118,6 +4280,17 @@ def _build_session_history_record(
         )
     tool_activity_summary = _summarize_tool_activity(tool_activity)
     agent_name, tenant_id = _extract_agent_context(kwargs)
+    explicit_tenant_id, tenant_source = _extract_tenant_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=standard_logging_object,
+    )
+    if explicit_tenant_id:
+        tenant_id = explicit_tenant_id
+    if tenant_id and tenant_source:
+        metadata["tenant_id_source"] = tenant_source
+    elif tenant_id:
+        metadata["tenant_id_source"] = "agent_context_text"
 
     response_cost_usd = _safe_float(
         _first_non_none(

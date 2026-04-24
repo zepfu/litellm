@@ -2,6 +2,7 @@ import os
 import sys
 
 import httpx
+import litellm
 import pytest
 
 sys.path.insert(
@@ -14,6 +15,23 @@ from litellm.llms.openrouter.chat.transformation import (
     OpenrouterConfig,
     OpenRouterException,
 )
+
+
+@pytest.fixture(autouse=True)
+def openrouter_cache_control_model_metadata(monkeypatch):
+    cache_control_models = [
+        "openrouter/anthropic/claude-3.5-sonnet",
+        "openrouter/google/gemini-2.5-pro",
+    ]
+    for model in cache_control_models:
+        monkeypatch.setitem(
+            litellm.model_cost[model], "supports_native_cache_control", True
+        )
+    monkeypatch.setitem(
+        litellm.model_cost["openrouter/deepseek/deepseek-chat"],
+        "supports_native_cache_control",
+        False,
+    )
 
 
 class TestOpenRouterChatCompletionStreamingHandler:
@@ -118,6 +136,28 @@ def test_openrouter_cache_control_flag_removal():
     assert transformed_request["messages"][0].get("cache_control") is None
 
 
+def test_openrouter_strips_content_block_cache_control_for_unsupported_model():
+    transformed_request = OpenrouterConfig().transform_request(
+        model="openrouter/deepseek/deepseek-chat",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Hello, world!",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        ],
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+    assert "cache_control" not in transformed_request["messages"][0]["content"][0]
+
 
 def test_openrouter_transform_request_with_cache_control():
     """
@@ -142,7 +182,6 @@ def test_openrouter_transform_request_with_cache_control():
         ]
     }
     """
-    import json
     config = OpenrouterConfig()
     
     messages = [
@@ -167,15 +206,12 @@ def test_openrouter_transform_request_with_cache_control():
     ]
     
     transformed_request = config.transform_request(
-        model="openrouter/anthropic/claude-3-5-sonnet-20240620",
+        model="openrouter/anthropic/claude-3.5-sonnet",
         messages=messages,
         optional_params={},
         litellm_params={},
         headers={},
     )
-    
-    print("\n=== Transformed Request ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
     
     assert "messages" in transformed_request
     assert len(transformed_request["messages"]) == 2
@@ -218,7 +254,6 @@ def test_openrouter_transform_request_with_cache_control_list_content():
         ]
     }
     """
-    import json
     config = OpenrouterConfig()
     
     messages = [
@@ -243,15 +278,12 @@ def test_openrouter_transform_request_with_cache_control_list_content():
     ]
     
     transformed_request = config.transform_request(
-        model="openrouter/anthropic/claude-3-5-sonnet-20240620",
+        model="openrouter/anthropic/claude-3.5-sonnet",
         messages=messages,
         optional_params={},
         litellm_params={},
         headers={},
     )
-    
-    print("\n=== Transformed Request (List Content) ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
     
     assert "messages" in transformed_request
     assert len(transformed_request["messages"]) == 2
@@ -289,7 +321,6 @@ def test_openrouter_transform_request_with_cache_control_gemini():
         ]
     }
     """
-    import json
     config = OpenrouterConfig()
     
     messages = [
@@ -301,15 +332,12 @@ def test_openrouter_transform_request_with_cache_control_gemini():
     ]
     
     transformed_request = config.transform_request(
-        model="openrouter/google/gemini-2.0-flash-exp:free",
+        model="openrouter/google/gemini-2.5-pro",
         messages=messages,
         optional_params={},
         litellm_params={},
         headers={},
     )
-    
-    print("\n=== Transformed Request (Gemini) ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
     
     assert "messages" in transformed_request
     assert len(transformed_request["messages"]) == 1
@@ -329,7 +357,6 @@ def test_openrouter_transform_request_multiple_cache_controls():
     When a message has 5 content blocks with cache_control at message level,
     only the 5th block should have cache_control, not all 5 blocks.
     """
-    import json
     config = OpenrouterConfig()
     
     messages = [
@@ -347,15 +374,12 @@ def test_openrouter_transform_request_multiple_cache_controls():
     ]
     
     transformed_request = config.transform_request(
-        model="openrouter/anthropic/claude-3-5-sonnet-20240620",
+        model="openrouter/anthropic/claude-3.5-sonnet",
         messages=messages,
         optional_params={},
         litellm_params={},
         headers={},
     )
-    
-    print("\n=== Transformed Request (Multiple Blocks) ===")
-    print(json.dumps(transformed_request, indent=4, default=str))
     
     system_message = transformed_request["messages"][0]
     assert len(system_message["content"]) == 5

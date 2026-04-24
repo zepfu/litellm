@@ -687,6 +687,78 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["metadata"]["cc_version"] == "2.1.112"
 
 
+def test_build_session_history_record_prefers_explicit_metadata_tenant() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "responses"
+    kwargs["litellm_call_id"] = "call-explicit-tenant"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-explicit-tenant"
+    kwargs["litellm_params"]["metadata"]["user_api_key_org_id"] = "org-aawm"
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={"usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}},
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["tenant_id"] == "org-aawm"
+    assert record["metadata"]["tenant_id"] == "org-aawm"
+    assert record["metadata"]["tenant_id_source"] == "litellm_params.metadata.user_api_key_org_id"
+
+
+def test_build_session_history_record_uses_request_header_tenant_without_prompt_context() -> None:
+    kwargs = _base_kwargs()
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = []
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "responses"
+    kwargs["litellm_call_id"] = "call-header-tenant"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-header-tenant"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-aawm-tenant-id": "tenant-from-header"}
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={"usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}},
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["tenant_id"] == "tenant-from-header"
+    assert record["metadata"]["tenant_id"] == "tenant-from-header"
+    assert record["metadata"]["tenant_id_source"] == "request_headers"
+
+
+def test_build_session_history_record_calculates_gpt_5_5_cost_from_current_prices() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "responses"
+    kwargs["litellm_call_id"] = "call-gpt-55-cost"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-gpt-55-cost"
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 1000,
+                "total_tokens": 2000,
+            }
+        },
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["response_cost_usd"] == pytest.approx(0.035)
+
+
 def test_build_session_history_record_estimates_reasoning_when_provider_reports_zero() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -1294,6 +1366,50 @@ def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_
     assert record["provider_cache_miss_cost_usd"] is None
 
 
+def test_build_session_history_record_flows_nvidia_provider_cache_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "nvidia_nim/mistralai/devstral-2-123b-instruct-2512"
+    kwargs["custom_llm_provider"] = "nvidia_nim"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-nvidia-cache-metadata"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-nvidia-cache-metadata",
+            "nvidia_provider_cache_attempted": True,
+            "nvidia_provider_cache_status": "miss",
+            "nvidia_provider_cache_miss": True,
+            "nvidia_provider_cache_miss_reason": "nvidia_no_native_prompt_cache",
+            "nvidia_provider_cache_source": "anthropic_adapter.cache_control",
+        }
+    )
+
+    result = {
+        "id": "provider-response-nvidia-cache-metadata",
+        "usage": {
+            "prompt_tokens": 1536,
+            "completion_tokens": 7,
+            "total_tokens": 1543,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "nvidia output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "nvidia_nim"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "nvidia_no_native_prompt_cache"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
+
+
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="codex")
@@ -1707,6 +1823,44 @@ def test_build_session_history_record_from_spend_log_row_recovers_real_session_i
     assert "claude-thinking-signature" in record["metadata"]["request_tags"]
 
 
+def test_build_session_history_record_from_spend_log_row_restores_header_tenant() -> None:
+    spend_log_row = {
+        "request_id": "req-header-tenant",
+        "call_type": "responses",
+        "custom_llm_provider": "openai",
+        "model": "gpt-5.5",
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+        "session_id": "trace-header-tenant",
+        "metadata": {},
+        "proxy_server_request": {
+            "headers": {"X-AAWM-Tenant-ID": "tenant-from-spend-header"},
+            "body": {
+                "metadata": {"session_id": "session-header-tenant"},
+                "messages": [],
+            },
+        },
+        "response": {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+            },
+        },
+    }
+
+    record = _build_session_history_record_from_spend_log_row(
+        spend_log_row,
+        backfill_run_id="run-header-tenant",
+    )
+
+    assert record is not None
+    assert record["tenant_id"] == "tenant-from-spend-header"
+    assert record["metadata"]["tenant_id"] == "tenant-from-spend-header"
+    assert record["metadata"]["tenant_id_source"] == "request_headers"
+
+
 def test_build_session_history_record_from_spend_log_row_falls_back_to_legacy_trace_id() -> None:
     spend_log_row = {
         "request_id": "req-456",
@@ -1929,6 +2083,43 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["metadata"]["session_id_source"] == "trace.sessionId"
     assert record["metadata"]["trace_id_source"] == "trace.id"
     assert "route:anthropic_messages" in record["metadata"]["request_tags"]
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_prefers_metadata_tenant() -> None:
+    trace = {
+        "id": "trace-explicit-tenant",
+        "name": "claude-code.orchestrator",
+        "sessionId": "session-explicit-tenant",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "You are 'orchestrator' and you are working on the 'litellm' project.",
+                }
+            ]
+        },
+    }
+    observation = {
+        "id": "call-explicit-langfuse-tenant",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.5",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "metadata": {"user_api_key_org_id": "org-aawm"},
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-tenant",
+    )
+
+    assert record is not None
+    assert record["tenant_id"] == "org-aawm"
+    assert record["metadata"]["tenant_id"] == "org-aawm"
+    assert record["metadata"]["tenant_id_source"] == "observation.metadata.user_api_key_org_id"
 
 
 def test_build_session_history_record_from_langfuse_trace_observation_uses_tool_name_fallback() -> None:

@@ -6,7 +6,6 @@ Calls done in OpenAI/openai.py as OpenRouter is openai-compatible.
 Docs: https://openrouter.ai/docs/parameters
 """
 
-from enum import Enum
 from typing import Any, AsyncIterator, Iterator, List, Optional, Tuple, Union, cast
 
 import httpx
@@ -17,19 +16,10 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.llms.openrouter import OpenRouterErrorMessage
 from litellm.types.utils import ModelResponse, ModelResponseStream
+from litellm.utils import supports_native_cache_control
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 from ..common_utils import OpenRouterException
-
-
-class CacheControlSupportedModels(str, Enum):
-    """Models that support cache_control in content blocks."""
-
-    CLAUDE = "claude"
-    GEMINI = "gemini"
-    MINIMAX = "minimax"
-    GLM = "glm"
-    ZAI = "z-ai"
 
 
 class OpenrouterConfig(OpenAIGPTConfig):
@@ -80,12 +70,10 @@ class OpenrouterConfig(OpenAIGPTConfig):
         Check if the model supports cache_control in content blocks.
 
         Returns:
-            bool: True if model supports cache_control (Claude or Gemini models)
+            bool: True if model metadata declares native cache_control support.
         """
-        model_lower = model.lower()
-        return any(
-            supported_model.value in model_lower
-            for supported_model in CacheControlSupportedModels
+        return supports_native_cache_control(
+            model=model, custom_llm_provider="openrouter"
         )
 
     def remove_cache_control_flag_from_messages_and_tools(
