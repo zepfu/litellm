@@ -1039,9 +1039,20 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     warning_only = bool(config.get('warning_only'))
     hard_failures: list[str] = unique_failures
     soft_failures: list[str] = []
-    if warning_only:
+    (
+        hard_failures,
+        soft_failures,
+        unique_warnings,
+        runtime_log_summary,
+    ) = _provider_unavailable_failure_soft_fail_result(
+        failures=hard_failures,
+        warnings=unique_warnings,
+        config=config,
+        runtime_logs=runtime_log_summary,
+    )
+    if warning_only and not soft_failures:
         hard_failures, soft_failures = _split_warning_only_failures(
-            failures=unique_failures,
+            failures=hard_failures,
             config=config,
         )
     if warning_only and soft_failures:
@@ -1173,6 +1184,49 @@ def _provider_unavailable_timeout_error_result(
         ],
         'runtime_logs': runtime_logs,
     }
+
+
+def _provider_unavailable_failure_soft_fail_result(
+    *,
+    failures: list[str],
+    warnings: list[str],
+    config: dict[str, Any],
+    runtime_logs: dict[str, Any],
+) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
+    soft_timeout_config = config.get('soft_fail_timeout_runtime_log_check')
+    if not isinstance(soft_timeout_config, dict) or not failures:
+        return failures, [], warnings, runtime_logs
+    if any('runtime logs contained forbidden substring' in failure for failure in failures):
+        return failures, [], warnings, runtime_logs
+
+    required_substrings = [
+        value
+        for value in soft_timeout_config.get('required_substrings', [])
+        if isinstance(value, str) and value
+    ]
+    if not required_substrings:
+        return failures, [], warnings, runtime_logs
+
+    log_excerpt = runtime_logs.get('log_excerpt')
+    if not isinstance(log_excerpt, str) or not log_excerpt:
+        return failures, [], warnings, runtime_logs
+
+    matched_substrings = [
+        substring for substring in required_substrings if substring in log_excerpt
+    ]
+    runtime_logs = {
+        **runtime_logs,
+        'required_soft_fail_substrings': required_substrings,
+        'matched_soft_fail_substrings': matched_substrings,
+    }
+    if len(matched_substrings) != len(required_substrings):
+        return failures, [], warnings, runtime_logs
+
+    soft_failures = list(failures)
+    soft_warnings = [
+        f'provider-unavailable soft-fail: {failure}' for failure in soft_failures
+    ]
+    return [], soft_failures, sorted(set([*warnings, *soft_warnings])), runtime_logs
 
 
 def _write_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:

@@ -923,11 +923,20 @@ class LiteLLMAnthropicMessagesAdapter:
             metadata = anthropic_message_request["metadata"]
             if metadata and "user_id" in metadata:
                 new_kwargs["user"] = metadata["user_id"]
+            if isinstance(metadata, dict):
+                new_kwargs["metadata"] = dict(metadata)
 
         # Pass litellm proxy specific metadata
         if "litellm_metadata" in anthropic_message_request:
             # metadata will be passed to litellm.acompletion(), it's a litellm_param
-            new_kwargs["metadata"] = anthropic_message_request.pop("litellm_metadata")
+            litellm_metadata = anthropic_message_request.pop("litellm_metadata")
+            if isinstance(litellm_metadata, dict):
+                new_kwargs["metadata"] = {
+                    **new_kwargs.get("metadata", {}),
+                    **litellm_metadata,
+                }
+            else:
+                new_kwargs["metadata"] = litellm_metadata
 
         ## CONVERT TOOL CHOICE
         if "tool_choice" in anthropic_message_request:

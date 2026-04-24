@@ -115,6 +115,84 @@ def test_provider_unavailable_timeout_stays_hard_without_exact_log_signature(mon
     assert result is None
 
 
+def test_provider_unavailable_command_failure_can_soft_fail_with_exact_log_signature():
+    harness = _load_harness_module()
+
+    failures, soft_failures, warnings, runtime_logs = (
+        harness._provider_unavailable_failure_soft_fail_result(
+            failures=[
+                "claude_adapter_gpt_oss_120b command failed",
+                "missing claude_adapter_gpt_oss_120b trace name: claude-code.orchestrator",
+            ],
+            warnings=[],
+            config={
+                "soft_fail_timeout_runtime_log_check": {
+                    "required_substrings": [
+                        "OpenRouter adapter upstream attempt",
+                        "failed with 503",
+                        "provider=OpenInference",
+                        "raw=no healthy upstream",
+                    ]
+                }
+            },
+            runtime_logs={
+                "log_excerpt": (
+                    "OpenRouter adapter upstream attempt 1/4\n"
+                    "failed with 503 (ProxyException, provider=OpenInference, "
+                    "raw=no healthy upstream)"
+                )
+            },
+        )
+    )
+
+    assert failures == []
+    assert soft_failures == [
+        "claude_adapter_gpt_oss_120b command failed",
+        "missing claude_adapter_gpt_oss_120b trace name: claude-code.orchestrator",
+    ]
+    assert warnings
+    assert runtime_logs["matched_soft_fail_substrings"] == [
+        "OpenRouter adapter upstream attempt",
+        "failed with 503",
+        "provider=OpenInference",
+        "raw=no healthy upstream",
+    ]
+
+
+def test_provider_unavailable_command_failure_does_not_mask_runtime_log_failures():
+    harness = _load_harness_module()
+
+    failures, soft_failures, warnings, _ = (
+        harness._provider_unavailable_failure_soft_fail_result(
+            failures=[
+                "claude_adapter_gpt_oss_120b runtime logs contained forbidden substring `KeyError: 'choices'`",
+            ],
+            warnings=[],
+            config={
+                "soft_fail_timeout_runtime_log_check": {
+                    "required_substrings": [
+                        "OpenRouter adapter upstream attempt",
+                        "failed with 503",
+                        "provider=OpenInference",
+                        "raw=no healthy upstream",
+                    ]
+                }
+            },
+            runtime_logs={
+                "log_excerpt": (
+                    "OpenRouter adapter upstream attempt 1/4\n"
+                    "failed with 503 (ProxyException, provider=OpenInference, "
+                    "raw=no healthy upstream)"
+                )
+            },
+        )
+    )
+
+    assert failures
+    assert soft_failures == []
+    assert warnings == []
+
+
 def test_warning_only_noncritical_exception_remains_soft():
     harness = _load_harness_module()
 

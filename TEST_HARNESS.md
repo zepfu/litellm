@@ -381,7 +381,8 @@ The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
 
-Current minimum harness bundle version is `h-v0.0.12`; it includes the controlled
-Claude settings overlay, the longer peeromega fanout timeout for prod `:4000`
-validation, and the narrow OpenRouter provider-unavailable timeout classifier
-used by the prod promotion suite.
+Current minimum harness bundle version is `h-v0.0.13` once the current branch
+reaches `main`; it includes the controlled Claude settings overlay, the longer
+peeromega fanout timeout for prod `:4000` validation, and the narrow OpenRouter
+provider-unavailable timeout / command-failure classifier used by the prod
+promotion suite.
