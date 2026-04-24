@@ -3,7 +3,7 @@
 import json
 import traceback
 from collections import deque
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Optional
 
 from litellm import verbose_logger
 from litellm._uuid import uuid
@@ -27,9 +27,11 @@ class AnthropicResponsesStreamWrapper:
         self,
         responses_stream: Any,
         model: str,
+        request_body: Optional[dict[str, Any]] = None,
     ) -> None:
         self.responses_stream = responses_stream
         self.model = model
+        self.request_body = request_body or {}
         self._message_id: str = f"msg_{uuid.uuid4()}"
         self._current_block_index: int = -1
         # Map item_id -> content_block_index so we can stop the right block later
@@ -43,6 +45,72 @@ class AnthropicResponsesStreamWrapper:
         self._sent_message_start = False
         self._sent_message_stop = False
         self._chunk_queue: deque = deque()
+        self._output_text_parts: list[str] = []
+        self._text_delta_keys_seen: set[str] = set()
+
+    @staticmethod
+    def _estimate_token_count(value: Any) -> int:
+        if value is None:
+            return 1
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                text = str(value)
+        return max(1, (len(text) + 3) // 4)
+
+    @staticmethod
+    def _event_text_key(event: Any) -> str:
+        item_id = getattr(event, "item_id", None) or (
+            event.get("item_id") if isinstance(event, dict) else None
+        )
+        if isinstance(item_id, str) and item_id:
+            return item_id
+        output_index = getattr(event, "output_index", None) or (
+            event.get("output_index") if isinstance(event, dict) else None
+        )
+        if isinstance(output_index, int):
+            return f"output:{output_index}"
+        return "output:0"
+
+    def _get_or_create_text_block_index(self, item_id: Any = None) -> int:
+        if isinstance(item_id, str) and item_id in self._item_id_to_block_index:
+            return self._item_id_to_block_index[item_id]
+        if self._current_block_index >= 0 and not isinstance(item_id, str):
+            return self._current_block_index
+
+        block_idx = self._next_block_index()
+        if isinstance(item_id, str) and item_id:
+            self._item_id_to_block_index[item_id] = block_idx
+        self._chunk_queue.append(
+            {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {"type": "text", "text": ""},
+            }
+        )
+        return block_idx
+
+    def _build_fallback_usage_delta(self) -> Dict[str, Any]:
+        return {
+            "input_tokens": self._estimate_token_count(self.request_body),
+            "output_tokens": self._estimate_token_count(
+                "".join(self._output_text_parts)
+            ),
+        }
+
+    def _queue_synthetic_message_stop(self) -> None:
+        self._chunk_queue.append(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": self._build_fallback_usage_delta(),
+            }
+        )
+        self._chunk_queue.append({"type": "message_stop"})
+        self._sent_message_stop = True
 
     @staticmethod
     def _deserialize_tool_input(arguments: Any) -> Dict[str, Any]:
@@ -217,16 +285,38 @@ class AnthropicResponsesStreamWrapper:
             delta = getattr(event, "delta", "") or (
                 event.get("delta", "") if isinstance(event, dict) else ""
             )
-            block_idx = (
-                self._item_id_to_block_index.get(item_id, self._current_block_index)
-                if item_id
-                else self._current_block_index
-            )
+            if isinstance(delta, str) and delta:
+                self._output_text_parts.append(delta)
+                self._text_delta_keys_seen.add(self._event_text_key(event))
+            block_idx = self._get_or_create_text_block_index(item_id)
             self._chunk_queue.append(
                 {
                     "type": "content_block_delta",
                     "index": block_idx,
                     "delta": {"type": "text_delta", "text": delta},
+                }
+            )
+            return
+
+        # Some OpenRouter Responses streams omit `response.completed` and only
+        # provide the final text in `response.output_text.done`.
+        if event_type == "response.output_text.done":
+            item_id = getattr(event, "item_id", None) or (
+                event.get("item_id") if isinstance(event, dict) else None
+            )
+            text = getattr(event, "text", None) or (
+                event.get("text") if isinstance(event, dict) else None
+            )
+            text_key = self._event_text_key(event)
+            if not isinstance(text, str) or not text or text_key in self._text_delta_keys_seen:
+                return
+            self._output_text_parts.append(text)
+            block_idx = self._get_or_create_text_block_index(item_id)
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "text_delta", "text": text},
                 }
             )
             return
@@ -509,6 +599,10 @@ class AnthropicResponsesStreamWrapper:
         if not self._sent_message_start and not self._sent_message_stop:
             self._sent_message_start = True
             return self._make_message_start()
+
+        if self._sent_message_start and not self._sent_message_stop:
+            self._queue_synthetic_message_stop()
+            return self._chunk_queue.popleft()
 
         raise StopAsyncIteration
 

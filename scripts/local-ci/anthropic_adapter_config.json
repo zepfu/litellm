@@ -1010,7 +1010,7 @@
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"
       },
-      "timeout_seconds": 240,
+      "timeout_seconds": 420,
       "langfuse_poll_timeout_seconds": 90
     },
     "claude_adapter_gemini_fanout": {

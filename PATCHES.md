@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27` (26 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29` (28 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.27`.
+`1.82.3+aawm.29`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -915,6 +915,72 @@ GHCR image publishing workflow.
 
 **Validation status:** Version/docs-only follow-up on top of the already
 validated `aawm.26` code patch set.
+
+---
+
+### aawm.28 — Prod trace-user harness hardening
+
+**Files:**
+- `scripts/local-ci/run_acceptance.py`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `scripts/local-ci/harness-version.txt`
+- `TEST_HARNESS.md`
+- `COMPLETED.md`
+- `TODO.md`
+
+**Upstream issue:** The prod adapter harness must validate the user/session
+headers that the harness itself controls. Ambient Claude project/user settings
+can otherwise override `ANTHROPIC_CUSTOM_HEADERS`, making trace-user checks
+look like a product failure when the local test runner is the source of drift.
+
+**Fix:** Add a temporary per-run Claude `--settings` overlay for harness runs
+so `x-litellm-end-user-id` and `langfuse_trace_user_id` are injected by the
+harness and cannot be overridden by local operator settings. Basic OpenAI
+adapter smoke cases validate routing, usage/cost, Langfuse, runtime logs, and
+session history without requiring exact model text.
+
+**Why not upstream:** This is AAWM promotion-harness behavior for our local
+Claude/LiteLLM/Langfuse integration.
+
+**Validation status:** Full prod `:4000` default adapter harness passed on
+`1.82.3+aawm.28` before this follow-up OpenRouter stream hardening.
+
+---
+
+### aawm.29 — OpenRouter Responses missing-completed stream fallback
+
+**Files:**
+- `litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `scripts/local-ci/harness-version.txt`
+- `tests/test_litellm/`
+
+**Upstream issue:** Some OpenRouter Responses streams can terminate with
+`response.output_text.done` and `[DONE]` without a `response.completed` event.
+The upstream OpenAI passthrough logging path then cannot rebuild the final
+response, causing zero usage/cost in Langfuse and `public.session_history`.
+The Anthropic adapter stream can also finish without a final usage-bearing
+`message_delta`.
+
+**Fix:** Synthesize a valid Anthropic `message_delta` / `message_stop` with
+estimated usage when an upstream Responses stream ends without
+`response.completed`. The passthrough logging handler now builds a fallback
+`ModelResponse` from streamed text, estimates usage from the request/output,
+and calculates cost from the checked-in/bundled model-price JSON if
+`completion_cost()` cannot resolve a newly added OpenRouter free-model entry.
+The peeromega fanout harness timeout was raised to avoid treating slow real
+multi-agent provider fanout as an adapter failure.
+
+**Why not upstream:** This is defensive handling for the AAWM Anthropic ->
+OpenRouter Responses adapter and local cost-map release cadence.
+
+**Validation status:** Focused stream-wrapper and OpenAI passthrough logging
+tests pass locally. Isolated prod `gpt-oss-120b`, peeromega fanout, NVIDIA, and
+OpenRouter cases plus a full prod `:4000` harness run are required after
+promoting this patch into the prod container.
 
 ---
 
