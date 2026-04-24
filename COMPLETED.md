@@ -2,6 +2,9 @@
 
 ## 2026-04-24
 
+- Advanced the harness artifact to `h-v0.0.13` and prepared the follow-up `aawm.34` image tag.
+  The `aawm.33` main push correctly triggered the harness artifact autobump because the prod hardening changed harness code. Since the image publisher requires fork image tags to point at current `main`, `aawm.34` carries the same NVIDIA metadata-preservation fix plus the `h-v0.0.13` artifact bump.
+
 - Promoted the local prod `:4000` LiteLLM container to the `aawm.32` image and isolated the remaining NVIDIA blocker.
   Prod readiness reported LiteLLM `1.82.3+aawm.32`; `claude_adapter_peeromega_fanout`, `claude_adapter_openrouter_ling_26_flash`, and `claude_adapter_gpt_oss_120b` passed. Focused NVIDIA validation showed DeepSeek and GLM still landing Langfuse trace `environment=default` despite correct `session_history.litellm_environment=prod`, and MiniMax timed out at 300s.
 

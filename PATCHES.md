@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33` (32 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34` (33 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.33`.
+`1.82.3+aawm.34`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1111,6 +1111,34 @@ for NVIDIA/OpenRouter lanes and AAWM prod/dev harness policy.
 **Validation status:** Focused metadata-regression and harness-hardening tests
 pass locally. Publish/promote `aawm.33`, rerun focused prod NVIDIA/OpenRouter
 cases, then run the default prod `:4000` harness.
+
+---
+
+### aawm.34 — Release tag alignment after harness artifact autobump
+
+**Files:**
+- `pyproject.toml`
+- `scripts/local-ci/harness-version.txt`
+- `PATCHES.md`
+- `TODO.md`
+- `COMPLETED.md`
+
+**Upstream issue:** Publishing `aawm.33` to `main` correctly triggered the
+independent harness artifact autobump to `h-v0.0.13`. The guarded image
+publisher requires fork image tags to point at the current `main` head, so the
+pre-autobump `v1.82.3-aawm.33` tag was rejected.
+
+**Fix:** Fast-forward `develop` through the `h-v0.0.13` artifact bump and bump
+the fork-local version to `1.82.3+aawm.34` on the new main head. This preserves
+the published `aawm.33` tag while creating a valid image-publish tag for the
+same metadata-preservation fix plus the harness artifact update.
+
+**Why not upstream:** AAWM release-management guardrail for fork image tags and
+independent harness artifacts.
+
+**Validation status:** Version/docs-only follow-up on top of `aawm.33`; publish
+and promote `aawm.34`, then rerun focused prod NVIDIA/OpenRouter cases and the
+default prod `:4000` harness.
 
 ---
 
