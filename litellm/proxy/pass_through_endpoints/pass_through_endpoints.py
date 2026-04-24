@@ -1003,6 +1003,16 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         from litellm.types.utils import all_litellm_params
 
         _parsed_body = _parsed_body or {}
+        from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
+
+        request_headers = dict(request.headers) if request.headers is not None else None
+        resolved_end_user_id = (
+            get_end_user_id_from_request_body(
+                request_body=dict(_parsed_body),
+                request_headers=request_headers,
+            )
+            or user_api_key_dict.end_user_id
+        )
         safe_user_api_key_hash = (
             HttpPassThroughEndpointHelpers._get_safe_passthrough_user_api_key_hash(
                 request=request,
@@ -1026,7 +1036,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 user_api_key_org_id=user_api_key_dict.org_id,
                 user_api_key_project_id=user_api_key_dict.project_id,
                 user_api_key_team_alias=user_api_key_dict.team_alias,
-                user_api_key_end_user_id=user_api_key_dict.end_user_id,
+                user_api_key_end_user_id=resolved_end_user_id,
                 user_api_key_request_route=user_api_key_dict.request_route,
                 user_api_key_spend=user_api_key_dict.spend,
                 user_api_key_max_budget=user_api_key_dict.max_budget,
@@ -1047,6 +1057,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             _metadata.update(litellm_metadata)
         if metadata:
             _metadata.update(metadata)
+        if resolved_end_user_id:
+            _metadata["user_api_key_end_user_id"] = resolved_end_user_id
 
         _metadata = _update_metadata_with_tags_in_header(
             request=request,
