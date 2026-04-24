@@ -57,7 +57,7 @@ It shells out to the actual Claude CLI and verifies Langfuse plus
 `session_history` for adapted Anthropic-route models.
 
 Current first-wave adapted coverage:
-- OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`
+- OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`
 - Gemini fanout hard gate: `claude_adapter_gemini_fanout`
   - isolates the exact multi-Gemini dispatch path on `:4001`
   - use this before spending time on the full adapter suite when a Gemini
@@ -86,7 +86,7 @@ Current first-wave adapted coverage:
   Adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may still show up as adapter warning/backoff lines, but they should not produce the generic pass-through exception traceback for the current request path.
 
 Preferred Anthropic-adapter model spellings:
-- direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
+- direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
 - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
 - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/inclusionai/ling-2.6-flash:free`, `openrouter/google/gemma-4-31b-it:free`
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because routing is now provider-first

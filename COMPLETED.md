@@ -2,6 +2,12 @@
 
 ## 2026-04-23
 
+- Added LiteLLM runtime and initiating-client identity to `public.session_history`.
+  New rows now persist `litellm_environment`, `litellm_version`, `litellm_fork_version`, `litellm_wheel_versions`, `client_name`, `client_version`, and `client_user_agent`; the same values are mirrored into row metadata for Langfuse/backfill context. Live writes derive these from trace environment metadata, installed package versions, associated overlay/config version env vars, request User-Agent, and Claude Code billing headers. Backfill paths only use values already present in spend-log/Langfuse metadata.
+
+- Hardened the Anthropic adapter harness around the new runtime/client identity fields.
+  Dev/prod target profile selection now injects `expected_litellm_environment` into session-history checks, and the harness fails rows missing runtime version, fork version, wheel-version JSON, client name, or client version. The callback overlay source remains byte-for-byte synced with the in-repo dev callback and its wheel version is now `0.0.7`.
+
 - Repaired `public.session_history` observability gaps in the local `aawm_tristore` database.
   The repair normalized null providers, removed invalid `reasoning_tokens_source=provider_reported` rows with zero reported reasoning tokens, populated target-provider cache statuses, and recalculated cache miss token/cost fields where usage exposed cache-write tokens.
 
@@ -25,6 +31,21 @@
 
 - Added dev/prod target profiles to the Anthropic adapter harness.
   `--target dev` validates `:4001`, `litellm-dev`, and Langfuse trace environment `dev`; `--target prod` validates `:4000`, `aawm-litellm`, and Langfuse trace environment `prod`. The pass-through trace context helper now correctly preserves `session_id` and `trace_environment` metadata on rewritten requests.
+
+- Fixed OpenRouter Anthropic-adapter Responses handling found during prod cutover.
+  Native OpenRouter `/v1/responses` payloads now build a Responses-aware logging object instead of falling through OpenAI chat-completions parsing, preventing the prior async `KeyError: choices` logging exception while preserving Codex Responses `local_shell_call` output metadata. Translated Anthropic responses now strip stale upstream `content-length`, `content-encoding`, and `transfer-encoding` headers so synthesized bodies do not trigger `IncompleteRead` / `Too little data for declared Content-Length`. Validated on dev `:4001` with a direct `inclusionai/ling-2.6-flash:free` request returning a complete `200` response.
+
+- Hardened the Anthropic adapter harness against the prod cutover failure modes.
+  Runtime-log validation now defaults to failing on async task exceptions, ASGI exceptions, `KeyError: choices`, `h11` protocol errors, stale content-length failures, and upstream 429/5xx passthrough exceptions. Warning-only optional cases still allow configured quality mismatches, but no longer hide command timeouts or runtime-log hard failures. Added local harness unit coverage for timeout hard-fail behavior and default runtime-log detection.
+
+- Fixed the shared OpenAI Responses function-schema failure that was blocking the dev harness.
+  Anthropic-to-Responses tool translation now recursively normalizes nested object schemas, including `$defs` nodes that previously declared `type=object` without `properties`. That closes the upstream `400 Invalid schema for function ... object schema missing properties` failure seen on ChatGPT/Codex Responses traffic. Validated with focused passthrough regression tests, isolated live `claude_adapter_gpt54` / `claude_adapter_gpt54_mini` / `claude_adapter_ctx_marker` runs, and a clean full dev harness pass on `:4001`.
+
+- Fixed OpenAI passthrough reconstruction for reasoning-only Responses output items.
+  The passthrough logging handler now rebuilds valid `ModelResponse` objects when `response.completed` contains only `ResponseReasoningItem` output, including provider shapes that place reasoning text under `summary` or under `content[type=reasoning_text]`. That removes the prior `Error rebuilding complete responses API stream: Unknown items in responses API response: [ResponseReasoningItem(...)]` warning on `gpt-oss-120b` while preserving usage, hidden `responses_output`, and reasoning text on the reconstructed message. Validated with focused unit coverage plus an isolated live `claude_adapter_gpt_oss_120b` run on `:4001` and a clean overlapping `litellm-dev` log window.
+
+- Added GPT-5.5 support to the Anthropic -> OpenAI Responses adapter.
+  The adapter now allowlists `gpt-5.5` / `openai/gpt-5.5`, the local model cost maps include `gpt-5.5` and `chatgpt/gpt-5.5`, and the default Anthropic adapter harness includes `claude_adapter_gpt55`. The cost-map rates match the live Claude CLI `modelUsage` surfaced during validation. Validated with focused unit coverage, JSON/compile checks, and an isolated live `claude_adapter_gpt55` run on dev `:4001` with a clean overlapping `litellm-dev` log window.
 
 ## 2026-04-22
 

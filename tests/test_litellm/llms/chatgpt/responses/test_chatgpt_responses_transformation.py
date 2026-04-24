@@ -25,6 +25,7 @@ class TestChatGPTResponsesAPITransformation:
         [
             "chatgpt/gpt-5.4",
             "chatgpt/gpt-5.4-pro",
+            "chatgpt/gpt-5.5",
             "chatgpt/gpt-5.3-chat-latest",
             "chatgpt/gpt-5.3-instant",
             "chatgpt/gpt-5.3-codex",

@@ -4,7 +4,6 @@ OpenAI Passthrough Logging Handler
 Handles cost tracking and logging for OpenAI passthrough endpoints, specifically /chat/completions.
 """
 
-import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
@@ -157,7 +156,6 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         litellm_params["metadata"] = metadata
         kwargs["litellm_params"] = litellm_params
 
-
     @staticmethod
     def _backfill_responses_api_model_response(
         model_response: Optional[ModelResponse],
@@ -169,7 +167,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
         response_model = response_body.get("model")
         current_model = getattr(model_response, "model", None)
-        if not isinstance(current_model, str) or not current_model.strip() or current_model == "unknown":
+        if (
+            not isinstance(current_model, str)
+            or not current_model.strip()
+            or current_model == "unknown"
+        ):
             if isinstance(response_model, str) and response_model.strip():
                 model_response.model = response_model
             elif isinstance(fallback_model, str) and fallback_model.strip():
@@ -195,6 +197,173 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             hidden_params["responses_output"] = response_output
 
         return model_response
+
+    @staticmethod
+    def _extract_responses_api_output_text(response_body: dict) -> str:
+        output_text = response_body.get("output_text")
+        if isinstance(output_text, str):
+            return output_text
+
+        text_parts: List[str] = []
+        response_output = response_body.get("output")
+        if not isinstance(response_output, list):
+            return ""
+
+        for item in response_output:
+            if not isinstance(item, dict):
+                continue
+            item_text = item.get("text")
+            if isinstance(item_text, str):
+                text_parts.append(item_text)
+                continue
+
+            content = item.get("content")
+            if isinstance(content, str):
+                text_parts.append(content)
+                continue
+            if not isinstance(content, list):
+                continue
+            for content_item in content:
+                if not isinstance(content_item, dict):
+                    continue
+                content_text = content_item.get("text")
+                if isinstance(content_text, str):
+                    text_parts.append(content_text)
+
+        return "".join(text_parts)
+
+    @staticmethod
+    def _extract_responses_api_reasoning_summary_text(
+        response_output: Any,
+    ) -> Optional[str]:
+        if not isinstance(response_output, list):
+            return None
+
+        reasoning_parts: List[str] = []
+        for item in response_output:
+            item_type = (
+                item.get("type")
+                if isinstance(item, dict)
+                else getattr(item, "type", None)
+            )
+            if item_type != "reasoning":
+                continue
+
+            summary_items = (
+                item.get("summary")
+                if isinstance(item, dict)
+                else getattr(item, "summary", None)
+            )
+            if not isinstance(summary_items, list):
+                summary_items = []
+
+            for summary_item in summary_items:
+                summary_text = (
+                    summary_item.get("text")
+                    if isinstance(summary_item, dict)
+                    else getattr(summary_item, "text", None)
+                )
+                if isinstance(summary_text, str) and summary_text:
+                    reasoning_parts.append(summary_text)
+
+            content_items = (
+                item.get("content")
+                if isinstance(item, dict)
+                else getattr(item, "content", None)
+            )
+            if not isinstance(content_items, list):
+                continue
+
+            for content_item in content_items:
+                content_text = (
+                    content_item.get("text")
+                    if isinstance(content_item, dict)
+                    else getattr(content_item, "text", None)
+                )
+                if not isinstance(content_text, str) or not content_text:
+                    content_text = (
+                        content_item.get("reasoning")
+                        if isinstance(content_item, dict)
+                        else getattr(content_item, "reasoning", None)
+                    )
+                if isinstance(content_text, str) and content_text:
+                    reasoning_parts.append(content_text)
+
+        return "\n\n".join(reasoning_parts) if reasoning_parts else None
+
+    @staticmethod
+    def _build_responses_api_fallback_model_response(
+        response_body: dict,
+        fallback_model: str,
+        assistant_content: str,
+        reasoning_content: Optional[str] = None,
+        responses_output: Optional[List[Any]] = None,
+        raw_hidden_params: Optional[dict] = None,
+    ) -> ModelResponse:
+        model_response = litellm.ModelResponse()
+        response_model = response_body.get("model")
+        model_response.model = (
+            response_model
+            if isinstance(response_model, str) and response_model.strip()
+            else fallback_model
+        )
+
+        model_response.choices = [
+            Choices(
+                message=Message(
+                    role="assistant",
+                    content=assistant_content,
+                    reasoning_content=reasoning_content,
+                ),
+                finish_reason="stop",
+                index=0,
+            )
+        ]
+
+        response_usage = response_body.get("usage")
+        if isinstance(response_usage, dict):
+            model_response.usage = (
+                ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+                    response_usage
+                )
+            )
+
+        response_id = response_body.get("id")
+        if isinstance(response_id, str) and response_id:
+            model_response.id = response_id
+        response_created = response_body.get("created_at", response_body.get("created"))
+        if isinstance(response_created, int):
+            model_response.created = response_created
+
+        hidden_params = getattr(model_response, "_hidden_params", None)
+        if not isinstance(hidden_params, dict):
+            hidden_params = {}
+            model_response._hidden_params = hidden_params
+
+        if isinstance(raw_hidden_params, dict) and raw_hidden_params:
+            hidden_params.update(raw_hidden_params)
+        if responses_output:
+            hidden_params["responses_output"] = responses_output
+
+        return model_response
+
+    @staticmethod
+    def _build_responses_api_model_response_from_body(
+        response_body: dict,
+        fallback_model: str,
+    ) -> ModelResponse:
+        response_output = response_body.get("output")
+        return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
+            response_body=response_body,
+            fallback_model=fallback_model,
+            assistant_content=OpenAIPassthroughLoggingHandler._extract_responses_api_output_text(
+                response_body
+            ),
+            reasoning_content=OpenAIPassthroughLoggingHandler._extract_responses_api_reasoning_summary_text(
+                response_output
+            ),
+            responses_output=response_output if isinstance(response_output, list) else None,
+        )
 
     @staticmethod
     def _response_output_stream_key(
@@ -561,21 +730,32 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 litellm_model_response._hidden_params["response_cost"] = response_cost
             elif is_responses:
                 # Handle responses API cost calculation
-                provider_config = handler_instance.get_provider_config(model=model)
                 existing_litellm_params = kwargs.get("litellm_params", {}) or {}
-                litellm_model_response = provider_config.transform_response(
-                    raw_response=httpx_response,
-                    model_response=litellm.ModelResponse(),
-                    model=model,
-                    messages=request_body.get("messages", []),
-                    logging_obj=logging_obj,
-                    optional_params=request_body.get("optional_params", {}),
-                    api_key="",
-                    request_data=request_body,
-                    encoding=litellm.encoding,
-                    json_mode=False,
-                    litellm_params=existing_litellm_params,
-                )
+                if (
+                    response_body.get("object") == "response"
+                    or isinstance(response_body.get("output"), list)
+                ):
+                    litellm_model_response = (
+                        handler_instance._build_responses_api_model_response_from_body(
+                            response_body=response_body,
+                            fallback_model=model,
+                        )
+                    )
+                else:
+                    provider_config = handler_instance.get_provider_config(model=model)
+                    litellm_model_response = provider_config.transform_response(
+                        raw_response=httpx_response,
+                        model_response=litellm.ModelResponse(),
+                        model=model,
+                        messages=request_body.get("messages", []),
+                        logging_obj=logging_obj,
+                        optional_params=request_body.get("optional_params", {}),
+                        api_key="",
+                        request_data=request_body,
+                        encoding=litellm.encoding,
+                        json_mode=False,
+                        litellm_params=existing_litellm_params,
+                    )
                 litellm_model_response = handler_instance._backfill_responses_api_model_response(
                     litellm_model_response,
                     response_body,
@@ -822,44 +1002,44 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 responses_output if isinstance(responses_output, list) else [],
                 reconstructed_output,
             )
-            if len(getattr(completed_response, "output", []) or []) == 0:
-                model_response = litellm.ModelResponse()
-                model_response.model = getattr(completed_response, "model", None) or model
-                model_response.choices = [
-                    Choices(
-                        message=Message(
-                            role="assistant", content="".join(output_text_parts)
-                        ),
-                        finish_reason="stop",
-                        index=0,
-                    )
-                ]
-                model_response.usage = (
-                    ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
-                        completed_response_payload.get("usage")
-                    )
-                )
-                raw_response_hidden_params = getattr(
-                    completed_response, "_hidden_params", {}
-                )
-                if raw_response_hidden_params:
-                    model_response._hidden_params.update(raw_response_hidden_params)
-                if merged_output:
-                    model_response._hidden_params["responses_output"] = merged_output
-                return model_response
-
-            model_response = responses_transformer.transform_response(
-                model=model,
-                raw_response=completed_response,
-                model_response=litellm.ModelResponse(),
-                logging_obj=litellm_logging_obj,
-                request_data=request_body,
-                messages=request_body.get("messages", []),
-                optional_params=request_body.get("optional_params", {}),
-                litellm_params=litellm_params,
-                encoding=litellm.encoding,
-                json_mode=False,
+            reasoning_summary_text = OpenAIPassthroughLoggingHandler._extract_responses_api_reasoning_summary_text(
+                merged_output
             )
+            raw_response_hidden_params = getattr(completed_response, "_hidden_params", {})
+            if len(getattr(completed_response, "output", []) or []) == 0:
+                return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
+                    response_body=completed_response_payload,
+                    fallback_model=model,
+                    assistant_content="".join(output_text_parts),
+                    reasoning_content=reasoning_summary_text,
+                    responses_output=merged_output,
+                    raw_hidden_params=raw_response_hidden_params,
+                )
+
+            try:
+                model_response = responses_transformer.transform_response(
+                    model=model,
+                    raw_response=completed_response,
+                    model_response=litellm.ModelResponse(),
+                    logging_obj=litellm_logging_obj,
+                    request_data=request_body,
+                    messages=request_body.get("messages", []),
+                    optional_params=request_body.get("optional_params", {}),
+                    litellm_params=litellm_params,
+                    encoding=litellm.encoding,
+                    json_mode=False,
+                )
+            except ValueError as e:
+                if reasoning_summary_text and "Unknown items in responses API response" in str(e):
+                    return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
+                        response_body=completed_response_payload,
+                        fallback_model=model,
+                        assistant_content="".join(output_text_parts),
+                        reasoning_content=reasoning_summary_text,
+                        responses_output=merged_output,
+                        raw_hidden_params=raw_response_hidden_params,
+                    )
+                raise
             backfilled_response = self._backfill_responses_api_model_response(
                 model_response,
                 completed_response_payload,
