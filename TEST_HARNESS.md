@@ -134,6 +134,13 @@ suite when the upstream provider is noisy:
 - `openrouter/free`
 - `inclusionai/ling-2.6-flash:free`
 - `openai/gpt-oss-20b:free`
+  - excluded from the default full suite; run explicitly with
+    `--cases claude_adapter_gpt_oss_20b` when this edge OpenRouter target needs
+    validation
+- `openai/gpt-oss-120b:free`
+  - excluded from the default full suite; run explicitly with
+    `--cases claude_adapter_gpt_oss_120b` when this edge OpenRouter target needs
+    validation
 - `google/gemma-4-31b-it:free`
 - `google/gemma-4-26b-a4b-it:free`
 - `nvidia/nemotron-3-super-120b-a12b:free`
@@ -142,6 +149,8 @@ suite when the upstream provider is noisy:
 
 Keep these out of the standard adapter harness run for now:
 
+- `openai/gpt-oss-20b:free`
+- `openai/gpt-oss-120b:free`
 - `meta-llama/llama-3.3-70b-instruct:free`
 - `minimax/minimax-m2.5:free`
 
