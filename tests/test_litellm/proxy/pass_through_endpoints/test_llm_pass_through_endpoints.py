@@ -3471,6 +3471,11 @@ class TestClaudePersistedOutputExpansion:
         request_body = {
             "model": requested_model,
             "max_tokens": 256,
+            "metadata": {"existing_key": "existing-value"},
+            "litellm_metadata": {
+                "session_id": "nvidia-session-1",
+                "trace_environment": "prod",
+            },
             "messages": [{"role": "user", "content": "Say model ok"}],
         }
 
@@ -3535,6 +3540,9 @@ class TestClaudePersistedOutputExpansion:
         assert call_kwargs["max_retries"] == 0
         assert "standard_callback_dynamic_params" not in call_kwargs
         assert call_kwargs["model"] == expected_model
+        assert call_kwargs["metadata"]["existing_key"] == "existing-value"
+        assert call_kwargs["metadata"]["session_id"] == "nvidia-session-1"
+        assert call_kwargs["metadata"]["trace_environment"] == "prod"
         assert (
             call_kwargs["litellm_metadata"]["passthrough_route_family"]
             == "anthropic_nvidia_completion_adapter"

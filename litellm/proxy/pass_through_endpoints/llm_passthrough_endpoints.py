@@ -4091,6 +4091,30 @@ def _build_anthropic_response_from_responses_response(
     )
 
 
+def _build_completion_adapter_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    metadata = dict(request_body.get("metadata") or {})
+    litellm_metadata = request_body.get("litellm_metadata")
+    if not isinstance(litellm_metadata, dict):
+        return metadata
+
+    # Normal completion callbacks turn metadata.trace_* into Langfuse trace
+    # fields. Keep provider-specific litellm_metadata intact, but mirror the
+    # trace context into metadata so completion adapters match passthrough logs.
+    for key in (
+        "session_id",
+        "trace_id",
+        "existing_trace_id",
+        "trace_name",
+        "trace_environment",
+    ):
+        value = litellm_metadata.get(key)
+        if value and not metadata.get(key):
+            metadata[key] = value
+    return metadata
+
+
 def _normalize_openai_function_tool_parameters(parameters: Any) -> dict[str, Any]:
     if not isinstance(parameters, dict):
         return {"type": "object", "properties": {}}
@@ -4891,7 +4915,7 @@ async def _handle_anthropic_nvidia_completion_adapter_route(
             max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
             messages=prepared_request_body.get("messages") or [],
             model=adapter_model,
-            metadata=prepared_request_body.get("metadata") or {},
+            metadata=_build_completion_adapter_metadata(prepared_request_body),
             stop_sequences=prepared_request_body.get("stop_sequences"),
             stream=upstream_stream,
             system=prepared_request_body.get("system"),
@@ -5011,7 +5035,7 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
             max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
             messages=prepared_request_body.get("messages") or [],
             model=adapter_model,
-            metadata=prepared_request_body.get("metadata") or {},
+            metadata=_build_completion_adapter_metadata(prepared_request_body),
             stop_sequences=prepared_request_body.get("stop_sequences"),
             stream=client_requested_stream,
             system=prepared_request_body.get("system"),

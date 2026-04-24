@@ -34,6 +34,87 @@ def test_warning_only_timeout_still_fails_hard():
     assert result.get("soft_failures") in (None, [])
 
 
+def test_provider_unavailable_timeout_can_soft_fail_with_exact_log_signature(monkeypatch):
+    harness = _load_harness_module()
+
+    def fake_read_runtime_logs_since(**kwargs):
+        return (
+            {"docker_logs_exit_code": 0, "log_excerpt": "provider unavailable"},
+            (
+                "OpenRouter adapter upstream attempt 1/4\n"
+                "failed with 503 (ProxyException, provider=OpenInference, "
+                "raw=no healthy upstream)"
+            ),
+        )
+
+    monkeypatch.setattr(
+        harness,
+        "_read_runtime_logs_since",
+        fake_read_runtime_logs_since,
+    )
+
+    result = harness._provider_unavailable_timeout_error_result(
+        "claude_adapter_gpt_oss_120b",
+        subprocess.TimeoutExpired(["claude"], 180),
+        {
+            "soft_fail_timeout_runtime_log_check": {
+                "required_substrings": [
+                    "OpenRouter adapter upstream attempt",
+                    "failed with 503",
+                    "provider=OpenInference",
+                    "raw=no healthy upstream",
+                ]
+            },
+            "runtime_postconditions": {"docker_container_name": "aawm-litellm"},
+        },
+        started="2026-04-24T11:12:45+00:00",
+    )
+
+    assert result is not None
+    assert result["passed"] is True
+    assert result["failures"] == []
+    assert result["soft_failures"]
+    assert result["warnings"]
+    assert result["runtime_logs"]["matched_required_substrings"] == [
+        "OpenRouter adapter upstream attempt",
+        "failed with 503",
+        "provider=OpenInference",
+        "raw=no healthy upstream",
+    ]
+
+
+def test_provider_unavailable_timeout_stays_hard_without_exact_log_signature(monkeypatch):
+    harness = _load_harness_module()
+
+    monkeypatch.setattr(
+        harness,
+        "_read_runtime_logs_since",
+        lambda **kwargs: (
+            {"docker_logs_exit_code": 0, "log_excerpt": "adapter traceback"},
+            "OpenRouter adapter upstream attempt but local adapter failed",
+        ),
+    )
+
+    result = harness._provider_unavailable_timeout_error_result(
+        "claude_adapter_gpt_oss_120b",
+        subprocess.TimeoutExpired(["claude"], 180),
+        {
+            "soft_fail_timeout_runtime_log_check": {
+                "required_substrings": [
+                    "OpenRouter adapter upstream attempt",
+                    "failed with 503",
+                    "provider=OpenInference",
+                    "raw=no healthy upstream",
+                ]
+            },
+            "runtime_postconditions": {"docker_container_name": "aawm-litellm"},
+        },
+        started="2026-04-24T11:12:45+00:00",
+    )
+
+    assert result is None
+
+
 def test_warning_only_noncritical_exception_remains_soft():
     harness = _load_harness_module()
 

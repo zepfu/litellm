@@ -1559,6 +1559,15 @@
         }
       },
       "allow_zero_cost": true,
+      "soft_fail_timeout_runtime_log_check": {
+        "tail_lines": 1200,
+        "required_substrings": [
+          "OpenRouter adapter upstream attempt",
+          "failed with 503",
+          "provider=OpenInference",
+          "raw=no healthy upstream"
+        ]
+      },
       "skip_generation_quality_checks": true,
       "runtime_postconditions": {
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",

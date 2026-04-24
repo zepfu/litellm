@@ -100,6 +100,12 @@ non-zero estimated usage/cost using the checked-in/bundled model-price JSON
 when LiteLLM's loaded runtime cost map does not yet include the OpenRouter free
 model alias.
 
+`claude_adapter_gpt_oss_120b` remains a hard OpenRouter gate. The only allowed
+timeout soft-fail is the narrow provider-unavailable case where the overlapping
+runtime logs contain the OpenRouter adapter attempt plus `503`,
+`provider=OpenInference`, and `raw=no healthy upstream`. Other timeouts still
+fail hard so local adapter or logging regressions are not hidden.
+
 ## Current model policy
 
 ### Hard gates
@@ -377,4 +383,5 @@ for the bundle-local usage notes.
 
 Current minimum harness bundle version is `h-v0.0.11`; it includes the controlled
 Claude settings overlay and the longer peeromega fanout timeout for prod `:4000`
-validation.
+validation. The next harness bundle, `h-v0.0.12`, adds the narrow OpenRouter
+provider-unavailable timeout classifier used by the prod promotion suite.

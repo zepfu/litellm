@@ -312,6 +312,43 @@ def _validate_runtime_postcondition(*, family: str, litellm_base_url: str, check
     return summary, failures
 
 
+def _read_runtime_logs_since(
+    *,
+    started: Any,
+    checks: dict[str, Any],
+    runtime_postconditions: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    container_name = (
+        checks.get('docker_container_name')
+        or runtime_postconditions.get('docker_container_name')
+        or 'litellm-dev'
+    )
+    tail_lines = int(checks.get('tail_lines') or 400)
+    summary: dict[str, Any] = {
+        'docker_container_name': container_name,
+        'tail_lines': tail_lines,
+        'docker_logs_exit_code': None,
+        'log_excerpt': '',
+    }
+    if not container_name:
+        return summary, ''
+
+    since_value = started.isoformat() if hasattr(started, 'isoformat') else str(started)
+    result = subprocess.run(
+        ['docker', 'logs', '--since', since_value, '--tail', str(tail_lines), container_name],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    log_text = '\n'.join(
+        value for value in (result.stdout, result.stderr) if isinstance(value, str) and value
+    )
+    summary['docker_logs_exit_code'] = result.returncode
+    summary['log_excerpt'] = log_text[-4000:] if log_text else ''
+    return summary, log_text
+
+
 def _validate_runtime_logs(
     *,
     family: str,
@@ -350,23 +387,17 @@ def _validate_runtime_logs(
     if not container_name or not forbidden_substrings:
         return summary, failures, warnings
 
-    since_value = started.isoformat() if hasattr(started, 'isoformat') else str(started)
-    result = subprocess.run(
-        ['docker', 'logs', '--since', since_value, '--tail', str(tail_lines), container_name],
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-        check=False,
+    log_summary, log_text = _read_runtime_logs_since(
+        started=started,
+        checks={'docker_container_name': container_name, 'tail_lines': tail_lines},
+        runtime_postconditions=runtime_postconditions,
     )
-    log_text = '\n'.join(
-        value for value in (result.stdout, result.stderr) if isinstance(value, str) and value
-    )
-    summary['docker_logs_exit_code'] = result.returncode
-    summary['log_excerpt'] = log_text[-4000:] if log_text else ''
+    summary['docker_logs_exit_code'] = log_summary.get('docker_logs_exit_code')
+    summary['log_excerpt'] = log_summary.get('log_excerpt', '')
 
-    if result.returncode != 0:
+    if summary['docker_logs_exit_code'] != 0:
         warnings.append(
-            f'{family} runtime log check could not read docker logs for `{container_name}` (exit {result.returncode})'
+            f'{family} runtime log check could not read docker logs for `{container_name}` (exit {summary["docker_logs_exit_code"]})'
         )
         return summary, failures, warnings
 
@@ -1086,6 +1117,64 @@ def _warning_only_error_result(
     }
 
 
+def _provider_unavailable_timeout_error_result(
+    family: str,
+    exc: Exception,
+    config: dict[str, Any],
+    *,
+    started: Any,
+) -> dict[str, Any] | None:
+    soft_timeout_config = config.get('soft_fail_timeout_runtime_log_check')
+    if not isinstance(soft_timeout_config, dict):
+        return None
+    if not isinstance(exc, subprocess.TimeoutExpired):
+        return None
+
+    required_substrings = [
+        value
+        for value in soft_timeout_config.get('required_substrings', [])
+        if isinstance(value, str) and value
+    ]
+    if not required_substrings:
+        return None
+
+    runtime_postconditions = dict(config.get('runtime_postconditions') or {})
+    runtime_logs, log_text = _read_runtime_logs_since(
+        started=started,
+        checks={
+            'docker_container_name': (
+                soft_timeout_config.get('docker_container_name')
+                or runtime_postconditions.get('docker_container_name')
+            ),
+            'tail_lines': soft_timeout_config.get('tail_lines', 800),
+        },
+        runtime_postconditions=runtime_postconditions,
+    )
+    matched_substrings = [
+        substring for substring in required_substrings if substring in log_text
+    ]
+    runtime_logs['required_substrings'] = required_substrings
+    runtime_logs['matched_required_substrings'] = matched_substrings
+    if runtime_logs.get('docker_logs_exit_code') != 0:
+        return None
+    if len(matched_substrings) != len(required_substrings):
+        return None
+
+    base = RA._family_error_result(family, exc)
+    failures = list(base.get('failures', []))
+    return {
+        **base,
+        'passed': True,
+        'failures': [],
+        'soft_failures': failures,
+        'warnings': [
+            f'provider-unavailable timeout soft-fail: {failure}'
+            for failure in failures
+        ],
+        'runtime_logs': runtime_logs,
+    }
+
+
 def _write_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:
     path.write_text(json.dumps(artifact, indent=2) + '\n', encoding='utf-8')
 
@@ -1210,6 +1299,7 @@ def main() -> int:
 
     for case_name in selected_cases:
         print(f'[start] {case_name}', file=sys.stderr, flush=True)
+        case_started = RA._utcnow()
         try:
             missing_required_env = _missing_required_env(cases[case_name])
             if missing_required_env:
@@ -1232,7 +1322,15 @@ def main() -> int:
                 litellm_base_url=litellm_base_url,
             )
         except Exception as exc:
-            if bool(cases[case_name].get('warning_only')):
+            provider_unavailable_timeout = _provider_unavailable_timeout_error_result(
+                case_name,
+                exc,
+                cases[case_name],
+                started=case_started,
+            )
+            if provider_unavailable_timeout is not None:
+                artifact['results'][case_name] = provider_unavailable_timeout
+            elif bool(cases[case_name].get('warning_only')):
                 artifact['results'][case_name] = _warning_only_error_result(
                     case_name,
                     exc,
