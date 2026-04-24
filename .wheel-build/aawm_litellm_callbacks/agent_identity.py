@@ -35,6 +35,8 @@ import shlex
 import threading
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
+from importlib import metadata as importlib_metadata
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
@@ -100,6 +102,54 @@ _AAWM_DB_URL_ENV_VARS = (
     "AAWM_DATABASE_URL",
     "AAWM_POSTGRES_URL",
 )
+_AAWM_LITELLM_ENVIRONMENT_ENV_VARS = (
+    "AAWM_LITELLM_ENVIRONMENT",
+    "LITELLM_INSTANCE_ENVIRONMENT",
+    "LITELLM_ENVIRONMENT",
+    "LITELLM_ENV",
+    "LITELLM_LANGFUSE_TRACE_ENVIRONMENT",
+    "LANGFUSE_TRACING_ENVIRONMENT",
+    "AAWM_ENVIRONMENT",
+)
+_AAWM_LITELLM_VERSION_ENV_VARS = (
+    "AAWM_LITELLM_VERSION",
+    "LITELLM_VERSION",
+)
+_AAWM_LITELLM_FORK_VERSION_ENV_VARS = (
+    "AAWM_LITELLM_FORK_VERSION",
+    "LITELLM_FORK_VERSION",
+)
+_AAWM_ASSOCIATED_WHEEL_PACKAGES = (
+    "litellm",
+    "aawm-litellm-callbacks",
+    "aawm-litellm-control-plane",
+)
+_AAWM_ASSOCIATED_VERSION_ENV_VARS = {
+    "aawm-litellm-callbacks": (
+        "AAWM_CALLBACK_WHEEL_VERSION",
+        "AAWM_LITELLM_CALLBACKS_VERSION",
+    ),
+    "aawm-litellm-control-plane": (
+        "AAWM_CONTROL_PLANE_WHEEL_VERSION",
+        "AAWM_LITELLM_CONTROL_PLANE_VERSION",
+    ),
+    "litellm-model-config": (
+        "AAWM_MODEL_CONFIG_VERSION",
+        "LITELLM_MODEL_CONFIG_VERSION",
+    ),
+    "litellm-local-ci-harness": (
+        "AAWM_HARNESS_VERSION",
+        "LITELLM_LOCAL_CI_HARNESS_VERSION",
+    ),
+}
+_USER_AGENT_PRODUCT_RE = re.compile(
+    r"(?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})/"
+    r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})"
+)
+_USER_AGENT_PAREN_PRODUCT_RE = re.compile(
+    r"\((?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})\s*;\s*"
+    r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})\)"
+)
 _AAWM_SESSION_HISTORY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.session_history (
     id BIGSERIAL PRIMARY KEY,
@@ -139,6 +189,13 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     git_commit_count INTEGER NOT NULL DEFAULT 0,
     git_push_count INTEGER NOT NULL DEFAULT 0,
     response_cost_usd DOUBLE PRECISION,
+    litellm_environment TEXT,
+    litellm_version TEXT,
+    litellm_fork_version TEXT,
+    litellm_wheel_versions JSONB NOT NULL DEFAULT '{}'::jsonb,
+    client_name TEXT,
+    client_version TEXT,
+    client_user_agent TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 )
 """
@@ -153,10 +210,19 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_reason TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_token_count INTEGER",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_cost_usd DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_environment TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_version TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_fork_version TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_wheel_versions JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_name TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_version TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_user_agent TEXT",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON public.session_history (session_id, model, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_litellm_environment_created_idx ON public.session_history (litellm_environment, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_client_created_idx ON public.session_history (client_name, client_version, created_at DESC)",
 )
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
@@ -223,11 +289,19 @@ INSERT INTO public.session_history (
     git_commit_count,
     git_push_count,
     response_cost_usd,
+    litellm_environment,
+    litellm_version,
+    litellm_fork_version,
+    litellm_wheel_versions,
+    client_name,
+    client_version,
+    client_user_agent,
     metadata
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb, $31, $32, $33, $34, $35, $36::jsonb
+    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb,
+    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43::jsonb
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -312,6 +386,28 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         session_history.response_cost_usd,
         EXCLUDED.response_cost_usd
     ),
+    litellm_environment = COALESCE(
+        NULLIF(EXCLUDED.litellm_environment, ''),
+        session_history.litellm_environment
+    ),
+    litellm_version = COALESCE(
+        NULLIF(EXCLUDED.litellm_version, ''),
+        session_history.litellm_version
+    ),
+    litellm_fork_version = COALESCE(
+        NULLIF(EXCLUDED.litellm_fork_version, ''),
+        session_history.litellm_fork_version
+    ),
+    litellm_wheel_versions = COALESCE(session_history.litellm_wheel_versions, '{}'::jsonb) || COALESCE(EXCLUDED.litellm_wheel_versions, '{}'::jsonb),
+    client_name = COALESCE(NULLIF(EXCLUDED.client_name, ''), session_history.client_name),
+    client_version = COALESCE(
+        NULLIF(EXCLUDED.client_version, ''),
+        session_history.client_version
+    ),
+    client_user_agent = COALESCE(
+        NULLIF(EXCLUDED.client_user_agent, ''),
+        session_history.client_user_agent
+    ),
     metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL = """
@@ -364,8 +460,16 @@ ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
 """
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "trace_name",
+    "trace_environment",
     "cc_version",
     "cc_entrypoint",
+    "litellm_environment",
+    "litellm_version",
+    "litellm_fork_version",
+    "litellm_wheel_versions",
+    "client_name",
+    "client_version",
+    "client_user_agent",
     "route_tag",
     "reasoning_content_present",
     "thinking_signature_present",
@@ -608,6 +712,247 @@ def _build_aawm_dsn() -> Optional[str]:
         return dsn
 
     return _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
+
+
+def _clean_non_empty_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _first_non_empty_string(*values: Any) -> Optional[str]:
+    for value in values:
+        cleaned = _clean_non_empty_string(value)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _coerce_string_dict(value: Any) -> Dict[str, str]:
+    parsed_value = _safe_json_load(value, value)
+    if not isinstance(parsed_value, dict):
+        return {}
+
+    result: Dict[str, str] = {}
+    for key, nested_value in parsed_value.items():
+        key_text = _clean_non_empty_string(key)
+        value_text = _clean_non_empty_string(nested_value)
+        if key_text and value_text:
+            result[key_text] = value_text
+    return result
+
+
+def _get_header_value(headers: Any, *names: str) -> Optional[str]:
+    if not headers:
+        return None
+    if not isinstance(headers, dict):
+        try:
+            headers = dict(headers)
+        except (TypeError, ValueError):
+            return None
+
+    wanted = {name.lower() for name in names}
+    for key, value in headers.items():
+        if str(key).lower() in wanted:
+            return _clean_non_empty_string(value)
+    return None
+
+
+def _extract_request_headers_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    header_sources = (
+        _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "headers"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers"),
+        _maybe_get_path(kwargs.get("standard_logging_object"), "request_headers"),
+        _maybe_get_path(kwargs.get("standard_logging_object"), "headers"),
+    )
+    merged: Dict[str, Any] = {}
+    for headers in header_sources:
+        if not headers:
+            continue
+        if not isinstance(headers, dict):
+            try:
+                headers = dict(headers)
+            except (TypeError, ValueError):
+                continue
+        merged.update(headers)
+    return merged
+
+
+@lru_cache(maxsize=1)
+def _resolve_runtime_litellm_version() -> Optional[str]:
+    env_version = _get_first_secret_value(_AAWM_LITELLM_VERSION_ENV_VARS)
+    if env_version:
+        return env_version
+
+    try:
+        from litellm._version import version as litellm_version
+
+        cleaned_version = _clean_non_empty_string(litellm_version)
+        if cleaned_version and cleaned_version.lower() != "unknown":
+            return cleaned_version
+    except Exception:
+        pass
+
+    try:
+        return _clean_non_empty_string(importlib_metadata.version("litellm"))
+    except Exception:
+        return None
+
+
+def _derive_fork_version(litellm_version: Optional[str]) -> Optional[str]:
+    env_version = _get_first_secret_value(_AAWM_LITELLM_FORK_VERSION_ENV_VARS)
+    if env_version:
+        return env_version
+    if not litellm_version:
+        return None
+    if "+" not in litellm_version:
+        return None
+    local_version = litellm_version.split("+", 1)[1].strip()
+    return local_version or None
+
+
+@lru_cache(maxsize=1)
+def _resolve_runtime_wheel_versions() -> Dict[str, str]:
+    versions: Dict[str, str] = {}
+    for package_name in _AAWM_ASSOCIATED_WHEEL_PACKAGES:
+        try:
+            version = _clean_non_empty_string(importlib_metadata.version(package_name))
+        except Exception:
+            version = None
+        if version:
+            versions[package_name] = version
+
+    for package_name, env_vars in _AAWM_ASSOCIATED_VERSION_ENV_VARS.items():
+        version = _get_first_secret_value(env_vars)
+        if version:
+            versions[package_name] = version
+    return versions
+
+
+def _parse_client_identity_from_user_agent(
+    user_agent: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    if not user_agent:
+        return None, None
+
+    known_patterns = (
+        (re.compile(r"\bclaude-code/(?P<version>[A-Za-z0-9.+_-]+)"), "claude-code"),
+        (re.compile(r"\bcodex-tui/(?P<version>[A-Za-z0-9.+_-]+)"), "codex-tui"),
+        (re.compile(r"\bOpenAI/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "openai-python"),
+        (re.compile(r"\bAnthropic/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "anthropic-python"),
+    )
+    for pattern, client_name in known_patterns:
+        match = pattern.search(user_agent)
+        if match:
+            return client_name, match.group("version")
+
+    for pattern in (_USER_AGENT_PRODUCT_RE, _USER_AGENT_PAREN_PRODUCT_RE):
+        match = pattern.search(user_agent)
+        if match:
+            return match.group("name"), match.group("version")
+
+    return None, None
+
+
+def _extract_claude_code_version_from_metadata(
+    metadata: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    billing_header_fields = metadata.get("anthropic_billing_header_fields")
+    if not isinstance(billing_header_fields, dict):
+        billing_header_fields = {}
+    return (
+        _first_non_empty_string(metadata.get("cc_version"), billing_header_fields.get("cc_version")),
+        _first_non_empty_string(metadata.get("cc_entrypoint"), billing_header_fields.get("cc_entrypoint")),
+    )
+
+
+def _build_session_runtime_identity(
+    *,
+    metadata: Dict[str, Any],
+    kwargs: Optional[Dict[str, Any]] = None,
+    trace_environment: Any = None,
+    allow_runtime: bool = True,
+) -> Dict[str, Any]:
+    headers = _extract_request_headers_from_kwargs(kwargs or {})
+    user_agent = _first_non_empty_string(
+        metadata.get("client_user_agent"),
+        metadata.get("user_agent"),
+        metadata.get("http_user_agent"),
+        _get_header_value(headers, "user-agent", "User-Agent"),
+    )
+
+    parsed_client_name, parsed_client_version = _parse_client_identity_from_user_agent(
+        user_agent
+    )
+    cc_version, cc_entrypoint = _extract_claude_code_version_from_metadata(metadata)
+    client_name = _first_non_empty_string(metadata.get("client_name"), parsed_client_name)
+    client_version = _first_non_empty_string(
+        metadata.get("client_version"),
+        parsed_client_version,
+    )
+    if cc_version and (client_name is None or client_name.lower() == "claude-code"):
+        client_name = "claude-code"
+        client_version = cc_version
+    elif cc_version and client_name is None:
+        client_name = "claude-code"
+        client_version = cc_version
+    if cc_entrypoint and client_name is None:
+        client_name = cc_entrypoint
+
+    litellm_environment = _first_non_empty_string(
+        metadata.get("litellm_environment"),
+        metadata.get("trace_environment"),
+        metadata.get("source_trace_environment"),
+        trace_environment,
+    )
+    if allow_runtime and litellm_environment is None:
+        litellm_environment = _get_first_secret_value(_AAWM_LITELLM_ENVIRONMENT_ENV_VARS)
+
+    litellm_version = _first_non_empty_string(metadata.get("litellm_version"))
+    if allow_runtime and litellm_version is None:
+        litellm_version = _resolve_runtime_litellm_version()
+
+    litellm_fork_version = _first_non_empty_string(metadata.get("litellm_fork_version"))
+    if allow_runtime and litellm_fork_version is None:
+        litellm_fork_version = _derive_fork_version(litellm_version)
+
+    wheel_versions = _coerce_string_dict(metadata.get("litellm_wheel_versions"))
+    if allow_runtime:
+        runtime_versions = _resolve_runtime_wheel_versions()
+        wheel_versions = {**runtime_versions, **wheel_versions}
+
+    return {
+        "litellm_environment": litellm_environment,
+        "litellm_version": litellm_version,
+        "litellm_fork_version": litellm_fork_version,
+        "litellm_wheel_versions": wheel_versions,
+        "client_name": client_name,
+        "client_version": client_version,
+        "client_user_agent": user_agent,
+    }
+
+
+def _enrich_session_runtime_identity_metadata(kwargs: Dict[str, Any]) -> None:
+    metadata = _ensure_mutable_metadata(kwargs)
+    identity = _build_session_runtime_identity(
+        metadata=metadata,
+        kwargs=kwargs,
+        allow_runtime=True,
+    )
+    cc_version, cc_entrypoint = _extract_claude_code_version_from_metadata(metadata)
+    if cc_version and not metadata.get("cc_version"):
+        metadata["cc_version"] = cc_version
+    if cc_entrypoint and not metadata.get("cc_entrypoint"):
+        metadata["cc_entrypoint"] = cc_entrypoint
+
+    for key, value in identity.items():
+        if key == "litellm_wheel_versions":
+            if isinstance(value, dict) and value:
+                metadata[key] = value
+            continue
+        if value is not None:
+            metadata[key] = value
 
 
 def _extract_agent_context_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1891,6 +2236,35 @@ def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
     record["provider_cache_miss_cost_usd"] = cache_state.get("miss_cost_usd")
 
 
+def _normalize_session_runtime_identity_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    identity = _build_session_runtime_identity(
+        metadata=metadata,
+        kwargs=None,
+        allow_runtime=False,
+    )
+    for key in (
+        "litellm_environment",
+        "litellm_version",
+        "litellm_fork_version",
+        "client_name",
+        "client_version",
+        "client_user_agent",
+    ):
+        if not _clean_non_empty_string(record.get(key)):
+            record[key] = identity.get(key)
+
+    record_wheel_versions = _coerce_string_dict(record.get("litellm_wheel_versions"))
+    metadata_wheel_versions = _coerce_string_dict(identity.get("litellm_wheel_versions"))
+    record["litellm_wheel_versions"] = {
+        **metadata_wheel_versions,
+        **record_wheel_versions,
+    }
+
+
 def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
@@ -1937,12 +2311,29 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
                 metadata[generic_key] = value
                 metadata[provider_key] = value
 
+    for key in (
+        "litellm_environment",
+        "litellm_version",
+        "litellm_fork_version",
+        "client_name",
+        "client_version",
+        "client_user_agent",
+    ):
+        value = _clean_non_empty_string(record.get(key))
+        if value is not None:
+            metadata[key] = value
+
+    wheel_versions = _coerce_string_dict(record.get("litellm_wheel_versions"))
+    if wheel_versions:
+        metadata["litellm_wheel_versions"] = wheel_versions
+
     record["metadata"] = metadata
 
 
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
+    _normalize_session_runtime_identity_on_record(record)
     _sync_session_history_record_metadata(record)
     return record
 
@@ -3004,6 +3395,7 @@ def _build_session_history_record_from_spend_log_row(
         result=result,
         start_time=_parse_datetime_value(spend_log_row.get("startTime")),
         end_time=_parse_datetime_value(spend_log_row.get("endTime")),
+        allow_runtime_identity=False,
     )
     if record is None:
         return None
@@ -3460,6 +3852,11 @@ def _build_session_history_record_from_langfuse_trace_observation(
             else "success",
         }
     )
+    runtime_identity = _build_session_runtime_identity(
+        metadata=history_metadata,
+        trace_environment=trace.get("environment"),
+        allow_runtime=False,
+    )
 
     return _normalize_session_history_record({
         "litellm_call_id": observation.get("id"),
@@ -3517,6 +3914,13 @@ def _build_session_history_record_from_langfuse_trace_observation(
                 trace.get("totalCost"),
             )
         ),
+        "litellm_environment": runtime_identity["litellm_environment"],
+        "litellm_version": runtime_identity["litellm_version"],
+        "litellm_fork_version": runtime_identity["litellm_fork_version"],
+        "litellm_wheel_versions": runtime_identity["litellm_wheel_versions"],
+        "client_name": runtime_identity["client_name"],
+        "client_version": runtime_identity["client_version"],
+        "client_user_agent": runtime_identity["client_user_agent"],
         "metadata": history_metadata,
     })
 
@@ -3607,6 +4011,7 @@ def _build_session_history_record(
     result: Any,
     start_time: Any,
     end_time: Any,
+    allow_runtime_identity: bool = True,
 ) -> Optional[Dict[str, Any]]:
     session_id = _extract_session_id(kwargs)
     if not session_id:
@@ -3758,6 +4163,12 @@ def _build_session_history_record(
             )
         )
 
+    runtime_identity = _build_session_runtime_identity(
+        metadata=metadata,
+        kwargs=kwargs,
+        allow_runtime=allow_runtime_identity,
+    )
+
     return _normalize_session_history_record({
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "session_id": session_id,
@@ -3807,6 +4218,13 @@ def _build_session_history_record(
         "git_push_count": tool_activity_summary["git_push_count"],
         "tool_activity": tool_activity,
         "response_cost_usd": response_cost_usd,
+        "litellm_environment": runtime_identity["litellm_environment"],
+        "litellm_version": runtime_identity["litellm_version"],
+        "litellm_fork_version": runtime_identity["litellm_fork_version"],
+        "litellm_wheel_versions": runtime_identity["litellm_wheel_versions"],
+        "client_name": runtime_identity["client_name"],
+        "client_version": runtime_identity["client_version"],
+        "client_user_agent": runtime_identity["client_user_agent"],
         "metadata": _build_session_history_metadata(
             metadata=metadata,
             request_tags=[tag for tag in request_tags if isinstance(tag, str)],
@@ -3890,6 +4308,13 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("git_commit_count", 0),
         record.get("git_push_count", 0),
         record["response_cost_usd"],
+        record.get("litellm_environment"),
+        record.get("litellm_version"),
+        record.get("litellm_fork_version"),
+        json.dumps(record.get("litellm_wheel_versions") or {}),
+        record.get("client_name"),
+        record.get("client_version"),
+        record.get("client_user_agent"),
         json.dumps(record["metadata"]),
     )
 
@@ -4315,6 +4740,8 @@ def _enrich_trace_name_and_provider_metadata(
         metadata["trace_name"] = agent_name
     if session_id and not metadata.get("session_id"):
         metadata["session_id"] = session_id
+
+    _enrich_session_runtime_identity_metadata(kwargs)
 
     message = _extract_first_response_message(result)
     if message is not None:

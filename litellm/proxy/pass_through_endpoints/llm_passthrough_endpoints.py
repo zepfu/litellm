@@ -156,6 +156,7 @@ _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
     {
         "gpt-5.4",
         "gpt-5.4-mini",
+        "gpt-5.5",
         "gpt-5.3-codex-spark",
     }
 )
@@ -3483,7 +3484,6 @@ def _wrap_streaming_response_with_release_callback(
     response: StreamingResponse,
     release_callback: Any,
 ) -> StreamingResponse:
-    original_iterator = response.body_iterator
     released = False
 
     def _release_once() -> None:
@@ -3497,6 +3497,11 @@ def _wrap_streaming_response_with_release_callback(
             verbose_proxy_logger.exception(
                 "Failed to release adapted streaming response guard callback"
             )
+
+    original_iterator = getattr(response, "body_iterator", None)
+    if original_iterator is None:
+        _release_once()
+        return response
 
     async def _wrapped_iterator():
         try:
@@ -4012,6 +4017,7 @@ def _build_anthropic_responses_adapter_request_body(
         anthropic_request,
         custom_llm_provider=translation_provider,
     )
+    _normalize_openai_function_tool_schemas(translated_body)
 
     if request_body.get("stream") is True:
         translated_body["stream"] = True
@@ -4083,6 +4089,70 @@ def _build_anthropic_response_from_responses_response(
         content=serialized_response,
         media_type="application/json",
     )
+
+
+def _normalize_openai_function_tool_parameters(parameters: Any) -> dict[str, Any]:
+    if not isinstance(parameters, dict):
+        return {"type": "object", "properties": {}}
+
+    normalized_parameters = dict(parameters)
+    if normalized_parameters.get("type") is None:
+        normalized_parameters["type"] = "object"
+    _sanitize_openai_object_schema_properties(normalized_parameters)
+
+    return normalized_parameters
+
+
+def _sanitize_openai_object_schema_properties(schema_node: Any) -> int:
+    fix_count = 0
+    if isinstance(schema_node, dict):
+        if schema_node.get("type") == "object" and not isinstance(
+            schema_node.get("properties"), dict
+        ):
+            schema_node["properties"] = {}
+            fix_count += 1
+        for value in schema_node.values():
+            fix_count += _sanitize_openai_object_schema_properties(value)
+    elif isinstance(schema_node, list):
+        for item in schema_node:
+            fix_count += _sanitize_openai_object_schema_properties(item)
+    return fix_count
+
+
+def _normalize_openai_function_tool_schemas(translated_body: dict[str, Any]) -> None:
+    tools = translated_body.get("tools")
+    if not isinstance(tools, list):
+        return
+
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+
+        if "parameters" in tool:
+            tool["parameters"] = _normalize_openai_function_tool_parameters(
+                tool.get("parameters")
+            )
+
+        function_block = tool.get("function")
+        if isinstance(function_block, dict):
+            function_block["parameters"] = _normalize_openai_function_tool_parameters(
+                function_block.get("parameters")
+            )
+
+
+def _copy_translated_anthropic_adapter_response_headers(
+    *,
+    translated_response: Response,
+    upstream_response: Response,
+) -> None:
+    for header_name, header_value in upstream_response.headers.items():
+        if header_name.lower() in {
+            "content-length",
+            "content-encoding",
+            "transfer-encoding",
+        }:
+            continue
+        translated_response.headers[header_name] = header_value
 
 
 def _get_latest_adapter_user_prompt_text(request_body: dict[str, Any]) -> Optional[str]:
@@ -4697,7 +4767,10 @@ async def _handle_anthropic_openai_responses_adapter_route(
             translated_response = _build_anthropic_response_from_responses_response(
                 response_body
             )
-            translated_response.headers.update(dict(upstream_response.headers))
+            _copy_translated_anthropic_adapter_response_headers(
+                translated_response=translated_response,
+                upstream_response=upstream_response,
+            )
             translated_response.status_code = upstream_response.status_code
             return translated_response
         return _build_anthropic_streaming_response_from_responses_stream(
@@ -4715,7 +4788,10 @@ async def _handle_anthropic_openai_responses_adapter_route(
     translated_response = _build_anthropic_response_from_responses_response(
         response_body
     )
-    translated_response.headers.update(dict(upstream_response.headers))
+    _copy_translated_anthropic_adapter_response_headers(
+        translated_response=translated_response,
+        upstream_response=upstream_response,
+    )
     translated_response.status_code = upstream_response.status_code
     return translated_response
 
@@ -5051,7 +5127,10 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
             translated_response = _build_anthropic_response_from_responses_response(
                 response_body
             )
-            translated_response.headers.update(dict(upstream_response.headers))
+            _copy_translated_anthropic_adapter_response_headers(
+                translated_response=translated_response,
+                upstream_response=upstream_response,
+            )
             translated_response.status_code = upstream_response.status_code
             return translated_response
         return _build_anthropic_streaming_response_from_responses_stream(
@@ -5069,7 +5148,10 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
     translated_response = _build_anthropic_response_from_responses_response(
         response_body
     )
-    translated_response.headers.update(dict(upstream_response.headers))
+    _copy_translated_anthropic_adapter_response_headers(
+        translated_response=translated_response,
+        upstream_response=upstream_response,
+    )
     translated_response.status_code = upstream_response.status_code
     return translated_response
 
@@ -5651,7 +5733,8 @@ def _expand_claude_persisted_output_value(
             hooks.update(child_hooks)
             source_metadata_items.extend(child_source_metadata_items)
             if updated_child is not child:
-                return (
+                changed = True
+        return (
             updated_dict if changed else value,
             expanded_count,
             hooks,
@@ -5676,7 +5759,8 @@ def _expand_claude_persisted_output_value(
             hooks.update(child_hooks)
             source_metadata_items.extend(child_source_metadata_items)
             if updated_child is not child:
-                return (
+                changed = True
+        return (
             updated_list if changed else value,
             expanded_count,
             hooks,

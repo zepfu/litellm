@@ -32,6 +32,24 @@ BUILT_IN_TARGET_PROFILES: dict[str, dict[str, str]] = {
         'expected_trace_environment': 'prod',
     },
 }
+DEFAULT_RUNTIME_LOG_FORBIDDEN_SUBSTRINGS = [
+    'Task exception was never retrieved',
+    'Exception in ASGI application',
+    "KeyError: 'choices'",
+    'h11._util.LocalProtocolError',
+    'Too little data for declared Content-Length',
+]
+DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS = [
+    'pass_through_endpoint(): Exception occured - 429:',
+    'pass_through_endpoint(): Exception occured - 500:',
+    'pass_through_endpoint(): Exception occured - 502:',
+    'pass_through_endpoint(): Exception occured - 503:',
+    'pass_through_endpoint(): Exception occured - 504:',
+]
+DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS = [
+    'timed out after',
+    'runtime logs contained forbidden substring',
+]
 
 
 def _load_run_acceptance_module() -> Any:
@@ -178,6 +196,15 @@ def _apply_target_profile_to_config(
         runtime_postconditions['docker_container_name'] = profile['docker_container_name']
         updated_case['runtime_postconditions'] = runtime_postconditions
         updated_case['expected_trace_environment'] = profile['expected_trace_environment']
+        session_history_validation = dict(
+            updated_case.get('session_history_validation') or {}
+        )
+        session_history_validation.setdefault(
+            'expected_litellm_environment',
+            profile['expected_trace_environment'],
+        )
+        session_history_validation.setdefault('require_runtime_identity', True)
+        updated_case['session_history_validation'] = session_history_validation
         updated_cases[case_name] = updated_case
 
     updated_config['cases'] = updated_cases
@@ -292,17 +319,18 @@ def _validate_runtime_logs(
         or 'litellm-dev'
     )
     tail_lines = int(checks.get('tail_lines') or 400)
-    forbidden_substrings = list(checks.get('forbidden_substrings') or [])
+    forbidden_substrings = [
+        *DEFAULT_RUNTIME_LOG_FORBIDDEN_SUBSTRINGS,
+        *list(checks.get('forbidden_substrings') or []),
+    ]
     if not bool(checks.get('disable_default_429_traceback_check')):
-        forbidden_substrings.extend(
-            [
-                'pass_through_endpoint(): Exception occured - 429:',
-                'pass_through_endpoint(): Exception occured - 500:',
-                'pass_through_endpoint(): Exception occured - 502:',
-                'pass_through_endpoint(): Exception occured - 503:',
-                'pass_through_endpoint(): Exception occured - 504:',
-            ]
-        )
+        forbidden_substrings.extend(DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS)
+    if bool(checks.get('disable_default_error_signature_check')):
+        configured_substrings = list(checks.get('forbidden_substrings') or [])
+        forbidden_substrings = configured_substrings
+        if not bool(checks.get('disable_default_429_traceback_check')):
+            forbidden_substrings.extend(DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS)
+    forbidden_substrings = sorted(set(forbidden_substrings))
 
     summary: dict[str, Any] = {
         'docker_container_name': container_name,
@@ -367,6 +395,8 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     expected_provider = checks.get('expected_provider')
     expected_model = checks.get('expected_model')
     expected_rows = checks.get('expected_rows') or []
+    expected_litellm_environment = checks.get('expected_litellm_environment')
+    require_runtime_identity = checks.get('require_runtime_identity', True) is not False
 
     query = '''
         select provider, model, session_id, input_tokens, output_tokens, total_tokens,
@@ -378,6 +408,8 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
                reasoning_tokens_source, tool_call_count, tool_names,
                file_read_count, file_modified_count, git_commit_count, git_push_count,
                response_cost_usd,
+               litellm_environment, litellm_version, litellm_fork_version,
+               litellm_wheel_versions, client_name, client_version, client_user_agent,
                start_time, end_time
         from public.session_history
         where session_id = %s
@@ -431,6 +463,30 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
             if not isinstance(reported, (int, float)) or reported <= 0:
                 failures.append(
                     f'{family} session_history row provider={row.get("provider")!r} model={row.get("model")!r} has `reasoning_tokens_source=provider_reported` with non-positive `reasoning_tokens_reported`={reported!r}'
+                )
+
+        if expected_litellm_environment is not None and row.get('litellm_environment') != expected_litellm_environment:
+            failures.append(
+                f'{family} session_history row provider={row.get("provider")!r} model={row.get("model")!r} has `litellm_environment`={row.get("litellm_environment")!r}; expected {expected_litellm_environment!r}'
+            )
+
+        if require_runtime_identity:
+            for key in (
+                'litellm_environment',
+                'litellm_version',
+                'litellm_fork_version',
+                'client_name',
+                'client_version',
+            ):
+                value = row.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    failures.append(
+                        f'{family} session_history row provider={row.get("provider")!r} model={row.get("model")!r} has null/empty `{key}`'
+                    )
+            wheel_versions = row.get('litellm_wheel_versions')
+            if not isinstance(wheel_versions, dict) or not wheel_versions:
+                failures.append(
+                    f'{family} session_history row provider={row.get("provider")!r} model={row.get("model")!r} has null/empty `litellm_wheel_versions`'
                 )
 
     def _normalize_record(row: dict[str, Any]) -> dict[str, Any]:
@@ -640,6 +696,46 @@ def _downgrade_configured_failures_to_warnings(
 
     return remaining_failures, warning_messages
 
+
+def _split_warning_only_failures(
+    *,
+    failures: list[str],
+    config: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    hard_substrings = [
+        *DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS,
+        *list(config.get('warning_only_hard_failure_substrings') or []),
+    ]
+    if bool(config.get('warning_only_allow_timeouts')):
+        hard_substrings = [
+            value for value in hard_substrings if value != 'timed out after'
+        ]
+
+    hard_failures: list[str] = []
+    soft_failures: list[str] = []
+    for failure in failures:
+        if any(substring and substring in failure for substring in hard_substrings):
+            hard_failures.append(failure)
+        else:
+            soft_failures.append(failure)
+    return hard_failures, soft_failures
+
+
+def _is_warning_only_hard_exception(
+    *,
+    exc: Exception,
+    config: dict[str, Any],
+) -> bool:
+    hard_substrings = [
+        *DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS,
+        *list(config.get('warning_only_hard_failure_substrings') or []),
+    ]
+    if bool(config.get('warning_only_allow_timeouts')):
+        hard_substrings = [
+            value for value in hard_substrings if value != 'timed out after'
+        ]
+    error_text = str(exc)
+    return any(substring and substring in error_text for substring in hard_substrings)
 
 
 def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
@@ -899,13 +995,19 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     )
     warnings.extend(downgraded_warnings)
 
-    warning_only = bool(config.get('warning_only'))
     unique_failures = sorted(set(failures))
     unique_warnings = sorted(set(warnings))
-    soft_failures = unique_failures if warning_only else []
-    if warning_only and unique_failures:
+    warning_only = bool(config.get('warning_only'))
+    hard_failures: list[str] = unique_failures
+    soft_failures: list[str] = []
+    if warning_only:
+        hard_failures, soft_failures = _split_warning_only_failures(
+            failures=unique_failures,
+            config=config,
+        )
+    if warning_only and soft_failures:
         unique_warnings.extend(
-            f'warning-only failure: {failure}' for failure in unique_failures
+            f'warning-only failure: {failure}' for failure in soft_failures
         )
         unique_warnings = sorted(set(unique_warnings))
 
@@ -938,8 +1040,8 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         'tool_activity': tool_activity_summary,
         'runtime_postconditions': runtime_summary,
         'runtime_logs': runtime_log_summary,
-        'passed': (not unique_failures) or warning_only,
-        'failures': [] if warning_only else unique_failures,
+        'passed': not hard_failures,
+        'failures': hard_failures,
         'soft_failures': soft_failures,
         'warnings': unique_warnings,
     }
@@ -956,7 +1058,14 @@ def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {'passed': not failures, 'failures': failures, 'warnings': warnings}
 
 
-def _warning_only_error_result(family: str, exc: Exception) -> dict[str, Any]:
+def _warning_only_error_result(
+    family: str,
+    exc: Exception,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    if _is_warning_only_hard_exception(exc=exc, config=config):
+        return RA._family_error_result(family, exc)
+
     base = RA._family_error_result(family, exc)
     failures = list(base.get('failures', []))
     return {
@@ -981,6 +1090,7 @@ def _parse_selected_cases(
 ) -> list[str]:
     preferred_order = [
         'claude_adapter_gpt54',
+        'claude_adapter_gpt55',
         'claude_adapter_gpt54_mini',
         'claude_adapter_ctx_marker',
         'claude_adapter_ctx_marker_escaped',
@@ -1116,7 +1226,9 @@ def main() -> int:
         except Exception as exc:
             if bool(cases[case_name].get('warning_only')):
                 artifact['results'][case_name] = _warning_only_error_result(
-                    case_name, exc
+                    case_name,
+                    exc,
+                    cases[case_name],
                 )
             else:
                 artifact['results'][case_name] = RA._family_error_result(

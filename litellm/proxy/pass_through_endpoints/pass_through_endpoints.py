@@ -85,6 +85,148 @@ def get_response_body(response: httpx.Response) -> Optional[dict]:
         return None
 
 
+def _normalize_openai_function_tool_parameters(parameters: Any) -> dict[str, Any]:
+    if not isinstance(parameters, dict):
+        return {"type": "object", "properties": {}}
+
+    normalized_parameters = dict(parameters)
+    if normalized_parameters.get("type") is None:
+        normalized_parameters["type"] = "object"
+    _sanitize_openai_object_schema_properties(normalized_parameters)
+
+    return normalized_parameters
+
+
+def _sanitize_openai_object_schema_properties(schema_node: Any) -> int:
+    fix_count = 0
+    if isinstance(schema_node, dict):
+        if schema_node.get("type") == "object" and not isinstance(
+            schema_node.get("properties"), dict
+        ):
+            schema_node["properties"] = {}
+            fix_count += 1
+        for value in schema_node.values():
+            fix_count += _sanitize_openai_object_schema_properties(value)
+    elif isinstance(schema_node, list):
+        for item in schema_node:
+            fix_count += _sanitize_openai_object_schema_properties(item)
+    return fix_count
+
+
+def _normalize_openai_function_tool_schemas_in_body(body: Optional[dict]) -> int:
+    if not isinstance(body, dict):
+        return 0
+
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return 0
+
+    normalized_count = 0
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+
+        if "parameters" in tool:
+            normalized_parameters = _normalize_openai_function_tool_parameters(
+                tool.get("parameters")
+            )
+            if normalized_parameters != tool.get("parameters"):
+                normalized_count += 1
+            tool["parameters"] = normalized_parameters
+
+        function_block = tool.get("function")
+        if isinstance(function_block, dict):
+            normalized_parameters = _normalize_openai_function_tool_parameters(
+                function_block.get("parameters")
+            )
+            if normalized_parameters != function_block.get("parameters"):
+                normalized_count += 1
+            function_block["parameters"] = normalized_parameters
+
+    return normalized_count
+
+
+def _collect_invalid_openai_function_tool_schemas(
+    body: Optional[dict],
+) -> list[dict[str, Any]]:
+    if not isinstance(body, dict):
+        return []
+
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return []
+
+    invalid_tools: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+
+        parameters = tool.get("parameters")
+        if isinstance(parameters, dict):
+            invalid_nodes = _collect_invalid_openai_object_schema_nodes(
+                parameters,
+                path=f"tools[{index}].parameters",
+            )
+            if invalid_nodes:
+                invalid_tools.append(
+                    {
+                        "index": index,
+                        "name": tool.get("name"),
+                        "shape": "flat",
+                        "invalid_nodes": invalid_nodes[:10],
+                    }
+                )
+
+        function_block = tool.get("function")
+        if isinstance(function_block, dict):
+            parameters = function_block.get("parameters")
+            if isinstance(parameters, dict):
+                invalid_nodes = _collect_invalid_openai_object_schema_nodes(
+                    parameters,
+                    path=f"tools[{index}].function.parameters",
+                )
+                if invalid_nodes:
+                    invalid_tools.append(
+                        {
+                            "index": index,
+                            "name": function_block.get("name"),
+                            "shape": "nested",
+                            "invalid_nodes": invalid_nodes[:10],
+                        }
+                    )
+
+    return invalid_tools
+
+
+def _collect_invalid_openai_object_schema_nodes(
+    schema_node: Any,
+    *,
+    path: str,
+) -> list[dict[str, Any]]:
+    invalid_nodes: list[dict[str, Any]] = []
+    if isinstance(schema_node, dict):
+        if schema_node.get("type") == "object" and not isinstance(
+            schema_node.get("properties"), dict
+        ):
+            invalid_nodes.append({"path": path, "schema": schema_node})
+        for key, value in schema_node.items():
+            invalid_nodes.extend(
+                _collect_invalid_openai_object_schema_nodes(
+                    value,
+                    path=f"{path}.{key}",
+                )
+            )
+    elif isinstance(schema_node, list):
+        for index, item in enumerate(schema_node):
+            invalid_nodes.extend(
+                _collect_invalid_openai_object_schema_nodes(
+                    item,
+                    path=f"{path}[{index}]",
+                )
+            )
+    return invalid_nodes
+
+
 def _build_http_exception_from_upstream_status_error(
     error: httpx.HTTPStatusError, detail: Any
 ) -> HTTPException:
@@ -1093,6 +1235,16 @@ async def pass_through_request(  # noqa: PLR0915
             _parsed_body = {}
         else:
             _parsed_body = await _read_request_body(request)
+        normalized_tool_schema_count = _normalize_openai_function_tool_schemas_in_body(
+            _parsed_body
+        )
+        if normalized_tool_schema_count > 0 and isinstance(_parsed_body, dict):
+            metadata = _parsed_body.get("litellm_metadata")
+            if isinstance(metadata, dict):
+                metadata["openai_function_tool_schema_fix_count"] = (
+                    metadata.get("openai_function_tool_schema_fix_count", 0)
+                    + normalized_tool_schema_count
+                )
         masked_headers = HttpPassThroughEndpointHelpers.get_masked_passthrough_headers(
             headers=headers
         )
@@ -1146,6 +1298,25 @@ async def pass_through_request(  # noqa: PLR0915
             data=_parsed_body,
             call_type="pass_through_endpoint",
         )
+        normalized_tool_schema_count = _normalize_openai_function_tool_schemas_in_body(
+            _parsed_body
+        )
+        if normalized_tool_schema_count > 0 and isinstance(_parsed_body, dict):
+            metadata = _parsed_body.get("litellm_metadata")
+            if isinstance(metadata, dict):
+                metadata["openai_function_tool_schema_fix_count"] = (
+                    metadata.get("openai_function_tool_schema_fix_count", 0)
+                    + normalized_tool_schema_count
+                )
+        invalid_openai_tool_schemas = _collect_invalid_openai_function_tool_schemas(
+            _parsed_body
+        )
+        if invalid_openai_tool_schemas:
+            verbose_proxy_logger.warning(
+                "Pass-through request still contains invalid OpenAI function tool schemas for target=%s invalid_tools=%s",
+                str(url),
+                invalid_openai_tool_schemas[:10],
+            )
         async_client_obj = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
             params={"timeout": 600},

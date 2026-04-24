@@ -2,7 +2,6 @@ import json
 import os
 import sys
 from datetime import datetime
-from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -391,6 +390,72 @@ class TestOpenAIPassthroughLoggingHandler:
         assert result["result"]._hidden_params["responses_output"] == codex_response["output"]
 
     @patch("litellm.completion_cost")
+    def test_openai_passthrough_handler_preserves_reasoning_only_responses_output(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.111
+
+        reasoning_only_response = {
+            "id": "resp-reasoning-only",
+            "object": "response",
+            "created_at": 1775863780,
+            "model": "gpt-oss-120b",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "summary": [
+                        {
+                            "type": "summary_text",
+                            "text": "Inspecting the shell state before answering.",
+                        }
+                    ],
+                }
+            ],
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 10,
+                "total_tokens": 60,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 10, "text_tokens": 0},
+            },
+        }
+        mock_httpx_response = self._create_mock_httpx_response(reasoning_only_response)
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+            httpx_response=mock_httpx_response,
+            response_body=reasoning_only_response,
+            logging_obj=mock_logging_obj,
+            url_route="https://openrouter.ai/api/v1/responses",
+            result="",
+            start_time=self.start_time,
+            end_time=self.end_time,
+            cache_hit=False,
+            request_body={"model": "gpt-oss-120b", "input": "probe reasoning"},
+            passthrough_logging_payload=PassthroughStandardLoggingPayload(
+                url="https://openrouter.ai/api/v1/responses",
+                request_body={"model": "gpt-oss-120b", "input": "probe reasoning"},
+                request_method="POST",
+            ),
+            custom_llm_provider="openrouter",
+            litellm_params={},
+        )
+
+        usage = result["result"].usage
+        message = result["result"].choices[0].message
+        assert message.content == ""
+        assert (
+            message.reasoning_content
+            == "Inspecting the shell state before answering."
+        )
+        assert usage.prompt_tokens == 50
+        assert usage.completion_tokens == 10
+        assert usage.total_tokens == 60
+        assert result["result"]._hidden_params["responses_output"] == reasoning_only_response["output"]
+        assert result["kwargs"]["response_cost"] == 0.111
+
+    @patch("litellm.completion_cost")
     def test_openai_streaming_handler_rebuilds_responses_api_usage(
         self, mock_completion_cost
     ):
@@ -433,6 +498,124 @@ class TestOpenAIPassthroughLoggingHandler:
         mock_completion_cost.assert_called_once()
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.123
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_reasoning_only_responses_output(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.222
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openrouter",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-reasoning-only","object":"response","created_at":1775869900,"status":"in_progress","model":"gpt-oss-120b","output":[]}}',
+            'event: response.reasoning_summary_text.delta',
+            'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_123","output_index":0,"summary_index":0,"delta":"Inspecting the shell state before answering."}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-reasoning-only","object":"response","created_at":1775869900,"status":"completed","model":"gpt-oss-120b","output":[{"type":"reasoning","id":"rs_123","summary":[{"type":"summary_text","text":"Inspecting the shell state before answering."}]}],"usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":10,"text_tokens":0}}}}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://openrouter.ai/api/v1/responses",
+            request_body={"model": "gpt-oss-120b", "input": "probe reasoning"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        usage = result["result"].usage
+        message = result["result"].choices[0].message
+        assert message.content == ""
+        assert (
+            message.reasoning_content
+            == "Inspecting the shell state before answering."
+        )
+        assert usage.prompt_tokens == 50
+        assert usage.completion_tokens == 10
+        assert usage.total_tokens == 60
+        assert result["result"]._hidden_params["responses_output"] == [
+            {
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": "Inspecting the shell state before answering.",
+                    }
+                ],
+            }
+        ]
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
+        assert result["kwargs"]["response_cost"] == 0.222
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_reasoning_only_content_output(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.333
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openrouter",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-reasoning-content-only","object":"response","created_at":1775869950,"status":"in_progress","model":"gpt-oss-120b","output":[]}}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-reasoning-content-only","object":"response","created_at":1775869950,"status":"completed","model":"gpt-oss-120b","output":[{"type":"reasoning","id":"rs_456","summary":[],"content":[{"type":"reasoning_text","text":"We need to respond with exactly two words: oss120 smoke."}],"status":"completed"}],"usage":{"input_tokens":40,"output_tokens":8,"total_tokens":48,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":8,"text_tokens":0}}}}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://openrouter.ai/api/v1/responses",
+            request_body={"model": "gpt-oss-120b", "input": "probe reasoning content"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        usage = result["result"].usage
+        message = result["result"].choices[0].message
+        assert message.content == ""
+        assert (
+            message.reasoning_content
+            == "We need to respond with exactly two words: oss120 smoke."
+        )
+        assert usage.prompt_tokens == 40
+        assert usage.completion_tokens == 8
+        assert usage.total_tokens == 48
+        assert result["result"]._hidden_params["responses_output"] == [
+            {
+                "type": "reasoning",
+                "id": "rs_456",
+                "summary": [],
+                "content": [
+                    {
+                        "type": "reasoning_text",
+                        "text": "We need to respond with exactly two words: oss120 smoke.",
+                    }
+                ],
+                "status": "completed",
+            }
+        ]
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
+        assert result["kwargs"]["response_cost"] == 0.333
 
     def test_openai_passthrough_handler_backfills_openrouter_responses_usage_and_model(self):
         mock_httpx_response = self._create_mock_httpx_response(
@@ -511,6 +694,7 @@ class TestOpenAIPassthroughLoggingHandler:
         assert standard_logging_object["completion_tokens"] == 198
         assert standard_logging_object["total_tokens"] == 96027
 
+    @patch("litellm.completion_cost")
     def test_openai_streaming_handler_rebuilds_codex_stream_with_empty_output(
         self, mock_completion_cost
     ):
@@ -714,6 +898,7 @@ class TestOpenAIPassthroughLoggingHandler:
             all_chunks=["chunk1", "chunk2"],
             litellm_logging_obj=self._create_mock_logging_obj(),
             model="gpt-4o",
+            url_route="https://api.openai.com/v1/chat/completions",
         )
         
         assert result is None  # Placeholder implementation
@@ -1020,6 +1205,7 @@ class TestOpenAIPassthroughIntegration:
         mock_logging_obj = AsyncMock()
         mock_logging_obj.model_call_details = {}
         mock_logging_obj.async_success_handler = AsyncMock()
+        mock_logging_obj.get_combined_callback_list = MagicMock(return_value=[])
         
         passthrough_payload = PassthroughStandardLoggingPayload(
             url="https://api.openai.com/v1/chat/completions",

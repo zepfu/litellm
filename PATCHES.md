@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25` (24 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26` (25 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.25`.
+`1.82.3+aawm.26`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -850,6 +850,48 @@ requirements for the forked proxy, not general LiteLLM release behavior.
 **Validation status:** The default adapter harness on `:4001` passed after the
 target-profile update, and focused regression tests cover trace context
 preservation for rewritten passthrough requests.
+
+---
+
+### aawm.26 — OpenAI Responses hardening, GPT-5.5, and runtime identity telemetry
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `model_prices_and_context_window.json`
+- `litellm/bundled_model_prices_and_context_window_fallback.json`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `tests/test_litellm/`
+
+**Upstream issue:** AAWM promotion uncovered additional local-pass-through
+gaps that upstream LiteLLM does not cover for this fork: OpenAI Responses
+stream reconstruction can receive reasoning-only output and nested object tool
+schemas, GPT-5.5 needs an AAWM pass-through/cost-map entry before official API
+pricing is available, and `public.session_history` needs runtime/client
+identity for dev/prod attribution.
+
+**Fix:**
+1. Rebuild OpenAI Responses logging payloads correctly for reasoning-only
+   completed responses and preserve Codex local-shell output activity.
+2. Normalize nested OpenAI Responses tool schemas before upstream dispatch.
+3. Add GPT-5.5 / ChatGPT GPT-5.5 cost-map entries and default harness coverage.
+4. Add first-class `session_history` columns for LiteLLM environment,
+   fork/runtime/wheel versions, and initiating client name/version/user-agent.
+5. Harden prod-cutover harness checks so runtime exceptions, stale transfer
+   headers, upstream passthrough 429/5xx tracebacks, missing runtime identity,
+   and missing client identity fail before promotion.
+
+**Why not upstream:** These are AAWM-specific pass-through adaptation,
+telemetry, local cost-map, and prod-promotion requirements layered on top of
+upstream LiteLLM.
+
+**Validation status:** Focused callback, OpenAI passthrough, Responses, and
+adapter-harness hardening tests pass locally. Full prod `:4000` harness
+validation is required after promoting this patch set into the prod container.
 
 ---
 
