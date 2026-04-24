@@ -22,6 +22,8 @@
   "default_excluded_cases": [
     "claude_adapter_gemma_31b",
     "claude_adapter_gemma_26b_a4b",
+    "claude_adapter_gpt_oss_20b",
+    "claude_adapter_gpt_oss_120b",
     "claude_adapter_nvidia_deepseek_v32",
     "claude_adapter_nvidia_glm47",
     "claude_adapter_nvidia_minimax_m27"
