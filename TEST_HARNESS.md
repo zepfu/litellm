@@ -375,6 +375,6 @@ The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
 
-Current minimum harness bundle version is `h-v0.0.9`; it includes the controlled
+Current minimum harness bundle version is `h-v0.0.10`; it includes the controlled
 Claude settings overlay and the longer peeromega fanout timeout for prod `:4000`
 validation.
