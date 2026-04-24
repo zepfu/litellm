@@ -324,6 +324,32 @@ def test_gpt5_4_pro_allows_reasoning_effort_xhigh(config: OpenAIConfig):
     assert params["reasoning_effort"] == "xhigh"
 
 
+def test_gpt5_5_allows_reasoning_effort_xhigh(config: OpenAIConfig):
+    params = config.map_openai_params(
+        non_default_params={"reasoning_effort": "xhigh"},
+        optional_params={},
+        model="gpt-5.5",
+        drop_params=False,
+    )
+    assert params["reasoning_effort"] == "xhigh"
+
+
+def test_gpt5_5_supports_sampling_params_with_none_reasoning(config: OpenAIConfig):
+    params = config.map_openai_params(
+        non_default_params={
+            "reasoning_effort": "none",
+            "top_p": 0.9,
+            "logprobs": True,
+        },
+        optional_params={},
+        model="gpt-5.5",
+        drop_params=False,
+    )
+    assert params["reasoning_effort"] == "none"
+    assert params["top_p"] == 0.9
+    assert params["logprobs"] is True
+
+
 def test_gpt5_normalizes_reasoning_effort_dict_with_summary(config: OpenAIConfig):
     """Dict with summary/generate_summary is normalized for chat completions."""
     params = config.map_openai_params(

@@ -224,6 +224,12 @@ Telemetry expectation:
   - current detection uses provider-native cache hints:
     `cache_control` for Anthropic/OpenRouter, `cachedContent` for Gemini, and
     `input_tokens_details.cached_tokens` for OpenAI-style usage
+- new `public.session_history` rows should identify the LiteLLM runtime and
+  initiating client:
+  `litellm_environment`, `litellm_version`, `litellm_fork_version`,
+  `litellm_wheel_versions`, `client_name`, `client_version`, and
+  `client_user_agent`; dev/prod harness target profiles inject the expected
+  environment into session-history validation
 - the default Anthropic adapter suite includes a provider-cache canary in
   `claude_adapter_peeromega_fanout`: at least one Anthropic child row must have
   `provider_cache_attempted=true` and `provider_cache_status` equal to `hit` or

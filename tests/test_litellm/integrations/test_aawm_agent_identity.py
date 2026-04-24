@@ -278,6 +278,93 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
     assert record["session_id"] == "session-from-header"
 
 
+def test_build_session_history_record_tracks_runtime_and_client_identity() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-runtime-client"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-runtime-client",
+            "trace_environment": "dev",
+            "litellm_version": "1.82.3+aawm.25",
+            "litellm_wheel_versions": {
+                "aawm-litellm-callbacks": "0.0.6",
+                "aawm-litellm-control-plane": "0.0.4",
+            },
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "user-agent": (
+                "codex-tui/0.124.0 (Ubuntu 22.4.0; x86_64) "
+                "WindowsTerminal (codex-tui; 0.124.0)"
+            )
+        }
+    }
+
+    result = {
+        "id": "resp-runtime-client",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["litellm_environment"] == "dev"
+    assert record["litellm_version"] == "1.82.3+aawm.25"
+    assert record["litellm_fork_version"] == "aawm.25"
+    assert record["litellm_wheel_versions"]["aawm-litellm-callbacks"] == "0.0.6"
+    assert record["client_name"] == "codex-tui"
+    assert record["client_version"] == "0.124.0"
+    assert "codex-tui/0.124.0" in record["client_user_agent"]
+    assert record["metadata"]["litellm_environment"] == "dev"
+    assert record["metadata"]["client_name"] == "codex-tui"
+
+
+def test_build_session_history_record_uses_claude_billing_header_client_identity() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-client"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-client",
+            "anthropic_billing_header_fields": {
+                "cc_version": "2.1.112",
+                "cc_entrypoint": "claude-code",
+            },
+        }
+    )
+
+    result = {
+        "id": "resp-claude-client",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["client_name"] == "claude-code"
+    assert record["client_version"] == "2.1.112"
+    assert record["metadata"]["client_name"] == "claude-code"
+    assert record["metadata"]["client_version"] == "2.1.112"
+
+
 def test_build_session_history_record_handles_object_tool_use_blocks() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.3-codex-spark"
@@ -775,6 +862,13 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
         "git_commit_count": 0,
         "git_push_count": 0,
         "response_cost_usd": None,
+        "litellm_environment": "dev",
+        "litellm_version": "1.82.3+aawm.25",
+        "litellm_fork_version": "aawm.25",
+        "litellm_wheel_versions": {"aawm-litellm-callbacks": "0.0.6"},
+        "client_name": "codex-tui",
+        "client_version": "0.124.0",
+        "client_user_agent": "codex-tui/0.124.0",
         "metadata": {},
     }
 
@@ -785,6 +879,13 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
     assert payload[19] == "not_applicable"
     assert payload[22] is True
     assert payload[23] == "hit"
+    assert payload[35] == "dev"
+    assert payload[36] == "1.82.3+aawm.25"
+    assert payload[37] == "aawm.25"
+    assert "aawm-litellm-callbacks" in payload[38]
+    assert payload[39] == "codex-tui"
+    assert payload[40] == "0.124.0"
+    assert payload[41] == "codex-tui/0.124.0"
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
@@ -1319,6 +1420,9 @@ def test_build_session_history_record_from_spend_log_row_recovers_real_session_i
     assert record["tenant_id"] == "litellm"
     assert record["reasoning_tokens_reported"] == 4
     assert record["tool_call_count"] == 1
+    assert record["client_name"] == "claude-code"
+    assert record["client_version"] == "2.1.112"
+    assert record["litellm_environment"] is None
     assert record["metadata"]["backfilled"] is True
     assert record["metadata"]["backfill_source"] == "LiteLLM_SpendLogs"
     assert record["metadata"]["backfill_run_id"] == "run-1"
@@ -1527,6 +1631,9 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["provider"] == "anthropic"
     assert record["agent_name"] == "orchestrator"
     assert record["tenant_id"] == "litellm"
+    assert record["litellm_environment"] == "dev"
+    assert record["client_name"] == "claude-code"
+    assert record["client_version"] == "2.1.112"
     assert record["input_tokens"] == 120
     assert record["output_tokens"] == 45
     assert record["total_tokens"] == 165

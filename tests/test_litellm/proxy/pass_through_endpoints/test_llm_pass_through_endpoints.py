@@ -24,6 +24,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_adapter_completion_message_window,
     _apply_google_adapter_request_shape_policy,
     _apply_google_code_assist_native_tool_aliases,
+    _build_anthropic_responses_adapter_request_body,
     _build_google_code_assist_request_from_completion_kwargs,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _get_google_adapter_rate_limit_key,
@@ -78,6 +79,65 @@ def clear_openrouter_adapter_failure_circuit_state():
 
 
 class TestResponsesAdapterToolChoice:
+    def test_responses_adapter_normalizes_empty_object_tool_schema(self):
+        translated_body = _build_anthropic_responses_adapter_request_body(
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 32,
+                "tools": [
+                    {
+                        "name": "mcp__mcppg__pg_alter_table",
+                        "description": "Alters a table.",
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            },
+            adapter_model="gpt-5.4",
+        )
+
+        assert translated_body["tools"][0]["parameters"] == {
+            "type": "object",
+            "properties": {},
+        }
+
+    def test_responses_adapter_normalizes_nested_object_schemas(self):
+        translated_body = _build_anthropic_responses_adapter_request_body(
+            {
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 32,
+                "tools": [
+                    {
+                        "name": "mcp__mcppg__pg_alter_table",
+                        "description": "Alters a table.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "alter_columns": {
+                                    "items": {"$ref": "#/$defs/_AlterColumnSpec"},
+                                    "type": "array",
+                                }
+                            },
+                            "$defs": {
+                                "_AlterColumnSpec": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                }
+                            },
+                        },
+                    }
+                ],
+            },
+            adapter_model="gpt-5.4",
+        )
+
+        assert translated_body["tools"][0]["parameters"]["$defs"]["_AlterColumnSpec"] == {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {},
+        }
+
     def test_forces_explicit_bash_tool_choice_when_prompt_requires_bash(self):
         translated_body = {
             "tools": [
@@ -556,6 +616,8 @@ class TestGoogleAdapterRequestShapePolicy:
         changes = _apply_google_adapter_request_shape_policy(payload)
 
         assert changes == {
+            "injected_default_thinking_config": True,
+            "injected_default_thinking_level": "low",
             "trimmed_contents_from_count": 30,
             "trimmed_contents_to_count": 9,
             "trimmed_contents_from_text_chars": 36260,
@@ -567,6 +629,10 @@ class TestGoogleAdapterRequestShapePolicy:
         assert len(payload["request"]["contents"]) == 9
         assert payload["request"]["contents"][0]["parts"][0]["text"].startswith("block-21-")
         assert payload["request"]["contents"][-1]["parts"][0]["text"].startswith("block-29-")
+        assert payload["request"]["generationConfig"]["thinkingConfig"] == {
+            "includeThoughts": False,
+            "thinkingLevel": "low",
+        }
 
     @pytest.mark.asyncio
     async def test_google_code_assist_builder_derives_user_prompt_id_from_prompt_not_session(self):
@@ -1457,6 +1523,95 @@ class TestPassThroughRequestRetryableFailures:
         assert exc_info.value.detail == '{"error":"provider failed"}'
         mock_logging_obj.post_call_failure_hook.assert_not_awaited()
         mock_log_exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_normalizes_openai_function_tool_schemas(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        mock_httpx_response = MagicMock()
+        mock_httpx_response.status_code = 200
+        mock_httpx_response.headers = {"content-type": "application/json"}
+        mock_httpx_response.aiter_bytes = AsyncMock(
+            return_value=[b'{"result": "success"}']
+        )
+        mock_httpx_response.aread = AsyncMock(return_value=b'{"result": "success"}')
+
+        custom_body = {
+            "model": "gpt-5.4",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "mcp__mcppg__pg_alter_table",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "nested_tool",
+                        "parameters": {},
+                    },
+                },
+            ],
+            "litellm_metadata": {},
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ) as mock_success_handler:
+            mock_client = MagicMock()
+            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_success_hook = AsyncMock()
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            await pass_through_request(
+                request=mock_request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                stream=False,
+            )
+
+            sent_json = mock_client.request.call_args.kwargs["json"]
+            assert sent_json["tools"][0]["parameters"] == {
+                "type": "object",
+                "properties": {},
+            }
+            assert sent_json["tools"][1]["function"]["parameters"] == {
+                "type": "object",
+                "properties": {},
+            }
+            assert "litellm_metadata" not in sent_json
+
+            mock_success_handler.assert_called_once()
+            success_kwargs = mock_success_handler.call_args.kwargs
+            assert (
+                success_kwargs["litellm_params"]["metadata"][
+                    "openai_function_tool_schema_fix_count"
+                ]
+                == 2
+            )
 
 
 class TestOpenRouterAdapterRetry:
@@ -2680,20 +2835,29 @@ class TestClaudePersistedOutputExpansion:
         assert _normalize_google_completion_adapter_model_name(f"gemini/{declared_model}") == translated_model
         assert _normalize_google_completion_adapter_model_name(f"google/{declared_model}") == translated_model
 
+    @pytest.mark.parametrize(
+        ("requested_model", "expected_model"),
+        [
+            ("openai/gpt-5.4-mini", "gpt-5.4-mini"),
+            ("openai/gpt-5.5", "gpt-5.5"),
+        ],
+    )
     def test_resolve_anthropic_openai_responses_adapter_model_supports_openai_prefix(
         self,
+        requested_model: str,
+        expected_model: str,
     ):
         from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
             _resolve_anthropic_openai_responses_adapter_model,
         )
 
-        request_body = {"model": "openai/gpt-5.4-mini"}
+        request_body = {"model": requested_model}
 
         assert (
             _resolve_anthropic_openai_responses_adapter_model(
                 request_body, endpoint="v1/messages"
             )
-            == "gpt-5.4-mini"
+            == expected_model
         )
 
     def test_resolve_anthropic_google_completion_adapter_model_supports_google_prefix(
@@ -3075,6 +3239,11 @@ class TestClaudePersistedOutputExpansion:
                         }
                     ).encode("utf-8"),
                     status_code=200,
+                    headers={
+                        "content-length": "999",
+                        "content-encoding": "br",
+                        "x-upstream-trace": "openrouter-test",
+                    },
                     media_type="application/json",
                 )
             ),
@@ -3088,6 +3257,9 @@ class TestClaudePersistedOutputExpansion:
 
         translated_body = json.loads(result.body.decode("utf-8"))
         assert translated_body["model"] == "inclusionai/ling-2.6-flash:free"
+        assert result.headers["content-length"] == str(len(result.body))
+        assert result.headers.get("content-encoding") is None
+        assert result.headers["x-upstream-trace"] == "openrouter-test"
         call_kwargs = mock_pass_through_request.await_args.kwargs
         assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
@@ -3599,11 +3771,20 @@ class TestClaudePersistedOutputExpansion:
         assert "model ok" in streamed_payload
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("requested_model", "response_model"),
+        [
+            ("gpt-5.4", "gpt-5.4"),
+            ("openai/gpt-5.5", "gpt-5.5"),
+        ],
+    )
     async def test_anthropic_proxy_route_adapts_allowlisted_openai_model_to_responses(
         self,
+        requested_model: str,
+        response_model: str,
     ):
         request_body = {
-            "model": "gpt-5.4",
+            "model": requested_model,
             "max_tokens": 256,
             "system": "You are helpful.",
             "messages": [{"role": "user", "content": "Say adapter ok"}],
@@ -3614,7 +3795,9 @@ class TestClaudePersistedOutputExpansion:
                 b'event: response.created\ndata: {"type":"response.created"}\n\n',
                 b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":"adapter "}\n\n',
                 b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":"ok"}\n\n',
-                b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_123","object":"response","created_at":1744974432,"model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}\n\n',
+                f'event: response.completed\ndata: {{"type":"response.completed","response":{{"id":"resp_123","object":"response","created_at":1744974432,"model":"{response_model}","status":"completed","output":[],"usage":{{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}}}}\n\n'.encode(
+                    "utf-8"
+                ),
             ]
             for chunk in chunks:
                 yield chunk
@@ -3659,7 +3842,7 @@ class TestClaudePersistedOutputExpansion:
         assert isinstance(result, Response)
         translated_body = json.loads(result.body.decode("utf-8"))
         assert translated_body["type"] == "message"
-        assert translated_body["model"] == "gpt-5.4"
+        assert translated_body["model"] == response_model
         assert translated_body["content"][0]["type"] == "text"
         assert translated_body["content"][0]["text"] == "adapter ok"
         assert translated_body["usage"]["input_tokens"] == 12
@@ -3693,7 +3876,7 @@ class TestClaudePersistedOutputExpansion:
             "session-id",
         ]
         assert call_kwargs["custom_headers"] == {}
-        assert call_kwargs["custom_body"]["model"] == "gpt-5.4"
+        assert call_kwargs["custom_body"]["model"] == response_model
         assert call_kwargs["custom_body"]["stream"] is True
         assert "max_output_tokens" not in call_kwargs["custom_body"]
         assert "temperature" not in call_kwargs["custom_body"]
