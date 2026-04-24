@@ -17,5 +17,5 @@
 
 ## Next
 
-- Keep future harness bundle publishes on version `0.0.7` or newer.
-  The `0.0.7` harness injects and validates a harness-controlled Claude trace `userId` without hard-coding the operator identity, and uses an explicit per-run Claude settings overlay so local user/project settings cannot override the test headers.
+- Keep future harness bundle publishes on version `0.0.8` or newer.
+  The `0.0.8` harness includes the controlled Claude trace `userId` validation plus the explicit per-run Claude settings overlay so local user/project settings cannot override the test headers.
