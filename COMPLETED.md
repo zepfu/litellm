@@ -2,6 +2,15 @@
 
 ## 2026-04-24
 
+- Promoted the local prod `:4000` LiteLLM container to the `aawm.34` image and completed validation.
+  Prod readiness reported LiteLLM `1.82.3+aawm.34`; focused `claude_adapter_openrouter_ling_26_flash`, `claude_adapter_peeromega_fanout`, NVIDIA GLM, and NVIDIA DeepSeek passed. `claude_adapter_gpt_oss_120b` hit the exact OpenRouter provider-unavailable signature (`503 provider=OpenInference raw=no healthy upstream`) and was classified as a soft warning during isolated validation.
+
+- Cleaned up the default prod adapter suite after OpenRouter edge-model noise.
+  `claude_adapter_gpt_oss_20b` and `claude_adapter_gpt_oss_120b` remain available as explicit `--cases` selections, but are excluded from the default suite because repeated OpenRouter provider-unavailable responses made default promotion runs noisy and slow. Harness `0.0.14` carries the updated defaults, and the clean default prod harness pass at `/tmp/litellm-prod-harness-aawm34-no-gptoss.json` completed with zero failures and zero warnings.
+
+- Captured the next promotion hardening requirement.
+  Future prod cutovers should include a production-style preflight against the exact built image / installed wheel path on `:4001`, plus a small explicit promotion-gate set for opt-in provider lanes, before touching the `:4000` container.
+
 - Advanced the harness artifact to `h-v0.0.13` and prepared the follow-up `aawm.34` image tag.
   The `aawm.33` main push correctly triggered the harness artifact autobump because the prod hardening changed harness code. Since the image publisher requires fork image tags to point at current `main`, `aawm.34` carries the same NVIDIA metadata-preservation fix plus the `h-v0.0.13` artifact bump.
 
