@@ -11,6 +11,9 @@
 - Advanced the callback, harness, and model-config artifact versions after branch promotion.
   Remote `cb-v0.0.7`, `h-v0.0.4`, and `cfg-v0.0.4` already existed on a release-only commit, so the durable release artifacts now use fresh non-rewritten versions: callback `0.0.8`, harness `0.0.5`, and model config `0.0.5`.
 
+- Advanced the fork image version to `1.82.3+aawm.27` for main-head promotion.
+  The initial `v1.82.3-aawm.26` tag was cut before `main` converged, and the guarded image publisher rejects non-main-head tags; `aawm.27` avoids force-moving the published `aawm.26` tag.
+
 - Repaired `public.session_history` observability gaps in the local `aawm_tristore` database.
   The repair normalized null providers, removed invalid `reasoning_tokens_source=provider_reported` rows with zero reported reasoning tokens, populated target-provider cache statuses, and recalculated cache miss token/cost fields where usage exposed cache-write tokens.
 
