@@ -58,6 +58,10 @@ def _load_repo_dotenv() -> None:
 
 _load_repo_dotenv()
 
+# Historical repairs should be reproducible against the bundled/promoted cost map
+# unless an operator explicitly opts into a different source.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
 from litellm.caching import DualCache
 from litellm.integrations.aawm_agent_identity import (
     _build_aawm_dsn,
@@ -1800,18 +1804,66 @@ def _recalculate_session_history_response_cost(row: Dict[str, Any]) -> Optional[
 
     cache_creation_input_tokens = _safe_int(row.get("cache_creation_input_tokens")) or 0
     cache_read_input_tokens = _safe_int(row.get("cache_read_input_tokens")) or 0
+    cache_input_tokens = cache_creation_input_tokens + cache_read_input_tokens
+    prompt_tokens_for_cost = prompt_tokens
+    if cache_input_tokens > prompt_tokens:
+        # Older rows stored only non-cache input in input_tokens while keeping
+        # cache counters separately. LiteLLM cost calculation expects total
+        # prompt tokens when cache details are present.
+        prompt_tokens_for_cost = prompt_tokens + cache_input_tokens
     provider = str(row.get("provider") or "").strip() or None
+    cost_model = model
+    cost_provider = provider
+    if (provider or "").lower() == "chatgpt" or model.lower().startswith("chatgpt/"):
+        # Avoid the ChatGPT auth-backed cost path during offline historical repairs.
+        # The stored ChatGPT rows here use OpenAI model ids and static pricing.
+        cost_provider = "openai"
+        if model.lower().startswith("chatgpt/"):
+            cost_model = model.split("/", 1)[1]
 
     try:
         import litellm
+        from litellm.types.utils import (
+            CacheCreationTokenDetails,
+            PromptTokensDetailsWrapper,
+            Usage,
+        )
+
+        usage_object = None
+        if (
+            (cost_provider or "").lower() == "anthropic"
+            and cache_creation_input_tokens > 0
+        ):
+            # Claude Code cache writes use Anthropic's 1-hour ephemeral cache tier.
+            # session_history only stores aggregate creation tokens, so rebuild the
+            # detail object needed for LiteLLM to price the same way live logging did.
+            usage_object = Usage(
+                prompt_tokens=prompt_tokens_for_cost,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens_for_cost + completion_tokens,
+                prompt_tokens_details=PromptTokensDetailsWrapper(
+                    text_tokens=max(
+                        prompt_tokens_for_cost
+                        - cache_read_input_tokens
+                        - cache_creation_input_tokens,
+                        0,
+                    ),
+                    cached_tokens=cache_read_input_tokens,
+                    cache_creation_tokens=cache_creation_input_tokens,
+                    cache_creation_token_details=CacheCreationTokenDetails(
+                        ephemeral_1h_input_tokens=cache_creation_input_tokens
+                    ),
+                ),
+            )
 
         prompt_cost, completion_cost = litellm.cost_per_token(
-            model=model,
-            prompt_tokens=prompt_tokens,
+            model=cost_model,
+            prompt_tokens=prompt_tokens_for_cost,
             completion_tokens=completion_tokens,
-            custom_llm_provider=provider,
+            custom_llm_provider=cost_provider,
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            usage_object=usage_object,
             call_type="responses",
         )
     except Exception:
@@ -1819,8 +1871,8 @@ def _recalculate_session_history_response_cost(row: Dict[str, Any]) -> Optional[
             import litellm
 
             prompt_cost, completion_cost = litellm.cost_per_token(
-                model=model,
-                prompt_tokens=prompt_tokens,
+                model=cost_model,
+                prompt_tokens=prompt_tokens_for_cost,
                 completion_tokens=completion_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,

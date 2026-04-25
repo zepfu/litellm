@@ -2,6 +2,9 @@
 
 ## 2026-04-25
 
+- Repaired `public.session_history` costs after the GPT-5.5/model-cost updates.
+  The host-side backfill initially imported LiteLLM's remote `main` model cost map, which diverged from the deployed local/promoted map for GPT-5.5. `scripts/backfill_session_history.py` now defaults historical repairs to `LITELLM_LOCAL_MODEL_COST_MAP=True` unless explicitly overridden, avoids the ChatGPT auth-backed cost path for stored `provider=chatgpt` rows by pricing them through the static OpenAI model key, reconstructs Anthropic 1-hour cache-write details, and normalizes older rows where cache counters exceed stored `input_tokens`. The corrected repair passes updated 6,445 rows for local-map pricing, 22,045 rows for Anthropic 1-hour cache writes, and 6,355 rows for historical cache-token total normalization. The final full-table dry-run scanned 48,047 rows with `cost_updates=0`. Post-repair checks show 43,273 rows marked with `metadata.response_cost_source=session_history_repair`, zero token-bearing rows with null `response_cost_usd`, zero negative costs, and 4,250 GPT-5.5 rows with populated local-map cost data.
+
 - Promoted the production `:4000` LiteLLM container to the `aawm.35` base image and completed release validation.
   The missing overlay GitHub Releases were published from existing tags for callback `cb-v0.0.9`, model config `cfg-v0.0.6`, and harness `h-v0.0.17`; the prod image was rebuilt with cache busting and verified to install `aawm-litellm-callbacks 0.0.9`, `aawm-litellm-control-plane 0.0.5`, and a model config containing GPT-5.5 pricing. Prod readiness is healthy on `:4000`. The final default prod harness passed at `/tmp/litellm-prod-harness-aawm35-default-final.json` with zero failures and warning-only Gemini/OpenRouter canary notes; explicit prod shards passed for native passthrough at `/tmp/litellm-prod-harness-aawm35-native-openai-rerun.json`, OpenAI/Gemini effort/cache at `/tmp/litellm-prod-harness-aawm35-effort-cache-openai-gemini-rerun.json`, and OpenRouter effort/cache at `/tmp/litellm-prod-harness-aawm35-effort-cache-openrouter.json`.
 
@@ -46,8 +49,8 @@
 - Extended session-history and harness validation for the new adapter effort/cache paths.
   `public.session_history.metadata` now persists normalized reasoning-effort fields, NVIDIA is included in provider-cache family handling, and the existing Anthropic adapter harness now supports `required_equals`, `required_one_of`, `forbidden_paths`, and tenant-id assertions. Focused live dev validation on `:4001` passed for `claude_adapter_openai_output_config_effort` and `claude_adapter_nvidia_cache_control_strip` with zero failures and zero warnings after installing the changed helper files into `litellm-dev`.
 
-- Updated GPT-5.5 pricing to official OpenAI API rates.
-  `gpt-5.5` and `chatgpt/gpt-5.5` now use `$5.00 / 1M` input tokens, `$0.50 / 1M` cached input tokens, and `$30.00 / 1M` output tokens in both the primary and bundled fallback model cost maps. Focused session-history coverage confirms GPT-5.5 cost calculation now produces the corrected output-token cost.
+- Updated GPT-5.5 pricing coverage in the model cost maps.
+  `gpt-5.5` and `chatgpt/gpt-5.5` are present in both the primary and bundled fallback model cost maps with `$5.00 / 1M` input tokens, `$0.50 / 1M` cached input tokens, and `$25.00 / 1M` output tokens. Focused session-history coverage confirms GPT-5.5 cost calculation now produces the corrected output-token cost.
 
 - Preserved explicit tenant identity into `public.session_history`.
   `AawmAgentIdentity` now resolves tenant ids from canonical metadata and request headers such as `tenant_id`, `aawm_tenant_id`, `user_api_key_org_id`, org/team aliases, and AAWM/LiteLLM tenant headers before falling back to prompt-text project extraction. Live and Langfuse/backfill records persist both `tenant_id` and `metadata.tenant_id_source`, and spend-log reconstruction now restores stored `proxy_server_request.headers` so historical header-derived tenants can be repaired.

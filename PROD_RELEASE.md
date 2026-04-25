@@ -259,6 +259,12 @@ id is essential to the test. Static session ids can collide with older
 `public.session_history` rows and produce false environment mismatches during
 prod validation.
 
+If a release changes model pricing, run any `public.session_history` cost
+repair from the repo backfill script so it uses the same bundled/promoted model
+cost map as the container. The repair script defaults
+`LITELLM_LOCAL_MODEL_COST_MAP=True`; only override that when intentionally
+testing against a different cost-map source.
+
 ## Optional Provider Lanes
 
 These cases remain available but are not part of the default promotion suite
