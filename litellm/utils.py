@@ -8340,6 +8340,8 @@ class ProviderConfigManager:
             return litellm.HuggingFaceRerankConfig()
         elif litellm.LlmProviders.DEEPINFRA == provider:
             return litellm.DeepinfraRerankConfig()
+        elif litellm.LlmProviders.OPENROUTER == provider:
+            return litellm.OpenRouterRerankConfig()
         elif litellm.LlmProviders.NVIDIA_NIM == provider:
             from litellm.llms.nvidia_nim.rerank.common_utils import (
                 get_nvidia_nim_rerank_config,

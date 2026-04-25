@@ -24335,6 +24335,18 @@
         "source": "https://openrouter.ai/api/v1/models/bytedance/ui-tars-1.5-7b",
         "supports_tool_choice": true
     },
+    "openrouter/cohere/rerank-4-pro": {
+        "input_cost_per_query": 0.0025,
+        "input_cost_per_token": 0.0,
+        "litellm_provider": "openrouter",
+        "max_input_tokens": 32768,
+        "max_output_tokens": 32768,
+        "max_query_tokens": 32768,
+        "max_tokens": 32768,
+        "mode": "rerank",
+        "output_cost_per_token": 0.0,
+        "source": "https://openrouter.ai/cohere/rerank-4-pro"
+    },
     "openrouter/deepseek/deepseek-chat": {
         "input_cost_per_token": 1.4e-07,
         "litellm_provider": "openrouter",
@@ -25174,6 +25186,17 @@
         "output_cost_per_token": 6.3e-07,
         "supports_tool_choice": true,
         "supports_vision": true
+    },
+    "openrouter/qwen/qwen3-embedding-8b": {
+        "input_cost_per_token": 1e-08,
+        "litellm_provider": "openrouter",
+        "max_input_tokens": 32000,
+        "max_output_tokens": 32000,
+        "max_tokens": 32000,
+        "mode": "embedding",
+        "output_cost_per_token": 0.0,
+        "output_vector_size": 4096,
+        "source": "https://openrouter.ai/qwen/qwen3-embedding-8b"
     },
     "openrouter/qwen/qwen3-coder": {
         "input_cost_per_token": 2.2e-07,

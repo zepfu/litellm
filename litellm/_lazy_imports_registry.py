@@ -150,6 +150,7 @@ LLM_CONFIG_NAMES = (
     "JinaAIRerankConfig",
     "DeepinfraRerankConfig",
     "HostedVLLMRerankConfig",
+    "OpenRouterRerankConfig",
     "NvidiaNimRerankConfig",
     "NvidiaNimRankingConfig",
     "VertexAIRerankConfig",
@@ -660,6 +661,10 @@ _LLM_CONFIGS_IMPORT_MAP = {
     "HostedVLLMRerankConfig": (
         ".llms.hosted_vllm.rerank.transformation",
         "HostedVLLMRerankConfig",
+    ),
+    "OpenRouterRerankConfig": (
+        ".llms.openrouter.rerank.transformation",
+        "OpenRouterRerankConfig",
     ),
     "NvidiaNimRerankConfig": (
         ".llms.nvidia_nim.rerank.transformation",

@@ -17,7 +17,13 @@ from litellm.cost_calculator import (
     response_cost_calculator,
 )
 from litellm.types.llms.openai import OpenAIRealtimeStreamList
-from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
+from litellm.types.rerank import RerankResponse
+from litellm.types.utils import (
+    EmbeddingResponse,
+    ModelResponse,
+    PromptTokensDetailsWrapper,
+    Usage,
+)
 from litellm.utils import TranscriptionResponse
 
 
@@ -2049,3 +2055,65 @@ def test_cost_calculator_openrouter_gpt_oss_20b_free_alias():
         completion='world',
     )
     assert response_cost == 0
+
+
+def test_cost_calculator_openrouter_qwen3_embedding_8b_metadata_and_cost():
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model = "openrouter/qwen/qwen3-embedding-8b"
+    model_info = litellm.get_model_info(model)
+
+    assert model_info["mode"] == "embedding"
+    assert model_info["litellm_provider"] == "openrouter"
+    assert model_info["max_input_tokens"] == 32000
+    assert model_info["max_output_tokens"] == 32000
+    assert model_info["input_cost_per_token"] == 1e-08
+    assert model_info["output_cost_per_token"] == 0.0
+    assert model_info["output_vector_size"] == 4096
+
+    response = EmbeddingResponse(
+        model=model,
+        data=[],
+        usage=Usage(prompt_tokens=1000, completion_tokens=0, total_tokens=1000),
+    )
+
+    response_cost = litellm.cost_calculator.completion_cost(
+        completion_response=response,
+        model=model,
+        custom_llm_provider="openrouter",
+        call_type="embedding",
+    )
+
+    assert response_cost == pytest.approx(1000 * 1e-08, rel=1e-12)
+
+
+def test_cost_calculator_openrouter_cohere_rerank_4_pro_metadata_and_cost():
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model = "openrouter/cohere/rerank-4-pro"
+    model_info = litellm.get_model_info(model)
+
+    assert model_info["mode"] == "rerank"
+    assert model_info["litellm_provider"] == "openrouter"
+    assert model_info["max_input_tokens"] == 32768
+    assert model_info["max_tokens"] == 32768
+    assert model_info["input_cost_per_query"] == 0.0025
+    assert model_info["input_cost_per_token"] == 0.0
+    assert model_info["output_cost_per_token"] == 0.0
+
+    response = RerankResponse(
+        id="rerank-test",
+        results=[],
+        meta={"billed_units": {"search_units": 2}},
+    )
+
+    response_cost = litellm.cost_calculator.completion_cost(
+        completion_response=response,
+        model=model,
+        custom_llm_provider="openrouter",
+        call_type="rerank",
+    )
+
+    assert response_cost == pytest.approx(2 * 0.0025, rel=1e-12)
