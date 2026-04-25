@@ -470,3 +470,149 @@ def test_session_history_expected_rows_can_require_multiple_shared_session_rows(
 
     assert failures == []
     assert len(matched_records) == 2
+
+
+def test_validation_db_connection_reuses_open_connection_and_closes(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+    connections = []
+
+    class FakeConnection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def fake_connect(**kwargs):
+        conn = FakeConnection()
+        connections.append((kwargs, conn))
+        return conn
+
+    monkeypatch.setattr(harness.psycopg, "connect", fake_connect)
+
+    settings = {
+        "host": "127.0.0.1",
+        "port": 5434,
+        "dbname": "aawm_tristore",
+        "user": "aawm",
+        "password": "pw",
+    }
+
+    first = harness._validation_db_connection(settings)
+    second = harness._validation_db_connection(settings)
+
+    assert first is second
+    assert len(connections) == 1
+    assert connections[0][0]["autocommit"] is True
+    assert connections[0][0]["connect_timeout"] == 10
+
+    harness._close_validation_db_connections()
+
+    assert connections[0][1].closed is True
+
+
+def test_session_history_and_tool_activity_validators_share_db_connection(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+    connections = []
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+            self.query = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            self.query = query
+            self.conn.executed.append((query, params))
+
+        def fetchall(self):
+            if "session_history_tool_activity" in self.query:
+                return [
+                    {
+                        "provider": "openai",
+                        "model": "gpt-5.4",
+                        "tool_index": 0,
+                        "tool_name": "Bash",
+                        "tool_kind": "execute",
+                        "command_text": "pwd",
+                        "arguments": {},
+                        "metadata": {},
+                        "created_at": None,
+                    }
+                ]
+            return [
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.4",
+                    "session_id": "session-1",
+                    "tenant_id": "adapter-harness-tenant",
+                    "provider_cache_status": "not_attempted",
+                    "provider_cache_miss": False,
+                    "reasoning_tokens_source": "not_applicable",
+                    "metadata": {},
+                    "start_time": None,
+                    "end_time": None,
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def __init__(self):
+            self.executed = []
+
+        def cursor(self):
+            return FakeCursor(self)
+
+        def close(self):
+            self.closed = True
+
+    def fake_connect(**kwargs):
+        conn = FakeConnection()
+        connections.append((kwargs, conn))
+        return conn
+
+    monkeypatch.setattr(harness.psycopg, "connect", fake_connect)
+    checks = {
+        "db_password": "pw",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4",
+        "require_runtime_identity": False,
+    }
+
+    session_summary, session_failures = harness._validate_session_history(
+        family="case",
+        session_id="session-1",
+        checks=checks,
+    )
+    tool_summary, tool_failures = harness._validate_tool_activity(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.4",
+                    "tool_name": "Bash",
+                    "tool_kind": "execute",
+                }
+            ],
+        },
+    )
+
+    assert session_failures == []
+    assert tool_failures == []
+    assert session_summary["record"]["provider"] == "openai"
+    assert tool_summary["record"]["tool_name"] == "Bash"
+    assert len(connections) == 1
+    assert len(connections[0][1].executed) == 2
+    assert connections[0][0]["autocommit"] is True
+
+    harness._close_validation_db_connections()
