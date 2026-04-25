@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib.util
 import json
 import os
@@ -51,6 +52,19 @@ DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS = [
     'timed out after',
     'runtime logs contained forbidden substring',
 ]
+_VALIDATION_DB_CONNECTIONS: dict[tuple[str, int, str, str, str], Any] = {}
+
+
+def _close_validation_db_connections() -> None:
+    while _VALIDATION_DB_CONNECTIONS:
+        _, conn = _VALIDATION_DB_CONNECTIONS.popitem()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_validation_db_connections)
 
 
 def _load_run_acceptance_module() -> Any:
@@ -902,17 +916,13 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     if not session_id:
         return {'record': None}, [f'{family} missing command session_id for session_history validation']
 
-    db_host = str(checks.get('db_host') or '127.0.0.1')
-    db_port = int(checks.get('db_port') or 5434)
-    db_name = str(checks.get('db_name') or 'aawm_tristore')
-    db_user = str(checks.get('db_user') or 'aawm')
-    db_password = None
-    if isinstance(checks.get('db_password_env'), str):
-        db_password = os.environ.get(str(checks['db_password_env']))
-    if db_password is None and isinstance(checks.get('db_password'), str):
-        db_password = str(checks['db_password'])
-    if db_password is None:
-        return {'record': None}, [f'{family} missing DB password for session_history validation']
+    db_settings, db_failures = _validation_db_settings(
+        family=family,
+        checks=checks,
+        validation_name='session_history',
+    )
+    if db_settings is None:
+        return {'record': None}, db_failures
 
     expected_provider = checks.get('expected_provider')
     expected_model = checks.get('expected_model')
@@ -939,18 +949,10 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         where session_id = %s
         order by start_time desc
     '''
-    with psycopg.connect(
-        host=db_host,
-        port=db_port,
-        dbname=db_name,
-        user=db_user,
-        password=db_password,
-        connect_timeout=10,
-        row_factory=psycopg.rows.dict_row,
-    ) as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, (session_id,))
-            records = cur.fetchall()
+    conn = _validation_db_connection(db_settings)
+    with conn.cursor() as cur:
+        cur.execute(query, (session_id,))
+        records = cur.fetchall()
 
     if not records:
         return {'record': None, 'records': []}, [f'{family} missing session_history row for session_id `{session_id}`']
@@ -1144,6 +1146,61 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     return {'record': normalized_record, 'records': [_normalize_record(row) for row in records]}, failures
 
 
+def _validation_db_settings(
+    *,
+    family: str,
+    checks: dict[str, Any],
+    validation_name: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    db_host = str(checks.get('db_host') or '127.0.0.1')
+    db_port = int(checks.get('db_port') or 5434)
+    db_name = str(checks.get('db_name') or 'aawm_tristore')
+    db_user = str(checks.get('db_user') or 'aawm')
+    db_password = None
+    if isinstance(checks.get('db_password_env'), str):
+        db_password = os.environ.get(str(checks['db_password_env']))
+    if db_password is None and isinstance(checks.get('db_password'), str):
+        db_password = str(checks['db_password'])
+    if db_password is None:
+        return None, [f'{family} missing DB password for {validation_name} validation']
+    return {
+        'host': db_host,
+        'port': db_port,
+        'dbname': db_name,
+        'user': db_user,
+        'password': db_password,
+    }, []
+
+
+def _validation_db_connection(settings: dict[str, Any]) -> Any:
+    key = (
+        str(settings['host']),
+        int(settings['port']),
+        str(settings['dbname']),
+        str(settings['user']),
+        str(settings['password']),
+    )
+    conn = _VALIDATION_DB_CONNECTIONS.get(key)
+    if conn is not None and not bool(getattr(conn, 'closed', False)):
+        return conn
+
+    if conn is not None:
+        _VALIDATION_DB_CONNECTIONS.pop(key, None)
+
+    conn = psycopg.connect(
+        host=key[0],
+        port=key[1],
+        dbname=key[2],
+        user=key[3],
+        password=key[4],
+        connect_timeout=10,
+        autocommit=True,
+        row_factory=psycopg.rows.dict_row,
+    )
+    _VALIDATION_DB_CONNECTIONS[key] = conn
+    return conn
+
+
 def _session_history_record_matches_expected(
     row: dict[str, Any],
     expected_row: dict[str, Any],
@@ -1220,17 +1277,13 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
     if not session_id:
         return {'record': None, 'records': []}, [f'{family} missing command session_id for tool_activity validation']
 
-    db_host = str(checks.get('db_host') or '127.0.0.1')
-    db_port = int(checks.get('db_port') or 5434)
-    db_name = str(checks.get('db_name') or 'aawm_tristore')
-    db_user = str(checks.get('db_user') or 'aawm')
-    db_password = None
-    if isinstance(checks.get('db_password_env'), str):
-        db_password = os.environ.get(str(checks['db_password_env']))
-    if db_password is None and isinstance(checks.get('db_password'), str):
-        db_password = str(checks['db_password'])
-    if db_password is None:
-        return {'record': None, 'records': []}, [f'{family} missing DB password for tool_activity validation']
+    db_settings, db_failures = _validation_db_settings(
+        family=family,
+        checks=checks,
+        validation_name='tool_activity',
+    )
+    if db_settings is None:
+        return {'record': None, 'records': []}, db_failures
 
     query = '''
         select provider, model, tool_index, tool_name, tool_kind, command_text,
@@ -1239,18 +1292,10 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
         where session_id = %s
         order by created_at asc, tool_index asc
     '''
-    with psycopg.connect(
-        host=db_host,
-        port=db_port,
-        dbname=db_name,
-        user=db_user,
-        password=db_password,
-        connect_timeout=10,
-        row_factory=psycopg.rows.dict_row,
-    ) as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, (session_id,))
-            records = cur.fetchall()
+    conn = _validation_db_connection(db_settings)
+    with conn.cursor() as cur:
+        cur.execute(query, (session_id,))
+        records = cur.fetchall()
 
     def _normalize_record(row: dict[str, Any]) -> dict[str, Any]:
         return {

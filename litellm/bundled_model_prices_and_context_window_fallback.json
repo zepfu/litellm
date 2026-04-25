@@ -26882,13 +26882,16 @@
         "source": "https://build.nvidia.com/deepseek-ai/deepseek-v3.2"
     },
     "nvidia_nim/minimaxai/minimax-m2.7": {
-        "input_cost_per_token": 3e-07,
-        "output_cost_per_token": 1.1e-06,
+        "input_cost_per_token": 1.5e-07,
+        "output_cost_per_token": 1.15e-06,
         "litellm_provider": "nvidia_nim",
         "max_input_tokens": 196608,
         "max_output_tokens": 65536,
         "max_tokens": 65536,
         "mode": "chat",
+        "pricing_source": "https://openrouter.ai/minimax/minimax-m2.5",
+        "pricing_source_model": "openrouter/minimax/minimax-m2.5",
+        "pricing_note": "Fallback pricing basis for NVIDIA minimaxai/minimax-m2.7 when NVIDIA token pricing is unavailable.",
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_response_schema": true,

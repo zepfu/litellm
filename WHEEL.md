@@ -242,6 +242,9 @@ Recent AAWM runtime work also changed the default performance posture:
   - tune with:
     - `AAWM_SESSION_HISTORY_BATCH_SIZE`
     - `AAWM_SESSION_HISTORY_FLUSH_INTERVAL_MS`
+    - `AAWM_SESSION_HISTORY_POOL_MAX_SIZE`
+  - the writer reuses a bounded asyncpg pool and bounds overflow flushing so
+    provider bursts do not create unbounded PostgreSQL client spikes
 - Claude dynamic injection now has a small TTL cache
   - tune with:
     - `AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS`

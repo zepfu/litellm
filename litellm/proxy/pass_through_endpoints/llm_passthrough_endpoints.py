@@ -4192,6 +4192,25 @@ def _build_completion_adapter_metadata(
         value = litellm_metadata.get(key)
         if value and not metadata.get(key):
             metadata[key] = value
+    for key in (
+        "passthrough_route_family",
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "langfuse_spans",
+    ):
+        value = litellm_metadata.get(key)
+        if value:
+            metadata[key] = value
+    litellm_tags = litellm_metadata.get("tags")
+    if isinstance(litellm_tags, list):
+        existing_tags = metadata.get("tags")
+        if not isinstance(existing_tags, list):
+            existing_tags = []
+        metadata["tags"] = [
+            *existing_tags,
+            *[tag for tag in litellm_tags if tag not in existing_tags],
+        ]
     return metadata
 
 
