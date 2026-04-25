@@ -2,6 +2,15 @@
 
 ## 2026-04-25
 
+- Promoted the production `:4000` LiteLLM container to the `aawm.35` base image and completed release validation.
+  The missing overlay GitHub Releases were published from existing tags for callback `cb-v0.0.9`, model config `cfg-v0.0.6`, and harness `h-v0.0.17`; the prod image was rebuilt with cache busting and verified to install `aawm-litellm-callbacks 0.0.9`, `aawm-litellm-control-plane 0.0.5`, and a model config containing GPT-5.5 pricing. Prod readiness is healthy on `:4000`. The final default prod harness passed at `/tmp/litellm-prod-harness-aawm35-default-final.json` with zero failures and warning-only Gemini/OpenRouter canary notes; explicit prod shards passed for native passthrough at `/tmp/litellm-prod-harness-aawm35-native-openai-rerun.json`, OpenAI/Gemini effort/cache at `/tmp/litellm-prod-harness-aawm35-effort-cache-openai-gemini-rerun.json`, and OpenRouter effort/cache at `/tmp/litellm-prod-harness-aawm35-effort-cache-openrouter.json`.
+
+- Hardened the release process after the `aawm.35` prod cutover.
+  `PROD_RELEASE.md` now calls out that overlay git tags are insufficient unless matching GitHub Release assets exist, that `--no-cache` rebuilds are required after publishing missing overlay releases, that built images should be inspected before restarting prod, and that direct `/openai_passthrough/*` prod validation requires `OPENAI_API_KEY` mapped into the container. The infrastructure compose file now maps `OPENAI_API_KEY` from `AAWM_OPENAI_API_KEY`, matching the dev runtime behavior.
+
+- Removed static session ids from opt-in effort/cache harness cases.
+  The OpenAI effort, Gemini effort, and OpenRouter effort/cache cases now use the existing generated per-run session id path, avoiding false prod failures caused by older dev `public.session_history` rows sharing the same static session id. The affected prod shard passed cleanly after the change.
+
 - Broadened live harness coverage for the completed `/anthropic` effort/cache translation work.
   Added default-excluded existing-harness cases for Gemini minimal/max effort with cache-control variants, OpenRouter max/none/no-effort with cache-control variants, and an ordered OpenAI two-pass prompt-cache case. The harness now supports repeated HTTP passes, compact repeated-text fixtures, env-expanded HTTP headers, multi-row session-history minimums, and provider cache hit validation without introducing a second harness. Live dev shard artifacts passed with zero failures/warnings at `/tmp/anthropic-effort-cache-gemini-dev.json`, `/tmp/anthropic-effort-cache-openrouter-dev.json`, and `/tmp/anthropic-effort-cache-openai-dev.json`.
 
