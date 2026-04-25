@@ -25,13 +25,12 @@ only as needed:
 
 ## In Progress
 
-- Finish the NVIDIA Anthropic-adapter lane and validation work.
-  Current target: direct `nvidia/...` agent models from `~/.claude/agents` should route through a dedicated `anthropic_nvidia_completion_adapter` lane with `nvidia` egress-family enforcement, OpenAI-compatible NVIDIA logging support, and `nvidia_nim/...` cost-map coverage. The end state should match the existing adapted providers: `session_history` rows with the normalized upstream model and non-zero cost when pricing is mapped, `session_history_tool_activity` rows when tool/agent dispatch occurs, Langfuse trace environment matching the selected target, tags / metadata / spans including `route:anthropic_nvidia_completion_adapter`, `anthropic-nvidia-completion-adapter`, `anthropic-adapter-target:nvidia:/v1/chat/completions`, and the `anthropic.nvidia_completion_adapter` span name. If NVIDIA does not expose usable non-free pricing for a target model, use the closest equivalent OpenRouter pricing as the fallback basis rather than leaving long-term cost tracking unmapped. DeepSeek and GLM now pass focused prod validation on `aawm.34`; MiniMax remains the known high-latency opt-in path and should stay out of the default suite unless explicitly requested.
+- None at the moment.
 
 ## Next
 
-- Investigate and harden PostgreSQL connection pressure during full prod harness runs.
-  The `aawm.35` prod validation passed, but warning-only OpenRouter canaries and one `AawmAgentIdentity` flush log hit `FATAL: sorry, too many clients already` while the heavy default harness was running. Determine whether the pressure comes from harness-side validation connections, callback/session-history writer connection churn, Langfuse/tristore pool sizing, or overlapping fanout/concurrent provider activity. Resolve by adding connection pooling/reuse, tighter close semantics, lower harness validator concurrency, or infrastructure pool sizing as appropriate, then rerun the default prod harness plus the OpenRouter canary cases to confirm the warning is gone without weakening hard failure checks.
+- Rerun the full default dev/prod harnesses after the upstream Codex/OpenAI account usage limit resets.
+  The PostgreSQL connection-pressure hardening is complete and targeted recent-window dev/prod log scans no longer show DB pressure signatures. The latest full default dev and prod runs were blocked by upstream OpenAI/Codex `usage_limit_reached` 429s in the Codex/Spark cases; the dev failure reported reset time `2026-04-25 20:27:55 UTC`, and the prod OpenRouter canary shard passed with warning-only optional Gemma notes. Do not skip or soften those cases; rerun the normal default harnesses once the upstream quota reset clears.
 
 ## Ongoing
 

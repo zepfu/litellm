@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from litellm.integrations import aawm_agent_identity
 from litellm.integrations.aawm_agent_identity import (
     AawmAgentIdentity,
     _build_session_runtime_identity,
@@ -15,6 +16,31 @@ from litellm.integrations.aawm_agent_identity import (
     _persist_session_history_records,
     _persist_session_history_record,
 )
+
+
+class _FakePoolAcquire:
+    def __init__(self, conn):
+        self.conn = conn
+        self.enter_count = 0
+        self.exit_count = 0
+
+    async def __aenter__(self):
+        self.enter_count += 1
+        return self.conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exit_count += 1
+
+
+class _FakePool:
+    def __init__(self, conn):
+        self.conn = conn
+        self.acquire_contexts = []
+
+    def acquire(self):
+        acquire_context = _FakePoolAcquire(self.conn)
+        self.acquire_contexts.append(acquire_context)
+        return acquire_context
 
 
 def _base_kwargs(trace_name: str = "claude-code") -> dict:
@@ -1710,6 +1736,183 @@ async def test_async_log_success_event_enqueues_session_history_record(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch) -> None:
+    created_pool = AsyncMock()
+    create_pool_calls = []
+
+    class FakeAsyncpg:
+        async def create_pool(self, **kwargs):
+            create_pool_calls.append(kwargs)
+            return created_pool
+
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_pools", {})
+    monkeypatch.setattr(
+        aawm_agent_identity, "_build_aawm_dsn", lambda: "postgresql://aawm@test/db"
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_get_session_history_pool_max_size", lambda: 3)
+    monkeypatch.setattr(
+        aawm_agent_identity.importlib,
+        "import_module",
+        lambda name: FakeAsyncpg() if name == "asyncpg" else None,
+    )
+
+    first_pool = await aawm_agent_identity._get_aawm_session_history_pool()
+    second_pool = await aawm_agent_identity._get_aawm_session_history_pool()
+
+    assert first_pool is created_pool
+    assert second_pool is created_pool
+    assert len(create_pool_calls) == 1
+    assert create_pool_calls[0]["max_size"] == 3
+
+    await aawm_agent_identity._close_aawm_session_history_pools_for_current_loop()
+    created_pool.close.assert_awaited_once()
+
+
+def test_enqueue_session_history_record_should_bound_overflow_flushers(monkeypatch) -> None:
+    class AlwaysFullQueue:
+        def put(self, record, timeout):
+            raise aawm_agent_identity.queue.Full
+
+    started_threads = []
+
+    class FakeThread:
+        def __init__(self, target, args, name, daemon):
+            self.target = target
+            self.args = args
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            started_threads.append(self)
+
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_overflow_flush_semaphore",
+        aawm_agent_identity.threading.BoundedSemaphore(value=1),
+    )
+    monkeypatch.setattr(aawm_agent_identity.threading, "Thread", FakeThread)
+
+    aawm_agent_identity._enqueue_session_history_record({"litellm_call_id": "call-1"})
+    aawm_agent_identity._enqueue_session_history_record({"litellm_call_id": "call-2"})
+
+    assert len(started_threads) == 1
+    assert started_threads[0].name == "aawm-session-history-overflow"
+
+
+def test_enqueue_session_history_record_releases_overflow_semaphore_when_thread_start_fails(
+    monkeypatch,
+) -> None:
+    class AlwaysFullQueue:
+        def put(self, record, timeout):
+            raise aawm_agent_identity.queue.Full
+
+    semaphore = aawm_agent_identity.threading.BoundedSemaphore(value=1)
+    flushed_records = []
+
+    def failing_thread(*args, **kwargs):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_overflow_flush_semaphore",
+        semaphore,
+    )
+    monkeypatch.setattr(aawm_agent_identity.threading, "Thread", failing_thread)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda records: flushed_records.append(records),
+    )
+
+    record = {"litellm_call_id": "call-1"}
+    aawm_agent_identity._enqueue_session_history_record(record)
+
+    assert flushed_records == [[record]]
+    assert semaphore.acquire(blocking=False) is True
+
+
+def test_enqueue_session_history_record_retries_queue_when_overflow_busy(monkeypatch) -> None:
+    class FullThenAvailableQueue:
+        def __init__(self):
+            self.records = []
+
+        def put(self, record, timeout):
+            if not self.records:
+                self.records.append(("full-attempt", timeout))
+                raise aawm_agent_identity.queue.Full
+            self.records.append((record, timeout))
+
+    queue = FullThenAvailableQueue()
+    semaphore = aawm_agent_identity.threading.BoundedSemaphore(value=1)
+    semaphore.acquire()
+    started_threads = []
+
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", queue)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_overflow_flush_semaphore",
+        semaphore,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity.threading,
+        "Thread",
+        lambda *args, **kwargs: started_threads.append((args, kwargs)),
+    )
+
+    aawm_agent_identity._enqueue_session_history_record({"litellm_call_id": "call-1"})
+
+    assert started_threads == []
+    assert queue.records[-1][0] == {"litellm_call_id": "call-1"}
+
+
+def test_shutdown_session_history_worker_waits_for_queue_space(monkeypatch) -> None:
+    class FakeWorker:
+        def __init__(self):
+            self.join_timeout = None
+
+        def join(self, timeout):
+            self.join_timeout = timeout
+
+    class FakeQueue:
+        def __init__(self):
+            self.put_calls = []
+
+        def put(self, item, timeout):
+            self.put_calls.append((item, timeout))
+
+    worker = FakeWorker()
+    queue = FakeQueue()
+
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_worker", worker)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", queue)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_flush_interval_seconds",
+        lambda: 0.5,
+    )
+
+    aawm_agent_identity._shutdown_session_history_worker()
+
+    assert queue.put_calls == [(None, 0.5)]
+    assert worker.join_timeout == 1.0
+
+
+@pytest.mark.asyncio
 async def test_persist_session_history_record_executes_insert(monkeypatch) -> None:
     record = {
         "litellm_call_id": "call-123",
@@ -1752,9 +1955,10 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     }
 
     mock_conn = AsyncMock()
+    fake_pool = _FakePool(mock_conn)
     monkeypatch.setattr(
-        "litellm.integrations.aawm_agent_identity._open_aawm_session_history_connection",
-        AsyncMock(return_value=mock_conn),
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
     )
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
@@ -1773,7 +1977,9 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     tool_args = mock_conn.executemany.await_args.args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
     assert tool_args[1][0][0] == "call-123"
-    mock_conn.close.assert_awaited_once()
+    assert fake_pool.acquire_contexts[0].enter_count == 1
+    assert fake_pool.acquire_contexts[0].exit_count == 1
+    mock_conn.close.assert_not_awaited()
 
 
 def test_build_session_history_record_from_spend_log_row_recovers_real_session_id() -> None:
@@ -2661,10 +2867,10 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     ]
 
     mock_conn = AsyncMock()
-    
+    fake_pool = _FakePool(mock_conn)
     monkeypatch.setattr(
-        "litellm.integrations.aawm_agent_identity._open_aawm_session_history_connection",
-        AsyncMock(return_value=mock_conn),
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
     )
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
@@ -2680,4 +2886,6 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
     assert tool_args[1][0][0] == "call-1"
-    mock_conn.close.assert_awaited_once()
+    assert fake_pool.acquire_contexts[0].enter_count == 1
+    assert fake_pool.acquire_contexts[0].exit_count == 1
+    mock_conn.close.assert_not_awaited()

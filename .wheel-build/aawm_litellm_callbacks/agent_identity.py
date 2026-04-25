@@ -541,11 +541,18 @@ _AAWM_TENANT_ID_HEADER_NAMES = (
 _AAWM_SESSION_HISTORY_BATCH_SIZE = 32
 _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
 _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS = 0.1
+_AAWM_SESSION_HISTORY_POOL_MAX_SIZE = 2
+_AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
 _aawm_session_history_schema_ready = False
 _aawm_session_history_schema_lock = threading.Lock()
 _aawm_session_history_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=1024)
 _aawm_session_history_worker: Optional[threading.Thread] = None
 _aawm_session_history_worker_lock = threading.Lock()
+_aawm_session_history_pool_lock = threading.Lock()
+_aawm_session_history_pools: Dict[Tuple[Any, str], Any] = {}
+_aawm_session_history_overflow_flush_semaphore = threading.BoundedSemaphore(
+    value=_AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS
+)
 
 
 def _get_session_history_batch_size() -> int:
@@ -567,14 +574,50 @@ def _get_session_history_flush_interval_seconds() -> float:
     return max(0.01, parsed_value)
 
 
+def _get_session_history_pool_max_size() -> int:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_POOL_MAX_SIZE") or ""
+    try:
+        parsed_value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_POOL_MAX_SIZE
+    return max(1, parsed_value)
 
-def _flush_session_history_batch(records: List[Dict[str, Any]]) -> None:
+
+async def _close_aawm_session_history_pools_for_current_loop() -> None:
+    loop = asyncio.get_running_loop()
+    pools_to_close: List[Any] = []
+    with _aawm_session_history_pool_lock:
+        for key, pool in list(_aawm_session_history_pools.items()):
+            if key[0] is loop:
+                pools_to_close.append(pool)
+                del _aawm_session_history_pools[key]
+
+    for pool in pools_to_close:
+        await pool.close()
+
+
+def _flush_session_history_batch(
+    records: List[Dict[str, Any]],
+    loop: Optional[asyncio.AbstractEventLoop] = None,
+) -> None:
     if not records:
         return
 
     started_at = time.perf_counter()
     try:
-        asyncio.run(_persist_session_history_records(records))
+        if loop is None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_persist_session_history_records(records))
+            finally:
+                loop.run_until_complete(
+                    _close_aawm_session_history_pools_for_current_loop()
+                )
+                loop.close()
+                asyncio.set_event_loop(None)
+        else:
+            loop.run_until_complete(_persist_session_history_records(records))
     except Exception as exc:
         verbose_logger.warning(
             "AawmAgentIdentity: failed to flush %d session_history records: %s",
@@ -590,36 +633,48 @@ def _flush_session_history_batch(records: List[Dict[str, Any]]) -> None:
     )
 
 
+def _flush_session_history_overflow_record(record: Dict[str, Any]) -> None:
+    try:
+        _flush_session_history_batch([record])
+    finally:
+        _aawm_session_history_overflow_flush_semaphore.release()
+
 
 def _session_history_worker_main() -> None:
     flush_interval = _get_session_history_flush_interval_seconds()
     batch_size = _get_session_history_batch_size()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-    while True:
-        try:
-            first_item = _aawm_session_history_queue.get(timeout=flush_interval)
-        except queue.Empty:
-            continue
-
-        if first_item is None:
-            break
-
-        batch: List[Dict[str, Any]] = [first_item]
-        deadline = time.monotonic() + flush_interval
-        while len(batch) < batch_size:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+    try:
+        while True:
             try:
-                next_item = _aawm_session_history_queue.get(timeout=remaining)
+                first_item = _aawm_session_history_queue.get(timeout=flush_interval)
             except queue.Empty:
-                break
-            if next_item is None:
-                _flush_session_history_batch(batch)
-                return
-            batch.append(next_item)
+                continue
 
-        _flush_session_history_batch(batch)
+            if first_item is None:
+                break
+
+            batch: List[Dict[str, Any]] = [first_item]
+            deadline = time.monotonic() + flush_interval
+            while len(batch) < batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    next_item = _aawm_session_history_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if next_item is None:
+                    _flush_session_history_batch(batch, loop=loop)
+                    return
+                batch.append(next_item)
+
+            _flush_session_history_batch(batch, loop=loop)
+    finally:
+        loop.run_until_complete(_close_aawm_session_history_pools_for_current_loop())
+        loop.close()
 
 
 
@@ -648,9 +703,17 @@ def _shutdown_session_history_worker() -> None:
         return
 
     try:
-        _aawm_session_history_queue.put_nowait(None)
+        _aawm_session_history_queue.put(
+            None,
+            timeout=max(
+                _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
+                _get_session_history_flush_interval_seconds(),
+            ),
+        )
     except queue.Full:
-        pass
+        verbose_logger.warning(
+            "AawmAgentIdentity: session_history queue full during shutdown; worker pool cleanup may be delayed"
+        )
 
     worker.join(timeout=1.0)
 
@@ -661,15 +724,43 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
     try:
         _aawm_session_history_queue.put(record, timeout=_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS)
     except queue.Full:
+        if not _aawm_session_history_overflow_flush_semaphore.acquire(blocking=False):
+            try:
+                _aawm_session_history_queue.put(
+                    record,
+                    timeout=max(
+                        _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
+                        _get_session_history_flush_interval_seconds(),
+                    ),
+                )
+                return
+            except queue.Full:
+                pass
+
+            verbose_logger.warning(
+                "AawmAgentIdentity: session_history queue full and overflow flusher busy; dropping overflow record"
+            )
+            return
+
         verbose_logger.warning(
             "AawmAgentIdentity: session_history queue full; flushing overflow record in background"
         )
-        threading.Thread(
-            target=_flush_session_history_batch,
-            args=([record],),
-            name="aawm-session-history-overflow",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=_flush_session_history_overflow_record,
+                args=(record,),
+                name="aawm-session-history-overflow",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity: failed to start session_history overflow flusher; flushing inline: %s",
+                exc,
+            )
+            try:
+                _flush_session_history_batch([record])
+            finally:
+                _aawm_session_history_overflow_flush_semaphore.release()
 
 
 atexit.register(_shutdown_session_history_worker)
@@ -4454,6 +4545,41 @@ async def _open_aawm_session_history_connection() -> Any:
     return await asyncpg.connect(dsn=dsn, command_timeout=10)
 
 
+async def _get_aawm_session_history_pool() -> Any:
+    dsn = _build_aawm_dsn()
+    if not dsn:
+        raise RuntimeError("AAWM session history database configuration is missing")
+
+    loop = asyncio.get_running_loop()
+    pool_key = (loop, dsn)
+    with _aawm_session_history_pool_lock:
+        pool = _aawm_session_history_pools.get(pool_key)
+    if pool is not None:
+        return pool
+
+    try:
+        asyncpg = importlib.import_module("asyncpg")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "AAWM session history requires asyncpg to be installed"
+        ) from exc
+
+    created_pool = await asyncpg.create_pool(
+        dsn=dsn,
+        min_size=0,
+        max_size=_get_session_history_pool_max_size(),
+        command_timeout=10,
+    )
+    with _aawm_session_history_pool_lock:
+        existing_pool = _aawm_session_history_pools.get(pool_key)
+        if existing_pool is None:
+            _aawm_session_history_pools[pool_key] = created_pool
+            return created_pool
+
+    await created_pool.close()
+    return existing_pool
+
+
 async def _ensure_session_history_schema(conn: Any) -> None:
     global _aawm_session_history_schema_ready
 
@@ -4559,8 +4685,8 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
 
 
 async def _persist_session_history_record(record: Dict[str, Any]) -> None:
-    conn = await _open_aawm_session_history_connection()
-    try:
+    pool = await _get_aawm_session_history_pool()
+    async with pool.acquire() as conn:
         await _ensure_session_history_schema(conn)
 
         history_payload = _build_session_history_db_payload(record)
@@ -4571,16 +4697,14 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
             )
-    finally:
-        await conn.close()
 
 
 async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
     if not records:
         return
 
-    conn = await _open_aawm_session_history_connection()
-    try:
+    pool = await _get_aawm_session_history_pool()
+    async with pool.acquire() as conn:
         await _ensure_session_history_schema(conn)
 
         payloads = [_build_session_history_db_payload(record) for record in records]
@@ -4593,8 +4717,6 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
             )
-    finally:
-        await conn.close()
 
 
 def _get_reasoning_state_tags(

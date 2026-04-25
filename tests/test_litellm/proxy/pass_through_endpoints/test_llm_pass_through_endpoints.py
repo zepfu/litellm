@@ -25,6 +25,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_adapter_request_shape_policy,
     _apply_google_code_assist_native_tool_aliases,
     _build_anthropic_responses_adapter_request_body,
+    _build_completion_adapter_metadata,
     _build_google_code_assist_request_from_completion_kwargs,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _get_google_adapter_rate_limit_key,
@@ -2207,6 +2208,53 @@ class TestBaseOpenAIPassThroughHandler:
         assert str(result) == "https://api.example.com/v1/chat/completions"
 
 
+def test_build_completion_adapter_metadata_overrides_adapter_owned_keys() -> None:
+    metadata = _build_completion_adapter_metadata(
+        {
+            "metadata": {
+                "existing_key": "existing-value",
+                "trace_environment": "caller-env",
+                "passthrough_route_family": "stale-route",
+                "anthropic_adapter_model": "stale-model",
+                "anthropic_adapter_original_model": "stale-original",
+                "anthropic_adapter_target_endpoint": "stale-target",
+                "langfuse_spans": [{"name": "stale.span"}],
+                "tags": ["caller-tag", "shared-tag"],
+            },
+            "litellm_metadata": {
+                "trace_environment": "prod",
+                "passthrough_route_family": "anthropic_nvidia_completion_adapter",
+                "anthropic_adapter_model": "deepseek-ai/deepseek-v3.2",
+                "anthropic_adapter_original_model": "nvidia/deepseek-ai/deepseek-v3.2",
+                "anthropic_adapter_target_endpoint": "nvidia:/v1/chat/completions",
+                "langfuse_spans": [{"name": "anthropic.nvidia_completion_adapter"}],
+                "tags": ["shared-tag", "anthropic-nvidia-completion-adapter"],
+            },
+        }
+    )
+
+    assert metadata["existing_key"] == "existing-value"
+    assert metadata["trace_environment"] == "caller-env"
+    assert metadata["passthrough_route_family"] == "anthropic_nvidia_completion_adapter"
+    assert metadata["anthropic_adapter_model"] == "deepseek-ai/deepseek-v3.2"
+    assert (
+        metadata["anthropic_adapter_original_model"]
+        == "nvidia/deepseek-ai/deepseek-v3.2"
+    )
+    assert (
+        metadata["anthropic_adapter_target_endpoint"]
+        == "nvidia:/v1/chat/completions"
+    )
+    assert metadata["langfuse_spans"] == [
+        {"name": "anthropic.nvidia_completion_adapter"}
+    ]
+    assert metadata["tags"] == [
+        "caller-tag",
+        "shared-tag",
+        "anthropic-nvidia-completion-adapter",
+    ]
+
+
 class TestClaudePersistedOutputExpansion:
     def test_expand_claude_persisted_output_text_subagentstart(self, tmp_path, monkeypatch):
         claude_root = tmp_path / ".claude" / "projects"
@@ -3579,6 +3627,8 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
             return_value="nvidia-test-key",
         ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ) as mock_validate_egress, patch(
             "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
             new=AsyncMock(
                 return_value={
@@ -3616,8 +3666,39 @@ class TestClaudePersistedOutputExpansion:
         assert call_kwargs["metadata"]["session_id"] == "nvidia-session-1"
         assert call_kwargs["metadata"]["trace_environment"] == "prod"
         assert (
+            call_kwargs["metadata"]["passthrough_route_family"]
+            == "anthropic_nvidia_completion_adapter"
+        )
+        assert call_kwargs["metadata"]["anthropic_adapter_model"] == expected_model
+        assert (
+            call_kwargs["metadata"]["anthropic_adapter_original_model"]
+            == requested_model
+        )
+        assert (
+            call_kwargs["metadata"]["anthropic_adapter_target_endpoint"]
+            == "nvidia:/v1/chat/completions"
+        )
+        assert (
+            "anthropic-nvidia-completion-adapter" in call_kwargs["metadata"]["tags"]
+        )
+        assert call_kwargs["metadata"]["langfuse_spans"][0]["name"] == (
+            "anthropic.nvidia_completion_adapter"
+        )
+        assert (
             call_kwargs["litellm_metadata"]["passthrough_route_family"]
             == "anthropic_nvidia_completion_adapter"
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["anthropic_adapter_model"]
+            == expected_model
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["anthropic_adapter_original_model"]
+            == requested_model
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["anthropic_adapter_target_endpoint"]
+            == "nvidia:/v1/chat/completions"
         )
         assert (
             "anthropic-nvidia-completion-adapter"
@@ -3631,9 +3712,18 @@ class TestClaudePersistedOutputExpansion:
             f"anthropic-adapter-target:nvidia:/v1/chat/completions"
             in call_kwargs["litellm_metadata"]["tags"]
         )
+        assert call_kwargs["litellm_metadata"]["langfuse_spans"][0]["name"] == (
+            "anthropic.nvidia_completion_adapter"
+        )
         assert (
             mock_request.scope["query_string"]
             == b"beta=true -> integrate.api.nvidia.com/v1/chat/completions"
+        )
+        mock_validate_egress.assert_called_once_with(
+            url="https://integrate.api.nvidia.com/v1/chat/completions",
+            headers={"Authorization": "Bearer nvidia-test-key"},
+            credential_family="nvidia",
+            expected_target_family="nvidia",
         )
 
     @pytest.mark.asyncio
