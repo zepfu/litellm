@@ -129,6 +129,41 @@ release before building prod. After publishing a missing overlay asset, rebuild
 with cache busting so Docker re-resolves the release API instead of reusing a
 layer that installed stale artifacts.
 
+GitHub-created artifact tags may not trigger the tag-based release workflows
+because GitHub suppresses recursive workflow triggers from the workflow token.
+If the autobump job creates `cb-v*`, `cfg-v*`, or `h-v*` tags but the matching
+GitHub Releases are missing, build and upload the missing assets before the
+infrastructure rebuild. Example recovery flow:
+
+```bash
+./.venv/bin/python -m build --wheel --outdir /tmp/aawm-cb-dist .wheel-build
+./.venv/bin/python scripts/build_model_config_bundle.py --outdir /tmp/aawm-cfg-dist
+./.venv/bin/python scripts/local-ci/build_harness_bundle.py --outdir /tmp/aawm-h-dist
+
+gh release create cb-v<version> --repo zepfu/litellm \
+  --title "aawm-litellm-callbacks v<version>" \
+  --notes "AAWM LiteLLM callback wheel."
+gh release upload cb-v<version> path/to/aawm_litellm_callbacks-<version>-py3-none-any.whl \
+  --repo zepfu/litellm
+
+gh release create cfg-v<version> --repo zepfu/litellm \
+  --title "litellm model config v<version>" \
+  --notes "Standalone LiteLLM model pricing/capability config archive."
+gh release upload cfg-v<version> path/to/litellm-model-config-<version>.tar.gz \
+  --repo zepfu/litellm
+
+gh release create h-v<version> --repo zepfu/litellm \
+  --title "litellm local acceptance harness v<version>" \
+  --notes "LiteLLM local acceptance harness archive."
+gh release upload h-v<version> path/to/litellm-local-ci-harness-<version>.tar.gz \
+  --repo zepfu/litellm
+```
+
+If the local `gh` package cannot upload assets from `/tmp`, copy the built
+artifacts into a temporary workspace directory and upload from there. After
+manual publication, verify the release assets again and move the matching
+`*-latest` tag only when it is part of the intended release-line behavior.
+
 Normal infrastructure rebuilds should pin the base fork image but float the
 latest versioned callback, control-plane, harness, and model-config artifacts.
 Pin overlay artifact versions only for incident response, rollback testing, or
@@ -144,6 +179,13 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    - `Dockerfile.litellm`
    - `docker-compose.litellm.yml`
+
+   When a release exposes new proxy-routed models or endpoints, also update the
+   production LiteLLM config template in
+   `/home/zepfu/projects/aawm-infrastructure/config/litellm-config.yaml.tmpl`.
+   The fork image and model-config archive can contain the code and pricing, but
+   prod will not expose the model until the compose-rendered config includes a
+   `model_list` entry and the required upstream key is available in `.env`.
 
 2. Build the prod image.
 
@@ -162,6 +204,14 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    environment. In AAWM infra, map it from `AAWM_OPENAI_API_KEY`; having only
    `AAWM_OPENAI_API_KEY` is not enough for `/openai_passthrough/*`.
 
+   When model-config behavior changed, verify the built image has the expected
+   metadata before restarting prod. For example:
+
+   ```bash
+   docker run --rm --entrypoint python3 aawm-litellm:latest -c \
+     "import json,pathlib; p=pathlib.Path('/usr/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json'); d=json.loads(p.read_text()); print(d.get('openrouter/qwen/qwen3-embedding-8b')); print(d.get('openrouter/cohere/rerank-4-pro'))"
+   ```
+
 3. Start the prod container.
 
    ```bash
@@ -175,7 +225,14 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    curl -sS http://127.0.0.1:4000/health
    ```
 
-5. Inspect startup logs.
+5. Confirm the rendered runtime config includes any newly exposed models.
+
+   ```bash
+   docker exec aawm-litellm sh -lc \
+     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro' /etc/litellm/config.yaml"
+   ```
+
+6. Inspect startup logs.
 
    ```bash
    docker logs --tail 500 aawm-litellm
@@ -225,6 +282,36 @@ Always inspect overlapping prod logs after the harness:
 docker logs --tail 1000 aawm-litellm
 ```
 
+For provider lanes that are not covered by the default adapter suite, run a
+small direct smoke before calling the cutover complete. For OpenRouter-hosted
+embedding/rerank, verify both the proxy response and `public.session_history`
+rows:
+
+```bash
+LITELLM_API_KEY="${LITELLM_API_KEY:-prod-openrouter-smoke}" \
+./.venv/bin/python -c 'import json, os, time, urllib.request
+base="http://127.0.0.1:4000"
+session=f"prod-or-embed-rerank-{int(time.time())}"
+api_key=os.environ["LITELLM_API_KEY"]
+headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","x-litellm-session-id":session,"x-aawm-tenant-id":"tenant-openrouter-prod-validation","x-litellm-end-user-id":"user-openrouter-prod-validation","x-litellm-agent-id":"prod-cutover-smoke","langfuse_trace_user_id":"user-openrouter-prod-validation"}
+def post(path,payload):
+    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST")
+    with urllib.request.urlopen(req,timeout=90) as r:
+        return json.loads(r.read().decode())
+emb=post("/v1/embeddings",{"model":"openrouter/qwen/qwen3-embedding-8b","input":"AAWM prod cutover OpenRouter embedding smoke.","provider":{"order":["DeepInfra"],"allow_fallbacks":False}})
+rerank=post("/rerank",{"model":"openrouter/cohere/rerank-4-pro","query":"Which document mentions AAWM prod cutover?","documents":["AAWM prod cutover validates OpenRouter rerank.","Unrelated document about weather."],"top_n":2,"return_documents":True})
+print(json.dumps({"session":session,"embedding_dims":len(emb["data"][0]["embedding"]),"embedding_usage":emb.get("usage"),"rerank_results":len(rerank.get("results",[])),"rerank_meta":rerank.get("meta")},sort_keys=True))'
+```
+
+Then query `session_history` using the schema that exists in prod. Some
+provider-specific values, such as OpenRouter rerank `usage_search_units`, may be
+stored in `metadata` instead of dedicated columns:
+
+```bash
+docker exec aawm-postgres18 psql -U aawm -d aawm_tristore -Atqc \
+  "select provider, model, call_type, tenant_id, input_tokens, output_tokens, total_tokens, response_cost_usd, litellm_environment, litellm_version, metadata from public.session_history where session_id = '<session-id>' order by start_time;"
+```
+
 For native passthrough changes, run the opt-in native shard in the existing
 harness. This includes the real Claude, Codex, and Gemini CLIs and should not
 be replaced with skipped or synthetic key checks.
@@ -258,6 +345,25 @@ Harness cases should use generated per-run session ids unless a stable session
 id is essential to the test. Static session ids can collide with older
 `public.session_history` rows and produce false environment mismatches during
 prod validation.
+
+### Interpreting Expected Codex 5.3 Pressure
+
+When OpenAI/Codex `gpt-5.3-codex-spark` is under account-level pressure, the
+prod default harness can fail Codex-dependent cases such as
+`claude_adapter_codex_tool_activity`, `claude_adapter_peeromega_fanout`, and
+`claude_adapter_spark`. Classify this as upstream quota pressure only when the
+command result and prod logs clearly show `usage_limit_reached` with a
+`resets_at` timestamp from `https://chatgpt.com/backend-api/codex/responses`.
+Convert that epoch to an exact UTC reset time and rerun after the reset.
+
+Do not silently ignore other harness failures. Non-Codex cases should still
+pass, warning-only canaries should remain warning-only, and the post-harness log
+scan should not contain unrelated ASGI/task/`Content-Length`/`h11`/database
+pressure blockers. The expected Codex quota path commonly appears in logs as:
+
+```text
+pass_through_endpoint(): Exception occured - 429: ... "type":"usage_limit_reached" ... "resets_at":<epoch>
+```
 
 If a release changes model pricing, run any `public.session_history` cost
 repair from the repo backfill script so it uses the same bundled/promoted model
