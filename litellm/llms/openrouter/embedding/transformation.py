@@ -83,14 +83,16 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
         """
         Get the complete URL for OpenRouter Embedding API endpoint.
         """
-        # api_base is already set to https://openrouter.ai/api/v1 in main.py
-        # Remove trailing slashes
         if api_base:
             api_base = api_base.rstrip("/")
         else:
             api_base = "https://openrouter.ai/api/v1"
 
-        # Return the embeddings endpoint
+        if api_base.endswith("/embeddings"):
+            return api_base
+        if api_base.endswith("/api"):
+            api_base = f"{api_base}/v1"
+
         return f"{api_base}/embeddings"
 
     def transform_embedding_request(
@@ -136,12 +138,24 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
 
         # OpenRouter returns standard OpenAI-compatible embedding response
         response_json = raw_response.json()
-
-        return convert_to_model_response_object(
+        response = convert_to_model_response_object(
             response_object=response_json,
             model_response_object=model_response,
             response_type="embedding",
         )
+
+        usage = response_json.get("usage") or {}
+        response_cost = usage.get("cost")
+        if response_cost is not None:
+            response._hidden_params.setdefault("additional_headers", {})[
+                "llm_provider-x-litellm-response-cost"
+            ] = float(response_cost)
+        if response_json.get("provider") is not None:
+            response._hidden_params["openrouter_provider"] = response_json.get(
+                "provider"
+            )
+
+        return response
 
     def get_supported_openai_params(self, model: str) -> list:
         """
@@ -151,6 +165,7 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
             "timeout",
             "dimensions",
             "encoding_format",
+            "provider",
             "user",
         ]
 

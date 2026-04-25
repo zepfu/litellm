@@ -2,6 +2,41 @@
 
 ## 2026-04-25
 
+- Exposed OpenRouter-hosted embedding and rerank models through the LiteLLM proxy surface.
+  `openrouter/qwen/qwen3-embedding-8b` is now available through `/v1/embeddings`
+  with OpenRouter provider routing support for DeepInfra pinning, and
+  `openrouter/cohere/rerank-4-pro` is available through `/rerank` / `/v1/rerank`
+  using OpenRouter's `/api/v1/rerank` endpoint while preserving Cohere-style
+  request/response shapes. The dev config exposes both models, the dev compose
+  mounts the required OpenRouter and callback files, and consumers authenticate
+  only to LiteLLM while the proxy uses the configured OpenRouter key upstream.
+
+- Completed OpenRouter embedding/rerank cost and `session_history` attribution coverage.
+  The primary and bundled model cost maps now include Qwen3 Embedding 8B with
+  4096-dimensional vectors, 32k context, and `$0.01 / 1M` input-token pricing,
+  plus Cohere Rerank 4 Pro with `$0.0025` per search unit. `AawmAgentIdentity`
+  now preserves OpenRouter usage/cost/provider metadata, uses hidden upstream
+  OpenRouter response cost when present, falls back to the bundled local model
+  map when the runtime remote map is stale, prefers caller-facing
+  `openrouter/...` proxy model names for OpenRouter rows, and persists
+  estimated prompt/total tokens for rerank calls even when OpenRouter reports
+  only `search_units`.
+
+- Added OpenRouter embedding/rerank consumer documentation and validation.
+  [OPENROUTER_EMBED_RERANK_CONSUMER.md](OPENROUTER_EMBED_RERANK_CONSUMER.md)
+  documents the LiteLLM endpoints, required LiteLLM auth, attribution headers,
+  DeepInfra provider routing, and session-history expectations. Focused tests
+  passed for OpenRouter rerank transformation, AAWM session-history behavior,
+  and exact Qwen/rerank cost-map coverage. Live dev proxy validation on `:4001`
+  passed for session `or-embed-rerank-20260425-3`: the embedding row stored
+  `provider=openrouter`, `model=openrouter/qwen/qwen3-embedding-8b`,
+  `tenant_id=tenant-openrouter-validation`, `input_tokens=18`,
+  `response_cost_usd=1.8e-07`, and `openrouter_provider=DeepInfra`; the rerank
+  row stored `model=openrouter/cohere/rerank-4-pro`, `input_tokens=40`,
+  `total_tokens=40`, `response_cost_usd=0.0025`, `usage_search_units=1`,
+  `usage_openrouter_cost=0.0025`, `openrouter_provider=Cohere`, and
+  `openrouter_response_model=rerank-v4.0-pro`.
+
 - Finished the NVIDIA Anthropic-adapter lane and validation closure.
   The completion-adapter metadata bridge now mirrors NVIDIA route family, adapter model/original model, target endpoint, Langfuse spans, and route tags from `litellm_metadata` into normal completion `metadata`, so downstream Langfuse and `session_history` paths see the same adapter context as native passthrough lanes; adapter-owned metadata now also overwrites stale/conflicting caller metadata while preserving ordinary caller trace fields. The NVIDIA MiniMax model cost map now uses the closest OpenRouter MiniMax M2.5 pricing as its fallback basis instead of leaving durable cost tracking unmapped, and both primary/bundled model cost maps have non-zero NVIDIA adapter pricing coverage. The NVIDIA harness cases now require the `anthropic.nvidia_completion_adapter` span, adapter metadata, tags, and non-zero `response_cost_usd`; the focused dev shard passed at `/tmp/litellm-dev-nvidia-final-escalated.json` for cache-control strip, DeepSeek V3.2, and GLM 4.7.
 

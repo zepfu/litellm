@@ -502,6 +502,10 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "anthropic_adapter_cache_control_present",
     "usage_tool_call_count",
     "usage_tool_names",
+    "usage_search_units",
+    "usage_openrouter_cost",
+    "openrouter_provider",
+    "openrouter_response_model",
     "aawm_local_prepare_ms",
     "aawm_upstream_wait_ms",
     "aawm_time_to_first_token_ms",
@@ -1647,6 +1651,23 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
     if usage_obj is not None:
         return _merge_usage_object_with_metadata(usage_obj, metadata_usage_object)
 
+    meta_obj = _maybe_get(result, "meta")
+    billed_units = _maybe_get(meta_obj, "billed_units")
+    if billed_units is not None:
+        search_units = _safe_int(_maybe_get(billed_units, "search_units"))
+        total_tokens = _safe_int(_maybe_get(billed_units, "total_tokens"))
+        rerank_usage: Dict[str, Any] = {
+            "prompt_tokens": total_tokens,
+            "completion_tokens": 0,
+            "total_tokens": total_tokens,
+        }
+        if search_units:
+            rerank_usage["search_units"] = search_units
+        return _merge_usage_object_with_metadata(
+            rerank_usage,
+            metadata_usage_object,
+        )
+
     completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
         _maybe_get(result, "response")
     )
@@ -2383,6 +2404,232 @@ def _estimate_reasoning_tokens(model: str, reasoning_text: str) -> Optional[int]
             exc,
         )
         return None
+
+
+def _extract_rerank_request_payload(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = (
+        _extract_provider_cache_request_body(kwargs),
+        kwargs,
+        _maybe_get(kwargs.get("standard_logging_object"), "optional_params"),
+        kwargs.get("optional_params"),
+    )
+    for candidate in candidates:
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("query") is not None
+            and candidate.get("documents") is not None
+        ):
+            return candidate
+    return None
+
+
+def _coerce_rerank_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return "\n".join(
+            text for item in value if (text := _coerce_rerank_text(item).strip())
+        )
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, sort_keys=True, default=str)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _extract_rerank_document_text(
+    document: Any,
+    rank_fields: Optional[List[str]],
+) -> str:
+    if isinstance(document, str):
+        return document
+    if isinstance(document, dict):
+        if rank_fields:
+            return "\n".join(
+                text
+                for field in rank_fields
+                if (text := _coerce_rerank_text(document.get(field)).strip())
+            )
+        if "text" in document:
+            return _coerce_rerank_text(document.get("text"))
+    return _coerce_rerank_text(document)
+
+
+def _fallback_text_token_estimate(text: str) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    return max(1, (len(stripped) + 3) // 4)
+
+
+def _estimate_rerank_request_tokens(
+    *,
+    kwargs: Dict[str, Any],
+    model: str,
+) -> Optional[int]:
+    request_payload = _extract_rerank_request_payload(kwargs)
+    if not request_payload:
+        return None
+
+    query_text = _coerce_rerank_text(request_payload.get("query")).strip()
+    documents = request_payload.get("documents")
+    if not isinstance(documents, list):
+        return None
+
+    raw_rank_fields = request_payload.get("rank_fields")
+    rank_fields = raw_rank_fields if isinstance(raw_rank_fields, list) else None
+    document_texts = [
+        text
+        for document in documents
+        if (text := _extract_rerank_document_text(document, rank_fields).strip())
+    ]
+    combined_text = "\n\n".join([query_text, *document_texts]).strip()
+    if not combined_text:
+        return None
+
+    try:
+        import litellm
+
+        token_count = litellm.token_counter(model=model or "", text=combined_text)
+        return _positive_int_or_none(token_count)
+    except Exception as exc:
+        verbose_logger.debug(
+            "AawmAgentIdentity: failed to estimate rerank tokens for model=%s: %s",
+            model,
+            exc,
+        )
+        return _fallback_text_token_estimate(combined_text)
+
+
+def _usage_has_positive_tokens(usage_obj: Any) -> bool:
+    prompt_tokens = _extract_prompt_tokens(usage_obj)
+    completion_tokens = _extract_completion_tokens(usage_obj)
+    total_tokens = _extract_total_tokens(usage_obj, prompt_tokens, completion_tokens)
+    return prompt_tokens > 0 or completion_tokens > 0 or total_tokens > 0
+
+
+def _merge_estimated_rerank_tokens_into_usage(
+    *,
+    kwargs: Dict[str, Any],
+    result: Any,
+    usage_obj: Any,
+    model: str,
+) -> Any:
+    usage_dict = _coerce_usage_object_to_dict(usage_obj)
+    if usage_dict is None:
+        return usage_obj
+    if _usage_has_positive_tokens(usage_dict):
+        return usage_obj
+
+    search_units = (
+        _safe_int(usage_dict.get("search_units"))
+        or _safe_int(_maybe_get_path(result, "meta", "billed_units", "search_units"))
+    )
+    if not search_units:
+        return usage_obj
+
+    estimated_tokens = _estimate_rerank_request_tokens(kwargs=kwargs, model=model)
+    if estimated_tokens is None:
+        return usage_obj
+
+    merged_usage = dict(usage_dict)
+    merged_usage.setdefault("prompt_tokens", estimated_tokens)
+    merged_usage.setdefault("completion_tokens", 0)
+    merged_usage.setdefault("total_tokens", estimated_tokens)
+    return merged_usage
+
+
+@lru_cache(maxsize=1)
+def _load_bundled_model_cost_map() -> Dict[str, Any]:
+    try:
+        from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+
+        return GetModelCostMap.load_local_model_cost_map()
+    except Exception as exc:
+        verbose_logger.debug(
+            "AawmAgentIdentity: failed to load bundled model cost map: %s",
+            exc,
+        )
+        return {}
+
+
+@lru_cache(maxsize=1)
+def _bundled_model_cost_casefold_lookup() -> Dict[str, str]:
+    return {
+        key.lower(): key
+        for key in _load_bundled_model_cost_map()
+        if isinstance(key, str)
+    }
+
+
+def _lookup_bundled_model_cost_info(
+    *,
+    model: str,
+    custom_llm_provider: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    model_cost = _load_bundled_model_cost_map()
+    if not model_cost:
+        return None
+
+    candidates = [model]
+    if custom_llm_provider:
+        provider_prefix = f"{custom_llm_provider}/"
+        if model.startswith(provider_prefix):
+            stripped_model = model[len(provider_prefix) :]
+            candidates.append(stripped_model)
+        else:
+            candidates.append(f"{provider_prefix}{model}")
+
+    lookup = _bundled_model_cost_casefold_lookup()
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        if candidate in model_cost and isinstance(model_cost[candidate], dict):
+            return model_cost[candidate]
+        matched_key = lookup.get(candidate.lower())
+        if matched_key is not None and isinstance(model_cost.get(matched_key), dict):
+            return model_cost[matched_key]
+
+    return None
+
+
+def _calculate_response_cost_from_bundled_model_cost_map(
+    *,
+    model: str,
+    custom_llm_provider: Optional[str],
+    prompt_tokens: int,
+    completion_tokens: int,
+    usage_obj: Any,
+) -> Optional[float]:
+    model_info = _lookup_bundled_model_cost_info(
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+    )
+    if not model_info:
+        return None
+
+    search_units = _safe_int(_maybe_get(usage_obj, "search_units"))
+    input_cost_per_query = _safe_float(model_info.get("input_cost_per_query"))
+    if search_units and input_cost_per_query is not None:
+        return search_units * input_cost_per_query
+
+    has_token_pricing = (
+        "input_cost_per_token" in model_info or "output_cost_per_token" in model_info
+    )
+    if not has_token_pricing:
+        return None
+
+    input_cost_per_token = _safe_float(model_info.get("input_cost_per_token")) or 0.0
+    output_cost_per_token = _safe_float(model_info.get("output_cost_per_token")) or 0.0
+    return (
+        (prompt_tokens * input_cost_per_token)
+        + (completion_tokens * output_cost_per_token)
+    )
 
 
 def _positive_int_or_none(value: Any) -> Optional[int]:
@@ -4265,6 +4512,27 @@ def _resolve_session_history_model(
     metadata: Dict[str, Any],
     result: Any,
 ) -> str:
+    if str(kwargs.get("custom_llm_provider") or "").lower() == "openrouter":
+        for candidate in (
+            _maybe_get_path(
+                kwargs.get("litellm_params"),
+                "proxy_server_request",
+                "body",
+                "model",
+            ),
+            _maybe_get_path(
+                kwargs.get("passthrough_logging_payload"),
+                "request_body",
+                "model",
+            ),
+            _maybe_get_path(standard_logging_object, "request_body", "model"),
+        ):
+            if candidate is None:
+                continue
+            normalized = str(candidate).strip()
+            if normalized.startswith("openrouter/"):
+                return normalized
+
     result_completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
         _maybe_get(result, "response")
     )
@@ -4318,6 +4586,35 @@ def _build_session_history_record(
     )
 
     usage_obj = _extract_usage_object(kwargs, result)
+    hidden_params = getattr(result, "_hidden_params", {}) or {}
+    usage_obj = _merge_estimated_rerank_tokens_into_usage(
+        kwargs=kwargs,
+        result=result,
+        usage_obj=usage_obj,
+        model=resolved_model,
+    )
+    usage_dict = _coerce_usage_object_to_dict(usage_obj) or {}
+    search_units = _safe_int(usage_dict.get("search_units"))
+    if search_units:
+        metadata["usage_search_units"] = search_units
+    usage_cost = _safe_float(usage_dict.get("cost"))
+    if usage_cost is not None:
+        metadata["usage_openrouter_cost"] = usage_cost
+    openrouter_usage = hidden_params.get("openrouter_usage")
+    if isinstance(openrouter_usage, dict):
+        search_units = _safe_int(openrouter_usage.get("search_units"))
+        if search_units:
+            metadata["usage_search_units"] = search_units
+        openrouter_cost = _safe_float(openrouter_usage.get("cost"))
+        if openrouter_cost is not None:
+            metadata["usage_openrouter_cost"] = openrouter_cost
+    if hidden_params.get("openrouter_provider") is not None:
+        metadata["openrouter_provider"] = hidden_params.get("openrouter_provider")
+    if hidden_params.get("openrouter_response_model") is not None:
+        metadata["openrouter_response_model"] = hidden_params.get(
+            "openrouter_response_model"
+        )
+
     prompt_tokens = _extract_prompt_tokens(usage_obj)
     completion_tokens = _extract_completion_tokens(usage_obj)
     total_tokens = _extract_total_tokens(usage_obj, prompt_tokens, completion_tokens)
@@ -4396,8 +4693,16 @@ def _build_session_history_record(
         _first_non_none(
             kwargs.get("response_cost"),
             standard_logging_object.get("response_cost"),
+            hidden_params.get("response_cost"),
+            _maybe_get_path(
+                hidden_params,
+                "additional_headers",
+                "llm_provider-x-litellm-response-cost",
+            ),
             metadata.get("litellm_response_cost"),
             metadata.get("response_cost"),
+            metadata.get("usage_openrouter_cost"),
+            usage_dict.get("cost"),
         )
     )
     if (
@@ -4431,11 +4736,29 @@ def _build_session_history_record(
             )
             response_cost_usd = prompt_cost + completion_cost
         except Exception as exc:
+            response_cost_usd = _calculate_response_cost_from_bundled_model_cost_map(
+                model=resolved_model,
+                custom_llm_provider=kwargs.get("custom_llm_provider"),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                usage_obj=usage_obj,
+            )
             verbose_logger.debug(
                 "AawmAgentIdentity: failed to backfill response cost for model=%s: %s",
                 resolved_model,
                 exc,
             )
+
+        if response_cost_usd == 0:
+            bundled_response_cost = _calculate_response_cost_from_bundled_model_cost_map(
+                model=resolved_model,
+                custom_llm_provider=kwargs.get("custom_llm_provider"),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                usage_obj=usage_obj,
+            )
+            if bundled_response_cost is not None:
+                response_cost_usd = bundled_response_cost
 
     provider_cache_state = _resolve_provider_cache_state(
         provider=resolved_provider,

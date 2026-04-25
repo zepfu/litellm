@@ -1434,6 +1434,9 @@ if TYPE_CHECKING:
     from .llms.hosted_vllm.rerank.transformation import (
         HostedVLLMRerankConfig as HostedVLLMRerankConfig,
     )
+    from .llms.openrouter.rerank.transformation import (
+        OpenRouterRerankConfig as OpenRouterRerankConfig,
+    )
     from .llms.nvidia_nim.rerank.transformation import (
         NvidiaNimRerankConfig as NvidiaNimRerankConfig,
     )

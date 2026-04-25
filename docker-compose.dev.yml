@@ -11,6 +11,9 @@ services:
       # Mount source for live code changes (key files only)
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
+      - ./litellm/__init__.py:/app/litellm/__init__.py
+      - ./litellm/_lazy_imports_registry.py:/app/litellm/_lazy_imports_registry.py
+      - ./litellm/main.py:/app/litellm/main.py
       - ./litellm/utils.py:/app/litellm/utils.py
       - ./litellm/litellm_core_utils/get_model_cost_map.py:/app/litellm/litellm_core_utils/get_model_cost_map.py
       - ./litellm/litellm_core_utils/prompt_templates/factory.py:/app/litellm/litellm_core_utils/prompt_templates/factory.py
@@ -19,9 +22,12 @@ services:
       - ./litellm/types/llms/anthropic_messages/anthropic_response.py:/app/litellm/types/llms/anthropic_messages/anthropic_response.py
       - ./litellm/types/llms/openai.py:/app/litellm/types/llms/openai.py
       - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
+      - ./litellm/llms/openrouter/embedding/transformation.py:/app/litellm/llms/openrouter/embedding/transformation.py
+      - ./litellm/llms/openrouter/rerank/transformation.py:/app/litellm/llms/openrouter/rerank/transformation.py
       - ./litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py:/app/litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py
       - ./litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py:/app/litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py
       - ./litellm/llms/anthropic/experimental_pass_through/adapters/handler.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/handler.py
+      - ./litellm/llms/anthropic/experimental_pass_through/adapters/observability.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/observability.py
       - ./litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py
       - ./litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py
       - ./litellm/_logging.py:/app/litellm/_logging.py
