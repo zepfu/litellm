@@ -1,5 +1,16 @@
 # Completed
 
+## 2026-04-25
+
+- Broadened live harness coverage for the completed `/anthropic` effort/cache translation work.
+  Added default-excluded existing-harness cases for Gemini minimal/max effort with cache-control variants, OpenRouter max/none/no-effort with cache-control variants, and an ordered OpenAI two-pass prompt-cache case. The harness now supports repeated HTTP passes, compact repeated-text fixtures, env-expanded HTTP headers, multi-row session-history minimums, and provider cache hit validation without introducing a second harness. Live dev shard artifacts passed with zero failures/warnings at `/tmp/anthropic-effort-cache-gemini-dev.json`, `/tmp/anthropic-effort-cache-openrouter-dev.json`, and `/tmp/anthropic-effort-cache-openai-dev.json`.
+
+- Fixed OpenAI Responses adapter cache-intent persistence for Anthropic `cache_control`.
+  The OpenAI Responses adapter now derives bounded `prompt_cache_key` values from Anthropic cache-control material, preserves route-level `litellm_metadata` while adding adapter cache metadata, and `public.session_history.metadata` now persists `openai_prompt_cache_key_present` plus `anthropic_adapter_cache_control_present`. The OpenAI two-pass live shard validates two rows for the generated session and requires a provider cache hit with cached input tokens on the warmed request.
+
+- Validated the broadened effort/cache harness work on dev.
+  Focused tests passed for local-ci harness hardening (`14 passed`), AAWM cache/session-history coverage (`9 passed / 55 deselected`), adapter/proxy cache transformation coverage (`28 passed / 350 deselected`), JSON/compile checks, and callback source parity. The full default dev Anthropic adapter harness passed at `/tmp/anthropic-adapter-dev-full-after-effort-cache.json` with no failures; the only warnings were the configured warning-only Gemini canary output/usage checks for `claude_adapter_gemini31_pro` and `claude_adapter_gemini31_flash`.
+
 ## 2026-04-24
 
 - Purged the 24 operator-approved ambiguous historical Gemini `unknown` zero-token rows from local `aawm_tristore`.
