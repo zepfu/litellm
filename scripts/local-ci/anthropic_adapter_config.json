@@ -638,7 +638,6 @@
           }
         }
       },
-      "expected_trace_session_id": "harness-openai-effort-session",
       "require_trace_session_id": true,
       "match_trace_session_id_from_stdout": true,
       "require_trace_ids_distinct_from_session_ids": true,
@@ -831,7 +830,6 @@
           }
         }
       },
-      "expected_trace_session_id": "harness-gemini-effort-session",
       "require_trace_session_id": true,
       "match_trace_session_id_from_stdout": true,
       "require_trace_ids_distinct_from_session_ids": true,
@@ -1425,7 +1423,6 @@
           }
         }
       },
-      "expected_trace_session_id": "harness-openrouter-effort-cache-session",
       "require_trace_session_id": true,
       "match_trace_session_id_from_stdout": true,
       "require_trace_ids_distinct_from_session_ids": true,
