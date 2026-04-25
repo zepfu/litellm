@@ -1097,14 +1097,14 @@ class LiteLLMAnthropicMessagesAdapter:
             model=model,
             custom_llm_provider=custom_llm_provider,
         )
-        if cache_requested and not preserve_cache_control:
+        if cache_requested:
             provider_key = "nvidia" if native_provider == "nvidia_nim" else native_provider
             metadata = dict(new_kwargs.get("metadata") or {})
             metadata.update(
                 provider_cache_intent_metadata(
                     provider=provider_key,
                     attempted=True,
-                    native_supported=False,
+                    native_supported=preserve_cache_control,
                 )
             )
             new_kwargs["metadata"] = metadata  # type: ignore[typeddict-item]

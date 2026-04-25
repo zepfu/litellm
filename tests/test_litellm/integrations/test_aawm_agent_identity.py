@@ -1234,6 +1234,8 @@ def test_build_session_history_record_marks_openai_prompt_cache_key_as_cache_att
         {
             "session_id": "session-openai-prompt-cache-key",
             "passthrough_route_family": "codex_responses",
+            "openai_prompt_cache_key_present": True,
+            "anthropic_adapter_cache_control_present": True,
         }
     )
     kwargs["passthrough_logging_payload"]["request_body"] = {
@@ -1267,6 +1269,8 @@ def test_build_session_history_record_marks_openai_prompt_cache_key_as_cache_att
     assert record["provider_cache_miss_reason"] == "prompt_cache_key_requested_without_hit"
     assert record["provider_cache_miss_token_count"] is None
     assert record["provider_cache_miss_cost_usd"] is None
+    assert record["metadata"]["openai_prompt_cache_key_present"] is True
+    assert record["metadata"]["anthropic_adapter_cache_control_present"] is True
 
 
 def test_build_session_history_record_ignores_nested_openai_prompt_cache_key_without_cached_token_evidence() -> None:
@@ -1406,6 +1410,47 @@ def test_build_session_history_record_flows_nvidia_provider_cache_metadata() -> 
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "nvidia_no_native_prompt_cache"
+    assert record["provider_cache_miss_token_count"] is None
+    assert record["provider_cache_miss_cost_usd"] is None
+
+
+def test_build_session_history_record_marks_gemini_cache_miss_from_intent_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gemini/gemini-3-flash-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-gemini-cache-intent-metadata"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-gemini-cache-intent-metadata",
+            "gemini_provider_cache_attempted": True,
+            "gemini_provider_cache_source": "anthropic_adapter.cache_control",
+        }
+    )
+
+    result = {
+        "id": "provider-response-gemini-cache-intent",
+        "usage": {
+            "prompt_tokens": 1536,
+            "completion_tokens": 7,
+            "total_tokens": 1543,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "gemini output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cache_attempted_without_hit"
     assert record["provider_cache_miss_token_count"] is None
     assert record["provider_cache_miss_cost_usd"] is None
 

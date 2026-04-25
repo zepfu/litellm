@@ -14,8 +14,5 @@
 
 ## Next
 
-- Broaden live harness coverage for the completed `/anthropic` effort/cache translation work.
-  Current state: shared normalization, provider-lane request shaping, OpenRouter/NVIDIA capability checks, session-history metadata persistence, and opt-in live `:4001` cases for OpenAI, Gemini, OpenRouter, and NVIDIA are in place. Remaining validation depth is to add a broader selectable matrix for Gemini minimal/max/cache combinations and OpenRouter max/none/cache combinations, plus OpenAI cache read/write two-pass behavior once there is a stable long-prefix fixture that reliably produces provider cached-token evidence. The OpenRouter Responses lane currently validates durable session metadata and provider-cache status; outbound native request-body path assertions should be reintroduced only after Langfuse/request logging exposes a stable parsed request shape for that lane.
-
 - Keep future harness bundle publishes on version `0.0.14` or newer.
   The `0.0.14` harness bundle includes the controlled Claude trace `userId` validation, explicit per-run Claude settings overlay, longer peeromega fanout timeout, the narrow OpenRouter provider-unavailable timeout / command-failure classifier, and the default-suite exclusion for GPT-OSS edge cases needed for real prod validation.

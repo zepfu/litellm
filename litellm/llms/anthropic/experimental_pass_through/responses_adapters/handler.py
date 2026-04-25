@@ -92,6 +92,15 @@ def _build_responses_kwargs(
             responses_kwargs[key] = value
         elif key not in excluded and key not in responses_kwargs and value is not None:
             responses_kwargs[key] = value
+        elif (
+            key == "litellm_metadata"
+            and isinstance(value, dict)
+            and isinstance(responses_kwargs.get("litellm_metadata"), dict)
+        ):
+            responses_kwargs["litellm_metadata"] = {
+                **value,
+                **responses_kwargs["litellm_metadata"],
+            }
 
     return responses_kwargs
 

@@ -30,7 +30,12 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.utils import supports_reasoning_summary
 
-from ..adapters.observability import normalize_reasoning_effort_for_provider
+from ..adapters.observability import (
+    derive_prompt_cache_key,
+    normalize_reasoning_effort_for_provider,
+    provider_cache_intent_metadata,
+    request_contains_cache_control,
+)
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -589,6 +594,32 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             )
             if openai_cm is not None:
                 responses_kwargs["context_management"] = openai_cm
+
+        cache_requested = request_contains_cache_control(anthropic_request)
+        if cache_requested:
+            prompt_cache_key = cast(Dict[str, Any], anthropic_request).get(
+                "prompt_cache_key"
+            )
+            if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
+                prompt_cache_key = derive_prompt_cache_key(anthropic_request)
+            if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
+                if len(prompt_cache_key) > 64:
+                    prompt_cache_key = derive_prompt_cache_key(
+                        {"prompt_cache_key": prompt_cache_key},
+                        prefix="anthropic-cache-key",
+                    )
+                responses_kwargs["prompt_cache_key"] = prompt_cache_key
+                litellm_metadata = dict(responses_kwargs.get("litellm_metadata") or {})
+                litellm_metadata.update(
+                    provider_cache_intent_metadata(
+                        provider="openai",
+                        attempted=True,
+                        native_supported=True,
+                    )
+                )
+                litellm_metadata["openai_prompt_cache_key_present"] = True
+                litellm_metadata["anthropic_adapter_cache_control_present"] = True
+                responses_kwargs["litellm_metadata"] = litellm_metadata
 
         # metadata user_id -> user
         metadata = anthropic_request.get("metadata")

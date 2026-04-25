@@ -1020,61 +1020,12 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         }
 
     if expected_rows:
-        matched_records: list[dict[str, Any]] = []
-
-        def _record_matches_expected(
-            row: dict[str, Any], expected_row: dict[str, Any]
-        ) -> bool:
-            row_provider = expected_row.get('provider')
-            row_model = expected_row.get('model')
-            if row_provider is not None and row.get('provider') != row_provider:
-                return False
-            if row_model is not None and row.get('model') != row_model:
-                return False
-            for key, expected in (expected_row.get('required_equals') or {}).items():
-                if row.get(key) != expected:
-                    return False
-            for key, allowed_values in (expected_row.get('required_one_of') or {}).items():
-                if row.get(key) not in set(allowed_values or []):
-                    return False
-            for key in expected_row.get('required_truthy') or []:
-                if not row.get(key):
-                    return False
-            for key, expected_substring in (
-                expected_row.get('required_contains') or {}
-            ).items():
-                actual = row.get(key)
-                if not isinstance(actual, str) or expected_substring not in actual:
-                    return False
-            for key, minimum in (expected_row.get('minimums') or {}).items():
-                actual = row.get(key)
-                if not isinstance(actual, (int, float)) or actual < minimum:
-                    return False
-            return True
-
-        for expected_row in expected_rows:
-            row_provider = expected_row.get('provider')
-            row_model = expected_row.get('model')
-            match = next(
-                (
-                    row
-                    for row in records
-                    if _record_matches_expected(row, expected_row)
-                ),
-                None,
-            )
-            if match is None:
-                failures.append(
-                    f'{family} missing session_history row for provider={row_provider!r} model={row_model!r}'
-                )
-                continue
-            matched_records.append(_normalize_record(match))
-            for key, minimum in (expected_row.get('minimums') or {}).items():
-                actual = match.get(key)
-                if not isinstance(actual, (int, float)) or actual < minimum:
-                    failures.append(
-                        f'{family} session_history row provider={row_provider!r} model={row_model!r} `{key}` below minimum: expected >= {minimum!r}, got {actual!r}'
-                    )
+        matched_records, expected_row_failures = _match_session_history_expected_rows(
+            family=family,
+            records=records,
+            expected_rows=expected_rows,
+        )
+        failures.extend(expected_row_failures)
 
         return {'record': matched_records[0] if matched_records else None, 'records': matched_records}, failures
 
@@ -1179,7 +1130,90 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         if not isinstance(actual, (int, float)) or actual < minimum:
             failures.append(f'{family} session_history `{key}` below minimum: expected >= {minimum!r}, got {actual!r}')
 
+    minimum_record_count = checks.get('minimum_record_count')
+    if minimum_record_count is not None:
+        try:
+            minimum_record_count_int = int(minimum_record_count)
+        except (TypeError, ValueError):
+            minimum_record_count_int = 0
+        if minimum_record_count_int > 0 and len(filtered_records) < minimum_record_count_int:
+            failures.append(
+                f'{family} session_history rows below minimum: expected >= {minimum_record_count_int}, got {len(filtered_records)}'
+            )
+
     return {'record': normalized_record, 'records': [_normalize_record(row) for row in records]}, failures
+
+
+def _session_history_record_matches_expected(
+    row: dict[str, Any],
+    expected_row: dict[str, Any],
+) -> bool:
+    row_provider = expected_row.get('provider')
+    row_model = expected_row.get('model')
+    if row_provider is not None and row.get('provider') != row_provider:
+        return False
+    if row_model is not None and row.get('model') != row_model:
+        return False
+    for key, expected in (expected_row.get('required_equals') or {}).items():
+        if row.get(key) != expected:
+            return False
+    for key, allowed_values in (expected_row.get('required_one_of') or {}).items():
+        if row.get(key) not in set(allowed_values or []):
+            return False
+    for key in expected_row.get('required_truthy') or []:
+        if not row.get(key):
+            return False
+    for key, expected_substring in (
+        expected_row.get('required_contains') or {}
+    ).items():
+        actual = row.get(key)
+        if not isinstance(actual, str) or expected_substring not in actual:
+            return False
+    for key, minimum in (expected_row.get('minimums') or {}).items():
+        actual = row.get(key)
+        if not isinstance(actual, (int, float)) or actual < minimum:
+            return False
+    return True
+
+
+def _match_session_history_expected_rows(
+    *,
+    family: str,
+    records: list[dict[str, Any]],
+    expected_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    def _normalize_record(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: (value.isoformat() if hasattr(value, 'isoformat') else value)
+            for key, value in row.items()
+        }
+
+    failures: list[str] = []
+    matched_records: list[dict[str, Any]] = []
+    used_record_indexes: set[int] = set()
+    for expected_row in expected_rows:
+        row_provider = expected_row.get('provider')
+        row_model = expected_row.get('model')
+        try:
+            minimum_count = max(1, int(expected_row.get('minimum_count') or 1))
+        except (TypeError, ValueError):
+            minimum_count = 1
+        matches: list[tuple[int, dict[str, Any]]] = [
+            (index, row)
+            for index, row in enumerate(records)
+            if index not in used_record_indexes
+            and _session_history_record_matches_expected(row, expected_row)
+        ]
+        if len(matches) < minimum_count:
+            failures.append(
+                f'{family} missing session_history rows for provider={row_provider!r} model={row_model!r}; expected >= {minimum_count}, got {len(matches)}'
+            )
+            continue
+        selected_matches = matches[:minimum_count]
+        used_record_indexes.update(index for index, _ in selected_matches)
+        matched_records.extend(_normalize_record(row) for _, row in selected_matches)
+
+    return matched_records, failures
 
 
 def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -1356,6 +1390,30 @@ def _inject_http_litellm_metadata(
     return updated
 
 
+def _expand_repeat_text_fixtures(value: Any) -> Any:
+    if isinstance(value, dict):
+        if 'repeat_text' in value and 'count' in value:
+            repeat_text = value.get('repeat_text')
+            separator = value.get('separator', '')
+            try:
+                count = int(value.get('count'))
+            except (TypeError, ValueError):
+                count = 0
+            if isinstance(repeat_text, str) and isinstance(separator, str) and count >= 0:
+                return separator.join([repeat_text] * count)
+        return {
+            key: _expand_repeat_text_fixtures(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_expand_repeat_text_fixtures(child) for child in value]
+    return value
+
+
+def _expand_env_placeholders(value: str) -> str:
+    return os.path.expandvars(value)
+
+
 def _summarize_http_response_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -1370,6 +1428,40 @@ def _summarize_http_response_payload(payload: Any) -> dict[str, Any]:
     if isinstance(payload.get('model'), str):
         summary['model'] = payload['model']
     return summary
+
+
+def _http_request_repeat_count(config: dict[str, Any]) -> int:
+    request_config = dict(config.get('http_request') or {})
+    raw_value = request_config.get(
+        'repeat_count',
+        request_config.get(
+            'http_request_repeat_count',
+            config.get(
+                'http_request_repeat_count',
+                2 if bool(config.get('repeat_http_request')) else 1,
+            ),
+        ),
+    )
+    try:
+        repeat_count = int(raw_value)
+    except (TypeError, ValueError):
+        repeat_count = 1
+    return max(1, repeat_count)
+
+
+def _http_request_repeat_delay_seconds(config: dict[str, Any]) -> float:
+    request_config = dict(config.get('http_request') or {})
+    raw_value = request_config.get(
+        'repeat_delay_seconds',
+        request_config.get(
+            'http_request_repeat_delay_seconds',
+            config.get('http_request_repeat_delay_seconds', 0),
+        ),
+    )
+    try:
+        return max(0.0, float(raw_value))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _run_http_request(config: dict[str, Any]) -> dict[str, Any]:
@@ -1395,7 +1487,10 @@ def _run_http_request(config: dict[str, Any]) -> dict[str, Any]:
         separator = '&' if '?' in url else '?'
         url = f'{url}{separator}{urllib.parse.urlencode(query)}'
 
-    headers = {str(key): str(value) for key, value in (request_config.get('headers') or {}).items()}
+    headers = {
+        str(key): _expand_env_placeholders(str(value))
+        for key, value in (request_config.get('headers') or {}).items()
+    }
     body = request_config.get('json')
     session_id = str(request_config.get('session_id') or '')
     if session_id:
@@ -1404,6 +1499,7 @@ def _run_http_request(config: dict[str, Any]) -> dict[str, Any]:
             session_id=session_id,
             trace_name=str(headers.get('langfuse_trace_name') or config.get('case_name') or 'native-passthrough'),
         )
+    body = _expand_repeat_text_fixtures(body)
 
     data = None
     if body is not None:
@@ -1464,6 +1560,73 @@ def _run_http_request(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _run_http_request_with_repeat(config: dict[str, Any]) -> dict[str, Any]:
+    repeat_count = _http_request_repeat_count(config)
+    if repeat_count <= 1:
+        return _run_http_request(config)
+
+    delay_seconds = _http_request_repeat_delay_seconds(config)
+    pass_results: list[dict[str, Any]] = []
+    final_run: dict[str, Any] | None = None
+    started = time.time()
+    for pass_index in range(1, repeat_count + 1):
+        run = _run_http_request(config)
+        parsed_stdout = _parse_command_output_json(run.get('stdout', ''))
+        pass_summary = {
+            'pass': pass_index,
+            'exit_code': run.get('exit_code'),
+            'duration_seconds': run.get('duration_seconds'),
+            'command': run.get('command'),
+            'command_string': run.get('command_string'),
+            'stderr': run.get('stderr'),
+            'response_excerpt': run.get('response_excerpt'),
+            'stdout': parsed_stdout if parsed_stdout is not None else run.get('stdout'),
+        }
+        pass_results.append(pass_summary)
+        final_run = run
+        if pass_index < repeat_count and delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    if final_run is None:
+        raise RuntimeError('http_request repeat loop produced no run result')
+
+    final_stdout = _parse_command_output_json(final_run.get('stdout', '')) or {}
+    if not isinstance(final_stdout, dict):
+        final_stdout = {}
+    stdout_payload = {
+        **final_stdout,
+        'http_request_repeat_count': repeat_count,
+        'http_request_passes': [
+            {
+                key: value
+                for key, value in pass_result.items()
+                if key
+                in {
+                    'pass',
+                    'exit_code',
+                    'duration_seconds',
+                    'stdout',
+                    'stderr',
+                }
+            }
+            for pass_result in pass_results
+        ],
+    }
+    return {
+        **final_run,
+        'exit_code': 1 if any(pass_result.get('exit_code') != 0 for pass_result in pass_results) else 0,
+        'duration_seconds': round(time.time() - started, 3),
+        'stdout': json.dumps(stdout_payload),
+        'stderr': '\n'.join(
+            str(pass_result.get('stderr') or '')
+            for pass_result in pass_results
+            if pass_result.get('stderr')
+        ),
+        'http_request_repeat_count': repeat_count,
+        'http_request_passes': pass_results,
+    }
+
+
 def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, Any], list[dict[str, Any]]]:
     retry_statuses = {int(value) for value in (config.get('retry_on_api_error_statuses') or [])}
     max_attempts = max(1, int(config.get('retry_max_attempts', 1) or 1))
@@ -1476,7 +1639,7 @@ def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, A
     for attempt in range(1, max_attempts + 1):
         started = RA._utcnow()
         if isinstance(config.get('http_request'), dict):
-            run = _run_http_request(config)
+            run = _run_http_request_with_repeat(config)
         else:
             run = RA._run_command(
                 config['command'],

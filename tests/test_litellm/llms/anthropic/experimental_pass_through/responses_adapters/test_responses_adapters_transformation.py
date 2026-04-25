@@ -14,6 +14,9 @@ import pytest
 sys.path.insert(0, os.path.abspath("../../../../../../.."))
 
 import litellm
+from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import (
+    _build_responses_kwargs,
+)
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
     LiteLLMAnthropicToResponsesAPIAdapter,
 )
@@ -1022,6 +1025,65 @@ class TestTranslateRequestBroaderCoverage:
         req = _make_request(metadata={"user_id": long_id})
         kwargs = _ADAPTER.translate_request(req)
         assert len(kwargs["user"]) == 64
+
+    def test_cache_control_adds_prompt_cache_key_and_logging_metadata(self):
+        req = _make_request(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cache me",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ]
+        )
+        kwargs = _ADAPTER.translate_request(req, custom_llm_provider="openai")
+
+        assert kwargs["prompt_cache_key"].startswith("anthropic-cache-")
+        assert len(kwargs["prompt_cache_key"]) <= 64
+        litellm_metadata = kwargs["litellm_metadata"]
+        assert litellm_metadata["usage_provider_cache_attempted"] is True
+        assert (
+            litellm_metadata["usage_provider_cache_source"]
+            == "anthropic_adapter.cache_control"
+        )
+        assert litellm_metadata["openai_provider_cache_attempted"] is True
+        assert litellm_metadata["openai_prompt_cache_key_present"] is True
+        assert litellm_metadata["anthropic_adapter_cache_control_present"] is True
+
+    def test_cache_metadata_merges_existing_litellm_metadata(self):
+        kwargs = _build_responses_kwargs(
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cache me",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+            model="gpt-5.4-mini",
+            extra_kwargs={
+                "litellm_metadata": {
+                    "tags": ["route:anthropic_messages"],
+                    "trace_environment": "dev",
+                }
+            },
+        )
+
+        litellm_metadata = kwargs["litellm_metadata"]
+        assert litellm_metadata["tags"] == ["route:anthropic_messages"]
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert litellm_metadata["openai_prompt_cache_key_present"] is True
+        assert litellm_metadata["anthropic_adapter_cache_control_present"] is True
 
     def test_no_optional_fields_does_not_add_spurious_keys(self):
         req = _make_request()

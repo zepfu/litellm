@@ -1134,6 +1134,40 @@ def test_output_config_effort_propagates_to_gemini_reasoning_effort():
     assert "output_config" not in openai_request
 
 
+def test_gemini_cache_control_adds_provider_cache_intent_metadata():
+    """Gemini cache-control requests should preserve durable cache intent metadata."""
+    request = cast(
+        Any,
+        {
+            "model": "gemini/gemini-3-pro-preview",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cache me",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+            "max_tokens": 1024,
+        },
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, _ = adapter.translate_anthropic_to_openai(
+        request, custom_llm_provider="gemini"
+    )
+
+    metadata = openai_request["metadata"]
+    assert metadata["usage_provider_cache_attempted"] is True
+    assert metadata["usage_provider_cache_source"] == "anthropic_adapter.cache_control"
+    assert metadata["gemini_provider_cache_attempted"] is True
+    assert metadata["gemini_provider_cache_source"] == "anthropic_adapter.cache_control"
+
+
 # ============================================================================
 # Cache Control Transformation Tests
 # ============================================================================

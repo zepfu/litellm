@@ -498,6 +498,8 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "usage_provider_cache_miss_cost_usd",
     "usage_provider_cache_miss_cost_basis",
     "usage_provider_cache_source",
+    "openai_prompt_cache_key_present",
+    "anthropic_adapter_cache_control_present",
     "usage_tool_call_count",
     "usage_tool_names",
     "aawm_local_prepare_ms",
@@ -2113,36 +2115,43 @@ def _resolve_provider_cache_state(
     miss_reason: Optional[str] = None
     source: Optional[str] = None
 
+    if state_from_metadata is not None and state_from_metadata.get("attempted"):
+        attempted = True
+        miss_reason = state_from_metadata.get("miss_reason") or "cache_attempted_without_hit"
+        source = state_from_metadata.get("source") or "metadata.provider_cache_attempted"
+
     if provider_family == "anthropic":
-        attempted = request_has_cache_control
+        attempted = attempted or request_has_cache_control
         if attempted:
-            miss_reason = "cache_control_requested_without_hit"
-            source = "request.cache_control"
+            miss_reason = miss_reason or "cache_control_requested_without_hit"
+            source = source or "request.cache_control"
     elif provider_family == "openrouter":
         if request_has_cache_control:
             attempted = True
-            miss_reason = "cache_control_requested_without_hit"
-            source = "request.cache_control"
+            miss_reason = miss_reason or "cache_control_requested_without_hit"
+            source = source or "request.cache_control"
         elif usage_has_openai_cached_tokens:
             attempted = True
-            miss_reason = "cached_tokens_reported_zero"
-            source = "usage.input_tokens_details.cached_tokens"
+            miss_reason = miss_reason or "cached_tokens_reported_zero"
+            source = source or "usage.input_tokens_details.cached_tokens"
     elif provider_family == "gemini":
         if request_has_cached_content:
             attempted = True
-            miss_reason = "cached_content_requested_without_hit"
-            source = "request.cached_content"
+            miss_reason = miss_reason or "cached_content_requested_without_hit"
+            source = source or "request.cached_content"
         elif usage_has_gemini_cached_content:
             attempted = True
-            miss_reason = "cached_tokens_reported_zero"
-            source = "usage.cached_content_token_count"
+            miss_reason = miss_reason or "cached_tokens_reported_zero"
+            source = source or "usage.cached_content_token_count"
     elif provider_family == "openai":
         openai_cache_attempt_source = _openai_cache_attempt_source(
             usage_obj, request_body
         )
         if openai_cache_attempt_source:
             attempted = True
-            miss_reason, source = openai_cache_attempt_source
+            source_miss_reason, source_name = openai_cache_attempt_source
+            miss_reason = miss_reason or source_miss_reason
+            source = source or source_name
 
     if not attempted:
         return {
