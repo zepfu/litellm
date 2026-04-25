@@ -112,6 +112,23 @@ Main pushes auto-bump independently shipped artifacts when their inputs change:
 - harness archive: `h-v*`
 - model config archive: `cfg-v*`
 
+Before rebuilding infrastructure, verify the GitHub Releases and assets exist.
+Remote tags alone are not enough: the infrastructure Dockerfile selects the
+latest non-draft GitHub Release assets, not the latest git tags. If an autobump
+workflow creates tags but the release workflows do not publish assets, the
+Docker build will silently keep resolving the previous released overlay.
+
+```bash
+gh release view cb-v<version> --repo zepfu/litellm
+gh release view cfg-v<version> --repo zepfu/litellm
+gh release view h-v<version> --repo zepfu/litellm
+```
+
+If a tag exists but the release is missing, publish or rerun the artifact
+release before building prod. After publishing a missing overlay asset, rebuild
+with cache busting so Docker re-resolves the release API instead of reusing a
+layer that installed stale artifacts.
+
 Normal infrastructure rebuilds should pin the base fork image but float the
 latest versioned callback, control-plane, harness, and model-config artifacts.
 Pin overlay artifact versions only for incident response, rollback testing, or
@@ -131,8 +148,19 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 2. Build the prod image.
 
    ```bash
-   docker compose -f docker-compose.litellm.yml build litellm
+   docker compose -f docker-compose.litellm.yml build --pull --no-cache litellm
    ```
+
+   Inspect the built image before restarting prod:
+
+   ```bash
+   docker run --rm --entrypoint python3 aawm-litellm:latest -c \
+     "import importlib.metadata as m; print(m.version('litellm')); print(m.version('aawm-litellm-callbacks')); print(m.version('aawm-litellm-control-plane'))"
+   ```
+
+   Direct OpenAI passthrough routes require `OPENAI_API_KEY` in the container
+   environment. In AAWM infra, map it from `AAWM_OPENAI_API_KEY`; having only
+   `AAWM_OPENAI_API_KEY` is not enough for `/openai_passthrough/*`.
 
 3. Start the prod container.
 
@@ -196,6 +224,40 @@ Always inspect overlapping prod logs after the harness:
 ```bash
 docker logs --tail 1000 aawm-litellm
 ```
+
+For native passthrough changes, run the opt-in native shard in the existing
+harness. This includes the real Claude, Codex, and Gemini CLIs and should not
+be replaced with skipped or synthetic key checks.
+
+```bash
+./.venv/bin/python -m dotenv run -- \
+  ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
+    --target prod \
+    --cases native_anthropic_passthrough_claude,native_openai_passthrough_chat,native_openai_passthrough_responses,native_openai_passthrough_responses_codex,native_gemini_passthrough_generate_content,native_gemini_passthrough_stream_generate_content \
+    --write-artifact /tmp/litellm-prod-native.json
+```
+
+For `/anthropic` effort/cache changes, run the opt-in shards that are
+default-excluded to keep the default suite stable:
+
+```bash
+./.venv/bin/python -m dotenv run -- \
+  ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
+    --target prod \
+    --cases claude_adapter_openai_output_config_effort,claude_adapter_openai_prompt_cache_two_pass,claude_adapter_gemini_output_config_effort,claude_adapter_gemini_output_config_minimal_effort,claude_adapter_gemini_output_config_max_effort,claude_adapter_gemini_output_config_minimal_effort_cache,claude_adapter_gemini_output_config_max_effort_cache \
+    --write-artifact /tmp/litellm-prod-effort-cache-openai-gemini.json
+
+./.venv/bin/python -m dotenv run -- \
+  ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
+    --target prod \
+    --cases claude_adapter_openrouter_output_config_effort_cache,claude_adapter_openrouter_output_config_max_effort,claude_adapter_openrouter_output_config_max_effort_cache,claude_adapter_openrouter_output_config_none_effort,claude_adapter_openrouter_output_config_none_effort_cache,claude_adapter_openrouter_no_effort_cache_control \
+    --write-artifact /tmp/litellm-prod-effort-cache-openrouter.json
+```
+
+Harness cases should use generated per-run session ids unless a stable session
+id is essential to the test. Static session ids can collide with older
+`public.session_history` rows and produce false environment mismatches during
+prod validation.
 
 ## Optional Provider Lanes
 
