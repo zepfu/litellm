@@ -32,7 +32,13 @@ async def arerank(
     documents: List[Union[str, Dict[str, Any]]],
     custom_llm_provider: Optional[
         Literal[
-            "cohere", "together_ai", "deepinfra", "fireworks_ai", "voyage", "watsonx"
+            "cohere",
+            "together_ai",
+            "deepinfra",
+            "fireworks_ai",
+            "voyage",
+            "watsonx",
+            "openrouter",
         ]
     ] = None,
     top_n: Optional[int] = None,
@@ -91,6 +97,7 @@ def rerank(  # noqa: PLR0915
             "fireworks_ai",
             "voyage",
             "watsonx",
+            "openrouter",
         ]
     ] = None,
     top_n: Optional[int] = None,

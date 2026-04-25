@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -783,6 +784,143 @@ def test_build_session_history_record_calculates_gpt_5_5_cost_from_current_price
 
     assert record is not None
     assert record["response_cost_usd"] == pytest.approx(0.035)
+
+
+def test_build_session_history_record_estimates_openrouter_rerank_tokens_from_request() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "cohere/rerank-4-pro"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "rerank"
+    kwargs["litellm_call_id"] = "call-openrouter-rerank-cost"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-rerank-cost"
+    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
+        "model": "openrouter/cohere/rerank-4-pro",
+        "query": "What is OpenRouter?",
+        "documents": [
+            "OpenRouter routes requests across model providers.",
+            "LiteLLM records provider usage in session history.",
+        ],
+    }}
+    kwargs["query"] = "What is OpenRouter?"
+    kwargs["documents"] = [
+        "OpenRouter routes requests across model providers.",
+        "LiteLLM records provider usage in session history.",
+    ]
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "query": "What is OpenRouter?",
+        "documents": [
+            "OpenRouter routes requests across model providers.",
+            "LiteLLM records provider usage in session history.",
+        ],
+    }
+
+    result = {
+        "id": "or-rerank-response-1",
+        "usage": {"search_units": 1, "cost": 0.0042},
+        "results": [{"index": 0, "relevance_score": 0.98}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "openrouter/cohere/rerank-4-pro"
+    assert record["call_type"] == "rerank"
+    assert record["input_tokens"] > 0
+    assert record["output_tokens"] == 0
+    assert record["total_tokens"] == record["input_tokens"]
+    assert record["metadata"]["usage_search_units"] == 1
+    assert record["metadata"]["usage_openrouter_cost"] == pytest.approx(0.0042)
+    assert record["response_cost_usd"] == pytest.approx(0.0042)
+
+
+def test_build_session_history_record_uses_openrouter_hidden_response_cost() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "openrouter/cohere/rerank-4-pro"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "rerank"
+    kwargs["litellm_call_id"] = "call-openrouter-hidden-rerank-cost"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-openrouter-hidden-rerank-cost"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "query": "What is OpenRouter?",
+        "documents": ["OpenRouter routes LLM calls.", "Unrelated text."],
+    }
+
+    result = SimpleNamespace(
+        id="or-rerank-response-hidden-cost",
+        usage={"search_units": 2},
+        results=[{"index": 0, "relevance_score": 0.98}],
+        _hidden_params={"response_cost": 0.0066},
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "openrouter/cohere/rerank-4-pro"
+    assert record["input_tokens"] > 0
+    assert record["total_tokens"] == record["input_tokens"]
+    assert record["metadata"]["usage_search_units"] == 2
+    assert record["response_cost_usd"] == pytest.approx(0.0066)
+
+
+def test_build_session_history_record_calculates_openrouter_embedding_cost() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "qwen/qwen3-embedding-8b"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "embedding"
+    kwargs["litellm_call_id"] = "call-openrouter-qwen-embedding-cost"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-openrouter-qwen-embedding-cost"
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
+        "model": "openrouter/qwen/qwen3-embedding-8b",
+        "input": "Embed this text.",
+    }}
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "qwen/qwen3-embedding-8b",
+        "input": "Embed this text.",
+    }
+
+    result = {
+        "id": "or-embedding-response-1",
+        "usage": {
+            "prompt_tokens": 2000,
+            "completion_tokens": 0,
+            "total_tokens": 2000,
+        },
+        "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "openrouter/qwen/qwen3-embedding-8b"
+    assert record["call_type"] == "embedding"
+    assert record["input_tokens"] == 2000
+    assert record["total_tokens"] == 2000
+    assert record["response_cost_usd"] == pytest.approx(0.00002)
 
 
 def test_build_session_history_record_estimates_reasoning_when_provider_reports_zero() -> None:

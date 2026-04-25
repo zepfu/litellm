@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34` (33 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34`, `aawm.35`, `aawm.36` (35 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.34`.
+`1.82.3+aawm.36`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1139,6 +1139,77 @@ independent harness artifacts.
 **Validation status:** Version/docs-only follow-up on top of `aawm.33`; publish
 and promote `aawm.34`, then rerun focused prod NVIDIA/OpenRouter cases and the
 default prod `:4000` harness.
+
+---
+
+### aawm.35 — OpenRouter embedding and rerank proxy surface
+
+**Files:**
+- `pyproject.toml`
+- `litellm/__init__.py`
+- `litellm/_lazy_imports_registry.py`
+- `litellm/main.py`
+- `litellm/utils.py`
+- `litellm/rerank_api/main.py`
+- `litellm/llms/openrouter/embedding/transformation.py`
+- `litellm/llms/openrouter/rerank/transformation.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `model_prices_and_context_window.json`
+- `litellm/bundled_model_prices_and_context_window_fallback.json`
+- `litellm-dev-config.yaml`
+- `docker-compose.dev.yml`
+- `OPENROUTER_EMBED_RERANK_CONSUMER.md`
+- focused OpenRouter, cost, and session-history tests
+
+**Upstream issue:** LiteLLM did not expose OpenRouter-hosted embedding/rerank
+models needed by AAWM consumers through the local proxy surface in a way that
+kept upstream billing centralized, preserved OpenRouter provider/cost metadata,
+and wrote complete `public.session_history` rows for rerank calls that bill by
+search unit instead of provider-reported tokens.
+
+**Fix:** Add OpenRouter rerank provider support for `/api/v1/rerank`, normalize
+OpenRouter embedding base URLs, pass OpenRouter provider routing through
+embeddings, and include `AAWM_OPENROUTER_API_KEY` in OpenRouter credential
+fallbacks. Add model metadata for `openrouter/qwen/qwen3-embedding-8b` and
+`openrouter/cohere/rerank-4-pro`. Preserve caller-facing `openrouter/...`
+models, OpenRouter upstream provider/model details, response cost, search-unit
+usage, and estimated rerank prompt/total tokens in AAWM `session_history`.
+
+**Why not upstream:** The provider surface is generally useful, but the
+session-history attribution, tenant/session requirements, callback wheel
+packaging, and centralized OpenRouter billing policy are AAWM-specific.
+
+**Validation status:** Focused unit coverage passed for OpenRouter embedding
+and rerank transforms, AAWM session-history rows, and exact cost-map coverage.
+Live dev validation on `:4001` passed for `openrouter/qwen/qwen3-embedding-8b`
+and `openrouter/cohere/rerank-4-pro`, including tenant/session attribution,
+DeepInfra/Cohere provider metadata, non-zero costs, and estimated rerank tokens.
+
+---
+
+### aawm.36 — Release metadata alignment for the OpenRouter release
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+
+**Upstream issue:** The previously cut `v1.82.3-aawm.35` tag pointed at an
+artifact-bump commit and still reported `1.82.3+aawm.34` from installed package
+metadata. The guarded image publisher requires new fork image tags to point at
+current `main`, and published tags must not be force-moved.
+
+**Fix:** Bump the fork-local version to `1.82.3+aawm.36` for the OpenRouter
+embedding/rerank promotion and leave the already-published `aawm.35` tag
+untouched.
+
+**Why not upstream:** AAWM release-line bookkeeping for fork image tags,
+runtime identity in `session_history`, and the local image publisher guard.
+
+**Validation status:** Version/docs-only release alignment on top of `aawm.35`.
+After `main` is converged and the artifact autobump has published callback and
+model-config assets, tag and publish `v1.82.3-aawm.36`, then promote through
+the normal prod `:4000` process.
 
 ---
 
