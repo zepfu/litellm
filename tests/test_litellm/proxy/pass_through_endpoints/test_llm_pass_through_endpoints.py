@@ -2888,6 +2888,50 @@ class TestClaudePersistedOutputExpansion:
             == expected_model
         )
 
+    def test_anthropic_openai_responses_adapter_merges_cache_litellm_metadata(
+        self,
+    ):
+        request_body = {
+            "model": "gpt-5.4-mini",
+            "max_tokens": 16,
+            "system": "Reply briefly.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cache me",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+            "litellm_metadata": {
+                "tags": ["route:anthropic_messages"],
+                "trace_environment": "dev",
+            },
+        }
+
+        translated_body = _build_anthropic_responses_adapter_request_body(
+            request_body,
+            adapter_model="gpt-5.4-mini",
+        )
+
+        litellm_metadata = translated_body["litellm_metadata"]
+        assert translated_body["prompt_cache_key"].startswith("anthropic-cache-")
+        assert set(litellm_metadata["tags"]) >= {
+            "route:anthropic_messages",
+            "route:anthropic_openai_responses_adapter",
+            "anthropic-openai-responses-adapter",
+            "anthropic-adapter-model:gpt-5.4-mini",
+            "anthropic-adapter-target:/v1/responses",
+        }
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert litellm_metadata["openai_prompt_cache_key_present"] is True
+        assert litellm_metadata["anthropic_adapter_cache_control_present"] is True
+        assert litellm_metadata["openai_provider_cache_attempted"] is True
+
     def test_resolve_anthropic_google_completion_adapter_model_supports_google_prefix(
         self,
     ):

@@ -4113,7 +4113,10 @@ def _build_anthropic_responses_adapter_request_body(
 
     existing_litellm_metadata = request_body.get("litellm_metadata")
     if isinstance(existing_litellm_metadata, dict):
-        translated_body["litellm_metadata"] = dict(existing_litellm_metadata)
+        translated_body["litellm_metadata"] = {
+            **existing_litellm_metadata,
+            **dict(translated_body.get("litellm_metadata") or {}),
+        }
 
     span_metadata = {
         "requested_model": request_body.get("model"),
