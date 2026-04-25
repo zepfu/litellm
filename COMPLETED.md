@@ -11,6 +11,9 @@
 - Removed static session ids from opt-in effort/cache harness cases.
   The OpenAI effort, Gemini effort, and OpenRouter effort/cache cases now use the existing generated per-run session id path, avoiding false prod failures caused by older dev `public.session_history` rows sharing the same static session id. The affected prod shard passed cleanly after the change.
 
+- Published the follow-up harness artifact from the post-release autobump.
+  Pushing the release-doc and harness-session cleanup to `main` auto-bumped the harness archive to `h-v0.0.18`; the missing GitHub Release asset was published and verified at `h-v0.0.18` with `litellm-local-ci-harness-0.0.18.tar.gz`.
+
 - Broadened live harness coverage for the completed `/anthropic` effort/cache translation work.
   Added default-excluded existing-harness cases for Gemini minimal/max effort with cache-control variants, OpenRouter max/none/no-effort with cache-control variants, and an ordered OpenAI two-pass prompt-cache case. The harness now supports repeated HTTP passes, compact repeated-text fixtures, env-expanded HTTP headers, multi-row session-history minimums, and provider cache hit validation without introducing a second harness. Live dev shard artifacts passed with zero failures/warnings at `/tmp/anthropic-effort-cache-gemini-dev.json`, `/tmp/anthropic-effort-cache-openrouter-dev.json`, and `/tmp/anthropic-effort-cache-openai-dev.json`.
 
