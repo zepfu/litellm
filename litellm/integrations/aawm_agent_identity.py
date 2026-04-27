@@ -44,6 +44,10 @@ from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.secret_managers.main import get_secret_str
 
+_CLAUDE_PERMISSION_CHECK_OUTPUT_RE = re.compile(
+    r"^<block>\s*(?P<decision>yes|no)\s*$",
+    re.IGNORECASE,
+)
 _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
 _AGENT_TENANT_RE = re.compile(
     r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project"
@@ -196,6 +200,9 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     client_name TEXT,
     client_version TEXT,
     client_user_agent TEXT,
+    token_permission_input INTEGER NOT NULL DEFAULT 0,
+    token_permission_output INTEGER NOT NULL DEFAULT 0,
+    permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 )
 """
@@ -218,6 +225,9 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_name TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_version TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_user_agent TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_input INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_output INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
@@ -297,12 +307,15 @@ INSERT INTO public.session_history (
     client_name,
     client_version,
     client_user_agent,
+    token_permission_input,
+    token_permission_output,
+    permission_usd_cost,
     metadata
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb,
-    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43::jsonb
+    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -386,6 +399,30 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         GREATEST(session_history.response_cost_usd, EXCLUDED.response_cost_usd),
         session_history.response_cost_usd,
         EXCLUDED.response_cost_usd
+    ),
+    token_permission_input = COALESCE(
+        GREATEST(
+            session_history.token_permission_input,
+            EXCLUDED.token_permission_input
+        ),
+        session_history.token_permission_input,
+        EXCLUDED.token_permission_input
+    ),
+    token_permission_output = COALESCE(
+        GREATEST(
+            session_history.token_permission_output,
+            EXCLUDED.token_permission_output
+        ),
+        session_history.token_permission_output,
+        EXCLUDED.token_permission_output
+    ),
+    permission_usd_cost = COALESCE(
+        GREATEST(
+            session_history.permission_usd_cost,
+            EXCLUDED.permission_usd_cost
+        ),
+        session_history.permission_usd_cost,
+        EXCLUDED.permission_usd_cost
     ),
     litellm_environment = COALESCE(
         NULLIF(EXCLUDED.litellm_environment, ''),
@@ -473,6 +510,13 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "client_version",
     "client_user_agent",
     "route_tag",
+    "claude_internal_check",
+    "claude_internal_check_type",
+    "claude_permission_check",
+    "claude_permission_check_decision",
+    "claude_permission_check_blocked",
+    "claude_permission_check_request_model",
+    "claude_permission_check_response_model",
     "reasoning_content_present",
     "thinking_signature_present",
     "usage_reasoning_tokens_reported",
@@ -1410,6 +1454,236 @@ def _append_langfuse_span(
 
     existing_spans.append(span_descriptor)
     metadata["langfuse_spans"] = existing_spans
+
+
+def _maybe_parse_json_text(value: str) -> Any:
+    stripped_value = value.strip()
+    if not stripped_value or stripped_value[0] not in "[{":
+        return None
+    try:
+        return json.loads(stripped_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_claude_permission_check_decision_from_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if type(value).__module__.startswith("unittest.mock"):
+        return None
+
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        match = _CLAUDE_PERMISSION_CHECK_OUTPUT_RE.match(stripped_value)
+        if match is not None:
+            return match.group("decision").lower()
+        parsed_value = _maybe_parse_json_text(stripped_value)
+        if parsed_value is not None:
+            return _extract_claude_permission_check_decision_from_value(parsed_value)
+        return None
+
+    if isinstance(value, list):
+        text_value = _content_to_text(value).strip()
+        match = _CLAUDE_PERMISSION_CHECK_OUTPUT_RE.match(text_value)
+        if match is not None:
+            return match.group("decision").lower()
+        for item in value:
+            decision = _extract_claude_permission_check_decision_from_value(item)
+            if decision is not None:
+                return decision
+        return None
+
+    content = _maybe_get(value, "content")
+    if content is not None:
+        decision = _extract_claude_permission_check_decision_from_value(content)
+        if decision is not None:
+            return decision
+
+    message = _extract_first_response_message(value)
+    if message is not None and message is not value:
+        decision = _extract_claude_permission_check_decision_from_value(message)
+        if decision is not None:
+            return decision
+
+    response = _maybe_get(value, "response")
+    if response is not None and response is not value:
+        decision = _extract_claude_permission_check_decision_from_value(response)
+        if decision is not None:
+            return decision
+
+    return None
+
+
+def _extract_claude_permission_check_decision(
+    result: Any,
+    standard_logging_object: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    decision = _extract_claude_permission_check_decision_from_value(result)
+    if decision is not None:
+        return decision
+
+    if isinstance(standard_logging_object, dict):
+        for candidate in (
+            standard_logging_object.get("response"),
+            standard_logging_object.get("output"),
+        ):
+            decision = _extract_claude_permission_check_decision_from_value(candidate)
+            if decision is not None:
+                return decision
+
+    return None
+
+
+def _first_non_empty_string(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_claude_permission_check_models(
+    kwargs: Dict[str, Any],
+    standard_logging_object: Dict[str, Any],
+    metadata: Dict[str, Any],
+    result: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    request_model = _first_non_empty_string(
+        _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"), "request_body", "model"
+        ),
+        _maybe_get_path(
+            kwargs.get("litellm_params"),
+            "proxy_server_request",
+            "body",
+            "model",
+        ),
+        _maybe_get_path(standard_logging_object, "request_body", "model"),
+    )
+    response_model = _first_non_empty_string(
+        _maybe_get(result, "model"),
+        _maybe_get_path(standard_logging_object, "response", "model"),
+        standard_logging_object.get("model"),
+        kwargs.get("model"),
+        metadata.get("model"),
+    )
+    return request_model, response_model
+
+
+def _enrich_claude_permission_check_metadata(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+    result: Any,
+    *,
+    standard_logging_object: Optional[Dict[str, Any]] = None,
+) -> None:
+    standard_logging_object = standard_logging_object or kwargs.get(
+        "standard_logging_object"
+    ) or {}
+    decision = _extract_claude_permission_check_decision(
+        result,
+        standard_logging_object=standard_logging_object,
+    )
+    if decision is None:
+        return
+
+    blocked = decision == "yes"
+    request_model, response_model = _extract_claude_permission_check_models(
+        kwargs,
+        standard_logging_object,
+        metadata,
+        result,
+    )
+
+    metadata["claude_internal_check"] = True
+    metadata["claude_internal_check_type"] = "permission_check"
+    metadata["claude_permission_check"] = True
+    metadata["claude_permission_check_decision"] = decision
+    metadata["claude_permission_check_blocked"] = blocked
+    if request_model:
+        metadata["claude_permission_check_request_model"] = request_model
+    if response_model:
+        metadata["claude_permission_check_response_model"] = response_model
+
+    _merge_tags(
+        metadata,
+        [
+            "claude-internal-check",
+            "claude-permission-check",
+            f"claude-permission-check:{decision}",
+            "claude-permission-check:block"
+            if blocked
+            else "claude-permission-check:allow",
+        ],
+    )
+
+    existing_spans = metadata.get("langfuse_spans") or []
+    if not isinstance(existing_spans, list):
+        existing_spans = []
+    if any(
+        isinstance(span, dict) and span.get("name") == "claude.permission_check"
+        for span in existing_spans
+    ):
+        return
+
+    span_metadata: Dict[str, Any] = {
+        "decision": decision,
+        "blocked": blocked,
+        "source": "claude_code_block_output",
+    }
+    for key in (
+        "cc_version",
+        "cc_entrypoint",
+        "client_name",
+        "client_version",
+        "litellm_environment",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            span_metadata[key] = value
+    if request_model:
+        span_metadata["request_model"] = request_model
+    if response_model:
+        span_metadata["response_model"] = response_model
+
+    now = datetime.now(timezone.utc)
+    _append_langfuse_span(
+        metadata,
+        name="claude.permission_check",
+        span_metadata=span_metadata,
+        input_data={"check_type": "permission_check"},
+        output_data={"decision": decision, "blocked": blocked},
+        start_time=now,
+        end_time=now,
+    )
+
+
+def _metadata_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _build_permission_usage_fields(
+    *,
+    metadata: Dict[str, Any],
+    prompt_tokens: Optional[int],
+    completion_tokens: Optional[int],
+    response_cost_usd: Optional[float],
+) -> Dict[str, Any]:
+    if not _metadata_bool(metadata.get("claude_permission_check")):
+        return {
+            "token_permission_input": 0,
+            "token_permission_output": 0,
+            "permission_usd_cost": 0.0,
+        }
+
+    return {
+        "token_permission_input": _safe_int(prompt_tokens) or 0,
+        "token_permission_output": _safe_int(completion_tokens) or 0,
+        "permission_usd_cost": _safe_float(response_cost_usd) or 0.0,
+    }
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -4263,6 +4537,31 @@ def _build_session_history_record_from_langfuse_trace_observation(
     provider = _infer_provider_from_langfuse_observation(observation, metadata)
 
     output_payload = observation.get("output")
+    permission_decision = _extract_claude_permission_check_decision_from_value(
+        output_payload
+    )
+    if permission_decision is not None:
+        permission_blocked = permission_decision == "yes"
+        metadata["claude_internal_check"] = True
+        metadata["claude_internal_check_type"] = "permission_check"
+        metadata["claude_permission_check"] = True
+        metadata["claude_permission_check_decision"] = permission_decision
+        metadata["claude_permission_check_blocked"] = permission_blocked
+        observation_model = str(observation.get("model") or "").strip()
+        if observation_model:
+            metadata["claude_permission_check_response_model"] = observation_model
+        _merge_tags(
+            metadata,
+            [
+                "claude-internal-check",
+                "claude-permission-check",
+                f"claude-permission-check:{permission_decision}",
+                "claude-permission-check:block"
+                if permission_blocked
+                else "claude-permission-check:allow",
+            ],
+        )
+
     message = _extract_first_langfuse_response_message(output_payload)
     if reported_reasoning_tokens is None and provider == "gemini":
         reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
@@ -4365,6 +4664,21 @@ def _build_session_history_record_from_langfuse_trace_observation(
             )
         )
 
+    response_cost_usd = _safe_float(
+        _first_non_none(
+            _maybe_get(observation.get("costDetails"), "total"),
+            observation.get("calculatedTotalCost"),
+            metadata.get("litellm_response_cost"),
+            trace.get("totalCost"),
+        )
+    )
+    permission_usage_fields = _build_permission_usage_fields(
+        metadata=metadata,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        response_cost_usd=response_cost_usd,
+    )
+
     history_metadata = _build_session_history_metadata(
         metadata=metadata,
         request_tags=request_tags,
@@ -4439,14 +4753,8 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "git_commit_count": tool_activity_summary["git_commit_count"],
         "git_push_count": tool_activity_summary["git_push_count"],
         "tool_activity": tool_activity,
-        "response_cost_usd": _safe_float(
-            _first_non_none(
-                _maybe_get(observation.get("costDetails"), "total"),
-                observation.get("calculatedTotalCost"),
-                metadata.get("litellm_response_cost"),
-                trace.get("totalCost"),
-            )
-        ),
+        "response_cost_usd": response_cost_usd,
+        **permission_usage_fields,
         "litellm_environment": runtime_identity["litellm_environment"],
         "litellm_version": runtime_identity["litellm_version"],
         "litellm_fork_version": runtime_identity["litellm_fork_version"],
@@ -4572,9 +4880,23 @@ def _build_session_history_record(
         return None
 
     litellm_params = kwargs.get("litellm_params") or {}
-    metadata = litellm_params.get("metadata") or {}
+    metadata = litellm_params.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        litellm_params["metadata"] = metadata
+        kwargs["litellm_params"] = litellm_params
     standard_logging_object = kwargs.get("standard_logging_object") or {}
-    request_tags = standard_logging_object.get("request_tags") or metadata.get("tags") or []
+    _enrich_claude_permission_check_metadata(
+        kwargs,
+        metadata,
+        result,
+        standard_logging_object=standard_logging_object,
+    )
+    _sync_standard_logging_object(kwargs, metadata)
+    standard_logging_object = kwargs.get("standard_logging_object") or standard_logging_object
+    request_tags = (
+        standard_logging_object.get("request_tags") or metadata.get("tags") or []
+    )
     if not isinstance(request_tags, list):
         request_tags = []
 
@@ -4760,6 +5082,13 @@ def _build_session_history_record(
             if bundled_response_cost is not None:
                 response_cost_usd = bundled_response_cost
 
+    permission_usage_fields = _build_permission_usage_fields(
+        metadata=metadata,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        response_cost_usd=response_cost_usd,
+    )
+
     provider_cache_state = _resolve_provider_cache_state(
         provider=resolved_provider,
         model=resolved_model,
@@ -4838,6 +5167,7 @@ def _build_session_history_record(
         "git_push_count": tool_activity_summary["git_push_count"],
         "tool_activity": tool_activity,
         "response_cost_usd": response_cost_usd,
+        **permission_usage_fields,
         "litellm_environment": runtime_identity["litellm_environment"],
         "litellm_version": runtime_identity["litellm_version"],
         "litellm_fork_version": runtime_identity["litellm_fork_version"],
@@ -4970,6 +5300,9 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("client_name"),
         record.get("client_version"),
         record.get("client_user_agent"),
+        record.get("token_permission_input", 0),
+        record.get("token_permission_output", 0),
+        record.get("permission_usd_cost", 0),
         json.dumps(record["metadata"]),
     )
 
@@ -5398,6 +5731,7 @@ def _enrich_trace_name_and_provider_metadata(
     if message is not None:
         _enrich_claude_thinking_metadata(metadata, message)
         _enrich_gemini_thought_signature_metadata(metadata, message)
+    _enrich_claude_permission_check_metadata(kwargs, metadata, result)
     _enrich_usage_breakout_metadata(kwargs, result)
     _enrich_provider_cache_metadata(kwargs, result)
 

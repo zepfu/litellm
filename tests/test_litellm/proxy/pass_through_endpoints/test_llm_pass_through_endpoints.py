@@ -4768,10 +4768,13 @@ class TestClaudePersistedOutputExpansion:
         assert "write to it directly with the Write tool" not in updated_system_text
         assert "memory_save(" in updated_system_text
         assert "memory_forget(source_ids=[...])" in updated_system_text
-        assert "<types>\n<type><name>user</name></type>\n<type><name>feedback</name></type>\n</types>" in updated_system_text
-        assert "## What NOT to save in memory\n\n- Old exclusion text." in updated_system_text
-        assert "## Before recommending from memory\n\nVerify the named file still exists." in updated_system_text
-        assert "## Memory and other forms of persistence\nMemory is one of several persistence mechanisms." in updated_system_text
+        assert "| `user` | Global |" in updated_system_text
+        assert "| `feedback` | Agent-scoped |" in updated_system_text
+        assert "## Staleness and verification" in updated_system_text
+        assert "<types>\n<type><name>user</name></type>" not in updated_system_text
+        assert "Old exclusion text" not in updated_system_text
+        assert "Verify the named file still exists." not in updated_system_text
+        assert "Memory is one of several persistence mechanisms." not in updated_system_text
         assert "# Environment\nOther Claude system text.\n" in updated_system_text
 
         litellm_metadata = updated_body["litellm_metadata"]
@@ -4924,6 +4927,9 @@ class TestClaudePersistedOutputExpansion:
         assert "write to it directly with the Write tool" not in updated_system_text
         assert "memory_save(" in updated_system_text
         assert "memory_forget(source_ids=[...])" in updated_system_text
+        assert "| `project` | Agent + project scoped |" in updated_system_text
+        assert "## Memory vs plans/tasks" in updated_system_text
+        assert "Old exclusion text" not in updated_system_text
 
         litellm_metadata = updated_body["litellm_metadata"]
         assert litellm_metadata["claude_system_prompt_override_ids"] == ["auto-memory"]
@@ -4934,6 +4940,153 @@ class TestClaudePersistedOutputExpansion:
             "section_heading"
         ] == "# Persistent Agent Memory"
         assert "claude-system-prompt-override:auto-memory" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_compacts_claude_code_tool_advertisements(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        long_bash_description = "Run commands safely. " + ("Prefer dedicated tools. " * 80)
+        long_schema_description = (
+            "Clear, concise description of what this command does in active voice. "
+            "Never use words like complex or risk in the description. "
+            + ("Keep it brief. " * 30)
+        )
+        custom_tool = {
+            "name": "custom_lookup",
+            "description": "Lookup custom project data.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Short query text.",
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+        request_body = {
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.113.50e; cc_entrypoint=cli; cch=42aab;",
+                }
+            ],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": long_bash_description,
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command to execute",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": long_schema_description,
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["default", "background"],
+                                "description": "Execution mode.",
+                            },
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+                custom_tool,
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        bash_tool = updated_body["tools"][0]
+        assert bash_tool["name"] == "Bash"
+        assert bash_tool["description"].startswith("Run a shell command.")
+        assert len(bash_tool["description"]) < len(long_bash_description)
+        assert "$schema" not in bash_tool["input_schema"]
+        assert bash_tool["input_schema"]["type"] == "object"
+        assert bash_tool["input_schema"]["required"] == ["command"]
+        assert bash_tool["input_schema"]["additionalProperties"] is False
+        assert (
+            bash_tool["input_schema"]["properties"]["mode"]["enum"]
+            == ["default", "background"]
+        )
+        compacted_property_description = bash_tool["input_schema"]["properties"][
+            "description"
+        ]["description"]
+        assert len(compacted_property_description) < len(long_schema_description)
+        assert "Never use words like complex or risk" in compacted_property_description
+        assert updated_body["tools"][1] == custom_tool
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert "claude-tool-advertisement-compaction" in litellm_metadata["tags"]
+        assert litellm_metadata["claude_tool_advertisement_compaction_count"] == 1
+        assert litellm_metadata[
+            "claude_tool_advertisement_compaction_tool_names"
+        ] == ["Bash"]
+        assert litellm_metadata["claude_tool_advertisement_compaction_saved_chars"] > 0
+        assert (
+            litellm_metadata["claude_tool_advertisement_compaction_events"][0][
+                "schema_dropped_key_count"
+            ]
+            == 1
+        )
+        assert any(
+            span["name"] == "claude.tool_advertisement_compaction"
+            for span in litellm_metadata["langfuse_spans"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_skips_tool_compaction_without_cc_version(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-7",
+            "system": [{"type": "text", "text": "plain system prompt"}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run commands safely. " + ("Prefer tools. " * 50),
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command to execute",
+                            }
+                        },
+                        "required": ["command"],
+                    },
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        assert updated_body["tools"] == request_body["tools"]
+        litellm_metadata = updated_body.get("litellm_metadata", {})
+        assert "claude-tool-advertisement-compaction" not in litellm_metadata.get(
+            "tags", []
+        )
+        assert "claude_tool_advertisement_compaction_count" not in litellm_metadata
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_applies_claude_prompt_patches(
