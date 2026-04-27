@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -185,6 +186,75 @@ def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
     assert "gemini_thought_signature_present" not in metadata
 
 
+def test_aawm_agent_identity_adds_claude_permission_check_span() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    kwargs["model"] = "claude-opus-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = "claude-opus-4-6"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "cc_version": "2.1.119.284",
+            "cc_entrypoint": "cli",
+            "client_name": "claude-cli",
+            "client_version": "2.1.119",
+            "litellm_environment": "prod",
+        }
+    )
+    result = {
+        "model": "claude-opus-4-6",
+        "choices": [
+            {
+                "message": {
+                    "content": "<block>no",
+                    "role": "assistant",
+                    "tool_calls": None,
+                }
+            }
+        ],
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result=result,
+        call_type="pass_through_endpoint",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    tags = metadata["tags"]
+    assert metadata["claude_internal_check"] is True
+    assert metadata["claude_internal_check_type"] == "permission_check"
+    assert metadata["claude_permission_check"] is True
+    assert metadata["claude_permission_check_decision"] == "no"
+    assert metadata["claude_permission_check_blocked"] is False
+    assert metadata["claude_permission_check_request_model"] == "claude-opus-4-6"
+    assert metadata["claude_permission_check_response_model"] == "claude-opus-4-6"
+    assert "claude-permission-check" in tags
+    assert "claude-permission-check:no" in tags
+    assert "claude-permission-check:allow" in tags
+    assert "claude-permission-check" in updated_kwargs["standard_logging_object"][
+        "request_tags"
+    ]
+    assert (
+        updated_kwargs["standard_logging_object"]["metadata"][
+            "claude_permission_check_decision"
+        ]
+        == "no"
+    )
+
+    permission_span = next(
+        span
+        for span in metadata["langfuse_spans"]
+        if isinstance(span, dict) and span.get("name") == "claude.permission_check"
+    )
+    assert permission_span["metadata"]["decision"] == "no"
+    assert permission_span["metadata"]["blocked"] is False
+    assert permission_span["metadata"]["request_model"] == "claude-opus-4-6"
+    assert permission_span["metadata"]["response_model"] == "claude-opus-4-6"
+    assert permission_span["input"] == {"check_type": "permission_check"}
+    assert permission_span["output"] == {"decision": "no", "blocked": False}
+
+
 def test_aawm_agent_identity_adds_gemini_thought_signature_tags() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="gemini")
@@ -305,6 +375,61 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
 
     assert record is not None
     assert record["session_id"] == "session-from-header"
+
+
+def test_build_session_history_record_marks_claude_permission_check() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "claude-opus-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-permission-check"
+    kwargs["passthrough_logging_payload"]["request_body"][
+        "model"
+    ] = "claude-opus-4-6"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-permission-check",
+            "cc_version": "2.1.119.284",
+            "client_name": "claude-cli",
+            "client_version": "2.1.119",
+        }
+    )
+    kwargs["response_cost"] = 0.016138
+    result = {
+        "id": "msg-claude-permission-check",
+        "model": "claude-opus-4-6",
+        "usage": {
+            "prompt_tokens": 12000,
+            "completion_tokens": 7,
+            "total_tokens": 12007,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "<block>no"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-27T10:48:33Z",
+        end_time="2026-04-27T10:48:36Z",
+    )
+
+    assert record is not None
+    assert record["session_id"] == "session-claude-permission-check"
+    assert record["model"] == "claude-opus-4-6"
+    assert record["output_tokens"] == 7
+    assert record["token_permission_input"] == 12000
+    assert record["token_permission_output"] == 7
+    assert record["permission_usd_cost"] == pytest.approx(0.016138)
+    metadata = record["metadata"]
+    assert metadata["claude_internal_check"] is True
+    assert metadata["claude_internal_check_type"] == "permission_check"
+    assert metadata["claude_permission_check"] is True
+    assert metadata["claude_permission_check_decision"] == "no"
+    assert metadata["claude_permission_check_blocked"] is False
+    assert metadata["claude_permission_check_request_model"] == "claude-opus-4-6"
+    assert metadata["claude_permission_check_response_model"] == "claude-opus-4-6"
+    assert "claude-permission-check" in metadata["request_tags"]
+    assert "claude-permission-check:no" in metadata["request_tags"]
 
 
 def test_build_session_history_record_tracks_runtime_and_client_identity() -> None:
@@ -1206,6 +1331,9 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
         "client_name": "codex-tui",
         "client_version": "0.124.0",
         "client_user_agent": "codex-tui/0.124.0",
+        "token_permission_input": 100,
+        "token_permission_output": 7,
+        "permission_usd_cost": 0.016138,
         "metadata": {},
     }
 
@@ -1223,6 +1351,12 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
     assert payload[39] == "codex-tui"
     assert payload[40] == "0.124.0"
     assert payload[41] == "codex-tui/0.124.0"
+    assert payload[42] == 100
+    assert payload[43] == 7
+    assert payload[44] == pytest.approx(0.016138)
+    payload_metadata = json.loads(payload[45])
+    assert payload_metadata["litellm_environment"] == "dev"
+    assert payload_metadata["client_name"] == "codex-tui"
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
@@ -2472,6 +2606,50 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["metadata"]["session_id_source"] == "trace.sessionId"
     assert record["metadata"]["trace_id_source"] == "trace.id"
     assert "route:anthropic_messages" in record["metadata"]["request_tags"]
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_marks_permission_cost() -> None:
+    trace = {
+        "id": "trace-permission",
+        "name": "claude-code.orchestrator",
+        "sessionId": "session-permission",
+        "environment": "prod",
+        "input": {"messages": None},
+    }
+    observation = {
+        "id": "call-permission",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "claude-opus-4-6",
+        "startTime": "2026-04-27T10:48:33Z",
+        "endTime": "2026-04-27T10:48:36Z",
+        "promptTokens": 11908,
+        "completionTokens": 7,
+        "totalTokens": 11915,
+        "costDetails": {"total": 0.0090475},
+        "output": {"content": "<block>no", "role": "assistant"},
+        "metadata": {
+            "tags": ["route:anthropic_messages"],
+            "cc_version": "2.1.119.284",
+            "client_name": "claude-cli",
+            "client_version": "2.1.119",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-permission",
+    )
+
+    assert record is not None
+    assert record["token_permission_input"] == 11908
+    assert record["token_permission_output"] == 7
+    assert record["permission_usd_cost"] == pytest.approx(0.0090475)
+    assert record["metadata"]["claude_permission_check"] is True
+    assert record["metadata"]["claude_permission_check_decision"] == "no"
+    assert "claude-permission-check" in record["metadata"]["request_tags"]
+    assert "claude-permission-check:no" in record["metadata"]["request_tags"]
 
 
 def test_build_session_history_record_from_langfuse_trace_observation_prefers_metadata_tenant() -> None:

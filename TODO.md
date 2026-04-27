@@ -29,8 +29,101 @@ only as needed:
 
 ## Next
 
-- Rerun the full default dev/prod harnesses after the upstream Codex/OpenAI account usage limit resets.
-  The PostgreSQL connection-pressure hardening is complete and targeted recent-window dev/prod log scans no longer show DB pressure signatures. The latest full default dev and prod runs were blocked by upstream OpenAI/Codex `usage_limit_reached` 429s in the Codex/Spark cases; the dev failure reported reset time `2026-04-25 20:27:55 UTC`, and the prod OpenRouter canary shard passed with warning-only optional Gemma notes. Do not skip or soften those cases; rerun the normal default harnesses once the upstream quota reset clears.
+- Implement a Google-only Gemini system prompt policy for Claude-initiated
+  `/anthropic` requests that route through `anthropic_google_completion_adapter`.
+  Saved design note and suggested prompt:
+  [.analysis/google-anthropic-system-prompt-policy-2026-04-27.md](.analysis/google-anthropic-system-prompt-policy-2026-04-27.md).
+  Restartable plan:
+  1. Add the rewrite in
+     `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py` inside
+     `_build_google_code_assist_request_from_completion_kwargs()`, after
+     Anthropic input is canonicalized and before `_transform_request_body()`
+     creates Gemini `systemInstruction`.
+  2. Keep the existing Claude-to-Gemini native tool aliasing intact; the prompt
+     policy should change operating instructions, not the tool schema mapping.
+  3. Feature-flag the policy with values such as `off`, `append`, and
+     `replace_compact`; use `replace_compact` as the target behavior after
+     validation.
+  4. Strip Claude/Anthropic provider overhead from the system prompt while
+     preserving project, workspace, safety, memory, and task constraints.
+  5. Inject the compact Gemini CLI-style agent prompt from the analysis note and
+     append preserved instructions under a clear heading.
+     Suggested compact prompt:
+     ```text
+     You are a non-interactive CLI software engineering agent.
+
+     Work in this cycle: understand, plan briefly, implement, verify, finalize.
+     Use the provided tools to inspect and modify the workspace when the task
+     requires it.
+
+     Tool usage:
+     - Prefer search tools before broad file reads.
+     - Batch independent search/read calls in parallel when possible.
+     - Use write/edit tools to complete requested artifacts or code changes.
+     - If a tool is unavailable or blocked, recover with another available tool.
+     - Do not remain in read-only exploration when the user requested an
+       implementation or artifact.
+
+     Follow the preserved project, workspace, safety, and operator instructions
+     below.
+     ```
+  6. Record prompt-policy metadata without logging the full prompt by default:
+     policy name/version, original and rewritten system text sizes, removed
+     Claude-overhead size, and preserved-instruction size.
+  7. Add focused unit coverage for disabled/append/replace modes, preservation
+     of safety/project instructions, removal of known Claude-only markers,
+     generated `request.systemInstruction`, metadata summary fields, and no
+     regression in Gemini-native tool aliases.
+  8. Extend the existing Anthropic adapter harness with a focused
+     `claude_adapter_gemini_*` case rather than creating a new harness. The case
+     should launch the real Claude CLI through `:4001/anthropic`, select a
+     Gemini child model through the normal Claude agent/fanout path, require a
+     bounded artifact-write/edit outcome, and validate the logged Google Code
+     Assist request body contains the compact Gemini prompt marker while
+     excluding known Claude-only overhead markers.
+  9. Harness validation should also assert the prompt-policy metadata in
+     Langfuse/session-history, preserve the existing Gemini provider/model/cost
+     and trace-environment checks, scan runtime logs for blocker patterns, and
+     treat `write_file`/write-edit tool activity as a hard gate only where the
+     current harness can observe child tool activity reliably; otherwise hard
+     gate final artifact creation plus logged request-body prompt-policy checks.
+  10. Validate with the focused dev harness case, the full default dev harness,
+      then the same focused/full checks on prod during the next promotion.
+
+- Normalize invalid empty optional Claude tool arguments returned by
+  non-Anthropic models on the `/anthropic` adapter path. Saved issue note:
+  [.analysis/gpt55-claude-read-pages-empty-arg-2026-04-27.md](.analysis/gpt55-claude-read-pages-empty-arg-2026-04-27.md).
+  Restartable plan:
+  1. Add a narrow adapter response sanitizer for Claude tool calls before they
+     are returned to Claude Code. Immediate target: `Read` tool calls with
+     `pages: ""` should omit `pages` entirely because Claude Code only accepts
+     meaningful PDF page ranges.
+  2. Prefer a shared helper in the Anthropic experimental pass-through adapter
+     translation layer so non-streaming and streaming tool-call output paths get
+     the same normalization. Inspect
+     `litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py`
+     and `streaming_iterator.py` before choosing the exact hook point.
+  3. Keep the sanitizer narrow: do not globally delete empty strings from all
+     tool arguments, since empty strings may be valid for other tools.
+  4. Preserve existing tool-name mapping behavior so the sanitizer can act on
+     the original Claude tool name even when provider-facing tool names were
+     truncated or aliased.
+  5. Add unit tests for non-streaming output where GPT/OpenAI returns
+     `Read({"file_path": "...", "pages": ""})` and the Anthropic `tool_use`
+     response omits `pages`; add streaming coverage if the existing streaming
+     test helpers can exercise assembled tool-call arguments.
+  6. Add a negative unit test proving unrelated tools or valid empty-string
+     arguments are not stripped.
+  7. Extend the existing Anthropic adapter harness with a focused GPT-5.5/OpenAI
+     Claude-dispatch case that reads a small source/text file, validates the
+     run does not loop on `Invalid pages parameter`, validates the logged
+     translated tool activity/request output does not contain `Read.pages=""`,
+     and keeps normal provider/model/cost, Langfuse, runtime-log, and
+     `session_history` invariants.
+  8. Optionally add a prompt-side belt-and-suspenders instruction to relevant
+     GPT/OpenAI dispatch prompts: when calling `Read`, omit `pages` unless
+     reading a PDF with a real page range. This should supplement, not replace,
+     adapter-side sanitization.
 
 ## Ongoing
 
