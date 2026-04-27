@@ -6546,28 +6546,25 @@ def _render_claude_auto_memory_replacement(
         raise ValueError(f"Unsupported Claude Code version for auto-memory override: {cc_version}")
 
     template_text = _load_claude_context_replacement_template(template_path)
-    types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(auto_memory_section)
-    if types_match is None:
-        raise ValueError("Missing Claude auto-memory <types> block")
-
     rendered_text = template_text
-    rendered_text = rendered_text.replace(
-        "{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip()
-    )
-    rendered_text = rendered_text.replace(
-        "{{WHAT_NOT_TO_SAVE_SECTION}}",
-        _extract_markdown_section(auto_memory_section, "What NOT to save in memory"),
-    )
-    rendered_text = rendered_text.replace(
-        "{{BEFORE_RECOMMENDING_SECTION}}",
-        _extract_markdown_section(auto_memory_section, "Before recommending from memory"),
-    )
-    rendered_text = rendered_text.replace(
-        "{{MEMORY_AND_PERSISTENCE_SECTION}}",
-        _extract_markdown_section(
-            auto_memory_section, "Memory and other forms of persistence"
-        ),
-    )
+    if "{{TYPES_XML_BLOCK}}" in rendered_text:
+        types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(auto_memory_section)
+        if types_match is None:
+            raise ValueError("Missing Claude auto-memory <types> block")
+        rendered_text = rendered_text.replace(
+            "{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip()
+        )
+
+    section_placeholders = {
+        "{{WHAT_NOT_TO_SAVE_SECTION}}": "What NOT to save in memory",
+        "{{BEFORE_RECOMMENDING_SECTION}}": "Before recommending from memory",
+        "{{MEMORY_AND_PERSISTENCE_SECTION}}": "Memory and other forms of persistence",
+    }
+    for placeholder, heading in section_placeholders.items():
+        if placeholder in rendered_text:
+            rendered_text = rendered_text.replace(
+                placeholder, _extract_markdown_section(auto_memory_section, heading)
+            )
 
     unresolved_placeholders = _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(
         rendered_text

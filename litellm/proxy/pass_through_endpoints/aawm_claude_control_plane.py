@@ -43,6 +43,42 @@ _CLAUDE_COMMONMARK_PROMPT_IDENTIFIER_TEMPLATE = (
     "monospace font using the CommonMark specification plus the following as a custom "
     "known list of technical identifiers: {identifiers}."
 )
+_CLAUDE_TOOL_DESCRIPTION_MAX_CHARS = 360
+_CLAUDE_TOOL_SCHEMA_DESCRIPTION_MAX_CHARS = 160
+_CLAUDE_TOOL_SCHEMA_DROP_KEYS = {"$schema"}
+_CLAUDE_KNOWN_TOOL_DESCRIPTIONS = {
+    "Bash": (
+        "Run a shell command. Prefer dedicated tools for search/read/edit/write. "
+        "Use absolute paths when practical, provide a concise `description`, and "
+        "use `run_in_background` for long tasks. Avoid destructive git, force, "
+        "no-verify, commit, or push actions unless explicitly requested."
+    ),
+    "Glob": "Find files by glob pattern. Provide `pattern`; optionally set `path`.",
+    "Grep": (
+        "Search file contents with ripgrep syntax. Provide `pattern`; optionally set "
+        "`path`, `glob`, `type`, output mode, context, and case-sensitivity options."
+    ),
+    "Read": "Read a file by absolute path. Use offsets/limits for long text reads.",
+    "Edit": (
+        "Edit an existing file by exact string replacement after reading it. "
+        "Preserve indentation; use `replace_all` only for intentional broad changes."
+    ),
+    "Write": (
+        "Create or overwrite a file. Read existing files first and prefer `Edit` "
+        "for modifications. Do not create docs unless explicitly requested."
+    ),
+    "NotebookEdit": "Edit a Jupyter notebook cell after reading the notebook.",
+    "WebFetch": "Fetch and summarize a web page from a URL.",
+    "WebSearch": "Search the web for current information.",
+    "TodoWrite": "Create or update the current conversation task list for active work.",
+    "Task": "Launch a subagent for bounded parallel work with a clear task.",
+    "Skill": "Load and follow a named local skill when it applies.",
+    "ExitPlanMode": "Leave plan mode after the user approves the plan.",
+    "BashOutput": "Read output from a background bash command.",
+    "KillBash": "Stop a background bash command.",
+    "EnterWorktree": "Enter an existing worktree for isolated task work.",
+    "ExitWorktree": "Exit and optionally clean up an isolated worktree.",
+}
 _AAWM_REFERENCE_IDENTIFIER_PATCH_ID = "technical-identifiers-list"
 _AAWM_REFERENCE_IDENTIFIER_CACHE_KEY = "reference-identifiers"
 _AAWM_REFERENCE_IDENTIFIER_LIST_QUERY = """
@@ -431,26 +467,25 @@ def _render_claude_auto_memory_replacement(
         )
 
     template_text = _load_claude_context_replacement_template(template_path)
-    types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(memory_section)
-    if types_match is None:
-        raise ValueError("Missing Claude auto-memory <types> block")
-
     rendered_text = template_text
-    rendered_text = rendered_text.replace(
-        "{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip()
-    )
-    rendered_text = rendered_text.replace(
-        "{{WHAT_NOT_TO_SAVE_SECTION}}",
-        _extract_markdown_section(memory_section, "What NOT to save in memory"),
-    )
-    rendered_text = rendered_text.replace(
-        "{{BEFORE_RECOMMENDING_SECTION}}",
-        _extract_markdown_section(memory_section, "Before recommending from memory"),
-    )
-    rendered_text = rendered_text.replace(
-        "{{MEMORY_AND_PERSISTENCE_SECTION}}",
-        _extract_markdown_section(memory_section, "Memory and other forms of persistence"),
-    )
+    if "{{TYPES_XML_BLOCK}}" in rendered_text:
+        types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(memory_section)
+        if types_match is None:
+            raise ValueError("Missing Claude auto-memory <types> block")
+        rendered_text = rendered_text.replace(
+            "{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip()
+        )
+
+    section_placeholders = {
+        "{{WHAT_NOT_TO_SAVE_SECTION}}": "What NOT to save in memory",
+        "{{BEFORE_RECOMMENDING_SECTION}}": "Before recommending from memory",
+        "{{MEMORY_AND_PERSISTENCE_SECTION}}": "Memory and other forms of persistence",
+    }
+    for placeholder, heading in section_placeholders.items():
+        if placeholder in rendered_text:
+            rendered_text = rendered_text.replace(
+                placeholder, _extract_markdown_section(memory_section, heading)
+            )
 
     unresolved_placeholders = _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(
         rendered_text
@@ -629,6 +664,264 @@ def _add_claude_system_prompt_override_logging_metadata(
             "langfuse_spans": [
                 lp._build_langfuse_span_descriptor(
                     name="claude.system_prompt_override",
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _json_compact_char_count(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _collapse_tool_description_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _truncate_tool_description_text(value: str, max_chars: int) -> str:
+    collapsed = _collapse_tool_description_text(value)
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _get_claude_tool_name(tool: dict[str, Any]) -> Optional[str]:
+    name = tool.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+
+    function_block = tool.get("function")
+    if isinstance(function_block, dict):
+        function_name = function_block.get("name")
+        if isinstance(function_name, str) and function_name.strip():
+            return function_name.strip()
+    return None
+
+
+def _compact_claude_tool_schema_value(
+    value: Any,
+) -> tuple[Any, int, int]:
+    if isinstance(value, dict):
+        updated_dict: dict[str, Any] = {}
+        changed = False
+        description_count = 0
+        dropped_key_count = 0
+
+        for key, child in value.items():
+            if key in _CLAUDE_TOOL_SCHEMA_DROP_KEYS:
+                changed = True
+                dropped_key_count += 1
+                continue
+
+            if key == "description" and isinstance(child, str):
+                compacted_child = _truncate_tool_description_text(
+                    child,
+                    _CLAUDE_TOOL_SCHEMA_DESCRIPTION_MAX_CHARS,
+                )
+                updated_dict[key] = compacted_child
+                if compacted_child != child:
+                    changed = True
+                    description_count += 1
+                continue
+
+            compacted_child, child_description_count, child_dropped_key_count = (
+                _compact_claude_tool_schema_value(child)
+            )
+            updated_dict[key] = compacted_child
+            description_count += child_description_count
+            dropped_key_count += child_dropped_key_count
+            if compacted_child is not child:
+                changed = True
+
+        return (
+            updated_dict if changed else value,
+            description_count,
+            dropped_key_count,
+        )
+
+    if isinstance(value, list):
+        updated_list = []
+        changed = False
+        description_count = 0
+        dropped_key_count = 0
+        for child in value:
+            compacted_child, child_description_count, child_dropped_key_count = (
+                _compact_claude_tool_schema_value(child)
+            )
+            updated_list.append(compacted_child)
+            description_count += child_description_count
+            dropped_key_count += child_dropped_key_count
+            if compacted_child is not child:
+                changed = True
+        return (
+            updated_list if changed else value,
+            description_count,
+            dropped_key_count,
+        )
+
+    return value, 0, 0
+
+
+def _compact_claude_tool_advertisement(
+    tool: Any,
+    *,
+    cc_version: str,
+) -> tuple[Any, Optional[dict[str, Any]]]:
+    if not isinstance(tool, dict):
+        return tool, None
+
+    tool_name = _get_claude_tool_name(tool) or "unknown"
+    original_chars = _json_compact_char_count(tool)
+    updated_tool = dict(tool)
+    changed = False
+    top_level_description_compacted = False
+    schema_description_count = 0
+    schema_dropped_key_count = 0
+
+    description = tool.get("description")
+    if isinstance(description, str):
+        known_description = _CLAUDE_KNOWN_TOOL_DESCRIPTIONS.get(tool_name)
+        compacted_description = (
+            known_description
+            if known_description is not None
+            else _truncate_tool_description_text(
+                description,
+                _CLAUDE_TOOL_DESCRIPTION_MAX_CHARS,
+            )
+        )
+        if compacted_description != description:
+            updated_tool["description"] = compacted_description
+            changed = True
+            top_level_description_compacted = True
+
+    input_schema = tool.get("input_schema")
+    if isinstance(input_schema, dict):
+        compacted_schema, schema_description_count, schema_dropped_key_count = (
+            _compact_claude_tool_schema_value(input_schema)
+        )
+        if compacted_schema is not input_schema:
+            updated_tool["input_schema"] = compacted_schema
+            changed = True
+
+    if not changed:
+        return tool, None
+
+    compacted_chars = _json_compact_char_count(updated_tool)
+    return updated_tool, {
+        "id": "tool-advertisement",
+        "status": "resolved",
+        "cc_version": cc_version,
+        "tool_name": tool_name,
+        "original_chars": original_chars,
+        "compacted_chars": compacted_chars,
+        "saved_chars": max(0, original_chars - compacted_chars),
+        "top_level_description_compacted": top_level_description_compacted,
+        "schema_description_compaction_count": schema_description_count,
+        "schema_dropped_key_count": schema_dropped_key_count,
+    }
+
+
+def _compact_claude_tool_advertisements_in_request_body(
+    request_body: dict[str, Any],
+    *,
+    cc_version: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    tools = request_body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return request_body, []
+
+    updated_tools = []
+    events: list[dict[str, Any]] = []
+    changed = False
+    for tool in tools:
+        updated_tool, event = _compact_claude_tool_advertisement(
+            tool,
+            cc_version=cc_version,
+        )
+        updated_tools.append(updated_tool)
+        if event is not None:
+            events.append(event)
+        if updated_tool is not tool:
+            changed = True
+
+    if not changed:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["tools"] = updated_tools
+    return updated_body, events
+
+
+def _add_claude_tool_advertisement_compaction_logging_metadata(
+    request_body: dict[str, Any],
+    compaction_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    lp = _lp()
+    tool_names = sorted(
+        {
+            event["tool_name"]
+            for event in compaction_events
+            if isinstance(event.get("tool_name"), str) and event["tool_name"]
+        }
+    )
+    statuses = [
+        event["status"]
+        for event in compaction_events
+        if isinstance(event.get("status"), str) and event["status"]
+    ]
+    cc_versions = sorted(
+        {
+            event["cc_version"]
+            for event in compaction_events
+            if isinstance(event.get("cc_version"), str) and event["cc_version"]
+        }
+    )
+    original_chars = sum(
+        event["original_chars"]
+        for event in compaction_events
+        if isinstance(event.get("original_chars"), int)
+    )
+    compacted_chars = sum(
+        event["compacted_chars"]
+        for event in compaction_events
+        if isinstance(event.get("compacted_chars"), int)
+    )
+    saved_chars = sum(
+        event["saved_chars"]
+        for event in compaction_events
+        if isinstance(event.get("saved_chars"), int)
+    )
+
+    span_metadata: dict[str, Any] = {
+        "tool_count": len(compaction_events),
+        "original_chars": original_chars,
+        "compacted_chars": compacted_chars,
+        "saved_chars": saved_chars,
+    }
+    if tool_names:
+        span_metadata["tool_names"] = tool_names
+    if cc_versions:
+        span_metadata["cc_versions"] = cc_versions
+
+    return lp._merge_litellm_metadata(
+        request_body,
+        tags_to_add=["claude-tool-advertisement-compaction"],
+        extra_fields={
+            "claude_tool_advertisement_compaction_count": len(compaction_events),
+            "claude_tool_advertisement_compaction_tool_names": tool_names,
+            "claude_tool_advertisement_compaction_statuses": statuses,
+            "claude_tool_advertisement_compaction_cc_versions": cc_versions,
+            "claude_tool_advertisement_compaction_original_chars": original_chars,
+            "claude_tool_advertisement_compaction_compacted_chars": compacted_chars,
+            "claude_tool_advertisement_compaction_saved_chars": saved_chars,
+            "claude_tool_advertisement_compaction_events": compaction_events,
+            "langfuse_spans": [
+                lp._build_langfuse_span_descriptor(
+                    name="claude.tool_advertisement_compaction",
                     metadata=span_metadata,
                 )
             ],
@@ -838,10 +1131,15 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
         manifest=manifest,
         available_context=available_context,
     )
-    if not override_events and not patch_events:
-        return request_body, [], []
 
     if not isinstance(updated_body, dict):
+        return request_body, [], []
+
+    updated_body, compaction_events = _compact_claude_tool_advertisements_in_request_body(
+        updated_body,
+        cc_version=cc_version,
+    )
+    if not override_events and not patch_events and not compaction_events:
         return request_body, [], []
 
     if override_events:
@@ -854,6 +1152,11 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
             updated_body,
             patch_events,
         )
+    if compaction_events:
+        updated_body = _add_claude_tool_advertisement_compaction_logging_metadata(
+            updated_body,
+            compaction_events,
+        )
 
     litellm_metadata = updated_body.get("litellm_metadata")
     if isinstance(litellm_metadata, dict):
@@ -865,6 +1168,7 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
                 if span_descriptor.get("name") in {
                     "claude.system_prompt_override",
                     "claude.prompt_patch",
+                    "claude.tool_advertisement_compaction",
                 }:
                     span_descriptor["start_time"] = lp._format_langfuse_span_timestamp(
                         span_started_at
