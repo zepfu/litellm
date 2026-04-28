@@ -486,6 +486,51 @@ def test_target_profile_formats_claude_case_harness_run_id(monkeypatch):
     )
 
 
+def test_target_profile_adds_native_cli_repository_headers(monkeypatch):
+    harness = _load_harness_module()
+    monkeypatch.setattr(
+        harness.RA,
+        "_git_value",
+        lambda *args: "https://github.com/zepfu/litellm.git"
+        if args == ("remote", "get-url", "origin")
+        else "",
+    )
+
+    config = {
+        "cases": {
+            "native_codex": {
+                "cli_passthrough": "codex",
+                "command": ["codex", "exec", "--json", "hello"],
+            },
+            "native_gemini": {
+                "cli_passthrough": "gemini",
+                "command": ["gemini", "--prompt", "hello"],
+            },
+        }
+    }
+
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    codex_command = updated["cases"]["native_codex"]["command"]
+    assert (
+        'model_providers.litellm-dev.http_headers.x-aawm-repository="zepfu/litellm"'
+        in codex_command
+    )
+    gemini_headers = updated["cases"]["native_gemini"]["env"][
+        "GEMINI_CLI_CUSTOM_HEADERS"
+    ]
+    assert "x-aawm-repository: zepfu/litellm" in gemini_headers
+
+
 def test_target_profile_appends_case_local_claude_agents(monkeypatch):
     harness = _load_harness_module()
 

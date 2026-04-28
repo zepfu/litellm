@@ -266,6 +266,9 @@
           "client_name": "codex_exec"
         },
         "metadata_required_truthy": ["request_tags", "client_version"],
+        "required_contains": {
+          "repository": "litellm"
+        },
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,
@@ -309,6 +312,9 @@
           "client_name": "gemini-cli"
         },
         "metadata_required_truthy": ["request_tags", "client_version"],
+        "required_contains": {
+          "repository": "litellm"
+        },
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,
@@ -352,6 +358,9 @@
           "client_name": "gemini-cli"
         },
         "metadata_required_truthy": ["request_tags", "client_version"],
+        "required_contains": {
+          "repository": "litellm"
+        },
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,

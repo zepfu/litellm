@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
@@ -203,7 +203,8 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     token_permission_input INTEGER NOT NULL DEFAULT 0,
     token_permission_output INTEGER NOT NULL DEFAULT 0,
     permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    repository TEXT
 )
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
@@ -228,12 +229,14 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_input INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_output INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS repository TEXT",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON public.session_history (session_id, model, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_litellm_environment_created_idx ON public.session_history (litellm_environment, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_client_created_idx ON public.session_history (client_name, client_version, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_repository_created_idx ON public.session_history (repository, created_at DESC)",
 )
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
@@ -310,12 +313,13 @@ INSERT INTO public.session_history (
     token_permission_input,
     token_permission_output,
     permission_usd_cost,
-    metadata
+    metadata,
+    repository
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb,
-    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb
+    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb, $47
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -446,6 +450,7 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         NULLIF(EXCLUDED.client_user_agent, ''),
         session_history.client_user_agent
     ),
+    repository = COALESCE(NULLIF(EXCLUDED.repository, ''), session_history.repository),
     metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL = """
@@ -509,6 +514,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "client_name",
     "client_version",
     "client_user_agent",
+    "repository",
     "route_tag",
     "claude_internal_check",
     "claude_internal_check_type",
@@ -593,6 +599,21 @@ _AAWM_TENANT_ID_HEADER_NAMES = (
     "x-org-id",
     "x-litellm-team-id",
     "x-team-id",
+)
+_AAWM_REPOSITORY_METADATA_KEYS = (
+    "repository",
+    "aawm_repository",
+    "repo",
+    "repo_name",
+    "repository_name",
+    "git_repository",
+    "vcs_repository",
+)
+_AAWM_REPOSITORY_HEADER_NAMES = (
+    "x-aawm-repository",
+    "x-litellm-repository",
+    "x-repository",
+    "x-git-repository",
 )
 _AAWM_SESSION_HISTORY_BATCH_SIZE = 32
 _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
@@ -1035,6 +1056,107 @@ def _extract_tenant_identity_from_langfuse_trace_observation(
 ) -> Tuple[Optional[str], Optional[str]]:
     trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
     return _extract_tenant_identity_from_metadata_sources(
+        ("observation.metadata", metadata or observation.get("metadata")),
+        ("trace.metadata", trace_metadata),
+        ("observation", observation),
+        ("trace", trace),
+    )
+
+
+def _normalize_repository_identity(value: Any) -> Optional[str]:
+    cleaned = _clean_non_empty_string(value)
+    if not cleaned:
+        return None
+
+    if cleaned.startswith("git@") and ":" in cleaned:
+        cleaned = cleaned.split(":", 1)[1]
+    elif "://" in cleaned:
+        try:
+            parsed = urlsplit(cleaned)
+            netloc = parsed.netloc.split("@", 1)[-1]
+            path = parsed.path.strip("/")
+            if netloc.lower().endswith("github.com") and path:
+                cleaned = path
+            else:
+                cleaned = urlunsplit(("", netloc, path, "", "")).strip("/")
+        except Exception:
+            pass
+
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+    return cleaned.strip().strip("/") or None
+
+
+def _extract_repository_identity_from_metadata_sources(
+    *sources: Tuple[str, Any],
+) -> Optional[str]:
+    for _source_name, raw_source in sources:
+        source = _coerce_mapping(raw_source)
+        if not source:
+            continue
+        for key in _AAWM_REPOSITORY_METADATA_KEYS:
+            repository = _normalize_repository_identity(source.get(key))
+            if repository:
+                return repository
+
+        for nested_key in ("metadata", "request_metadata", "user_api_key_metadata"):
+            nested_source = _coerce_mapping(source.get(nested_key))
+            if not nested_source:
+                continue
+            for key in _AAWM_REPOSITORY_METADATA_KEYS:
+                repository = _normalize_repository_identity(nested_source.get(key))
+                if repository:
+                    return repository
+
+    return None
+
+
+def _extract_repository_identity_from_kwargs(
+    kwargs: Dict[str, Any],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    standard_logging_object: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    litellm_params = kwargs.get("litellm_params") or {}
+    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
+    passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
+    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
+    proxy_body = _coerce_mapping(proxy_request.get("body"))
+    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
+
+    repository = _extract_repository_identity_from_metadata_sources(
+        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
+        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
+        ("kwargs.metadata", kwargs.get("metadata")),
+        ("litellm_params.proxy_server_request.body", proxy_body),
+        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
+        ("passthrough_logging_payload", passthrough_payload),
+        ("passthrough_logging_payload.request_body", passthrough_body),
+        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
+        ("standard_logging_object", standard_logging_object),
+        ("kwargs", kwargs),
+    )
+    if repository:
+        return repository
+
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    for header_name in _AAWM_REPOSITORY_HEADER_NAMES:
+        repository = _normalize_repository_identity(
+            _get_header_value(headers, header_name)
+        )
+        if repository:
+            return repository
+
+    return None
+
+
+def _extract_repository_identity_from_langfuse_trace_observation(
+    trace: Dict[str, Any],
+    observation: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
+    return _extract_repository_identity_from_metadata_sources(
         ("observation.metadata", metadata or observation.get("metadata")),
         ("trace.metadata", trace_metadata),
         ("observation", observation),
@@ -3059,6 +3181,17 @@ def _normalize_session_runtime_identity_on_record(record: Dict[str, Any]) -> Non
     }
 
 
+def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
+    repository = _normalize_repository_identity(record.get("repository"))
+    if repository is None:
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict):
+            repository = _extract_repository_identity_from_metadata_sources(
+                ("record.metadata", metadata)
+            )
+    record["repository"] = repository
+
+
 def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
@@ -3121,6 +3254,10 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     if wheel_versions:
         metadata["litellm_wheel_versions"] = wheel_versions
 
+    repository = _normalize_repository_identity(record.get("repository"))
+    if repository is not None:
+        metadata["repository"] = repository
+
     record["metadata"] = metadata
 
 
@@ -3128,6 +3265,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
+    _normalize_session_repository_on_record(record)
     _sync_session_history_record_metadata(record)
     return record
 
@@ -4700,6 +4838,13 @@ def _build_session_history_record_from_langfuse_trace_observation(
         metadata["tenant_id_source"] = tenant_source
     elif tenant_id:
         metadata["tenant_id_source"] = "agent_context_text"
+    repository = _extract_repository_identity_from_langfuse_trace_observation(
+        trace,
+        observation,
+        metadata,
+    )
+    if repository:
+        metadata["repository"] = repository
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
     provider_cache_state = _resolve_provider_cache_state(
         provider=provider,
@@ -4771,6 +4916,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "model_group": metadata.get("model_group"),
         "agent_name": agent_name,
         "tenant_id": tenant_id,
+        "repository": repository,
         "call_type": metadata.get("user_api_key_request_route") or observation.get("name"),
         "start_time": _parse_datetime_value(observation.get("startTime")),
         "end_time": _parse_datetime_value(observation.get("endTime")),
@@ -5066,6 +5212,13 @@ def _build_session_history_record(
         metadata["tenant_id_source"] = tenant_source
     elif tenant_id:
         metadata["tenant_id_source"] = "agent_context_text"
+    repository = _extract_repository_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=standard_logging_object,
+    )
+    if repository:
+        metadata["repository"] = repository
 
     response_cost_usd = _safe_float(
         _first_non_none(
@@ -5184,6 +5337,7 @@ def _build_session_history_record(
         "model_group": metadata.get("model_group") or standard_logging_object.get("model_group"),
         "agent_name": agent_name,
         "tenant_id": tenant_id,
+        "repository": repository,
         "call_type": kwargs.get("call_type") or standard_logging_object.get("call_type"),
         "start_time": _normalize_datetime(start_time),
         "end_time": _normalize_datetime(end_time),
@@ -5360,6 +5514,7 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("token_permission_output", 0),
         record.get("permission_usd_cost", 0),
         json.dumps(record["metadata"]),
+        record.get("repository"),
     )
 
 

@@ -229,6 +229,12 @@ _AAWM_TENANT_ID_HEADER_NAMES = (
     "x-litellm-team-id",
     "x-team-id",
 )
+_PASSTHROUGH_REPOSITORY_HEADER_NAMES = (
+    "x-aawm-repository",
+    "x-litellm-repository",
+    "x-repository",
+    "x-git-repository",
+)
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
     {"/messages", "/v1/messages"}
 )
@@ -6988,6 +6994,49 @@ def _extract_passthrough_session_id(
     return None
 
 
+def _extract_passthrough_repository(
+    request: Request, request_body: Optional[dict[str, Any]] = None
+) -> Optional[str]:
+    def normalize(value: str) -> Optional[str]:
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if cleaned.startswith("git@") and ":" in cleaned:
+            cleaned = cleaned.split(":", 1)[1]
+        elif "://" in cleaned:
+            parsed = urlparse(cleaned)
+            path = parsed.path.strip("/")
+            netloc = parsed.netloc.split("@", 1)[-1]
+            if netloc.lower().endswith("github.com") and path:
+                cleaned = path
+            else:
+                cleaned = f"{netloc}/{path}".strip("/")
+        if cleaned.endswith(".git"):
+            cleaned = cleaned[:-4]
+        return cleaned.strip("/") or None
+
+    if isinstance(request_body, dict):
+        for path in (
+            ("repository",),
+            ("repo",),
+            ("metadata", "repository"),
+            ("metadata", "repo"),
+            ("litellm_metadata", "repository"),
+            ("request", "repository"),
+            ("request", "metadata", "repository"),
+        ):
+            value = _get_nested_str_value(request_body, path)
+            if value:
+                return normalize(value)
+
+    headers = _safe_get_request_headers(request)
+    for header_name in _PASSTHROUGH_REPOSITORY_HEADER_NAMES:
+        value = headers.get(header_name)
+        if isinstance(value, str) and value.strip():
+            return normalize(value)
+    return None
+
+
 def _get_passthrough_trace_environment() -> Optional[str]:
     for env_var in (
         "LITELLM_LANGFUSE_TRACE_ENVIRONMENT",
@@ -7004,6 +7053,7 @@ def _add_passthrough_trace_context_metadata(
     *,
     session_id: Optional[str],
     trace_environment: Optional[str],
+    repository: Optional[str] = None,
 ) -> dict[str, Any]:
     updated_body = dict(request_body)
     litellm_metadata = dict(updated_body.get("litellm_metadata") or {})
@@ -7023,6 +7073,10 @@ def _add_passthrough_trace_context_metadata(
             litellm_metadata["trace_environment"] = trace_environment
             changed = True
 
+    if repository and not litellm_metadata.get("repository"):
+        litellm_metadata["repository"] = repository
+        changed = True
+
     if not changed:
         return request_body
 
@@ -7036,11 +7090,15 @@ def _prepare_request_body_for_passthrough_observability(
     session_id = _extract_passthrough_session_id(
         request=request, request_body=request_body
     )
+    repository = _extract_passthrough_repository(
+        request=request, request_body=request_body
+    )
     trace_environment = _get_passthrough_trace_environment()
     return _add_passthrough_trace_context_metadata(
         request_body,
         session_id=session_id,
         trace_environment=trace_environment,
+        repository=repository,
     )
 
 

@@ -53,6 +53,8 @@ Current responsibilities:
 - `public.session_history` persistence into the AAWM tristore
 - `public.session_history_tool_activity` classification for delegated agents and
   provider-native tool names
+- repository attribution for native CLI passthrough rows when clients send
+  explicit repository metadata or `x-aawm-repository`
 - background batching for `session_history` writes with configurable batch/flush tuning
 - Gemini/Codex usage breakout normalization for cache, reasoning, and tool-call fields
 
