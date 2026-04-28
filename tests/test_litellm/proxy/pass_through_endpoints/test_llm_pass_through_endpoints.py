@@ -7609,6 +7609,63 @@ async def test_gemini_proxy_route_code_assist_oauth_passthrough_target():
 
 
 @pytest.mark.asyncio
+async def test_openai_passthrough_route_sets_repository_trace_environment_and_session(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = {
+        "session_id": "codex-session-123",
+        "user-agent": "codex-cli/1.0",
+        "x-aawm-repository": "git@github.com:zepfu/litellm.git",
+    }
+    mock_request.query_params = {}
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(
+            return_value={
+                "model": "gpt-5.4",
+                "input": "hello",
+                "reasoning": {"effort": "xhigh"},
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+                "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": "prompt-cache-key-123",
+            }
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=AsyncMock(return_value={"ok": True}),
+    ):
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://api.openai.com",
+            api_key="test_api_key",
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        )
+
+    assert result == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    prepared_body = mock_set_parsed_body.call_args.args[1]
+    litellm_metadata = prepared_body["litellm_metadata"]
+    assert litellm_metadata["session_id"] == "codex-session-123"
+    assert litellm_metadata["trace_environment"] == "dev"
+    assert litellm_metadata["repository"] == "zepfu/litellm"
+    assert litellm_metadata["passthrough_route_family"] == "codex_responses"
+    assert "route:codex_responses" in litellm_metadata["tags"]
+
+
+@pytest.mark.asyncio
 async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch):
     monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
     body = (
@@ -7625,6 +7682,7 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
         "headers": [
             (b"content-type", b"application/json"),
             (b"authorization", b"Bearer ya29.test-oauth-token"),
+            (b"x-aawm-repository", b"https://github.com/zepfu/litellm.git"),
         ],
     }
 
@@ -7654,6 +7712,7 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
     litellm_metadata = prepared_body["litellm_metadata"]
     assert litellm_metadata["session_id"] == "gemini-session-123"
     assert litellm_metadata["trace_environment"] == "dev"
+    assert litellm_metadata["repository"] == "zepfu/litellm"
     assert litellm_metadata["gemini_thinking_config_present"] is True
     assert litellm_metadata["gemini_include_thoughts"] is True
     assert litellm_metadata["gemini_thinking_level"] == "high"

@@ -455,6 +455,40 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
     assert record["session_id"] == "session-from-header"
 
 
+def test_build_session_history_record_uses_repository_header_and_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-repository"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "x-aawm-repository": "https://github.com/zepfu/litellm.git",
+        }
+    }
+
+    result = {
+        "id": "resp-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "zepfu/litellm"
+    assert record["metadata"]["repository"] == "zepfu/litellm"
+
+    payload = _build_session_history_db_payload(record)
+    assert payload[46] == "zepfu/litellm"
+
+
 def test_build_session_history_record_marks_claude_permission_check() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "claude-opus-4-6"

@@ -2,6 +2,24 @@
 
 ## 2026-04-28
 
+- Added durable repository attribution to `public.session_history` for native
+  CLI passthrough runs. The AAWM callback schema now creates and upserts a
+  top-level `repository TEXT` column, mirrors it into row metadata, and extracts
+  it from explicit metadata/body/header sources including `x-aawm-repository`.
+  The OpenAI/Codex and Gemini passthrough request preparation now preserves that
+  repository header in `litellm_metadata`, and the native CLI harness injects
+  the current git repository identity for Codex and Gemini cases. Callback
+  overlay source was synced and `.wheel-build` callback version moved to
+  `0.0.14`. Focused validation passed:
+  `test_aawm_agent_identity.py` plus
+  `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py` (`123 passed`),
+  targeted passthrough repository tests (`4 passed`), JSON validation for
+  `scripts/local-ci/anthropic_adapter_config.json`, live dev
+  `/tmp/litellm-dev-native-codex-repository.json`, and live dev
+  `/tmp/litellm-dev-native-gemini-repository.json`. The direct local DB check
+  confirmed `session_history.repository` exists as `text` and recent
+  `codex_exec` / `gemini-cli` rows store `zepfu/litellm`.
+
 - Audited the AAWM patch/process documentation after the aawm.37 prod cutover.
   Updated the docs to reflect the current carried patch semantics, overlay
   responsibilities, `h-v0.0.21` harness minimum for the `cb-v0.0.12` prod line,

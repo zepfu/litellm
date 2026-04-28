@@ -419,16 +419,48 @@ def _ensure_claude_tenant_header(config: dict[str, Any], tenant_id: str) -> dict
 
 
 def _append_codex_tenant_config_arg(command: list[Any], tenant_id: str) -> list[Any]:
-    tenant_config = f'model_providers.{{codex_profile}}.http_headers.x-aawm-tenant-id="{tenant_id}"'
-    if any(str(item) == tenant_config for item in command):
+    return _append_codex_header_config_arg(
+        command,
+        "x-aawm-tenant-id",
+        tenant_id,
+    )
+
+
+def _append_codex_header_config_arg(
+    command: list[Any],
+    header_name: str,
+    header_value: str,
+) -> list[Any]:
+    header_config = f'model_providers.{{codex_profile}}.http_headers.{header_name}="{header_value}"'
+    if any(str(item) == header_config for item in command):
         return command
     updated = list(command)
     try:
         insert_at = updated.index('--json')
     except ValueError:
         insert_at = max(0, len(updated) - 1)
-    updated[insert_at:insert_at] = ['-c', tenant_config]
+    updated[insert_at:insert_at] = ['-c', header_config]
     return updated
+
+
+def _normalize_harness_repository(value: str) -> str:
+    repository = value.strip()
+    if repository.startswith('git@') and ':' in repository:
+        repository = repository.split(':', 1)[1]
+    elif 'github.com/' in repository:
+        repository = repository.split('github.com/', 1)[1]
+    repository = repository.strip().strip('/')
+    if repository.endswith('.git'):
+        repository = repository[:-4]
+    return repository or ROOT.name
+
+
+def _resolve_harness_repository() -> str:
+    for args in (('remote', 'get-url', 'origin'), ('rev-parse', '--show-toplevel')):
+        value = RA._git_value(*args)
+        if value:
+            return _normalize_harness_repository(value)
+    return ROOT.name
 
 
 def _ensure_http_harness_context(
@@ -503,12 +535,14 @@ def _ensure_cli_harness_context(
     session_id = str(
         updated.get('expected_trace_session_id') or f'{harness_user_id}.session'
     )
+    repository = _resolve_harness_repository()
     codex_profile = 'litellm' if target == 'prod' else 'litellm-dev'
     context = {
         'target': target,
         'case_name': case_name,
         'harness_user_id': harness_user_id,
         'session_id': session_id,
+        'repository': repository,
         'litellm_base_url': profile['litellm_base_url'],
         'anthropic_base_url': profile['anthropic_base_url'],
         'codex_profile': codex_profile,
@@ -521,13 +555,20 @@ def _ensure_cli_harness_context(
         ('langfuse_trace_user_id', harness_user_id),
         ('langfuse_trace_name', case_name),
         ('x-aawm-tenant-id', tenant_id),
+        ('x-aawm-repository', repository),
     ]
     if cli_kind == 'codex':
         controlled_headers.append(('session_id', session_id))
         command = updated.get('command')
         if isinstance(command, list):
+            command = _append_codex_tenant_config_arg(command, tenant_id)
+            command = _append_codex_header_config_arg(
+                command,
+                "x-aawm-repository",
+                repository,
+            )
             updated['command'] = _format_harness_template(
-                _append_codex_tenant_config_arg(command, tenant_id),
+                command,
                 context,
             )
     if cli_kind == 'gemini':
@@ -1063,7 +1104,7 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     require_runtime_identity = checks.get('require_runtime_identity', True) is not False
 
     query = '''
-        select provider, model, session_id, tenant_id,
+        select provider, model, session_id, tenant_id, repository,
                input_tokens, output_tokens, total_tokens,
                cache_read_input_tokens, cache_creation_input_tokens,
                provider_cache_attempted, provider_cache_status,
