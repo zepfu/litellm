@@ -426,6 +426,12 @@ gaps, and session-history gaps remain hard failures.
   default-suite failure. If an OpenRouter focused child proof times out before
   any Langfuse trace exists, classify it as provider/model no-response or
   latency until additional transcript capture proves an adapter bug.
+- In multi-agent fanout, a single OpenRouter Ling empty response can leave the
+  Claude Code child without an assistant message or completion notification even
+  though LiteLLM/session history records a quick zero-token request. When this
+  happens, the parent waits for that child until the command timeout. Future
+  fanout gates should record per-child completion state and hard-fail zero-token
+  successful OpenRouter/Ling responses.
 
 ## Finalization
 
