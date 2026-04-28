@@ -104,11 +104,12 @@ only as needed:
 
 ## Next
 
-- Prep the validated adapter/harness state for the next prod promotion without
-  restarting `aawm-litellm` on `:4000`: commit on `develop`, align release
-  metadata for the next fork tag, inspect/pin the infrastructure image target in
-  `/home/zepfu/projects/aawm-infrastructure`, and defer `docker compose -f
-  docker-compose.litellm.yml up -d litellm` until explicitly approved.
+- Await explicit approval before restarting or replacing prod `aawm-litellm` on
+  `:4000`. The `aawm.37` image and overlay assets are published, and
+  `/home/zepfu/projects/aawm-infrastructure` `develop` is pinned/built locally.
+  The remaining cutover step is intentionally deferred: run
+  `docker compose -f docker-compose.litellm.yml up -d litellm`, then validate
+  readiness, prod harness, and prod logs only after approval.
 
 ## Ongoing
 

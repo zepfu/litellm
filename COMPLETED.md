@@ -2,6 +2,23 @@
 
 ## 2026-04-28
 
+- Prepared the validated adapter/harness state for the next prod cutover without
+  restarting `aawm-litellm`. LiteLLM `develop` and `main` were fast-forwarded to
+  the validated aawm.37 release head, the artifact autobump advanced callback
+  to `cb-v0.0.11`, control-plane to `cp-v0.0.6`, and harness to `h-v0.0.20`,
+  and the missing GitHub Release assets were published for all three overlay
+  tags. The fork image workflow passed for `v1.82.3-aawm.37`, publishing
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.37`. In
+  `/home/zepfu/projects/aawm-infrastructure`, `develop` was updated and pushed
+  at `d727d34` to pin `Dockerfile.litellm` and
+  `docker-compose.litellm.yml` to the aawm.37 image. A local infrastructure
+  build completed without running `up -d`; built image inspection reported
+  `litellm=1.82.3+aawm.37`, `aawm-litellm-callbacks=0.0.11`, and
+  `aawm-litellm-control-plane=0.0.6`. The running prod container remained
+  untouched and was still `aawm-litellm:latest` up for 3 days/healthy during
+  prep. Actual `:4000` restart and prod harness validation are deferred until
+  explicit approval.
+
 - Closed the Gemini 3.1 Pro quota-reset validation loop on dev `:4001`.
   Added the default-excluded
   `claude_adapter_gemini31_pro_child_parallel_read_tools` harness case and
