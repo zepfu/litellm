@@ -5764,15 +5764,6 @@ def _enrich_trace_name_and_provider_metadata(
     metadata = _ensure_mutable_metadata(kwargs)
     session_id = _extract_session_id(kwargs)
 
-    if headers:
-        current = headers.get("langfuse_trace_name")
-        if current == "claude-code":
-            headers["langfuse_trace_name"] = f"claude-code.{agent_name}"
-            verbose_logger.debug(
-                "AawmAgentIdentity: enriched header trace_name to claude-code.%s",
-                agent_name,
-            )
-
     current_trace_name = metadata.get("trace_name")
     if current_trace_name == "claude-code":
         metadata["trace_name"] = f"claude-code.{agent_name}"
@@ -5780,6 +5771,20 @@ def _enrich_trace_name_and_provider_metadata(
         metadata["trace_name"] = agent_name
     child_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
     child_trace_name = _clean_non_empty_string(metadata.get("trace_name"))
+    if headers and child_trace_name and child_trace_name.startswith("claude-code."):
+        current_trace_name_header = _clean_non_empty_string(
+            headers.get("langfuse_trace_name")
+        )
+        if (
+            current_trace_name_header is None
+            or current_trace_name_header == "claude-code"
+            or current_trace_name_header.startswith("claude-code.")
+        ) and current_trace_name_header != child_trace_name:
+            headers["langfuse_trace_name"] = child_trace_name
+            verbose_logger.debug(
+                "AawmAgentIdentity: enriched header trace_name to %s",
+                child_trace_name,
+            )
     if (
         headers
         and child_trace_user_id
