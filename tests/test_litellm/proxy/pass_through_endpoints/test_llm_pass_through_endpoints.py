@@ -26,10 +26,12 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_adapter_request_shape_policy,
     _apply_google_adapter_system_prompt_policy,
     _apply_google_code_assist_native_tool_aliases,
+    _apply_openai_adapter_parallel_instruction_policy,
     _build_anthropic_responses_adapter_request_body,
     _build_completion_adapter_metadata,
     _build_google_code_assist_request_from_completion_kwargs,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
+    _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _get_google_adapter_rate_limit_key,
     _get_google_code_assist_prime_cache_key,
     _get_google_code_assist_prime_ttl_seconds,
@@ -181,6 +183,130 @@ def test_anthropic_completion_adapter_preserves_trace_metadata():
 
 
 class TestResponsesAdapterToolChoice:
+    def test_applies_openai_parallel_instruction_policy_for_multiple_function_tools(
+        self,
+    ):
+        request_body = {
+            "instructions": (
+                "You are Claude Code, Anthropic's official CLI for Claude. "
+                "Return findings directly."
+            ),
+            "parallel_tool_calls": True,
+            "tools": [
+                {"type": "function", "name": "Read", "parameters": {}},
+                {"type": "function", "name": "Glob", "parameters": {}},
+                {"type": "function", "name": "Grep", "parameters": {}},
+                {"type": "web_search_preview"},
+            ],
+            "litellm_metadata": {
+                "tags": ["existing-tag"],
+                "langfuse_spans": [{"name": "existing.span"}],
+            },
+        }
+
+        updated_body, changes = _apply_openai_adapter_parallel_instruction_policy(
+            request_body
+        )
+
+        assert updated_body is not request_body
+        assert updated_body["instructions"].startswith(
+            "You are an OpenAI Responses function-calling agent for Claude Code."
+        )
+        assert (
+            "emit all independent function calls together"
+            in updated_body["instructions"]
+        )
+        assert "You are Claude Code, Anthropic's official CLI" not in updated_body[
+            "instructions"
+        ]
+        assert changes["openai_adapter_parallel_instruction_policy_applied"] is True
+        assert changes["openai_adapter_parallel_instruction_tool_names"] == [
+            "Read",
+            "Glob",
+            "Grep",
+        ]
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert (
+            litellm_metadata["openai_adapter_parallel_instruction_policy_applied"]
+            is True
+        )
+        assert litellm_metadata[
+            "openai_adapter_parallel_instruction_tool_names"
+        ] == ["Read", "Glob", "Grep"]
+        assert "existing-tag" in litellm_metadata["tags"]
+        assert (
+            "openai-adapter-parallel-instruction-policy"
+            in litellm_metadata["tags"]
+        )
+        assert "openai-adapter-parallel-tool:read" in litellm_metadata["tags"]
+        assert "openai-adapter-parallel-tool:glob" in litellm_metadata["tags"]
+        assert "openai-adapter-parallel-tool:grep" in litellm_metadata["tags"]
+        assert any(
+            span["name"] == "openai_adapter.parallel_instruction_policy"
+            for span in litellm_metadata["langfuse_spans"]
+        )
+
+    def test_skips_openai_parallel_instruction_policy_without_parallel_flag(self):
+        request_body = {
+            "instructions": "Preserve these instructions.",
+            "parallel_tool_calls": False,
+            "tools": [
+                {"type": "function", "name": "Read", "parameters": {}},
+                {"type": "function", "name": "Glob", "parameters": {}},
+            ],
+        }
+
+        updated_body, changes = _apply_openai_adapter_parallel_instruction_policy(
+            request_body
+        )
+
+        assert updated_body is request_body
+        assert updated_body["instructions"] == "Preserve these instructions."
+        assert changes == {}
+
+    def test_skips_openai_parallel_instruction_policy_with_single_function_tool(self):
+        request_body = {
+            "instructions": "Preserve these instructions.",
+            "parallel_tool_calls": True,
+            "tools": [
+                {"type": "function", "name": "Read", "parameters": {}},
+                {"type": "web_search_preview"},
+            ],
+        }
+
+        updated_body, changes = _apply_openai_adapter_parallel_instruction_policy(
+            request_body
+        )
+
+        assert updated_body is request_body
+        assert updated_body["instructions"] == "Preserve these instructions."
+        assert changes == {}
+
+    def test_skips_openai_parallel_instruction_policy_when_already_applied(self):
+        request_body = {
+            "instructions": (
+                "You are Claude Code, Anthropic's official CLI for Claude. "
+                "Return findings directly."
+            ),
+            "parallel_tool_calls": True,
+            "tools": [
+                {"type": "function", "name": "Read", "parameters": {}},
+                {"type": "function", "name": "Glob", "parameters": {}},
+            ],
+        }
+        updated_body, changes = _apply_openai_adapter_parallel_instruction_policy(
+            request_body
+        )
+        assert changes["openai_adapter_parallel_instruction_policy_applied"] is True
+
+        second_body, second_changes = _apply_openai_adapter_parallel_instruction_policy(
+            updated_body
+        )
+
+        assert second_body is updated_body
+        assert second_changes == {}
+
     def test_responses_adapter_normalizes_empty_object_tool_schema(self):
         translated_body = _build_anthropic_responses_adapter_request_body(
             {
@@ -9162,6 +9288,144 @@ class TestForwardHeaders:
                 # Note: The current implementation doesn't explicitly pass _forward_headers
                 # This test documents the current behavior. If _forward_headers should be
                 # configurable in llm_passthrough_factory_proxy_route, it would need to be added
+
+
+class TestOpenAIAdapterClaudeContextCompaction:
+    def test_compacts_large_subagent_and_claude_md_context_blocks(self, monkeypatch):
+        monkeypatch.setenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP", "900")
+        user_task = (
+            "Emit exactly one assistant message containing exactly three tool calls."
+        )
+        subagent_context = (
+            "<system-reminder>\n"
+            "SubagentStart hook additional context: You are 'harness-gpt55-parallel-read-tools' "
+            "and you are working on the 'litellm' project.\n"
+            "# TriStore Inject [start:litellm:harness-gpt55-parallel-read-tools]\n"
+            + ("project context line\n" * 500)
+            + "</system-reminder>\n"
+        )
+        claude_md_context = (
+            "<system-reminder>\n"
+            "As you answer the user's questions, you can use the following context:\n"
+            "# claudeMd\n"
+            "Contents of /home/zepfu/projects/litellm/CLAUDE.md:\n"
+            + ("developer instruction line\n" * 1500)
+            + "</system-reminder>\n"
+        )
+        request_body = {
+            "model": "openai/gpt-5.5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": subagent_context},
+                        {"type": "text", "text": claude_md_context},
+                        {"type": "text", "text": user_task},
+                    ],
+                }
+            ],
+        }
+
+        updated_body, compacted_count, markers, metadata_items = (
+            _compact_openai_adapter_claude_context_in_anthropic_request_body(
+                request_body
+            )
+        )
+
+        assert compacted_count == 2
+        assert markers == {"claude-md", "subagentstart", "tristore-inject"}
+        assert len(metadata_items) == 2
+        updated_parts = updated_body["messages"][0]["content"]
+        assert updated_parts[2]["text"] == user_task
+        assert "OpenAI adapter compacted Claude Code context block" in updated_parts[0][
+            "text"
+        ]
+        assert "OpenAI adapter compacted Claude Code context block" in updated_parts[1][
+            "text"
+        ]
+        assert len(updated_parts[0]["text"]) < len(subagent_context)
+        assert len(updated_parts[1]["text"]) < len(claude_md_context)
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert "openai-adapter-claude-context-compacted" in litellm_metadata["tags"]
+        assert (
+            "openai-adapter-claude-context:claude-md"
+            in litellm_metadata["tags"]
+        )
+        assert (
+            litellm_metadata["openai_adapter_claude_context_compacted"]
+            is True
+        )
+        assert (
+            litellm_metadata["openai_adapter_claude_context_compacted_count"]
+            == 2
+        )
+        assert litellm_metadata["openai_adapter_claude_context_saved_chars"] > 0
+        assert any(
+            span["name"] == "openai_adapter.claude_context_compaction"
+            for span in litellm_metadata["langfuse_spans"]
+        )
+
+    def test_preserves_task_trailing_after_context_block(self, monkeypatch):
+        monkeypatch.setenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP", "700")
+        user_task = "Read TODO.md and return the first heading."
+        request_body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "<system-reminder>\n"
+                        "SubagentStart hook additional context: cached context\n"
+                        + ("context\n" * 800)
+                        + "</system-reminder>\n\n"
+                        + user_task
+                    ),
+                }
+            ]
+        }
+
+        updated_body, compacted_count, _markers, _metadata_items = (
+            _compact_openai_adapter_claude_context_in_anthropic_request_body(
+                request_body
+            )
+        )
+
+        assert compacted_count == 1
+        updated_text = updated_body["messages"][0]["content"]
+        assert updated_text.endswith(user_task)
+        assert "OpenAI adapter compacted Claude Code context block" in updated_text
+
+    def test_does_not_compact_small_context_blocks(self, monkeypatch):
+        monkeypatch.setenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP", "2000")
+        request_body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "<system-reminder>\n"
+                                "SubagentStart hook additional context: short\n"
+                                "</system-reminder>\n"
+                            ),
+                        },
+                        {"type": "text", "text": "Return ok."},
+                    ],
+                }
+            ]
+        }
+
+        updated_body, compacted_count, markers, metadata_items = (
+            _compact_openai_adapter_claude_context_in_anthropic_request_body(
+                request_body
+            )
+        )
+
+        assert updated_body == request_body
+        assert compacted_count == 0
+        assert markers == set()
+        assert metadata_items == []
 
 
 class TestGooglePersistedOutputCompaction:

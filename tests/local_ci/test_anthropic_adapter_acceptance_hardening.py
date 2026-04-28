@@ -629,8 +629,43 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
         assert {row["tool_name"] for row in durable_rows} == durable_tool_names
 
         if provider == "openai":
-            assert case_config["request_payload_checks"]["required_equals"][
+            assert "claude-tool-advertisement-compaction" in case_config[
+                "required_trace_tags"
+            ]
+            assert "claude-prompt-patch" in case_config["required_trace_tags"]
+            assert "openai-adapter-claude-context-compacted" in case_config[
+                "required_trace_tags"
+            ]
+            assert "openai-adapter-claude-context:claude-md" in case_config[
+                "required_trace_tags"
+            ]
+            assert "openai-adapter-parallel-instruction-policy" in case_config[
+                "required_trace_tags"
+            ]
+            required_paths = case_config["request_payload_checks"]["required_paths"]
+            for path in (
+                "model",
+                "input",
+                "instructions",
+                "reasoning.effort",
+                "stream",
+                "tools",
+                "litellm_metadata.openai_adapter_claude_context_compacted",
+                "litellm_metadata.openai_adapter_claude_context_compaction_events",
+                "litellm_metadata.openai_adapter_parallel_instruction_policy_applied",
+            ):
+                assert path in required_paths
+            required_equals = case_config["request_payload_checks"][
+                "required_equals"
+            ]
+            assert required_equals[
                 "parallel_tool_calls"
+            ] is True
+            assert required_equals[
+                "litellm_metadata.openai_adapter_claude_context_compacted"
+            ] is True
+            assert required_equals[
+                "litellm_metadata.openai_adapter_parallel_instruction_policy_applied"
             ] is True
 
 
