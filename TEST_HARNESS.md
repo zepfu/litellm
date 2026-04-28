@@ -102,6 +102,14 @@ non-zero estimated usage/cost using the checked-in/bundled model-price JSON
 when LiteLLM's loaded runtime cost map does not yet include the OpenRouter free
 model alias.
 
+OpenRouter/Ling has a separate unresolved failure mode after the aawm.37 prod
+cutover: `inclusionai/ling-2.6-flash:free` can return a successful-but-empty
+Claude Code child result with zero tokens, no assistant message, and no
+completion notification even though LiteLLM records a quick successful request.
+Until the raw response/chunk shape is captured and classified, keep Ling/free
+as warning-only and make future focused Ling harness work hard-fail empty
+successful responses with per-child completion state in the artifact.
+
 OpenRouter GPT-OSS edge cases remain explicit opt-in checks, not default hard
 gates. When selected, `claude_adapter_gpt_oss_120b` has one narrow allowed
 soft-fail: the overlapping runtime logs must contain the OpenRouter adapter
@@ -197,7 +205,9 @@ noisy on some OpenRouter-adapted runs.
 
 Important lane note:
 - `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic ->
-  OpenRouter `Responses` lane with the other `vendor/model:free` adapters
+  OpenRouter `Responses` lane with the other `vendor/model:free` adapters, but
+  successful-empty / zero-token Ling results are unresolved and should not be
+  promoted to hard-gate proof without stricter no-empty-response capture
 - `openrouter/elephant-alpha` remains the special Anthropic -> OpenRouter
   `chat/completions` detour for the legacy agent/model mapping
 
@@ -394,7 +404,10 @@ The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
 
-Current minimum harness bundle version is `h-v0.0.13`; it includes the controlled
-Claude settings overlay, the longer peeromega fanout timeout for prod `:4000`
-validation, and the narrow OpenRouter provider-unavailable timeout /
-command-failure classifier used by the prod promotion suite.
+Current minimum harness bundle version is `h-v0.0.21` for the aawm.37 /
+`cb-v0.0.12` prod validation line. It includes the controlled Claude settings
+overlay, tenant-only trace-user validation, the longer peeromega fanout timeout
+for prod `:4000` validation, the narrow OpenRouter provider-unavailable timeout
+/ command-failure classifier, and the default-suite GPT-OSS exclusions used by
+the prod promotion suite. Older `h-v0.0.13` / `h-v0.0.14` notes are historical
+only.

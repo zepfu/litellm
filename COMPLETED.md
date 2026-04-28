@@ -2,6 +2,14 @@
 
 ## 2026-04-28
 
+- Audited the AAWM patch/process documentation after the aawm.37 prod cutover.
+  Updated the docs to reflect the current carried patch semantics, overlay
+  responsibilities, `h-v0.0.21` harness minimum for the `cb-v0.0.12` prod line,
+  tenant-only Langfuse user ids, stale child trace-name header rewriting, GPT-OSS
+  opt-in status, and the unresolved OpenRouter/Ling successful-empty response
+  lane. This was documentation/process cleanup only; the Ling/OpenRouter deep
+  dive remains queued in [TODO.md](TODO.md).
+
 - Promoted prod `aawm-litellm` on `:4000` to the rebuilt aawm.37 image with
   overlay artifacts `cb-v0.0.12`, `cp-v0.0.6`, and `h-v0.0.21`.
   Readiness passed with `litellm_version=1.82.3+aawm.37` and callbacks including
