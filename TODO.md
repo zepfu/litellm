@@ -3,8 +3,8 @@
 ## Cold Start Orientation
 
 Use this file as the primary restart surface. For a no-context session, first read
-the current `In Progress` and `Next` sections below, then branch into these docs
-only as needed:
+the current `Validated Context` and `Next` sections below, then branch into
+these docs only as needed:
 
 - [COMPLETED.md](COMPLETED.md) - recent completed work, validation results,
   repair stats, and release/session-history context from prior sessions.
@@ -46,7 +46,7 @@ only as needed:
   [COMPLETED.md](COMPLETED.md) for prior failures and [TODO.md](TODO.md) for the
   current planned route.
 
-## In Progress
+## Validated Context
 
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
   Gemini through dev `:4001`. GPT-5.5 passed at
@@ -184,5 +184,11 @@ only as needed:
 - Keep the adapter harness aligned with the real stored session shapes on both `:4001` dev and `:4000` prod targets.
   Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:` via the rewritten request body instead of a brittle exact model reply, `claude_adapter_ctx_marker_escaped` must keep validating `\\:#name.ctx#\\:` literal escaping, dispatched child-agent backtick and bare-acronym lookups should stay aligned with the same `tristore_search_exact` semantics, the CommonMark system-prompt identifier list rewrite should stay aligned with the tenant/agent-scoped raw-content query until the stored procedure lands, the provider-cache canary should keep finding at least one Anthropic `hit` / `write` row in the default suite, Gemini fanout should now deliberately hard-gate child native `run_shell_command` rows rather than relying on plausible final text, and the direct Gemini Read gate is `claude_adapter_gemini31_pro_read_tool_id_sanitizer` rather than the fanout case. The post-tool-result Gemini gate is `claude_adapter_gemini31_pro_bash_then_read_stream_state`; keep it default-excluded but run it explicitly when Claude-dispatched Gemini fails after an initial tool call. Persisted Gemini tool activity uses native `read_file` / `run_shell_command` while Claude Code sees restored `Read` / `Bash`, so validators should match the stored native tool names and require the matching tool-call rows instead of the latest no-tool final row. `--target dev` / `--target prod` should continue enforcing the correct port, Docker container, and Langfuse trace environment. Claude trace-user validation should validate tenant-only Langfuse user ids (`userId=<tenant_id>`) while trace names carry the agent (`claude-code.<agent>`); do not use `project.agent` as the user id. Basic OpenAI smoke cases should validate success, usage, cost, routing, Langfuse, and session-history invariants rather than brittle exact natural-language output. Keep the prod-cutover failure guards active by default: async task exceptions, ASGI exceptions, `KeyError: choices`, stale `Content-Length` / `h11` protocol failures, upstream passthrough 429/5xx traces, and the OpenAI Responses nested-object-schema regression must fail the run instead of surfacing only as downstream session-history gaps; warning-only optional cases must not mask command timeouts or runtime-log hard failures. Before future prod promotions, add a production-style preflight that validates the exact image / installed wheel path on `:4001` plus a small explicit promotion-gate set for opt-in provider lanes, so packaging and adapter metadata gaps are caught before touching `:4000`.
 
-- Keep future harness bundle publishes on version `0.0.14` or newer.
-  The `0.0.14` harness bundle includes the controlled Claude trace `userId` validation, explicit per-run Claude settings overlay, longer peeromega fanout timeout, the narrow OpenRouter provider-unavailable timeout / command-failure classifier, and the default-suite exclusion for GPT-OSS edge cases needed for real prod validation.
+- Keep future harness bundle publishes ahead of `h-v0.0.21` for the current
+  aawm.37 prod-validation line. `h-v0.0.21` is the minimum known-good bundle for
+  the rebuilt `cb-v0.0.12` prod image: it includes controlled Claude trace
+  `userId` validation, explicit per-run Claude settings overlay, longer
+  peeromega fanout timeout, the narrow OpenRouter provider-unavailable timeout /
+  command-failure classifier, the default-suite exclusion for GPT-OSS edge
+  cases, and the focused prod child trace-name coverage used during the latest
+  `:4000` validation.

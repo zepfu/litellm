@@ -46,9 +46,13 @@ Tag line:
 Current responsibilities:
 
 - Claude Code / agent identity extraction
-- Langfuse trace naming and request-tag normalization
+- Langfuse trace naming, tenant-only trace user ids, and request-tag normalization
+- stale Claude Code orchestrator trace-header rewrite for dispatched child
+  traces while preserving unrelated explicit caller trace names
 - Claude/Gemini reasoning and signature enrichment
 - `public.session_history` persistence into the AAWM tristore
+- `public.session_history_tool_activity` classification for delegated agents and
+  provider-native tool names
 - background batching for `session_history` writes with configurable batch/flush tuning
 - Gemini/Codex usage breakout normalization for cache, reasoning, and tool-call fields
 
