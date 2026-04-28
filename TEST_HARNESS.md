@@ -95,6 +95,11 @@ do not hard-gate the exact natural-language result string. They hard-gate comman
 success, usage/cost, routing, request payload logging, Langfuse
 trace/user/session context, runtime logs, and `session_history` invariants.
 
+Native Codex and Gemini CLI passthrough cases inject the current git repository
+identity through `x-aawm-repository` and hard-gate that
+`public.session_history.repository` is populated for the emitted provider
+session.
+
 OpenRouter Responses hard gates must also catch streams that finish without a
 `response.completed` event. The adapter should still emit a valid Anthropic
 `message_delta` / `message_stop`, and passthrough logging should persist

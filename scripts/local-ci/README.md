@@ -115,6 +115,9 @@ the real local provider CLIs (`claude`, `codex`, `gemini`) so they use the same
 authentication state as normal operator traffic. All cases validate Langfuse
 plus `public.session_history` for the actual provider session id emitted or
 derived by that client.
+Codex and Gemini CLI cases also send the current git repository identity via
+`x-aawm-repository` and require `public.session_history.repository` to be
+populated.
 
 ```bash
 python3 run_anthropic_adapter_acceptance.py \
