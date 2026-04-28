@@ -43,6 +43,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         text="",
     )
     chunk_queue: deque = deque()  # Queue for buffering multiple chunks
+    buffered_tool_calls: Dict[int, Dict[str, Any]]
 
     def __init__(
         self,
@@ -54,6 +55,18 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         self.model = model
         # Mapping of truncated tool names to original names (for OpenAI's 64-char limit)
         self.tool_name_mapping = tool_name_mapping or {}
+        self.sent_first_chunk = False
+        self.sent_content_block_start = False
+        self.sent_content_block_finish = False
+        self.current_content_block_type = "text"
+        self.sent_last_message = False
+        self.holding_chunk = None
+        self.holding_stop_reason_chunk = None
+        self.queued_usage_chunk = False
+        self.current_content_block_index = 0
+        self.current_content_block_start = self.TextBlock(type="text", text="")
+        self.chunk_queue = deque()
+        self.buffered_tool_calls = {}
 
     def _create_initial_usage_delta(self) -> UsageDelta:
         """
@@ -104,6 +117,226 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         )
         self.sent_content_block_finish = True
 
+    def _sanitize_tool_use_delta_if_needed(self, processed_chunk: Any) -> Any:
+        if not isinstance(processed_chunk, dict):
+            return processed_chunk
+        if processed_chunk.get("type") != "content_block_delta":
+            return processed_chunk
+        delta = processed_chunk.get("delta")
+        if not isinstance(delta, dict) or delta.get("type") != "input_json_delta":
+            return processed_chunk
+        partial_json = delta.get("partial_json")
+        if not isinstance(partial_json, str):
+            return processed_chunk
+        if not isinstance(self.current_content_block_start, dict):
+            return processed_chunk
+        if self.current_content_block_start.get("type") != "tool_use":
+            return processed_chunk
+        tool_name = self.current_content_block_start.get("name")
+        if not isinstance(tool_name, str):
+            return processed_chunk
+
+        from .transformation import sanitize_anthropic_tool_use_input_json_delta
+
+        sanitized_partial_json = sanitize_anthropic_tool_use_input_json_delta(
+            tool_name=tool_name,
+            partial_json=partial_json,
+        )
+        if sanitized_partial_json == partial_json:
+            return processed_chunk
+        sanitized_delta = dict(delta)
+        sanitized_delta["partial_json"] = sanitized_partial_json
+        sanitized_chunk = dict(processed_chunk)
+        sanitized_chunk["delta"] = sanitized_delta
+        return sanitized_chunk
+
+    def _should_suppress_provider_thinking_blocks(self) -> bool:
+        return "gemini" in self.model.lower()
+
+    def _should_suppress_provider_thinking_delta(self, processed_chunk: Any) -> bool:
+        if not self._should_suppress_provider_thinking_blocks():
+            return False
+        if not isinstance(processed_chunk, dict):
+            return False
+        if processed_chunk.get("type") != "content_block_delta":
+            return False
+        delta = processed_chunk.get("delta")
+        if not isinstance(delta, dict):
+            return False
+        return delta.get("type") in {"thinking_delta", "signature_delta"}
+
+    @staticmethod
+    def _chunk_has_tool_call_delta(chunk: "ModelResponseStream") -> bool:
+        try:
+            tool_calls = chunk.choices[0].delta.tool_calls
+        except (AttributeError, IndexError, TypeError):
+            return False
+        if not tool_calls:
+            return False
+        return any(
+            getattr(tool_call, "function", None) is not None
+            for tool_call in tool_calls
+        )
+
+    def _should_buffer_gemini_tool_calls(self, chunk: "ModelResponseStream") -> bool:
+        return "gemini" in self.model.lower() and (
+            self._chunk_has_tool_call_delta(chunk) or bool(self.buffered_tool_calls)
+        )
+
+    def _buffer_tool_call_delta(self, chunk: "ModelResponseStream") -> None:
+        try:
+            tool_calls = chunk.choices[0].delta.tool_calls or []
+        except (AttributeError, IndexError, TypeError):
+            return
+
+        for ordinal, tool_call in enumerate(tool_calls):
+            function = getattr(tool_call, "function", None)
+            if function is None:
+                continue
+            raw_index = getattr(tool_call, "index", None)
+            index = raw_index if isinstance(raw_index, int) else ordinal
+            buffered = self.buffered_tool_calls.setdefault(
+                index,
+                {
+                    "id": None,
+                    "name": None,
+                    "arguments": "",
+                },
+            )
+            tool_call_id = getattr(tool_call, "id", None)
+            if tool_call_id:
+                buffered["id"] = tool_call_id
+            function_name = getattr(function, "name", None)
+            if function_name:
+                buffered["name"] = function_name
+            arguments = getattr(function, "arguments", None)
+            if isinstance(arguments, str) and arguments:
+                buffered["arguments"] += arguments
+
+    def _queue_buffered_gemini_tool_calls(
+        self, chunk: "ModelResponseStream"
+    ) -> bool:
+        if not self._should_buffer_gemini_tool_calls(chunk):
+            return False
+
+        self._buffer_tool_call_delta(chunk)
+        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+        if finish_reason is None:
+            return True
+        if not self.buffered_tool_calls:
+            return False
+
+        from .transformation import (
+            LiteLLMAnthropicMessagesAdapter,
+            sanitize_anthropic_tool_use_id,
+            sanitize_anthropic_tool_use_input_json_delta,
+        )
+
+        if self.sent_content_block_start and self.sent_content_block_finish is False:
+            self.chunk_queue.append(
+                {
+                    "type": "content_block_stop",
+                    "index": self.current_content_block_index,
+                }
+            )
+
+        for _, tool_call in sorted(self.buffered_tool_calls.items()):
+            tool_name = tool_call.get("name") or ""
+            original_tool_name = self.tool_name_mapping.get(tool_name, tool_name)
+            self._increment_content_block_index()
+            self.current_content_block_type = "tool_use"
+            self.current_content_block_start = {
+                "type": "tool_use",
+                "id": sanitize_anthropic_tool_use_id(tool_call.get("id"))
+                or str(uuid.uuid4()),
+                "name": original_tool_name,
+                "input": {},
+            }
+            self.chunk_queue.append(
+                {
+                    "type": "content_block_start",
+                    "index": self.current_content_block_index,
+                    "content_block": self.current_content_block_start,
+                }
+            )
+            arguments = tool_call.get("arguments")
+            if isinstance(arguments, str) and arguments:
+                self.chunk_queue.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": self.current_content_block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": sanitize_anthropic_tool_use_input_json_delta(
+                                tool_name=original_tool_name,
+                                partial_json=arguments,
+                            ),
+                        },
+                    }
+                )
+            self.chunk_queue.append(
+                {
+                    "type": "content_block_stop",
+                    "index": self.current_content_block_index,
+                }
+            )
+
+        self.buffered_tool_calls.clear()
+        self.sent_content_block_finish = True
+        message_delta = (
+            LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
+                response=chunk,
+                current_content_block_index=self.current_content_block_index,
+            )
+        )
+        self.chunk_queue.append(message_delta)
+        return True
+
+    def _translate_terminal_tool_call_chunk(
+        self,
+        chunk: "ModelResponseStream",
+        current_content_block_index: int,
+    ) -> Any:
+        from .transformation import LiteLLMAnthropicMessagesAdapter
+
+        adapter = LiteLLMAnthropicMessagesAdapter()
+        terminal_message_delta = adapter.translate_streaming_openai_response_to_anthropic(
+            response=chunk,
+            current_content_block_index=current_content_block_index,
+        )
+        if (
+            isinstance(terminal_message_delta, dict)
+            and terminal_message_delta.get("type") == "message_delta"
+        ):
+            self.holding_stop_reason_chunk = terminal_message_delta
+
+        (
+            _type_of_content,
+            content_block_delta,
+        ) = adapter._translate_streaming_openai_chunk_to_anthropic(
+            choices=chunk.choices  # type: ignore[arg-type]
+        )
+        return {
+            "type": "content_block_delta",
+            "index": current_content_block_index,
+            "delta": content_block_delta,
+        }
+
+    def _queue_held_stop_reason_if_needed(self) -> bool:
+        if self.holding_stop_reason_chunk is None:
+            return False
+        if self.sent_content_block_finish is False:
+            self.chunk_queue.append(
+                {
+                    "type": "content_block_stop",
+                    "index": self.current_content_block_index,
+                }
+            )
+            self.sent_content_block_finish = True
+        self.chunk_queue.append(self.holding_stop_reason_chunk)
+        self.holding_stop_reason_chunk = None
+        return True
+
     def __next__(self):
         from .transformation import LiteLLMAnthropicMessagesAdapter
 
@@ -147,14 +380,33 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
+                if self._queue_buffered_gemini_tool_calls(chunk):
+                    if self.chunk_queue:
+                        return self.chunk_queue.popleft()
+                    continue
+
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
                     self._increment_content_block_index()
 
-                processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
-                    response=chunk,
-                    current_content_block_index=self.current_content_block_index,
+                if (
+                    getattr(chunk.choices[0], "finish_reason", None) is not None
+                    and self._chunk_has_tool_call_delta(chunk)
+                ):
+                    processed_chunk = self._translate_terminal_tool_call_chunk(
+                        chunk=chunk,
+                        current_content_block_index=self.current_content_block_index,
+                    )
+                else:
+                    processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
+                        response=chunk,
+                        current_content_block_index=self.current_content_block_index,
+                    )
+                processed_chunk = self._sanitize_tool_use_delta_if_needed(
+                    processed_chunk
                 )
+                if self._should_suppress_provider_thinking_delta(processed_chunk):
+                    continue
 
                 if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and "gemini" in self.model:
                     try:
@@ -196,6 +448,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         and processed_chunk.get("type") == "content_block_delta"
                         and isinstance(processed_chunk.get("delta"), dict)
                         and processed_chunk["delta"].get("type") == "input_json_delta"
+                        and processed_chunk["delta"].get("partial_json")
                     ):
                         self.chunk_queue.append(processed_chunk)
                     self.sent_content_block_finish = False
@@ -229,7 +482,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 self.chunk_queue.append(self.holding_chunk)
                 self.holding_chunk = None
 
-            self._queue_synthetic_end_turn_if_needed()
+            if not self._queue_held_stop_reason_if_needed():
+                self._queue_synthetic_end_turn_if_needed()
 
             if not self.sent_last_message:
                 self.sent_last_message = True
@@ -295,15 +549,34 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
+                if self._queue_buffered_gemini_tool_calls(chunk):
+                    if self.chunk_queue:
+                        return self.chunk_queue.popleft()
+                    continue
+
                 # Check if we need to start a new content block
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
                     self._increment_content_block_index()
 
-                processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
-                    response=chunk,
-                    current_content_block_index=self.current_content_block_index,
+                if (
+                    getattr(chunk.choices[0], "finish_reason", None) is not None
+                    and self._chunk_has_tool_call_delta(chunk)
+                ):
+                    processed_chunk = self._translate_terminal_tool_call_chunk(
+                        chunk=chunk,
+                        current_content_block_index=self.current_content_block_index,
+                    )
+                else:
+                    processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
+                        response=chunk,
+                        current_content_block_index=self.current_content_block_index,
+                    )
+                processed_chunk = self._sanitize_tool_use_delta_if_needed(
+                    processed_chunk
                 )
+                if self._should_suppress_provider_thinking_delta(processed_chunk):
+                    continue
 
                 if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and "gemini" in self.model:
                     try:
@@ -326,6 +599,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if (
                     self.holding_stop_reason_chunk is not None
                     and getattr(chunk, "usage", None) is not None
+                    and not self._chunk_has_tool_call_delta(chunk)
                 ):
                     # Merge usage into the held stop_reason chunk
                     merged_chunk = self.holding_stop_reason_chunk.copy()
@@ -403,6 +677,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             and processed_chunk.get("type") == "content_block_delta"
                             and isinstance(processed_chunk.get("delta"), dict)
                             and processed_chunk["delta"].get("type") == "input_json_delta"
+                            and processed_chunk["delta"].get("partial_json")
                         ):
                             self.chunk_queue.append(processed_chunk)
 
@@ -445,15 +720,12 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
             # Handle any remaining held chunks after stream ends
             if not self.queued_usage_chunk:
-                if self.holding_stop_reason_chunk is not None:
-                    self.chunk_queue.append(self.holding_stop_reason_chunk)
-                    self.holding_stop_reason_chunk = None
-
                 if self.holding_chunk is not None:
                     self.chunk_queue.append(self.holding_chunk)
                     self.holding_chunk = None
 
-                self._queue_synthetic_end_turn_if_needed()
+                if not self._queue_held_stop_reason_if_needed():
+                    self._queue_synthetic_end_turn_if_needed()
 
             if not self.sent_last_message:
                 self.sent_last_message = True
@@ -470,8 +742,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             if self.chunk_queue:
                 return self.chunk_queue.popleft()
             # Handle any held stop_reason chunk
-            if self.holding_stop_reason_chunk is not None:
-                return self.holding_stop_reason_chunk
+            if self._queue_held_stop_reason_if_needed() and self.chunk_queue:
+                return self.chunk_queue.popleft()
             if not self.sent_last_message:
                 self.sent_last_message = True
                 return {"type": "message_stop"}
@@ -524,7 +796,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
         # Example logic - customize based on your needs:
         # If chunk indicates a tool call
-        if chunk.choices[0].finish_reason is not None:
+        if (
+            chunk.choices[0].finish_reason is not None
+            and not self._chunk_has_tool_call_delta(chunk)
+        ):
             return False
 
         (
@@ -533,6 +808,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         ) = LiteLLMAnthropicMessagesAdapter()._translate_streaming_openai_chunk_to_anthropic_content_block(
             choices=chunk.choices  # type: ignore
         )
+        if block_type == "thinking" and self._should_suppress_provider_thinking_blocks():
+            return False
 
         # Restore original tool name if it was truncated for OpenAI's 64-char limit
         if block_type == "tool_use":

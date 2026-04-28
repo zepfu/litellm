@@ -9,7 +9,13 @@ sys.path.insert(0, os.path.abspath("../../../../.."))
 from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
     AnthropicStreamWrapper,
 )
-from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+from litellm.types.utils import (
+    ChatCompletionDeltaToolCall,
+    Delta,
+    Function,
+    ModelResponseStream,
+    StreamingChoices,
+)
 
 
 # Create a simple test
@@ -189,6 +195,299 @@ def test_sync_wrapper_synthesizes_end_turn_when_stream_ends_without_terminal_chu
 
     message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "end_turn"
+
+
+def test_sync_wrapper_omits_empty_read_pages_argument_in_complete_json_delta():
+    class MockCompletionStreamWithReadTool:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                tool_calls=[
+                                    ChatCompletionDeltaToolCall(
+                                        id="call_read",
+                                        function=Function(
+                                            name="read_file",
+                                            arguments='{"file_path": "/tmp/example.py", "pages": ""}',
+                                        ),
+                                        type="function",
+                                        index=0,
+                                    )
+                                ]
+                            ),
+                            index=0,
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= len(self.responses):
+                raise StopIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStreamWithReadTool(),
+        model="gpt-5.5",
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    chunks = list(wrapper)
+    tool_start = next(
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_start"
+        and chunk["content_block"]["type"] == "tool_use"
+    )
+    tool_delta = next(
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "input_json_delta"
+    )
+
+    assert tool_start["content_block"]["name"] == "Read"
+    assert tool_delta["delta"]["partial_json"] == '{"file_path":"/tmp/example.py"}'
+
+
+def test_sync_wrapper_keeps_queued_chunks_instance_scoped():
+    class MockCompletionStreamWithReadTool:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                tool_calls=[
+                                    ChatCompletionDeltaToolCall(
+                                        id="call_read",
+                                        function=Function(
+                                            name="read_file",
+                                            arguments='{"file_path": "/tmp/example.py"}',
+                                        ),
+                                        type="function",
+                                        index=0,
+                                    )
+                                ]
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                )
+            ]
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= len(self.responses):
+                raise StopIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    first_wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStreamWithReadTool(),
+        model="gemini-3.1-pro-preview",
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    assert next(first_wrapper)["type"] == "message_start"
+    assert next(first_wrapper)["type"] == "content_block_start"
+    assert next(first_wrapper)["type"] == "content_block_stop"
+
+    second_wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStream(), model="claude-3"
+    )
+
+    assert next(second_wrapper)["type"] == "message_start"
+
+
+def test_sync_wrapper_preserves_read_tool_after_thinking_block():
+    class MockCompletionStreamWithThinkingThenRead:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                reasoning_content="I need to read the plan.",
+                                thinking_blocks=[
+                                    {
+                                        "type": "thinking",
+                                        "thinking": "I need to read the plan.",
+                                        "signature": None,
+                                    }
+                                ],
+                                content="",
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                tool_calls=[
+                                    ChatCompletionDeltaToolCall(
+                                        id="call_read__thought__sig_123",
+                                        function=Function(
+                                            name="read_file",
+                                            arguments='{"file_path": "/tmp/plan.md"}',
+                                        ),
+                                        type="function",
+                                        index=0,
+                                    )
+                                ]
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content=""),
+                            index=0,
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= len(self.responses):
+                raise StopIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStreamWithThinkingThenRead(),
+        model="gemini-3.1-pro-preview",
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    chunks = list(wrapper)
+    tool_start = next(
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_start"
+        and chunk["content_block"]["type"] == "tool_use"
+    )
+    tool_delta = next(
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "input_json_delta"
+    )
+    thinking_deltas = [
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] in {"thinking_delta", "signature_delta"}
+    ]
+
+    assert tool_start["content_block"]["id"] == "call_read"
+    assert tool_start["content_block"]["name"] == "Read"
+    assert tool_delta["delta"]["partial_json"] == '{"file_path": "/tmp/plan.md"}'
+    assert thinking_deltas == []
+
+
+def test_sync_wrapper_preserves_terminal_tool_call_after_text_delta():
+    class MockCompletionStreamWithTextThenTerminalTool:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                content="I will check the current working directory.\n"
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                tool_calls=[
+                                    ChatCompletionDeltaToolCall(
+                                        id="call_bash__thought__sig_123",
+                                        function=Function(
+                                            name="run_shell_command",
+                                            arguments='{"command": "pwd"}',
+                                        ),
+                                        type="function",
+                                        index=0,
+                                    )
+                                ]
+                            ),
+                            index=0,
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= len(self.responses):
+                raise StopIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStreamWithTextThenTerminalTool(),
+        model="gemini-3.1-pro-preview",
+        tool_name_mapping={"run_shell_command": "Bash"},
+    )
+
+    chunks = list(wrapper)
+    tool_start = next(
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_start"
+        and chunk["content_block"]["type"] == "tool_use"
+    )
+    tool_delta = next(
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "input_json_delta"
+    )
+    message_delta = next(
+        chunk for chunk in chunks if chunk["type"] == "message_delta"
+    )
+
+    assert tool_start["content_block"]["id"] == "call_bash"
+    assert tool_start["content_block"]["name"] == "Bash"
+    assert tool_delta["delta"]["partial_json"] == '{"command": "pwd"}'
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
 
 
 @pytest.mark.asyncio

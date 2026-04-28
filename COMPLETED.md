@@ -1,5 +1,545 @@
 # Completed
 
+## 2026-04-28
+
+- Added the first half of the expanded Claude-dispatch base-tool harness:
+  default-excluded sequential child-agent cases for GPT-5.5 and Gemini 3.1 Pro,
+  plus transcript-level validation of Claude Code child `.jsonl` files. The new
+  `transcript_tool_use_validation` block locates subagent transcripts by the
+  command `session_id`, filters by child agent type, counts
+  `message.content[].type == "tool_use"` by tool name and assistant
+  `message.id`, and can require sequential proof with
+  `maximum_tool_uses_per_assistant_message=1`. The live cases are intentionally
+  not parallel tests yet; they require sequential `Read`, `Write`, `Edit`,
+  `Glob`, `Grep`, `Bash`, `WebSearch`, and `WebFetch` first.
+
+- Unblocked the planned Gemini sequential web-tool proof by broadening the
+  Google Code Assist follow-up tool allowlist from the six file/shell tools to
+  the full base set, adding `WebSearch` and `WebFetch` plus their native aliases
+  (`google_web_search`, `web_fetch`). `WebFetch` and Gemini `replace` are now
+  classified correctly in `session_history_tool_activity` as read and modify
+  activity respectively, with the callback overlay source kept in parity.
+  Focused checks passed:
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`31 passed`),
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k "trims_followup_google_tools_to_core_set" -q`
+  (`2 passed`), and
+  `./.venv/bin/python -m json.tool scripts/local-ci/anthropic_adapter_config.json`.
+
+- Ran the first live GPT-5.5 sequential base-tool proof on `:4001` and captured
+  the exact remaining blockers in
+  `/tmp/claude_adapter_gpt55_child_sequential_core_tools.json`. The child did
+  complete with `GPT55 SEQUENTIAL TOOLS PASSED` and durable tool activity
+  included every required base tool, but the harness failed because
+  `session_history_validation` incorrectly required file read/write counters on
+  a single multi-turn response row and because `WebSearch` retried after
+  Claude Code emitted `allowed_domains: []` / `blocked_domains: []`, which
+  Anthropic rejects as ambiguous. The sequential cases now rely on
+  `tool_activity_validation` for per-tool proof, and the Anthropic request
+  preparation path sanitizes empty web-search domain lists to `null` while
+  tagging the request with
+  `claude-web-search-domain-filter-sanitized`.
+
+- Reran the GPT-5.5 sequential proof after deploying the web-search sanitizer.
+  Artifact
+  `/tmp/claude_adapter_gpt55_child_sequential_core_tools_rerun.json` confirmed
+  `WebSearch` ran once and the request carried
+  `claude-web-search-domain-filter-sanitized`; there were no new web-search
+  empty-domain 400s. The run still failed correctly because the reused
+  `/tmp/gpt55-sequential-tool-probe.txt` already existed, so Claude Code's
+  `Write` tool returned `File has not been read yet` and GPT had to issue an
+  extra `Read` plus retry `Write`. The transcript also showed `WebFetch` hit a
+  403 on the OpenAI docs URL. The harness/config now uses per-run unique temp
+  probe paths and can reject transcript `tool_result` errors, with the
+  sequential probes switched to `https://example.com/` for a stable fetch target.
+
+- Passed the GPT-5.5 sequential base-tool proof on dev `:4001` with the unique
+  temp path and stricter transcript checks. Artifact:
+  `/tmp/claude_adapter_gpt55_child_sequential_core_tools_unique.json`. The
+  transcript shows exactly one each of `Read`, `Write`, `Edit`, `Glob`, `Grep`,
+  `Bash`, `WebSearch`, and `WebFetch`, with
+  `max_tool_uses_in_single_assistant_message=1` and no `tool_result` errors.
+  Langfuse/session validation passed, durable tool activity included all base
+  tools, and the sanitizer tag
+  `claude-web-search-domain-filter-sanitized` was present.
+
+- Ran the Gemini 3.1 Pro sequential base-tool proof after GPT passed. Artifact:
+  `/tmp/claude_adapter_gemini31_pro_child_sequential_core_tools_unique.json`.
+  The child never reached tool execution: Claude Code returned a 429
+  `RESOURCE_EXHAUSTED` / `QUOTA_EXHAUSTED` from Google Code Assist for
+  `gemini-3.1-pro-preview`, with reset text around
+  `2026-04-28T13:08:24Z`; the transcript for
+  `gemini-3-1-pro-preview` had zero `tool_use` blocks. Added a separate
+  default-excluded `claude_adapter_gemini3_flash_child_sequential_core_tools`
+  case so the Gemini adapter/base-tool path can still be proven on an available
+  Gemini model without marking the Pro quota failure as a tool-path result.
+
+- Ran the Gemini 3 Flash sequential base-tool proof twice and classified the
+  remaining failure as post-tool-result malformed tool syntax, not a missing
+  harness gate. The first Flash run exercised all eight base tools and had no
+  transcript tool-result errors, but failed strict prompt/final-output checks:
+  it searched LiteLLM/Gemini docs instead of the required `IANA example domain`
+  query and returned a verbose final answer. The stricter rerun failed after one
+  valid Claude-visible `Read`; the child then emitted plain text
+  `Calling tool Write. Carvercall:default_api:write_file{...` with
+  `stop_reason=end_turn` instead of a second `tool_use`. Artifact:
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_strict.json`;
+  transcript:
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/bafed1b3-89cf-42e1-a46c-879929986ab4/subagents/agent-ad7916f2f4f6fbfd6.jsonl`.
+  Do not rerun the same Flash proof unchanged; next work is to isolate whether
+  the bad `Carvercall` text comes from model behavior, the Gemini adapter
+  response conversion, or Claude Code's streamed tool-call parsing after a tool
+  result.
+
+- Identified and patched the Claude-dispatched Gemini parallel tool-call stream
+  collapse. Live evidence: aawm-tap Langfuse trace
+  `d0275abf-2e5f-4964-b875-74159927acb1` recorded a single Gemini upstream
+  generation with five native tool calls (`read_file` x4 plus
+  `run_shell_command`), but Claude Code transcript
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-aawm-tap/b0428c41-09d8-40ec-b2b5-4d87ffdb40dd/subagents/agent-ab792fb928eb0da98.jsonl`
+  only received one `Read` block for that same assistant turn and then logged
+  `API Error: Content block not found`. The Anthropic streaming wrapper now
+  buffers Gemini streaming tool-call deltas until the terminal tool-call chunk
+  and emits one Claude-visible `tool_use` block per Gemini tool call, preserving
+  ids, mapped tool names, and JSON arguments. Focused validation passed with
+  `./.venv/bin/python -m pytest tests/test_litellm/llms/anthropic/experimental_pass_through/messages/test_parallel_tool_calls.py -q`
+  (`5 passed` after adding both pre-terminal and terminal parallel-call
+  regression shapes).
+
+- Broadened validation for the Gemini stream patch and deployed it to dev.
+  Focused test runs passed:
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/adapters/test_anthropic_experimental_pass_through_adapters_transformation.py`
+  (`63 passed`), and
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/messages/test_parallel_tool_calls.py`
+  plus
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/messages/test_sse_wrapper.py`
+  plus
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/messages/test_content_after_stop_reason.py`
+  (`19 passed`). Restarted `litellm-dev`; `curl -sS http://127.0.0.1:4001/health`
+  returned `healthy_count=3` and `unhealthy_count=0`.
+
+- Classified the later Gemini v11 continuation failure as a separate upstream
+  Google Code Assist capacity/quota error, not the same adapter stream bug. The
+  same child agent `ab792fb928eb0da98` later returned
+  `RESOURCE_EXHAUSTED` / `QUOTA_EXHAUSTED` from
+  `cloudcode-pa.googleapis.com` with reset timestamp
+  `2026-04-28T13:08:24Z`. The user may still see remaining Gemini UI usage
+  because this error is from the Cloud Code / Code Assist quota bucket used by
+  the Claude-dispatch adapter path.
+
+- Fixed the live GPT-5.5 Claude-dispatch report-file refusal. Smoking gun:
+  aawm-tap trace `0f1f34a2-c892-4a2f-87ef-e8dd4687bbcf` put the old Claude
+  Code no-write instruction in a plain string `instructions` field, but the
+  runtime control-plane patcher only rewrote `{"type":"text","text":...}`
+  blocks. `aawm_claude_control_plane.py` now applies manifest patches to plain
+  strings too and adds a pattern fallback for the rendered `Write` form and the
+  `${...}` template form of the report-file instruction. Focused tests passed:
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k "claude_prompt_patches or report_file_instruction" -q`
+  (`3 passed`) and
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`28 passed`).
+
+- Added and passed a focused live dev harness gate for the exact failure mode:
+  `claude_adapter_gpt55_child_analysis_write_probe`, default-excluded, validates
+  real Claude Code dispatch through `:4001` to GPT-5.5, the patched request text,
+  absence of the old no-write sentence, tenant trace ids, session-history, and
+  child `Bash` plus `Write` tool activity. Live artifact:
+  `/tmp/claude_adapter_gpt55_child_analysis_write_probe_rerun.json`. The run
+  passed with no failures/warnings; `session_id=9483c5ae-c37c-412f-a076-ebfbbdbf6ec5`,
+  `file_modified_count=1`, GPT-5.5 `tool_name=Write`, and
+  `/tmp/gpt55-analysis-write-probe.md` contained
+  `write probe passed: 2026-04-28T03:55:21.606747634Z`.
+
+- Fixed a harness lookup bug exposed by the write probe. Name-based trace
+  lookup was not constrained by the harness user when
+  `expected_trace_user_ids_by_name` was configured, so overlapping historical
+  `claude-code.*` traces from another session could produce false
+  `sessionId mismatch` failures. The harness now resolves a lookup user from
+  `expected_user_ids` or a single common per-trace expected user id before
+  polling by trace name, with regression tests covering both paths and the
+  mixed-user no-guess path.
+
+- Removed a false failure source from the sequential tool harness by filtering
+  Anthropic `/anthropic/v1/messages/count_tokens` observations out of
+  completion-generation and session-history route checks. This prevented
+  count-token traces with null model/cost from being mistaken for the child
+  model completion in live sequential runs.
+
+- Classified the latest Gemini 3 Flash sequential rerun after the synthetic
+  `Calling tool ...` context fix and neutral fixture change. The old live
+  `Carvercall` malformed text did not recur, and the child reached the first
+  four tools correctly, but the normal global `gemini-3-flash-preview` agent
+  still drifted: invalid `Grep(file_path=...)`, retry `Grep`, extra
+  `Read`/`Bash`/`Edit`, and no `WebSearch`/`WebFetch`. Artifact:
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_neutral_fixture.json`.
+  Next validation should use a case-local harness agent with only the eight
+  base tools rather than the normal coding/investigation agent.
+
+- Converted the sequential base-tool cases to case-local harness agents and
+  caught a Claude Code flag trap before continuing. A live Gemini 3 Flash run
+  with `--tools Agent` dispatched the custom child but gave it no base tool
+  declarations; the child returned a Python snippet and the request metadata
+  showed `usage_tool_call_count=0`. Trace
+  `7c0f2ff0-8c6b-420d-91aa-019416f9f522`, artifact
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_harness_agent.json`,
+  transcript
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/3abda483-a70c-4b46-a8bd-3d49ac83710c/subagents/agent-a4e1afdbf072999e5.jsonl`.
+  The harness now uses `--allowedTools Agent` for the parent, preserving the
+  built-in tool registry for the child while still forcing parent dispatch.
+  Focused validation passed:
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`39 passed`).
+
+- Reran the Gemini 3 Flash sequential base-tool proof with the corrected
+  parent flag, `--allowedTools Agent`. This restored child tool availability:
+  the custom harness agent executed the first six tools in exact order
+  (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`) with no zero-tool registry
+  failure. The run still failed, now at the real remaining boundary: after the
+  `Bash` date command, Gemini produced final text instead of continuing to
+  `WebSearch` and `WebFetch`. Artifact:
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_allowed_tools_agent.json`;
+  transcript:
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/4f7ee447-3c96-4b44-b71f-b3cfe212f5e5/subagents/agent-aca1b5abcf7e0f51c.jsonl`.
+
+- Tried parent and child prompt hardening for the Gemini 3 Flash post-Bash
+  stop and classified it as a dead end. Focused config validation still passed
+  (`39 passed`), but the live rerun again stopped after `Read`, `Write`,
+  `Edit`, `Glob`, `Grep`, and `Bash`; the child returned only the Bash
+  timestamp. Artifact:
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_after_web_guardrail.json`;
+  transcript:
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/8e120b2a-6910-4b6a-9fd9-b5199027369e/subagents/agent-a25c33e8f798ab2ee.jsonl`.
+  Trace inspection showed `google_web_search` and `web_fetch` were declared in
+  the post-Bash request, so this was not tool availability or schema loss. The
+  request text had lost the original numbered task because the Google
+  completion-message window kept only the recent tail; fallback text context
+  carried only the latest `Grep` and `Bash` tool results.
+
+- Classified the first Gemini 3 Flash live rerun after adding preserved active
+  task state. The child again executed `Read`, `Write`, `Edit`, `Glob`, `Grep`,
+  and `Bash` in order, but the post-Bash request failed with a proxy 500 before
+  `WebSearch`. Artifact:
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_after_task_state_retention.json`;
+  transcript:
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/cb4e5338-f3f5-4af4-bc58-c569c7e0ab90/subagents/agent-a394ea6c1467d0f19.jsonl`.
+  The LiteLLM stack trace was
+  `Missing corresponding tool call for tool response message`: inserting the
+  preserved task reminder reduced the retained tail to `max_window - 1`, and
+  that tail began with a `tool` result whose matching assistant `tool_calls`
+  message had been trimmed away.
+
+- Patched the Google completion-message window retention logic to preserve a
+  valid assistant/tool-result pair boundary while still keeping the active task
+  reminder. Added regression coverage for the orphan-tool-result shape and
+  reran the focused pass-through tests:
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k "completion_message_window or preserves_task_state or orphan_tool_result or fallback_text_context or fallback_excludes_synthetic" -q`
+  (`4 passed`).
+
+- Passed the Gemini 3 Flash sequential base-tool proof on dev `:4001` after
+  deploying the valid tool-pair boundary fix. Artifact:
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_after_tool_pair_boundary.json`;
+  transcript:
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/6a386d08-8a2a-4dd6-abe9-27b84ee95d3e/subagents/agent-a79dba772e8299f95.jsonl`.
+  The child emitted exactly eight Claude-visible tool calls, one per assistant
+  message: `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`, `WebSearch`, and
+  `WebFetch`. The post-Bash turn correctly called `WebSearch` with
+  `IANA example domain`, `WebFetch` fetched `https://example.com/`, the final
+  result was `GEMINI3 FLASH SEQUENTIAL TOOLS PASSED`, transcript validation
+  showed `max_tool_uses_in_single_assistant_message=1` and no tool-result
+  errors, Langfuse user ids were tenant-only (`adapter-harness-tenant`), durable
+  tool activity included the required tools, and runtime logs had no forbidden
+  substrings.
+
+- Added the first parallel read-tool harness gates for Claude-dispatched
+  OpenAI/GPT and Gemini children. The default-excluded cases require `Read`,
+  `Glob`, and `Grep` to appear in one Claude-visible assistant message, enforce
+  exactly three child tool uses, and require matching durable
+  `session_history_tool_activity` rows. Harness config validation passed in
+  `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py`, including the
+  new `minimum_tools_in_single_assistant_message` transcript validator shape.
+
+- Ran the initial live parallel read-tool proofs on dev `:4001`. Gemini 3 Flash
+  passed after loosening the parent command JSON check to `required_contains`
+  for the final line. Artifact:
+  `/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`;
+  transcript:
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/951409fd-1786-476b-94e4-ab0db4af5e61/subagents/agent-a853e8ba3c302886b.jsonl`.
+  The child emitted `Read`, `Glob`, and `Grep` under one assistant
+  `message.id` and the run passed with zero failures/warnings. GPT-5.5 failed
+  the same proof at
+  `/tmp/claude_adapter_gpt55_child_parallel_read_tools.json`: it emitted
+  `Read`, waited for the result, then `Glob`, waited, then `Grep`, so transcript
+  validation failed with `max=1` tool_use block in a single assistant message.
+  Treat this as an active OpenAI/Responses parallel-tool request translation gap,
+  not a missing Gemini stream fix.
+
+- Patched the Anthropic-to-OpenAI Responses adapter to send
+  `parallel_tool_calls=true` when translated requests contain only function
+  tools and Anthropic did not set `disable_parallel_tool_use`. It still sends
+  `false` when Anthropic explicitly disables parallel use and leaves the field
+  unset for built-in or mixed Responses tools. Focused tests passed:
+  `./.venv/bin/python -m pytest tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_responses_adapters_transformation.py::TestTranslateParallelToolCallsToResponsesAPI tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_responses_adapters_transformation.py::TestTranslateRequestBroaderCoverage::test_disable_parallel_tool_use_sets_parallel_tool_calls_false tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_responses_adapters_transformation.py::TestTranslateRequestBroaderCoverage::test_function_tools_set_parallel_tool_calls_true_without_tool_choice tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_responses_adapters_transformation.py::TestTranslateRequestBroaderCoverage::test_function_tools_set_parallel_tool_calls_true_with_auto_tool_choice tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_responses_adapters_transformation.py::TestTranslateRequestBroaderCoverage::test_disable_parallel_tool_use_not_set_for_built_in_tools tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_responses_adapters_transformation.py::TestTranslateRequestBroaderCoverage::test_no_optional_fields_does_not_add_spurious_keys -q`
+  (`11 passed`). The broader transformation-file run was stopped after hanging
+  before the relevant assertions.
+
+- Reran the GPT-5.5 parallel read-tool proof after restarting `litellm-dev`.
+  Artifact:
+  `/tmp/claude_adapter_gpt55_child_parallel_read_tools_rerun.json`; transcript:
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/7a30aa90-9f0a-4aa0-bc7d-e0a9256e1b0b/subagents/agent-a6504af3f9f1ef52f.jsonl`.
+  Langfuse confirmed the OpenAI Responses payload now included
+  `parallel_tool_calls=true` with `Read`, `Glob`, and `Grep` function tools, and
+  the harness now hard-gates that request field. GPT-5.5 still serialized the
+  tool calls into three assistant messages (`max_tool_uses_in_single_assistant_message=1`),
+  so the remaining GPT gap is no longer the missing request flag.
+
+- Narrowed the remaining GPT-5.5 parallel gap with direct Responses probes
+  through `:4001`. A simple direct GPT-5.5 Responses call with
+  `parallel_tool_calls=true` emitted three function calls in one response. A
+  direct call using the exact logged `Read`/`Glob`/`Grep` schemas plus the exact
+  child task also emitted all three function calls, even with the Claude Code
+  `instructions` string included. Reusing the full logged Claude Code input
+  shape, which had three user content blocks (about 8 KB subagent context,
+  36 KB project/Claude context, then the 858 byte task), made GPT-5.5 emit only
+  `Read`. Replacing that real context with dummy context of similar size still
+  parallelized. Current classification: GPT-5.5 can parallelize via the
+  Responses backend; the remaining issue is semantic interference from the real
+  injected Claude Code context for adapted OpenAI subagents.
+
+## 2026-04-27
+
+- Closed the latest `aawm-tap` Claude-dispatched Gemini/GPT-5.5 investigation
+  with concrete trace evidence. Gemini 3.1 Pro did not fail in the latest v10
+  review; it wrote
+  `/home/zepfu/projects/aawm-tap/.analysis/plan-phase01-remediation-v10-cc-gemini3.1pro.md`
+  at `2026-04-28T01:58:56Z` after a long model turn before the `Write` call.
+  GPT-5.5 did batch multiple `Read` calls, so its slow review was not caused by
+  Claude Code forcing all tools to run serially; the long spans were large model
+  synthesis turns through the Claude Code Anthropic-compatible child-agent path.
+  Native Codex CLI and Gemini CLI speed remains separate evidence: we have not
+  built Codex-CLI/Gemini-CLI translation between those CLIs, and the problematic
+  path was specifically Claude Code dispatch through LiteLLM's Anthropic
+  adapter.
+  A transcript sweep for session `b0428c41-09d8-40ec-b2b5-4d87ffdb40dd`
+  found no latest-subagent interrupt marker. Gemini had a recoverable
+  `Content block not found` API marker but still completed and wrote the file;
+  do not treat that marker as the failure root cause unless it recurs with an
+  actual missing final/write.
+
+- Fixed the dev-runtime cause of GPT-5.5 still seeing the old Claude Code
+  report-file block. The running `litellm-dev` container's
+  `/app/context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json`
+  was stale and lacked `subagent-report-file-explicit-request`, even though the
+  repo file had it. `docker-compose.dev.yml` now bind-mounts
+  `./context-replacement` into `/app/context-replacement`, and the container was
+  recreated so the prompt-patch cache was cleared. Direct container validation
+  confirmed the exact old no-report-files sentence rewrites to the explicit
+  request form and records `subagent-report-file-explicit-request`.
+
+- Strengthened the live GPT-5.5 child Bash harness gate to validate the prompt
+  patch as part of the same real Claude dispatch. The initial live run proved
+  the product path was fixed but exposed a harness filter gap: the OpenAI child
+  trace had route tags and `passthrough_route_family` but no
+  `user_api_key_request_route`, so generation filtering dropped the child before
+  trace-tag/request-text checks. The harness now accepts route-family tags for
+  allowed-route matching, with a regression test covering this shape. Focused
+  validation passed with
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`25 passed`) and
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k "claude_prompt_patches" -q`
+  (`2 passed`). Live dev validation passed at
+  `/tmp/claude_adapter_gpt55_child_bash_prompt_patch_rerun.json`: `claude-code.gpt-5-5`
+  has `userId=adapter-harness-tenant`, OpenAI/GPT-5.5 route tags, the
+  `claude-prompt-patch:subagent-report-file-explicit-request` tag, and exactly
+  one persisted `Bash` row for `date -u +%Y-%m-%dT%H:%M:%S.%NZ`.
+
+- Corrected the temporary `project.agent` trace-user interpretation. The
+  actual convention is `trace.name=claude-code.<agent>` and Langfuse
+  `userId=<tenant_id>` only; `aawm_claude_project` remains separate project
+  context and must not be folded into the Langfuse user id. The metadata helper
+  now sets `trace_user_id` from the explicit tenant identity, and the AAWM
+  logging hook rewrites `langfuse_trace_user_id` to that tenant value for child
+  traces so Langfuse headers cannot override it back to a synthetic harness
+  user. Live dev `claude_adapter_gemini_fanout` passed at
+  `/tmp/claude_adapter_gemini_fanout_after_tenant_userid_fix.json` for session
+  `78f60054-fef4-4764-8614-000966d91cc6`; direct Langfuse verification showed
+  `claude-code.orchestrator` and all three `claude-code.gemini-*` traces with
+  `userId=adapter-harness-tenant`.
+
+- Verified the same tenant-only trace-user behavior for OpenAI models. The
+  direct GPT-5.5 harness case now expects tenant-only user ids and passed at
+  `/tmp/claude_adapter_gpt55_after_tenant_userid_harness_fix.json`; direct
+  Langfuse verification for session `bf0c814c-8521-487c-b0cc-fe676416a9b2`
+  showed `claude-code.orchestrator` with `userId=adapter-harness-tenant`. Added
+  the focused default-excluded `claude_adapter_gpt55_child_bash_identity` case
+  so OpenAI child dispatch can be hard-gated with a real Bash tool call. Live
+  dev validation passed at `/tmp/claude_adapter_gpt55_child_bash_identity.json`
+  for session `2e83ca42-df97-4a19-823b-4075482dca29`; Langfuse showed
+  `claude-code.gpt-5-5` with `userId=adapter-harness-tenant`, and
+  `session_history_tool_activity` recorded `provider=openai`,
+  `model=gpt-5.5`, `tool_name=Bash`, command
+  `date -u +%Y-%m-%dT%H:%M:%S.%NZ`.
+
+- Implemented source-side Claude Code child-model observability preservation
+  for Anthropic-adapted routes. `_prepare_anthropic_request_body_for_passthrough`
+  now derives Claude child agent/project context before provider translation and
+  stores `agent_name`, `aawm_claude_agent_name`, `tenant_id`, `aawm_tenant_id`,
+  `aawm_claude_project`, `trace_name=claude-code.<agent>`, and
+  `trace_user_id=<tenant_id>` in `litellm_metadata`; completion-adapter
+  metadata mirrors `trace_user_id`; and `AawmAgentIdentity` now prefers those
+  explicit metadata keys before scanning prompt text. Focused validation passed
+  for OpenAI Responses, OpenRouter Responses, Google/Gemini completion, NVIDIA
+  completion, and callback/session-history identity preservation.
+
+- Strengthened the Anthropic adapter harness so smoke cases can prove tool use,
+  not just plausible final text. `command_json_checks` now supports
+  `required_regex`, `tool_activity_validation` supports `maximum_count` and
+  forbidden command substrings, Ling/OpenRouter smoke prompts now require a
+  high-resolution UTC `Bash` timestamp command, and
+  `claude_adapter_gemini_fanout` now requires native Gemini
+  `run_shell_command` rows for all three Gemini children. The later live dev
+  artifact `/tmp/claude_adapter_gemini_fanout_final.json` confirmed
+  `gemini-3-flash-preview`, `gemini-3.1-pro-preview`, and
+  `gemini-3.1-flash-lite-preview` all persisted the exact
+  `date -u +%Y-%m-%dT%H:%M:%S.%NZ` command. The later tenant and Langfuse
+  user-attribution issues were closed separately; do not reclassify this as
+  missing Gemini Bash/tool activity.
+
+- Fixed and validated the Gemini Code Assist wrapped-stream logging gap that
+  made earlier fanout runs look like Flash/Flash-lite had not used Bash. The
+  Gemini passthrough logger now assembles multi-chunk Code Assist streams
+  instead of transforming only the final wrapped `response` chunk, preserving
+  non-final native `functionCall` chunks for Langfuse and
+  `session_history_tool_activity`. Focused tests passed with
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`38 passed`), and direct dev DB checks for session
+  `fe80c0ed-e1a7-4f59-81c3-8742327932fd` show all three Gemini
+  `run_shell_command` rows.
+
+- Tightened the harness session-history diagnostics for expected-row failures.
+  When provider/model rows exist but fail a secondary predicate, such as the
+  current Gemini fanout `tenant_id` mismatch, artifacts now include
+  `all_records` and failure messages include candidate rows with the mismatched
+  fields. Focused validation now passes with `39 passed` for the Gemini
+  passthrough logging and local-ci harness tests.
+
+- Fixed the Claude Code child `session_history` tenant mismatch exactly. The
+  dev container was already importing the bind-mounted local source; the
+  mismatch was caused by `_add_claude_child_agent_observability_metadata()`
+  writing `litellm_metadata.tenant_id` from the Claude project text
+  (`litellm`) before `AawmAgentIdentity` considered the harness
+  `x-aawm-tenant-id` header. The preparation path now feeds the explicit
+  tenant header into child observability metadata, while preserving the Claude
+  project separately as `aawm_claude_project`. After recreating `litellm-dev`,
+  live `claude_adapter_gemini_fanout` passed at
+  `/tmp/claude_adapter_gemini_fanout_after_tenant_fix.json` with zero failures:
+  all three Gemini child `session_history` rows have
+  `tenant_id=adapter-harness-tenant`, Langfuse child traces retain names such
+  as `claude-code.gemini-3-flash-preview`, and all three native
+  `run_shell_command` rows persist.
+
+- Closed the remaining Claude Code Gemini 3.1 Pro post-tool-result dispatch
+  failure on dev `:4001`. The v10 aawm-tap transcript at
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-aawm-tap/b0428c41-09d8-40ec-b2b5-4d87ffdb40dd/subagents/agent-ae56c557397dcc651.jsonl`
+  showed Gemini ran one `Bash` call, then Claude Code recorded only a
+  thinking block with `output_tokens=0` and `stop_reason=end_turn`. Langfuse
+  for the same window showed prompt policy `2026-04-27.v2` was present and
+  Gemini had emitted follow-up `read_file` tool calls, so the remaining issue
+  was not the direct `Read.pages` / malformed-id case. The Anthropic stream
+  wrapper now keeps per-instance stream state instead of sharing the class
+  `chunk_queue`, preserves terminal chunks that carry both `finish_reason` and
+  tool-call deltas, and suppresses Gemini provider thinking/signature deltas so
+  Claude Code receives the actionable `tool_use` blocks.
+
+- Added and validated the post-tool-result Gemini harness gate.
+  `claude_adapter_gemini31_pro_bash_then_read_stream_state` is default-excluded
+  and forces real Claude Code on `:4001` through `Bash` then `Read`, validating
+  Langfuse, `session_history`, and native Gemini tool activity
+  (`run_shell_command` and `read_file`). Live dev validation passed at
+  `/tmp/gemini_bash_then_read_stream_state.json` with zero failures/warnings.
+  The older direct `Read` gate still passed after the streaming fix at
+  `/tmp/gemini_read_tool_id_sanitizer_after_stream_fix.json`.
+
+- Corrected the GPT-5.5 Claude-dispatched write-file refusal root cause. The
+  v10 GPT subagent transcript
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-aawm-tap/b0428c41-09d8-40ec-b2b5-4d87ffdb40dd/subagents/agent-a05c7877ad61b70ca.jsonl`
+  line 1 contains the explicit request to write
+  `.analysis/plan-phase01-remediation-v10-cc-gpt5.5.md`, line 4 says it will
+  return validation inline instead, and line 112's Claude Code continuation
+  summary repeats the higher-priority instruction. The decisive source check is
+  Langfuse trace `4adee2dc-ac8f-43c8-ac41-484dec7a324b`: the GPT-5.5 upstream
+  OpenAI Responses request already contained the no-write sentence in
+  `instructions`. `strings` on Claude Code binary
+  `/home/zepfu/.local/share/claude/versions/2.1.119` shows the sentence in the
+  built-in background/subagent system prompt. LiteLLM did not author the
+  sentence, but the OpenAI translation path did preserve it when converting the
+  incoming Claude `system` prompt into OpenAI `instructions`; the prompt-patch
+  metadata was adjacent and only changed the code-snippet guidance.
+
+- Mitigated the Claude Code subagent report-file block through the existing
+  prompt-patch path instead of editing the Claude binary. The new
+  `subagent-report-file-explicit-request` patch rewrites the rendered sentence
+  to allow report/summary/findings/analysis `.md` writes when the user
+  explicitly asks for them, while still requiring the model to return findings
+  in its final assistant message. Focused validation passed with
+  `./.venv/bin/python -m json.tool context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json`
+  and
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k test_prepare_anthropic_request_body_applies_claude_prompt_patches -q`
+  (`1 passed, 220 deselected`).
+
+- Closed the Gemini Claude Code direct-`Read` failure on the dev adapter.
+  The failing transcript showed upstream Gemini produced a real native
+  `read_file` call, but the Gemini thought signature had been embedded into the
+  Anthropic `tool_use.id`; Claude Code then surfaced only `Calling tool Read.`
+  and did not execute the read. The Anthropic adapter now strips `__thought__`
+  suffixes from tool-use ids while preserving the signature in
+  `provider_specific_fields`, drops synthetic `Calling tool ...` text when a
+  real tool call is present, and keeps the existing empty `Read.pages`
+  sanitizer. The Google adapter system prompt policy is now
+  `2026-04-27.v2` and explicitly requires visible final assistant text after
+  tool results, which fixed the follow-up Gemini thinking-only final turn seen
+  in the first live validation.
+
+- Added and validated the targeted Gemini Read harness gate.
+  `claude_adapter_gemini31_pro_read_tool_id_sanitizer` is default-excluded but
+  hard-fails when selected. It validates the real Claude Code path through
+  `:4001`, requires final result `# TODO`, checks prompt-policy v2 metadata,
+  validates the matching Gemini session row with `tool_call_count=1` and
+  `file_read_count=1`, and matches persisted tool activity as native
+  `read_file`. Live dev validation passed at
+  `/tmp/gemini_read_tool_id_sanitizer_v2.json` for session
+  `4a08eeda-4aa6-40ca-9394-fec5dfa501f0` with result `# TODO`, one persisted
+  `read_file` row, and zero failures/warnings. The earlier
+  `claude_adapter_gemini_fanout` case remains useful only for child-agent
+  fanout/session-history coverage and should not be treated as proof that
+  Gemini direct Read/tool-use completion works.
+
+- Confirmed the GPT-5.5 review write-file behavior is expected for Claude Code
+  background/subagent sessions unless the OpenAI adapter strips or overrides
+  that Claude-native no-report-files instruction for non-Claude models.
+
+- Implemented the Google-only Gemini system prompt policy for Claude-initiated
+  `/anthropic` requests routed through `anthropic_google_completion_adapter`.
+  The Google request builder now rewrites canonicalized system messages before
+  Gemini `systemInstruction` generation, supports `off`, `append`, and
+  `replace_compact` policy modes through
+  `AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY`, preserves project/safety/operator
+  instructions under a clear heading, keeps Gemini native tool aliasing intact,
+  and records prompt-policy summary metadata without logging full prompt text.
+
+- Normalized invalid empty Claude `Read.pages` tool arguments on the
+  non-Anthropic `/anthropic` adapter response path. The shared sanitizer removes
+  empty `pages` only for restored Claude `Read` tool calls, preserves unrelated
+  empty-string arguments, covers non-streaming responses plus complete streaming
+  JSON deltas, and respects tool-name mappings such as Gemini `read_file` back
+  to Claude `Read`.
+
+- Extended focused harness coverage for the adapter hardening. The Anthropic
+  adapter harness now has a GPT-5.5 `Read` sanitizer case, supports forbidden
+  substrings in persisted tool-activity arguments, and validates Gemini prompt
+  policy markers/metadata on the existing Gemini adapter lane. Focused unit
+  validation passed with `303 passed` across the touched adapter, proxy, SSE,
+  and local-ci test files; the harness JSON config parses successfully.
+
 ## 2026-04-25
 
 - Exposed OpenRouter-hosted embedding and rerank models through the LiteLLM proxy surface.

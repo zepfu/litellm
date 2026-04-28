@@ -1763,6 +1763,274 @@ def test_translate_openai_response_restores_tool_names():
     assert tool_use_blocks[0]["name"] == original_name
 
 
+def test_translate_openai_response_omits_empty_read_pages_argument():
+    """Read tool calls with empty pages should omit pages for Claude Code."""
+    response = ModelResponse(
+        id="test-id",
+        choices=[
+            Choices(
+                index=0,
+                finish_reason="tool_calls",
+                message=Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        ChatCompletionAssistantToolCall(
+                            id="call_read",
+                            type="function",
+                            function=Function(
+                                name="Read",
+                                arguments='{"file_path": "/tmp/example.py", "pages": ""}',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ],
+        model="gpt-5.5",
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result = adapter.translate_openai_response_to_anthropic(response=response)
+
+    tool_use_blocks = [c for c in result["content"] if c.get("type") == "tool_use"]
+    assert len(tool_use_blocks) == 1
+    assert tool_use_blocks[0]["name"] == "Read"
+    assert tool_use_blocks[0]["input"] == {"file_path": "/tmp/example.py"}
+
+
+def test_translate_openai_response_sanitizes_read_pages_after_tool_name_mapping():
+    """Sanitization should use the restored original Claude tool name."""
+    response = ModelResponse(
+        id="test-id",
+        choices=[
+            Choices(
+                index=0,
+                finish_reason="tool_calls",
+                message=Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        ChatCompletionAssistantToolCall(
+                            id="call_read",
+                            type="function",
+                            function=Function(
+                                name="read_file",
+                                arguments='{"file_path": "/tmp/example.py", "pages": []}',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ],
+        model="gemini-3.1-pro-preview",
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result = adapter.translate_openai_response_to_anthropic(
+        response=response,
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    tool_use_blocks = [c for c in result["content"] if c.get("type") == "tool_use"]
+    assert len(tool_use_blocks) == 1
+    assert tool_use_blocks[0]["name"] == "Read"
+    assert tool_use_blocks[0]["input"] == {"file_path": "/tmp/example.py"}
+
+
+def test_translate_openai_response_strips_gemini_thought_signature_from_tool_id():
+    """Gemini thought signatures belong in metadata, not the Claude tool_use id."""
+    thought_signature = "sig_123"
+    response = ModelResponse(
+        id="test-id",
+        choices=[
+            Choices(
+                index=0,
+                finish_reason="tool_calls",
+                message=Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        ChatCompletionAssistantToolCall(
+                            id=f"call_read__thought__{thought_signature}",
+                            type="function",
+                            function=Function(
+                                name="read_file",
+                                arguments='{"file_path": "/tmp/example.py"}',
+                            ),
+                            provider_specific_fields={
+                                "thought_signature": thought_signature
+                            },
+                        )
+                    ],
+                ),
+            )
+        ],
+        model="gemini-3.1-pro-preview",
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result = adapter.translate_openai_response_to_anthropic(
+        response=response,
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    assert result["stop_reason"] == "tool_use"
+    assert result["content"] == [
+        {
+            "type": "tool_use",
+            "id": "call_read",
+            "name": "Read",
+            "input": {"file_path": "/tmp/example.py"},
+            "provider_specific_fields": {"signature": thought_signature},
+        }
+    ]
+
+
+def test_translate_streaming_openai_chunk_strips_gemini_thought_signature_from_tool_id():
+    choices = [
+        StreamingChoices(
+            finish_reason=None,
+            index=0,
+            delta=Delta(
+                provider_specific_fields=None,
+                content=None,
+                role="assistant",
+                function_call=None,
+                tool_calls=[
+                    ChatCompletionDeltaToolCall(
+                        id="call_read__thought__sig_123",
+                        function=Function(
+                            arguments='{"file_path": "/tmp/example.py"}',
+                            name="read_file",
+                        ),
+                        type="function",
+                        index=0,
+                    )
+                ],
+                audio=None,
+            ),
+            logprobs=None,
+        )
+    ]
+
+    (
+        block_type,
+        content_block_start,
+    ) = LiteLLMAnthropicMessagesAdapter()._translate_streaming_openai_chunk_to_anthropic_content_block(
+        choices=choices
+    )
+
+    assert block_type == "tool_use"
+    assert content_block_start["id"] == "call_read"
+
+
+def test_translate_openai_response_drops_synthetic_tool_call_text():
+    """Gemini may emit a text preamble next to a real tool call; Claude Code needs only the tool_use."""
+    response = ModelResponse(
+        id="test-id",
+        choices=[
+            Choices(
+                index=0,
+                finish_reason="tool_calls",
+                message=Message(
+                    role="assistant",
+                    content="Calling tool Read File.",
+                    tool_calls=[
+                        ChatCompletionAssistantToolCall(
+                            id="call_read",
+                            type="function",
+                            function=Function(
+                                name="read_file",
+                                arguments='{"file_path": "/tmp/example.py", "offset": 0, "limit": 200}',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ],
+        model="gemini-3.1-pro-preview",
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result = adapter.translate_openai_response_to_anthropic(
+        response=response,
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    assert result["stop_reason"] == "tool_use"
+    assert result["content"] == [
+        {
+            "type": "tool_use",
+            "id": "call_read",
+            "name": "Read",
+            "input": {
+                "file_path": "/tmp/example.py",
+                "offset": 0,
+                "limit": 200,
+            },
+            "provider_specific_fields": None,
+        }
+    ]
+
+
+def test_translate_openai_response_keeps_unrelated_empty_string_arguments():
+    """Only Read.pages should be stripped; other empty strings may be meaningful."""
+    response = ModelResponse(
+        id="test-id",
+        choices=[
+            Choices(
+                index=0,
+                finish_reason="tool_calls",
+                message=Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        ChatCompletionAssistantToolCall(
+                            id="call_write",
+                            type="function",
+                            function=Function(
+                                name="Write",
+                                arguments='{"file_path": "/tmp/empty.txt", "content": ""}',
+                            ),
+                        ),
+                        ChatCompletionAssistantToolCall(
+                            id="call_read",
+                            type="function",
+                            function=Function(
+                                name="Read",
+                                arguments='{"file_path": "/tmp/report.pdf", "pages": "1-2"}',
+                            ),
+                        ),
+                    ],
+                ),
+            )
+        ],
+        model="gpt-5.5",
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result = adapter.translate_openai_response_to_anthropic(response=response)
+
+    tool_use_blocks = [c for c in result["content"] if c.get("type") == "tool_use"]
+    assert len(tool_use_blocks) == 2
+    assert tool_use_blocks[0]["name"] == "Write"
+    assert tool_use_blocks[0]["input"] == {
+        "file_path": "/tmp/empty.txt",
+        "content": "",
+    }
+    assert tool_use_blocks[1]["name"] == "Read"
+    assert tool_use_blocks[1]["input"] == {
+        "file_path": "/tmp/report.pdf",
+        "pages": "1-2",
+    }
+
+
 def test_translate_openai_response_to_anthropic_input_tokens_excludes_cached_tokens():
     """
     Regression test: input_tokens in Anthropic format should NOT include cached tokens.

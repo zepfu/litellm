@@ -345,6 +345,18 @@ class GeminiPassthroughLoggingHandler:
                 if isinstance(chunk, dict) and isinstance(chunk.get("response"), dict)
             ]
             if len(code_assist_chunks) > 0:
+                if len(code_assist_chunks) > 1:
+                    complete_streaming_response = (
+                        GeminiPassthroughLoggingHandler._build_complete_response_from_gemini_stream_chunks(
+                            all_chunks=[
+                                json.dumps(chunk) for chunk in code_assist_chunks
+                            ],
+                            litellm_logging_obj=litellm_logging_obj,
+                        )
+                    )
+                    if complete_streaming_response is not None:
+                        return complete_streaming_response
+
                 transformed_httpx_response = httpx.Response(
                     status_code=200,
                     content=json.dumps(code_assist_chunks[-1]).encode("utf-8"),
@@ -365,34 +377,56 @@ class GeminiPassthroughLoggingHandler:
                     encoding=litellm.encoding,
                 )
 
-            gemini_iterator: Any = GeminiModelResponseIterator(
-                streaming_response=None,
-                sync_stream=False,
-                logging_obj=litellm_logging_obj,
+            complete_streaming_response = (
+                GeminiPassthroughLoggingHandler._build_complete_response_from_gemini_stream_chunks(
+                    all_chunks=all_chunks,
+                    litellm_logging_obj=litellm_logging_obj,
+                )
             )
-            chunk_parsing_logic: Any = gemini_iterator._common_chunk_parsing_logic
-            normalized_chunks = []
-            for chunk in all_chunks:
-                normalized_chunks.append(chunk)
-
-            parsed_chunks = [chunk_parsing_logic(chunk) for chunk in normalized_chunks]
+            if complete_streaming_response is not None:
+                return complete_streaming_response
         else:
             return None
 
-        if len(parsed_chunks) == 0:
+        return None
+
+    @staticmethod
+    def _build_complete_response_from_gemini_stream_chunks(
+        all_chunks: List[str],
+        litellm_logging_obj: LiteLLMLoggingObj,
+    ) -> Optional[ModelResponse]:
+        gemini_iterator: Any = GeminiModelResponseIterator(
+            streaming_response=None,
+            sync_stream=False,
+            logging_obj=litellm_logging_obj,
+        )
+        chunk_parsing_logic: Any = gemini_iterator._common_chunk_parsing_logic
+        all_openai_chunks = []
+        for chunk in all_chunks:
+            parsed_chunk = chunk_parsing_logic(chunk)
+            if parsed_chunk is not None:
+                all_openai_chunks.append(parsed_chunk)
+            while gemini_iterator.pending_model_response_chunks:
+                all_openai_chunks.append(
+                    gemini_iterator.pending_model_response_chunks.pop(0)
+                )
+
+        if (
+            gemini_iterator.chunk_type == "accumulated_json"
+            and gemini_iterator.accumulated_json
+        ):
+            parsed_chunk = gemini_iterator.handle_accumulated_json_chunk(chunk="")
+            if parsed_chunk is not None:
+                all_openai_chunks.append(parsed_chunk)
+            while gemini_iterator.pending_model_response_chunks:
+                all_openai_chunks.append(
+                    gemini_iterator.pending_model_response_chunks.pop(0)
+                )
+
+        if len(all_openai_chunks) == 0:
             return None
 
-        all_openai_chunks = []
-        for parsed_chunk in parsed_chunks:
-            if parsed_chunk is None:
-                continue
-            all_openai_chunks.append(parsed_chunk)
-
-        complete_streaming_response = litellm.stream_chunk_builder(
-            chunks=all_openai_chunks
-        )
-
-        return complete_streaming_response
+        return litellm.stream_chunk_builder(chunks=all_openai_chunks)
 
     @staticmethod
     def extract_model_from_url(

@@ -390,6 +390,69 @@ class TestGeminiPassthroughLoggingHandler:
         assert response.usage.completion_tokens == 73
         assert response.usage.completion_tokens_details.reasoning_tokens == 70
 
+    def test_build_complete_streaming_response_code_assist_preserves_tool_call_from_non_final_chunk(self):
+        mock_logging_obj = self._create_mock_logging_obj()
+        tool_chunk = "data: " + json.dumps(
+            {
+                "traceId": "trace-tool-123",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": "run_shell_command",
+                                            "args": {
+                                                "command": "date -u +%Y-%m-%dT%H:%M:%S.%NZ",
+                                                "description": "Get current timestamp",
+                                            },
+                                        }
+                                    }
+                                ],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ]
+                },
+            }
+        )
+        usage_chunk = "data: " + json.dumps(
+            {
+                "traceId": "trace-tool-123",
+                "response": {
+                    "candidates": [{"finishReason": "STOP", "index": 0}],
+                    "usageMetadata": {
+                        "promptTokenCount": 4302,
+                        "candidatesTokenCount": 176,
+                        "totalTokenCount": 4478,
+                    },
+                    "modelVersion": "gemini-3.1-flash-lite-preview",
+                },
+            }
+        )
+
+        response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=[tool_chunk, usage_chunk, "data: [DONE]"],
+            litellm_logging_obj=mock_logging_obj,
+            model="gemini-3.1-flash-lite-preview",
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+        )
+
+        assert response is not None
+        message = response.choices[0].message
+        assert message.tool_calls is not None
+        assert len(message.tool_calls) == 1
+        assert message.tool_calls[0].function.name == "run_shell_command"
+        assert json.loads(message.tool_calls[0].function.arguments) == {
+            "command": "date -u +%Y-%m-%dT%H:%M:%S.%NZ",
+            "description": "Get current timestamp",
+        }
+        assert response.usage.prompt_tokens == 4302
+        assert response.usage.completion_tokens == 176
+
     @patch("litellm.completion_cost")
     def test_gemini_passthrough_handler_streaming(self, mock_completion_cost):
         """Test cost tracking for Gemini streaming endpoint"""

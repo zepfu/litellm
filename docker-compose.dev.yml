@@ -42,6 +42,7 @@ services:
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py
       - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
+      - ./context-replacement:/app/context-replacement
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
       # Claude persisted-output files for local expansion
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro

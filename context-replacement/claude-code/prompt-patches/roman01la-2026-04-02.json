@@ -52,6 +52,11 @@
       "after": "Include code snippets when they provide useful context (e.g., bugs found, function signatures, relevant patterns, code that informs the decision). Summarize rather than quoting large blocks verbatim."
     },
     {
+      "id": "subagent-report-file-explicit-request",
+      "before": "Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message — the parent agent reads your text output, not files you create.",
+      "after": "Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."
+    },
+    {
       "id": "match-scope-instruction",
       "before": "Match the scope of your actions to what was actually requested.",
       "after": "Match the scope of your actions to what was actually requested, but do address closely related issues you discover during the work when fixing them is clearly the right thing to do."

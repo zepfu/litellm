@@ -546,6 +546,14 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "anthropic_adapter_cache_control_present",
     "usage_tool_call_count",
     "usage_tool_names",
+    "google_adapter_system_prompt_policy_name",
+    "google_adapter_system_prompt_policy",
+    "google_adapter_system_prompt_policy_version",
+    "google_adapter_system_prompt_original_chars",
+    "google_adapter_system_prompt_rewritten_chars",
+    "google_adapter_system_prompt_removed_claude_overhead_chars",
+    "google_adapter_system_prompt_preserved_instruction_chars",
+    "google_adapter_system_prompt_policy_applied",
     "usage_search_units",
     "usage_openrouter_cost",
     "openrouter_provider",
@@ -1230,6 +1238,24 @@ def _extract_agent_context_from_text(text: str) -> Tuple[Optional[str], Optional
 def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """Extract agent/tenant from request content when present."""
     explicit_tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(kwargs)
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata = litellm_params.get("metadata") or {}
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    standard_metadata = standard_logging_object.get("metadata") or {}
+    for source in (metadata, standard_metadata):
+        if not isinstance(source, dict):
+            continue
+        agent_name = _clean_non_empty_string(
+            source.get("agent_name") or source.get("aawm_claude_agent_name")
+        )
+        tenant_id = _clean_non_empty_string(
+            source.get("tenant_id")
+            or source.get("aawm_tenant_id")
+            or source.get("aawm_claude_project")
+        )
+        if agent_name:
+            return agent_name, explicit_tenant_id or tenant_id
+
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
         for message in messages:
@@ -3116,11 +3142,16 @@ _TOOL_ACTIVITY_READ_NAMES = {
     "listdir",
     "list_files",
     "search",
+    "fetch",
+    "webfetch",
+    "web_fetch",
     "notebookread",
 }
 _TOOL_ACTIVITY_MODIFY_NAMES = {
     "write",
     "edit",
+    "replace",
+    "replacement",
     "multiedit",
     "apply_patch",
     "applypatch",
@@ -3206,6 +3237,29 @@ def _parse_tool_arguments(arguments: Any) -> Any:
         except json.JSONDecodeError:
             return {"raw_text": stripped}
     return {"value": arguments}
+
+
+def _is_empty_claude_read_pages_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return len(value) == 0
+    return False
+
+
+def _sanitize_tool_activity_arguments(tool_name: str, arguments: Any) -> Any:
+    if tool_name != "Read" or not isinstance(arguments, dict):
+        return arguments
+    if "pages" not in arguments:
+        return arguments
+    if not _is_empty_claude_read_pages_value(arguments.get("pages")):
+        return arguments
+
+    sanitized_arguments = dict(arguments)
+    sanitized_arguments.pop("pages", None)
+    return sanitized_arguments
 
 
 def _extract_paths_from_patch_text(text: str) -> List[str]:
@@ -3318,7 +3372,8 @@ def _classify_tool_kind(tool_name: str) -> str:
     ):
         return "modify"
     if normalized_name in _TOOL_ACTIVITY_READ_NAMES or any(
-        token in normalized_name for token in ("read", "view", "grep", "glob", "search")
+        token in normalized_name
+        for token in ("read", "view", "grep", "glob", "search", "fetch")
     ):
         return "read"
     return "other"
@@ -3333,6 +3388,7 @@ def _build_tool_activity_entry(
     source: Optional[str] = None,
 ) -> Dict[str, Any]:
     parsed_arguments = _parse_tool_arguments(arguments)
+    parsed_arguments = _sanitize_tool_activity_arguments(tool_name, parsed_arguments)
     tool_kind = _classify_tool_kind(tool_name)
     file_paths_read: List[str] = []
     file_paths_modified: List[str] = []
@@ -5722,6 +5778,21 @@ def _enrich_trace_name_and_provider_metadata(
         metadata["trace_name"] = f"claude-code.{agent_name}"
     elif not current_trace_name:
         metadata["trace_name"] = agent_name
+    child_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
+    child_trace_name = _clean_non_empty_string(metadata.get("trace_name"))
+    if (
+        headers
+        and child_trace_user_id
+        and child_trace_name
+        and child_trace_name.startswith("claude-code.")
+    ):
+        current_trace_user_id = headers.get("langfuse_trace_user_id")
+        if current_trace_user_id != child_trace_user_id:
+            headers["langfuse_trace_user_id"] = child_trace_user_id
+            verbose_logger.debug(
+                "AawmAgentIdentity: enriched header trace_user_id to %s",
+                child_trace_user_id,
+            )
     if session_id and not metadata.get("session_id"):
         metadata["session_id"] = session_id
 
