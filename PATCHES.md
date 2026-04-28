@@ -80,6 +80,12 @@ identity from Claude Code prompt content and map it to Langfuse trace naming.
   `You are 'orchestrator'` / `You are 'engineer'`.
 - Rewrites `langfuse_trace_name` / fallback `metadata["trace_name"]` so traces
   become `claude-code.orchestrator`, `claude-code.engineer`, etc.
+- Preserves tenant-only Langfuse user ids (`userId=<tenant_id>`) while keeping
+  child agent identity in the trace name (`claude-code.<agent>`), not in the
+  user id.
+- Rewrites stale inbound `langfuse_trace_name: claude-code.orchestrator`
+  headers to the child `metadata.trace_name` when Claude Code dispatches a
+  subagent, while preserving unrelated explicit caller trace names.
 - Preserves a workable attribution model without requiring Claude Code to emit
   dynamic per-subagent headers.
 
@@ -88,6 +94,9 @@ upstream feature.
 
 **Note:** Includes the unused-import fix (removal of `Union` import) that was
 previously a separate `chore` commit — squashed into this patch.
+Production callback behavior is shipped from the overlay wheel, so changes here
+must stay in parity with `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+and the published `cb-v*` artifact.
 
 **Upstream watch:** v1.82.2+ adds `x-litellm-agent-id` / `x-litellm-trace-id`
 agent tracing headers. These are header-based (not system-prompt-based) and
@@ -116,7 +125,8 @@ header-based metadata extraction.
 3. In `AnthropicPassthroughLoggingHandler.anthropic_passthrough_logged_success_handler()`,
    populate `proxy_server_request["headers"]` from `request_headers` when present.
 
-**Why not upstream:** Upstream bug not fixed as of v1.82.1 (March 2026).
+**Why not upstream:** This pass-through logging path is still carried locally on
+the current v1.82.3-based AAWM release line.
 
 ---
 
@@ -1257,11 +1267,13 @@ OpenRouter/Ling plus NVIDIA/DeepSeek
 Flash parallel read tools
 (`/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`), and
 Gemini 3.1 Pro sequential plus parallel gates after quota reset
-(`/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`). Before
-promoting to prod, merge to `main`, allow the harness artifact autobump to
-publish the next `h-v*` release, tag/publish `v1.82.3-aawm.37` from the final
-`main` head, then update and build the infrastructure image without restarting
-`aawm-litellm` until explicitly approved.
+(`/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`). Prod `:4000`
+was promoted to `v1.82.3-aawm.37` with `cb-v0.0.12`, `cp-v0.0.6`, and
+`h-v0.0.21`. Focused prod validation passed at
+`/tmp/litellm-prod-aawm37-cb12-focused-no-openrouter.json`. The default prod
+harness was not a clean pass because `claude_adapter_peeromega_fanout` timed
+out on the OpenRouter/Ling child lane; that follow-up is tracked in
+`TODO.md`, not as a blocker for the already-proven child trace-name fix.
 
 ---
 

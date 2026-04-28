@@ -120,6 +120,7 @@ Docker build will silently keep resolving the previous released overlay.
 
 ```bash
 gh release view cb-v<version> --repo zepfu/litellm
+gh release view cp-v<version> --repo zepfu/litellm
 gh release view cfg-v<version> --repo zepfu/litellm
 gh release view h-v<version> --repo zepfu/litellm
 ```
@@ -131,12 +132,13 @@ layer that installed stale artifacts.
 
 GitHub-created artifact tags may not trigger the tag-based release workflows
 because GitHub suppresses recursive workflow triggers from the workflow token.
-If the autobump job creates `cb-v*`, `cfg-v*`, or `h-v*` tags but the matching
-GitHub Releases are missing, build and upload the missing assets before the
-infrastructure rebuild. Example recovery flow:
+If the autobump job creates `cb-v*`, `cp-v*`, `cfg-v*`, or `h-v*` tags but the
+matching GitHub Releases are missing, build and upload the missing assets before
+the infrastructure rebuild. Example recovery flow:
 
 ```bash
 ./.venv/bin/python -m build --wheel --outdir /tmp/aawm-cb-dist .wheel-build
+./.venv/bin/python -m build --wheel --outdir /tmp/aawm-cp-dist .control-plane-wheel-build
 ./.venv/bin/python scripts/build_model_config_bundle.py --outdir /tmp/aawm-cfg-dist
 ./.venv/bin/python scripts/local-ci/build_harness_bundle.py --outdir /tmp/aawm-h-dist
 
@@ -144,6 +146,12 @@ gh release create cb-v<version> --repo zepfu/litellm \
   --title "aawm-litellm-callbacks v<version>" \
   --notes "AAWM LiteLLM callback wheel."
 gh release upload cb-v<version> path/to/aawm_litellm_callbacks-<version>-py3-none-any.whl \
+  --repo zepfu/litellm
+
+gh release create cp-v<version> --repo zepfu/litellm \
+  --title "aawm-litellm-control-plane v<version>" \
+  --notes "AAWM LiteLLM Claude control-plane wheel."
+gh release upload cp-v<version> path/to/aawm_litellm_control_plane-<version>-py3-none-any.whl \
   --repo zepfu/litellm
 
 gh release create cfg-v<version> --repo zepfu/litellm \
@@ -239,7 +247,8 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    ```
 
 Do not use `:latest` as the prod base image pin. Production infrastructure
-should pin an exact fork image such as `ghcr.io/zepfu/litellm:1.82.3-aawm.34`.
+should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
+or the current promoted line, `ghcr.io/zepfu/litellm:1.82.3-aawm.37`.
 
 ## Prod Validation
 
@@ -396,7 +405,7 @@ gaps, and session-history gaps remain hard failures.
 
 ## Release Findings
 
-2026-04-28 aawm.37 / `cb-v0.0.12` / `h-v0.0.21` prod cutover notes:
+2026-04-28 aawm.37 / `cb-v0.0.12` / `cp-v0.0.6` / `h-v0.0.21` prod cutover notes:
 
 - Callback behavior in prod comes from the overlay wheel, not only the in-repo
   `litellm/integrations` source. When fixing callback behavior, keep

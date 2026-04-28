@@ -81,7 +81,7 @@ Current first-wave adapted coverage:
   - run them only by explicit selection, for example:
     `--cases claude_adapter_gpt_oss_20b,claude_adapter_gpt_oss_120b,claude_adapter_gemma_31b,claude_adapter_gemma_26b_a4b`
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
-- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane with the other `vendor/model:free` targets
+- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane with the other `vendor/model:free` targets, but post-aawm.37 prod validation left Ling/free behavior unresolved: successful-empty or no-response cases remain warning-only until raw response/chunk capture and no-empty-response classification are added
 - current dev OpenRouter pacing on `:4001`:
   - `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
@@ -175,4 +175,4 @@ Important notes:
 - Fanout prompts should continue using the Claude agent names from `~/.claude/agents` such as `gemini-3-flash-preview`; those agent files now carry explicit provider-prefixed `model:` values like `google/gemini-3-flash-preview`.
 - `openrouter/free` and `inclusionai/ling-2.6-flash:free` are canaries, not hard gates; upstream routing / rate limits can make them noisy even when the local adapter path is correct.
 - `warning_only` canaries stay non-gating even when the subprocess itself times out; those conditions should surface as `soft_failures` / warnings in the artifact, not as suite-stopping failures.
-- `ling-2-6-flash` now validates on the generic OpenRouter `Responses` lane, so trace tags / metadata / `session_history` should match the other free-model response adapters.
+- `ling-2-6-flash` should keep the same trace tags / metadata / `session_history` shaping as the other free-model response adapters, but do not treat it as fully validated after the aawm.37 prod run. The unresolved behavior is successful-empty / zero-token OpenRouter responses that can leave Claude Code child sessions incomplete.
