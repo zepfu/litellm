@@ -114,10 +114,17 @@ only as needed:
 - Resolve the remaining prod default-suite blocker before calling the cutover
   clean. `/tmp/litellm-prod-harness-aawm37-cb12.json` failed only
   `claude_adapter_peeromega_fanout`: the Claude CLI command timed out after
-  `420s` with empty stdout/stderr, no Langfuse traces, and no session/tool
-  evidence. Next pass should isolate peeromega fanout with stronger per-child
-  transcript/trace capture so we can identify which child lane is hanging
-  instead of treating the whole fanout as one opaque timeout.
+  `420s` with empty stdout/stderr. Follow-up transcript/database inspection
+  identified the hanging child: parent session
+  `9db3bb66-6898-4257-a597-95090851414d` launched all eight agents, seven
+  completed, and its final transcript line said it was still waiting on
+  `ling-2-6-flash`. The Ling child transcript
+  `agent-a71b22a70294d7082.jsonl` contains only the user prompt plus injected
+  context and no assistant message, while `session_history` recorded an
+  OpenRouter Ling row for the same session with `input_tokens=0`,
+  `output_tokens=0`, `tool_call_count=0`, and `response_cost_usd=0`. Next pass
+  should hard-fail empty successful Ling responses and make the fanout harness
+  report per-child completion state before the parent timeout.
 
 - Keep OpenRouter Ling/free behavior as an unresolved provider-lane follow-up,
   not as the old trace-name bug. The isolated OpenRouter parallel proof
