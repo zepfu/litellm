@@ -2,6 +2,36 @@
 
 ## 2026-04-28
 
+- Promoted prod `aawm-litellm` on `:4000` to the rebuilt aawm.37 image with
+  overlay artifacts `cb-v0.0.12`, `cp-v0.0.6`, and `h-v0.0.21`.
+  Readiness passed with `litellm_version=1.82.3+aawm.37` and callbacks including
+  `AawmAgentIdentity`; container package inspection reported
+  `litellm=1.82.3+aawm.37`, `aawm-litellm-callbacks=0.0.12`, and
+  `aawm-litellm-control-plane=0.0.6`. The focused prod harness artifact
+  `/tmp/litellm-prod-aawm37-cb12-focused-no-openrouter.json` passed all selected
+  GPT-5.5, Gemini 3.1 Pro, Gemini 3 Flash, and NVIDIA DeepSeek cases with zero
+  failures and zero warnings. It also proved the child trace-name fix in prod:
+  each child trace appeared as its `claude-code.harness-*` name and each
+  expected trace carried tenant-only user id `adapter-harness-tenant`.
+
+- Ran the default prod adapter harness after the focused prod pass. Artifact
+  `/tmp/litellm-prod-harness-aawm37-cb12.json` is not a clean release pass:
+  overall `passed=false` because `claude_adapter_peeromega_fanout` timed out
+  after `420s` with no stdout/stderr, no response excerpt, and zero Langfuse
+  traces. The same artifact passed the other default OpenAI, Gemini, Codex,
+  GPT-5.5 read-pages, OpenRouter/NVIDIA Nemotron, and context-marker gates.
+  OpenRouter free/Ling cases passed only as warning-only: they returned empty
+  successful Claude CLI results with zero usage, missing generation token/cost
+  telemetry, and missing `Bash` tool activity for Ling. The isolated OpenRouter
+  parallel proof
+  `/tmp/litellm-prod-aawm37-cb12-openrouter-parallel.json` also timed out after
+  `300s` with no stdout/stderr and zero Langfuse traces, so classify that lane
+  as provider/model no-response or latency until a deeper per-child transcript
+  capture proves otherwise. Post-run prod log scan did not show ASGI/task,
+  `KeyError: choices`, stale `Content-Length`/`h11`, or quota-pressure
+  blockers; expected `LITELLM_MASTER_KEY` startup warning and provider attempt
+  warnings were present.
+
 - Fixed the prod aawm.37 focused-harness child trace-name blocker found after
   restarting `aawm-litellm` on `:4000`. Root cause: `/anthropic` child-agent
   metadata correctly set `trace_name=claude-code.<agent>` and
@@ -21,8 +51,10 @@
   (`3 passed`),
   `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py` (`41 passed`),
   JSON validation for `scripts/local-ci/anthropic_adapter_config.json`, and
-  `py_compile` for both callback source copies. Prod validation is still
-  pending until the rebuilt image includes `cb-v0.0.12` and `h-v0.0.21`.
+  `py_compile` for both callback source copies. Prod follow-up validation with
+  the rebuilt `cb-v0.0.12` / `h-v0.0.21` image proved this trace-name fix in the
+  focused prod harness; remaining prod failures are now peeromega/OpenRouter
+  provider-lane behavior, not this stale-header overwrite.
 
 - Re-verified the aawm.37 prod-prep state after the terminal crash without
   restarting `aawm-litellm`. Re-read [PROD_RELEASE.md](PROD_RELEASE.md) and

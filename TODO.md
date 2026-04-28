@@ -104,17 +104,30 @@ only as needed:
 
 ## Next
 
-- Prod `aawm-litellm` on `:4000` has been restarted onto the prepared aawm.37
-  image and is currently in release validation, but the focused prod harness
-  exposed a real child trace-name blocker before the default suite. The child
-  requests carry correct `litellm_metadata.trace_name=claude-code.<agent>` and
-  `claude-agent:*` tags, but stale inbound `langfuse_trace_name:
-  claude-code.orchestrator` headers overwrite the child trace name in Langfuse.
-  Patch and validate the AAWM trace-name header rewrite, rebuild/promote the
-  fixed image, rerun the focused prod harness, then run the default prod
-  harness and post-run log inspection. Record artifact paths/results in
-  [COMPLETED.md](COMPLETED.md) and release-process findings in
-  [PROD_RELEASE.md](PROD_RELEASE.md).
+- Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
+  `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and
+  the `h-v0.0.21` harness. The stale `langfuse_trace_name:
+  claude-code.orchestrator` child trace-name overwrite is resolved and proven in
+  `/tmp/litellm-prod-aawm37-cb12-focused-no-openrouter.json`; do not redo that
+  fix unless the same trace-header overwrite signature recurs.
+
+- Resolve the remaining prod default-suite blocker before calling the cutover
+  clean. `/tmp/litellm-prod-harness-aawm37-cb12.json` failed only
+  `claude_adapter_peeromega_fanout`: the Claude CLI command timed out after
+  `420s` with empty stdout/stderr, no Langfuse traces, and no session/tool
+  evidence. Next pass should isolate peeromega fanout with stronger per-child
+  transcript/trace capture so we can identify which child lane is hanging
+  instead of treating the whole fanout as one opaque timeout.
+
+- Keep OpenRouter Ling/free behavior as an unresolved provider-lane follow-up,
+  not as the old trace-name bug. The isolated OpenRouter parallel proof
+  `/tmp/litellm-prod-aawm37-cb12-openrouter-parallel.json` timed out after
+  `300s` with no stdout/stderr, no response excerpt, and zero Langfuse traces.
+  The default OpenRouter free/Ling cases returned successful empty Claude CLI
+  results with zero usage and missing `Bash` tool activity, and passed only
+  because they are warning-only. Re-test with either a more reliable OpenRouter
+  model or a stricter no-empty-response classifier before promoting OpenRouter
+  Ling/free coverage from warning-only to release-gating.
 
 ## Ongoing
 

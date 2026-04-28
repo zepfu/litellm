@@ -394,6 +394,39 @@ OpenRouter provider-unavailable signature:
 Other timeouts, command failures, adapter exceptions, traceback patterns, cost
 gaps, and session-history gaps remain hard failures.
 
+## Release Findings
+
+2026-04-28 aawm.37 / `cb-v0.0.12` / `h-v0.0.21` prod cutover notes:
+
+- Callback behavior in prod comes from the overlay wheel, not only the in-repo
+  `litellm/integrations` source. When fixing callback behavior, keep
+  `.wheel-build/aawm_litellm_callbacks/` in parity, publish the callback wheel,
+  rebuild the infrastructure image, and verify installed package versions inside
+  the built/running container before relying on prod harness evidence.
+- GitHub release workflows require the tagged commit to be reachable from
+  `main`. Tags created from `develop` can publish git refs but fail asset
+  publication at the "tagged commit is on main" gate; fast-forward `main` first
+  or rerun the release workflow after convergence.
+- After restart, use `/health/readiness`, container package-version inspection,
+  and focused/default harness artifacts as the release gates. Full `/health`
+  can include unrelated upstream model health failures and should not be the
+  only promotion signal.
+- If focused prod validation reports missing child trace names, inspect the
+  stale inbound `langfuse_trace_name: claude-code.orchestrator` header overwrite
+  path before reworking the `/anthropic` child metadata merge. The proven fix is
+  to rewrite stale `claude-code*` Langfuse trace-name headers to the child
+  `metadata.trace_name` while preserving unrelated explicit trace names.
+- Do not call a release clean when default prod harness fails only in a large
+  fanout timeout. Record the exact timed-out case, artifact, stdout/stderr,
+  Langfuse trace count, and next isolation plan in `TODO.md`; rerun a focused
+  per-child or narrower fanout case before broad retesting.
+- OpenRouter free/Ling lanes can produce successful Claude CLI exits with empty
+  `result`, zero usage, and no tool activity. Keep those warning-only unless the
+  harness is deliberately tightened, and do not let those warnings mask a hard
+  default-suite failure. If an OpenRouter focused child proof times out before
+  any Langfuse trace exists, classify it as provider/model no-response or
+  latency until additional transcript capture proves an adapter bug.
+
 ## Finalization
 
 After prod validation passes:
