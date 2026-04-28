@@ -23,6 +23,29 @@ only as needed:
 - [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md) - repo conventions,
   development commands, and broader LiteLLM testing/lint guidance.
 
+## Operating Loop
+
+- Preserve context aggressively. For substantial investigations, feature work,
+  live harness analysis, or multi-lane debugging, fan out to subagents whenever
+  the subtask is concrete and can run independently. Use the main thread for
+  integration, decisions, and the current critical path.
+- Keep [TODO.md](TODO.md) and [COMPLETED.md](COMPLETED.md) current while work is
+  underway, not just at the end. `TODO.md` should say what is currently
+  unresolved, what failed, and the next plan of attack. `COMPLETED.md` should
+  record what was fixed, what was validated, exact artifacts/traces when useful,
+  and any dead ends that should not be repeated.
+- When a fix is believed to work, proactively add the evidence to
+  [COMPLETED.md](COMPLETED.md). If later validation fails, update
+  [COMPLETED.md](COMPLETED.md) with the failed result and update [TODO.md](TODO.md)
+  with the next iteration before continuing.
+- After each major feature or repair is delivered and checked in locally, commit
+  it on the `develop` branch. Keep the commit boundary aligned with the proven
+  behavior so later sessions can tell what code, tests, and notes belonged
+  together.
+- Avoid repeating known dead ends. Before rerunning an approach, check
+  [COMPLETED.md](COMPLETED.md) for prior failures and [TODO.md](TODO.md) for the
+  current planned route.
+
 ## In Progress
 
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
