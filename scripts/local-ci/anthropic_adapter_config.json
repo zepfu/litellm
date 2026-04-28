@@ -31,6 +31,8 @@
     "claude_adapter_gpt55_child_analysis_write_probe",
     "claude_adapter_gpt55_child_sequential_core_tools",
     "claude_adapter_gpt55_child_parallel_read_tools",
+    "claude_adapter_openrouter_ling_child_parallel_read_tools",
+    "claude_adapter_nvidia_deepseek_child_parallel_read_tools",
     "claude_adapter_gemini_output_config_effort",
     "claude_adapter_gemini_output_config_minimal_effort",
     "claude_adapter_gemini_output_config_max_effort",
@@ -1189,6 +1191,373 @@
       },
       "timeout_seconds": 300,
       "langfuse_poll_timeout_seconds": 90
+    },
+    "claude_adapter_openrouter_ling_child_parallel_read_tools": {
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the harness-openrouter-ling-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read /home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from /home/zepfu/projects/litellm, and Grep pattern exactly `sequential-core-tools-grep` with path exactly `/home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: OPENROUTER PARALLEL TOOLS PASSED",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "harness-openrouter-ling-parallel-read-tools": {
+          "description": "Acceptance harness child for OpenRouter parallel read-tool proof.",
+          "model": "openrouter/inclusionai/ling-2.6-flash:free",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, return only the caller's exact final line."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.harness-openrouter-ling-parallel-read-tools"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.harness-openrouter-ling-parallel-read-tools": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "allow_zero_cost": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openrouter_responses_adapter",
+        "anthropic-openrouter-responses-adapter",
+        "anthropic-adapter-model:inclusionai/ling-2.6-flash:free",
+        "anthropic-adapter-target:openrouter:/v1/responses",
+        "claude-tool-advertisement-compaction",
+        "claude-prompt-patch",
+        "openrouter-adapter-claude-context-compacted",
+        "openrouter-adapter-claude-context:claude-md",
+        "openrouter-adapter-parallel-instruction-policy",
+        "claude-prompt-patch:subagent-report-file-explicit-request"
+      ],
+      "request_text_checks": {
+        "required_substrings": [
+          "Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."
+        ],
+        "forbidden_substrings": [
+          "Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message — the parent agent reads your text output, not files you create."
+        ]
+      },
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "input",
+          "instructions",
+          "stream",
+          "tools",
+          "litellm_metadata.openrouter_adapter_claude_context_compacted",
+          "litellm_metadata.openrouter_adapter_claude_context_compaction_events",
+          "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied"
+        ],
+        "required_equals": {
+          "parallel_tool_calls": true,
+          "litellm_metadata.openrouter_adapter_claude_context_compacted": true,
+          "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied": true
+        }
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false,
+          "result": "OPENROUTER PARALLEL TOOLS PASSED"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "provider": "openrouter",
+            "model": "inclusionai/ling-2.6-flash:free",
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1
+          },
+          {
+            "provider": "openrouter",
+            "model": "inclusionai/ling-2.6-flash:free",
+            "tool_name": "Read",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "openrouter",
+            "model": "inclusionai/ling-2.6-flash:free",
+            "tool_name": "Glob",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "scripts/local-ci/sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "openrouter",
+            "model": "inclusionai/ling-2.6-flash:free",
+            "tool_name": "Grep",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential-core-tools-grep"
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "harness-openrouter-ling-parallel-read-tools",
+            "expected_tool_counts": {
+              "Read": 1,
+              "Glob": 1,
+              "Grep": 1
+            },
+            "minimum_total_tool_uses": 3,
+            "maximum_total_tool_uses": 3,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "retry_on_api_error_statuses": [
+        429,
+        503
+      ],
+      "retry_max_attempts": 2,
+      "retry_backoff_seconds": 10,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 90
+    },
+    "claude_adapter_nvidia_deepseek_child_parallel_read_tools": {
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the harness-nvidia-deepseek-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read /home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from /home/zepfu/projects/litellm, and Grep pattern exactly `sequential-core-tools-grep` with path exactly `/home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: NVIDIA PARALLEL TOOLS PASSED",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "harness-nvidia-deepseek-parallel-read-tools": {
+          "description": "Acceptance harness child for NVIDIA parallel read-tool proof.",
+          "model": "nvidia/deepseek-ai/deepseek-v3.2",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, return only the caller's exact final line."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.harness-nvidia-deepseek-parallel-read-tools"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.harness-nvidia-deepseek-parallel-read-tools": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_nvidia_completion_adapter",
+        "anthropic-nvidia-completion-adapter",
+        "anthropic-adapter-model:deepseek-ai/deepseek-v3.2",
+        "anthropic-adapter-target:nvidia:/v1/chat/completions",
+        "claude-tool-advertisement-compaction",
+        "claude-prompt-patch",
+        "claude-prompt-patch:subagent-report-file-explicit-request"
+      ],
+      "request_text_checks": {
+        "required_substrings": [
+          "Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."
+        ],
+        "forbidden_substrings": [
+          "Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message — the parent agent reads your text output, not files you create."
+        ]
+      },
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "max_tokens",
+          "tools"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false,
+          "result": "NVIDIA PARALLEL TOOLS PASSED"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1,
+          "total_cost_usd": 1e-06
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "provider": "nvidia_nim",
+            "model": "deepseek-ai/deepseek-v3.2",
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1,
+              "response_cost_usd": 1e-06
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1
+          },
+          {
+            "provider": "nvidia_nim",
+            "model": "deepseek-ai/deepseek-v3.2",
+            "tool_name": "Read",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "nvidia_nim",
+            "model": "deepseek-ai/deepseek-v3.2",
+            "tool_name": "Glob",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "scripts/local-ci/sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "nvidia_nim",
+            "model": "deepseek-ai/deepseek-v3.2",
+            "tool_name": "Grep",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential-core-tools-grep"
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "harness-nvidia-deepseek-parallel-read-tools",
+            "expected_tool_counts": {
+              "Read": 1,
+              "Glob": 1,
+              "Grep": 1
+            },
+            "minimum_total_tool_uses": 3,
+            "maximum_total_tool_uses": 3,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 120
     },
     "claude_adapter_gpt55_read_pages_sanitizer": {
       "command": [

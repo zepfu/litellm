@@ -91,6 +91,17 @@ only as needed:
   artifact:
   `/tmp/claude_adapter_gpt55_child_parallel_read_tools_parallel_instruction_policy.json`.
 
+- OpenRouter and NVIDIA `/anthropic` parallel read-tool proofs are now validated
+  on dev `:4001`. OpenRouter proof uses
+  `openrouter/inclusionai/ling-2.6-flash:free`; the earlier
+  `openrouter/qwen/qwen3-coder:free` attempt hit provider 429 from Venice before
+  adapter validation and should remain a dead-end breadcrumb, not a regression.
+  NVIDIA proof uses `nvidia/deepseek-ai/deepseek-v3.2`; no separate
+  completion-side parallel policy was needed because the model emitted the three
+  tools together once the child trace-name metadata merge was fixed. Artifacts:
+  `/tmp/claude_adapter_openrouter_ling_nvidia_parallel_read_tools.json` and
+  `/tmp/claude_adapter_nvidia_parallel_read_tools_trace_fix.json`.
+
 ## Next
 
 - When Google Code Assist quota/capacity is available, rerun the Gemini 3.1 Pro

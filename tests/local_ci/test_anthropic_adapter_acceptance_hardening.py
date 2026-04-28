@@ -39,6 +39,18 @@ PARALLEL_CASE_AGENTS = {
         "gpt-5.5",
         {"Read", "Glob", "Grep"},
     ),
+    "claude_adapter_openrouter_ling_child_parallel_read_tools": (
+        "harness-openrouter-ling-parallel-read-tools",
+        "openrouter",
+        "inclusionai/ling-2.6-flash:free",
+        {"Read", "Glob", "Grep"},
+    ),
+    "claude_adapter_nvidia_deepseek_child_parallel_read_tools": (
+        "harness-nvidia-deepseek-parallel-read-tools",
+        "nvidia_nim",
+        "deepseek-ai/deepseek-v3.2",
+        {"Read", "Glob", "Grep"},
+    ),
     "claude_adapter_gemini3_flash_child_parallel_read_tools": (
         "harness-gemini3-flash-parallel-read-tools",
         "gemini",
@@ -667,6 +679,50 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
             assert required_equals[
                 "litellm_metadata.openai_adapter_parallel_instruction_policy_applied"
             ] is True
+        elif provider == "openrouter":
+            assert "route:anthropic_openrouter_responses_adapter" in case_config[
+                "required_trace_tags"
+            ]
+            assert "openrouter-adapter-claude-context-compacted" in case_config[
+                "required_trace_tags"
+            ]
+            assert "openrouter-adapter-parallel-instruction-policy" in case_config[
+                "required_trace_tags"
+            ]
+            required_paths = case_config["request_payload_checks"]["required_paths"]
+            for path in (
+                "model",
+                "input",
+                "instructions",
+                "stream",
+                "tools",
+                "litellm_metadata.openrouter_adapter_claude_context_compacted",
+                "litellm_metadata.openrouter_adapter_claude_context_compaction_events",
+                "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied",
+            ):
+                assert path in required_paths
+            required_equals = case_config["request_payload_checks"][
+                "required_equals"
+            ]
+            assert required_equals["parallel_tool_calls"] is True
+            assert required_equals[
+                "litellm_metadata.openrouter_adapter_claude_context_compacted"
+            ] is True
+            assert required_equals[
+                "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied"
+            ] is True
+        elif provider == "nvidia_nim":
+            assert "route:anthropic_nvidia_completion_adapter" in case_config[
+                "required_trace_tags"
+            ]
+            required_paths = case_config["request_payload_checks"]["required_paths"]
+            for path in (
+                "model",
+                "messages",
+                "max_tokens",
+                "tools",
+            ):
+                assert path in required_paths
 
 
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):

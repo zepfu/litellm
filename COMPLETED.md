@@ -348,6 +348,48 @@
   (`max_tool_uses_in_single_assistant_message=3`), and durable tool activity
   recorded the three OpenAI `responses.output` rows at the same timestamp.
 
+- Started the OpenRouter/NVIDIA `/anthropic` parallel read-tool extension.
+  Focused code/config checks passed before the first live run:
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k "parallel_instruction_policy or completion_parallel_tool_policy or OpenAIAdapterClaudeContextCompaction" -q`
+  (`10 passed` at that point), `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`41 passed`), JSON validation, and the Ruff E9/F821/F823 gate. Live artifact
+  `/tmp/claude_adapter_openrouter_nvidia_parallel_read_tools.json` split the
+  failure modes: OpenRouter/Qwen never reached adapter proof because
+  `qwen/qwen3-coder:free` returned provider 429s from Venice on all four
+  upstream attempts; NVIDIA/DeepSeek did emit `Read`, `Glob`, and `Grep` in one
+  child assistant message (`max_tool_uses_in_single_assistant_message=3`) and
+  durable `nvidia_nim` `Read`/`Glob`/`Grep` rows, but the harness correctly
+  failed because Langfuse still named the child trace as
+  `claude-code.orchestrator`. Do not repeat the OpenRouter/Qwen free-provider
+  attempt as adapter validation; use a different available OpenRouter lane.
+
+- Closed the OpenRouter and NVIDIA `/anthropic` parallel read-tool proof on dev
+  `:4001`. The OpenRouter Responses route now applies the same compact
+  function-calling instruction policy with OpenRouter-specific
+  `openrouter-adapter-*` metadata and compacts Claude context before
+  Anthropic-to-Responses translation. The passing OpenRouter artifact is
+  `/tmp/claude_adapter_openrouter_ling_nvidia_parallel_read_tools.json` using
+  `openrouter/inclusionai/ling-2.6-flash:free`; it recorded trace names
+  `claude-code.orchestrator` and
+  `claude-code.harness-openrouter-ling-parallel-read-tools`, user id
+  `adapter-harness-tenant`, request payload gates for
+  `parallel_tool_calls=true`,
+  `openrouter_adapter_claude_context_compacted=true`, and
+  `openrouter_adapter_parallel_instruction_policy_applied=true`, transcript
+  `Read`/`Glob`/`Grep` in one assistant message
+  (`max_tool_uses_in_single_assistant_message=3`), and durable OpenRouter
+  `Read`/`Glob`/`Grep` rows at the same timestamp. The passing NVIDIA artifact
+  is `/tmp/claude_adapter_nvidia_parallel_read_tools_trace_fix.json` using
+  `nvidia/deepseek-ai/deepseek-v3.2`; it recorded trace names
+  `claude-code.orchestrator` and
+  `claude-code.harness-nvidia-deepseek-parallel-read-tools`, user id
+  `adapter-harness-tenant`, transcript `Read`/`Glob`/`Grep` in one assistant
+  message (`max_tool_uses_in_single_assistant_message=3`), and durable
+  `nvidia_nim` `Read`/`Glob`/`Grep` rows at the same timestamp. The NVIDIA
+  fix was not a model prompting change; completion-adapter metadata now lets
+  child `litellm_metadata.trace_name` override stale orchestrator
+  `metadata.trace_name` when building the actual completion call.
+
 ## 2026-04-27
 
 - Closed the latest `aawm-tap` Claude-dispatched Gemini/GPT-5.5 investigation
