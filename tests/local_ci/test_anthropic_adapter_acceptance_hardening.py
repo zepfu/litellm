@@ -51,6 +51,12 @@ PARALLEL_CASE_AGENTS = {
         "deepseek-ai/deepseek-v3.2",
         {"Read", "Glob", "Grep"},
     ),
+    "claude_adapter_gemini31_pro_child_parallel_read_tools": (
+        "harness-gemini31-pro-parallel-read-tools",
+        "gemini",
+        "gemini-3.1-pro-preview",
+        {"read_file", "glob", "grep_search"},
+    ),
     "claude_adapter_gemini3_flash_child_parallel_read_tools": (
         "harness-gemini3-flash-parallel-read-tools",
         "gemini",

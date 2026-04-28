@@ -51,8 +51,8 @@ only as needed:
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
   Gemini through dev `:4001`. GPT-5.5 passed at
   `/tmp/claude_adapter_gpt55_child_sequential_core_tools_unique.json`; Gemini
-  3.1 Pro remains classified as a Google Code Assist quota/capacity block at
-  `/tmp/claude_adapter_gemini31_pro_child_sequential_core_tools_unique.json`;
+  3.1 Pro passed after the Google Code Assist quota reset at
+  `/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`;
   Gemini 3 Flash passed at
   `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_after_tool_pair_boundary.json`
   with exactly one each of `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`,
@@ -78,10 +78,10 @@ only as needed:
   including pre-terminal and terminal parallel-call chunks; the latest combined
   stream/SSE run passed (`19 passed`) and adapter transformation tests passed
   (`63 passed`). `litellm-dev` has been restarted with `:4001` healthy. Gemini
-  3 Flash also passed the live parallel read-tool proof on dev `:4001` at
-  `/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`.
-  Gemini 3.1 Pro can be rerun when the Google Code Assist quota/capacity block
-  clears, but do not treat that quota block as an unvalidated stream-fix gap.
+  3 Flash passed the live parallel read-tool proof on dev `:4001` at
+  `/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`, and
+  Gemini 3.1 Pro passed the matching live parallel proof after quota reset at
+  `/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`.
 
 - GPT-5.5/OpenAI Claude-dispatched parallel tool calls are now validated on dev
   `:4001`. Keep the dead-end breadcrumb in [COMPLETED.md](COMPLETED.md): context
@@ -104,10 +104,11 @@ only as needed:
 
 ## Next
 
-- When Google Code Assist quota/capacity is available, rerun the Gemini 3.1 Pro
-  sequential and parallel gates to distinguish model capacity from adapter
-  behavior. Gemini 3 Flash and GPT-5.5 have both passed the current dev `:4001`
-  sequential and parallel base-tool proofs.
+- Prep the validated adapter/harness state for the next prod promotion without
+  restarting `aawm-litellm` on `:4000`: commit on `develop`, align release
+  metadata for the next fork tag, inspect/pin the infrastructure image target in
+  `/home/zepfu/projects/aawm-infrastructure`, and defer `docker compose -f
+  docker-compose.litellm.yml up -d litellm` until explicitly approved.
 
 ## Ongoing
 
