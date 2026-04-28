@@ -111,20 +111,33 @@ only as needed:
   `/tmp/litellm-prod-aawm37-cb12-focused-no-openrouter.json`; do not redo that
   fix unless the same trace-header overwrite signature recurs.
 
-- Resolve the remaining prod default-suite blocker before calling the cutover
-  clean. `/tmp/litellm-prod-harness-aawm37-cb12.json` failed only
-  `claude_adapter_peeromega_fanout`: the Claude CLI command timed out after
-  `420s` with empty stdout/stderr. Follow-up transcript/database inspection
-  identified the hanging child: parent session
-  `9db3bb66-6898-4257-a597-95090851414d` launched all eight agents, seven
-  completed, and its final transcript line said it was still waiting on
-  `ling-2-6-flash`. The Ling child transcript
-  `agent-a71b22a70294d7082.jsonl` contains only the user prompt plus injected
-  context and no assistant message, while `session_history` recorded an
-  OpenRouter Ling row for the same session with `input_tokens=0`,
-  `output_tokens=0`, `tool_call_count=0`, and `response_cost_usd=0`. Next pass
-  should hard-fail empty successful Ling responses and make the fanout harness
-  report per-child completion state before the parent timeout.
+- Next deep dive: determine why OpenRouter
+  `inclusionai/ling-2.6-flash:free` returns successful-but-empty Claude Code
+  child results through `/anthropic`. Treat this as a likely adapter/translation
+  issue until disproven: OpenRouter did return a `200 OK`/successful request, so
+  the next session should inspect the raw OpenRouter response shape, the
+  OpenAI/Responses-to-Anthropic translation path, stop/finish reasons, streaming
+  chunk handling, usage extraction, and empty-content handling before
+  classifying it as purely provider behavior. The concrete failing prod case is
+  `/tmp/litellm-prod-harness-aawm37-cb12.json` /
+  `claude_adapter_peeromega_fanout`: the parent Claude command timed out after
+  `420s` with empty stdout/stderr because it kept waiting on only
+  `ling-2-6-flash`. Parent session
+  `9db3bb66-6898-4257-a597-95090851414d` launched all eight agents; seven
+  completed. Its final transcript line says it was still waiting on
+  `ling-2-6-flash`. The Ling child transcript at
+  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/9db3bb66-6898-4257-a597-95090851414d/subagents/agent-a71b22a70294d7082.jsonl`
+  contains only the user prompt plus injected context and no assistant message
+  or completion notification. Prod `session_history` recorded an OpenRouter Ling
+  row for the same session from `2026-04-28T22:09:15.779Z` to
+  `22:09:16.416Z` with `input_tokens=0`, `output_tokens=0`,
+  `tool_call_count=0`, and `response_cost_usd=0`. The isolated parallel proof
+  `/tmp/litellm-prod-aawm37-cb12-openrouter-parallel.json` also timed out after
+  `300s` with no stdout/stderr, no response excerpt, and zero Langfuse traces.
+  Preserve the next harness requirements: hard-fail empty successful Ling
+  responses, capture per-child completion state before the parent timeout, and
+  include the raw translated response/chunks in the artifact when the adapter
+  emits an empty Anthropic response.
 
 - Keep OpenRouter Ling/free behavior as an unresolved provider-lane follow-up,
   not as the old trace-name bug. The isolated OpenRouter parallel proof
