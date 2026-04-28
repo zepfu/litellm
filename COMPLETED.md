@@ -32,6 +32,20 @@
   blockers; expected `LITELLM_MASTER_KEY` startup warning and provider attempt
   warnings were present.
 
+- Classified the `claude_adapter_peeromega_fanout` timeout down to a specific
+  child lane. Parent Claude session
+  `9db3bb66-6898-4257-a597-95090851414d` launched all eight requested agents;
+  the parent transcript's last assistant message at `2026-04-28T22:10:06Z`
+  says it was still waiting on `ling-2-6-flash`. The Ling child transcript
+  `agent-a71b22a70294d7082.jsonl` has only the user prompt and injected context,
+  with no assistant message or completion notification. Prod `session_history`
+  still recorded the OpenRouter Ling request for that session from
+  `2026-04-28T22:09:15.779Z` to `22:09:16.416Z`, but it had
+  `input_tokens=0`, `output_tokens=0`, `tool_call_count=0`, and cost `0`.
+  Conclusion: the mega fanout timed out because OpenRouter Ling returned an
+  empty successful response that never became a completed Claude Code child, not
+  because all fanout lanes were slow.
+
 - Fixed the prod aawm.37 focused-harness child trace-name blocker found after
   restarting `aawm-litellm` on `:4000`. Root cause: `/anthropic` child-agent
   metadata correctly set `trace_name=claude-code.<agent>` and
