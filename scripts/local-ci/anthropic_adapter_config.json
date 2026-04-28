@@ -1059,6 +1059,11 @@
         "anthropic-openai-responses-adapter",
         "anthropic-adapter-model:gpt-5.5",
         "anthropic-adapter-target:/v1/responses",
+        "claude-tool-advertisement-compaction",
+        "claude-prompt-patch",
+        "openai-adapter-claude-context-compacted",
+        "openai-adapter-claude-context:claude-md",
+        "openai-adapter-parallel-instruction-policy",
         "claude-prompt-patch:subagent-report-file-explicit-request"
       ],
       "request_text_checks": {
@@ -1070,8 +1075,21 @@
         ]
       },
       "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "input",
+          "instructions",
+          "reasoning.effort",
+          "stream",
+          "tools",
+          "litellm_metadata.openai_adapter_claude_context_compacted",
+          "litellm_metadata.openai_adapter_claude_context_compaction_events",
+          "litellm_metadata.openai_adapter_parallel_instruction_policy_applied"
+        ],
         "required_equals": {
-          "parallel_tool_calls": true
+          "parallel_tool_calls": true,
+          "litellm_metadata.openai_adapter_claude_context_compacted": true,
+          "litellm_metadata.openai_adapter_parallel_instruction_policy_applied": true
         }
       },
       "command_json_checks": {
