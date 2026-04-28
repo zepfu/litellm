@@ -2,6 +2,19 @@
 
 ## 2026-04-28
 
+- Re-verified the aawm.37 prod-prep state after the terminal crash without
+  restarting `aawm-litellm`. Re-read [PROD_RELEASE.md](PROD_RELEASE.md) and
+  confirmed the remaining cutover step is intentionally deferred until explicit
+  approval. GitHub release checks confirmed `v1.82.3-aawm.37`, `cb-v0.0.11`,
+  `cp-v0.0.6`, `h-v0.0.20`, and the floated `cfg-v0.0.7` model-config asset
+  are published; the `aawm-publish.yml` workflow for `v1.82.3-aawm.37` is
+  `completed/success`. Infra `develop` is still clean and pinned to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; local `aawm-litellm:latest` image
+  inspection still reports `litellm=1.82.3+aawm.37`,
+  `aawm-litellm-callbacks=0.0.11`, and
+  `aawm-litellm-control-plane=0.0.6`. The running prod container remained
+  untouched: `aawm-litellm:155693327495:Up 3 days (healthy)`.
+
 - Prepared the validated adapter/harness state for the next prod cutover without
   restarting `aawm-litellm`. LiteLLM `develop` and `main` were fast-forwarded to
   the validated aawm.37 release head, the artifact autobump advanced callback
