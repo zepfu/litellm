@@ -104,12 +104,17 @@ only as needed:
 
 ## Next
 
-- Await explicit approval before restarting or replacing prod `aawm-litellm` on
-  `:4000`. The `aawm.37` image and overlay assets are published, and
-  `/home/zepfu/projects/aawm-infrastructure` `develop` is pinned/built locally.
-  The remaining cutover step is intentionally deferred: run
-  `docker compose -f docker-compose.litellm.yml up -d litellm`, then validate
-  readiness, prod harness, and prod logs only after approval.
+- Prod `aawm-litellm` on `:4000` has been restarted onto the prepared aawm.37
+  image and is currently in release validation, but the focused prod harness
+  exposed a real child trace-name blocker before the default suite. The child
+  requests carry correct `litellm_metadata.trace_name=claude-code.<agent>` and
+  `claude-agent:*` tags, but stale inbound `langfuse_trace_name:
+  claude-code.orchestrator` headers overwrite the child trace name in Langfuse.
+  Patch and validate the AAWM trace-name header rewrite, rebuild/promote the
+  fixed image, rerun the focused prod harness, then run the default prod
+  harness and post-run log inspection. Record artifact paths/results in
+  [COMPLETED.md](COMPLETED.md) and release-process findings in
+  [PROD_RELEASE.md](PROD_RELEASE.md).
 
 ## Ongoing
 

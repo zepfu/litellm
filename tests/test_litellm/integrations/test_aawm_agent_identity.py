@@ -18,6 +18,7 @@ from litellm.integrations.aawm_agent_identity import (
     _persist_session_history_records,
     _persist_session_history_record,
 )
+from litellm.integrations.langfuse.langfuse import LangFuseLogger
 
 
 class _FakePoolAcquire:
@@ -129,6 +130,34 @@ def test_aawm_agent_identity_keeps_child_dispatch_trace_metadata() -> None:
     assert standard_metadata["trace_user_id"] == "aegis"
     assert headers["langfuse_trace_name"] == "claude-code.reviewer"
     assert headers["langfuse_trace_user_id"] == "aegis"
+
+
+def test_aawm_agent_identity_rewrites_stale_orchestrator_langfuse_trace_header() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _child_dispatch_metadata_kwargs()
+    kwargs["litellm_params"]["proxy_server_request"]["headers"][
+        "langfuse_trace_name"
+    ] = "claude-code.orchestrator"
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert metadata["trace_name"] == "claude-code.reviewer"
+    assert headers["langfuse_trace_name"] == "claude-code.reviewer"
+    assert headers["langfuse_trace_user_id"] == "aegis"
+
+    langfuse_metadata = LangFuseLogger.add_metadata_from_header(
+        updated_kwargs["litellm_params"],
+        dict(metadata),
+    )
+    assert langfuse_metadata["trace_name"] == "claude-code.reviewer"
+    assert langfuse_metadata["trace_user_id"] == "aegis"
 
 
 def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:

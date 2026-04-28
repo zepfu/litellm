@@ -2524,7 +2524,9 @@
       },
       "command_json_checks": {
         "required_equals": {
-          "is_error": false,
+          "is_error": false
+        },
+        "required_contains": {
           "result": "GEMINI3 FLASH SEQUENTIAL TOOLS PASSED"
         },
         "required_minimums": {

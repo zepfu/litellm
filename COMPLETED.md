@@ -2,6 +2,28 @@
 
 ## 2026-04-28
 
+- Fixed the prod aawm.37 focused-harness child trace-name blocker found after
+  restarting `aawm-litellm` on `:4000`. Root cause: `/anthropic` child-agent
+  metadata correctly set `trace_name=claude-code.<agent>` and
+  `trace_user_id=adapter-harness-tenant`, but Langfuse later re-read the stale
+  inbound `langfuse_trace_name: claude-code.orchestrator` request header and
+  overwrote the child trace name. `AawmAgentIdentity` now rewrites stale
+  `claude-code*` Langfuse trace-name headers to the child trace name, mirroring
+  the existing trace-user-id header correction. The callback overlay source in
+  `.wheel-build/aawm_litellm_callbacks/agent_identity.py` was synced with the
+  in-repo callback source and the callback artifact version was bumped to
+  `0.0.12`. The Gemini 3 Flash sequential harness case now checks the returned
+  final marker as a substring because the prod artifact proved all eight tools
+  completed while Claude wrapped the child final line. Local validation passed:
+  `test_aawm_agent_identity.py -k "child_dispatch_trace_metadata or stale_orchestrator"`
+  (`2 passed`),
+  `test_llm_pass_through_endpoints.py -k "child_identity or child_trace_context or overrides_orchestrator"`
+  (`3 passed`),
+  `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py` (`41 passed`),
+  JSON validation for `scripts/local-ci/anthropic_adapter_config.json`, and
+  `py_compile` for both callback source copies. Prod validation is still
+  pending until the rebuilt image includes `cb-v0.0.12` and `h-v0.0.21`.
+
 - Re-verified the aawm.37 prod-prep state after the terminal crash without
   restarting `aawm-litellm`. Re-read [PROD_RELEASE.md](PROD_RELEASE.md) and
   confirmed the remaining cutover step is intentionally deferred until explicit
