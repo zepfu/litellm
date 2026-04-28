@@ -27,6 +27,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_adapter_system_prompt_policy,
     _apply_google_code_assist_native_tool_aliases,
     _apply_openai_adapter_parallel_instruction_policy,
+    _apply_openrouter_adapter_parallel_instruction_policy,
     _build_anthropic_responses_adapter_request_body,
     _build_completion_adapter_metadata,
     _build_google_code_assist_request_from_completion_kwargs,
@@ -159,6 +160,24 @@ async def test_prepare_anthropic_request_body_uses_explicit_tenant_header_for_ch
     assert "claude-project:aawm-tap" in litellm_metadata["tags"]
 
 
+@pytest.mark.asyncio
+async def test_prepare_anthropic_request_body_overrides_orchestrator_trace_name_for_child():
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {"x-aawm-tenant-id": "adapter-harness-tenant"}
+    request_body = _build_claude_code_agent_project_request_body("gpt-5.5")
+    request_body["litellm_metadata"]["trace_name"] = "claude-code.orchestrator"
+
+    updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+        mock_request,
+        request_body,
+    )
+
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert litellm_metadata["source_trace_name"] == "claude-code.orchestrator"
+    assert litellm_metadata["trace_name"] == "claude-code.gpt5-5"
+    assert litellm_metadata["trace_user_id"] == "adapter-harness-tenant"
+
+
 def test_anthropic_completion_adapter_preserves_trace_metadata():
     completion_kwargs, _ = (
         LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
@@ -180,6 +199,35 @@ def test_anthropic_completion_adapter_preserves_trace_metadata():
     assert completion_kwargs["metadata"]["existing_key"] == "existing-value"
     assert completion_kwargs["metadata"]["session_id"] == "session-1"
     assert completion_kwargs["metadata"]["trace_environment"] == "prod"
+
+
+def test_completion_adapter_metadata_prefers_child_trace_context():
+    metadata = _build_completion_adapter_metadata(
+        {
+            "metadata": {
+                "trace_name": "claude-code.orchestrator",
+                "trace_user_id": "stale-user",
+                "existing_key": "existing-value",
+            },
+            "litellm_metadata": {
+                "trace_name": "claude-code.harness-nvidia",
+                "trace_user_id": "adapter-harness-tenant",
+                "source_trace_name": "claude-code.orchestrator",
+                "agent_name": "harness-nvidia",
+                "aawm_claude_agent_name": "harness-nvidia",
+                "tenant_id": "adapter-harness-tenant",
+                "aawm_tenant_id": "adapter-harness-tenant",
+                "aawm_claude_project": "litellm",
+            },
+        }
+    )
+
+    assert metadata["existing_key"] == "existing-value"
+    assert metadata["trace_name"] == "claude-code.harness-nvidia"
+    assert metadata["trace_user_id"] == "adapter-harness-tenant"
+    assert metadata["source_trace_name"] == "claude-code.orchestrator"
+    assert metadata["agent_name"] == "harness-nvidia"
+    assert metadata["aawm_claude_project"] == "litellm"
 
 
 class TestResponsesAdapterToolChoice:
@@ -306,6 +354,44 @@ class TestResponsesAdapterToolChoice:
 
         assert second_body is updated_body
         assert second_changes == {}
+
+    def test_applies_openrouter_parallel_instruction_policy_with_openrouter_metadata(
+        self,
+    ):
+        request_body = {
+            "instructions": "You are Claude Code. Return findings directly.",
+            "parallel_tool_calls": True,
+            "tools": [
+                {"type": "function", "name": "Read", "parameters": {}},
+                {"type": "function", "name": "Glob", "parameters": {}},
+            ],
+        }
+
+        updated_body, changes = _apply_openrouter_adapter_parallel_instruction_policy(
+            request_body
+        )
+
+        assert updated_body["instructions"].startswith(
+            "You are an OpenAI Responses function-calling agent for Claude Code."
+        )
+        assert (
+            changes["openrouter_adapter_parallel_instruction_policy_applied"]
+            is True
+        )
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert (
+            litellm_metadata["openrouter_adapter_parallel_instruction_policy_applied"]
+            is True
+        )
+        assert (
+            "openrouter-adapter-parallel-instruction-policy"
+            in litellm_metadata["tags"]
+        )
+        assert "openrouter-adapter-parallel-tool:read" in litellm_metadata["tags"]
+        assert any(
+            span["name"] == "openrouter_adapter.parallel_instruction_policy"
+            for span in litellm_metadata["langfuse_spans"]
+        )
 
     def test_responses_adapter_normalizes_empty_object_tool_schema(self):
         translated_body = _build_anthropic_responses_adapter_request_body(

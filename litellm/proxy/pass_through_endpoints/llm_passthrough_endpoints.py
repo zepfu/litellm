@@ -4717,8 +4717,12 @@ def _get_openai_adapter_function_tool_names(
     return names
 
 
-def _apply_openai_adapter_parallel_instruction_policy(
+def _apply_responses_adapter_parallel_instruction_policy(
     request_body: dict[str, Any],
+    *,
+    tag_prefix: str,
+    metadata_prefix: str,
+    span_name: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if request_body.get("parallel_tool_calls") is not True:
         return request_body, {}
@@ -4741,20 +4745,20 @@ def _apply_openai_adapter_parallel_instruction_policy(
         existing_instructions.encode("utf-8", errors="replace")
     ).hexdigest()
     changes = {
-        "openai_adapter_parallel_instruction_policy_applied": True,
-        "openai_adapter_parallel_instruction_original_chars": len(
+        f"{metadata_prefix}_parallel_instruction_policy_applied": True,
+        f"{metadata_prefix}_parallel_instruction_original_chars": len(
             existing_instructions
         ),
-        "openai_adapter_parallel_instruction_rewritten_chars": len(replacement),
-        "openai_adapter_parallel_instruction_original_hash": original_hash,
-        "openai_adapter_parallel_instruction_tool_names": function_tool_names,
+        f"{metadata_prefix}_parallel_instruction_rewritten_chars": len(replacement),
+        f"{metadata_prefix}_parallel_instruction_original_hash": original_hash,
+        f"{metadata_prefix}_parallel_instruction_tool_names": function_tool_names,
     }
     updated_body = _merge_litellm_metadata(
         updated_body,
         tags_to_add=[
-            "openai-adapter-parallel-instruction-policy",
+            f"{tag_prefix}-parallel-instruction-policy",
             *[
-                f"openai-adapter-parallel-tool:{_normalize_low_cardinality_tag_value(tool_name) or 'unknown'}"
+                f"{tag_prefix}-parallel-tool:{_normalize_low_cardinality_tag_value(tool_name) or 'unknown'}"
                 for tool_name in function_tool_names
             ],
         ],
@@ -4762,7 +4766,7 @@ def _apply_openai_adapter_parallel_instruction_policy(
             **changes,
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
-                    name="openai_adapter.parallel_instruction_policy",
+                    name=span_name,
                     metadata={
                         "tool_names": function_tool_names,
                         "original_chars": len(existing_instructions),
@@ -4773,6 +4777,28 @@ def _apply_openai_adapter_parallel_instruction_policy(
         },
     )
     return updated_body, changes
+
+
+def _apply_openai_adapter_parallel_instruction_policy(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return _apply_responses_adapter_parallel_instruction_policy(
+        request_body,
+        tag_prefix="openai-adapter",
+        metadata_prefix="openai_adapter",
+        span_name="openai_adapter.parallel_instruction_policy",
+    )
+
+
+def _apply_openrouter_adapter_parallel_instruction_policy(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return _apply_responses_adapter_parallel_instruction_policy(
+        request_body,
+        tag_prefix="openrouter-adapter",
+        metadata_prefix="openrouter_adapter",
+        span_name="openrouter_adapter.parallel_instruction_policy",
+    )
 
 
 def _build_anthropic_response_from_responses_response(
@@ -4817,7 +4843,18 @@ def _build_completion_adapter_metadata(
         "trace_environment",
     ):
         value = litellm_metadata.get(key)
-        if value and not metadata.get(key):
+        if value and (key in {"trace_name", "trace_user_id"} or not metadata.get(key)):
+            metadata[key] = value
+    for key in (
+        "source_trace_name",
+        "agent_name",
+        "aawm_claude_agent_name",
+        "tenant_id",
+        "aawm_tenant_id",
+        "aawm_claude_project",
+    ):
+        value = litellm_metadata.get(key)
+        if value:
             metadata[key] = value
     for key in (
         "passthrough_route_family",
@@ -5843,6 +5880,23 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
     adapter_model: str,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
+    (
+        prepared_request_body,
+        openrouter_context_compacted_count,
+        openrouter_context_compacted_markers,
+        _openrouter_context_compaction_metadata,
+    ) = _compact_openai_adapter_claude_context_in_anthropic_request_body(
+        prepared_request_body,
+        tag_prefix="openrouter-adapter",
+        metadata_prefix="openrouter_adapter",
+        span_name="openrouter_adapter.claude_context_compaction",
+    )
+    if openrouter_context_compacted_count > 0:
+        verbose_proxy_logger.debug(
+            "Compacted Claude Code context for OpenRouter Responses adapter; count=%s markers=%s",
+            openrouter_context_compacted_count,
+            sorted(openrouter_context_compacted_markers),
+        )
     translated_request_body = _build_anthropic_responses_adapter_request_body(
         prepared_request_body,
         adapter_model=adapter_model,
@@ -5851,6 +5905,17 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
         span_name="anthropic.openrouter_responses_adapter",
         target_endpoint="openrouter:/v1/responses",
     )
+    (
+        translated_request_body,
+        openrouter_parallel_instruction_policy_changes,
+    ) = _apply_openrouter_adapter_parallel_instruction_policy(translated_request_body)
+    if openrouter_parallel_instruction_policy_changes:
+        verbose_proxy_logger.debug(
+            "Applied OpenRouter adapter parallel instruction policy; tools=%s",
+            openrouter_parallel_instruction_policy_changes.get(
+                "openrouter_adapter_parallel_instruction_tool_names"
+            ),
+        )
     forced_tool_choice_changes = (
         _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
             prepared_request_body,
@@ -6609,6 +6674,9 @@ def _add_openai_adapter_claude_context_compaction_logging_metadata(
     markers: set[str],
     metadata_items: list[dict[str, Any]],
     span_started_at: datetime,
+    tag_prefix: str = "openai-adapter",
+    metadata_prefix: str = "openai_adapter",
+    span_name: str = "openai_adapter.claude_context_compaction",
 ) -> dict[str, Any]:
     original_chars = sum(
         item.get("original_chars", 0)
@@ -6622,9 +6690,9 @@ def _add_openai_adapter_claude_context_compaction_logging_metadata(
     )
     sorted_markers = sorted(markers)
     tags = [
-        "openai-adapter-claude-context-compacted",
+        f"{tag_prefix}-claude-context-compacted",
         *[
-            f"openai-adapter-claude-context:{marker}"
+            f"{tag_prefix}-claude-context:{marker}"
             for marker in sorted_markers
         ],
     ]
@@ -6632,18 +6700,18 @@ def _add_openai_adapter_claude_context_compaction_logging_metadata(
         request_body,
         tags_to_add=tags,
         extra_fields={
-            "openai_adapter_claude_context_compacted": True,
-            "openai_adapter_claude_context_compacted_count": compacted_count,
-            "openai_adapter_claude_context_markers": sorted_markers,
-            "openai_adapter_claude_context_original_chars": original_chars,
-            "openai_adapter_claude_context_compacted_chars": compacted_chars,
-            "openai_adapter_claude_context_saved_chars": max(
+            f"{metadata_prefix}_claude_context_compacted": True,
+            f"{metadata_prefix}_claude_context_compacted_count": compacted_count,
+            f"{metadata_prefix}_claude_context_markers": sorted_markers,
+            f"{metadata_prefix}_claude_context_original_chars": original_chars,
+            f"{metadata_prefix}_claude_context_compacted_chars": compacted_chars,
+            f"{metadata_prefix}_claude_context_saved_chars": max(
                 0, original_chars - compacted_chars
             ),
-            "openai_adapter_claude_context_compaction_events": metadata_items,
+            f"{metadata_prefix}_claude_context_compaction_events": metadata_items,
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
-                    name="openai_adapter.claude_context_compaction",
+                    name=span_name,
                     metadata={
                         "compacted_count": compacted_count,
                         "markers": sorted_markers,
@@ -6661,6 +6729,10 @@ def _add_openai_adapter_claude_context_compaction_logging_metadata(
 
 def _compact_openai_adapter_claude_context_in_anthropic_request_body(
     request_body: dict[str, Any],
+    *,
+    tag_prefix: str = "openai-adapter",
+    metadata_prefix: str = "openai_adapter",
+    span_name: str = "openai_adapter.claude_context_compaction",
 ) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
     span_started_at = datetime.now(timezone.utc)
     updated_body = dict(request_body)
@@ -6691,6 +6763,9 @@ def _compact_openai_adapter_claude_context_in_anthropic_request_body(
         markers=markers,
         metadata_items=metadata_items,
         span_started_at=span_started_at,
+        tag_prefix=tag_prefix,
+        metadata_prefix=metadata_prefix,
+        span_name=span_name,
     )
     return updated_body, compacted_count, markers, metadata_items
 
@@ -8115,8 +8190,11 @@ def _add_claude_child_agent_observability_metadata(
         tags_to_add.append(f"claude-agent:{normalized_agent}")
 
         existing_trace_name = litellm_metadata.get("trace_name")
-        if not existing_trace_name or existing_trace_name == "claude-code":
-            extra_fields["trace_name"] = f"claude-code.{agent}"
+        child_trace_name = f"claude-code.{agent}"
+        if existing_trace_name != child_trace_name:
+            if existing_trace_name and not litellm_metadata.get("source_trace_name"):
+                extra_fields["source_trace_name"] = existing_trace_name
+            extra_fields["trace_name"] = child_trace_name
 
     if tenant:
         tenant_for_identity = explicit_tenant_id or tenant
