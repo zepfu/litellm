@@ -393,6 +393,70 @@ def _extract_generation_metric(
     return current
 
 
+def _route_family_candidates_for_request_route(route: str) -> set[str]:
+    normalized = route.split("?", 1)[0].strip().strip("/")
+    if not normalized:
+        return set()
+
+    route_lower = normalized.lower()
+    candidates: set[str] = set()
+    parts = [part for part in re.split(r"[/:\-]+", route_lower) if part]
+    parts_without_version = [
+        part for part in parts if not re.fullmatch(r"v\d+(?:internal)?", part)
+    ]
+    if parts_without_version:
+        candidates.add("_".join(parts_without_version))
+
+    if route_lower in {"anthropic/v1/messages", "anthropic/messages", "v1/messages"}:
+        candidates.add("anthropic_messages")
+    if route_lower.startswith("gemini/") and "streamgeneratecontent" in route_lower:
+        candidates.add("gemini_stream_generate_content")
+    elif route_lower.startswith("gemini/") and "generatecontent" in route_lower:
+        candidates.add("gemini_generate_content")
+    if route_lower.startswith("openai_passthrough/") and route_lower.endswith(
+        "responses"
+    ):
+        candidates.add("openai_passthrough_responses")
+
+    return candidates
+
+
+def _is_count_tokens_request_route(request_route: Any) -> bool:
+    if not isinstance(request_route, str):
+        return False
+    normalized = request_route.strip().lower().rstrip("/")
+    return normalized.endswith("/count_tokens")
+
+
+def _generation_observation_matches_allowed_route(
+    observation: dict[str, Any], allowed_request_routes: list[str]
+) -> bool:
+    metadata = observation.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    request_route = metadata.get("user_api_key_request_route")
+    if isinstance(request_route, str):
+        if request_route in allowed_request_routes:
+            return True
+        if _is_count_tokens_request_route(request_route):
+            return False
+
+    tags = metadata.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    tag_values = {tag for tag in tags if isinstance(tag, str)}
+
+    passthrough_route_family = metadata.get("passthrough_route_family")
+    for route in allowed_request_routes:
+        for route_family in _route_family_candidates_for_request_route(route):
+            if passthrough_route_family == route_family:
+                return True
+            if f"route:{route_family}" in tag_values:
+                return True
+    return False
+
+
 def _validate_generation_observations(
     *,
     family: str,
@@ -441,10 +505,10 @@ def _validate_generation_observations(
                 route_filtered_observations = [
                     observation
                     for observation in observations
-                    if (observation.get("metadata") or {}).get(
-                        "user_api_key_request_route"
+                    if _generation_observation_matches_allowed_route(
+                        observation,
+                        allowed_request_routes,
                     )
-                    in allowed_request_routes
                 ]
             if route_filtered_observations:
                 break

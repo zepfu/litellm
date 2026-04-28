@@ -230,6 +230,159 @@ def test_anthropic_stream_wrapper_back_to_back_tool_calls():
     assert get_weather_calls == 2
 
 
+def test_gemini_stream_wrapper_buffers_parallel_tool_calls_until_terminal_chunk():
+    responses = [
+        ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(
+                        tool_calls=[
+                            ChatCompletionDeltaToolCall(
+                                id="call_plan",
+                                function=Function(
+                                    arguments='{"file_path":"/tmp/plan.md"}',
+                                    name="read_file",
+                                ),
+                                index=0,
+                                type="function",
+                            ),
+                            ChatCompletionDeltaToolCall(
+                                id="call_docs",
+                                function=Function(
+                                    arguments='{"file_path":"/tmp/docs.md"}',
+                                    name="read_file",
+                                ),
+                                index=1,
+                                type="function",
+                            ),
+                        ]
+                    ),
+                    index=0,
+                    finish_reason=None,
+                )
+            ],
+        ),
+        ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(content=""),
+                    index=0,
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=Usage(prompt_tokens=230, completion_tokens=65, total_tokens=295),
+        ),
+    ]
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStream(responses),
+        model="gemini-3.1-pro-preview",
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    chunks = list(wrapper)
+    tool_starts = [
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_start"
+        and chunk["content_block"]["type"] == "tool_use"
+    ]
+    tool_deltas = [
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "input_json_delta"
+    ]
+
+    assert [chunk["content_block"]["id"] for chunk in tool_starts] == [
+        "call_plan",
+        "call_docs",
+    ]
+    assert [chunk["content_block"]["name"] for chunk in tool_starts] == [
+        "Read",
+        "Read",
+    ]
+    assert [chunk["delta"]["partial_json"] for chunk in tool_deltas] == [
+        '{"file_path":"/tmp/plan.md"}',
+        '{"file_path":"/tmp/docs.md"}',
+    ]
+    assert next(
+        chunk for chunk in chunks if chunk["type"] == "message_delta"
+    )["delta"]["stop_reason"] == "tool_use"
+
+
+def test_gemini_stream_wrapper_preserves_parallel_tool_calls_on_terminal_chunk():
+    responses = [
+        ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(
+                        tool_calls=[
+                            ChatCompletionDeltaToolCall(
+                                id="call_plan",
+                                function=Function(
+                                    arguments='{"file_path":"/tmp/plan.md"}',
+                                    name="read_file",
+                                ),
+                                index=0,
+                                type="function",
+                            ),
+                            ChatCompletionDeltaToolCall(
+                                id="call_docs",
+                                function=Function(
+                                    arguments='{"file_path":"/tmp/docs.md"}',
+                                    name="read_file",
+                                ),
+                                index=1,
+                                type="function",
+                            ),
+                        ]
+                    ),
+                    index=0,
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=Usage(prompt_tokens=230, completion_tokens=65, total_tokens=295),
+        ),
+    ]
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStream(responses),
+        model="gemini-3.1-pro-preview",
+        tool_name_mapping={"read_file": "Read"},
+    )
+
+    chunks = list(wrapper)
+    tool_starts = [
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_start"
+        and chunk["content_block"]["type"] == "tool_use"
+    ]
+    tool_deltas = [
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "input_json_delta"
+    ]
+
+    assert [chunk["content_block"]["id"] for chunk in tool_starts] == [
+        "call_plan",
+        "call_docs",
+    ]
+    assert [chunk["content_block"]["name"] for chunk in tool_starts] == [
+        "Read",
+        "Read",
+    ]
+    assert [chunk["delta"]["partial_json"] for chunk in tool_deltas] == [
+        '{"file_path":"/tmp/plan.md"}',
+        '{"file_path":"/tmp/docs.md"}',
+    ]
+    assert next(
+        chunk for chunk in chunks if chunk["type"] == "message_delta"
+    )["delta"]["stop_reason"] == "tool_use"
+
+
 def test_anthropic_stream_wrapper_interleaved_tool_calls_and_text():
     responses = [
         *construct_split_tool_call("tooluse_foo", "get_weather", ['{"city":', '"NY"}']),

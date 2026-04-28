@@ -26,6 +26,14 @@ _CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH = (
 _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH = (
     "context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json"
 )
+_CLAUDE_REPORT_FILE_PATCH_ID = "subagent-report-file-explicit-request"
+_CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN = re.compile(
+    r"Do NOT\s+(?:Write|\$\{[^}\r\n]+\})\s+"
+    r"report/summary/findings/analysis\s+\.md\s+files\.\s+"
+    r"Return findings directly as your final assistant message"
+    r"(?:\s+[—-]\s+the parent agent reads your text output,\s+not files you create)?"
+    r"\.?",
+)
 _CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION = (2, 1, 110)
 _CLAUDE_MEMORY_SECTION_PATTERN = re.compile(
     r"(?ms)^(?P<section_heading># (?:auto memory|Persistent Agent Memory))\n"
@@ -929,6 +937,53 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
     )
 
 
+def _apply_claude_prompt_patch_manifest_to_text(
+    text: str,
+    *,
+    cc_version: str,
+    manifest: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    updated_text = text
+    patch_events: list[dict[str, Any]] = []
+
+    for patch_descriptor in manifest["patches"]:
+        patch_id = patch_descriptor["id"]
+        before_text = patch_descriptor["before"]
+        after_text = patch_descriptor["after"]
+        occurrences = updated_text.count(before_text)
+        match_types: list[str] = []
+        if occurrences:
+            updated_text = updated_text.replace(before_text, after_text)
+            match_types.append("exact")
+
+        if patch_id == _CLAUDE_REPORT_FILE_PATCH_ID:
+            updated_text, pattern_occurrences = (
+                _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN.subn(
+                    after_text,
+                    updated_text,
+                )
+            )
+            if pattern_occurrences:
+                occurrences += pattern_occurrences
+                match_types.append("pattern")
+
+        if not occurrences:
+            continue
+
+        event: dict[str, Any] = {
+            "id": patch_id,
+            "status": "resolved",
+            "cc_version": cc_version,
+            "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
+            "occurrences": occurrences,
+        }
+        if match_types:
+            event["match_types"] = match_types
+        patch_events.append(event)
+
+    return updated_text, patch_events
+
+
 async def _rewrite_claude_control_plane_text(
     text: str,
     *,
@@ -963,22 +1018,11 @@ async def _rewrite_claude_control_plane_text(
                 override_events.append(override_event)
 
     try:
-        for patch_descriptor in manifest["patches"]:
-            before_text = patch_descriptor["before"]
-            if before_text not in updated_text:
-                continue
-            after_text = patch_descriptor["after"]
-            occurrences = updated_text.count(before_text)
-            updated_text = updated_text.replace(before_text, after_text)
-            patch_events.append(
-                {
-                    "id": patch_descriptor["id"],
-                    "status": "resolved",
-                    "cc_version": cc_version,
-                    "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
-                    "occurrences": occurrences,
-                }
-            )
+        updated_text, patch_events = _apply_claude_prompt_patch_manifest_to_text(
+            updated_text,
+            cc_version=cc_version,
+            manifest=manifest,
+        )
     except Exception as exc:
         patch_events.append(
             {
@@ -1109,6 +1153,17 @@ async def _rewrite_claude_control_plane_in_value(
             combined_patch_events,
         )
 
+    if isinstance(value, str):
+        updated_text, override_events, patch_events = await _rewrite_claude_control_plane_text(
+            value,
+            cc_version=cc_version,
+            manifest=manifest,
+            available_context=available_context,
+        )
+        if not override_events and not patch_events:
+            return value, [], []
+        return updated_text, override_events, patch_events
+
     return value, [], []
 
 
@@ -1227,28 +1282,11 @@ def _apply_claude_prompt_patches_in_text(
 ) -> tuple[str, list[dict[str, Any]]]:
     manifest_path = _resolve_claude_prompt_patch_manifest_path()
     manifest = _load_claude_prompt_patch_manifest(manifest_path)
-    updated_text = text
-    patch_events: list[dict[str, Any]] = []
-
-    for patch_descriptor in manifest["patches"]:
-        before_text = patch_descriptor["before"]
-        if before_text not in updated_text:
-            continue
-
-        after_text = patch_descriptor["after"]
-        occurrences = updated_text.count(before_text)
-        updated_text = updated_text.replace(before_text, after_text)
-        patch_events.append(
-            {
-                "id": patch_descriptor["id"],
-                "status": "resolved",
-                "cc_version": cc_version,
-                "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
-                "occurrences": occurrences,
-            }
-        )
-
-    return updated_text, patch_events
+    return _apply_claude_prompt_patch_manifest_to_text(
+        text,
+        cc_version=cc_version,
+        manifest=manifest,
+    )
 
 
 def _replace_claude_prompt_patches_in_value(
@@ -1303,6 +1341,24 @@ def _replace_claude_prompt_patches_in_value(
             if updated_child is not child:
                 changed = True
         return (updated_list if changed else value), combined_events
+
+    if isinstance(value, str):
+        try:
+            updated_text, patch_events = _apply_claude_prompt_patches_in_text(
+                value, cc_version
+            )
+        except Exception as exc:
+            return value, [
+                {
+                    "id": "manifest-load",
+                    "status": "failed",
+                    "cc_version": cc_version,
+                    "error": exc.__class__.__name__,
+                }
+            ]
+        if not patch_events:
+            return value, []
+        return updated_text, patch_events
 
     return value, []
 

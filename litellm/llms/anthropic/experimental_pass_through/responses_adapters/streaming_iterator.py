@@ -7,6 +7,10 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from litellm import verbose_logger
 from litellm._uuid import uuid
+from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+    sanitize_anthropic_tool_use_input,
+    sanitize_anthropic_tool_use_input_json_delta,
+)
 
 
 class AnthropicResponsesStreamWrapper:
@@ -40,8 +44,10 @@ class AnthropicResponsesStreamWrapper:
         self._pending_tool_ids: Dict[
             str, str
         ] = {}  # item_id -> call_id / name accumulator
+        self._pending_tool_names: Dict[str, str] = {}
         self._tool_inputs_seeded: set[str] = set()
         self._tool_argument_deltas_seen: set[str] = set()
+        self._read_tool_argument_buffers: Dict[str, str] = {}
         self._sent_message_start = False
         self._sent_message_stop = False
         self._chunk_queue: deque = deque()
@@ -208,10 +214,15 @@ class AnthropicResponsesStreamWrapper:
                     getattr(item, "arguments", None)
                     or (item.get("arguments") if isinstance(item, dict) else None)
                 )
+                input_data = sanitize_anthropic_tool_use_input(
+                    tool_name=name,
+                    tool_input=input_data,
+                )
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
                     self._pending_tool_ids[item_id] = call_id
+                    self._pending_tool_names[item_id] = name
                     if input_data:
                         self._tool_inputs_seeded.add(item_id)
                 self._chunk_queue.append(
@@ -348,10 +359,30 @@ class AnthropicResponsesStreamWrapper:
             item_id = getattr(event, "item_id", None) or (
                 event.get("item_id") if isinstance(event, dict) else None
             )
-            if item_id:
-                self._tool_argument_deltas_seen.add(item_id)
             delta = getattr(event, "delta", "") or (
                 event.get("delta", "") if isinstance(event, dict) else ""
+            )
+            tool_name = (
+                self._pending_tool_names.get(item_id, "") if item_id else ""
+            )
+            if item_id and tool_name == "Read":
+                buffered_delta = self._read_tool_argument_buffers.get(item_id, "") + delta
+                try:
+                    json.loads(buffered_delta)
+                except json.JSONDecodeError:
+                    self._read_tool_argument_buffers[item_id] = buffered_delta
+                    return
+                delta = sanitize_anthropic_tool_use_input_json_delta(
+                    tool_name=tool_name,
+                    partial_json=buffered_delta,
+                )
+                self._read_tool_argument_buffers.pop(item_id, None)
+                self._tool_argument_deltas_seen.add(item_id)
+            elif item_id:
+                self._tool_argument_deltas_seen.add(item_id)
+            delta = sanitize_anthropic_tool_use_input_json_delta(
+                tool_name=tool_name,
+                partial_json=delta,
             )
             block_idx = (
                 self._item_id_to_block_index.get(item_id, self._current_block_index)
@@ -472,6 +503,16 @@ class AnthropicResponsesStreamWrapper:
                     getattr(item, "arguments", None)
                     or (item.get("arguments") if isinstance(item, dict) else None)
                 )
+                if item_type == "function_call":
+                    tool_name = (
+                        getattr(item, "name", None)
+                        or (item.get("name") if isinstance(item, dict) else None)
+                        or self._pending_tool_names.get(item_id, "")
+                    )
+                    input_data = sanitize_anthropic_tool_use_input(
+                        tool_name=tool_name,
+                        tool_input=input_data,
+                    )
                 if (
                     input_data
                     and item_id not in self._tool_argument_deltas_seen

@@ -7,12 +7,14 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any
 
 import psycopg
@@ -185,9 +187,21 @@ def _format_harness_template(value: Any, context: dict[str, str]) -> Any:
     if isinstance(value, str):
         try:
             return value.format(**context)
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, IndexError):
             return value
     return value
+
+
+def _append_claude_agents_arg(command: list[Any], agents: Any) -> list[Any]:
+    if not isinstance(agents, dict) or not agents:
+        return command
+    if any(str(item) == '--agents' for item in command):
+        return command
+    return [
+        *command,
+        '--agents',
+        json.dumps(agents, sort_keys=True, separators=(',', ':')),
+    ]
 
 
 def _append_comma_headers(existing: str | None, headers: list[tuple[str, str]]) -> str:
@@ -288,6 +302,26 @@ def _apply_target_profile_to_config(
         updated_case['case_name'] = case_name
         tenant_id = _resolve_harness_tenant_id(updated_config, updated_case)
         updated_case['tenant_id'] = tenant_id
+        harness_run_id = str(
+            updated_case.get('harness_run_id')
+            or f'{case_name}-{uuid.uuid4().hex[:12]}'
+        )
+        updated_case['harness_run_id'] = harness_run_id
+        template_context = {
+            'target': target,
+            'case_name': case_name,
+            'tenant_id': tenant_id,
+            'harness_run_id': harness_run_id,
+            'litellm_base_url': profile['litellm_base_url'],
+            'anthropic_base_url': profile['anthropic_base_url'],
+        }
+        updated_case = _format_harness_template(updated_case, template_context)
+        command = updated_case.get('command')
+        if isinstance(command, list):
+            updated_case['command'] = _append_claude_agents_arg(
+                command,
+                updated_case.get('claude_agents'),
+            )
         session_history_validation = dict(
             updated_case.get('session_history_validation') or {}
         )
@@ -340,6 +374,7 @@ def _apply_target_profile_to_config(
                 case_name=case_name,
             )
         else:
+            updated_case.setdefault('expected_user_ids', [tenant_id])
             updated_case = _ensure_claude_tenant_header(updated_case, tenant_id)
             updated_case = RA._ensure_claude_harness_headers(
                 updated_case,
@@ -525,6 +560,79 @@ def _missing_required_env(config: dict[str, Any]) -> list[str]:
     ]
 
 
+def _normalize_expected_trace_user_ids_by_name(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for trace_name, user_id in value.items():
+        if not isinstance(trace_name, str):
+            continue
+        trace_name = trace_name.strip()
+        if not trace_name:
+            continue
+        if not isinstance(user_id, (str, int, float)):
+            continue
+        user_id = str(user_id).strip()
+        if user_id:
+            normalized[trace_name] = user_id
+    return normalized
+
+
+def _resolve_trace_lookup_user_id(
+    expected_user_ids: list[str],
+    expected_trace_user_ids_by_name: dict[str, str],
+) -> str | None:
+    if expected_user_ids:
+        return expected_user_ids[0]
+
+    expected_user_ids_from_trace_names = sorted(
+        {
+            user_id
+            for user_id in expected_trace_user_ids_by_name.values()
+            if isinstance(user_id, str) and user_id
+        }
+    )
+    if len(expected_user_ids_from_trace_names) == 1:
+        return expected_user_ids_from_trace_names[0]
+    return None
+
+
+def _validate_trace_user_ids_by_name(
+    *,
+    family: str,
+    traces: list[dict[str, Any]],
+    expected: dict[str, str],
+) -> tuple[dict[str, Any], list[str]]:
+    actual_by_name: dict[str, list[str]] = {}
+    for trace in traces:
+        trace_name = trace.get('name')
+        user_id = trace.get('userId')
+        if not isinstance(trace_name, str) or not trace_name:
+            continue
+        if not isinstance(user_id, str) or not user_id:
+            continue
+        actual_by_name.setdefault(trace_name, [])
+        if user_id not in actual_by_name[trace_name]:
+            actual_by_name[trace_name].append(user_id)
+
+    failures: list[str] = []
+    for trace_name, expected_user_id in expected.items():
+        actual_user_ids = actual_by_name.get(trace_name, [])
+        if expected_user_id not in actual_user_ids:
+            failures.append(
+                f'{family} trace {trace_name} missing user id {expected_user_id}'
+            )
+
+    summary = {
+        'expected': expected,
+        'actual_by_name': {
+            trace_name: sorted(user_ids)
+            for trace_name, user_ids in sorted(actual_by_name.items())
+        },
+    }
+    return summary, failures
+
+
 def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     failures: list[str] = []
     parsed = _parse_command_output_json(stdout)
@@ -533,10 +641,12 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
 
     required_equals = checks.get('required_equals', {}) or {}
     required_contains = checks.get('required_contains', {}) or {}
+    required_regex = checks.get('required_regex', {}) or {}
     required_minimums = checks.get('required_minimums', {}) or {}
 
     equals_hits: dict[str, Any] = {}
     contains_hits: dict[str, Any] = {}
+    regex_hits: dict[str, Any] = {}
     minimum_hits: dict[str, Any] = {}
 
     for path, expected in required_equals.items():
@@ -553,6 +663,26 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
                 f'{family} command JSON missing substring for `{path}`: expected to contain {expected_substring!r}, got {actual!r}'
             )
 
+    for path, expected_pattern in required_regex.items():
+        actual = _extract_path_value(parsed, path)
+        regex_hits[path] = actual
+        if not isinstance(actual, str) or not isinstance(expected_pattern, str):
+            failures.append(
+                f'{family} command JSON regex mismatch for `{path}`: expected pattern {expected_pattern!r}, got {actual!r}'
+            )
+            continue
+        try:
+            matched = re.search(expected_pattern, actual) is not None
+        except re.error as exc:
+            failures.append(
+                f'{family} command JSON invalid regex for `{path}`: {expected_pattern!r} ({exc})'
+            )
+            continue
+        if not matched:
+            failures.append(
+                f'{family} command JSON regex mismatch for `{path}`: expected pattern {expected_pattern!r}, got {actual!r}'
+            )
+
     for path, minimum in required_minimums.items():
         actual = _extract_path_value(parsed, path)
         minimum_hits[path] = actual
@@ -563,6 +693,7 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
         'parsed': parsed,
         'required_equals_hits': equals_hits,
         'required_contains_hits': contains_hits,
+        'required_regex_hits': regex_hits,
         'required_minimum_hits': minimum_hits,
     }, failures
 
@@ -950,9 +1081,28 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         order by start_time desc
     '''
     conn = _validation_db_connection(db_settings)
-    with conn.cursor() as cur:
-        cur.execute(query, (session_id,))
-        records = cur.fetchall()
+    poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
+    poll_interval_seconds = max(0.1, float(checks.get('poll_interval_seconds') or 1))
+    poll_deadline = time.monotonic() + poll_timeout_seconds
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(query, (session_id,))
+            records = cur.fetchall()
+
+        if records:
+            if not expected_rows:
+                break
+            _, expected_row_failures = _match_session_history_expected_rows(
+                family=family,
+                records=records,
+                expected_rows=expected_rows,
+            )
+            if not expected_row_failures:
+                break
+
+        if time.monotonic() >= poll_deadline:
+            break
+        time.sleep(poll_interval_seconds)
 
     if not records:
         return {'record': None, 'records': []}, [f'{family} missing session_history row for session_id `{session_id}`']
@@ -1029,7 +1179,11 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         )
         failures.extend(expected_row_failures)
 
-        return {'record': matched_records[0] if matched_records else None, 'records': matched_records}, failures
+        return {
+            'record': matched_records[0] if matched_records else None,
+            'records': matched_records,
+            'all_records': [_normalize_record(row) for row in records],
+        }, failures
 
     filtered_records = [
         row for row in records
@@ -1233,6 +1387,36 @@ def _session_history_record_matches_expected(
     return True
 
 
+def _session_history_candidate_summary(
+    row: dict[str, Any],
+    expected_row: dict[str, Any],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        'provider': row.get('provider'),
+        'model': row.get('model'),
+        'tenant_id': row.get('tenant_id'),
+        'input_tokens': row.get('input_tokens'),
+        'output_tokens': row.get('output_tokens'),
+        'response_cost_usd': row.get('response_cost_usd'),
+    }
+    metadata = row.get('metadata')
+    if isinstance(metadata, dict) and metadata.get('tenant_id') is not None:
+        summary['metadata.tenant_id'] = metadata.get('tenant_id')
+
+    mismatches: dict[str, Any] = {}
+    for key, expected in (expected_row.get('required_equals') or {}).items():
+        actual = row.get(key)
+        if actual != expected:
+            mismatches[key] = {'expected': expected, 'actual': actual}
+    for key, minimum in (expected_row.get('minimums') or {}).items():
+        actual = row.get(key)
+        if not isinstance(actual, (int, float)) or actual < minimum:
+            mismatches[key] = {'minimum': minimum, 'actual': actual}
+    if mismatches:
+        summary['mismatches'] = mismatches
+    return summary
+
+
 def _match_session_history_expected_rows(
     *,
     family: str,
@@ -1262,8 +1446,24 @@ def _match_session_history_expected_rows(
             and _session_history_record_matches_expected(row, expected_row)
         ]
         if len(matches) < minimum_count:
+            candidate_rows = [
+                row
+                for row in records
+                if (row_provider is None or row.get('provider') == row_provider)
+                and (row_model is None or row.get('model') == row_model)
+            ]
+            candidate_summary = [
+                _session_history_candidate_summary(row, expected_row)
+                for row in candidate_rows[:5]
+            ]
+            detail = ''
+            if candidate_summary:
+                detail = (
+                    '; candidate rows: '
+                    + json.dumps(candidate_summary, sort_keys=True, default=str)
+                )
             failures.append(
-                f'{family} missing session_history rows for provider={row_provider!r} model={row_model!r}; expected >= {minimum_count}, got {len(matches)}'
+                f'{family} missing session_history rows for provider={row_provider!r} model={row_model!r}; expected >= {minimum_count}, got {len(matches)}{detail}'
             )
             continue
         selected_matches = matches[:minimum_count]
@@ -1293,9 +1493,39 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
         order by created_at asc, tool_index asc
     '''
     conn = _validation_db_connection(db_settings)
-    with conn.cursor() as cur:
-        cur.execute(query, (session_id,))
-        records = cur.fetchall()
+    expected_rows = checks.get('expected_rows') or []
+    poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
+    poll_interval_seconds = max(0.1, float(checks.get('poll_interval_seconds') or 1))
+    poll_deadline = time.monotonic() + poll_timeout_seconds
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(query, (session_id,))
+            records = cur.fetchall()
+
+        missing_expected_rows = False
+        for expected_row in expected_rows:
+            row_provider = expected_row.get('provider')
+            row_model = expected_row.get('model')
+            row_tool_name = expected_row.get('tool_name')
+            row_tool_kind = expected_row.get('tool_kind')
+            matches = [
+                row
+                for row in records
+                if (row_provider is None or row.get('provider') == row_provider)
+                and (row_model is None or row.get('model') == row_model)
+                and (row_tool_name is None or row.get('tool_name') == row_tool_name)
+                and (row_tool_kind is None or row.get('tool_kind') == row_tool_kind)
+            ]
+            minimum_count = int(expected_row.get('minimum_count') or 1)
+            if len(matches) < minimum_count:
+                missing_expected_rows = True
+                break
+
+        if records and not missing_expected_rows:
+            break
+        if time.monotonic() >= poll_deadline:
+            break
+        time.sleep(poll_interval_seconds)
 
     def _normalize_record(row: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1304,7 +1534,6 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
         }
 
     failures: list[str] = []
-    expected_rows = checks.get('expected_rows') or []
     matched_records: list[dict[str, Any]] = []
     for expected_row in expected_rows:
         row_provider = expected_row.get('provider')
@@ -1325,11 +1554,98 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
                 f'{family} missing tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} tool_kind={row_tool_kind!r}; expected >= {minimum_count}, got {len(matches)}'
             )
             continue
+        maximum_count = expected_row.get('maximum_count')
+        if maximum_count is not None:
+            maximum_count_int = int(maximum_count)
+            if len(matches) > maximum_count_int:
+                failures.append(
+                    f'{family} too many tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} tool_kind={row_tool_kind!r}; expected <= {maximum_count_int}, got {len(matches)}'
+                )
         command_text_contains = expected_row.get('command_text_contains')
         if isinstance(command_text_contains, str) and command_text_contains:
             if not any(command_text_contains in str(row.get('command_text') or '') for row in matches):
                 failures.append(
                     f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} did not include command text containing {command_text_contains!r}'
+                )
+        required_argument_substrings = []
+        configured_required_argument = expected_row.get(
+            'arguments_required_substring'
+        )
+        if (
+            isinstance(configured_required_argument, str)
+            and configured_required_argument
+        ):
+            required_argument_substrings.append(configured_required_argument)
+        configured_required_arguments = expected_row.get(
+            'arguments_required_substrings'
+        )
+        if isinstance(configured_required_arguments, list):
+            required_argument_substrings.extend(
+                value
+                for value in configured_required_arguments
+                if isinstance(value, str) and value
+            )
+        for required_argument_substring in required_argument_substrings:
+            if not any(
+                required_argument_substring
+                in json.dumps(row.get('arguments'), sort_keys=True)
+                for row in matches
+            ):
+                failures.append(
+                    f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} did not include arguments containing {required_argument_substring!r}'
+                )
+        forbidden_command_substrings = []
+        configured_forbidden_command = expected_row.get(
+            'command_text_forbidden_substring'
+        )
+        if (
+            isinstance(configured_forbidden_command, str)
+            and configured_forbidden_command
+        ):
+            forbidden_command_substrings.append(configured_forbidden_command)
+        configured_forbidden_commands = expected_row.get(
+            'command_text_forbidden_substrings'
+        )
+        if isinstance(configured_forbidden_commands, list):
+            forbidden_command_substrings.extend(
+                value
+                for value in configured_forbidden_commands
+                if isinstance(value, str) and value
+            )
+        for forbidden_command_substring in forbidden_command_substrings:
+            if any(
+                forbidden_command_substring in str(row.get('command_text') or '')
+                for row in matches
+            ):
+                failures.append(
+                    f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} included forbidden command text substring {forbidden_command_substring!r}'
+                )
+        forbidden_argument_substrings = []
+        configured_forbidden_argument = expected_row.get(
+            'arguments_forbidden_substring'
+        )
+        if (
+            isinstance(configured_forbidden_argument, str)
+            and configured_forbidden_argument
+        ):
+            forbidden_argument_substrings.append(configured_forbidden_argument)
+        configured_forbidden_arguments = expected_row.get(
+            'arguments_forbidden_substrings'
+        )
+        if isinstance(configured_forbidden_arguments, list):
+            forbidden_argument_substrings.extend(
+                value
+                for value in configured_forbidden_arguments
+                if isinstance(value, str) and value
+            )
+        for forbidden_argument_substring in forbidden_argument_substrings:
+            if any(
+                forbidden_argument_substring
+                in json.dumps(row.get('arguments'), sort_keys=True)
+                for row in matches
+            ):
+                failures.append(
+                    f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} included forbidden arguments substring {forbidden_argument_substring!r}'
                 )
         matched_records.extend(_normalize_record(row) for row in matches[:minimum_count])
 
@@ -1338,6 +1654,433 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
         'records': [_normalize_record(row) for row in records],
         'matched_records': matched_records,
     }, failures
+
+
+def _claude_projects_root(checks: dict[str, Any]) -> pathlib.Path:
+    configured = (
+        checks.get('claude_projects_root')
+        or checks.get('projects_root')
+        or os.environ.get('CLAUDE_PROJECTS_ROOT')
+        or os.environ.get('CLAUDE_PROJECTS_DIR')
+        or '/home/zepfu/.claude/projects'
+    )
+    return pathlib.Path(str(configured)).expanduser()
+
+
+def _iter_claude_jsonl(path: pathlib.Path) -> list[tuple[int, dict[str, Any]]]:
+    records: list[tuple[int, dict[str, Any]]] = []
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return records
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            records.append((line_number, parsed))
+    return records
+
+
+def _preview_json(value: Any, *, max_chars: int = 300) -> str:
+    try:
+        text = json.dumps(value, sort_keys=True, default=str)
+    except TypeError:
+        text = str(value)
+    text = text.replace('\n', '\\n')
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + '...'
+
+
+def _transcript_agent_type(path: pathlib.Path) -> str | None:
+    meta_path = path.with_suffix('.meta.json')
+    try:
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    if isinstance(meta, dict):
+        for key in ('agentType', 'agent_type', 'name'):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    for _, record in _iter_claude_jsonl(path)[:5]:
+        attachment = record.get('attachment')
+        if not isinstance(attachment, dict):
+            continue
+        content = attachment.get('content')
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, str):
+                continue
+            match = re.search(r"You are '([^']+)'", item)
+            if match:
+                return match.group(1).strip()
+    return None
+
+
+def _find_claude_subagent_transcripts(
+    *,
+    session_id: str,
+    projects_root: pathlib.Path,
+    expected_agent: str | None,
+) -> tuple[list[pathlib.Path], list[dict[str, Any]]]:
+    pattern = f'*/{session_id}/subagents/*.jsonl'
+    candidate_paths = sorted(projects_root.glob(pattern))
+    candidates: list[dict[str, Any]] = []
+    matches: list[pathlib.Path] = []
+    expected = expected_agent.strip() if isinstance(expected_agent, str) else None
+    for path in candidate_paths:
+        if path.name.startswith('agent-acompact-'):
+            continue
+        agent_type = _transcript_agent_type(path)
+        candidate = {
+            'path': str(path),
+            'agent_type': agent_type,
+        }
+        candidates.append(candidate)
+        if expected is None or agent_type == expected:
+            matches.append(path)
+    return matches, candidates
+
+
+def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]:
+    by_tool_name: dict[str, int] = {}
+    by_assistant_message_id: dict[str, dict[str, int]] = {}
+    records: list[dict[str, Any]] = []
+    records_by_tool_use_id: dict[str, dict[str, Any]] = {}
+    tool_result_errors: list[dict[str, Any]] = []
+    transcript_summaries: list[dict[str, Any]] = []
+    for path in paths:
+        transcript_tool_count = 0
+        for line_number, record in _iter_claude_jsonl(path):
+            message = record.get('message')
+            if not isinstance(message, dict):
+                continue
+            content = message.get('content')
+            if not isinstance(content, list):
+                continue
+            if message.get('role') == 'user':
+                for block in content:
+                    if not isinstance(block, dict) or block.get('type') != 'tool_result':
+                        continue
+                    tool_use_id = str(block.get('tool_use_id') or '')
+                    is_error = block.get('is_error') is True
+                    tool_result_record = {
+                        'path': str(path),
+                        'line': line_number,
+                        'timestamp': record.get('timestamp'),
+                        'agent_id': record.get('agentId'),
+                        'entry_uuid': record.get('uuid'),
+                        'tool_use_id': tool_use_id,
+                        'is_error': is_error,
+                        'content_preview': _preview_json(block.get('content')),
+                    }
+                    if tool_use_id in records_by_tool_use_id:
+                        records_by_tool_use_id[tool_use_id][
+                            'tool_result_is_error'
+                        ] = is_error
+                        records_by_tool_use_id[tool_use_id][
+                            'tool_result_line'
+                        ] = line_number
+                        records_by_tool_use_id[tool_use_id][
+                            'tool_result_content_preview'
+                        ] = tool_result_record['content_preview']
+                    if is_error:
+                        tool_result_errors.append(tool_result_record)
+                continue
+            if message.get('role') != 'assistant':
+                continue
+            message_id = str(message.get('id') or '')
+            for block in content:
+                if not isinstance(block, dict) or block.get('type') != 'tool_use':
+                    continue
+                tool_name = str(block.get('name') or '')
+                if not tool_name:
+                    continue
+                by_tool_name[tool_name] = by_tool_name.get(tool_name, 0) + 1
+                message_counts = by_assistant_message_id.setdefault(message_id, {})
+                message_counts[tool_name] = message_counts.get(tool_name, 0) + 1
+                transcript_tool_count += 1
+                tool_use_id = str(block.get('id') or '')
+                tool_record = {
+                    'path': str(path),
+                    'line': line_number,
+                    'timestamp': record.get('timestamp'),
+                    'agent_id': record.get('agentId'),
+                    'message_id': message_id,
+                    'entry_uuid': record.get('uuid'),
+                    'tool_use_id': tool_use_id,
+                    'tool_name': tool_name,
+                    'input_preview': _preview_json(block.get('input')),
+                }
+                records.append(tool_record)
+                if tool_use_id:
+                    records_by_tool_use_id[tool_use_id] = tool_record
+        transcript_summaries.append({
+            'path': str(path),
+            'agent_type': _transcript_agent_type(path),
+            'tool_use_count': transcript_tool_count,
+        })
+
+    message_totals = {
+        message_id: sum(tool_counts.values())
+        for message_id, tool_counts in by_assistant_message_id.items()
+    }
+    max_tools_in_message = max(message_totals.values(), default=0)
+    return {
+        'transcripts': transcript_summaries,
+        'by_tool_name': dict(sorted(by_tool_name.items())),
+        'by_assistant_message_id': {
+            message_id: dict(sorted(tool_counts.items()))
+            for message_id, tool_counts in sorted(by_assistant_message_id.items())
+        },
+        'max_tool_uses_in_single_assistant_message': max_tools_in_message,
+        'total_tool_uses': len(records),
+        'tool_result_errors': tool_result_errors,
+        'records': records,
+    }
+
+
+def _normalize_transcript_agent_checks(checks: dict[str, Any]) -> list[dict[str, Any]]:
+    configured_agents = checks.get('expected_agents')
+    if isinstance(configured_agents, list) and configured_agents:
+        return [agent for agent in configured_agents if isinstance(agent, dict)]
+
+    expected_agent = checks.get('expected_child_agent', checks.get('expected_agent'))
+    if expected_agent is None and not (
+        checks.get('expected_tool_counts') or checks.get('tool_counts')
+    ):
+        return []
+    return [{
+        'agent_type': expected_agent,
+        'expected_tool_counts': checks.get('expected_tool_counts')
+        or checks.get('tool_counts')
+        or {},
+        'minimum_total_tool_uses': checks.get('minimum_total_tool_uses'),
+        'maximum_total_tool_uses': checks.get('maximum_total_tool_uses'),
+        'maximum_tool_uses_per_assistant_message': checks.get(
+            'maximum_tool_uses_per_assistant_message'
+        ),
+        'minimum_tools_in_single_assistant_message': checks.get(
+            'minimum_tools_in_single_assistant_message'
+        ),
+        'forbid_tool_result_errors': checks.get('forbid_tool_result_errors'),
+        'expected_tool_sequence': checks.get('expected_tool_sequence'),
+        'require_tool_result_before_next_tool_use': checks.get(
+            'require_tool_result_before_next_tool_use'
+        ),
+    }]
+
+
+def _tool_count_bounds(expected: Any) -> tuple[int, int | None]:
+    if isinstance(expected, dict):
+        raw_minimum = expected.get('minimum_count', expected.get('min', 1))
+        raw_maximum = expected.get('maximum_count', expected.get('max'))
+    else:
+        raw_minimum = expected
+        raw_maximum = expected
+    try:
+        minimum = int(raw_minimum)
+    except (TypeError, ValueError):
+        minimum = 1
+    maximum: int | None
+    try:
+        maximum = int(raw_maximum) if raw_maximum is not None else None
+    except (TypeError, ValueError):
+        maximum = None
+    return minimum, maximum
+
+
+def _validate_transcript_agent_tool_uses(
+    *,
+    family: str,
+    session_id: str,
+    projects_root: pathlib.Path,
+    agent_checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    expected_agent = agent_checks.get('agent_type') or agent_checks.get('agent')
+    expected_agent_text = (
+        str(expected_agent).strip()
+        if isinstance(expected_agent, (str, int, float))
+        and str(expected_agent).strip()
+        else None
+    )
+    paths, candidates = _find_claude_subagent_transcripts(
+        session_id=session_id,
+        projects_root=projects_root,
+        expected_agent=expected_agent_text,
+    )
+    summary = {
+        'expected_agent': expected_agent_text,
+        'candidate_transcripts': candidates,
+        **_summarize_transcript_tool_uses(paths),
+    }
+    failures: list[str] = []
+    if not paths:
+        failures.append(
+            f'{family} missing Claude subagent transcript for agent={expected_agent_text!r} session_id={session_id!r}'
+        )
+        return summary, failures
+
+    expected_tool_counts = (
+        agent_checks.get('expected_tool_counts')
+        or agent_checks.get('tool_counts')
+        or {}
+    )
+    if isinstance(expected_tool_counts, dict):
+        for tool_name, expected_count in expected_tool_counts.items():
+            minimum, maximum = _tool_count_bounds(expected_count)
+            actual = int(summary['by_tool_name'].get(str(tool_name), 0))
+            if actual < minimum:
+                failures.append(
+                    f'{family} transcript for agent={expected_agent_text!r} missing tool_use {str(tool_name)!r}; expected >= {minimum}, got {actual}'
+                )
+            if maximum is not None and actual > maximum:
+                failures.append(
+                    f'{family} transcript for agent={expected_agent_text!r} had too many tool_use {str(tool_name)!r}; expected <= {maximum}, got {actual}'
+                )
+
+    total_tool_uses = int(summary['total_tool_uses'])
+    for key, label, comparator in (
+        ('minimum_total_tool_uses', 'total tool_use count', '>='),
+        ('maximum_total_tool_uses', 'total tool_use count', '<='),
+    ):
+        raw_expected = agent_checks.get(key)
+        if raw_expected is None:
+            continue
+        expected_int = int(raw_expected)
+        if comparator == '>=' and total_tool_uses < expected_int:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} {label} expected >= {expected_int}, got {total_tool_uses}'
+            )
+        if comparator == '<=' and total_tool_uses > expected_int:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} {label} expected <= {expected_int}, got {total_tool_uses}'
+            )
+
+    expected_tool_sequence = agent_checks.get('expected_tool_sequence')
+    if isinstance(expected_tool_sequence, list):
+        expected_sequence = [str(tool_name) for tool_name in expected_tool_sequence]
+        actual_sequence = [
+            str(record.get('tool_name') or '')
+            for record in (summary.get('records') or [])
+        ]
+        if actual_sequence != expected_sequence:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} tool_use sequence mismatch; expected {json.dumps(expected_sequence)}, got {json.dumps(actual_sequence)}'
+            )
+
+    if agent_checks.get('require_tool_result_before_next_tool_use') is True:
+        records = [
+            record for record in (summary.get('records') or [])
+            if isinstance(record, dict)
+        ]
+        for previous_record, next_record in zip(records, records[1:]):
+            result_line = previous_record.get('tool_result_line')
+            previous_path = previous_record.get('path')
+            next_path = next_record.get('path')
+            try:
+                result_line_int = int(result_line)
+            except (TypeError, ValueError):
+                result_line_int = 0
+            try:
+                next_line_int = int(next_record.get('line') or 0)
+            except (TypeError, ValueError):
+                next_line_int = 0
+            if previous_path != next_path:
+                failures.append(
+                    f'{family} transcript for agent={expected_agent_text!r} cannot prove tool_result before next tool_use across transcripts after {previous_record.get("tool_name")!r}'
+                )
+                continue
+            if result_line_int <= 0 or result_line_int >= next_line_int:
+                failures.append(
+                    f'{family} transcript for agent={expected_agent_text!r} did not record tool_result before next tool_use after {previous_record.get("tool_name")!r}'
+                )
+
+    max_per_message = int(summary['max_tool_uses_in_single_assistant_message'])
+    raw_max_per_message = agent_checks.get('maximum_tool_uses_per_assistant_message')
+    if raw_max_per_message is not None:
+        expected_max = int(raw_max_per_message)
+        if max_per_message > expected_max:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} had {max_per_message} tool_use blocks in one assistant message; expected <= {expected_max}'
+            )
+    raw_min_parallel = agent_checks.get('minimum_tools_in_single_assistant_message')
+    if raw_min_parallel is not None:
+        expected_min = int(raw_min_parallel)
+        if max_per_message < expected_min:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} never had >= {expected_min} tool_use blocks in one assistant message; max was {max_per_message}'
+            )
+
+    if agent_checks.get('forbid_tool_result_errors') is True:
+        tool_result_errors = summary.get('tool_result_errors') or []
+        if tool_result_errors:
+            previews = [
+                {
+                    'line': error.get('line'),
+                    'tool_use_id': error.get('tool_use_id'),
+                    'content_preview': error.get('content_preview'),
+                }
+                for error in tool_result_errors[:5]
+            ]
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} had tool_result errors: {json.dumps(previews, sort_keys=True)}'
+            )
+
+    return summary, failures
+
+
+def _validate_transcript_tool_use(
+    *,
+    family: str,
+    session_id: str | None,
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not session_id:
+        return {'agents': []}, [f'{family} missing command session_id for transcript tool_use validation']
+
+    projects_root = _claude_projects_root(checks)
+    agent_checks = _normalize_transcript_agent_checks(checks)
+    if not agent_checks:
+        return {'projects_root': str(projects_root), 'agents': []}, []
+
+    poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
+    poll_interval_seconds = max(0.1, float(checks.get('poll_interval_seconds') or 1))
+    poll_deadline = time.monotonic() + poll_timeout_seconds
+    final_summary: dict[str, Any] = {'projects_root': str(projects_root), 'agents': []}
+    final_failures: list[str] = []
+    while True:
+        summaries: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for one_agent_checks in agent_checks:
+            summary, agent_failures = _validate_transcript_agent_tool_uses(
+                family=family,
+                session_id=session_id,
+                projects_root=projects_root,
+                agent_checks=one_agent_checks,
+            )
+            summaries.append(summary)
+            failures.extend(agent_failures)
+
+        final_summary = {
+            'projects_root': str(projects_root),
+            'session_id': session_id,
+            'agents': summaries,
+        }
+        final_failures = failures
+        if not failures or time.monotonic() >= poll_deadline:
+            break
+        time.sleep(poll_interval_seconds)
+
+    return final_summary, final_failures
 
 
 def _downgrade_configured_failures_to_warnings(
@@ -1738,6 +2481,13 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
 
     expected_trace_names = config.get('required_trace_names', [])
     expected_user_ids = config.get('expected_user_ids', [])
+    expected_trace_user_ids_by_name = _normalize_expected_trace_user_ids_by_name(
+        config.get('expected_trace_user_ids_by_name')
+    )
+    lookup_user_id = _resolve_trace_lookup_user_id(
+        expected_user_ids,
+        expected_trace_user_ids_by_name,
+    )
     use_session_trace_lookup = bool(config.get('use_session_trace_lookup', True))
     can_session_trace_lookup = (
         use_session_trace_lookup
@@ -1754,7 +2504,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             public_key=public_key,
             secret_key=secret_key,
             names=expected_trace_names,
-            user_id=expected_user_ids[0] if expected_user_ids else None,
+            user_id=lookup_user_id,
             start_time=started,
             limit=100,
             timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
@@ -1764,7 +2514,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             query_url=query_url,
             public_key=public_key,
             secret_key=secret_key,
-            user_id=expected_user_ids[0] if expected_user_ids else None,
+            user_id=lookup_user_id,
             start_time=started,
             session_id=command_session_id.strip(),
             timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
@@ -1789,6 +2539,14 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     for user_id in expected_user_ids:
         if user_id not in actual_user_ids:
             failures.append(f'missing {name} user id: {user_id}')
+    trace_user_ids_by_name_summary, trace_user_ids_by_name_failures = (
+        _validate_trace_user_ids_by_name(
+            family=name,
+            traces=traces,
+            expected=expected_trace_user_ids_by_name,
+        )
+    )
+    failures.extend(trace_user_ids_by_name_failures)
     if bool(config.get('require_trace_user_id')) and traces and not actual_user_ids:
         failures.append(f'{name} traces did not include a Langfuse userId')
 
@@ -1917,6 +2675,12 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('tool_activity_validation') or {},
     ) if config.get('tool_activity_validation') else ({'record': None, 'records': []}, [])
     failures.extend(tool_activity_failures)
+    transcript_tool_use_summary, transcript_tool_use_failures = _validate_transcript_tool_use(
+        family=name,
+        session_id=command_session_id,
+        checks=config.get('transcript_tool_use_validation') or {},
+    ) if config.get('transcript_tool_use_validation') else ({'agents': []}, [])
+    failures.extend(transcript_tool_use_failures)
 
     runtime_summary, runtime_failures = _validate_runtime_postcondition(
         family=name,
@@ -1976,6 +2740,8 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             'actual_trace_names': actual_trace_names,
             'expected_user_ids': expected_user_ids,
             'actual_user_ids': actual_user_ids,
+            'expected_trace_user_ids_by_name': expected_trace_user_ids_by_name,
+            'trace_user_ids_by_name': trace_user_ids_by_name_summary,
             'trace_ids': trace_ids,
             'trace_count': len(traces),
             'lookup_error': lookup_error,
@@ -1993,6 +2759,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         'command_json': command_json_summary,
         'session_history': session_history_summary,
         'tool_activity': tool_activity_summary,
+        'transcript_tool_use': transcript_tool_use_summary,
         'runtime_postconditions': runtime_summary,
         'runtime_logs': runtime_log_summary,
         'passed': not hard_failures,
