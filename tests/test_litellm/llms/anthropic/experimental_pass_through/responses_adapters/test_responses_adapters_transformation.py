@@ -688,7 +688,21 @@ class TestTranslateToolChoiceToResponsesAPI:
 
 
 class TestTranslateParallelToolCallsToResponsesAPI:
-    """Anthropic disable_parallel_tool_use -> Responses parallel_tool_calls."""
+    """Anthropic parallel tool-use semantics -> Responses parallel_tool_calls."""
+
+    def test_parallel_tool_use_maps_to_true_for_function_tools_by_default(self):
+        result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
+            {"type": "auto"},
+            translated_tools=[{"type": "function", "name": "get_weather"}],
+        )
+        assert result is True
+
+    def test_parallel_tool_use_maps_to_true_without_tool_choice(self):
+        result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
+            None,
+            translated_tools=[{"type": "function", "name": "get_weather"}],
+        )
+        assert result is True
 
     def test_disable_parallel_tool_use_maps_to_false_for_function_tools(self):
         result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
@@ -701,6 +715,13 @@ class TestTranslateParallelToolCallsToResponsesAPI:
         result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
             {"type": "auto", "disable_parallel_tool_use": True},
             translated_tools=None,
+        )
+        assert result is None
+
+    def test_tool_choice_none_ignores_parallel_tool_calls(self):
+        result = _ADAPTER.translate_parallel_tool_calls_to_responses_api(
+            {"type": "none"},
+            translated_tools=[{"type": "function", "name": "get_weather"}],
         )
         assert result is None
 
@@ -973,6 +994,19 @@ class TestTranslateRequestBroaderCoverage:
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["parallel_tool_calls"] is False
 
+    def test_function_tools_set_parallel_tool_calls_true_without_tool_choice(self):
+        req = _make_request(tools=[{"name": "do_thing"}])
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["parallel_tool_calls"] is True
+
+    def test_function_tools_set_parallel_tool_calls_true_with_auto_tool_choice(self):
+        req = _make_request(
+            tools=[{"name": "do_thing"}],
+            tool_choice={"type": "auto"},
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["parallel_tool_calls"] is True
+
     def test_disable_parallel_tool_use_not_set_for_built_in_tools(self):
         req = _make_request(
             tools=[{"name": "web_search", "type": "web_search_20250305"}],
@@ -1198,6 +1232,39 @@ class TestTranslateResponse:
         assert block["id"] == "call_99"
         assert block["name"] == "get_weather"
         assert block["input"] == {"city": "NYC"}
+
+    def test_function_call_omits_empty_read_pages_argument(self):
+        fc = _make_function_call_item(
+            "call_read",
+            "Read",
+            '{"file_path": "/tmp/example.py", "pages": ""}',
+        )
+        response = _make_mock_response(output=[fc])
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"][0]["input"] == {"file_path": "/tmp/example.py"}
+
+    def test_function_call_preserves_unrelated_empty_strings(self):
+        fc = _make_function_call_item(
+            "call_read",
+            "Read",
+            '{"file_path": "/tmp/example.py", "note": ""}',
+        )
+        response = _make_mock_response(output=[fc])
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"][0]["input"] == {
+            "file_path": "/tmp/example.py",
+            "note": "",
+        }
+
+    def test_non_read_function_call_preserves_empty_pages_argument(self):
+        fc = _make_function_call_item(
+            "call_other",
+            "Search",
+            '{"query": "docs", "pages": ""}',
+        )
+        response = _make_mock_response(output=[fc])
+        result: Any = _ADAPTER.translate_response(response)
+        assert result["content"][0]["input"] == {"query": "docs", "pages": ""}
 
     def test_function_call_sets_stop_reason_tool_use(self):
         """Presence of a function_call sets stop_reason to 'tool_use'."""

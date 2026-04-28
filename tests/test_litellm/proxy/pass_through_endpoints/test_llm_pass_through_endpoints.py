@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import traceback
+from typing import Any
 from unittest import mock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -23,6 +24,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     RouteChecks,
     _apply_google_adapter_completion_message_window,
     _apply_google_adapter_request_shape_policy,
+    _apply_google_adapter_system_prompt_policy,
     _apply_google_code_assist_native_tool_aliases,
     _build_anthropic_responses_adapter_request_body,
     _build_completion_adapter_metadata,
@@ -38,6 +40,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_google_adapter_semaphore,
     _get_openrouter_adapter_hidden_retry_budget_seconds,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
+    _handle_anthropic_nvidia_completion_adapter_route,
     _perform_google_adapter_pass_through_request,
     _perform_openrouter_adapter_pass_through_request,
     _perform_openrouter_completion_adapter_operation,
@@ -77,11 +80,81 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
 )
 
 
+_CLAUDE_CODE_AGENT_PROJECT_TEXT = (
+    "You are 'gpt5-5' and you are working on the 'aawm-tap' project.\n"
+    "Return ok."
+)
+
+
 @pytest.fixture(autouse=True)
 def clear_openrouter_adapter_failure_circuit_state():
     _openrouter_adapter_failure_circuit_until_monotonic_by_key.clear()
     yield
     _openrouter_adapter_failure_circuit_until_monotonic_by_key.clear()
+
+
+def _build_claude_code_agent_project_request_body(model: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "max_tokens": 32,
+        "litellm_metadata": {
+            "tags": ["existing-tag"],
+            "trace_name": "claude-code",
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": _CLAUDE_CODE_AGENT_PROJECT_TEXT,
+            }
+        ],
+    }
+
+
+async def _prepare_claude_code_agent_project_request_body(
+    model: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = headers or {}
+    request_body = _build_claude_code_agent_project_request_body(model)
+    updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+        mock_request,
+        request_body,
+    )
+    return updated_body
+
+
+def _assert_claude_code_agent_project_litellm_metadata(
+    litellm_metadata: dict[str, Any],
+) -> None:
+    assert litellm_metadata["agent_name"] == "gpt5-5"
+    assert litellm_metadata["aawm_claude_agent_name"] == "gpt5-5"
+    assert litellm_metadata["tenant_id"] == "aawm-tap"
+    assert litellm_metadata["aawm_tenant_id"] == "aawm-tap"
+    assert litellm_metadata["aawm_claude_project"] == "aawm-tap"
+    assert litellm_metadata["trace_user_id"] == "aawm-tap"
+    assert litellm_metadata["trace_name"] == "claude-code.gpt5-5"
+    assert "existing-tag" in litellm_metadata["tags"]
+    assert "claude-agent:gpt5-5" in litellm_metadata["tags"]
+    assert "claude-project:aawm-tap" in litellm_metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_anthropic_request_body_uses_explicit_tenant_header_for_child_identity():
+    updated_body = await _prepare_claude_code_agent_project_request_body(
+        "gpt-5.5",
+        headers={"x-aawm-tenant-id": "adapter-harness-tenant"},
+    )
+
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert litellm_metadata["agent_name"] == "gpt5-5"
+    assert litellm_metadata["tenant_id"] == "adapter-harness-tenant"
+    assert litellm_metadata["aawm_tenant_id"] == "adapter-harness-tenant"
+    assert litellm_metadata["trace_user_id"] == "adapter-harness-tenant"
+    assert litellm_metadata["aawm_claude_project"] == "aawm-tap"
+    assert litellm_metadata["trace_name"] == "claude-code.gpt5-5"
+    assert "claude-project:aawm-tap" in litellm_metadata["tags"]
 
 
 def test_anthropic_completion_adapter_preserves_trace_metadata():
@@ -211,6 +284,138 @@ class TestResponsesAdapterToolChoice:
 
 
 class TestGoogleNativeToolAliases:
+    def test_google_system_prompt_policy_replace_compact_preserves_project_and_safety(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY", "replace_compact"
+        )
+        completion_kwargs = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Claude Code, Anthropic's official CLI for Claude.\n\n"
+                        "x-anthropic-billing-header: cc_version=2.1.119; cc_entrypoint=cli;\n\n"
+                        "# Project\nPreserve workspace constraints and keep API keys secret.\n\n"
+                        "IMPORTANT: Assist only with authorized security testing."
+                    ),
+                },
+                {"role": "user", "content": "hello"},
+            ],
+            "metadata": {"tags": ["existing-tag"]},
+        }
+
+        updated_kwargs, changes = _apply_google_adapter_system_prompt_policy(
+            completion_kwargs
+        )
+
+        system_text = updated_kwargs["messages"][0]["content"]
+        metadata = updated_kwargs["metadata"]
+        assert "You are a non-interactive CLI software engineering agent." in system_text
+        assert "# Preserved Project And Safety Instructions" in system_text
+        assert "You are Claude Code" not in system_text
+        assert "x-anthropic-billing-header" not in system_text
+        assert "Preserve workspace constraints and keep API keys secret." in system_text
+        assert "IMPORTANT: Assist only with authorized security testing." in system_text
+        assert "Final responses must include visible assistant text." in system_text
+        assert changes["google_adapter_system_prompt_policy"] == "replace_compact"
+        assert changes["google_adapter_system_prompt_removed_claude_overhead_chars"] > 0
+        assert metadata["google_adapter_system_prompt_policy"] == "replace_compact"
+        assert (
+            metadata["google_adapter_system_prompt_policy_version"]
+            == "2026-04-27.v2"
+        )
+        assert "google-adapter-system-prompt-policy:replace_compact" in metadata["tags"]
+        assert "existing-tag" in metadata["tags"]
+
+    def test_google_system_prompt_policy_rewrites_list_text_content(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY", "replace_compact"
+        )
+        completion_kwargs = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are Claude Code, Anthropic's official CLI for Claude.\n\n"
+                                "# Project\nKeep this repository constraint."
+                            ),
+                        },
+                        {"type": "image", "source": {"type": "base64", "data": "x"}},
+                        {"type": "text", "text": "x-anthropic-billing-header: cc"},
+                    ],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        updated_kwargs, changes = _apply_google_adapter_system_prompt_policy(
+            completion_kwargs
+        )
+
+        system_content = updated_kwargs["messages"][0]["content"]
+        assert isinstance(system_content, list)
+        assert system_content[0]["type"] == "text"
+        assert (
+            "You are a non-interactive CLI software engineering agent."
+            in system_content[0]["text"]
+        )
+        assert "Keep this repository constraint." in system_content[0]["text"]
+        assert system_content[1] == {"type": "image", "source": {"type": "base64", "data": "x"}}
+        assert len(system_content) == 2
+        assert changes["google_adapter_system_prompt_policy"] == "replace_compact"
+
+    def test_google_system_prompt_policy_off_leaves_system_text_unchanged(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY", "off")
+        original_system_text = "You are Claude Code.\n\n# Project\nKeep constraints."
+        completion_kwargs = {
+            "messages": [
+                {"role": "system", "content": original_system_text},
+                {"role": "user", "content": "hello"},
+            ]
+        }
+
+        updated_kwargs, changes = _apply_google_adapter_system_prompt_policy(
+            completion_kwargs
+        )
+
+        assert updated_kwargs["messages"][0]["content"] == original_system_text
+        assert changes["google_adapter_system_prompt_policy"] == "off"
+        assert updated_kwargs["metadata"][
+            "google_adapter_system_prompt_policy_applied"
+        ] is False
+
+    def test_google_system_prompt_policy_append_keeps_original_for_rollout(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY", "append")
+        original_system_text = "You are Claude Code.\n\n# Project\nKeep constraints."
+        completion_kwargs = {
+            "messages": [
+                {"role": "system", "content": original_system_text},
+                {"role": "user", "content": "hello"},
+            ]
+        }
+
+        updated_kwargs, changes = _apply_google_adapter_system_prompt_policy(
+            completion_kwargs
+        )
+
+        system_text = updated_kwargs["messages"][0]["content"]
+        assert "You are a non-interactive CLI software engineering agent." in system_text
+        assert "# Original Claude System Instructions" in system_text
+        assert original_system_text in system_text
+        assert changes["google_adapter_system_prompt_policy"] == "append"
+        assert changes["google_adapter_system_prompt_removed_claude_overhead_chars"] == 0
+
     def test_apply_google_code_assist_native_tool_aliases(self):
         completion_kwargs = {
             "tools": [
@@ -542,7 +747,7 @@ class TestGoogleAdapterRequestShapePolicy:
         changes = _apply_google_adapter_request_shape_policy(payload)
 
         assert changes["trimmed_followup_function_declarations_from"] == 10
-        assert changes["trimmed_followup_function_declarations_to"] == 6
+        assert changes["trimmed_followup_function_declarations_to"] == 8
         assert payload["request"]["tools"] == [
             {
                 "functionDeclarations": [
@@ -552,6 +757,8 @@ class TestGoogleAdapterRequestShapePolicy:
                     {"name": "Glob"},
                     {"name": "Grep"},
                     {"name": "Bash"},
+                    {"name": "WebSearch"},
+                    {"name": "WebFetch"},
                 ]
             }
         ]
@@ -595,7 +802,7 @@ class TestGoogleAdapterRequestShapePolicy:
         changes = _apply_google_adapter_request_shape_policy(payload)
 
         assert changes["trimmed_followup_function_declarations_from"] == 10
-        assert changes["trimmed_followup_function_declarations_to"] == 6
+        assert changes["trimmed_followup_function_declarations_to"] == 8
         assert payload["request"]["tools"] == [
             {
                 "functionDeclarations": [
@@ -605,6 +812,8 @@ class TestGoogleAdapterRequestShapePolicy:
                     {"name": "glob"},
                     {"name": "grep_search"},
                     {"name": "run_shell_command"},
+                    {"name": "google_web_search"},
+                    {"name": "web_fetch"},
                 ]
             }
         ]
@@ -628,6 +837,174 @@ class TestGoogleAdapterRequestShapePolicy:
         assert len(trimmed_messages) == 12
         assert trimmed_messages[0]["content"].startswith("msg-8-")
         assert trimmed_messages[-1]["content"].startswith("msg-19-")
+
+    def test_preserves_active_task_state_when_trimming_tool_followup_messages(self, monkeypatch):
+        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW", raising=False)
+        task = (
+            "<system-reminder>\nSubagentStart hook additional context: cached context\n"
+            + ("context\n" * 200)
+            + "</system-reminder>\n"
+            "Run this numbered script exactly.\n"
+            "6. Bash: call Bash exactly once with command exactly `date -u +%Y-%m-%dT%H:%M:%S.%NZ`.\n"
+            "7. WebSearch: after step 6 Bash, the next and only valid tool call is WebSearch with query exactly `IANA example domain`.\n"
+            "8. WebFetch: fetch https://example.com/.\n"
+        )
+        messages = [{"role": "user", "content": task}]
+        for index, tool_name in enumerate(
+            ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "WebSearch"]
+        ):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "content": f"{tool_name} result",
+                }
+            )
+
+        trimmed_messages, changes = _apply_google_adapter_completion_message_window(messages)
+
+        preserved_text = trimmed_messages[0]["content"]
+        assert len(trimmed_messages) == 11
+        assert changes["preserved_active_task_state"] is True
+        assert changes["preserved_active_task_state_source_index"] == 0
+        assert changes["trimmed_completion_messages_tool_pair_boundary_adjustments"] == 1
+        assert "Gemini adapter preserved active child-agent task state" in preserved_text
+        assert "SubagentStart hook additional context" not in preserved_text
+        assert "Run this numbered script exactly" in preserved_text
+        assert "IANA example domain" in preserved_text
+        assert trimmed_messages[1]["role"] == "assistant"
+        assert trimmed_messages[1]["tool_calls"][0]["id"] == "call_2"
+        assert trimmed_messages[2]["role"] == "tool"
+        assert trimmed_messages[2]["tool_call_id"] == "call_2"
+        assert trimmed_messages[-1]["content"] == "WebSearch result"
+
+    def test_preserved_task_state_does_not_leave_orphan_tool_result(self, monkeypatch):
+        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW", raising=False)
+        task = (
+            "Run this numbered script exactly.\n"
+            "6. Bash: call Bash exactly once with command exactly `date -u +%Y-%m-%dT%H:%M:%S.%NZ`.\n"
+            "7. WebSearch: after step 6 Bash, the next and only valid tool call is WebSearch with query exactly `IANA example domain`.\n"
+            "8. WebFetch: fetch https://example.com/.\n"
+            "A final response immediately after Bash is invalid.\n"
+        )
+        messages = [{"role": "user", "content": task}]
+        for index, tool_name in enumerate(
+            ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+        ):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "content": f"{tool_name} result",
+                }
+            )
+
+        trimmed_messages, changes = _apply_google_adapter_completion_message_window(messages)
+
+        assert changes["preserved_active_task_state"] is True
+        assert changes["trimmed_completion_messages_tool_pair_boundary_adjustments"] == 1
+        assert len(trimmed_messages) == 11
+        assert "IANA example domain" in trimmed_messages[0]["content"]
+        assert trimmed_messages[1]["role"] == "assistant"
+        assert trimmed_messages[1]["tool_calls"][0]["id"] == "call_1"
+        assert trimmed_messages[2]["role"] == "tool"
+        assert trimmed_messages[2]["tool_call_id"] == "call_1"
+        assert trimmed_messages[-2]["tool_calls"][0]["function"]["name"] == "Bash"
+        assert trimmed_messages[-1]["content"] == "Bash result"
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_builder_preserves_task_state_before_transform(self, monkeypatch):
+        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW", raising=False)
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "header-session-xyz"}
+        captured_messages = {}
+        task = (
+            "<system-reminder>\nSubagentStart hook additional context: cached context\n"
+            + ("context\n" * 200)
+            + "</system-reminder>\n"
+            "Run this numbered script exactly.\n"
+            "6. Bash: call Bash exactly once with command exactly `date -u +%Y-%m-%dT%H:%M:%S.%NZ`.\n"
+            "7. WebSearch: after step 6 Bash, the next and only valid tool call is WebSearch with query exactly `IANA example domain`.\n"
+            "8. WebFetch: fetch https://example.com/.\n"
+        )
+        messages = [{"role": "user", "content": task}]
+        for index, tool_name in enumerate(
+            ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "WebSearch"]
+        ):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "content": f"{tool_name} result",
+                }
+            )
+
+        def _capture_transform_request_body(*args, **kwargs):
+            captured_messages["messages"] = kwargs["messages"]
+            return {"contents": [{"role": "user", "parts": [{"text": "ok"}]}]}
+
+        with patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs",
+            return_value=({"messages": messages, "max_tokens": 32}, {}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.GoogleAIStudioGeminiConfig.map_openai_params",
+            return_value={},
+        ), patch(
+            "litellm.llms.vertex_ai.gemini.transformation._transform_request_body",
+            side_effect=_capture_transform_request_body,
+        ):
+            _, _, completion_messages, _, _, changes = await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={"max_tokens": 32, "messages": [{"role": "user", "content": "ignored"}]},
+                adapter_model="gemini-3-flash-preview",
+                project="test-project",
+                request=mock_request,
+            )
+
+        preserved_text = captured_messages["messages"][0]["content"]
+        assert completion_messages[0]["content"] == preserved_text
+        assert changes["preserved_active_task_state"] is True
+        assert "Gemini adapter preserved active child-agent task state" in preserved_text
+        assert "Run this numbered script exactly" in preserved_text
+        assert "IANA example domain" in preserved_text
 
     def test_trims_large_contents_window_for_session_scoped_google_requests(self, monkeypatch):
         monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW", raising=False)
@@ -787,7 +1164,7 @@ class TestGoogleAdapterRequestShapePolicy:
         assert first_request["user_prompt_id"] == second_request["user_prompt_id"]
 
     @pytest.mark.asyncio
-    async def test_google_code_assist_builder_injects_tool_call_context_text(self):
+    async def test_google_code_assist_builder_leaves_empty_tool_call_text_empty(self):
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {"session_id": "header-session-tools"}
         captured_messages = {}
@@ -832,9 +1209,60 @@ class TestGoogleAdapterRequestShapePolicy:
                 request=mock_request,
             )
 
-        assert changes["google_adapter_injected_tool_call_context_count"] == 1
-        assert completion_messages[1]["content"] == "Calling tool Bash."
-        assert captured_messages["messages"][1]["content"] == "Calling tool Bash."
+        assert "google_adapter_injected_tool_call_context_count" not in changes
+        assert "google_adapter_suppressed_tool_call_context_text_count" not in changes
+        assert completion_messages[1]["content"] == ""
+        assert captured_messages["messages"][1]["content"] == ""
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_builder_suppresses_synthetic_tool_call_text(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "header-session-tools"}
+        captured_messages = {}
+
+        def _capture_transform_request_body(*args, **kwargs):
+            captured_messages["messages"] = kwargs["messages"]
+            return {}
+
+        with patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs",
+            return_value=(
+                {
+                    "messages": [
+                        {"role": "user", "content": "Run date -u once."},
+                        {
+                            "role": "assistant",
+                            "content": "Calling tool Bash.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "Bash", "arguments": '{"command":"date -u"}'},
+                                }
+                            ],
+                        },
+                    ],
+                    "max_tokens": 32,
+                },
+                {},
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.GoogleAIStudioGeminiConfig.map_openai_params",
+            return_value={},
+        ), patch(
+            "litellm.llms.vertex_ai.gemini.transformation._transform_request_body",
+            side_effect=_capture_transform_request_body,
+        ):
+            _, _, completion_messages, _, _, changes = await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={"max_tokens": 32, "messages": [{"role": "user", "content": "ignored"}]},
+                adapter_model="gemini-3-flash-preview",
+                project="test-project",
+                request=mock_request,
+            )
+
+        assert changes["google_adapter_suppressed_tool_call_context_text_count"] == 1
+        assert completion_messages[1]["content"] == ""
+        assert captured_messages["messages"][1]["content"] == ""
 
     @pytest.mark.asyncio
     async def test_google_code_assist_builder_normalizes_httpx_part_keys(self):
@@ -1050,6 +1478,132 @@ class TestGoogleAdapterRequestShapePolicy:
         assert changes["inserted_fallback_text_context_sources"] == 2
         assert changes["inserted_fallback_text_context_chars"] == len(
             "Run date -u and return only the output.\n\nI will call Bash."
+        )
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_fallback_excludes_synthetic_tool_call_text(self, monkeypatch):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP", "500")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "header-session-xyz"}
+
+        with patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs",
+            return_value=(
+                {
+                    "messages": [
+                        {"role": "user", "content": "Run date -u and return only the output."},
+                        {
+                            "role": "assistant",
+                            "content": "Calling tool Bash.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "Bash", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                    ],
+                    "max_tokens": 32,
+                },
+                {},
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.GoogleAIStudioGeminiConfig.map_openai_params",
+            return_value={},
+        ), patch(
+            "litellm.llms.vertex_ai.gemini.transformation._transform_request_body",
+            return_value={
+                "contents": [
+                    {"role": "model", "parts": [{"functionCall": {"name": "Bash", "args": {}}}]},
+                    {"role": "user", "parts": [{"functionResponse": {"name": "Bash", "response": {}}}]},
+                ]
+            },
+        ):
+            wrapped_request, _, _, _, _, changes = await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={"max_tokens": 32, "messages": [{"role": "user", "content": "ignored"}]},
+                adapter_model="gemini-3-flash-preview",
+                project="test-project",
+                request=mock_request,
+            )
+
+        assert wrapped_request["request"]["contents"][0]["parts"][0]["text"] == (
+            "Run date -u and return only the output."
+        )
+        assert changes["inserted_fallback_text_context"] is True
+        assert changes["inserted_fallback_text_context_sources"] == 1
+        assert changes["google_adapter_suppressed_tool_call_context_text_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_builder_applies_system_prompt_policy_before_transform(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY", "replace_compact"
+        )
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "header-session-policy"}
+
+        wrapped_request, tool_name_mapping, _, _, _, changes = await _build_google_code_assist_request_from_completion_kwargs(
+            completion_kwargs={
+                "max_tokens": 32,
+                "system": (
+                    "You are Claude Code, Anthropic's official CLI for Claude.\n\n"
+                    "# Project\nKeep workspace and safety constraints."
+                ),
+                "messages": [{"role": "user", "content": "Read the source file."}],
+                "tools": [
+                    {
+                        "name": "Read",
+                        "description": "Read a file",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                        },
+                    }
+                ],
+            },
+            adapter_model="gemini-3-flash-preview",
+            project="test-project",
+            request=mock_request,
+        )
+
+        def _collect_text(value: Any) -> list[str]:
+            if isinstance(value, dict):
+                texts = [value["text"]] if isinstance(value.get("text"), str) else []
+                for child in value.values():
+                    texts.extend(_collect_text(child))
+                return texts
+            if isinstance(value, list):
+                texts = []
+                for child in value:
+                    texts.extend(_collect_text(child))
+                return texts
+            return []
+
+        system_text = "\n".join(
+            _collect_text(wrapped_request["request"]["systemInstruction"])
+        )
+        function_names = [
+            declaration["name"]
+            for tool_entry in wrapped_request["request"]["tools"]
+            for declaration in (
+                tool_entry.get("functionDeclarations")
+                or tool_entry.get("function_declarations")
+                or []
+            )
+        ]
+
+        assert "You are a non-interactive CLI software engineering agent." in system_text
+        assert "You are Claude Code" not in system_text
+        assert "Keep workspace and safety constraints." in system_text
+        assert function_names == ["read_file"]
+        assert tool_name_mapping["read_file"] == "Read"
+        assert changes["google_adapter_system_prompt_policy"] == "replace_compact"
+        assert (
+            wrapped_request["litellm_metadata"]["google_adapter_system_prompt_policy"]
+            == "replace_compact"
         )
 
     @pytest.mark.asyncio
@@ -2253,6 +2807,236 @@ def test_build_completion_adapter_metadata_overrides_adapter_owned_keys() -> Non
         "shared-tag",
         "anthropic-nvidia-completion-adapter",
     ]
+
+
+class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_preserves_agent_project_context_in_litellm_metadata(
+        self,
+    ):
+        prepared_body = await _prepare_claude_code_agent_project_request_body(
+            "claude-opus-4-6"
+        )
+
+        litellm_metadata = prepared_body["litellm_metadata"]
+        _assert_claude_code_agent_project_litellm_metadata(litellm_metadata)
+        assert litellm_metadata["passthrough_route_family"] == "anthropic_messages"
+        assert "route:anthropic_messages" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_adapter_preserves_agent_project_litellm_metadata(
+        self,
+    ):
+        prepared_body = await _prepare_claude_code_agent_project_request_body(
+            "gpt-5.4-mini"
+        )
+
+        translated_body = _build_anthropic_responses_adapter_request_body(
+            prepared_body,
+            adapter_model="gpt-5.4-mini",
+        )
+
+        litellm_metadata = translated_body["litellm_metadata"]
+        _assert_claude_code_agent_project_litellm_metadata(litellm_metadata)
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "anthropic_openai_responses_adapter"
+        )
+        assert "route:anthropic_messages" in litellm_metadata["tags"]
+        assert "route:anthropic_openai_responses_adapter" in litellm_metadata["tags"]
+        assert "anthropic-openai-responses-adapter" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_openrouter_responses_adapter_preserves_agent_project_litellm_metadata(
+        self,
+    ):
+        prepared_body = await _prepare_claude_code_agent_project_request_body(
+            "openrouter/inclusionai/ling-2.6-flash:free"
+        )
+
+        translated_body = _build_anthropic_responses_adapter_request_body(
+            prepared_body,
+            adapter_model="inclusionai/ling-2.6-flash:free",
+            route_family="anthropic_openrouter_responses_adapter",
+            tag_prefix="anthropic-openrouter-responses-adapter",
+            span_name="anthropic.openrouter_responses_adapter",
+            target_endpoint="openrouter:/v1/responses",
+        )
+
+        litellm_metadata = translated_body["litellm_metadata"]
+        _assert_claude_code_agent_project_litellm_metadata(litellm_metadata)
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "anthropic_openrouter_responses_adapter"
+        )
+        assert "route:anthropic_messages" in litellm_metadata["tags"]
+        assert (
+            "route:anthropic_openrouter_responses_adapter"
+            in litellm_metadata["tags"]
+        )
+        assert "anthropic-openrouter-responses-adapter" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_google_completion_adapter_preserves_agent_project_litellm_metadata(
+        self,
+    ):
+        prepared_body = await _prepare_claude_code_agent_project_request_body(
+            "gemini-3.1-pro-preview"
+        )
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+
+        translated_response = {
+            "id": "chatcmpl-google-agent-project",
+            "object": "chat.completion",
+            "created": 1744974432,
+            "model": "gemini-3.1-pro-preview",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "ok",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
+            new=AsyncMock(return_value="ya29.test-google-token"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+            new=AsyncMock(return_value="project_123"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
+            new=AsyncMock(
+                return_value=(
+                    {
+                        "model": "gemini-3.1-pro-preview",
+                        "project": "project_123",
+                        "user_prompt_id": "prompt-123",
+                        "request": {"contents": [{"parts": [{"text": "ok"}]}]},
+                    },
+                    {},
+                    [],
+                    {},
+                    {},
+                    {},
+                )
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(
+                return_value=StreamingResponse(
+                    iter([b"data: [DONE]\n\n"]),
+                    media_type="text/event-stream",
+                )
+            ),
+        ) as mock_pass_through_request, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_response_from_stream",
+            new=AsyncMock(return_value=translated_response),
+        ):
+            await _handle_anthropic_google_completion_adapter_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="gemini-3.1-pro-preview",
+            )
+
+        litellm_metadata = mock_pass_through_request.await_args.kwargs["custom_body"][
+            "litellm_metadata"
+        ]
+        _assert_claude_code_agent_project_litellm_metadata(litellm_metadata)
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "anthropic_google_completion_adapter"
+        )
+        assert "route:anthropic_messages" in litellm_metadata["tags"]
+        assert "route:anthropic_google_completion_adapter" in litellm_metadata["tags"]
+        assert "anthropic-google-completion-adapter" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_nvidia_completion_adapter_preserves_agent_project_litellm_metadata(
+        self,
+    ):
+        prepared_body = await _prepare_claude_code_agent_project_request_body(
+            "nvidia/deepseek-ai/deepseek-v3.2"
+        )
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
+            return_value="nvidia-test-key",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ), patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+            new=AsyncMock(
+                return_value={
+                    "id": "msg_nvidia_agent_project",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "deepseek-ai/deepseek-v3.2",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                    },
+                }
+            ),
+        ) as mock_completion_adapter:
+            await _handle_anthropic_nvidia_completion_adapter_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="deepseek-ai/deepseek-v3.2",
+            )
+
+        litellm_metadata = mock_completion_adapter.await_args.kwargs[
+            "litellm_metadata"
+        ]
+        _assert_claude_code_agent_project_litellm_metadata(litellm_metadata)
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "anthropic_nvidia_completion_adapter"
+        )
+        assert "route:anthropic_messages" in litellm_metadata["tags"]
+        assert "route:anthropic_nvidia_completion_adapter" in litellm_metadata["tags"]
+        assert "anthropic-nvidia-completion-adapter" in litellm_metadata["tags"]
 
 
 class TestClaudePersistedOutputExpansion:
@@ -4681,6 +5465,49 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["session_id"] == "claude-session-123"
 
     @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_sanitizes_web_search_domain_lists(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "claude-opus-4-6",
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "allowed_domains": [],
+                    "blocked_domains": [],
+                },
+                {
+                    "name": "regular_tool",
+                    "input_schema": {"type": "object"},
+                    "allowed_domains": [],
+                },
+            ],
+            "messages": [{"role": "user", "content": "search"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        web_search_tool = updated_body["tools"][0]
+        regular_tool = updated_body["tools"][1]
+        assert web_search_tool["allowed_domains"] is None
+        assert web_search_tool["blocked_domains"] is None
+        assert regular_tool["allowed_domains"] == []
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert (
+            litellm_metadata["claude_web_search_domain_filter_sanitized_count"] == 2
+        )
+        assert (
+            "claude-web-search-domain-filter-sanitized"
+            in litellm_metadata["tags"]
+        )
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_extracts_session_from_stringified_user_id(
         self,
     ):
@@ -5113,6 +5940,10 @@ class TestClaudePersistedOutputExpansion:
             "authorization context: pentesting engagements, CTF competitions, security research, or "
             "defensive use cases."
         )
+        report_file_patch_before = (
+            "Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message "
+            "— the parent agent reads your text output, not files you create."
+        )
         request_body = {
             "model": "claude-opus-4-6",
             "system": [
@@ -5122,7 +5953,7 @@ class TestClaudePersistedOutputExpansion:
                 },
                 {
                     "type": "text",
-                    "text": f"Prelude\n\n{system_patch_before}\n\n{security_patch_before}\n",
+                    "text": f"Prelude\n\n{system_patch_before}\n\n{security_patch_before}\n\n{report_file_patch_before}\n",
                 },
             ],
             "messages": [
@@ -5155,6 +5986,15 @@ class TestClaudePersistedOutputExpansion:
             in updated_system_text
         )
         assert "Refuse requests for destructive techniques" not in updated_system_text
+        assert report_file_patch_before not in updated_system_text
+        assert (
+            "Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do."
+            in updated_system_text
+        )
+        assert (
+            "Regardless of a file write-- you need to return findings directly as your final assistant message."
+            in updated_system_text
+        )
         assert message_patch_before not in updated_message_text
         assert "NOTE: Be thorough in your exploration." in updated_message_text
         assert (
@@ -5163,15 +6003,17 @@ class TestClaudePersistedOutputExpansion:
         )
 
         litellm_metadata = updated_body["litellm_metadata"]
-        assert litellm_metadata["claude_prompt_patch_count"] == 3
-        assert litellm_metadata["claude_prompt_patch_replacement_count"] == 3
+        assert litellm_metadata["claude_prompt_patch_count"] == 4
+        assert litellm_metadata["claude_prompt_patch_replacement_count"] == 4
         assert litellm_metadata["claude_prompt_patch_ids"] == [
             "explore-agent-speed-note",
             "output-efficiency-important-line",
             "security-authorized-use-instruction",
+            "subagent-report-file-explicit-request",
         ]
         assert litellm_metadata["claude_prompt_patch_failure_ids"] == []
         assert litellm_metadata["claude_prompt_patch_statuses"] == [
+            "resolved",
             "resolved",
             "resolved",
             "resolved",
@@ -5189,6 +6031,10 @@ class TestClaudePersistedOutputExpansion:
         assert "claude-prompt-patch:explore-agent-speed-note" in litellm_metadata["tags"]
         assert (
             "claude-prompt-patch:security-authorized-use-instruction"
+            in litellm_metadata["tags"]
+        )
+        assert (
+            "claude-prompt-patch:subagent-report-file-explicit-request"
             in litellm_metadata["tags"]
         )
         assert any(
@@ -5224,6 +6070,58 @@ class TestClaudePersistedOutputExpansion:
         litellm_metadata = updated_body["litellm_metadata"]
         assert "claude-prompt-patch" not in litellm_metadata["tags"]
         assert "claude_prompt_patch_ids" not in litellm_metadata
+
+    @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_patches_report_file_instruction_in_plain_string_system(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        report_file_patch_before = (
+            "Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message "
+            "— the parent agent reads your text output, not files you create."
+        )
+        report_file_template_before = (
+            "Do NOT ${$4} report/summary/findings/analysis .md files. Return findings directly as your final assistant message."
+        )
+        request_body = {
+            "model": "claude-opus-4-6",
+            "system": (
+                "x-anthropic-billing-header: cc_version=2.1.119; cc_entrypoint=cli; cch=42aab;\n\n"
+                f"{report_file_patch_before}\n\n{report_file_template_before}"
+            ),
+            "messages": [{"role": "user", "content": "write the review file"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        updated_system_text = updated_body["system"]
+        assert report_file_patch_before not in updated_system_text
+        assert report_file_template_before not in updated_system_text
+        assert (
+            updated_system_text.count(
+                "Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do."
+            )
+            == 2
+        )
+        assert (
+            updated_system_text.count(
+                "Regardless of a file write-- you need to return findings directly as your final assistant message."
+            )
+            == 2
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["claude_prompt_patch_ids"] == [
+            "subagent-report-file-explicit-request",
+        ]
+        assert litellm_metadata["claude_prompt_patch_replacement_count"] == 2
+        assert (
+            "claude-prompt-patch:subagent-report-file-explicit-request"
+            in litellm_metadata["tags"]
+        )
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_rewrites_commonmark_prompt_with_reference_identifiers(

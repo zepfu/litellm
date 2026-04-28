@@ -1,4 +1,5 @@
 import importlib.util
+import datetime as dt
 import json
 import pathlib
 import subprocess
@@ -6,6 +7,45 @@ import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 HARNESS_PATH = ROOT / "scripts" / "local-ci" / "run_anthropic_adapter_acceptance.py"
+ANTHROPIC_ADAPTER_CONFIG_PATH = (
+    ROOT / "scripts" / "local-ci" / "anthropic_adapter_config.json"
+)
+SEQUENTIAL_CORE_TOOLS = [
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Bash",
+    "WebSearch",
+    "WebFetch",
+]
+SEQUENTIAL_CASE_AGENTS = {
+    "claude_adapter_gpt55_child_sequential_core_tools": (
+        "harness-gpt55-sequential-core-tools"
+    ),
+    "claude_adapter_gemini31_pro_child_sequential_core_tools": (
+        "harness-gemini31-pro-sequential-core-tools"
+    ),
+    "claude_adapter_gemini3_flash_child_sequential_core_tools": (
+        "harness-gemini3-flash-sequential-core-tools"
+    ),
+}
+PARALLEL_READ_TOOLS = ["Read", "Glob", "Grep"]
+PARALLEL_CASE_AGENTS = {
+    "claude_adapter_gpt55_child_parallel_read_tools": (
+        "harness-gpt55-parallel-read-tools",
+        "openai",
+        "gpt-5.5",
+        {"Read", "Glob", "Grep"},
+    ),
+    "claude_adapter_gemini3_flash_child_parallel_read_tools": (
+        "harness-gemini3-flash-parallel-read-tools",
+        "gemini",
+        "gemini-3-flash-preview",
+        {"read_file", "glob", "grep_search"},
+    ),
+}
 
 
 def _load_harness_module():
@@ -83,6 +123,32 @@ def test_provider_unavailable_timeout_can_soft_fail_with_exact_log_signature(mon
     ]
 
 
+def test_generation_route_filter_excludes_anthropic_count_tokens_observations():
+    harness = _load_harness_module()
+
+    assert harness.RA._generation_observation_matches_allowed_route(
+        {
+            "metadata": {
+                "user_api_key_request_route": "/anthropic/v1/messages/count_tokens",
+                "passthrough_route_family": "anthropic_messages",
+                "tags": ["route:anthropic_messages"],
+            }
+        },
+        ["/anthropic/v1/messages"],
+    ) is False
+
+    assert harness.RA._generation_observation_matches_allowed_route(
+        {
+            "metadata": {
+                "user_api_key_request_route": "/anthropic/v1/messages",
+                "passthrough_route_family": "anthropic_messages",
+                "tags": ["route:anthropic_messages"],
+            }
+        },
+        ["/anthropic/v1/messages"],
+    ) is True
+
+
 def test_provider_unavailable_timeout_stays_hard_without_exact_log_signature(monkeypatch):
     harness = _load_harness_module()
 
@@ -113,6 +179,78 @@ def test_provider_unavailable_timeout_stays_hard_without_exact_log_signature(mon
     )
 
     assert result is None
+
+
+def test_command_json_validator_accepts_required_regex():
+    harness = _load_harness_module()
+
+    summary, failures = harness._validate_command_output_json(
+        family="case",
+        stdout=json.dumps({"is_error": False, "result": "2026-04-27\n"}),
+        checks={"required_regex": {"result": r"^\d{4}-\d{2}-\d{2}\s*$"}},
+    )
+
+    assert failures == []
+    assert summary["required_regex_hits"] == {"result": "2026-04-27\n"}
+
+
+def test_command_json_validator_rejects_required_regex_mismatch():
+    harness = _load_harness_module()
+    pattern = r"^\d{4}-\d{2}-\d{2}\s*$"
+
+    summary, failures = harness._validate_command_output_json(
+        family="case",
+        stdout=json.dumps({"is_error": False, "result": "looked at files"}),
+        checks={"required_regex": {"result": pattern}},
+    )
+
+    assert summary["required_regex_hits"] == {"result": "looked at files"}
+    assert failures == [
+        f"case command JSON regex mismatch for `result`: expected pattern {pattern!r}, got 'looked at files'"
+    ]
+
+
+def test_generation_route_filter_accepts_route_tag_without_request_route(monkeypatch):
+    harness = _load_harness_module()
+    observation = {
+        "id": "generation-1",
+        "traceId": "trace-1",
+        "type": "GENERATION",
+        "startTime": "2026-04-28T02:15:23Z",
+        "model": "gpt-5.5",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "costDetails": {"total": 0.01},
+        "calculatedTotalCost": 0.01,
+        "metadata": {
+            "passthrough_route_family": "anthropic_openai_responses_adapter",
+            "tags": [
+                "route:anthropic_messages",
+                "route:anthropic_openai_responses_adapter",
+            ],
+        },
+    }
+
+    monkeypatch.setattr(
+        harness.RA,
+        "_recent_langfuse_generation_observations_for_trace_ids",
+        lambda **_kwargs: [observation],
+    )
+
+    raw_observations, summaries, failures = harness.RA._validate_generation_observations(
+        family="case",
+        query_url="http://127.0.0.1:3000",
+        public_key="pk",
+        secret_key="sk",
+        trace_ids=["trace-1"],
+        start_time=dt.datetime(2026, 4, 28, 2, 15, tzinfo=dt.timezone.utc),
+        allowed_request_routes=["/anthropic/v1/messages"],
+    )
+
+    assert failures == []
+    assert raw_observations == [observation]
+    assert summaries[0]["traceId"] == "trace-1"
 
 
 def test_provider_unavailable_command_failure_can_soft_fail_with_exact_log_signature():
@@ -275,14 +413,225 @@ def test_target_profile_sets_session_history_runtime_identity_expectations(monke
     assert validation["require_runtime_identity"] is True
     assert updated["cases"]["claude_adapter_gpt55"]["require_trace_user_id"] is True
     assert updated["cases"]["claude_adapter_gpt55"]["expected_user_ids"] == [
-        "litellm-harness-test"
+        "adapter-harness-tenant"
     ]
     assert case_env["ANTHROPIC_CUSTOM_HEADERS"] == (
-        "x-litellm-end-user-id: litellm-harness-test\n"
-        "langfuse_trace_user_id: litellm-harness-test\n"
+        "x-litellm-end-user-id: adapter-harness-tenant\n"
+        "langfuse_trace_user_id: adapter-harness-tenant\n"
         "langfuse_trace_name: claude-code\n"
         "x-aawm-tenant-id: adapter-harness-tenant"
     )
+    assert "harness_run_id" in updated["cases"]["claude_adapter_gpt55"]
+
+
+def test_target_profile_formats_claude_case_harness_run_id(monkeypatch):
+    harness = _load_harness_module()
+
+    class FixedUuid:
+        hex = "abcdef1234567890"
+
+    monkeypatch.setattr(harness.uuid, "uuid4", lambda: FixedUuid())
+
+    config = {
+        "cases": {
+            "claude_adapter_gpt55_child_sequential_core_tools": {
+                "command": [
+                    "claude",
+                    "-p",
+                    "write /tmp/probe-{harness_run_id}.txt for {case_name}",
+                ],
+                "env": {"ANTHROPIC_BASE_URL": "placeholder"},
+                "session_history_validation": {"expected_provider": "openai"},
+            }
+        }
+    }
+
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    case_config = updated["cases"]["claude_adapter_gpt55_child_sequential_core_tools"]
+    assert (
+        case_config["harness_run_id"]
+        == "claude_adapter_gpt55_child_sequential_core_tools-abcdef123456"
+    )
+    assert case_config["command"][2] == (
+        "write /tmp/probe-claude_adapter_gpt55_child_sequential_core_tools-abcdef123456.txt "
+        "for claude_adapter_gpt55_child_sequential_core_tools"
+    )
+
+
+def test_target_profile_appends_case_local_claude_agents(monkeypatch):
+    harness = _load_harness_module()
+
+    class FixedUuid:
+        hex = "abcdef1234567890"
+
+    monkeypatch.setattr(harness.uuid, "uuid4", lambda: FixedUuid())
+
+    config = {
+        "cases": {
+            "claude_adapter_gemini3_flash_child_sequential_core_tools": {
+                "command": [
+                    "claude",
+                    "-p",
+                    "Dispatch to harness-gemini3-flash-sequential-core-tools.",
+                    "--allowedTools",
+                    "Agent",
+                ],
+                "claude_agents": {
+                    "harness-gemini3-flash-sequential-core-tools": {
+                        "model": "google/gemini-3-flash-preview",
+                        "tools": SEQUENTIAL_CORE_TOOLS,
+                    }
+                },
+                "env": {"ANTHROPIC_BASE_URL": "placeholder"},
+                "session_history_validation": {"expected_provider": "gemini"},
+            }
+        }
+    }
+
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    command = updated["cases"][
+        "claude_adapter_gemini3_flash_child_sequential_core_tools"
+    ]["command"]
+    assert command[command.index("--allowedTools") + 1] == "Agent"
+    assert "--tools" not in command
+    assert command.count("--agents") == 1
+    agents = json.loads(command[command.index("--agents") + 1])
+    assert agents["harness-gemini3-flash-sequential-core-tools"]["tools"] == (
+        SEQUENTIAL_CORE_TOOLS
+    )
+    assert not any(
+        tool.startswith("mcp__aawm__")
+        for tool in agents["harness-gemini3-flash-sequential-core-tools"][
+            "tools"
+        ]
+    )
+
+
+def test_sequential_core_tool_prompts_use_neutral_fixture_and_harness_agents():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name, agent_name in SEQUENTIAL_CASE_AGENTS.items():
+        case_config = config["cases"][case_name]
+        command = case_config["command"]
+        prompt = command[2]
+        assert "scripts/local-ci/sequential_core_tools_fixture.txt" in prompt
+        assert "sequential-core-tools-grep" in prompt
+        assert "Use Read to read /home/zepfu/projects/litellm/TODO.md" not in prompt
+        assert f"Dispatch to the {agent_name} agent" in prompt
+        assert "A final response immediately after Bash is invalid" in prompt
+        assert "the child must call WebSearch next" in prompt
+        assert "the child must call WebFetch next" in prompt
+        assert command[command.index("--allowedTools") + 1] == "Agent"
+        assert "--tools" not in command
+
+        assert set(case_config["claude_agents"]) == {agent_name}
+        agent_config = case_config["claude_agents"][agent_name]
+        assert agent_config["tools"] == SEQUENTIAL_CORE_TOOLS
+        assert not any(
+            tool.startswith("mcp__aawm__") for tool in agent_config["tools"]
+        )
+        assert "This is not a repository investigation" in agent_config["prompt"]
+        assert (
+            "You must complete exactly eight tool calls before final text"
+            in agent_config["prompt"]
+        )
+        assert (
+            "Never answer, summarize, or report failure after Bash"
+            in agent_config["prompt"]
+        )
+        assert (
+            "The task is incomplete until WebFetch returns"
+            in agent_config["prompt"]
+        )
+        assert f"claude-code.{agent_name}" in case_config["required_trace_names"]
+        assert case_config["expected_trace_user_ids_by_name"][
+            f"claude-code.{agent_name}"
+        ] == "adapter-harness-tenant"
+        assert (
+            case_config["transcript_tool_use_validation"]["expected_agents"][0][
+                "agent_type"
+            ]
+            == agent_name
+        )
+
+
+def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name, (
+        agent_name,
+        provider,
+        model,
+        durable_tool_names,
+    ) in PARALLEL_CASE_AGENTS.items():
+        case_config = config["cases"][case_name]
+        command = case_config["command"]
+        prompt = command[2]
+        assert case_name in config["default_excluded_cases"]
+        assert f"Dispatch to the {agent_name} agent" in prompt
+        assert "exactly three tool calls" in prompt
+        assert "must not wait for any tool result" in prompt
+        assert "sequential_core_tools_fixture.txt" in prompt
+        assert "sequential-core-tools-grep" in prompt
+        assert command[command.index("--allowedTools") + 1] == "Agent"
+        assert "--tools" not in command
+
+        assert set(case_config["claude_agents"]) == {agent_name}
+        agent_config = case_config["claude_agents"][agent_name]
+        assert agent_config["tools"] == PARALLEL_READ_TOOLS
+        assert "first assistant message must contain exactly three tool_use blocks" in (
+            agent_config["prompt"]
+        )
+        assert "Do not wait for any tool result" in agent_config["prompt"]
+        assert f"claude-code.{agent_name}" in case_config["required_trace_names"]
+        assert case_config["expected_trace_user_ids_by_name"][
+            f"claude-code.{agent_name}"
+        ] == "adapter-harness-tenant"
+
+        transcript_agent = case_config["transcript_tool_use_validation"][
+            "expected_agents"
+        ][0]
+        assert transcript_agent["agent_type"] == agent_name
+        assert transcript_agent["expected_tool_counts"] == {
+            "Read": 1,
+            "Glob": 1,
+            "Grep": 1,
+        }
+        assert transcript_agent["minimum_tools_in_single_assistant_message"] == 3
+        assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
+        assert "require_tool_result_before_next_tool_use" not in transcript_agent
+
+        durable_rows = [
+            row
+            for row in case_config["tool_activity_validation"]["expected_rows"]
+            if row.get("provider") == provider and row.get("model") == model
+        ]
+        assert {row["tool_name"] for row in durable_rows} == durable_tool_names
+
+        if provider == "openai":
+            assert case_config["request_payload_checks"]["required_equals"][
+                "parallel_tool_calls"
+            ] is True
 
 
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):
@@ -334,6 +683,81 @@ def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):
     assert captured["env"]["AAWM_DB_PASSWORD"] == "not-written-to-settings"
     assert not captured["settings_path"].exists()
     assert result["command"] == captured["command"]
+
+
+def test_trace_user_id_validation_can_require_child_trace_users():
+    harness = _load_harness_module()
+
+    summary, failures = harness._validate_trace_user_ids_by_name(
+        family="gemini fanout",
+        traces=[
+            {
+                "name": "claude-code.gemini-3-flash-preview",
+                "userId": "adapter-harness-tenant",
+            },
+            {
+                "name": "claude-code.gemini-3-1-pro-preview",
+                "userId": "wrong-user",
+            },
+        ],
+        expected={
+            "claude-code.gemini-3-flash-preview": "adapter-harness-tenant",
+            "claude-code.gemini-3-1-pro-preview": "adapter-harness-tenant",
+        },
+    )
+
+    assert summary["actual_by_name"]["claude-code.gemini-3-flash-preview"] == [
+        "adapter-harness-tenant"
+    ]
+    assert failures == [
+        "gemini fanout trace claude-code.gemini-3-1-pro-preview missing user id "
+        "adapter-harness-tenant"
+    ]
+
+
+def test_trace_lookup_uses_expected_user_when_trace_name_user_checks_are_configured():
+    harness = _load_harness_module()
+
+    assert (
+        harness._resolve_trace_lookup_user_id(
+            ["adapter-harness-tenant"],
+            {
+                "claude-code.orchestrator": "adapter-harness-tenant",
+                "claude-code.gpt-5-5": "adapter-harness-tenant",
+            },
+        )
+        == "adapter-harness-tenant"
+    )
+
+
+def test_trace_lookup_derives_single_user_from_trace_name_user_checks():
+    harness = _load_harness_module()
+
+    assert (
+        harness._resolve_trace_lookup_user_id(
+            [],
+            {
+                "claude-code.orchestrator": "adapter-harness-tenant",
+                "claude-code.gpt-5-5": "adapter-harness-tenant",
+            },
+        )
+        == "adapter-harness-tenant"
+    )
+
+
+def test_trace_lookup_does_not_guess_when_trace_name_users_differ():
+    harness = _load_harness_module()
+
+    assert (
+        harness._resolve_trace_lookup_user_id(
+            [],
+            {
+                "claude-code.orchestrator": "tenant-a",
+                "claude-code.gpt-5-5": "tenant-b",
+            },
+        )
+        is None
+    )
 
 
 def test_http_request_repeat_runs_same_request_and_reports_each_pass(monkeypatch):
@@ -511,6 +935,642 @@ def test_validation_db_connection_reuses_open_connection_and_closes(monkeypatch)
     assert connections[0][1].closed is True
 
 
+def test_tool_activity_validation_rejects_forbidden_argument_substring(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            pass
+
+        def fetchall(self):
+            return [
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "tool_index": 0,
+                    "tool_name": "Read",
+                    "tool_kind": "read",
+                    "command_text": "",
+                    "arguments": {"file_path": "/tmp/example.py", "pages": ""},
+                    "metadata": {},
+                    "created_at": None,
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+
+    _, failures = harness._validate_tool_activity(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "tool_name": "Read",
+                    "tool_kind": "read",
+                    "arguments_forbidden_substring": '"pages": ""',
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case tool_activity rows for provider='openai' model='gpt-5.5' tool_name='Read' included forbidden arguments substring '\"pages\": \"\"'"
+    ]
+
+    harness._close_validation_db_connections()
+
+
+def test_tool_activity_validation_rejects_missing_required_argument_substring(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            pass
+
+        def fetchall(self):
+            return [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "tool_index": 0,
+                    "tool_name": "google_web_search",
+                    "tool_kind": "read",
+                    "command_text": "",
+                    "arguments": {"query": "litellm anthropic adapter"},
+                    "metadata": {},
+                    "created_at": None,
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+
+    _, failures = harness._validate_tool_activity(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "tool_name": "google_web_search",
+                    "tool_kind": "read",
+                    "arguments_required_substring": "IANA example domain",
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case tool_activity rows for provider='gemini' model='gemini-3-flash-preview' tool_name='google_web_search' did not include arguments containing 'IANA example domain'"
+    ]
+
+    harness._close_validation_db_connections()
+
+
+def test_tool_activity_validation_rejects_too_many_and_forbidden_commands(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            pass
+
+        def fetchall(self):
+            return [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3.1-pro-preview",
+                    "tool_index": 0,
+                    "tool_name": "run_shell_command",
+                    "tool_kind": "command",
+                    "command_text": "date -u +%Y-%m-%d",
+                    "arguments": {},
+                    "metadata": {},
+                    "created_at": None,
+                },
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3.1-pro-preview",
+                    "tool_index": 1,
+                    "tool_name": "run_shell_command",
+                    "tool_kind": "command",
+                    "command_text": "ls docs",
+                    "arguments": {},
+                    "metadata": {},
+                    "created_at": None,
+                },
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+
+    _, failures = harness._validate_tool_activity(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3.1-pro-preview",
+                    "tool_name": "run_shell_command",
+                    "tool_kind": "command",
+                    "minimum_count": 1,
+                    "maximum_count": 1,
+                    "command_text_contains": "date -u +%Y-%m-%d",
+                    "command_text_forbidden_substrings": ["ls"],
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case too many tool_activity rows for provider='gemini' model='gemini-3.1-pro-preview' tool_name='run_shell_command' tool_kind='command'; expected <= 1, got 2",
+        "case tool_activity rows for provider='gemini' model='gemini-3.1-pro-preview' tool_name='run_shell_command' included forbidden command text substring 'ls'",
+    ]
+
+    harness._close_validation_db_connections()
+
+
+def test_transcript_tool_use_validation_counts_child_tools(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = (
+        tmp_path
+        / "-home-zepfu-projects-litellm"
+        / "session-1"
+        / "subagents"
+    )
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-abc.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "gpt-5-5"}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "timestamp": "2026-04-28T10:00:00Z",
+                        "message": {
+                            "id": "msg-1",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-1",
+                                    "name": "Read",
+                                    "input": {"file_path": "TODO.md"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "timestamp": "2026-04-28T10:00:01Z",
+                        "message": {
+                            "id": "msg-2",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-2",
+                                    "name": "Bash",
+                                    "input": {"command": "date -u"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": "gpt-5-5",
+                    "expected_tool_counts": {"Read": 1, "Bash": 1},
+                    "expected_tool_sequence": ["Read", "Bash"],
+                    "maximum_total_tool_uses": 2,
+                    "maximum_tool_uses_per_assistant_message": 1,
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    agent_summary = summary["agents"][0]
+    assert agent_summary["by_tool_name"] == {"Bash": 1, "Read": 1}
+    assert agent_summary["max_tool_uses_in_single_assistant_message"] == 1
+    assert len(agent_summary["records"]) == 2
+
+
+def test_transcript_tool_use_validation_rejects_wrong_sequence(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-abc.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "gpt-5-5"}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-1",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-2",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "tool-2", "name": "Read", "input": {}},
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": "gpt-5-5",
+                    "expected_tool_sequence": ["Read", "Bash"],
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case transcript for agent='gpt-5-5' tool_use sequence mismatch; expected [\"Read\", \"Bash\"], got [\"Bash\", \"Read\"]"
+    ]
+
+
+def test_transcript_tool_use_validation_requires_result_before_next_tool(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-abc.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "gpt-5-5"}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-1",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-2",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "tool-2", "name": "Bash", "input": {}},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "agentId": "abc",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"},
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": "gpt-5-5",
+                    "require_tool_result_before_next_tool_use": True,
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case transcript for agent='gpt-5-5' did not record tool_result before next tool_use after 'Read'"
+    ]
+
+
+def test_transcript_tool_use_validation_rejects_tool_result_errors(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-abc.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "gpt-5-5"}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-1",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-1",
+                                    "name": "WebFetch",
+                                    "input": {"url": "https://example.com"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "agentId": "abc",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-1",
+                                    "is_error": True,
+                                    "content": "Request failed with status code 403",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": "gpt-5-5",
+                    "expected_tool_counts": {"WebFetch": 1},
+                    "forbid_tool_result_errors": True,
+                }
+            ],
+        },
+    )
+
+    assert summary["agents"][0]["tool_result_errors"][0]["tool_use_id"] == "tool-1"
+    assert len(failures) == 1
+    assert "had tool_result errors" in failures[0]
+    assert "Request failed with status code 403" in failures[0]
+
+
+def test_transcript_tool_use_validation_rejects_batched_message(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-def.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "gemini-3-1-pro-preview"}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "agentId": "def",
+                "message": {
+                    "id": "msg-parallel",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}},
+                        {"type": "tool_use", "id": "tool-2", "name": "Bash", "input": {}},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": "gemini-3-1-pro-preview",
+                    "expected_tool_counts": {"Read": 1, "Bash": 1},
+                    "maximum_tool_uses_per_assistant_message": 1,
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case transcript for agent='gemini-3-1-pro-preview' had 2 tool_use blocks in one assistant message; expected <= 1"
+    ]
+
+
+def test_transcript_tool_use_validation_accepts_required_parallel_message(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-def.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "harness-parallel-read-tools"}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "agentId": "def",
+                "message": {
+                    "id": "msg-parallel",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}},
+                        {"type": "tool_use", "id": "tool-2", "name": "Glob", "input": {}},
+                        {"type": "tool_use", "id": "tool-3", "name": "Grep", "input": {}},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": "harness-parallel-read-tools",
+                    "expected_tool_counts": {"Read": 1, "Glob": 1, "Grep": 1},
+                    "minimum_total_tool_uses": 3,
+                    "maximum_total_tool_uses": 3,
+                    "minimum_tools_in_single_assistant_message": 3,
+                    "maximum_tool_uses_per_assistant_message": 3,
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    agent_summary = summary["agents"][0]
+    assert agent_summary["max_tool_uses_in_single_assistant_message"] == 3
+    assert agent_summary["total_tool_uses"] == 3
+
+
+def test_transcript_tool_use_validation_reports_missing_child_agent(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-def.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "gemini-3-flash-preview"}),
+        encoding="utf-8",
+    )
+    transcript.write_text("", encoding="utf-8")
+
+    summary, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [{"agent_type": "gemini-3-1-pro-preview"}],
+        },
+    )
+
+    assert summary["agents"][0]["candidate_transcripts"] == [
+        {
+            "path": str(transcript),
+            "agent_type": "gemini-3-flash-preview",
+        }
+    ]
+    assert failures == [
+        "case missing Claude subagent transcript for agent='gemini-3-1-pro-preview' session_id='session-1'"
+    ]
+
+
 def test_session_history_and_tool_activity_validators_share_db_connection(monkeypatch):
     harness = _load_harness_module()
     harness._close_validation_db_connections()
@@ -614,5 +1674,224 @@ def test_session_history_and_tool_activity_validators_share_db_connection(monkey
     assert len(connections) == 1
     assert len(connections[0][1].executed) == 2
     assert connections[0][0]["autocommit"] is True
+
+    harness._close_validation_db_connections()
+
+
+def test_session_history_validation_polls_until_expected_rows_are_visible(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+    attempts = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            attempts.append((query, params))
+
+        def fetchall(self):
+            if len(attempts) == 1:
+                return []
+            return [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "session_id": "session-1",
+                    "tenant_id": "adapter-harness-tenant",
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                    "provider_cache_status": "not_attempted",
+                    "provider_cache_miss": False,
+                    "reasoning_tokens_source": "not_applicable",
+                    "tool_call_count": 1,
+                    "tool_names": ["run_shell_command"],
+                    "metadata": {},
+                    "start_time": None,
+                    "end_time": None,
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+    monkeypatch.setattr(harness.time, "sleep", lambda seconds: None)
+
+    summary, failures = harness._validate_session_history(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "require_runtime_identity": False,
+            "poll_timeout_seconds": 1,
+            "poll_interval_seconds": 0.1,
+            "expected_rows": [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "minimums": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    assert summary["record"]["model"] == "gemini-3-flash-preview"
+    assert len(attempts) == 2
+
+    harness._close_validation_db_connections()
+
+
+def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            pass
+
+        def fetchall(self):
+            return [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "session_id": "session-1",
+                    "tenant_id": "litellm",
+                    "input_tokens": 10,
+                    "output_tokens": 1,
+                    "total_tokens": 11,
+                    "provider_cache_status": "miss",
+                    "provider_cache_miss": True,
+                    "provider_cache_miss_reason": "cache_attempted_without_hit",
+                    "reasoning_tokens_source": "not_applicable",
+                    "tool_call_count": 1,
+                    "tool_names": ["run_shell_command"],
+                    "metadata": {"tenant_id": "litellm"},
+                    "start_time": None,
+                    "end_time": None,
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+
+    summary, failures = harness._validate_session_history(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "require_runtime_identity": False,
+            "expected_rows": [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "minimums": {"input_tokens": 1, "output_tokens": 1},
+                    "required_equals": {"tenant_id": "adapter-harness-tenant"},
+                }
+            ],
+        },
+    )
+
+    assert summary["records"] == []
+    assert summary["all_records"][0]["tenant_id"] == "litellm"
+    assert len(failures) == 1
+    assert "candidate rows" in failures[0]
+    assert '"actual": "litellm"' in failures[0]
+    assert '"expected": "adapter-harness-tenant"' in failures[0]
+
+    harness._close_validation_db_connections()
+
+
+def test_tool_activity_validation_polls_until_expected_rows_are_visible(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+    attempts = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            attempts.append((query, params))
+
+        def fetchall(self):
+            if len(attempts) == 1:
+                return []
+            return [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "tool_index": 0,
+                    "tool_name": "run_shell_command",
+                    "tool_kind": "command",
+                    "command_text": "date -u +%Y-%m-%dT%H:%M:%S.%NZ",
+                    "arguments": {},
+                    "metadata": {},
+                    "created_at": None,
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+    monkeypatch.setattr(harness.time, "sleep", lambda seconds: None)
+
+    summary, failures = harness._validate_tool_activity(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "poll_timeout_seconds": 1,
+            "poll_interval_seconds": 0.1,
+            "expected_rows": [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "tool_name": "run_shell_command",
+                    "tool_kind": "command",
+                    "command_text_contains": "date -u",
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    assert summary["record"]["tool_name"] == "run_shell_command"
+    assert len(attempts) == 2
 
     harness._close_validation_db_connections()

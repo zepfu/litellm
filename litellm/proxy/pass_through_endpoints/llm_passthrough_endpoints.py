@@ -152,6 +152,47 @@ _CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN = re.compile(
     re.DOTALL,
 )
 _ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME = "google_anthropic_system_prompt_policy"
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION = "2026-04-27.v2"
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV = (
+    "AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY"
+)
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT = "replace_compact"
+_GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT = """You are a non-interactive CLI software engineering agent.
+
+Work in this cycle: understand, plan briefly, implement, verify, finalize.
+Use the provided tools to inspect and modify the workspace when the task
+requires it.
+
+Tool usage:
+- Prefer search tools before broad file reads.
+- Batch independent search/read calls in parallel when possible.
+- Use write/edit tools to complete requested artifacts or code changes.
+- If a tool is unavailable or blocked, recover with another available tool.
+- Do not remain in read-only exploration when the user requested an
+  implementation or artifact.
+- Final responses must include visible assistant text. Never end a completed
+  task with only thoughts or reasoning. After tool results, write the requested
+  final answer in normal text.
+
+Follow the preserved project, workspace, safety, and operator instructions
+below."""
+_GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = (
+    "# Preserved Project And Safety Instructions"
+)
+_GOOGLE_ADAPTER_ORIGINAL_SYSTEM_PROMPT_HEADING = (
+    "# Original Claude System Instructions"
+)
+_GOOGLE_ADAPTER_CLAUDE_OVERHEAD_MARKERS = (
+    "you are claude code",
+    "anthropic's official cli for claude",
+    "anthropic's official claude cli",
+    "claude code's slash commands",
+    "claude code slash commands",
+)
+_GOOGLE_ADAPTER_SYNTHETIC_TOOL_CONTEXT_PATTERN = re.compile(
+    r"\ACalling (?:tool [A-Za-z0-9_.:-]+|tools: [A-Za-z0-9_.:,\-\s]+)\.\Z"
+)
 _PASSTHROUGH_SESSION_ID_HEADER_NAMES = (
     "session_id",
     "Session_Id",
@@ -159,6 +200,16 @@ _PASSTHROUGH_SESSION_ID_HEADER_NAMES = (
     "X-Session-Id",
 )
 _PASS_THROUGH_HEADER_PREFIX = "x-pass-"
+_AAWM_TENANT_ID_HEADER_NAMES = (
+    "x-aawm-tenant-id",
+    "x-litellm-tenant-id",
+    "x-litellm-organization-id",
+    "x-litellm-org-id",
+    "x-organization-id",
+    "x-org-id",
+    "x-litellm-team-id",
+    "x-team-id",
+)
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
     {"/messages", "/v1/messages"}
 )
@@ -460,6 +511,14 @@ def _get_request_header_or_passthrough_alias(
         value = headers.get(candidate)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    return None
+
+
+def _get_aawm_tenant_header(request: Request) -> Optional[str]:
+    for header_name in _AAWM_TENANT_ID_HEADER_NAMES:
+        value = _get_request_header_or_passthrough_alias(request, header_name)
+        if value:
+            return value
     return None
 
 
@@ -1371,7 +1430,16 @@ def _get_google_adapter_followup_allowed_tool_names() -> set[str]:
             if isinstance(item, str) and item.strip()
         }
     else:
-        allowed_tool_names = {"Read", "Write", "Edit", "Glob", "Grep", "Bash"}
+        allowed_tool_names = {
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Bash",
+            "WebSearch",
+            "WebFetch",
+        }
 
     aliases = _get_google_code_assist_native_tool_aliases()
     expanded_tool_names = set(allowed_tool_names)
@@ -2724,6 +2792,25 @@ def _extract_completion_message_text(message: Any) -> str:
     return "\n".join(parts)
 
 
+def _is_google_adapter_synthetic_tool_context_text(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    return bool(
+        _GOOGLE_ADAPTER_SYNTHETIC_TOOL_CONTEXT_PATTERN.fullmatch(text.strip())
+    )
+
+
+def _is_google_adapter_synthetic_tool_context_message(message: Any) -> bool:
+    if not isinstance(message, dict):
+        return False
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list) or len(tool_calls) == 0:
+        return False
+    return _is_google_adapter_synthetic_tool_context_text(
+        _extract_completion_message_text(message)
+    )
+
+
 def _get_google_adapter_fallback_context_char_cap() -> int:
     raw_value = _clean_codex_auth_value(
         os.getenv("AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP")
@@ -2748,6 +2835,8 @@ def _inject_google_adapter_fallback_text_context(
 
     text_snippets: list[str] = []
     for message in reversed(completion_messages):
+        if _is_google_adapter_synthetic_tool_context_message(message):
+            continue
         text = _extract_completion_message_text(message).strip()
         if text:
             text_snippets.append(text)
@@ -2774,6 +2863,219 @@ def _inject_google_adapter_fallback_text_context(
         "inserted_fallback_text_context_chars": len(fallback_text),
         "inserted_fallback_text_context_sources": len(text_snippets),
     }
+
+
+def _get_google_adapter_system_prompt_policy() -> str:
+    raw_value = _clean_codex_auth_value(
+        os.getenv(_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV)
+    )
+    if raw_value is None:
+        return _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
+    normalized_value = raw_value.strip().lower()
+    if normalized_value in {"0", "false", "disabled", "none", "off"}:
+        return "off"
+    if normalized_value in {"append", "replace_compact"}:
+        return normalized_value
+    return _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
+
+
+def _extract_google_adapter_system_text_from_content(content: Any) -> Optional[str]:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    text_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in {None, "text"}:
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            text_parts.append(text)
+    if not text_parts:
+        return None
+    return "\n\n".join(text_parts)
+
+
+def _replace_google_adapter_system_message_text(
+    message: dict[str, Any],
+    rewritten_text: str,
+) -> dict[str, Any]:
+    updated_message = dict(message)
+    content = updated_message.get("content")
+    if isinstance(content, list):
+        first_text_index: Optional[int] = None
+        updated_content: list[Any] = []
+        for index, part in enumerate(content):
+            if (
+                first_text_index is None
+                and isinstance(part, dict)
+                and part.get("type") in {None, "text"}
+                and isinstance(part.get("text"), str)
+            ):
+                first_text_index = index
+                updated_part = dict(part)
+                updated_part["text"] = rewritten_text
+                updated_content.append(updated_part)
+                continue
+            if (
+                first_text_index is not None
+                and isinstance(part, dict)
+                and part.get("type") in {None, "text"}
+                and isinstance(part.get("text"), str)
+            ):
+                continue
+            updated_content.append(part)
+        if first_text_index is not None:
+            updated_message["content"] = updated_content
+            return updated_message
+    updated_message["content"] = rewritten_text
+    return updated_message
+
+
+def _is_google_adapter_claude_overhead_block(block: str) -> bool:
+    stripped_block = block.strip()
+    if not stripped_block:
+        return False
+
+    lowered_block = stripped_block.lower()
+    if lowered_block.startswith(_ANTHROPIC_BILLING_HEADER_PREFIX):
+        return True
+    if any(marker in lowered_block for marker in _GOOGLE_ADAPTER_CLAUDE_OVERHEAD_MARKERS):
+        return True
+    if "claude code" in lowered_block and any(
+        marker in lowered_block
+        for marker in (
+            "slash command",
+            "task management",
+            "todowrite",
+            "tool use policy",
+        )
+    ):
+        return True
+    return False
+
+
+def _strip_google_adapter_claude_system_overhead(
+    system_text: str,
+) -> tuple[str, int]:
+    preserved_blocks: list[str] = []
+    removed_chars = 0
+    for block in re.split(r"\n{2,}", system_text):
+        stripped_block = block.strip()
+        if not stripped_block:
+            continue
+        if _is_google_adapter_claude_overhead_block(stripped_block):
+            removed_chars += len(block)
+            continue
+        preserved_blocks.append(stripped_block)
+    return "\n\n".join(preserved_blocks).strip(), removed_chars
+
+
+def _build_google_adapter_system_prompt_policy_text(
+    *,
+    original_text: str,
+    policy_mode: str,
+) -> tuple[str, dict[str, Any]]:
+    normalized_original_text = original_text.strip()
+    if policy_mode == "off":
+        rewritten_text = original_text
+        preserved_text = original_text
+        removed_chars = 0
+    elif policy_mode == "append":
+        preserved_text = normalized_original_text
+        removed_chars = 0
+        rewritten_text = (
+            f"{_GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT}\n\n"
+            f"{_GOOGLE_ADAPTER_ORIGINAL_SYSTEM_PROMPT_HEADING}\n\n"
+            f"{preserved_text}"
+        ).strip()
+    else:
+        preserved_text, removed_chars = _strip_google_adapter_claude_system_overhead(
+            normalized_original_text
+        )
+        if preserved_text:
+            rewritten_text = (
+                f"{_GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT}\n\n"
+                f"{_GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING}\n\n"
+                f"{preserved_text}"
+            )
+        else:
+            rewritten_text = _GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT
+
+    metadata = {
+        "google_adapter_system_prompt_policy_name": _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME,
+        "google_adapter_system_prompt_policy": policy_mode,
+        "google_adapter_system_prompt_policy_version": _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION,
+        "google_adapter_system_prompt_original_chars": len(original_text),
+        "google_adapter_system_prompt_rewritten_chars": len(rewritten_text),
+        "google_adapter_system_prompt_removed_claude_overhead_chars": removed_chars,
+        "google_adapter_system_prompt_preserved_instruction_chars": len(
+            preserved_text
+        ),
+        "google_adapter_system_prompt_policy_applied": policy_mode != "off",
+    }
+    return rewritten_text, metadata
+
+
+def _apply_google_adapter_system_prompt_policy(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return completion_kwargs, {}
+
+    system_message_index: Optional[int] = None
+    system_text: Optional[str] = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        candidate_text = _extract_google_adapter_system_text_from_content(
+            message.get("content")
+        )
+        if isinstance(candidate_text, str):
+            system_message_index = index
+            system_text = candidate_text
+            break
+    if system_message_index is None or system_text is None:
+        return completion_kwargs, {}
+
+    policy_mode = _get_google_adapter_system_prompt_policy()
+    rewritten_text, policy_metadata = _build_google_adapter_system_prompt_policy_text(
+        original_text=system_text,
+        policy_mode=policy_mode,
+    )
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_messages = list(messages)
+    if policy_mode != "off":
+        updated_messages[system_message_index] = _replace_google_adapter_system_message_text(
+            cast(dict[str, Any], updated_messages[system_message_index]),
+            rewritten_text,
+        )
+        updated_kwargs["messages"] = updated_messages
+
+    metadata = updated_kwargs.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    metadata.update(policy_metadata)
+    tags = metadata.get("tags")
+    if not isinstance(tags, list):
+        tags = []
+    metadata["tags"] = list(
+        dict.fromkeys(
+            [
+                *tags,
+                "google-adapter-system-prompt-policy",
+                f"google-adapter-system-prompt-policy:{policy_mode}",
+            ]
+        )
+    )
+    updated_kwargs["metadata"] = metadata
+    return updated_kwargs, policy_metadata
 
 
 async def _build_google_code_assist_request_from_completion_kwargs(
@@ -2818,6 +3120,9 @@ async def _build_google_code_assist_request_from_completion_kwargs(
                 "n": completion_kwargs.get("n"),
             },
         )
+    )
+    completion_kwargs, system_prompt_policy_changes = _apply_google_adapter_system_prompt_policy(
+        completion_kwargs
     )
     completion_messages = list(completion_kwargs.get("messages") or [])
     (
@@ -2914,6 +3219,7 @@ async def _build_google_code_assist_request_from_completion_kwargs(
     completion_message_window_changes = {
         **completion_message_window_changes,
         **native_tool_alias_changes,
+        **system_prompt_policy_changes,
         'google_adapter_session_id_source': session_id_source,
         'google_adapter_session_id_hash': hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8],
     }
@@ -3064,7 +3370,7 @@ def _inject_google_adapter_tool_call_context_text(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     updated_messages: list[dict[str, Any]] = []
-    injected_count = 0
+    suppressed_count = 0
 
     for message in messages:
         if not isinstance(message, dict):
@@ -3078,36 +3384,21 @@ def _inject_google_adapter_tool_call_context_text(
             updated_messages.append(message)
             continue
         if _completion_message_has_visible_text(message):
+            if _is_google_adapter_synthetic_tool_context_message(message):
+                updated_message = dict(message)
+                updated_message["content"] = ""
+                updated_messages.append(updated_message)
+                suppressed_count += 1
+                continue
             updated_messages.append(message)
             continue
 
-        tool_names: list[str] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function_block = tool_call.get("function")
-            if not isinstance(function_block, dict):
-                continue
-            tool_name = function_block.get("name")
-            if isinstance(tool_name, str) and tool_name:
-                tool_names.append(tool_name)
-        if tool_names:
-            if len(tool_names) == 1:
-                synthesized_text = f"Calling tool {tool_names[0]}."
-            else:
-                synthesized_text = f"Calling tools: {', '.join(tool_names)}."
-        else:
-            synthesized_text = "Calling tool."
+        updated_messages.append(message)
 
-        updated_message = dict(message)
-        updated_message["content"] = synthesized_text
-        updated_messages.append(updated_message)
-        injected_count += 1
-
-    if injected_count == 0:
+    if suppressed_count == 0:
         return messages, {}
     return updated_messages, {
-        "google_adapter_injected_tool_call_context_count": injected_count,
+        "google_adapter_suppressed_tool_call_context_text_count": suppressed_count,
     }
 
 
@@ -3129,6 +3420,200 @@ def _estimate_completion_message_text_chars(message: Any) -> int:
     return 0
 
 
+def _completion_message_has_tool_result(message: Any) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") == "tool":
+        return True
+    if isinstance(message.get("tool_call_id"), str):
+        return True
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "tool_result":
+                return True
+            if isinstance(part.get("tool_result"), dict):
+                return True
+    return False
+
+
+def _completion_message_tool_call_ids(message: Any) -> set[str]:
+    if not isinstance(message, dict):
+        return set()
+    tool_call_ids: set[str] = set()
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = tool_call.get("id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                tool_call_ids.add(tool_call_id)
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "tool_use":
+                tool_call_id = part.get("id")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    tool_call_ids.add(tool_call_id)
+    return tool_call_ids
+
+
+def _completion_message_tool_result_ids(message: Any) -> set[str]:
+    if not isinstance(message, dict):
+        return set()
+    tool_result_ids: set[str] = set()
+    tool_call_id = message.get("tool_call_id")
+    if isinstance(tool_call_id, str) and tool_call_id:
+        tool_result_ids.add(tool_call_id)
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_tool_use_id = part.get("tool_use_id")
+            if isinstance(part_tool_use_id, str) and part_tool_use_id:
+                tool_result_ids.add(part_tool_use_id)
+            tool_result = part.get("tool_result")
+            if isinstance(tool_result, dict):
+                nested_tool_use_id = tool_result.get("tool_use_id")
+                if isinstance(nested_tool_use_id, str) and nested_tool_use_id:
+                    tool_result_ids.add(nested_tool_use_id)
+    return tool_result_ids
+
+
+def _trim_completion_message_tail_preserving_tool_pairs(
+    messages: list[dict[str, Any]],
+    tail_budget: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if tail_budget <= 0:
+        return [], {}
+
+    tail_start = max(0, len(messages) - tail_budget)
+    boundary_adjustments = 0
+    while tail_start < len(messages) and _completion_message_has_tool_result(
+        messages[tail_start]
+    ):
+        tail_start += 1
+        boundary_adjustments += 1
+
+    while tail_start < len(messages):
+        seen_tool_call_ids: set[str] = set()
+        orphan_index: Optional[int] = None
+        for index, message in enumerate(messages[tail_start:]):
+            seen_tool_call_ids.update(_completion_message_tool_call_ids(message))
+            tool_result_ids = _completion_message_tool_result_ids(message)
+            if tool_result_ids and not tool_result_ids.issubset(seen_tool_call_ids):
+                orphan_index = tail_start + index
+                break
+        if orphan_index is None:
+            break
+        tail_start = orphan_index + 1
+        boundary_adjustments += 1
+        while tail_start < len(messages) and _completion_message_has_tool_result(
+            messages[tail_start]
+        ):
+            tail_start += 1
+            boundary_adjustments += 1
+
+    changes: dict[str, Any] = {}
+    if boundary_adjustments:
+        changes["trimmed_completion_messages_tool_pair_boundary_adjustments"] = (
+            boundary_adjustments
+        )
+    return messages[tail_start:], changes
+
+
+def _get_google_adapter_preserved_task_state_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_GOOGLE_ADAPTER_PRESERVED_TASK_STATE_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 6000
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 6000
+    return max(512, parsed)
+
+
+def _extract_google_adapter_preserved_task_excerpt(text: str) -> str:
+    text_value = text.strip()
+    reminder_matches = list(
+        re.finditer(r"<system-reminder>.*?</system-reminder>\n*", text_value, re.DOTALL)
+    )
+    if reminder_matches:
+        trailing_text = text_value[reminder_matches[-1].end():].strip()
+        if trailing_text:
+            text_value = trailing_text
+
+    cap = _get_google_adapter_preserved_task_state_char_cap()
+    if len(text_value) <= cap:
+        return text_value
+    return text_value[-cap:].lstrip()
+
+
+def _build_google_adapter_preserved_task_state_message(
+    messages: list[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    task_markers = (
+        "Run this numbered script",
+        "numbered script",
+        "next and only valid tool call",
+        "A final response immediately after Bash is invalid",
+        "After WebFetch",
+    )
+    fallback: tuple[int, str] | None = None
+    selected: tuple[int, str] | None = None
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") == "tool":
+            continue
+        if _completion_message_has_tool_result(message):
+            continue
+        if _is_google_adapter_synthetic_tool_context_message(message):
+            continue
+        text = _extract_completion_message_text(message).strip()
+        if not text:
+            continue
+        if fallback is None:
+            fallback = (index, text)
+        if any(marker in text for marker in task_markers):
+            selected = (index, text)
+            break
+
+    if selected is None:
+        selected = fallback
+    if selected is None:
+        return None, {}
+
+    source_index, source_text = selected
+    excerpt = _extract_google_adapter_preserved_task_excerpt(source_text)
+    if not excerpt:
+        return None, {}
+
+    preserved_text = (
+        "<system-reminder>\n"
+        "Gemini adapter preserved active child-agent task state from trimmed conversation. "
+        "Continue to follow this original task and its next-tool obligations.\n\n"
+        "Original task excerpt:\n"
+        f"{excerpt}\n"
+        "</system-reminder>"
+    )
+    return {
+        "role": "user",
+        "content": preserved_text,
+    }, {
+        "preserved_active_task_state": True,
+        "preserved_active_task_state_chars": len(excerpt),
+        "preserved_active_task_state_source_index": source_index,
+    }
+
+
 def _apply_google_adapter_completion_message_window(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -3138,6 +3623,39 @@ def _apply_google_adapter_completion_message_window(
     original_count = len(messages)
     original_text_chars = sum(_estimate_completion_message_text_chars(message) for message in messages)
     trimmed_messages = list(messages[-max_window:])
+    preserved_task_message: Optional[dict[str, Any]] = None
+    preserved_task_changes: dict[str, Any] = {}
+    if (
+        max_window >= 3
+        and any(_completion_message_has_tool_result(message) for message in messages)
+    ):
+        first_retained_index = max(0, original_count - max_window)
+        initial_text_index = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if _extract_completion_message_text(message).strip()
+            ),
+            None,
+        )
+        if initial_text_index is not None and initial_text_index < first_retained_index:
+            preserved_task_message, preserved_task_changes = (
+                _build_google_adapter_preserved_task_state_message(messages)
+            )
+            if preserved_task_message is not None:
+                retained_tail, tail_boundary_changes = (
+                    _trim_completion_message_tail_preserving_tool_pairs(
+                        messages, max_window - 1
+                    )
+                )
+                trimmed_messages = [
+                    preserved_task_message,
+                    *retained_tail,
+                ]
+                preserved_task_changes = {
+                    **preserved_task_changes,
+                    **tail_boundary_changes,
+                }
     trimmed_text_chars = sum(_estimate_completion_message_text_chars(message) for message in trimmed_messages)
     if len(trimmed_messages) == original_count:
         return messages, {}
@@ -3147,6 +3665,7 @@ def _apply_google_adapter_completion_message_window(
         "trimmed_completion_messages_from_text_chars": original_text_chars,
         "trimmed_completion_messages_to_text_chars": trimmed_text_chars,
         "trimmed_completion_messages_max_window": max_window,
+        **preserved_task_changes,
     }
 
 
@@ -4187,6 +4706,7 @@ def _build_completion_adapter_metadata(
         "trace_id",
         "existing_trace_id",
         "trace_name",
+        "trace_user_id",
         "trace_environment",
     ):
         value = litellm_metadata.get(key)
@@ -6163,6 +6683,77 @@ def _add_claude_request_breakout_logging_metadata(
     )
 
 
+def _is_anthropic_web_search_tool(value: dict[str, Any]) -> bool:
+    tool_type = value.get("type")
+    tool_name = value.get("name")
+    return (
+        isinstance(tool_type, str)
+        and tool_type.startswith("web_search")
+    ) or tool_name == "web_search"
+
+
+def _sanitize_anthropic_web_search_empty_domain_lists_in_value(
+    value: Any,
+) -> tuple[Any, int]:
+    if isinstance(value, dict):
+        updated_dict: dict[str, Any] = {}
+        changed = False
+        sanitized_count = 0
+        is_web_search_tool = _is_anthropic_web_search_tool(value)
+        for key, child in value.items():
+            if (
+                is_web_search_tool
+                and key in {"allowed_domains", "blocked_domains"}
+                and child == []
+            ):
+                updated_dict[key] = None
+                changed = True
+                sanitized_count += 1
+                continue
+            updated_child, child_count = (
+                _sanitize_anthropic_web_search_empty_domain_lists_in_value(child)
+            )
+            updated_dict[key] = updated_child
+            sanitized_count += child_count
+            if updated_child is not child:
+                changed = True
+        return (updated_dict if changed else value), sanitized_count
+
+    if isinstance(value, list):
+        updated_list: list[Any] = []
+        changed = False
+        sanitized_count = 0
+        for child in value:
+            updated_child, child_count = (
+                _sanitize_anthropic_web_search_empty_domain_lists_in_value(child)
+            )
+            updated_list.append(updated_child)
+            sanitized_count += child_count
+            if updated_child is not child:
+                changed = True
+        return (updated_list if changed else value), sanitized_count
+
+    return value, 0
+
+
+def _sanitize_anthropic_web_search_empty_domain_lists(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    updated_value, sanitized_count = (
+        _sanitize_anthropic_web_search_empty_domain_lists_in_value(request_body)
+    )
+    if not sanitized_count or not isinstance(updated_value, dict):
+        return request_body, 0
+    updated_body = _merge_litellm_metadata(
+        updated_value,
+        tags_to_add=["claude-web-search-domain-filter-sanitized"],
+        extra_fields={
+            "claude_web_search_domain_filter_sanitized_count": sanitized_count,
+        },
+    )
+    return updated_body, sanitized_count
+
+
 def _extract_gemini_request_breakout_fields(
     request_body: dict[str, Any],
 ) -> tuple[list[str], dict[str, Any]]:
@@ -6643,7 +7234,8 @@ def _replace_claude_system_prompt_override_in_value(
             updated_dict[key] = updated_child
             combined_events.extend(child_events)
             if updated_child is not child:
-                return (updated_dict if changed else value), combined_events
+                changed = True
+        return (updated_dict if changed else value), combined_events
 
     if isinstance(value, list):
         updated_list = []
@@ -6657,7 +7249,8 @@ def _replace_claude_system_prompt_override_in_value(
             updated_list.append(updated_child)
             combined_events.extend(child_events)
             if updated_child is not child:
-                return (updated_list if changed else value), combined_events
+                changed = True
+        return (updated_list if changed else value), combined_events
 
     return value, []
 
@@ -6846,7 +7439,8 @@ def _replace_claude_prompt_patches_in_value(
             updated_dict[key] = updated_child
             combined_events.extend(child_events)
             if updated_child is not child:
-                return (updated_dict if changed else value), combined_events
+                changed = True
+        return (updated_dict if changed else value), combined_events
 
     if isinstance(value, list):
         updated_list = []
@@ -6860,7 +7454,8 @@ def _replace_claude_prompt_patches_in_value(
             updated_list.append(updated_child)
             combined_events.extend(child_events)
             if updated_child is not child:
-                return (updated_list if changed else value), combined_events
+                changed = True
+        return (updated_list if changed else value), combined_events
 
     return value, []
 
@@ -7111,6 +7706,54 @@ def _build_aawm_context_for_anthropic_request(
     if tenant:
         context["tenant"] = tenant
     return context
+
+
+def _add_claude_child_agent_observability_metadata(
+    request_body: dict[str, Any],
+    *,
+    explicit_tenant_id: Optional[str] = None,
+) -> dict[str, Any]:
+    agent, tenant = _extract_claude_agent_and_tenant_from_request_body(request_body)
+    if not agent and not tenant:
+        return request_body
+
+    extra_fields: dict[str, Any] = {}
+    tags_to_add: list[str] = []
+    litellm_metadata = request_body.get("litellm_metadata")
+    if not isinstance(litellm_metadata, dict):
+        litellm_metadata = {}
+
+    if agent:
+        extra_fields["agent_name"] = agent
+        extra_fields["aawm_claude_agent_name"] = agent
+        normalized_agent = _normalize_low_cardinality_tag_value(agent) or "unknown"
+        tags_to_add.append(f"claude-agent:{normalized_agent}")
+
+        existing_trace_name = litellm_metadata.get("trace_name")
+        if not existing_trace_name or existing_trace_name == "claude-code":
+            extra_fields["trace_name"] = f"claude-code.{agent}"
+
+    if tenant:
+        tenant_for_identity = explicit_tenant_id or tenant
+        extra_fields["tenant_id"] = tenant_for_identity
+        extra_fields["aawm_tenant_id"] = tenant_for_identity
+        extra_fields["aawm_claude_project"] = tenant
+        existing_trace_user_id = litellm_metadata.get("trace_user_id")
+        if existing_trace_user_id != tenant_for_identity:
+            if existing_trace_user_id and not litellm_metadata.get(
+                "source_trace_user_id"
+            ):
+                extra_fields["source_trace_user_id"] = existing_trace_user_id
+            extra_fields["trace_user_id"] = tenant_for_identity
+        tags_to_add.append(
+            f"claude-project:{_normalize_low_cardinality_tag_value(tenant) or 'unknown'}"
+        )
+
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
 
 
 def _detect_claude_post_rewrite_context_files(
@@ -7540,6 +8183,13 @@ async def _prepare_anthropic_request_body_for_passthrough(
     )
     updated_body = _aawm_add_claude_post_rewrite_context_file_logging_metadata(
         updated_body
+    )
+    updated_body, _web_search_domain_filter_sanitized_count = (
+        _sanitize_anthropic_web_search_empty_domain_lists(updated_body)
+    )
+    updated_body = _add_claude_child_agent_observability_metadata(
+        updated_body,
+        explicit_tenant_id=_get_aawm_tenant_header(request),
     )
     if billing_header_fields:
         updated_body = _add_anthropic_billing_header_logging_metadata(

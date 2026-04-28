@@ -1,0 +1,4 @@
+sequential-core-tools-fixture
+read-token: alpha
+edit-token-before: beta
+grep-token: sequential-core-tools-grep

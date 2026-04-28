@@ -2842,11 +2842,16 @@ _TOOL_ACTIVITY_READ_NAMES = {
     "listdir",
     "list_files",
     "search",
+    "fetch",
+    "webfetch",
+    "web_fetch",
     "notebookread",
 }
 _TOOL_ACTIVITY_MODIFY_NAMES = {
     "write",
     "edit",
+    "replace",
+    "replacement",
     "multiedit",
     "apply_patch",
     "applypatch",
@@ -3044,7 +3049,8 @@ def _classify_tool_kind(tool_name: str) -> str:
     ):
         return "modify"
     if normalized_name in _TOOL_ACTIVITY_READ_NAMES or any(
-        token in normalized_name for token in ("read", "view", "grep", "glob", "search")
+        token in normalized_name
+        for token in ("read", "view", "grep", "glob", "search", "fetch")
     ):
         return "read"
     return "other"

@@ -36,6 +36,7 @@ from ..adapters.observability import (
     provider_cache_intent_metadata,
     request_contains_cache_control,
 )
+from ..adapters.transformation import sanitize_anthropic_tool_use_input
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -359,27 +360,30 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
     @staticmethod
     def translate_parallel_tool_calls_to_responses_api(
-        tool_choice: AnthropicMessagesToolChoice,
+        tool_choice: Optional[AnthropicMessagesToolChoice],
         translated_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[bool]:
         """
-        Convert Anthropic disable_parallel_tool_use to Responses parallel_tool_calls.
+        Convert Anthropic parallel tool-use semantics to Responses.
 
         Only emit the parameter when there are translated function tools on the
         request. Built-in Responses tools do not support parallel function-calling
         semantics in the same way, so leaving the parameter unset is the safer
         best-effort translation for mixed/non-function tool sets.
         """
-        if not tool_choice.get("disable_parallel_tool_use"):
-            return None
-
         if not translated_tools:
             return None
 
         if any(tool.get("type") != "function" for tool in translated_tools):
             return None
 
-        return False
+        if tool_choice and tool_choice.get("type") == "none":
+            return None
+
+        if tool_choice and tool_choice.get("disable_parallel_tool_use"):
+            return False
+
+        return True
 
     @staticmethod
     def translate_context_management_to_responses_api(
@@ -545,14 +549,13 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             tool_choice_type = cast(AnthropicMessagesToolChoice, tool_choice).get("type")
             if not (tool_choice_type == "none" and not translated_tools):
                 responses_kwargs["tool_choice"] = translated_tool_choice
-            parallel_tool_calls = (
-                self.translate_parallel_tool_calls_to_responses_api(
-                    cast(AnthropicMessagesToolChoice, tool_choice),
-                    translated_tools=translated_tools,
-                )
-            )
-            if parallel_tool_calls is not None:
-                responses_kwargs["parallel_tool_calls"] = parallel_tool_calls
+
+        parallel_tool_calls = self.translate_parallel_tool_calls_to_responses_api(
+            cast(Optional[AnthropicMessagesToolChoice], tool_choice),
+            translated_tools=translated_tools,
+        )
+        if parallel_tool_calls is not None:
+            responses_kwargs["parallel_tool_calls"] = parallel_tool_calls
 
         # thinking -> reasoning
         thinking = anthropic_request.get("thinking")
@@ -721,7 +724,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         )
 
             elif isinstance(item, ResponseFunctionToolCall):
-                input_data = self._deserialize_tool_input(item.arguments)
+                input_data = sanitize_anthropic_tool_use_input(
+                    tool_name=item.name,
+                    tool_input=self._deserialize_tool_input(item.arguments),
+                )
                 content.append(
                     AnthropicResponseContentBlockToolUse(
                         type="tool_use",
@@ -741,7 +747,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 ).model_dump()
                             )
                 elif item_type == "function_call":
-                    input_data = self._deserialize_tool_input(item.get("arguments"))
+                    input_data = sanitize_anthropic_tool_use_input(
+                        tool_name=item.get("name", ""),
+                        tool_input=self._deserialize_tool_input(item.get("arguments")),
+                    )
                     content.append(
                         AnthropicResponseContentBlockToolUse(
                             type="tool_use",

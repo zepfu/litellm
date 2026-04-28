@@ -25,113 +25,101 @@ only as needed:
 
 ## In Progress
 
-- None at the moment.
+- Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
+  Gemini through dev `:4001`. GPT-5.5 passed at
+  `/tmp/claude_adapter_gpt55_child_sequential_core_tools_unique.json`; Gemini
+  3.1 Pro remains classified as a Google Code Assist quota/capacity block at
+  `/tmp/claude_adapter_gemini31_pro_child_sequential_core_tools_unique.json`;
+  Gemini 3 Flash passed at
+  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_after_tool_pair_boundary.json`
+  with exactly one each of `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`,
+  `WebSearch`, and `WebFetch`, `max_tool_uses_in_single_assistant_message=1`,
+  no transcript tool-result errors, clean runtime logs, valid tenant-only
+  Langfuse user ids, and durable tool activity. Keep the dead-end breadcrumbs in
+  [COMPLETED.md](COMPLETED.md): do not rerun the neutral-fixture prompt
+  unchanged, do not use parent `--tools Agent`, do not chase the old synthetic
+  `Carvercall` text unless it recurs as live assistant output, and do not treat
+  prompt hardening as the fix for the post-Bash Gemini stop.
+
+- Keep the Claude-dispatched Gemini parallel tool-call stream fix classified as
+  validated for the available Gemini lane. Smoking gun: Langfuse trace
+  `d0275abf-2e5f-4964-b875-74159927acb1` recorded one upstream Gemini
+  generation with `usage_tool_call_count=5` (`read_file` x4 plus
+  `run_shell_command`), while Claude Code child transcript
+  `agent-ab792fb928eb0da98.jsonl` only received one `Read` tool_use for the
+  same turn and immediately logged `API Error: Content block not found`. The
+  adapter patch now buffers Gemini streaming tool-call deltas and emits one
+  Anthropic `tool_use` block per Gemini tool call. Focused unit validation
+  passed in
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/messages/test_parallel_tool_calls.py`
+  including pre-terminal and terminal parallel-call chunks; the latest combined
+  stream/SSE run passed (`19 passed`) and adapter transformation tests passed
+  (`63 passed`). `litellm-dev` has been restarted with `:4001` healthy. Gemini
+  3 Flash also passed the live parallel read-tool proof on dev `:4001` at
+  `/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`.
+  Gemini 3.1 Pro can be rerun when the Google Code Assist quota/capacity block
+  clears, but do not treat that quota block as an unvalidated stream-fix gap.
 
 ## Next
 
-- Implement a Google-only Gemini system prompt policy for Claude-initiated
-  `/anthropic` requests that route through `anthropic_google_completion_adapter`.
-  Saved design note and suggested prompt:
-  [.analysis/google-anthropic-system-prompt-policy-2026-04-27.md](.analysis/google-anthropic-system-prompt-policy-2026-04-27.md).
-  Restartable plan:
-  1. Add the rewrite in
-     `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py` inside
-     `_build_google_code_assist_request_from_completion_kwargs()`, after
-     Anthropic input is canonicalized and before `_transform_request_body()`
-     creates Gemini `systemInstruction`.
-  2. Keep the existing Claude-to-Gemini native tool aliasing intact; the prompt
-     policy should change operating instructions, not the tool schema mapping.
-  3. Feature-flag the policy with values such as `off`, `append`, and
-     `replace_compact`; use `replace_compact` as the target behavior after
-     validation.
-  4. Strip Claude/Anthropic provider overhead from the system prompt while
-     preserving project, workspace, safety, memory, and task constraints.
-  5. Inject the compact Gemini CLI-style agent prompt from the analysis note and
-     append preserved instructions under a clear heading.
-     Suggested compact prompt:
-     ```text
-     You are a non-interactive CLI software engineering agent.
-
-     Work in this cycle: understand, plan briefly, implement, verify, finalize.
-     Use the provided tools to inspect and modify the workspace when the task
-     requires it.
-
-     Tool usage:
-     - Prefer search tools before broad file reads.
-     - Batch independent search/read calls in parallel when possible.
-     - Use write/edit tools to complete requested artifacts or code changes.
-     - If a tool is unavailable or blocked, recover with another available tool.
-     - Do not remain in read-only exploration when the user requested an
-       implementation or artifact.
-
-     Follow the preserved project, workspace, safety, and operator instructions
-     below.
-     ```
-  6. Record prompt-policy metadata without logging the full prompt by default:
-     policy name/version, original and rewritten system text sizes, removed
-     Claude-overhead size, and preserved-instruction size.
-  7. Add focused unit coverage for disabled/append/replace modes, preservation
-     of safety/project instructions, removal of known Claude-only markers,
-     generated `request.systemInstruction`, metadata summary fields, and no
-     regression in Gemini-native tool aliases.
-  8. Extend the existing Anthropic adapter harness with a focused
-     `claude_adapter_gemini_*` case rather than creating a new harness. The case
-     should launch the real Claude CLI through `:4001/anthropic`, select a
-     Gemini child model through the normal Claude agent/fanout path, require a
-     bounded artifact-write/edit outcome, and validate the logged Google Code
-     Assist request body contains the compact Gemini prompt marker while
-     excluding known Claude-only overhead markers.
-  9. Harness validation should also assert the prompt-policy metadata in
-     Langfuse/session-history, preserve the existing Gemini provider/model/cost
-     and trace-environment checks, scan runtime logs for blocker patterns, and
-     treat `write_file`/write-edit tool activity as a hard gate only where the
-     current harness can observe child tool activity reliably; otherwise hard
-     gate final artifact creation plus logged request-body prompt-policy checks.
-  10. Validate with the focused dev harness case, the full default dev harness,
-      then the same focused/full checks on prod during the next promotion.
-
-- Normalize invalid empty optional Claude tool arguments returned by
-  non-Anthropic models on the `/anthropic` adapter path. Saved issue note:
-  [.analysis/gpt55-claude-read-pages-empty-arg-2026-04-27.md](.analysis/gpt55-claude-read-pages-empty-arg-2026-04-27.md).
-  Restartable plan:
-  1. Add a narrow adapter response sanitizer for Claude tool calls before they
-     are returned to Claude Code. Immediate target: `Read` tool calls with
-     `pages: ""` should omit `pages` entirely because Claude Code only accepts
-     meaningful PDF page ranges.
-  2. Prefer a shared helper in the Anthropic experimental pass-through adapter
-     translation layer so non-streaming and streaming tool-call output paths get
-     the same normalization. Inspect
-     `litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py`
-     and `streaming_iterator.py` before choosing the exact hook point.
-  3. Keep the sanitizer narrow: do not globally delete empty strings from all
-     tool arguments, since empty strings may be valid for other tools.
-  4. Preserve existing tool-name mapping behavior so the sanitizer can act on
-     the original Claude tool name even when provider-facing tool names were
-     truncated or aliased.
-  5. Add unit tests for non-streaming output where GPT/OpenAI returns
-     `Read({"file_path": "...", "pages": ""})` and the Anthropic `tool_use`
-     response omits `pages`; add streaming coverage if the existing streaming
-     test helpers can exercise assembled tool-call arguments.
-  6. Add a negative unit test proving unrelated tools or valid empty-string
-     arguments are not stripped.
-  7. Extend the existing Anthropic adapter harness with a focused GPT-5.5/OpenAI
-     Claude-dispatch case that reads a small source/text file, validates the
-     run does not loop on `Invalid pages parameter`, validates the logged
-     translated tool activity/request output does not contain `Read.pages=""`,
-     and keeps normal provider/model/cost, Langfuse, runtime-log, and
-     `session_history` invariants.
-  8. Optionally add a prompt-side belt-and-suspenders instruction to relevant
-     GPT/OpenAI dispatch prompts: when calling `Read`, omit `pages` unless
-     reading a PDF with a real page range. This should supplement, not replace,
-     adapter-side sanitization.
+- Finish the separate parallel-call proof now that sequential base-tool
+  coverage has passed. Gemini 3 Flash passed the live Claude-dispatch parallel
+  read-tool proof on dev `:4001` at
+  `/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`,
+  with `Read`, `Glob`, and `Grep` emitted in one assistant message and durable
+  tool activity recorded. GPT-5.5 still serializes the same request: artifact
+  `/tmp/claude_adapter_gpt55_child_parallel_read_tools.json` failed because the
+  child transcript never had `>= 3` `tool_use` blocks in a single assistant
+  message (`max=1`). The OpenAI Responses adapter now emits
+  `parallel_tool_calls=true` for function-tool requests when Anthropic has not
+  disabled parallel tool use, and the GPT harness case now hard-gates that
+  logged payload field. Live rerun
+  `/tmp/claude_adapter_gpt55_child_parallel_read_tools_rerun.json` confirmed the
+  flag was present but GPT-5.5 still serialized `Read`, `Glob`, and `Grep` into
+  separate assistant messages. Direct `/openai_passthrough/v1/responses` probes
+  showed GPT-5.5 can parallelize the same tools and same child task when the
+  large Claude Code injected context is absent, but emits only `Read` when the
+  full logged three-block Claude Code input is reused. Next work is context
+  shaping for OpenAI-dispatched Claude Code subagents: minimize the logged
+  Claude Code injected context, identify the exact semantic interference,
+  decide which real context should be summarized, omitted, or moved for adapted
+  non-Anthropic models without breaking normal agent grounding, then rerun
+  `claude_adapter_gpt55_child_parallel_read_tools` on dev `:4001`.
 
 ## Ongoing
 
 - Keep Codex/OpenAI streaming tool activity aligned across Langfuse and `session_history`.
   Current target: `response.output_item.*` / `response.function_call_arguments.*` reconstruction should continue to yield `usage_tool_call_count`, `codex_tool_call_count`, and `session_history_tool_activity` rows for Claude-to-Codex tool runs on `:4001`.
 
+- Keep GPT/OpenAI Claude-dispatch file-write behavior classified correctly.
+  Smoking gun for the 2026-04-28 aawm-tap failure: the real GPT-5.5 request put
+  the Claude Code no-write instruction in a plain string `instructions` field,
+  while the runtime prompt patcher only rewrote `{"type":"text","text":...}`
+  blocks. Trace `0f1f34a2-c892-4a2f-87ef-e8dd4687bbcf` therefore still carried
+  the old absolute no-write sentence and lacked
+  `subagent-report-file-explicit-request`. Fixed by patching plain strings and
+  the `${...}` template variant in
+  `aawm_claude_control_plane.py`; live dev validation passed at
+  `/tmp/claude_adapter_gpt55_child_analysis_write_probe_rerun.json`, where the
+  request text carried the patched sentence, the old sentence was absent,
+  `session_history` recorded `file_modified_count=1`, and GPT-5.5 persisted
+  both `Bash` and `Write` tool activity for
+  `/tmp/gpt55-analysis-write-probe.md`.
+
+- Keep Claude-dispatched model latency classified separately from native CLI
+  latency. For GPT-5.5, current evidence still points to large model turns plus
+  Claude Code/orchestrator overhead: the focused GPT-5.5 write probe took
+  `50.192s` wall clock through Claude Code while the GPT adapter session logged
+  about `2.156s` proxy/upstream duration; later aawm-tap GPT spans still ran
+  `64-172s`. For Gemini, do not classify all delay as context size: the v11
+  aawm-tap trace above proved a concrete adapter stream bug where five upstream
+  Gemini tool calls collapsed to one Claude-visible `Read` and a Claude Code
+  protocol error. Native Codex CLI / Gemini CLI speed remains separate because
+  this work targets Claude Code dispatch through LiteLLM's Anthropic-compatible
+  adapter.
+
 - Keep the adapter harness aligned with the real stored session shapes on both `:4001` dev and `:4000` prod targets.
-  Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:` via the rewritten request body instead of a brittle exact model reply, `claude_adapter_ctx_marker_escaped` must keep validating `\\:#name.ctx#\\:` literal escaping, dispatched child-agent backtick and bare-acronym lookups should stay aligned with the same `tristore_search_exact` semantics, the CommonMark system-prompt identifier list rewrite should stay aligned with the tenant/agent-scoped raw-content query until the stored procedure lands, the provider-cache canary should keep finding at least one Anthropic `hit` / `write` row in the default suite, Gemini fanout should keep validating the parent session’s delegated `Agent` rows without assuming every Gemini child emits its own command activity, and `--target dev` / `--target prod` should continue enforcing the correct port, Docker container, and Langfuse trace environment. Claude trace-user validation must inject a harness-controlled `x-litellm-end-user-id` / `langfuse_trace_user_id` value via the explicit per-run Claude `--settings` overlay and validate that exact value without hard-coding an ambient operator identity. Basic OpenAI smoke cases should validate success, usage, cost, routing, Langfuse, and session-history invariants rather than brittle exact natural-language output. Keep the prod-cutover failure guards active by default: async task exceptions, ASGI exceptions, `KeyError: choices`, stale `Content-Length` / `h11` protocol failures, upstream passthrough 429/5xx traces, and the OpenAI Responses nested-object-schema regression must fail the run instead of surfacing only as downstream session-history gaps; warning-only optional cases must not mask command timeouts or runtime-log hard failures. Before future prod promotions, add a production-style preflight that validates the exact image / installed wheel path on `:4001` plus a small explicit promotion-gate set for opt-in provider lanes, so packaging and adapter metadata gaps are caught before touching `:4000`.
+  Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:` via the rewritten request body instead of a brittle exact model reply, `claude_adapter_ctx_marker_escaped` must keep validating `\\:#name.ctx#\\:` literal escaping, dispatched child-agent backtick and bare-acronym lookups should stay aligned with the same `tristore_search_exact` semantics, the CommonMark system-prompt identifier list rewrite should stay aligned with the tenant/agent-scoped raw-content query until the stored procedure lands, the provider-cache canary should keep finding at least one Anthropic `hit` / `write` row in the default suite, Gemini fanout should now deliberately hard-gate child native `run_shell_command` rows rather than relying on plausible final text, and the direct Gemini Read gate is `claude_adapter_gemini31_pro_read_tool_id_sanitizer` rather than the fanout case. The post-tool-result Gemini gate is `claude_adapter_gemini31_pro_bash_then_read_stream_state`; keep it default-excluded but run it explicitly when Claude-dispatched Gemini fails after an initial tool call. Persisted Gemini tool activity uses native `read_file` / `run_shell_command` while Claude Code sees restored `Read` / `Bash`, so validators should match the stored native tool names and require the matching tool-call rows instead of the latest no-tool final row. `--target dev` / `--target prod` should continue enforcing the correct port, Docker container, and Langfuse trace environment. Claude trace-user validation should validate tenant-only Langfuse user ids (`userId=<tenant_id>`) while trace names carry the agent (`claude-code.<agent>`); do not use `project.agent` as the user id. Basic OpenAI smoke cases should validate success, usage, cost, routing, Langfuse, and session-history invariants rather than brittle exact natural-language output. Keep the prod-cutover failure guards active by default: async task exceptions, ASGI exceptions, `KeyError: choices`, stale `Content-Length` / `h11` protocol failures, upstream passthrough 429/5xx traces, and the OpenAI Responses nested-object-schema regression must fail the run instead of surfacing only as downstream session-history gaps; warning-only optional cases must not mask command timeouts or runtime-log hard failures. Before future prod promotions, add a production-style preflight that validates the exact image / installed wheel path on `:4001` plus a small explicit promotion-gate set for opt-in provider lanes, so packaging and adapter metadata gaps are caught before touching `:4000`.
 
 - Keep future harness bundle publishes on version `0.0.14` or newer.
   The `0.0.14` harness bundle includes the controlled Claude trace `userId` validation, explicit per-run Claude settings overlay, longer peeromega fanout timeout, the narrow OpenRouter provider-unavailable timeout / command-failure classifier, and the default-suite exclusion for GPT-OSS edge cases needed for real prod validation.

@@ -62,6 +62,29 @@ def _base_kwargs(trace_name: str = "claude-code") -> dict:
     }
 
 
+def _child_dispatch_metadata_kwargs() -> dict:
+    kwargs = _base_kwargs(trace_name="claude-code.reviewer")
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
+        {"role": "user", "content": "Review the recent changes."}
+    ]
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "agent_name": "reviewer",
+            "tenant_id": "aegis",
+            "trace_name": "claude-code.reviewer",
+            "trace_user_id": "aegis",
+            "session_id": "session-child-dispatch",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "claude-code.reviewer",
+            "langfuse_trace_user_id": "harness-user",
+        }
+    }
+    return kwargs
+
+
 def test_aawm_agent_identity_enriches_trace_name() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
@@ -80,6 +103,32 @@ def test_aawm_agent_identity_enriches_trace_name() -> None:
     assert updated_kwargs["standard_logging_object"]["metadata"]["trace_name"] == (
         "claude-code.engineer"
     )
+
+
+def test_aawm_agent_identity_keeps_child_dispatch_trace_metadata() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _child_dispatch_metadata_kwargs()
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    standard_metadata = updated_kwargs["standard_logging_object"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert metadata["trace_name"] == "claude-code.reviewer"
+    assert metadata["agent_name"] == "reviewer"
+    assert metadata["tenant_id"] == "aegis"
+    assert metadata["trace_user_id"] == "aegis"
+    assert standard_metadata["trace_name"] == "claude-code.reviewer"
+    assert standard_metadata["agent_name"] == "reviewer"
+    assert standard_metadata["tenant_id"] == "aegis"
+    assert standard_metadata["trace_user_id"] == "aegis"
+    assert headers["langfuse_trace_name"] == "claude-code.reviewer"
+    assert headers["langfuse_trace_user_id"] == "aegis"
 
 
 def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:
@@ -703,6 +752,95 @@ def test_build_session_history_record_uses_hidden_responses_output_for_tool_acti
     assert record["tool_names"] == ["Bash"]
     assert len(record["tool_activity"]) == 1
     assert record["tool_activity"][0]["command_text"] == "pwd"
+
+
+def test_build_session_history_record_omits_empty_read_pages_from_tool_activity() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-read-output"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-claude-code-session-id": "session-read-output"}
+    }
+
+    class _Result:
+        def __init__(self):
+            self.id = "resp-read-output"
+            self.usage = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            self.choices = [{"message": {"role": "assistant", "content": "# TODO"}}]
+            self._hidden_params = {
+                "responses_output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_read",
+                        "id": "call_read",
+                        "name": "Read",
+                        "arguments": {
+                            "file_path": "/tmp/example.py",
+                            "offset": 0,
+                            "limit": 40,
+                            "pages": "",
+                        },
+                    }
+                ]
+            }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_Result(),
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["tool_activity"][0]["tool_name"] == "Read"
+    assert record["tool_activity"][0]["arguments"] == {
+        "file_path": "/tmp/example.py",
+        "offset": 0,
+        "limit": 40,
+    }
+
+
+def test_build_session_history_record_keeps_google_prompt_policy_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gemini-3.1-pro-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-google-policy"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-claude-code-session-id": "session-google-policy"}
+    }
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "google_adapter_system_prompt_policy": "replace_compact",
+            "google_adapter_system_prompt_policy_version": "2026-04-27.v2",
+            "google_adapter_system_prompt_original_chars": 1234,
+            "google_adapter_system_prompt_rewritten_chars": 456,
+        }
+    )
+
+    result = {
+        "id": "resp-google-policy",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "gemini smoke"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["metadata"]["google_adapter_system_prompt_policy"] == "replace_compact"
+    assert (
+        record["metadata"]["google_adapter_system_prompt_policy_version"]
+        == "2026-04-27.v2"
+    )
+    assert record["metadata"]["google_adapter_system_prompt_original_chars"] == 1234
+    assert record["metadata"]["google_adapter_system_prompt_rewritten_chars"] == 456
 
 
 def test_build_session_history_record_uses_standard_logging_response_output_for_tool_activity() -> None:
@@ -1976,6 +2114,50 @@ def test_log_success_event_enqueues_session_history_record(monkeypatch) -> None:
     queued_record = enqueue_mock.call_args.args[0]
     assert queued_record["litellm_call_id"] == "call-enqueue-1"
     assert queued_record["session_id"] == "session-enqueue-1"
+
+
+def test_log_success_event_enqueues_child_dispatch_session_history_identity(
+    monkeypatch,
+) -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _child_dispatch_metadata_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-child-dispatch"
+    kwargs["response_cost"] = 0.001
+
+    enqueue_mock = MagicMock()
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        enqueue_mock,
+    )
+
+    logger.log_success_event(
+        kwargs=kwargs,
+        response_obj={
+            "id": "resp-child-dispatch",
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 4,
+                "total_tokens": 16,
+            },
+        },
+        start_time="2026-04-27T12:00:00Z",
+        end_time="2026-04-27T12:00:01Z",
+    )
+
+    enqueue_mock.assert_called_once()
+    queued_record = enqueue_mock.call_args.args[0]
+    assert queued_record["litellm_call_id"] == "call-child-dispatch"
+    assert queued_record["session_id"] == "session-child-dispatch"
+    assert queued_record["provider_response_id"] == "resp-child-dispatch"
+    assert queued_record["agent_name"] == "reviewer"
+    assert queued_record["tenant_id"] == "aegis"
+    assert queued_record["metadata"]["trace_name"] == "claude-code.reviewer"
+    assert queued_record["metadata"]["tenant_id"] == "aegis"
+    assert queued_record["metadata"]["tenant_id_source"] == "litellm_params.metadata.tenant_id"
 
 
 @pytest.mark.asyncio

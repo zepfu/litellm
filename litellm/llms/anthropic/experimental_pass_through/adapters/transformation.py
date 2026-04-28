@@ -62,6 +62,76 @@ def create_tool_name_mapping(
     return mapping
 
 
+def _is_empty_claude_read_pages_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return len(value) == 0
+    return False
+
+
+def sanitize_anthropic_tool_use_input(
+    *,
+    tool_name: str,
+    tool_input: Any,
+) -> Any:
+    if tool_name != "Read" or not isinstance(tool_input, dict):
+        return tool_input
+    if "pages" not in tool_input:
+        return tool_input
+    if not _is_empty_claude_read_pages_value(tool_input.get("pages")):
+        return tool_input
+
+    sanitized_input = dict(tool_input)
+    sanitized_input.pop("pages", None)
+    return sanitized_input
+
+
+def sanitize_anthropic_tool_use_input_json_delta(
+    *,
+    tool_name: str,
+    partial_json: str,
+) -> str:
+    if tool_name != "Read" or not isinstance(partial_json, str):
+        return partial_json
+    try:
+        parsed_input = json.loads(partial_json)
+    except json.JSONDecodeError:
+        return partial_json
+    sanitized_input = sanitize_anthropic_tool_use_input(
+        tool_name=tool_name,
+        tool_input=parsed_input,
+    )
+    if sanitized_input == parsed_input:
+        return partial_json
+    return json.dumps(sanitized_input, separators=(",", ":"))
+
+
+def _is_synthetic_tool_call_text(content: Any) -> bool:
+    if not isinstance(content, str):
+        return False
+    stripped_content = content.strip()
+    if not stripped_content.startswith("Calling tool "):
+        return False
+    if not stripped_content.endswith("."):
+        return False
+    tool_label = stripped_content[len("Calling tool ") : -1].strip()
+    if not tool_label:
+        return False
+    return all(char.isalnum() or char in {"_", "-", ".", " "} for char in tool_label)
+
+
+def sanitize_anthropic_tool_use_id(tool_use_id: Any) -> str:
+    if not isinstance(tool_use_id, str):
+        return ""
+    base_id, separator, _signature = tool_use_id.partition("__thought__")
+    if separator and base_id:
+        return base_id
+    return tool_use_id
+
+
 from openai.types.chat.chat_completion_chunk import Choice as OpenAIStreamingChoice
 
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
@@ -246,6 +316,24 @@ class LiteLLMAnthropicMessagesAdapter:
         Only checks provider_specific_fields, not thinking blocks.
         """
         signature = None
+
+        if isinstance(tool_call, dict):
+            provider_specific_fields = tool_call.get("provider_specific_fields")
+            if isinstance(provider_specific_fields, dict):
+                signature = provider_specific_fields.get("thought_signature")
+            function_block = tool_call.get("function")
+            function_provider_specific_fields = (
+                function_block.get("provider_specific_fields")
+                if isinstance(function_block, dict)
+                else None
+            )
+            if signature is None and isinstance(
+                function_provider_specific_fields, dict
+            ):
+                signature = function_provider_specific_fields.get(
+                    "thought_signature"
+                )
+            return signature
 
         if (
             hasattr(tool_call, "provider_specific_fields")
@@ -1205,18 +1293,23 @@ class LiteLLMAnthropicMessagesAdapter:
                     ).model_dump()
                 )
 
+            has_tool_calls = (
+                choice.message.tool_calls is not None
+                and len(choice.message.tool_calls) > 0
+            )
+
             # Handle text content
-            if choice.message.content is not None:
+            if choice.message.content is not None and not (
+                has_tool_calls
+                and _is_synthetic_tool_call_text(choice.message.content)
+            ):
                 new_content.append(
                     AnthropicResponseContentBlockText(
                         type="text", text=choice.message.content
                     ).model_dump()
                 )
             # Handle tool calls (in parallel to text content)
-            if (
-                choice.message.tool_calls is not None
-                and len(choice.message.tool_calls) > 0
-            ):
+            if has_tool_calls:
                 for tool_call in choice.message.tool_calls:
                     # Extract signature from provider_specific_fields only
                     signature = self._extract_signature_from_tool_call(tool_call)
@@ -1235,12 +1328,15 @@ class LiteLLMAnthropicMessagesAdapter:
 
                     tool_use_block = AnthropicResponseContentBlockToolUse(
                         type="tool_use",
-                        id=tool_call.id,
+                        id=sanitize_anthropic_tool_use_id(tool_call.id),
                         name=original_name,
-                        input=parse_tool_call_arguments(
-                            tool_call.function.arguments,
+                        input=sanitize_anthropic_tool_use_input(
                             tool_name=original_name,
-                            context="Anthropic pass-through adapter",
+                            tool_input=parse_tool_call_arguments(
+                                tool_call.function.arguments,
+                                tool_name=original_name,
+                                context="Anthropic pass-through adapter",
+                            ),
                         ),
                     )
                     # Add provider_specific_fields if signature is present
@@ -1340,7 +1436,10 @@ class LiteLLMAnthropicMessagesAdapter:
             ):
                 return "tool_use", ToolUseBlock(
                     type="tool_use",
-                    id=choice.delta.tool_calls[0].id or str(uuid.uuid4()),
+                    id=sanitize_anthropic_tool_use_id(
+                        choice.delta.tool_calls[0].id
+                    )
+                    or str(uuid.uuid4()),
                     name=choice.delta.tool_calls[0].function.name or "",
                     input={},  # type: ignore[typeddict-item]
                 )

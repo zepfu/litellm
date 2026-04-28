@@ -227,6 +227,211 @@ async def test_stream_wrapper_emits_done_delta_when_function_call_arguments_arri
 
 
 @pytest.mark.asyncio
+async def test_stream_wrapper_omits_empty_read_pages_argument_in_complete_json_delta():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=12,
+            output_tokens=7,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[
+            {
+                "type": "function_call",
+                "id": "fc_read",
+                "call_id": "call_fc_read",
+                "name": "Read",
+                "arguments": {"file_path": "/tmp/example.py", "pages": ""},
+            }
+        ],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_read",
+                call_id="call_fc_read",
+                name="Read",
+                arguments=None,
+            ),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_read",
+            delta='{"file_path": "/tmp/example.py", "pages": ""}',
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_read",
+                call_id="call_fc_read",
+                name="Read",
+                arguments={"file_path": "/tmp/example.py", "pages": ""},
+            ),
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="gpt-5.5",
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    assert chunks[1]["content_block"] == {
+        "type": "tool_use",
+        "id": "call_fc_read",
+        "name": "Read",
+        "input": {},
+    }
+    assert chunks[2]["delta"] == {
+        "type": "input_json_delta",
+        "partial_json": '{"file_path":"/tmp/example.py"}',
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_preserves_unrelated_empty_strings_in_read_delta():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=12,
+            output_tokens=7,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[
+            {
+                "type": "function_call",
+                "id": "fc_read_note",
+                "call_id": "call_fc_read_note",
+                "name": "Read",
+                "arguments": {"file_path": "/tmp/example.py", "note": ""},
+            }
+        ],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_read_note",
+                call_id="call_fc_read_note",
+                name="Read",
+                arguments=None,
+            ),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_read_note",
+            delta='{"file_path": "/tmp/example.py", "note": ""}',
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_read_note",
+                call_id="call_fc_read_note",
+                name="Read",
+                arguments={"file_path": "/tmp/example.py", "note": ""},
+            ),
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="gpt-5.5",
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    assert chunks[2]["delta"] == {
+        "type": "input_json_delta",
+        "partial_json": '{"file_path": "/tmp/example.py", "note": ""}',
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_omits_empty_read_pages_argument_from_split_deltas():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=12,
+            output_tokens=7,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[
+            {
+                "type": "function_call",
+                "id": "fc_read_split",
+                "call_id": "call_fc_read_split",
+                "name": "Read",
+                "arguments": {"file_path": "/tmp/example.py", "pages": ""},
+            }
+        ],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_read_split",
+                call_id="call_fc_read_split",
+                name="Read",
+                arguments=None,
+            ),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_read_split",
+            delta='{"file_path": "/tmp/example.py"',
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_read_split",
+            delta=', "pages": ""}',
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_read_split",
+                call_id="call_fc_read_split",
+                name="Read",
+                arguments={"file_path": "/tmp/example.py", "pages": ""},
+            ),
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="gpt-5.5",
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    assert [chunk["type"] for chunk in chunks] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert chunks[2]["delta"] == {
+        "type": "input_json_delta",
+        "partial_json": '{"file_path":"/tmp/example.py"}',
+    }
+
+
+@pytest.mark.asyncio
 async def test_stream_wrapper_synthesizes_stop_and_usage_when_completed_is_missing():
     events = [
         SimpleNamespace(type="response.created"),
