@@ -83,31 +83,20 @@ only as needed:
   Gemini 3.1 Pro can be rerun when the Google Code Assist quota/capacity block
   clears, but do not treat that quota block as an unvalidated stream-fix gap.
 
+- GPT-5.5/OpenAI Claude-dispatched parallel tool calls are now validated on dev
+  `:4001`. Keep the dead-end breadcrumb in [COMPLETED.md](COMPLETED.md): context
+  compaction alone was insufficient; the passing repair also rewrites the
+  adapted OpenAI Responses `instructions` to a compact function-calling policy
+  when `parallel_tool_calls=true` and multiple function tools are present. Live
+  artifact:
+  `/tmp/claude_adapter_gpt55_child_parallel_read_tools_parallel_instruction_policy.json`.
+
 ## Next
 
-- Finish the separate parallel-call proof now that sequential base-tool
-  coverage has passed. Gemini 3 Flash passed the live Claude-dispatch parallel
-  read-tool proof on dev `:4001` at
-  `/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`,
-  with `Read`, `Glob`, and `Grep` emitted in one assistant message and durable
-  tool activity recorded. GPT-5.5 still serializes the same request: artifact
-  `/tmp/claude_adapter_gpt55_child_parallel_read_tools.json` failed because the
-  child transcript never had `>= 3` `tool_use` blocks in a single assistant
-  message (`max=1`). The OpenAI Responses adapter now emits
-  `parallel_tool_calls=true` for function-tool requests when Anthropic has not
-  disabled parallel tool use, and the GPT harness case now hard-gates that
-  logged payload field. Live rerun
-  `/tmp/claude_adapter_gpt55_child_parallel_read_tools_rerun.json` confirmed the
-  flag was present but GPT-5.5 still serialized `Read`, `Glob`, and `Grep` into
-  separate assistant messages. Direct `/openai_passthrough/v1/responses` probes
-  showed GPT-5.5 can parallelize the same tools and same child task when the
-  large Claude Code injected context is absent, but emits only `Read` when the
-  full logged three-block Claude Code input is reused. Next work is context
-  shaping for OpenAI-dispatched Claude Code subagents: minimize the logged
-  Claude Code injected context, identify the exact semantic interference,
-  decide which real context should be summarized, omitted, or moved for adapted
-  non-Anthropic models without breaking normal agent grounding, then rerun
-  `claude_adapter_gpt55_child_parallel_read_tools` on dev `:4001`.
+- When Google Code Assist quota/capacity is available, rerun the Gemini 3.1 Pro
+  sequential and parallel gates to distinguish model capacity from adapter
+  behavior. Gemini 3 Flash and GPT-5.5 have both passed the current dev `:4001`
+  sequential and parallel base-tool proofs.
 
 ## Ongoing
 

@@ -305,6 +305,49 @@
   Responses backend; the remaining issue is semantic interference from the real
   injected Claude Code context for adapted OpenAI subagents.
 
+- Tried the first OpenAI Responses adapter context-shaping repair for GPT-5.5
+  parallel tool calls and classified it as insufficient by itself. The adapter
+  now compacts large Claude Code `SubagentStart` / `# claudeMd` reminder blocks
+  before Anthropic-to-Responses translation, preserves the actual child task,
+  and records `openai-adapter-claude-context-compacted` metadata/tags plus an
+  `openai_adapter.claude_context_compaction` span. Focused checks passed:
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k "OpenAIAdapterClaudeContextCompaction or trims_followup_google_tools_to_core_set or openai_responses_adapter_preserves_agent_project_litellm_metadata" -q`
+  (`6 passed`), `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`41 passed`), JSON config validation, and
+  `./.venv/bin/ruff check --select E9,F821,F823 ...`. Full Ruff on the touched
+  files still reports pre-existing unrelated lint debt. Live dev artifact
+  `/tmp/claude_adapter_gpt55_child_parallel_read_tools_context_shaped.json`
+  proved compaction ran (`43112` original context chars to `1418`, first GPT
+  request `2237` input tokens, request-payload checks passed), but GPT-5.5
+  still serialized `Read`, `Glob`, and `Grep` into three assistant messages
+  (`max_tool_uses_in_single_assistant_message=1`). Do not repeat "compact
+  Claude Code context only" as the next fix.
+
+- Closed the GPT-5.5/OpenAI Claude-dispatched parallel tool-call gap on dev
+  `:4001`. Exact compacted-payload probes showed the remaining blocker was the
+  full Claude Code `instructions` string: the exact compacted payload still
+  serialized, while a compact OpenAI Responses function-calling instruction
+  emitted `Read`, `Glob`, and `Grep` together in repeated direct probes. The
+  adapter now applies that instruction policy after Anthropic-to-Responses
+  translation only when `parallel_tool_calls=true` and multiple function tools
+  are present, and records
+  `openai-adapter-parallel-instruction-policy`,
+  `openai-adapter-parallel-tool:<tool>`, and
+  `openai_adapter.parallel_instruction_policy` metadata/spans. Focused checks
+  passed: `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k "OpenAIAdapterClaudeContextCompaction or applies_openai_parallel_instruction_policy or skips_openai_parallel_instruction_policy or trims_followup_google_tools_to_core_set or openai_responses_adapter_preserves_agent_project_litellm_metadata" -q`
+  (`10 passed`), `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`41 passed`), JSON config validation, and
+  `./.venv/bin/ruff check --select E9,F821,F823 ...`. Live dev harness passed:
+  `/tmp/claude_adapter_gpt55_child_parallel_read_tools_parallel_instruction_policy.json`.
+  The request payload checks found
+  `litellm_metadata.openai_adapter_parallel_instruction_policy_applied=true`,
+  Langfuse trace names were `claude-code.orchestrator` and
+  `claude-code.harness-gpt55-parallel-read-tools` with user id
+  `adapter-harness-tenant`, runtime logs had no forbidden errors, transcript
+  validation saw one assistant message containing `Read`, `Glob`, and `Grep`
+  (`max_tool_uses_in_single_assistant_message=3`), and durable tool activity
+  recorded the three OpenAI `responses.output` rows at the same timestamp.
+
 ## 2026-04-27
 
 - Closed the latest `aawm-tap` Claude-dispatched Gemini/GPT-5.5 investigation

@@ -193,6 +193,25 @@ _GOOGLE_ADAPTER_CLAUDE_OVERHEAD_MARKERS = (
 _GOOGLE_ADAPTER_SYNTHETIC_TOOL_CONTEXT_PATTERN = re.compile(
     r"\ACalling (?:tool [A-Za-z0-9_.:-]+|tools: [A-Za-z0-9_.:,\-\s]+)\.\Z"
 )
+_OPENAI_ADAPTER_SYSTEM_REMINDER_INLINE_PATTERN = re.compile(
+    r"<system-reminder>\n.*?</system-reminder>\n?",
+    re.DOTALL,
+)
+_OPENAI_ADAPTER_CONTEXT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("SubagentStart hook additional context:", "subagentstart"),
+    ("SubAgentStart hook additional context:", "subagentstart"),
+    ("# claudeMd", "claude-md"),
+    ("CLAUDE.md", "claude-md"),
+    ("MEMORY.md", "memory-md"),
+    ("# TriStore Inject", "tristore-inject"),
+)
+_OPENAI_ADAPTER_PARALLEL_FUNCTION_TOOL_INSTRUCTIONS = """You are an OpenAI Responses function-calling agent for Claude Code.
+
+Parallel tool calls are enabled. When the current user task asks for multiple independent tool calls, emit all independent function calls together in one response output array before receiving any tool result. Do not serialize independent Read, Glob, Grep, Bash, WebSearch, or WebFetch calls when their arguments are already specified or can be determined from the current task.
+
+Follow the latest user task exactly. Use the provided tool schemas as the source of truth for arguments. Emit no assistant text before tool calls when the task asks for tool calls only. After tool results return, provide the requested final answer.
+
+Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."""
 _PASSTHROUGH_SESSION_ID_HEADER_NAMES = (
     "session_id",
     "Session_Id",
@@ -1449,6 +1468,19 @@ def _get_google_adapter_followup_allowed_tool_names() -> set[str]:
             expanded_tool_names.add(alias_name)
 
     return expanded_tool_names
+
+
+def _get_openai_adapter_claude_context_char_cap() -> int:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP")
+    )
+    if raw_value is None:
+        return 1200
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return 1200
+    return max(256, parsed)
 
 
 def _request_block_has_google_function_response(request_block: dict[str, Any]) -> bool:
@@ -4668,6 +4700,81 @@ def _build_anthropic_responses_adapter_request_body(
     )
 
 
+def _get_openai_adapter_function_tool_names(
+    request_body: dict[str, Any],
+) -> list[str]:
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return []
+
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        name = tool.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _apply_openai_adapter_parallel_instruction_policy(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if request_body.get("parallel_tool_calls") is not True:
+        return request_body, {}
+
+    function_tool_names = _get_openai_adapter_function_tool_names(request_body)
+    if len(function_tool_names) < 2:
+        return request_body, {}
+
+    existing_instructions = request_body.get("instructions")
+    if not isinstance(existing_instructions, str) or not existing_instructions.strip():
+        return request_body, {}
+
+    replacement = _OPENAI_ADAPTER_PARALLEL_FUNCTION_TOOL_INSTRUCTIONS
+    if existing_instructions == replacement:
+        return request_body, {}
+
+    updated_body = dict(request_body)
+    updated_body["instructions"] = replacement
+    original_hash = hashlib.sha256(
+        existing_instructions.encode("utf-8", errors="replace")
+    ).hexdigest()
+    changes = {
+        "openai_adapter_parallel_instruction_policy_applied": True,
+        "openai_adapter_parallel_instruction_original_chars": len(
+            existing_instructions
+        ),
+        "openai_adapter_parallel_instruction_rewritten_chars": len(replacement),
+        "openai_adapter_parallel_instruction_original_hash": original_hash,
+        "openai_adapter_parallel_instruction_tool_names": function_tool_names,
+    }
+    updated_body = _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            "openai-adapter-parallel-instruction-policy",
+            *[
+                f"openai-adapter-parallel-tool:{_normalize_low_cardinality_tag_value(tool_name) or 'unknown'}"
+                for tool_name in function_tool_names
+            ],
+        ],
+        extra_fields={
+            **changes,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="openai_adapter.parallel_instruction_policy",
+                    metadata={
+                        "tool_names": function_tool_names,
+                        "original_chars": len(existing_instructions),
+                        "rewritten_chars": len(replacement),
+                    },
+                )
+            ],
+        },
+    )
+    return updated_body, changes
+
+
 def _build_anthropic_response_from_responses_response(
     response_body: dict[str, Any],
 ) -> Response:
@@ -5341,11 +5448,42 @@ async def _handle_anthropic_openai_responses_adapter_route(
         local_codex_headers = _load_local_codex_auth_headers(request)
 
     use_chatgpt_codex_defaults = uses_codex_native_auth or local_codex_headers is not None
+    (
+        prepared_request_body,
+        openai_context_compacted_count,
+        openai_context_compacted_markers,
+        _openai_context_compaction_metadata,
+    ) = _compact_openai_adapter_claude_context_in_anthropic_request_body(
+        prepared_request_body
+    )
+    if openai_context_compacted_count > 0:
+        verbose_proxy_logger.debug(
+            "Compacted Claude Code context for OpenAI Responses adapter; count=%s markers=%s",
+            openai_context_compacted_count,
+            sorted(openai_context_compacted_markers),
+        )
     translated_request_body = _build_anthropic_responses_adapter_request_body(
         prepared_request_body,
         adapter_model=adapter_model,
         use_chatgpt_codex_defaults=use_chatgpt_codex_defaults,
     )
+    (
+        translated_request_body,
+        openai_parallel_instruction_policy_changes,
+    ) = _apply_openai_adapter_parallel_instruction_policy(translated_request_body)
+    if openai_parallel_instruction_policy_changes:
+        verbose_proxy_logger.debug(
+            "Applied OpenAI adapter parallel instruction policy; tools=%s original_chars=%s rewritten_chars=%s",
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_tool_names"
+            ),
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_original_chars"
+            ),
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_rewritten_chars"
+            ),
+        )
     if use_chatgpt_codex_defaults:
         translated_request_body = _add_codex_request_breakout_logging_metadata(
             translated_request_body
@@ -6308,6 +6446,253 @@ def _compact_google_adapter_persisted_output_in_anthropic_request_body(
     if not isinstance(updated_body, dict):
         return request_body, 0, set(), []
     return updated_body, compacted_count, hooks, metadata_items
+
+
+def _detect_openai_adapter_claude_context_markers(text: str) -> set[str]:
+    markers: set[str] = set()
+    for marker_text, marker_name in _OPENAI_ADAPTER_CONTEXT_MARKERS:
+        if marker_text in text:
+            markers.add(marker_name)
+    return markers
+
+
+def _select_openai_adapter_context_summary_lines(text: str) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        include_line = (
+            line.startswith("SubagentStart hook additional context:")
+            or line.startswith("SubAgentStart hook additional context:")
+            or line.startswith("#")
+            or line.startswith("Contents of ")
+            or line.startswith("You are '")
+            or line.startswith("Codebase and user instructions")
+            or line.startswith("IMPORTANT:")
+        )
+        if not include_line:
+            continue
+        if line in seen:
+            continue
+        selected.append(line)
+        seen.add(line)
+        if len(selected) >= 10:
+            break
+    if selected:
+        return selected
+    return [line.strip() for line in text.splitlines() if line.strip()][:4]
+
+
+def _build_openai_adapter_compacted_claude_context_block(
+    *,
+    original_block: str,
+    markers: set[str],
+    cap: int,
+) -> str:
+    marker_text = ", ".join(sorted(markers)) or "unknown"
+    heading = (
+        "[OpenAI adapter compacted Claude Code context block "
+        f"from {len(original_block)} chars. Markers: {marker_text}. "
+        "The current child task, tool schemas, and latest user instructions remain authoritative.]"
+    )
+    summary_budget = max(0, cap - len(heading) - 64)
+    summary_text = "\n".join(
+        _select_openai_adapter_context_summary_lines(original_block)
+    ).strip()
+    if len(summary_text) > summary_budget:
+        summary_text = summary_text[:summary_budget].rstrip()
+    if summary_text:
+        body = f"{heading}\n{summary_text}"
+    else:
+        body = heading
+    return f"<system-reminder>\n{body}\n</system-reminder>\n"
+
+
+def _compact_openai_adapter_claude_context_text(
+    text: str,
+    *,
+    cap: Optional[int] = None,
+) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
+    effective_cap = cap or _get_openai_adapter_claude_context_char_cap()
+    updated_text = text
+    compacted_count = 0
+    combined_markers: set[str] = set()
+    metadata_items: list[dict[str, Any]] = []
+
+    matches = list(_OPENAI_ADAPTER_SYSTEM_REMINDER_INLINE_PATTERN.finditer(text))
+    for match in reversed(matches):
+        reminder_block = match.group(0)
+        markers = _detect_openai_adapter_claude_context_markers(reminder_block)
+        if not markers or len(reminder_block) <= effective_cap:
+            continue
+
+        compacted_block = _build_openai_adapter_compacted_claude_context_block(
+            original_block=reminder_block,
+            markers=markers,
+            cap=effective_cap,
+        )
+        updated_text = (
+            updated_text[: match.start()]
+            + compacted_block
+            + updated_text[match.end() :]
+        )
+        compacted_count += 1
+        combined_markers.update(markers)
+        metadata_items.append(
+            {
+                "markers": sorted(markers),
+                "original_chars": len(reminder_block),
+                "kept_chars": len(compacted_block),
+                "mode": "system_reminder_context_cap",
+            }
+        )
+
+    metadata_items.reverse()
+    return updated_text, compacted_count, combined_markers, metadata_items
+
+
+def _compact_openai_adapter_claude_context_value(
+    value: Any,
+    *,
+    cap: Optional[int] = None,
+) -> Tuple[Any, int, set[str], list[dict[str, Any]]]:
+    if isinstance(value, str):
+        return _compact_openai_adapter_claude_context_text(value, cap=cap)
+
+    if isinstance(value, dict):
+        updated_dict: dict[str, Any] = {}
+        compacted_count = 0
+        markers: set[str] = set()
+        metadata_items: list[dict[str, Any]] = []
+        changed = False
+        for key, child in value.items():
+            updated_child, child_count, child_markers, child_metadata = (
+                _compact_openai_adapter_claude_context_value(child, cap=cap)
+            )
+            updated_dict[key] = updated_child
+            compacted_count += child_count
+            markers.update(child_markers)
+            metadata_items.extend(child_metadata)
+            changed = changed or updated_child != child
+        if changed:
+            return updated_dict, compacted_count, markers, metadata_items
+        return value, compacted_count, markers, metadata_items
+
+    if isinstance(value, list):
+        updated_list: list[Any] = []
+        compacted_count = 0
+        markers: set[str] = set()
+        metadata_items: list[dict[str, Any]] = []
+        changed = False
+        for child in value:
+            updated_child, child_count, child_markers, child_metadata = (
+                _compact_openai_adapter_claude_context_value(child, cap=cap)
+            )
+            updated_list.append(updated_child)
+            compacted_count += child_count
+            markers.update(child_markers)
+            metadata_items.extend(child_metadata)
+            changed = changed or updated_child != child
+        if changed:
+            return updated_list, compacted_count, markers, metadata_items
+        return value, compacted_count, markers, metadata_items
+
+    return value, 0, set(), []
+
+
+def _add_openai_adapter_claude_context_compaction_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    compacted_count: int,
+    markers: set[str],
+    metadata_items: list[dict[str, Any]],
+    span_started_at: datetime,
+) -> dict[str, Any]:
+    original_chars = sum(
+        item.get("original_chars", 0)
+        for item in metadata_items
+        if isinstance(item.get("original_chars"), int)
+    )
+    compacted_chars = sum(
+        item.get("kept_chars", 0)
+        for item in metadata_items
+        if isinstance(item.get("kept_chars"), int)
+    )
+    sorted_markers = sorted(markers)
+    tags = [
+        "openai-adapter-claude-context-compacted",
+        *[
+            f"openai-adapter-claude-context:{marker}"
+            for marker in sorted_markers
+        ],
+    ]
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags,
+        extra_fields={
+            "openai_adapter_claude_context_compacted": True,
+            "openai_adapter_claude_context_compacted_count": compacted_count,
+            "openai_adapter_claude_context_markers": sorted_markers,
+            "openai_adapter_claude_context_original_chars": original_chars,
+            "openai_adapter_claude_context_compacted_chars": compacted_chars,
+            "openai_adapter_claude_context_saved_chars": max(
+                0, original_chars - compacted_chars
+            ),
+            "openai_adapter_claude_context_compaction_events": metadata_items,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="openai_adapter.claude_context_compaction",
+                    metadata={
+                        "compacted_count": compacted_count,
+                        "markers": sorted_markers,
+                        "original_chars": original_chars,
+                        "compacted_chars": compacted_chars,
+                        "saved_chars": max(0, original_chars - compacted_chars),
+                    },
+                    start_time=span_started_at,
+                    end_time=datetime.now(timezone.utc),
+                )
+            ],
+        },
+    )
+
+
+def _compact_openai_adapter_claude_context_in_anthropic_request_body(
+    request_body: dict[str, Any],
+) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
+    span_started_at = datetime.now(timezone.utc)
+    updated_body = dict(request_body)
+    compacted_count = 0
+    markers: set[str] = set()
+    metadata_items: list[dict[str, Any]] = []
+    changed = False
+
+    for top_level_key in ("system", "messages"):
+        if top_level_key not in request_body:
+            continue
+        updated_value, value_count, value_markers, value_metadata = (
+            _compact_openai_adapter_claude_context_value(request_body[top_level_key])
+        )
+        if value_count > 0:
+            updated_body[top_level_key] = updated_value
+            compacted_count += value_count
+            markers.update(value_markers)
+            metadata_items.extend(value_metadata)
+            changed = True
+
+    if not changed:
+        return request_body, 0, set(), []
+
+    updated_body = _add_openai_adapter_claude_context_compaction_logging_metadata(
+        updated_body,
+        compacted_count=compacted_count,
+        markers=markers,
+        metadata_items=metadata_items,
+        span_started_at=span_started_at,
+    )
+    return updated_body, compacted_count, markers, metadata_items
 
 
 def _expand_claude_persisted_output_text(
