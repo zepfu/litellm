@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34`, `aawm.35`, `aawm.36` (35 active carried patches)
+Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34`, `aawm.35`, `aawm.36`, `aawm.37` (36 active carried patches)
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +38,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.36`.
+`1.82.3+aawm.37`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1210,6 +1210,58 @@ runtime identity in `session_history`, and the local image publisher guard.
 After `main` is converged and the artifact autobump has published callback and
 model-config assets, tag and publish `v1.82.3-aawm.36`, then promote through
 the normal prod `:4000` process.
+
+---
+
+### aawm.37 — Claude-dispatched parallel tool dispatch and harness closure
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `pyproject.toml`
+- `TODO.md`
+- `COMPLETED.md`
+- `PATCHES.md`
+
+**Upstream issue:** Claude Code child-agent dispatch through LiteLLM's
+Anthropic-compatible adapter needed durable proof that OpenAI/GPT, Gemini,
+OpenRouter, and NVIDIA routes preserve sequential and parallel tool-call
+semantics plus child trace identity. GPT-5.5 and OpenRouter Responses requests
+also needed compact function-calling instruction policy when
+`parallel_tool_calls=true`, while completion adapters needed to prefer child
+trace metadata over stale orchestrator metadata.
+
+**Fix:** Add reusable Responses-adapter parallel instruction policy metadata,
+apply OpenRouter-specific context compaction and parallel policy, preserve child
+trace names/user ids through completion-adapter metadata merging, and extend the
+local Anthropic adapter harness with default-excluded OpenRouter, NVIDIA, and
+Gemini 3.1 Pro parallel read-tool proofs. The release metadata now advances to
+`1.82.3+aawm.37`.
+
+**Why not upstream:** This is AAWM-specific Claude Code dispatch behavior,
+Langfuse/session-history identity policy, local harness coverage, and provider
+selection for `/anthropic` routes backed by OpenAI Responses, Google Code
+Assist, OpenRouter, and NVIDIA.
+
+**Validation status:** Focused proxy tests passed for child trace context,
+trace-name precedence, context compaction, and parallel instruction policy
+(`11 passed`). Harness hardening passed (`41 passed`), JSON validation passed,
+and Ruff `E9,F821,F823` passed for touched Python files. Live dev `:4001`
+artifacts passed for OpenAI/GPT-5.5
+(`/tmp/claude_adapter_gpt55_child_parallel_read_tools_parallel_instruction_policy.json`),
+OpenRouter/Ling plus NVIDIA/DeepSeek
+(`/tmp/claude_adapter_openrouter_ling_nvidia_parallel_read_tools.json`,
+`/tmp/claude_adapter_nvidia_parallel_read_tools_trace_fix.json`), Gemini 3
+Flash parallel read tools
+(`/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`), and
+Gemini 3.1 Pro sequential plus parallel gates after quota reset
+(`/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`). Before
+promoting to prod, merge to `main`, allow the harness artifact autobump to
+publish the next `h-v*` release, tag/publish `v1.82.3-aawm.37` from the final
+`main` head, then update and build the infrastructure image without restarting
+`aawm-litellm` until explicitly approved.
 
 ---
 

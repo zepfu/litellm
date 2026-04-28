@@ -2,6 +2,29 @@
 
 ## 2026-04-28
 
+- Closed the Gemini 3.1 Pro quota-reset validation loop on dev `:4001`.
+  Added the default-excluded
+  `claude_adapter_gemini31_pro_child_parallel_read_tools` harness case and
+  reran it with the existing
+  `claude_adapter_gemini31_pro_child_sequential_core_tools` case after Google
+  Code Assist capacity reset. Live artifact:
+  `/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`. Both cases
+  passed with zero failures and zero warnings. Sequential proof recorded final
+  `GEMINI31 PRO SEQUENTIAL TOOLS PASSED`, trace
+  `claude-code.harness-gemini31-pro-sequential-core-tools`, tenant-only user id
+  `adapter-harness-tenant`, exact ordered `Read`, `Write`, `Edit`, `Glob`,
+  `Grep`, `Bash`, `WebSearch`, and `WebFetch` transcript tools with
+  `max_tool_uses_in_single_assistant_message=1`, durable native Gemini
+  `read_file`, `write_file`, `replace`, `glob`, `grep_search`,
+  `run_shell_command`, `google_web_search`, and `web_fetch` activity, and no
+  transcript tool-result errors. Parallel proof recorded final
+  `GEMINI31 PRO PARALLEL TOOLS PASSED`, trace
+  `claude-code.harness-gemini31-pro-parallel-read-tools`, native Gemini
+  `read_file`/`glob`/`grep_search` rows, and
+  `max_tool_uses_in_single_assistant_message=3`. The harness runtime log guard
+  found no live `Content block not found` or `Invalid pages parameter` blockers
+  in the checked run window.
+
 - Added the first half of the expanded Claude-dispatch base-tool harness:
   default-excluded sequential child-agent cases for GPT-5.5 and Gemini 3.1 Pro,
   plus transcript-level validation of Claude Code child `.jsonl` files. The new

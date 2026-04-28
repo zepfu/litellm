@@ -39,6 +39,7 @@
     "claude_adapter_gemini_output_config_minimal_effort_cache",
     "claude_adapter_gemini_output_config_max_effort_cache",
     "claude_adapter_gemini31_pro_child_sequential_core_tools",
+    "claude_adapter_gemini31_pro_child_parallel_read_tools",
     "claude_adapter_gemini3_flash_child_sequential_core_tools",
     "claude_adapter_gemini3_flash_child_parallel_read_tools",
     "claude_adapter_gemini31_pro_read_tool_id_sanitizer",
@@ -2212,6 +2213,208 @@
             ],
             "maximum_tool_uses_per_assistant_message": 1,
             "require_tool_result_before_next_tool_use": true,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "retry_on_api_error_statuses": [
+        429
+      ],
+      "retry_max_attempts": 3,
+      "retry_backoff_seconds": 25,
+      "runtime_log_checks": {
+        "forbidden_substrings": [
+          "Invalid pages parameter",
+          "Content block not found"
+        ]
+      },
+      "timeout_seconds": 540,
+      "langfuse_poll_timeout_seconds": 90,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_gemini31_pro_child_parallel_read_tools": {
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the harness-gemini31-pro-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read /home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from /home/zepfu/projects/litellm, and Grep pattern exactly `sequential-core-tools-grep` with path exactly `/home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: GEMINI31 PRO PARALLEL TOOLS PASSED",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "harness-gemini31-pro-parallel-read-tools": {
+          "description": "Acceptance harness child for Gemini 3.1 Pro parallel read-tool proof.",
+          "model": "google/gemini-3.1-pro-preview",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, return only the caller's exact final line."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.harness-gemini31-pro-parallel-read-tools"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.harness-gemini31-pro-parallel-read-tools": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 6,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_google_completion_adapter",
+        "anthropic-google-completion-adapter",
+        "anthropic-adapter-model:gemini-3.1-pro-preview",
+        "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
+      ],
+      "required_trace_tag_prefixes": [
+        "anthropic-billing-header-key:cc_version",
+        "anthropic-billing-header-key:cc_entrypoint",
+        "claude-effort:",
+        "thinking-type:"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family",
+        "google_adapter_system_prompt_policy",
+        "google_adapter_system_prompt_policy_version",
+        "google_adapter_system_prompt_original_chars",
+        "google_adapter_system_prompt_rewritten_chars"
+      ],
+      "request_text_checks": {
+        "required_substrings": [
+          "You are a non-interactive CLI software engineering agent.",
+          "Final responses must include visible assistant text."
+        ],
+        "forbidden_substrings": [
+          "You are Claude Code"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_contains": {
+          "result": "GEMINI31 PRO PARALLEL TOOLS PASSED"
+        },
+        "required_minimums": {
+          "modelUsage.google/gemini-3.1-pro-preview.inputTokens": 1,
+          "modelUsage.google/gemini-3.1-pro-preview.outputTokens": 1,
+          "total_cost_usd": 1e-06
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "metadata_required_equals": {
+          "google_adapter_system_prompt_policy": "replace_compact",
+          "google_adapter_system_prompt_policy_version": "2026-04-27.v2"
+        },
+        "metadata_required_truthy": [
+          "google_adapter_system_prompt_original_chars",
+          "google_adapter_system_prompt_rewritten_chars"
+        ],
+        "expected_rows": [
+          {
+            "provider": "gemini",
+            "model": "gemini-3.1-pro-preview",
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "reasoning_tokens_reported": 1,
+              "response_cost_usd": 1e-06
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1
+          },
+          {
+            "provider": "gemini",
+            "model": "gemini-3.1-pro-preview",
+            "tool_name": "read_file",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "gemini",
+            "model": "gemini-3.1-pro-preview",
+            "tool_name": "glob",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "scripts/local-ci/sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "gemini",
+            "model": "gemini-3.1-pro-preview",
+            "tool_name": "grep_search",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential-core-tools-grep"
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "harness-gemini31-pro-parallel-read-tools",
+            "expected_tool_counts": {
+              "Read": 1,
+              "Glob": 1,
+              "Grep": 1
+            },
+            "minimum_total_tool_uses": 3,
+            "maximum_total_tool_uses": 3,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
             "forbid_tool_result_errors": true
           }
         ]
