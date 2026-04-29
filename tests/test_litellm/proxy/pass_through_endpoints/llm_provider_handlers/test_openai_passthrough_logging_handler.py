@@ -811,6 +811,7 @@ class TestOpenAIPassthroughLoggingHandler:
 
         usage = result["result"].usage
         standard_logging_object = result["kwargs"]["standard_logging_object"]
+        metadata = result["kwargs"]["litellm_params"]["metadata"]
         assert result["result"].choices[0].message.content == "langfuse fixed"
         assert usage.prompt_tokens == 15519
         assert usage.completion_tokens == 29
@@ -826,6 +827,19 @@ class TestOpenAIPassthroughLoggingHandler:
                 "call_id": "call_pwd",
                 "id": "fc_pwd",
                 "name": "Bash",
+                "arguments": '{"command":"pwd"}',
+            }
+        ]
+        assert "response.output_item.added" in metadata["responses_stream_event_types"]
+        assert "response.function_call_arguments.done" in metadata["responses_stream_event_types"]
+        assert metadata["responses_stream_event_counts"]["response.output_item.added"] == 1
+        assert metadata["responses_stream_tool_call_count"] == 1
+        assert metadata["responses_stream_tool_names"] == ["Bash"]
+        assert metadata["responses_stream_tool_state"] == [
+            {
+                "type": "function_call",
+                "name": "Bash",
+                "call_id": "call_pwd",
                 "arguments": '{"command":"pwd"}',
             }
         ]

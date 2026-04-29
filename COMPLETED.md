@@ -2,6 +2,47 @@
 
 ## 2026-04-29
 
+- Added the focused Codex stream-state parity gate for `/anthropic` work. The
+  OpenAI passthrough streaming logger now records bounded
+  `responses_stream_event_types`, event counts, reconstructed tool-call count,
+  tool names, and tool state from Responses streaming chunks. The harness now
+  has `stream_tool_call_state_validation`, a native Codex CLI baseline case
+  (`native_openai_passthrough_responses_codex_tool_activity`), and matching
+  hard gates on `claude_adapter_codex_tool_activity` for reconstructed
+  `response.output_item.*` / `response.function_call_arguments.*` state plus
+  `session_history_tool_activity`.
+
+- Focused validation for the Codex stream-state gate passed:
+  `test_openai_passthrough_logging_handler.py` (`35 passed`),
+  `test_anthropic_adapter_acceptance_hardening.py` (`47 passed`), targeted
+  harness stream-state/config tests (`3 passed`), JSON validation for
+  `scripts/local-ci/anthropic_adapter_config.json`, `py_compile` for the touched
+  Python files, focused `ruff check` for
+  `litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py`,
+  and `git diff --check`.
+
+- Failed/dead-end notes from this slice: the first targeted harness test run
+  failed because the config patch accidentally attached the Codex stream
+  metadata gate to the GPT-5.4 smoke case rather than
+  `claude_adapter_codex_tool_activity`; the config-shape test caught it and the
+  gate was moved to the intended case. A broad ruff run over all touched
+  harness/test files still reports pre-existing lint debt in
+  `scripts/local-ci/run_anthropic_adapter_acceptance.py` and
+  `test_openai_passthrough_logging_handler.py`; after refactoring the touched
+  OpenAI implementation, the implementation-file ruff gate passes. A local
+  Langfuse observation curl probe intermittently returned connection refused
+  after a prior successful observation fetch while `/api/public/health` remained
+  healthy, so raw observation inspection was not used as the validation source.
+  The first live focused Codex pair at `/tmp/anthropic_codex_tool_parity.json`
+  failed the native baseline because the assumed native tool name was
+  `local_shell_call`/`Bash`; live Codex CLI actually produced
+  `response.function_call_arguments.*` for `function_call` name `exec_command`
+  with `cmd: "pwd"`, and `session_history_tool_activity` recorded
+  `tool_name=exec_command`. The `/anthropic` half passed in that same artifact,
+  and the native baseline was updated to match the observed native Codex shape.
+  The focused dev rerun passed with both native and `/anthropic` Codex gates
+  clean at `/tmp/anthropic_codex_tool_parity_after_exec_command.json`.
+
 - Continued the `/anthropic` parity refinement pass with three focused fixes and
   coverage additions. The OpenAI/Codex Responses adapter no longer turns prior
   assistant `thinking` / `redacted_thinking` history into visible

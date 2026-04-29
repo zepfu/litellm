@@ -306,6 +306,99 @@ def test_generation_route_filter_accepts_route_tag_without_request_route(monkeyp
     assert summaries[0]["traceId"] == "trace-1"
 
 
+def test_stream_tool_call_state_validation_accepts_recorded_responses_state():
+    harness = _load_harness_module()
+    observation = {
+        "id": "generation-1",
+        "metadata": {
+            "responses_stream_event_types": [
+                "response.output_item.added",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            ],
+            "responses_stream_event_counts": {
+                "response.output_item.added": 1,
+                "response.function_call_arguments.done": 1,
+                "response.output_item.done": 1,
+            },
+            "responses_stream_tool_state": [
+                {
+                    "type": "function_call",
+                    "name": "Bash",
+                    "call_id": "call_pwd",
+                    "arguments": '{"command":"pwd"}',
+                }
+            ],
+        },
+    }
+
+    summary, failures = harness._validate_stream_tool_call_state(
+        family="case",
+        observations=[observation],
+        checks={
+            "required_event_types": [
+                "response.output_item.added",
+                "response.output_item.done",
+            ],
+            "required_any_event_type_groups": [
+                [
+                    "response.function_call_arguments.delta",
+                    "response.function_call_arguments.done",
+                ]
+            ],
+            "expected_tools": [
+                {
+                    "tool_name": "Bash",
+                    "tool_type": "function_call",
+                    "arguments_required_substrings": ["pwd"],
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    assert summary["event_counts"]["response.output_item.added"] == 1
+    assert summary["tool_names"] == ["Bash"]
+
+
+def test_stream_tool_call_state_validation_rejects_missing_event_and_tool():
+    harness = _load_harness_module()
+
+    _summary, failures = harness._validate_stream_tool_call_state(
+        family="case",
+        observations=[
+            {
+                "id": "generation-1",
+                "metadata": {
+                    "responses_stream_event_types": ["response.created"],
+                    "responses_stream_tool_state": [],
+                },
+            }
+        ],
+        checks={
+            "required_event_types": ["response.output_item.added"],
+            "required_any_event_type_groups": [
+                [
+                    "response.function_call_arguments.delta",
+                    "response.function_call_arguments.done",
+                ]
+            ],
+            "expected_tools": [
+                {
+                    "tool_name": "Bash",
+                    "arguments_required_substrings": ["pwd"],
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case missing Responses stream event type `response.output_item.added`",
+        "case missing any Responses stream event type from ['response.function_call_arguments.delta', 'response.function_call_arguments.done']",
+        "case missing Responses stream tool state for {'tool_name': 'Bash', 'arguments_required_substrings': ['pwd']}; expected >= 1, got 0",
+    ]
+
+
 def test_provider_unavailable_command_failure_can_soft_fail_with_exact_log_signature():
     harness = _load_harness_module()
 
@@ -564,6 +657,47 @@ def test_target_profile_adds_native_cli_repository_headers(monkeypatch):
         "GEMINI_CLI_CUSTOM_HEADERS"
     ]
     assert "x-aawm-repository: zepfu/litellm" in gemini_headers
+
+
+def test_codex_tool_activity_parity_cases_have_stream_state_gates():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    native_case = config["cases"][
+        "native_openai_passthrough_responses_codex_tool_activity"
+    ]
+    claude_case = config["cases"]["claude_adapter_codex_tool_activity"]
+
+    assert (
+        "native_openai_passthrough_responses_codex_tool_activity"
+        in config["default_excluded_cases"]
+    )
+    assert native_case["cli_passthrough"] == "codex"
+    assert "pwd" in native_case["command"][-1]
+    assert "responses_stream_tool_call_count" in native_case[
+        "required_generation_metadata_minimums"
+    ]
+    assert native_case["stream_tool_call_state_validation"]["expected_tools"][0][
+        "tool_name"
+    ] == "exec_command"
+    assert native_case["stream_tool_call_state_validation"]["expected_tools"][0][
+        "tool_type"
+    ] == "function_call"
+    assert native_case["tool_activity_validation"]["expected_rows"][0][
+        "tool_name"
+    ] == "exec_command"
+    assert native_case["tool_activity_validation"]["expected_rows"][0][
+        "command_text_contains"
+    ] == "pwd"
+
+    claude_stream_gate = claude_case["stream_tool_call_state_validation"]
+    assert claude_stream_gate["expected_tools"][0]["tool_name"] == "Bash"
+    assert claude_stream_gate["expected_tools"][0]["tool_type"] == "function_call"
+    assert "response.function_call_arguments.done" in claude_stream_gate[
+        "required_any_event_type_groups"
+    ][0]
+    assert "responses_stream_tool_call_count" in claude_case[
+        "required_generation_metadata_minimums"
+    ]
 
 
 def test_target_profile_appends_case_local_claude_agents(monkeypatch):

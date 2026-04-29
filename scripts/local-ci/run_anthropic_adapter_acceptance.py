@@ -999,6 +999,199 @@ def _validate_logged_request_payload_checks(
     return summary, failures, warnings
 
 
+def _stream_tool_state_from_output_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = item.get('type')
+    if item_type not in {
+        'function_call',
+        'local_shell_call',
+        'apply_patch_call',
+        'custom_tool_call',
+        'mcp_call',
+    }:
+        return None
+    tool_name = item.get('name')
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        tool_name = item_type
+    arguments = None
+    for key in ('arguments', 'input', 'action', 'patch'):
+        if item.get(key) is not None:
+            arguments = item.get(key)
+            break
+    if isinstance(arguments, str):
+        arguments_text = arguments
+    elif arguments is None:
+        arguments_text = ''
+    else:
+        try:
+            arguments_text = json.dumps(arguments, sort_keys=True)
+        except (TypeError, ValueError):
+            arguments_text = str(arguments)
+    return {
+        'type': item_type,
+        'name': tool_name,
+        'call_id': item.get('call_id') or item.get('id'),
+        'arguments': arguments_text,
+    }
+
+
+def _collect_stream_tool_call_state(
+    observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    event_types: list[str] = []
+    event_counts: dict[str, int] = {}
+    tool_state: list[dict[str, Any]] = []
+
+    for observation in observations:
+        metadata = observation.get('metadata')
+        if isinstance(metadata, dict):
+            metadata_event_types = metadata.get('responses_stream_event_types')
+            if isinstance(metadata_event_types, list):
+                for event_type in metadata_event_types:
+                    if isinstance(event_type, str) and event_type not in event_types:
+                        event_types.append(event_type)
+            metadata_event_counts = metadata.get('responses_stream_event_counts')
+            if isinstance(metadata_event_counts, dict):
+                for event_type, count in metadata_event_counts.items():
+                    if not isinstance(event_type, str):
+                        continue
+                    if isinstance(count, (int, float)):
+                        event_counts[event_type] = event_counts.get(event_type, 0) + int(count)
+            metadata_tool_state = metadata.get('responses_stream_tool_state')
+            if isinstance(metadata_tool_state, list):
+                for item in metadata_tool_state:
+                    if isinstance(item, dict):
+                        tool_state.append(dict(item))
+
+        output = observation.get('output')
+        if isinstance(output, dict):
+            for path in (
+                '_hidden_params.responses_output',
+                'hidden_params.responses_output',
+                'output',
+            ):
+                output_items = _extract_path_value(output, path)
+                if not isinstance(output_items, list):
+                    continue
+                for item in output_items:
+                    if not isinstance(item, dict):
+                        continue
+                    state_item = _stream_tool_state_from_output_item(item)
+                    if state_item is not None:
+                        tool_state.append(state_item)
+
+    deduped_tool_state: list[dict[str, Any]] = []
+    seen_tools: set[tuple[str, str, str]] = set()
+    for item in tool_state:
+        key = (
+            str(item.get('type') or ''),
+            str(item.get('name') or ''),
+            str(item.get('arguments') or ''),
+        )
+        if key in seen_tools:
+            continue
+        seen_tools.add(key)
+        deduped_tool_state.append(item)
+
+    return {
+        'event_types': event_types,
+        'event_counts': event_counts,
+        'tool_state': deduped_tool_state,
+        'tool_names': [
+            item.get('name')
+            for item in deduped_tool_state
+            if isinstance(item.get('name'), str) and item.get('name')
+        ],
+    }
+
+
+def _stream_tool_state_matches_expected(
+    item: dict[str, Any],
+    expected: dict[str, Any],
+) -> bool:
+    expected_name = expected.get('tool_name')
+    if expected_name is not None and item.get('name') != expected_name:
+        return False
+    name_one_of = expected.get('tool_name_one_of')
+    if isinstance(name_one_of, list) and name_one_of:
+        if item.get('name') not in set(name_one_of):
+            return False
+
+    expected_type = expected.get('tool_type')
+    if expected_type is not None and item.get('type') != expected_type:
+        return False
+    type_one_of = expected.get('tool_type_one_of')
+    if isinstance(type_one_of, list) and type_one_of:
+        if item.get('type') not in set(type_one_of):
+            return False
+
+    argument_text = str(item.get('arguments') or '')
+    required_substrings = []
+    configured_substring = expected.get('arguments_required_substring')
+    if isinstance(configured_substring, str) and configured_substring:
+        required_substrings.append(configured_substring)
+    configured_substrings = expected.get('arguments_required_substrings')
+    if isinstance(configured_substrings, list):
+        required_substrings.extend(
+            value
+            for value in configured_substrings
+            if isinstance(value, str) and value
+        )
+    return all(substring in argument_text for substring in required_substrings)
+
+
+def _validate_stream_tool_call_state(
+    *,
+    family: str,
+    observations: list[dict[str, Any]],
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not checks:
+        return {}, []
+
+    summary = _collect_stream_tool_call_state(observations)
+    failures: list[str] = []
+    observed_event_types = set(summary.get('event_types') or [])
+
+    for event_type in _as_string_list(checks.get('required_event_types')):
+        if event_type not in observed_event_types:
+            failures.append(
+                f'{family} missing Responses stream event type `{event_type}`'
+            )
+
+    required_any_groups = checks.get('required_any_event_type_groups') or []
+    if isinstance(required_any_groups, list):
+        for group in required_any_groups:
+            group_values = _as_string_list(group)
+            if not group_values:
+                continue
+            if not any(event_type in observed_event_types for event_type in group_values):
+                failures.append(
+                    f'{family} missing any Responses stream event type from {group_values!r}'
+                )
+
+    tool_state = [
+        item for item in summary.get('tool_state') or [] if isinstance(item, dict)
+    ]
+    for expected in checks.get('expected_tools') or []:
+        if not isinstance(expected, dict):
+            continue
+        try:
+            minimum_count = max(1, int(expected.get('minimum_count') or 1))
+        except (TypeError, ValueError):
+            minimum_count = 1
+        matches = [
+            item
+            for item in tool_state
+            if _stream_tool_state_matches_expected(item, expected)
+        ]
+        if len(matches) < minimum_count:
+            failures.append(
+                f'{family} missing Responses stream tool state for {expected!r}; expected >= {minimum_count}, got {len(matches)}'
+            )
+
+    return summary, failures
+
+
 
 def _validate_runtime_postcondition(*, family: str, litellm_base_url: str, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     health_url = str(checks.get('healthcheck_url') or f"{litellm_base_url.rstrip('/')}/health/liveliness")
@@ -2716,6 +2909,13 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     failures.extend(request_text_failures)
     warnings.extend(request_text_warnings)
 
+    stream_tool_call_state_summary, stream_tool_call_state_failures = _validate_stream_tool_call_state(
+        family=name,
+        observations=raw_generation_observations,
+        checks=config.get('stream_tool_call_state_validation') or {},
+    )
+    failures.extend(stream_tool_call_state_failures)
+
     aawm_dynamic_injection_summary = None
     aawm_dynamic_injection_config = config.get('aawm_dynamic_injection')
     if isinstance(aawm_dynamic_injection_config, dict):
@@ -2859,6 +3059,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             'generation_metadata': generation_metadata_summary,
             'request_payload_checks': request_payload_summary,
             'request_text_checks': request_text_summary,
+            'stream_tool_call_state': stream_tool_call_state_summary,
             'aawm_dynamic_injection': aawm_dynamic_injection_summary,
             'span_observations': span_observations,
             'generation_observations': generation_observations,
