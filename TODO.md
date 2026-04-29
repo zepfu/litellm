@@ -186,13 +186,14 @@ these docs only as needed:
     `request.session_id`, `request.contents`, `request.systemInstruction`,
     `request.generationConfig.thinkingConfig`, and `request.tools`, with
     `gemini-2.5-flash`, `includeThoughts=true`, and `thinkingBudget=8192`.
-    Next Gemini work should live-compare the `/anthropic` Code Assist request
-    envelope against that native capture before treating the session/id contract
-    as fully proven. Unit coverage now pins the model-scoped Code Assist
-    `session_id`, hand-built `user_prompt_id`, native function declaration
-    aliases, full Claude-core native alias mapping, `tool_choice`, assistant
-    tool-call aliases, restored streaming tool names, parallel tool-call
-    buffering, and terminal usage preservation.
+    The focused `/anthropic` comparison is now live-proven by
+    `claude_adapter_gemini3_flash_child_parallel_read_tools`, including the
+    Code Assist envelope fields above plus native Gemini function declaration
+    names. Unit coverage now pins the model-scoped Code Assist `session_id`,
+    hand-built `user_prompt_id`, native function declaration aliases, full
+    Claude-core native alias mapping, `tool_choice`, assistant tool-call
+    aliases, restored streaming tool names, parallel tool-call buffering, and
+    terminal usage preservation.
   - Track the live policy drift explicitly: native Gemini CLI defaults its
     thinking config to `thinkingBudget=8192`, while the current `/anthropic`
     Gemini adapter effort path has been observed using `thinkingLevel` for
@@ -210,6 +211,10 @@ these docs only as needed:
     shape. Current focused coverage proves multiple function calls spread across
     Code Assist chunks; add a route-level raw-transport split fixture only if
     live captures make that shape relevant.
+  - `claude_adapter_gemini3_flash_child_parallel_read_tools` now carries and
+    passes the focused `/anthropic` Code Assist envelope comparison gate for
+    model/project/user_prompt/session/systemInstruction/tools/thinkingConfig.
+    Keep this as the Gemini tool-envelope proof before broad harness work.
 
   NVIDIA/OpenRouter completion adapters:
   - Run live focused `/anthropic` cases before broad harness work to confirm the

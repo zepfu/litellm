@@ -3721,6 +3721,8 @@ def _normalize_google_code_assist_httpx_payload(value: Any) -> Any:
         "mime_type": "mimeType",
         "file_uri": "fileUri",
         "media_resolution": "mediaResolution",
+        "function_declarations": "functionDeclarations",
+        "allowed_function_names": "allowedFunctionNames",
     }
     if isinstance(value, list):
         return [_normalize_google_code_assist_httpx_payload(item) for item in value]

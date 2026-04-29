@@ -2930,6 +2930,33 @@
         "google_adapter_system_prompt_original_chars",
         "google_adapter_system_prompt_rewritten_chars"
       ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "project",
+          "user_prompt_id",
+          "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
+          "request.systemInstruction.parts.text",
+          "request.tools",
+          "request.tools.0.functionDeclarations.0.name",
+          "request.tools.0.functionDeclarations.1.name",
+          "request.tools.0.functionDeclarations.2.name",
+          "request.generationConfig.thinkingConfig"
+        ],
+        "required_equals": {
+          "model": "gemini-3-flash-preview",
+          "request.tools.0.functionDeclarations.0.name": "read_file",
+          "request.tools.0.functionDeclarations.1.name": "glob",
+          "request.tools.0.functionDeclarations.2.name": "grep_search",
+          "request.generationConfig.thinkingConfig.thinkingLevel": "high",
+          "request.generationConfig.thinkingConfig.includeThoughts": true
+        },
+        "forbidden_paths": [
+          "request.generationConfig.thinkingConfig.thinkingBudget"
+        ]
+      },
       "request_text_checks": {
         "required_substrings": [
           "You are a non-interactive CLI software engineering agent.",

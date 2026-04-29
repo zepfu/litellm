@@ -1123,6 +1123,64 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
                 assert path in required_paths
 
 
+def test_gemini3_flash_parallel_case_has_code_assist_envelope_gates():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][
+        "claude_adapter_gemini3_flash_child_parallel_read_tools"
+    ]
+
+    assert (
+        "claude_adapter_gemini3_flash_child_parallel_read_tools"
+        in config["default_excluded_cases"]
+    )
+    assert "route:anthropic_google_completion_adapter" in case_config[
+        "required_trace_tags"
+    ]
+    assert (
+        "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
+        in case_config["required_trace_tags"]
+    )
+
+    request_payload_checks = case_config["request_payload_checks"]
+    for path in (
+        "model",
+        "project",
+        "user_prompt_id",
+        "request.contents",
+        "request.session_id",
+        "request.systemInstruction",
+        "request.systemInstruction.parts.text",
+        "request.tools",
+        "request.tools.0.functionDeclarations.0.name",
+        "request.tools.0.functionDeclarations.1.name",
+        "request.tools.0.functionDeclarations.2.name",
+        "request.generationConfig.thinkingConfig",
+    ):
+        assert path in request_payload_checks["required_paths"]
+
+    required_equals = request_payload_checks["required_equals"]
+    assert required_equals["model"] == "gemini-3-flash-preview"
+    assert required_equals["request.tools.0.functionDeclarations.0.name"] == (
+        "read_file"
+    )
+    assert required_equals["request.tools.0.functionDeclarations.1.name"] == "glob"
+    assert required_equals["request.tools.0.functionDeclarations.2.name"] == (
+        "grep_search"
+    )
+    assert (
+        required_equals["request.generationConfig.thinkingConfig.thinkingLevel"]
+        == "high"
+    )
+    assert (
+        required_equals["request.generationConfig.thinkingConfig.includeThoughts"]
+        is True
+    )
+    assert (
+        "request.generationConfig.thinkingConfig.thinkingBudget"
+        in request_payload_checks["forbidden_paths"]
+    )
+
+
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):
     harness = _load_harness_module()
     captured = {}
