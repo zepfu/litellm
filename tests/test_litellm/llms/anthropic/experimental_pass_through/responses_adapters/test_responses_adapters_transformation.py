@@ -401,6 +401,45 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
 
+    def test_assistant_mixed_text_tool_use_preserves_block_order(self):
+        """Mixed assistant text/tool_use blocks stay ordered in Responses input."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Before tool."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01",
+                        "name": "get_weather",
+                        "input": {"location": "Boston"},
+                    },
+                    {"type": "text", "text": "After tool."},
+                ],
+            }
+        ]
+
+        result = _translate_messages(messages)
+
+        assert result == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Before tool."}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "toolu_01",
+                "name": "get_weather",
+                "arguments": json.dumps({"location": "Boston"}),
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "After tool."}],
+            },
+        ]
+
     def test_assistant_thinking_block_becomes_output_text(self):
         """Assistant thinking block text is included as output_text."""
         messages = [
