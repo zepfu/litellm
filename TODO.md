@@ -132,9 +132,16 @@ these docs only as needed:
   the adapter rejects empty successful OpenRouter Responses streams/non-stream
   bodies and logs a bounded raw event/body diagnostic, while the harness
   hard-fails successful empty command output when a selected case opts in.
-  Next OpenRouter work should pick a currently available replacement free model
-  for the parallel read-tool proof, then run only that focused case before
-  reconsidering any peeromega fanout rerun.
+  The replacement free-model parallel proof
+  `claude_adapter_openrouter_nemotron_child_parallel_read_tools` using
+  `nvidia/nemotron-3-super-120b-a12b:free` passed once on dev at
+  `/tmp/claude_adapter_openrouter_nemotron_parallel_read_tools.json`; keep it
+  as the focused OpenRouter parallel proof and use it before reconsidering any
+  peeromega fanout rerun. Do not retry the attempted Poolside Laguna
+  replacement without a separate Claude Code model-resolution fix; Claude Code
+  rejected
+  `openrouter/poolside/laguna-m.1:free` as unavailable/inaccessible before
+  traffic reached the OpenRouter adapter.
 
 - Keep the native Codex/Gemini repository-attribution gap as an explicit
   regression gate. The original issue was Codex CLI and Gemini CLI runs through
@@ -211,9 +218,9 @@ these docs only as needed:
   - Treat it as the OpenAI Responses parity path plus OpenRouter-specific
     routing/empty-success behavior for `/anthropic` traffic. There is no
     first-party OpenRouter CLI baseline, so compare request/stream
-    reconstruction to the native OpenAI/Codex baseline and then run a single
-    currently available free-model OpenRouter `/anthropic` case before any
-    peeromega fanout rerun.
+    reconstruction to the native OpenAI/Codex baseline and then run
+    `claude_adapter_openrouter_nemotron_child_parallel_read_tools` as the
+    focused replacement proof before any peeromega fanout rerun.
 
 ## Ongoing
 

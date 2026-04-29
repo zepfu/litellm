@@ -75,13 +75,17 @@ Current first-wave adapted coverage:
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - this case remains available by explicit `--cases claude_adapter_gpt_oss_120b`, but is excluded from the default suite because OpenRouter frequently returns provider-unavailable `503 provider=OpenInference raw=no healthy upstream`
 - OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
-- OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `openai/gpt-oss-120b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+- OpenRouter focused replacement parallel proof: `claude_adapter_openrouter_nemotron_child_parallel_read_tools`
+  - uses `nvidia/nemotron-3-super-120b-a12b:free`
+  - hard-gates OpenRouter Responses routing, `session_history`, persisted tool activity, and the one-message parallel `Read` / `Glob` / `Grep` transcript shape
+- OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `openai/gpt-oss-120b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`
   - `openai/gpt-oss-20b:free` and `openai/gpt-oss-120b:free` remain available in config but are excluded from the default full suite because they are edge OpenRouter targets with noisy upstream availability
   - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain available in config but are excluded from the default full suite
   - run them only by explicit selection, for example:
     `--cases claude_adapter_gpt_oss_20b,claude_adapter_gpt_oss_120b,claude_adapter_gemma_31b,claude_adapter_gemma_26b_a4b`
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
-- `inclusionai/ling-2.6-flash:free` / `ling-2-6-flash` is retired from active harness targets after OpenRouter started returning `404` for the old free alias. Keep the historical artifacts as breadcrumbs only; choose a currently available OpenRouter model before adding any replacement parallel proof.
+- `inclusionai/ling-2.6-flash:free` / `ling-2-6-flash` is retired from active harness targets after OpenRouter started returning `404` for the old free alias. Keep the historical artifacts as breadcrumbs only; the replacement parallel proof is `claude_adapter_openrouter_nemotron_child_parallel_read_tools`.
+- `poolside/laguna-m.1:free` is currently listed by OpenRouter as a free tool-capable model, but Claude Code rejected it as unavailable/inaccessible when used as a child-agent model, so do not use it for the parallel proof without a separate model-resolution fix.
 - current dev OpenRouter pacing on `:4001`:
   - `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
