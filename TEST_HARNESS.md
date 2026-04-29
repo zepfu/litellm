@@ -158,12 +158,24 @@ suite when the upstream provider is noisy:
     validation
 - `google/gemma-4-31b-it:free`
 - `google/gemma-4-26b-a4b-it:free`
-- `nvidia/nemotron-3-super-120b-a12b:free`
+
+The focused OpenRouter replacement parallel proof is not a warning-only
+canary:
+
+- `claude_adapter_openrouter_nemotron_child_parallel_read_tools`
+  - uses `nvidia/nemotron-3-super-120b-a12b:free`
+  - hard-gates the OpenRouter Responses route, session-history persistence,
+    tool-activity persistence, and one-message parallel `Read` / `Glob` /
+    `Grep` transcript shape
 
 ### Manual-only spot checks
 
 Keep these out of the standard adapter harness run for now:
 
+- `poolside/laguna-m.1:free`
+  - OpenRouter lists it as free and tool-capable, but Claude Code rejected it
+    as unavailable/inaccessible as a child-agent model during the replacement
+    parallel-proof attempt
 - `openai/gpt-oss-20b:free`
 - `openai/gpt-oss-120b:free`
 - `google/gemma-4-31b-it:free`

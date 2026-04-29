@@ -39,6 +39,12 @@ PARALLEL_CASE_AGENTS = {
         "gpt-5.5",
         {"Read", "Glob", "Grep"},
     ),
+    "claude_adapter_openrouter_nemotron_child_parallel_read_tools": (
+        "harness-openrouter-nemotron-parallel-read-tools",
+        "openrouter",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        {"Read", "Glob", "Grep"},
+    ),
     "claude_adapter_nvidia_deepseek_child_parallel_read_tools": (
         "harness-nvidia-deepseek-parallel-read-tools",
         "nvidia_nim",
