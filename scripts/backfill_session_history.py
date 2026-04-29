@@ -70,6 +70,7 @@ from litellm.integrations.aawm_agent_identity import (
     _derive_request_tags_from_langfuse_metadata,
     _derive_langfuse_trace_tags_from_spend_log_row,
     _ensure_session_history_schema,
+    _extract_repository_identity_from_metadata_sources,
     _extract_tenant_identity_from_metadata_sources,
     _persist_session_history_records,
     _safe_float,
@@ -1889,9 +1890,28 @@ def _derive_session_history_tenant_identity(
     metadata = row.get("metadata")
     if not isinstance(metadata, dict):
         metadata = _parse_clickhouse_value(metadata)
-    return _extract_tenant_identity_from_metadata_sources(
+    tenant_id, source = _extract_tenant_identity_from_metadata_sources(
         ("session_history.metadata", metadata),
     )
+    if tenant_id:
+        return tenant_id, source
+
+    if str(row.get("tenant_id") or "").strip():
+        return None, None
+
+    repository = _extract_repository_identity_from_metadata_sources(
+        ("session_history.metadata", metadata),
+    )
+    if repository:
+        return repository, "session_history.metadata.repository"
+
+    repository = _extract_repository_identity_from_metadata_sources(
+        ("session_history", {"repository": row.get("repository")}),
+    )
+    if repository:
+        return repository, "session_history.repository"
+
+    return None, None
 
 
 def _extract_gemini_control_plane_method(value: Any) -> Optional[str]:
@@ -2210,6 +2230,7 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
                 response_cost_usd,
+                repository,
                 metadata
             FROM public.session_history
             WHERE {' AND '.join(where_clauses)}

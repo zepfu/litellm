@@ -147,7 +147,11 @@ these docs only as needed:
   gate, not as currently open. The original issue was Codex CLI and Gemini CLI
   runs through LiteLLM not populating `public.session_history.repository`; the
   2026-04-28 fix added the top-level column, header propagation, metadata
-  mirroring, and focused dev proof. A 2026-04-29 real Codex session from
+  mirroring, and focused dev proof. A 2026-04-29 reporting-query follow-up
+  clarified that `tenant_id` is the durable repository grouping field, so
+  repository-only native rows must now also set `tenant_id` and
+  `metadata.tenant_id` from the resolved repository when no explicit tenant is
+  present. A 2026-04-29 real Codex session from
   `/home/zepfu/projects/aawm` showed the missing-harness-header gap still
   existed for normal Codex traffic; the follow-up fix infers repository from
   prepared `litellm_metadata` and workspace context text such as
@@ -165,8 +169,9 @@ these docs only as needed:
   `native_openai_passthrough_responses_codex`,
   `native_gemini_passthrough_generate_content`, and
   `native_gemini_passthrough_stream_generate_content` when touching this path.
-  They must keep requiring top-level `repository` plus `metadata.repository`
-  and should include non-harness-header Codex and Gemini workspace-text proofs;
+  They must keep requiring top-level `repository`, `metadata.repository`,
+  fallback `tenant_id`, and `metadata.tenant_id` for repository-only rows, and
+  should include non-harness-header Codex and Gemini workspace-text proofs;
   relevant files are
   `litellm/integrations/aawm_agent_identity.py`,
   `.wheel-build/aawm_litellm_callbacks/agent_identity.py`,
