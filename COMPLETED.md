@@ -1,5 +1,34 @@
 # Completed
 
+## 2026-04-29
+
+- Added OpenRouter Responses empty-success protection for the Anthropic adapter.
+  OpenRouter Responses streams/non-stream bodies that complete successfully
+  without usable assistant text, tool calls, or thinking content now raise a
+  diagnostic adapter error instead of being translated into an empty Anthropic
+  success. The stream path records bounded event summaries for diagnostics, and
+  the stream collector now also reconstructs text from
+  `response.output_text.done` when deltas are absent.
+
+- Tightened the Anthropic adapter harness around Ling/OpenRouter empty output.
+  The `fail_empty_success` case option hard-fails successful empty Claude CLI
+  results and zero usage even for otherwise warning-only Ling canaries, and the
+  Ling smoke/parallel cases opt into it. Focused tests passed:
+  `test_streaming_iterator.py` plus
+  `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py` (`54 passed`),
+  JSON validation passed for `scripts/local-ci/anthropic_adapter_config.json`,
+  and py_compile passed for the touched Python files.
+
+- Re-ran the focused dev Ling smoke without using the full harness. The first
+  run at `/tmp/litellm-dev-ling-26-flash-empty-success.json` proved the new
+  harness hard-fails the old `is_error=false`, empty-result, zero-usage shape.
+  After moving the adapter guard onto the OpenRouter route, the rerun at
+  `/tmp/litellm-dev-ling-26-flash-empty-success-rerun.json` no longer accepted
+  an empty success; OpenRouter now returns `404` stating
+  `Ling-2.6-flash is no longer available as a free model`. The Ling cases remain
+  warning-only legacy canaries, and future OpenRouter release-gating should use
+  a currently available replacement model.
+
 ## 2026-04-28
 
 - Added durable repository attribution to `public.session_history` for native

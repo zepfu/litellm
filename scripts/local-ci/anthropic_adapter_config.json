@@ -1299,6 +1299,7 @@
           "usage.output_tokens": 1
         }
       },
+      "fail_empty_success": true,
       "session_history_validation": {
         "db_host": "127.0.0.1",
         "db_port": 5434,
@@ -6504,6 +6505,7 @@
       "retry_backoff_seconds": 25,
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 90,
+      "fail_empty_success": true,
       "warning_only": true,
       "runtime_postconditions": {
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",

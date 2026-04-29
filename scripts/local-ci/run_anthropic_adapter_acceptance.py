@@ -53,6 +53,7 @@ DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS = [
 DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS = [
     'timed out after',
     'runtime logs contained forbidden substring',
+    'successful empty',
 ]
 _VALIDATION_DB_CONNECTIONS: dict[tuple[str, int, str, str, str], Any] = {}
 
@@ -737,6 +738,62 @@ def _validate_command_output_json(*, family: str, stdout: str, checks: dict[str,
         'required_regex_hits': regex_hits,
         'required_minimum_hits': minimum_hits,
     }, failures
+
+
+def _validate_no_successful_empty_command_output(
+    *,
+    family: str,
+    stdout: str,
+    stderr: str,
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not bool(checks.get('fail_empty_success')):
+        return {'enabled': False}, []
+
+    parsed = _parse_command_output_json(stdout)
+    combined_output = f'{stdout}\n{stderr}'
+    adapter_diagnostic_hit = (
+        'OpenRouter Responses adapter returned empty successful response'
+        in combined_output
+    )
+    summary: dict[str, Any] = {
+        'enabled': True,
+        'adapter_diagnostic_hit': adapter_diagnostic_hit,
+        'parsed': parsed,
+    }
+    failures: list[str] = []
+    if adapter_diagnostic_hit:
+        failures.append(
+            f'{family} successful empty OpenRouter adapter diagnostic surfaced'
+        )
+
+    if not isinstance(parsed, dict):
+        return summary, failures
+
+    is_error = parsed.get('is_error')
+    result = parsed.get('result')
+    input_tokens = _extract_path_value(parsed, 'usage.input_tokens')
+    output_tokens = _extract_path_value(parsed, 'usage.output_tokens')
+    result_empty = not isinstance(result, str) or not result.strip()
+    input_zero = isinstance(input_tokens, (int, float)) and input_tokens <= 0
+    output_zero = isinstance(output_tokens, (int, float)) and output_tokens <= 0
+    summary.update(
+        {
+            'is_error': is_error,
+            'result_empty': result_empty,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+        }
+    )
+
+    if is_error is False and result_empty:
+        failures.append(f'{family} successful empty command result')
+    if is_error is False and input_zero and output_zero:
+        failures.append(
+            f'{family} successful empty command usage: input_tokens={input_tokens!r}, output_tokens={output_tokens!r}'
+        )
+
+    return summary, failures
 
 
 
@@ -2703,6 +2760,15 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('command_json_checks') or {},
     )
     failures.extend(command_json_failures)
+    empty_success_summary, empty_success_failures = (
+        _validate_no_successful_empty_command_output(
+            family=name,
+            stdout=run['stdout'],
+            stderr=run['stderr'],
+            checks=config,
+        )
+    )
+    failures.extend(empty_success_failures)
 
     session_history_summary, session_history_failures = _validate_session_history(
         family=name,
@@ -2798,6 +2864,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             'generation_observations': generation_observations,
         },
         'command_json': command_json_summary,
+        'empty_success': empty_success_summary,
         'session_history': session_history_summary,
         'tool_activity': tool_activity_summary,
         'transcript_tool_use': transcript_tool_use_summary,
