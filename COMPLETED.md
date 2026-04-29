@@ -48,6 +48,31 @@
   confirmed all three tool calls were emitted in one child assistant message
   with no tool-result errors.
 
+- Resolved the Gemini thinking-config drift as an intentional model/API
+  distinction rather than an adapter rewrite. The native Gemini CLI payload
+  gate captures `gemini-2.5-flash` using `thinkingBudget=8192`; the focused
+  `/anthropic` effort cases target `gemini-3-flash-preview`, where the shared
+  Gemini mapper uses `thinkingLevel`. Added config hardening so all five
+  Gemini 3 `/anthropic` effort/cache cases require the Code Assist envelope
+  fields `model`, `project`, `user_prompt_id`, `request.contents`,
+  `request.session_id`, `request.systemInstruction`, and
+  `request.generationConfig.thinkingConfig`, require the expected
+  `thinkingLevel`, and forbid `request.generationConfig.thinkingConfig.thinkingBudget`.
+  Focused local validation passed for the native Gemini payload gate and the
+  new Gemini 3 `/anthropic` effort gate config test (`2 passed`), JSON parsing
+  passed for `scripts/local-ci/anthropic_adapter_config.json`, and
+  `git diff --check` passed. The first live dev shard at
+  `/tmp/anthropic_gemini3_thinking_level_gates.json` proved the request-payload
+  gates for all five cases; four cases passed, while
+  `claude_adapter_gemini_output_config_effort` returned a transient 502
+  `Google Code Assist streaming adapter could not build a complete response`
+  after its payload had already satisfied `thinkingLevel=high` and no
+  `thinkingBudget` (trace `5b6b4202-63e4-44b6-ba57-a51e65237bdc`). The focused
+  high-effort rerun passed with zero failures/warnings at
+  `/tmp/anthropic_gemini3_thinking_level_high_rerun.json` with trace
+  `4ead5af2-4802-4376-9e2e-cd31a8a4fc4d`, so do not treat that first 502 as a
+  Gemini thinking-config regression.
+
 - Implemented the Codex-native tool alias layer for `/anthropic` traffic that
   targets OpenAI/Codex Responses. The adapter now maps Claude-side `Bash`
   definitions, `tool_choice`, and prior assistant tool-use history to upstream
