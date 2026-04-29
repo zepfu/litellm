@@ -2,6 +2,35 @@
 
 ## 2026-04-29
 
+- Fixed the native Codex/Gemini repository-attribution regression that remained
+  after the header-based harness proof. Normal Codex CLI traffic does not
+  always send `x-aawm-repository`, so passthrough request preparation now infers
+  repository from workspace context text such as
+  `AGENTS.md instructions for /path`, `<cwd>/path</cwd>`, and `cwd: /path`.
+  The AAWM session-history callback now also reads `litellm_metadata` from
+  `litellm_params`, prepared proxy request bodies, and passthrough logging
+  payloads, preserves `repository` in `StandardLoggingMetadata`, and falls back
+  to the same workspace-text inference before writing `public.session_history`.
+  Callback overlay source in `.wheel-build` was kept in parity.
+
+  Focused validation passed for the new passthrough repository inference test,
+  the route repository tests, and the AAWM callback repository tests. After
+  copying the patched files into `litellm-dev` and restarting `:4001`, a real
+  Codex CLI smoke from `/home/zepfu/projects/aawm` completed with session
+  `019dd8b8-c4f5-7c21-81bd-f4cab0715d6c`; the direct DB check showed
+  `repository=aawm` and `metadata.repository=aawm`. The focused native Gemini
+  passthrough pair also passed with zero failures/warnings at
+  `/tmp/native_gemini_repository_regression_after_inference.json`; sessions
+  `97f116a1-4293-4bb6-9b82-fd930e15a5ee` and
+  `e92d75d8-9726-460f-879f-12aadf27adbd` stored
+  `repository=zepfu/litellm` and matching metadata. Dead-end note: do not rely
+  on the harness's `x-aawm-repository` injection alone for this invariant; keep
+  at least one normal Codex workspace-text proof when validating future changes.
+  The first local pytest command also used stale class-qualified nodes for the
+  route repository tests and failed at collection; the current route tests are
+  module-level nodes in
+  `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`.
+
 - Cleared the previously noted focused Ruff debt in
   `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`. The
   file now passes

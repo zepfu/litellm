@@ -143,19 +143,29 @@ these docs only as needed:
   `openrouter/poolside/laguna-m.1:free` as unavailable/inaccessible before
   traffic reached the OpenRouter adapter.
 
-- Keep the native Codex/Gemini repository-attribution gap as an explicit
-  regression gate. The original issue was Codex CLI and Gemini CLI runs through
-  LiteLLM not populating `public.session_history.repository`; the 2026-04-28
-  fix added the top-level column, header propagation, metadata mirroring, and
-  focused dev proof. Until the next prod/default validation proves it again,
-  run only the focused native cases
+- Keep native Codex/Gemini repository attribution as an explicit regression
+  gate, not as currently open. The original issue was Codex CLI and Gemini CLI
+  runs through LiteLLM not populating `public.session_history.repository`; the
+  2026-04-28 fix added the top-level column, header propagation, metadata
+  mirroring, and focused dev proof. A 2026-04-29 real Codex session from
+  `/home/zepfu/projects/aawm` showed the missing-harness-header gap still
+  existed for normal Codex traffic; the follow-up fix infers repository from
+  prepared `litellm_metadata` and workspace context text such as
+  `AGENTS.md instructions for /path` / `<cwd>/path</cwd>`. Dev proof:
+  `session_history` session `019dd8b8-c4f5-7c21-81bd-f4cab0715d6c` now has
+  `repository=aawm` and `metadata.repository=aawm`; focused Gemini native proof
+  passed at `/tmp/native_gemini_repository_regression_after_inference.json`.
+  Until the next prod/default validation proves it again, run only the focused
+  native cases
   `native_openai_passthrough_responses_codex`,
   `native_gemini_passthrough_generate_content`, and
   `native_gemini_passthrough_stream_generate_content` when touching this path.
-  They must keep requiring top-level `repository` containing `litellm` plus
-  `metadata.repository`; relevant files are
+  They must keep requiring top-level `repository` plus `metadata.repository`
+  and should include at least one non-harness-header Codex workspace-text proof;
+  relevant files are
   `litellm/integrations/aawm_agent_identity.py`,
   `.wheel-build/aawm_litellm_callbacks/agent_identity.py`,
+  `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`,
   `scripts/local-ci/run_anthropic_adapter_acceptance.py`, and
   `scripts/local-ci/anthropic_adapter_config.json`.
 

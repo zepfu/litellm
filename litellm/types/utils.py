@@ -2587,6 +2587,7 @@ class StandardLoggingMetadata(StandardLoggingUserAPIKeyMetadata):
     ]  # S3/GCS object key for cold storage retrieval
     team_alias: Optional[str]
     team_id: Optional[str]
+    repository: Optional[str]
 
 
 class StandardLoggingAdditionalHeaders(TypedDict, total=False):
