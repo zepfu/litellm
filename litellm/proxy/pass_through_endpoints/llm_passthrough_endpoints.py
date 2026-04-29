@@ -258,7 +258,6 @@ _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
 _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
     {
         "openrouter/free",
-        "inclusionai/ling-2.6-flash:free",
         "google/gemma-4-31b-it:free",
         "google/gemma-4-26b-a4b-it:free",
         "nvidia/nemotron-3-super-120b-a12b:free",
@@ -651,7 +650,6 @@ def _normalize_anthropic_openrouter_adapter_model_name(
     openrouter_model_aliases = {
         "free": "openrouter/free",
         "elephant-alpha": "openrouter/elephant-alpha",
-        "ling-2-6-flash": "inclusionai/ling-2.6-flash:free",
         "meta-llama/llama-3.3-70b-instructfree": (
             "meta-llama/llama-3.3-70b-instruct:free"
         ),
