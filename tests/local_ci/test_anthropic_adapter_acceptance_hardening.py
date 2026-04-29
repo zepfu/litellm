@@ -763,6 +763,68 @@ def test_native_gemini_cases_have_code_assist_request_payload_gates():
         )
 
 
+def test_anthropic_gemini_effort_cases_have_gemini3_thinking_level_gates():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    expected_levels = {
+        "claude_adapter_gemini_output_config_effort": "high",
+        "claude_adapter_gemini_output_config_minimal_effort": "low",
+        "claude_adapter_gemini_output_config_max_effort": "high",
+        "claude_adapter_gemini_output_config_minimal_effort_cache": "low",
+        "claude_adapter_gemini_output_config_max_effort_cache": "high",
+    }
+
+    for case_name, expected_level in expected_levels.items():
+        case_config = config["cases"][case_name]
+        assert case_name in config["default_excluded_cases"]
+        assert (
+            case_config["http_request"]["json"]["model"]
+            == "gemini-3-flash-preview"
+        )
+        assert case_config["allowed_generation_routes"] == [
+            "/anthropic/v1/messages"
+        ]
+        assert "route:anthropic_google_completion_adapter" in case_config[
+            "required_trace_tags"
+        ]
+        assert (
+            "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
+            in case_config["required_trace_tags"]
+        )
+
+        request_payload_checks = case_config["request_payload_checks"]
+        for path in (
+            "model",
+            "project",
+            "user_prompt_id",
+            "request.contents",
+            "request.session_id",
+            "request.systemInstruction",
+            "request.generationConfig.thinkingConfig",
+        ):
+            assert path in request_payload_checks["required_paths"]
+
+        required_equals = request_payload_checks["required_equals"]
+        assert required_equals["model"] == "gemini-3-flash-preview"
+        assert (
+            required_equals[
+                "request.generationConfig.thinkingConfig.thinkingLevel"
+            ]
+            == expected_level
+        )
+        assert (
+            required_equals[
+                "request.generationConfig.thinkingConfig.includeThoughts"
+            ]
+            is True
+        )
+        assert "output_config" in request_payload_checks["forbidden_paths"]
+        assert (
+            "request.generationConfig.thinkingConfig.thinkingBudget"
+            in request_payload_checks["forbidden_paths"]
+        )
+
+
 def test_target_profile_appends_case_local_claude_agents(monkeypatch):
     harness = _load_harness_module()
 

@@ -196,10 +196,15 @@ these docs only as needed:
   - Track the live policy drift explicitly: native Gemini CLI defaults its
     thinking config to `thinkingBudget=8192`, while the current `/anthropic`
     Gemini adapter effort path has been observed using `thinkingLevel` for
-    selected Gemini 3 cases. Decide whether that difference is intentional
-    model/API behavior or should become an adapter default-alignment fix.
-    Native Gemini tool-use capture is still only envelope evidence, not a
-    first-party tool-call parity baseline.
+    selected Gemini 3 cases. This is currently treated as intentional
+    model/API behavior: the native capture is `gemini-2.5-flash`, while the
+    `/anthropic` effort cases target `gemini-3-flash-preview`, and the shared
+    Gemini mapper uses `thinkingLevel` rather than `thinkingBudget` for Gemini
+    3. The harness now hard-gates that the Gemini 3 effort cases include
+    `request.session_id`, `request.systemInstruction`, and `thinkingLevel`, and
+    that they do not emit a Gemini 2-style `thinkingBudget`. Native Gemini
+    tool-use capture is still only envelope evidence, not a first-party
+    tool-call parity baseline.
   - If live Gemini captures show true partial `functionCall.args` fragments
     across valid Code Assist SSE events, add a focused fixture for that exact
     shape. Current focused coverage proves multiple function calls spread across

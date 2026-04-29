@@ -3394,14 +3394,18 @@
           "project",
           "user_prompt_id",
           "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
           "request.generationConfig.thinkingConfig"
         ],
         "required_equals": {
+          "model": "gemini-3-flash-preview",
           "request.generationConfig.thinkingConfig.thinkingLevel": "high",
           "request.generationConfig.thinkingConfig.includeThoughts": true
         },
         "forbidden_paths": [
-          "output_config"
+          "output_config",
+          "request.generationConfig.thinkingConfig.thinkingBudget"
         ]
       },
       "command_json_checks": {
@@ -3501,14 +3505,18 @@
           "project",
           "user_prompt_id",
           "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
           "request.generationConfig.thinkingConfig"
         ],
         "required_equals": {
+          "model": "gemini-3-flash-preview",
           "request.generationConfig.thinkingConfig.thinkingLevel": "low",
           "request.generationConfig.thinkingConfig.includeThoughts": true
         },
         "forbidden_paths": [
-          "output_config"
+          "output_config",
+          "request.generationConfig.thinkingConfig.thinkingBudget"
         ]
       },
       "command_json_checks": {
@@ -3610,14 +3618,18 @@
           "project",
           "user_prompt_id",
           "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
           "request.generationConfig.thinkingConfig"
         ],
         "required_equals": {
+          "model": "gemini-3-flash-preview",
           "request.generationConfig.thinkingConfig.thinkingLevel": "high",
           "request.generationConfig.thinkingConfig.includeThoughts": true
         },
         "forbidden_paths": [
-          "output_config"
+          "output_config",
+          "request.generationConfig.thinkingConfig.thinkingBudget"
         ]
       },
       "command_json_checks": {
@@ -3727,14 +3739,18 @@
           "project",
           "user_prompt_id",
           "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
           "request.generationConfig.thinkingConfig"
         ],
         "required_equals": {
+          "model": "gemini-3-flash-preview",
           "request.generationConfig.thinkingConfig.thinkingLevel": "low",
           "request.generationConfig.thinkingConfig.includeThoughts": true
         },
         "forbidden_paths": [
-          "output_config"
+          "output_config",
+          "request.generationConfig.thinkingConfig.thinkingBudget"
         ]
       },
       "command_json_checks": {
@@ -3857,14 +3873,18 @@
           "project",
           "user_prompt_id",
           "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
           "request.generationConfig.thinkingConfig"
         ],
         "required_equals": {
+          "model": "gemini-3-flash-preview",
           "request.generationConfig.thinkingConfig.thinkingLevel": "high",
           "request.generationConfig.thinkingConfig.includeThoughts": true
         },
         "forbidden_paths": [
-          "output_config"
+          "output_config",
+          "request.generationConfig.thinkingConfig.thinkingBudget"
         ]
       },
       "command_json_checks": {
