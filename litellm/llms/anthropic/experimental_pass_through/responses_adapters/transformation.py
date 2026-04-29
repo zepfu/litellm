@@ -275,6 +275,19 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                     )
                 elif isinstance(content, list):
                     asst_parts: List[Dict[str, Any]] = []
+
+                    def flush_assistant_parts() -> None:
+                        if not asst_parts:
+                            return
+                        input_items.append(
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": list(asst_parts),
+                            }
+                        )
+                        asst_parts.clear()
+
                     for block in content:
                         if not isinstance(block, dict):
                             continue
@@ -284,6 +297,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 {"type": "output_text", "text": block.get("text", "")}
                             )
                         elif btype == "tool_use":
+                            flush_assistant_parts()
                             # tool_use becomes a top-level function_call item
                             input_items.append(
                                 {
@@ -307,14 +321,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 asst_parts.append(
                                     {"type": "output_text", "text": thinking_text}
                                 )
-                    if asst_parts:
-                        input_items.append(
-                            {
-                                "type": "message",
-                                "role": "assistant",
-                                "content": asst_parts,
-                            }
-                        )
+                    flush_assistant_parts()
 
         return input_items
 

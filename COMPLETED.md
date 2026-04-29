@@ -2,6 +2,25 @@
 
 ## 2026-04-29
 
+- Continued the `/anthropic` parity refinement pass with the remaining
+  OpenAI/Codex Responses input-ordering fix and completion-adapter streaming
+  behavior fixes. `translate_messages_to_responses_input()` now preserves
+  intra-assistant block order when a prior assistant turn mixes text and
+  `tool_use`, flushing text before and after the top-level `function_call`.
+  The completion streaming wrapper no longer emits a synthetic leading empty
+  text block before tool-only output, and OpenAI-compatible parallel
+  `delta.tool_calls` chunks now emit separate Anthropic `tool_use` blocks and
+  `input_json_delta` streams by tool index/id. Focused validation passed:
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/adapters/test_anthropic_experimental_pass_through_adapters_transformation.py`
+  (`68 passed`), the two targeted Responses input-ordering tests (`2 passed`),
+  `ruff check` for
+  `litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py`,
+  `py_compile` for the touched Python files, and `git diff --check`.
+  Dead-end validation note: running the whole
+  `test_responses_adapters_transformation.py -q` file hung after printing one
+  dot for multiple minutes, so do not use that whole-file command as a focused
+  gate until the unrelated hang is investigated; use targeted tests instead.
+
 - Started the `/anthropic` streaming/tool-call parity refinement pass with
   focused unit/path validation only; the full multi-path harness has not been
   run yet. OpenAI/Codex Responses adapter now handles
