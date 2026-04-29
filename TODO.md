@@ -200,6 +200,51 @@ these docs only as needed:
     OpenAI/Codex sees native `exec_command` / `cmd` tool state while Claude
     Code still sees `Bash` / `command` on the Anthropic side, scoped only to the
     Codex-backed `/anthropic` route.
+  - Completed locally, external full-harness gate blocked: strip
+    Anthropic-only tool metadata such as
+    `defer_loading`, `eager_input_streaming`, `allowed_callers`, and
+    `input_examples` from provider tool schemas on `/anthropic` to
+    non-Anthropic paths, while preserving enough adapter-side metadata for
+    future work. The OpenAI-compatible chat path now strips these fields before
+    forwarding provider tool schemas, and the OpenAI Responses path has an
+    explicit regression test proving the fields are not forwarded. Focused
+    local validation and a focused live failed-case rerun have passed. Broad
+    dev `/anthropic` harness reruns at
+    `/tmp/anthropic_tool_metadata_strip_full_dev.json` and
+    `/tmp/anthropic_tool_metadata_strip_full_dev_rerun.json` are not clean
+    because live Gemini 3.1 Pro child-agent requests intermittently hit
+    upstream Google Code Assist `MODEL_CAPACITY_EXHAUSTED`; the second run
+    otherwise cleared the OpenAI/Codex path and every non-fanout default case.
+    Next action for this item is a later broad rerun when Gemini 3.1 Pro
+    capacity is available; do not chase this as a schema-strip regression and
+    do not start the broader deferred-search control loop as part of this
+    cleanup.
+  - Deferred/parked: adapter-owned support for Anthropic deferred tool loading
+    on `/anthropic` to non-Anthropic paths. The preferred design is still a
+    bounded internal tool-search loop: hold `defer_loading=true` tool
+    definitions in an adapter registry, send upstream only normal tools plus a
+    compact synthetic search tool, intercept synthetic search tool calls
+    without streaming them to Claude Code, rank/select a small set of matching
+    deferred tools, and issue the follow-up provider call with those full
+    definitions expanded. Start with OpenAI Responses/Codex when this is
+    resumed, then extend to Gemini, OpenRouter, and NVIDIA after the control
+    loop, usage aggregation, and stream hiding behavior are stable. Focused
+    tests must prove deferred tool schemas are absent from the first upstream
+    request, selected deferred schemas appear only after internal search,
+    internal search calls never surface as Anthropic `tool_use` blocks,
+    explicit `tool_choice` for a deferred tool pre-expands that tool, and
+    usage/session-history metadata can represent the multi-call provider turn
+    without double-counting. Do not run the full multi-path harness until the
+    unit and one-lane focused live proof pass.
+  - Deferred/parked: revisit `eager_input_streaming`.
+    For OpenAI/OpenRouter/NVIDIA chat-style streams we already forward upstream
+    function-argument deltas as Anthropic `input_json_delta` events when the
+    provider streams them. Gemini intentionally buffers parallel tool calls
+    until terminal chunks, and the OpenAI Responses/Codex path currently buffers
+    Codex `exec_command` and `Read` until valid JSON for alias/sanitizer
+    correctness. Decide per tool/provider whether `eager_input_streaming=true`
+    should bypass that buffering, and gate it with focused fixtures using
+    large write/edit-style arguments before enabling it broadly.
 
   Google/Gemini Code Assist adapter:
   - Native Gemini CLI Code Assist envelope gates are now live-proven for both
