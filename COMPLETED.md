@@ -2,6 +2,47 @@
 
 ## 2026-04-29
 
+- Started the `/anthropic` streaming/tool-call parity refinement pass with
+  focused unit/path validation only; the full multi-path harness has not been
+  run yet. OpenAI/Codex Responses adapter now handles
+  `response.function_call_arguments.done` for `/anthropic` streaming, and the
+  forced-stream non-stream collector reconstructs streamed `function_call` /
+  `mcp_call` output items plus `.done` arguments before translating back to
+  Anthropic. Focused validation passed:
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_streaming_iterator.py`
+  (`9 passed`), the two focused OpenAI/Codex proxy tests in
+  `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+  (`2 passed`), and the combined touched proxy shard below (`5 passed`).
+
+- Mirrored Responses adapter tool-choice semantics in the `/anthropic`
+  completion adapter for NVIDIA/OpenRouter-style paths. The completion adapter
+  now maps Anthropic `tool_choice={"type":"none"}` to OpenAI-compatible `none`
+  and maps `tool_choice={"type":"auto","disable_parallel_tool_use":true}` to
+  `parallel_tool_calls=false` when translated function tools are present,
+  without adding `parallel_tool_calls` for `none` or web-search-only requests.
+  Focused validation passed:
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/adapters/test_anthropic_experimental_pass_through_adapters_transformation.py`
+  (`66 passed`). The broader streaming completion-adapter issues remain open:
+  parallel streamed tool calls can still collapse and tool-only streams can
+  still start with a synthetic empty text block.
+
+- Added focused Gemini Code Assist `/anthropic` parity coverage and a small
+  same-name parallel tool-result fix. The Google adapter now annotates duplicate
+  same-name parallel `functionResponse.response` payloads with their Claude
+  `tool_use_id` so follow-up tool results remain unambiguous. Unit coverage now
+  exercises Code Assist SSE tool-use normalization with usage metadata,
+  non-stream tool-use normalization, and two parallel same-name `Read` calls
+  followed by distinct tool results. Focused validation passed in
+  `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+  for the three Gemini cases plus the two OpenAI/Codex collector/stream cases
+  (`5 passed, 243 deselected`). `py_compile` passed for all touched Python
+  files and `git diff --check` passed. A targeted ruff run over the touched
+  files still fails on pre-existing lint debt (`F401`, `T201`, `F811`, `F841`,
+  `F541`, and `PLR0915` in large existing proxy/test functions); after
+  refactoring the new helper-heavy code, the remaining `PLR0915` hits no longer
+  point at the new Responses collector or duplicate-tool annotation helpers. No
+  live Code Assist harness validation has been run yet.
+
 - Added OpenRouter Responses empty-success protection for the Anthropic adapter.
   OpenRouter Responses streams/non-stream bodies that complete successfully
   without usable assistant text, tool calls, or thinking content now raise a

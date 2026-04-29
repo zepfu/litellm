@@ -31,6 +31,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _build_anthropic_responses_adapter_request_body,
     _build_completion_adapter_metadata,
     _build_google_code_assist_request_from_completion_kwargs,
+    _collect_responses_response_from_stream,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _get_google_adapter_rate_limit_key,
@@ -5519,6 +5520,36 @@ class TestClaudePersistedOutputExpansion:
         assert getattr(events[0], "delta", None) == "café"
 
     @pytest.mark.asyncio
+    async def test_collect_responses_stream_reconstructs_arguments_from_done(self):
+        async def _responses_stream():
+            chunks = [
+                b'event: response.created\ndata: {"type":"response.created"}\n\n',
+                b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pwd","id":"fc_pwd","name":"Bash","arguments":""}}\n\n',
+                b'event: response.function_call_arguments.done\ndata: {"type":"response.function_call_arguments.done","item_id":"fc_pwd","output_index":0,"arguments":"{\\"command\\":\\"pwd\\"}"}\n\n',
+                b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_codex","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":12,"output_tokens":4}}}\n\n',
+            ]
+            for chunk in chunks:
+                yield chunk
+
+        response = StreamingResponse(
+            _responses_stream(),
+            status_code=200,
+            media_type="text/event-stream",
+        )
+
+        collected = await _collect_responses_response_from_stream(response)
+
+        assert collected["output"] == [
+            {
+                "type": "function_call",
+                "call_id": "call_pwd",
+                "id": "fc_pwd",
+                "name": "Bash",
+                "arguments": '{"command":"pwd"}',
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_gemini_tool_use_stream_preserves_input_json_delta_when_starting_new_block(
         self,
     ):
@@ -7572,6 +7603,234 @@ async def test_iterate_google_code_assist_unwrapped_stream_arms_post_tool_cooldo
 
     assert 'functionCall' in first_chunk
     assert module._google_adapter_rate_limit_until_monotonic_by_key['__default__'] >= time.monotonic() + 2.5
+
+
+def _decode_anthropic_sse_events(chunks: list[bytes]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    raw_stream = b"".join(chunks).decode("utf-8")
+    for event_block in raw_stream.split("\n\n"):
+        data_lines = [
+            line.removeprefix("data: ")
+            for line in event_block.splitlines()
+            if line.startswith("data: ")
+        ]
+        if data_lines:
+            events.append(json.loads("\n".join(data_lines)))
+    return events
+
+
+@pytest.mark.asyncio
+async def test_google_code_assist_anthropic_stream_preserves_tool_use_and_usage_metadata():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _build_anthropic_streaming_response_from_google_code_assist_stream,
+    )
+
+    async def _body_iterator():
+        yield (
+            b'data: {"traceId":"trace-code-assist-1","response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"file_path":"/tmp/a.txt"}},"thoughtSignature":"sig-read"}]}}]}}\n\n'
+        )
+        yield (
+            b'data: {"traceId":"trace-code-assist-1","response":{"candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10,"trafficType":"ON_DEMAND"}}}\n\n'
+        )
+
+    google_stream = StreamingResponse(_body_iterator(), media_type="text/event-stream")
+    anthropic_stream = _build_anthropic_streaming_response_from_google_code_assist_stream(
+        response=google_stream,
+        adapter_model="gemini-3-flash-preview",
+        tool_name_mapping={"read_file": "Read"},
+        gemini_optional_params={},
+    )
+
+    chunks = [chunk async for chunk in anthropic_stream.body_iterator]
+    events = _decode_anthropic_sse_events(chunks)
+
+    tool_start_events = [
+        event
+        for event in events
+        if event.get("type") == "content_block_start"
+        and event.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert len(tool_start_events) == 1
+    assert tool_start_events[0]["content_block"]["name"] == "Read"
+    assert tool_start_events[0]["content_block"]["id"].startswith("call_")
+
+    tool_delta_events = [
+        event
+        for event in events
+        if event.get("type") == "content_block_delta"
+        and event.get("delta", {}).get("type") == "input_json_delta"
+    ]
+    assert len(tool_delta_events) == 1
+    assert json.loads(tool_delta_events[0]["delta"]["partial_json"]) == {
+        "file_path": "/tmp/a.txt"
+    }
+
+    message_delta_events = [
+        event for event in events if event.get("type") == "message_delta"
+    ]
+    assert message_delta_events[-1]["delta"]["stop_reason"] == "tool_use"
+    assert message_delta_events[-1]["usage"]["input_tokens"] == 7
+    assert message_delta_events[-1]["usage"]["output_tokens"] == 3
+    assert events[-1]["type"] == "message_stop"
+
+
+@pytest.mark.asyncio
+async def test_google_code_assist_non_stream_preserves_tool_use_after_normalization():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _translate_google_code_assist_response_to_anthropic,
+    )
+
+    google_response = Response(
+        content=json.dumps(
+            {
+                "traceId": "trace-code-assist-non-stream",
+                "response": {
+                    "candidates": [
+                        {
+                            "index": 0,
+                            "finishReason": "STOP",
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": "read_file",
+                                            "args": {"file_path": "/tmp/a.txt"},
+                                        },
+                                        "thoughtSignature": "sig-read",
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 11,
+                        "candidatesTokenCount": 5,
+                        "totalTokenCount": 16,
+                        "trafficType": "ON_DEMAND",
+                    },
+                },
+            }
+        ),
+        media_type="application/json",
+    )
+
+    anthropic_response = await _translate_google_code_assist_response_to_anthropic(
+        response=google_response,
+        adapter_model="gemini-3-flash-preview",
+        tool_name_mapping={"read_file": "Read"},
+        completion_messages=[{"role": "user", "content": "read a file"}],
+        gemini_optional_params={},
+        litellm_params={},
+        logging_obj=SimpleNamespace(post_call=lambda **_: None, optional_params={}),
+    )
+    payload = json.loads(anthropic_response.body.decode("utf-8"))
+
+    assert payload["id"] == "trace-code-assist-non-stream"
+    assert payload["stop_reason"] == "tool_use"
+    assert payload["usage"] == {"input_tokens": 11, "output_tokens": 5}
+    assert payload["content"] == [
+        {
+            "type": "tool_use",
+            "id": payload["content"][0]["id"],
+            "name": "Read",
+            "input": {"file_path": "/tmp/a.txt"},
+            "provider_specific_fields": {"signature": "sig-read"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_google_code_assist_round_trips_same_name_parallel_tool_results():
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {"session_id": "same-name-parallel-tools"}
+    completion_kwargs = {
+        "model": "google/gemini-3-flash-preview",
+        "max_tokens": 32,
+        "parallel_tool_calls": True,
+        "tools": [
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "Read both files."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_read_a",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/a.txt"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_read_b",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/b.txt"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read_a",
+                        "content": "alpha",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read_b",
+                        "content": "bravo",
+                    },
+                ],
+            },
+        ],
+    }
+
+    wrapped_request, tool_name_mapping, _, _, _, changes = (
+        await _build_google_code_assist_request_from_completion_kwargs(
+            completion_kwargs=completion_kwargs,
+            adapter_model="gemini-3-flash-preview",
+            project="test-project",
+            request=mock_request,
+        )
+    )
+
+    parts = [
+        part
+        for content in wrapped_request["request"]["contents"]
+        for part in content.get("parts", [])
+        if isinstance(part, dict)
+    ]
+    function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
+    function_responses = [
+        part["functionResponse"] for part in parts if "functionResponse" in part
+    ]
+
+    assert function_calls == [
+        {"name": "read_file", "args": {"file_path": "/tmp/a.txt"}},
+        {"name": "read_file", "args": {"file_path": "/tmp/b.txt"}},
+    ]
+    assert function_responses == [
+        {
+            "name": "read_file",
+            "response": {"output": "alpha", "tool_use_id": "toolu_read_a"},
+        },
+        {
+            "name": "read_file",
+            "response": {"output": "bravo", "tool_use_id": "toolu_read_b"},
+        },
+    ]
+    assert tool_name_mapping["read_file"] == "Read"
+    assert changes["google_adapter_annotated_duplicate_tool_response_count"] == 2
 
 
 async def test_gemini_proxy_route_code_assist_oauth_passthrough_target():

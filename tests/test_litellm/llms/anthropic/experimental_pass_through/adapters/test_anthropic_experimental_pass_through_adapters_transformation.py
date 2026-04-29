@@ -1168,6 +1168,93 @@ def test_gemini_cache_control_adds_provider_cache_intent_metadata():
     assert metadata["gemini_provider_cache_source"] == "anthropic_adapter.cache_control"
 
 
+def test_translate_anthropic_tool_choice_none_to_openai_none():
+    request = cast(
+        Any,
+        {
+            "model": "openrouter/openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather information",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                }
+            ],
+            "tool_choice": {"type": "none"},
+        },
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, _ = adapter.translate_anthropic_to_openai(request)
+
+    assert openai_request["tool_choice"] == "none"
+    assert "parallel_tool_calls" not in openai_request
+
+
+def test_translate_anthropic_auto_disable_parallel_tool_use_to_parallel_tool_calls_false():
+    request = cast(
+        Any,
+        {
+            "model": "nvidia_nim/meta/llama-3.1-70b-instruct",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather information",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                }
+            ],
+            "tool_choice": {
+                "type": "auto",
+                "disable_parallel_tool_use": True,
+            },
+        },
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, _ = adapter.translate_anthropic_to_openai(request)
+
+    assert openai_request["tool_choice"] == "auto"
+    assert openai_request["parallel_tool_calls"] is False
+
+
+def test_translate_anthropic_auto_disable_parallel_tool_use_without_function_tools_omits_parallel_tool_calls():
+    request = cast(
+        Any,
+        {
+            "model": "openrouter/openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "type": "web_search_20260209",
+                    "name": "web_search",
+                }
+            ],
+            "tool_choice": {
+                "type": "auto",
+                "disable_parallel_tool_use": True,
+            },
+        },
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, _ = adapter.translate_anthropic_to_openai(request)
+
+    assert openai_request["tool_choice"] == "auto"
+    assert "web_search_options" in openai_request
+    assert "parallel_tool_calls" not in openai_request
+
+
 # ============================================================================
 # Cache Control Transformation Tests
 # ============================================================================

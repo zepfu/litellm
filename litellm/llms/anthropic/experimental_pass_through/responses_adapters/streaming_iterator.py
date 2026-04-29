@@ -27,6 +27,7 @@ class AnthropicResponsesStreamWrapper:
       response.output_text.delta         -> content_block_delta (text_delta)
       response.reasoning_summary_text.delta -> content_block_delta (thinking_delta)
       response.function_call_arguments.delta -> content_block_delta (input_json_delta)
+      response.function_call_arguments.done -> content_block_delta (input_json_delta if no delta arrived)
       response.output_item.done          -> content_block_stop
       response.completed                 -> message_delta + message_stop
     """
@@ -178,10 +179,15 @@ class AnthropicResponsesStreamWrapper:
             "response.output_text.delta",
             "response.output_text.done",
             "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.mcp_call_arguments.delta",
+            "response.mcp_call_arguments.done",
             "response.reasoning_summary_text.delta",
         }:
             summary["item_id"] = cls._get_value(event, "item_id")
             text = cls._get_value(event, "delta")
+            if text is None:
+                text = cls._get_value(event, "arguments")
             if text is None:
                 text = cls._get_value(event, "text")
             if isinstance(text, str):
@@ -525,6 +531,54 @@ class AnthropicResponsesStreamWrapper:
             )
             return
 
+        # Some Responses streams, including native Codex shapes, can send the
+        # complete function-call arguments only in the `.done` event. Emit them
+        # as a normal Anthropic input_json_delta only if we have not already sent
+        # argument deltas or seeded complete tool input from output_item.added.
+        if event_type == "response.function_call_arguments.done":
+            item_id = getattr(event, "item_id", None) or (
+                event.get("item_id") if isinstance(event, dict) else None
+            )
+            if not item_id:
+                return
+            if (
+                item_id in self._tool_argument_deltas_seen
+                or item_id in self._tool_inputs_seeded
+            ):
+                return
+            arguments = getattr(event, "arguments", None) or (
+                event.get("arguments") if isinstance(event, dict) else None
+            )
+            if arguments in (None, ""):
+                return
+            if isinstance(arguments, dict):
+                arguments_json = json.dumps(arguments)
+            elif isinstance(arguments, str):
+                arguments_json = arguments
+            else:
+                return
+            tool_name = self._pending_tool_names.get(item_id, "")
+            arguments_json = sanitize_anthropic_tool_use_input_json_delta(
+                tool_name=tool_name,
+                partial_json=arguments_json,
+            )
+            self._tool_argument_deltas_seen.add(item_id)
+            block_idx = self._item_id_to_block_index.get(
+                item_id,
+                self._current_block_index,
+            )
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": arguments_json,
+                    },
+                }
+            )
+            return
+
         # ---- MCP call arguments delta ----
         if event_type == "response.mcp_call_arguments.delta":
             item_id = getattr(event, "item_id", None) or (
@@ -545,6 +599,45 @@ class AnthropicResponsesStreamWrapper:
                     "type": "content_block_delta",
                     "index": block_idx,
                     "delta": {"type": "input_json_delta", "partial_json": delta},
+                }
+            )
+            return
+
+        if event_type == "response.mcp_call_arguments.done":
+            item_id = getattr(event, "item_id", None) or (
+                event.get("item_id") if isinstance(event, dict) else None
+            )
+            if not item_id:
+                return
+            if (
+                item_id in self._tool_argument_deltas_seen
+                or item_id in self._tool_inputs_seeded
+            ):
+                return
+            arguments = getattr(event, "arguments", None) or (
+                event.get("arguments") if isinstance(event, dict) else None
+            )
+            if arguments in (None, ""):
+                return
+            if isinstance(arguments, dict):
+                arguments_json = json.dumps(arguments)
+            elif isinstance(arguments, str):
+                arguments_json = arguments
+            else:
+                return
+            self._tool_argument_deltas_seen.add(item_id)
+            block_idx = self._item_id_to_block_index.get(
+                item_id,
+                self._current_block_index,
+            )
+            self._chunk_queue.append(
+                {
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": arguments_json,
+                    },
                 }
             )
             return

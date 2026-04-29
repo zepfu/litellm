@@ -3219,6 +3219,12 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         cached_content=None,
     )
     google_request_dict = _normalize_google_code_assist_httpx_payload(dict(google_request))
+    duplicate_tool_response_changes = (
+        _annotate_google_code_assist_duplicate_tool_responses(
+            google_request_dict,
+            completion_messages,
+        )
+    )
     fallback_context_changes = _inject_google_adapter_fallback_text_context(
         google_request_dict,
         completion_messages,
@@ -3255,6 +3261,7 @@ async def _build_google_code_assist_request_from_completion_kwargs(
     completion_message_window_changes = {
         **completion_message_window_changes,
         **native_tool_alias_changes,
+        **duplicate_tool_response_changes,
         **system_prompt_policy_changes,
         'google_adapter_session_id_source': session_id_source,
         'google_adapter_session_id_hash': hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8],
@@ -3724,6 +3731,117 @@ def _normalize_google_code_assist_httpx_payload(value: Any) -> Any:
         normalized_key = key_mapping.get(key, key)
         normalized[normalized_key] = _normalize_google_code_assist_httpx_payload(item)
     return normalized
+
+
+def _google_code_assist_duplicate_tool_results_from_completion_messages(
+    completion_messages: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    duplicate_tool_results: list[tuple[str, str]] = []
+    pending_tool_calls_by_id: dict[str, str] = {}
+    duplicate_tool_call_names: set[str] = set()
+
+    for message in completion_messages:
+        role = message.get("role")
+        if role == "assistant":
+            pending_tool_calls_by_id.clear()
+            duplicate_tool_call_names.clear()
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            tool_call_name_counts: dict[str, int] = {}
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_call_id = tool_call.get("id")
+                function = tool_call.get("function")
+                if not isinstance(tool_call_id, str) or not isinstance(function, dict):
+                    continue
+                function_name = function.get("name")
+                if not isinstance(function_name, str) or not function_name:
+                    continue
+                pending_tool_calls_by_id[tool_call_id] = function_name
+                tool_call_name_counts[function_name] = (
+                    tool_call_name_counts.get(function_name, 0) + 1
+                )
+            duplicate_tool_call_names = {
+                name for name, count in tool_call_name_counts.items() if count > 1
+            }
+            continue
+
+        if role != "tool":
+            pending_tool_calls_by_id.clear()
+            duplicate_tool_call_names.clear()
+            continue
+
+        tool_call_id = message.get("tool_call_id")
+        if not isinstance(tool_call_id, str):
+            continue
+        function_name = pending_tool_calls_by_id.get(tool_call_id)
+        if function_name in duplicate_tool_call_names:
+            duplicate_tool_results.append((function_name, tool_call_id))
+
+    return duplicate_tool_results
+
+
+def _annotate_google_code_assist_duplicate_tool_response_parts(
+    contents: list[Any],
+    duplicate_tool_results: list[tuple[str, str]],
+) -> int:
+    annotated_count = 0
+    pending_index = 0
+    for content in contents:
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if pending_index >= len(duplicate_tool_results):
+                break
+            if not isinstance(part, dict):
+                continue
+            function_response = part.get("functionResponse")
+            if not isinstance(function_response, dict):
+                continue
+            function_name, tool_call_id = duplicate_tool_results[pending_index]
+            if function_response.get("name") != function_name:
+                continue
+            response_payload = function_response.get("response")
+            if not isinstance(response_payload, dict):
+                response_payload = {}
+                function_response["response"] = response_payload
+            response_payload.setdefault("tool_use_id", tool_call_id)
+            annotated_count += 1
+            pending_index += 1
+    return annotated_count
+
+
+def _annotate_google_code_assist_duplicate_tool_responses(
+    google_request_dict: dict[str, Any],
+    completion_messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Preserve Claude tool_use ids when Gemini has same-name parallel tool results."""
+    duplicate_tool_results = (
+        _google_code_assist_duplicate_tool_results_from_completion_messages(
+            completion_messages
+        )
+    )
+    if not duplicate_tool_results:
+        return {}
+
+    contents = google_request_dict.get("contents")
+    if not isinstance(contents, list):
+        return {}
+
+    annotated_count = _annotate_google_code_assist_duplicate_tool_response_parts(
+        contents,
+        duplicate_tool_results,
+    )
+    if annotated_count == 0:
+        return {}
+    return {
+        "google_adapter_annotated_duplicate_tool_response_count": annotated_count,
+    }
 
 
 def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
@@ -5132,6 +5250,9 @@ def _responses_stream_event_summary(event: Any) -> dict[str, Any]:
         "response.output_text.delta",
         "response.output_text.done",
         "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.mcp_call_arguments.delta",
+        "response.mcp_call_arguments.done",
         "response.reasoning_summary_text.delta",
     }:
         summary["item_id"] = getattr(event, "item_id", None) or (
@@ -5140,6 +5261,10 @@ def _responses_stream_event_summary(event: Any) -> dict[str, Any]:
         text = getattr(event, "delta", None) or (
             event.get("delta") if isinstance(event, dict) else None
         )
+        if text is None:
+            text = getattr(event, "arguments", None) or (
+                event.get("arguments") if isinstance(event, dict) else None
+            )
         if text is None:
             text = getattr(event, "text", None) or (
                 event.get("text") if isinstance(event, dict) else None
@@ -5232,6 +5357,206 @@ def _is_empty_success_responses_body(response_body: dict[str, Any]) -> bool:
     return True
 
 
+def _responses_output_stream_key(
+    *,
+    item: Optional[dict[str, Any]] = None,
+    output_index: Any = None,
+    item_id: Any = None,
+    fallback_index: Optional[int] = None,
+) -> str:
+    if isinstance(item, dict):
+        for key in ("call_id", "id"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(item_id, str) and item_id.strip():
+        return item_id.strip()
+    if isinstance(output_index, int):
+        return f"output:{output_index}"
+    if fallback_index is not None:
+        return f"fallback:{fallback_index}"
+    return "fallback:0"
+
+
+def _merge_responses_output_lists(
+    completed_output: Optional[list[dict[str, Any]]],
+    streamed_output: Optional[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    merged_by_key: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+
+    for output_list in (streamed_output or [], completed_output or []):
+        for item in output_list:
+            if not isinstance(item, dict):
+                continue
+            key = _responses_output_stream_key(
+                item=item,
+                fallback_index=len(ordered_keys),
+            )
+            if key not in ordered_keys:
+                ordered_keys.append(key)
+            existing = merged_by_key.get(key, {})
+            merged_item = {**existing, **item}
+            if "arguments" in existing and "arguments" not in item:
+                merged_item["arguments"] = existing["arguments"]
+            merged_by_key[key] = merged_item
+
+    return [merged_by_key[key] for key in ordered_keys if key in merged_by_key]
+
+
+def _responses_output_has_message_text(output: Any) -> bool:
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") in {"output_text", "text"}
+                and isinstance(part.get("text"), str)
+                and part["text"]
+            ):
+                return True
+    return False
+
+
+def _build_collected_responses_text_output_item(text: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "id": "msg_adapter_0",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": text,
+                "annotations": [],
+            }
+        ],
+    }
+
+
+def _record_collected_responses_output_item_event(
+    *,
+    event: Any,
+    output_items: dict[str, dict[str, Any]],
+    ordered_keys: list[str],
+    key_aliases: dict[str, str],
+    key_by_output_index: dict[int, str],
+) -> None:
+    item = _coerce_namespace_to_mapping(getattr(event, "item", None))
+    if not isinstance(item, dict):
+        return
+
+    output_index = getattr(event, "output_index", None)
+    raw_key = _responses_output_stream_key(
+        item=item,
+        output_index=output_index,
+        fallback_index=len(ordered_keys),
+    )
+    if isinstance(output_index, int) and output_index in key_by_output_index:
+        key = key_by_output_index[output_index]
+    else:
+        key = key_aliases.get(raw_key, raw_key)
+    if key not in ordered_keys:
+        ordered_keys.append(key)
+
+    existing = output_items.get(key, {})
+    merged_item = {**existing, **item}
+    if "arguments" in existing and "arguments" not in item:
+        merged_item["arguments"] = existing["arguments"]
+    output_items[key] = merged_item
+
+    if isinstance(output_index, int):
+        key_by_output_index[output_index] = key
+    for alias in (raw_key, item.get("id"), item.get("call_id")):
+        if isinstance(alias, str) and alias.strip():
+            key_aliases[alias.strip()] = key
+
+
+def _record_collected_responses_arguments_event(
+    *,
+    event: Any,
+    event_type: str,
+    output_items: dict[str, dict[str, Any]],
+    ordered_keys: list[str],
+    key_aliases: dict[str, str],
+    key_by_output_index: dict[int, str],
+) -> None:
+    item_id = getattr(event, "item_id", None)
+    output_index = getattr(event, "output_index", None)
+    raw_key = _responses_output_stream_key(
+        output_index=output_index,
+        item_id=item_id,
+        fallback_index=len(ordered_keys),
+    )
+    if isinstance(output_index, int) and output_index in key_by_output_index:
+        key = key_by_output_index[output_index]
+    else:
+        key = key_aliases.get(raw_key, raw_key)
+    if key not in ordered_keys:
+        ordered_keys.append(key)
+
+    existing = output_items.get(key, {})
+    if not existing:
+        item_type = "mcp_call" if "mcp_call" in event_type else "function_call"
+        existing = {"type": item_type, "id": item_id}
+        if item_type == "function_call" and isinstance(item_id, str) and item_id:
+            existing["call_id"] = item_id
+
+    value = getattr(event, "arguments", None)
+    if not isinstance(value, str):
+        value = getattr(event, "delta", None)
+    if isinstance(value, str):
+        if event_type.endswith(".delta"):
+            existing["arguments"] = f"{existing.get('arguments', '')}{value}"
+        else:
+            existing["arguments"] = value
+
+    output_items[key] = existing
+    if isinstance(output_index, int):
+        key_by_output_index[output_index] = key
+    if isinstance(item_id, str) and item_id.strip():
+        key_aliases[item_id.strip()] = key
+
+
+def _finalize_collected_responses_stream_response(
+    *,
+    response_dict: dict[str, Any],
+    output_text_parts: list[str],
+    output_items: dict[str, dict[str, Any]],
+    ordered_keys: list[str],
+) -> dict[str, Any]:
+    streamed_output = [
+        output_items[key]
+        for key in ordered_keys
+        if key in output_items
+    ]
+    completed_output = response_dict.get("output")
+    if (
+        output_text_parts
+        and not _responses_output_has_message_text(streamed_output)
+        and not _responses_output_has_message_text(completed_output)
+    ):
+        streamed_output.append(
+            _build_collected_responses_text_output_item("".join(output_text_parts))
+        )
+    if streamed_output:
+        response_dict["output"] = _merge_responses_output_lists(
+            completed_output if isinstance(completed_output, list) else [],
+            streamed_output,
+        )
+    elif not response_dict.get("output") and output_text_parts:
+        response_dict["output"] = [
+            _build_collected_responses_text_output_item("".join(output_text_parts))
+        ]
+    return response_dict
+
+
 def _build_empty_success_responses_diagnostic(
     *,
     response_body: dict[str, Any],
@@ -5265,12 +5590,24 @@ async def _collect_responses_response_from_stream(
 ) -> dict[str, Any]:
     output_text_parts: list[str] = []
     text_done_keys_seen: set[str] = set()
+    output_items: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+    key_aliases: dict[str, str] = {}
+    key_by_output_index: dict[int, str] = {}
     event_iterator = _iterate_responses_sse_events(response.body_iterator)
     try:
         async for event in event_iterator:
             event_type = getattr(event, "type", None)
             if event_summaries is not None and len(event_summaries) < 50:
                 event_summaries.append(_responses_stream_event_summary(event))
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                _record_collected_responses_output_item_event(
+                    event=event,
+                    output_items=output_items,
+                    ordered_keys=ordered_keys,
+                    key_aliases=key_aliases,
+                    key_by_output_index=key_by_output_index,
+                )
             if event_type == "response.output_text.delta":
                 delta = getattr(event, "delta", None)
                 if isinstance(delta, str):
@@ -5286,29 +5623,32 @@ async def _collect_responses_response_from_stream(
                 ):
                     output_text_parts.append(text)
                     text_done_keys_seen.add(text_key)
+            if event_type in {
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.mcp_call_arguments.delta",
+                "response.mcp_call_arguments.done",
+            }:
+                _record_collected_responses_arguments_event(
+                    event=event,
+                    event_type=event_type,
+                    output_items=output_items,
+                    ordered_keys=ordered_keys,
+                    key_aliases=key_aliases,
+                    key_by_output_index=key_by_output_index,
+                )
             if event_type == "response.completed":
                 response_payload = getattr(event, "response", None)
                 if response_payload is None:
                     continue
                 response_dict = _coerce_namespace_to_mapping(response_payload)
                 if isinstance(response_dict, dict):
-                    if not response_dict.get("output") and output_text_parts:
-                        response_dict["output"] = [
-                            {
-                                "type": "message",
-                                "id": "msg_adapter_0",
-                                "status": "completed",
-                                "role": "assistant",
-                                "content": [
-                                    {
-                                        "type": "output_text",
-                                        "text": "".join(output_text_parts),
-                                        "annotations": [],
-                                    }
-                                ],
-                            }
-                        ]
-                    return response_dict
+                    return _finalize_collected_responses_stream_response(
+                        response_dict=response_dict,
+                        output_text_parts=output_text_parts,
+                        output_items=output_items,
+                        ordered_keys=ordered_keys,
+                    )
     finally:
         await event_iterator.aclose()
         body_iterator = getattr(response, "body_iterator", None)
