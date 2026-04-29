@@ -109,9 +109,9 @@ content, the OpenRouter adapter rejects it and logs bounded raw event/body
 diagnostics. Harness cases with `fail_empty_success` hard-fail empty successful
 Claude command output even when the case is otherwise warning-only.
 
-OpenRouter/Ling remains a legacy warning-only canary, not a release gate. The
-aawm.37 prod cutover exposed successful-empty Ling/free behavior, and the
-focused dev rerun on 2026-04-29 now shows OpenRouter returning `404` because
+Ling is retired from active OpenRouter harness targets. The aawm.37 prod
+cutover exposed successful-empty Ling/free behavior, and the focused dev rerun
+on 2026-04-29 shows OpenRouter returning `404` because
 `inclusionai/ling-2.6-flash:free` is no longer available as a free model. Use a
 currently available replacement OpenRouter model for future parallel read-tool
 proofs.
@@ -148,7 +148,6 @@ suite when the upstream provider is noisy:
   - single-model `429` / `RESOURCE_EXHAUSTED` responses can still be upstream
     noise, which is why the individual model cases remain warning-only
 - `openrouter/free`
-- `inclusionai/ling-2.6-flash:free`
 - `openai/gpt-oss-20b:free`
   - excluded from the default full suite; run explicitly with
     `--cases claude_adapter_gpt_oss_20b` when this edge OpenRouter target needs
@@ -176,7 +175,7 @@ Keep these out of the standard adapter harness run for now:
 
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
 - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
-- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/inclusionai/ling-2.6-flash:free`, `openrouter/google/gemma-4-31b-it:free`
+- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
 
 ## How to interpret results
@@ -196,7 +195,9 @@ OpenRouter twin whenever OpenRouter publishes one. Current true zero-cost
 exceptions remain:
 
 - `openrouter/free`
-- `inclusionai/ling-2.6-flash:free`
+
+No retired Ling target should be added back to the active canary list without a
+new available model decision.
 
 ### Source of truth for OpenRouter observability
 
@@ -210,9 +211,8 @@ Do not hard-gate on Langfuse generation usage fields yet; they are still too
 noisy on some OpenRouter-adapted runs.
 
 Important lane note:
-- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic ->
-  OpenRouter `Responses` lane as a legacy canary only. It is not a hard-gate
-  proof target because OpenRouter now reports that the free model is unavailable.
+- `inclusionai/ling-2.6-flash:free` / `ling-2-6-flash` is historical only and
+  no longer has an active harness case or adapter alias.
 - `openrouter/elephant-alpha` remains the special Anthropic -> OpenRouter
   `chat/completions` detour for the legacy agent/model mapping
 
