@@ -550,6 +550,8 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "usage_provider_cache_source",
     "openai_prompt_cache_key_present",
     "anthropic_adapter_cache_control_present",
+    "anthropic_adapter_unsupported_hosted_tools",
+    "anthropic_adapter_unsupported_hosted_tool_choice",
     "usage_tool_call_count",
     "usage_tool_names",
     "google_adapter_system_prompt_policy_name",

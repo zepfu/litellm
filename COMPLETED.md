@@ -2,6 +2,46 @@
 
 ## 2026-04-29
 
+- Failed/dead-end note for the NVIDIA hosted-tool policy gate: the first live
+  dev run of `claude_adapter_nvidia_hosted_tool_policy` returned 200 from
+  `nvidia/deepseek-ai/deepseek-v3.2` with final content `hosted policy`, but
+  failed 16 harness checks at
+  `/tmp/anthropic_nvidia_hosted_tool_policy.json` (trace
+  `665ae5c4-654b-41b9-aed0-720582d76c52`). Langfuse generation metadata did
+  contain truthy `anthropic_adapter_unsupported_hosted_tools` and
+  `anthropic_adapter_unsupported_hosted_tool_choice`, but
+  `session_history.metadata` dropped both keys because they were missing from
+  the AAWM session-history metadata allowlist. The request-payload failures
+  were not provider drift: the harness checks inspect logged Langfuse
+  generation input, which does not expose the transformed NVIDIA
+  chat/completions payload (`tools`, `web_search_options`, or adapter
+  metadata) for this completion-adapter path. Do not chase those checks again
+  without first adding reliable transformed upstream-payload capture.
+
+- Failed validation note for the same NVIDIA hosted-tool policy slice after the
+  local allowlist fix: the focused rerun at
+  `/tmp/anthropic_nvidia_hosted_tool_policy_after_metadata.json` failed only the
+  two exact `session_history.metadata` assertions because the live
+  `litellm-dev` container was still running code without the new AAWM metadata
+  allowlist entries. Treat this as a dev-container refresh issue, not as a
+  transformation or harness-config failure; update the running container before
+  rerunning the focused case.
+
+- Added and validated the focused NVIDIA `/anthropic` hosted-tool policy gate.
+  The AAWM session-history metadata allowlist now persists
+  `anthropic_adapter_unsupported_hosted_tools` and
+  `anthropic_adapter_unsupported_hosted_tool_choice`, and the live
+  `claude_adapter_nvidia_hosted_tool_policy` case hard-gates the exact
+  unsupported hosted `bash` metadata in `session_history` while Langfuse
+  generation metadata also requires both keys to be truthy. Focused local
+  validation passed for the AAWM record-builder test, the harness config-shape
+  test, and the three hosted-tool transformer tests (`5 passed`), plus JSON
+  parse, `py_compile`, and `git diff --check`. After copying the patched
+  `aawm_agent_identity.py` into `litellm-dev` and restarting, the focused live
+  dev run passed with zero failures/warnings at
+  `/tmp/anthropic_nvidia_hosted_tool_policy_after_container_refresh.json`;
+  trace id `b28b3ce6-bbc1-4fa4-9162-3bfd5b90c05f`.
+
 - Added native Gemini CLI Code Assist request-payload gates to the focused
   adapter harness. Both native Gemini passthrough cases now require the Code
   Assist envelope fields `model`, `project`, `user_prompt_id`,

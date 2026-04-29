@@ -825,6 +825,59 @@ def test_anthropic_gemini_effort_cases_have_gemini3_thinking_level_gates():
         )
 
 
+def test_nvidia_hosted_tool_policy_case_gates_dropped_hosted_tools():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_name = "claude_adapter_nvidia_hosted_tool_policy"
+    case_config = config["cases"][case_name]
+
+    assert case_name in config["default_excluded_cases"]
+    assert (
+        case_config["http_request"]["json"]["model"]
+        == "nvidia/deepseek-ai/deepseek-v3.2"
+    )
+    assert case_config["allowed_generation_routes"] == [
+        "/anthropic/v1/messages"
+    ]
+    assert "route:anthropic_nvidia_completion_adapter" in case_config[
+        "required_trace_tags"
+    ]
+    assert "anthropic.nvidia_completion_adapter" in case_config[
+        "required_span_names"
+    ]
+
+    request_tools = case_config["http_request"]["json"]["tools"]
+    assert {tool["name"] for tool in request_tools} == {
+        "web_search",
+        "bash",
+        "get_weather",
+    }
+    assert case_config["http_request"]["json"]["tool_choice"] == {
+        "type": "tool",
+        "name": "bash",
+    }
+
+    assert "request_payload_checks" not in case_config
+
+    for metadata_key in (
+        "anthropic_adapter_unsupported_hosted_tools",
+        "anthropic_adapter_unsupported_hosted_tool_choice",
+    ):
+        assert metadata_key in case_config["required_generation_metadata_truthy"]
+
+    metadata_required_equals = case_config["session_history_validation"][
+        "metadata_required_equals"
+    ]
+    assert metadata_required_equals["anthropic_adapter_unsupported_hosted_tools"] == [
+        {"type": "bash_20250124", "name": "bash"}
+    ]
+    assert metadata_required_equals[
+        "anthropic_adapter_unsupported_hosted_tool_choice"
+    ] == {"type": "tool", "name": "bash"}
+    assert case_config["session_history_validation"]["metadata_required_truthy"] == [
+        "tenant_id_source"
+    ]
+
+
 def test_target_profile_appends_case_local_claude_agents(monkeypatch):
     harness = _load_harness_module()
 

@@ -1913,6 +1913,51 @@ def test_build_session_history_record_flows_nvidia_provider_cache_metadata() -> 
     assert record["provider_cache_miss_cost_usd"] is None
 
 
+def test_build_session_history_record_keeps_unsupported_hosted_tool_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "nvidia_nim/deepseek-ai/deepseek-v3.2"
+    kwargs["custom_llm_provider"] = "nvidia_nim"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-nvidia-hosted-tool-policy"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-nvidia-hosted-tool-policy",
+            "anthropic_adapter_unsupported_hosted_tools": [
+                {"type": "bash_20250124", "name": "bash"}
+            ],
+            "anthropic_adapter_unsupported_hosted_tool_choice": {
+                "type": "tool",
+                "name": "bash",
+            },
+        }
+    )
+
+    result = {
+        "id": "provider-response-nvidia-hosted-tool-policy",
+        "usage": {
+            "prompt_tokens": 317,
+            "completion_tokens": 4,
+            "total_tokens": 321,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "hosted policy"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["metadata"]["anthropic_adapter_unsupported_hosted_tools"] == [
+        {"type": "bash_20250124", "name": "bash"}
+    ]
+    assert record["metadata"][
+        "anthropic_adapter_unsupported_hosted_tool_choice"
+    ] == {"type": "tool", "name": "bash"}
+
+
 def test_build_session_history_record_marks_gemini_cache_miss_from_intent_metadata() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gemini/gemini-3-flash-preview"
