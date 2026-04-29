@@ -698,6 +698,40 @@ class TestTranslateToolsToResponsesAPI:
             "max_output_tokens",
         }
 
+    def test_anthropic_only_tool_metadata_is_not_forwarded(self):
+        tools = [
+            {
+                "type": "custom",
+                "name": "write_file",
+                "description": "Write a file.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"],
+                },
+                "defer_loading": True,
+                "eager_input_streaming": True,
+                "allowed_callers": ["tool_search_tool_regex"],
+                "input_examples": [{"content": "hello"}],
+                "custom": {"defer_loading": True},
+            }
+        ]
+
+        result = _ADAPTER.translate_tools_to_responses_api(tools)  # type: ignore[arg-type]
+
+        assert result == [
+            {
+                "type": "function",
+                "name": "write_file",
+                "description": "Write a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"],
+                },
+            }
+        ]
+
     def test_tool_without_description(self):
         """Tool without a description omits the description key."""
         tools = [{"name": "ping", "input_schema": {"type": "object", "properties": {}}}]
