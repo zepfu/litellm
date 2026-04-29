@@ -162,23 +162,14 @@ these docs only as needed:
   scope.
 
   OpenAI/Codex Responses adapter:
-  - The Codex stream-state harness gate is now implemented locally: OpenAI
-    Responses streaming logging records bounded `responses_stream_*` metadata,
-    `native_openai_passthrough_responses_codex_tool_activity` captures the
-    native Codex shell baseline, and `claude_adapter_codex_tool_activity` now
-    hard-gates reconstructed `response.output_item.*` /
-    `response.function_call_arguments.*` state plus
-    `session_history_tool_activity`. Focused dev validation passed at
-    `/tmp/anthropic_codex_tool_parity_after_exec_command.json`; keep this pair
-    as the narrow OpenAI/Codex streaming-tool gate before broad harness work.
-  - New live drift to address after the gate is green: native Codex CLI shell
-    activity reaches OpenAI Responses as `function_call` name `exec_command`
-    with arguments like `{"cmd":"pwd","login":true,...}`, while the current
-    `/anthropic` Codex path reaches OpenAI as `function_call` name `Bash` with
-    Claude-style `{"command":"pwd",...}` arguments. Decide whether to add a
-    Codex-specific Claude-core alias layer (`Bash` <-> `exec_command`,
-    `command` <-> `cmd`) so OpenAI/Codex sees native Codex-shaped tools while
-    Claude Code still sees `Bash` on the Anthropic side.
+  - Codex stream/tool parity is now validated for the narrow focused pair.
+    Keep
+    `native_openai_passthrough_responses_codex_tool_activity,claude_adapter_codex_tool_activity`
+    as the OpenAI/Codex gate before broad harness work. The latest passing
+    artifact is `/tmp/anthropic_codex_tool_alias_after_fix.json`: upstream
+    OpenAI/Codex sees native `exec_command` / `cmd` tool state while Claude
+    Code still sees `Bash` / `command` on the Anthropic side, scoped only to the
+    Codex-backed `/anthropic` route.
 
   Google/Gemini Code Assist adapter:
   - Live-compare the newly covered `/anthropic` Code Assist request envelope

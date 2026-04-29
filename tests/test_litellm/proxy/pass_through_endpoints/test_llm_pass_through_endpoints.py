@@ -453,6 +453,47 @@ class TestResponsesAdapterToolChoice:
             "properties": {},
         }
 
+    def test_responses_adapter_codex_defaults_alias_bash_to_exec_command(self):
+        request_body = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "Run pwd with Bash."}],
+            "max_tokens": 32,
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "Bash"},
+        }
+
+        default_body = _build_anthropic_responses_adapter_request_body(
+            request_body,
+            adapter_model="gpt-5.4",
+        )
+        codex_body = _build_anthropic_responses_adapter_request_body(
+            request_body,
+            adapter_model="gpt-5.4",
+            use_chatgpt_codex_defaults=True,
+        )
+
+        assert default_body["tools"][0]["name"] == "Bash"
+        assert default_body["tool_choice"] == {"type": "function", "name": "Bash"}
+
+        assert codex_body["tools"][0]["name"] == "exec_command"
+        assert codex_body["tool_choice"] == {
+            "type": "function",
+            "name": "exec_command",
+        }
+        litellm_metadata = codex_body["litellm_metadata"]
+        assert "anthropic-openai-codex-native-tools" in litellm_metadata["tags"]
+        assert litellm_metadata["anthropic_adapter_codex_native_tool_aliases"] is True
+
     def test_forces_explicit_bash_tool_choice_when_prompt_requires_bash(self):
         translated_body = {
             "tools": [
@@ -5199,6 +5240,114 @@ class TestClaudePersistedOutputExpansion:
             "anthropic-openai-responses-adapter"
             in call_kwargs["custom_body"]["litellm_metadata"]["tags"]
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "expected_tool_name", "expects_codex_alias_metadata"),
+        [
+            (
+                {
+                    "content-type": "application/json",
+                    "x-pass-authorization": "Bearer openai-api-key",
+                },
+                "Bash",
+                False,
+            ),
+            (
+                {
+                    "content-type": "application/json",
+                    "x-pass-authorization": "Bearer codex-oauth-token",
+                    "x-pass-chatgpt-account-id": "acct_123",
+                    "x-pass-originator": "codex-cli",
+                },
+                "exec_command",
+                True,
+            ),
+        ],
+    )
+    async def test_anthropic_proxy_route_scopes_codex_native_tool_aliases(
+        self,
+        headers: dict[str, str],
+        expected_tool_name: str,
+        expects_codex_alias_metadata: bool,
+    ):
+        request_body = {
+            "model": "gpt-5.4",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Run pwd with Bash."}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "Bash"},
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = headers
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(
+                return_value=Response(
+                    content=json.dumps(
+                        {
+                            "id": "resp_123",
+                            "object": "response",
+                            "created_at": 1744974432,
+                            "model": "gpt-5.4",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        }
+                    ).encode("utf-8"),
+                    status_code=200,
+                    media_type="application/json",
+                )
+            ),
+        ) as mock_pass_through_request:
+            await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        custom_body = call_kwargs["custom_body"]
+        assert custom_body["tools"][0]["name"] == expected_tool_name
+        assert custom_body["tool_choice"] == {
+            "type": "function",
+            "name": expected_tool_name,
+        }
+        litellm_metadata = custom_body["litellm_metadata"]
+        assert (
+            "anthropic-openai-codex-native-tools" in litellm_metadata["tags"]
+        ) == expects_codex_alias_metadata
+        assert (
+            litellm_metadata.get("anthropic_adapter_codex_native_tool_aliases")
+            is True
+        ) == expects_codex_alias_metadata
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_adds_minimal_adapter_instructions_without_system(
