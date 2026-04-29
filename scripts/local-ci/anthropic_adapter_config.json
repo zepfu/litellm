@@ -57,6 +57,7 @@
     "native_openai_passthrough_chat",
     "native_openai_passthrough_responses",
     "native_openai_passthrough_responses_codex",
+    "native_openai_passthrough_responses_codex_tool_activity",
     "native_gemini_passthrough_generate_content",
     "native_gemini_passthrough_stream_generate_content"
   ],
@@ -273,6 +274,108 @@
           "output_tokens": 1,
           "total_tokens": 1
         }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 60
+    },
+    "native_openai_passthrough_responses_codex_tool_activity": {
+      "cli_passthrough": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "-p",
+        "{codex_profile}",
+        "-m",
+        "gpt-5.4-mini",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-litellm-end-user-id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_user_id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "Use the shell tool exactly once to run pwd. Return only the working directory path."
+      ],
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses"
+      ],
+      "required_trace_tags": ["route:codex_responses"],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "responses_stream_event_types",
+        "responses_stream_tool_state"
+      ],
+      "required_generation_metadata_minimums": {
+        "responses_stream_tool_call_count": 1,
+        "codex_tool_call_count": 1
+      },
+      "stream_tool_call_state_validation": {
+        "required_event_types": [
+          "response.output_item.added",
+          "response.output_item.done"
+        ],
+        "expected_tools": [
+          {
+            "tool_name": "exec_command",
+            "tool_type": "function_call",
+            "arguments_required_substrings": ["pwd"],
+            "minimum_count": 1
+          }
+        ]
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openai",
+        "expected_model": "gpt-5.4-mini",
+        "expected_client_name": "codex_exec",
+        "client_user_agent_contains": "codex_exec/",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "codex_exec"
+        },
+        "metadata_required_truthy": [
+          "request_tags",
+          "client_version"
+        ],
+        "required_contains": {
+          "repository": "litellm"
+        },
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "tool_name": "exec_command",
+            "tool_kind": "command",
+            "minimum_count": 1,
+            "command_text_contains": "pwd"
+          }
+        ]
       },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60
@@ -4843,8 +4946,14 @@
         "anthropic_adapter_model",
         "anthropic_adapter_original_model",
         "anthropic_adapter_target_endpoint",
-        "passthrough_route_family"
+        "passthrough_route_family",
+        "responses_stream_event_types",
+        "responses_stream_tool_state"
       ],
+      "required_generation_metadata_minimums": {
+        "responses_stream_tool_call_count": 1,
+        "codex_tool_call_count": 1
+      },
       "request_payload_checks": {
         "required_paths": [
           "model",
@@ -4852,6 +4961,26 @@
           "instructions",
           "reasoning.effort",
           "stream"
+        ]
+      },
+      "stream_tool_call_state_validation": {
+        "required_event_types": [
+          "response.output_item.added",
+          "response.output_item.done"
+        ],
+        "required_any_event_type_groups": [
+          [
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done"
+          ]
+        ],
+        "expected_tools": [
+          {
+            "tool_name": "Bash",
+            "tool_type": "function_call",
+            "arguments_required_substrings": ["pwd"],
+            "minimum_count": 1
+          }
         ]
       },
       "command_json_checks": {

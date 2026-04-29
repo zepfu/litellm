@@ -634,6 +634,87 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return [merged_by_key[key] for key in ordered_keys if key in merged_by_key]
 
     @staticmethod
+    def _record_responses_output_item_stream_event(
+        *,
+        parsed_chunk: dict,
+        output_items: Dict[str, dict],
+        ordered_keys: List[str],
+        key_aliases: Dict[str, str],
+        key_by_output_index: Dict[int, str],
+    ) -> None:
+        item = parsed_chunk.get("item")
+        if not isinstance(item, dict):
+            return
+        raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+            item=item,
+            output_index=parsed_chunk.get("output_index"),
+            fallback_index=len(ordered_keys),
+        )
+        output_index = parsed_chunk.get("output_index")
+        if isinstance(output_index, int) and output_index in key_by_output_index:
+            key = key_by_output_index[output_index]
+        else:
+            key = key_aliases.get(raw_key, raw_key)
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+        existing = output_items.get(key, {})
+        merged_item = {**existing, **item}
+        if "arguments" in existing and "arguments" not in item:
+            merged_item["arguments"] = existing["arguments"]
+        output_items[key] = merged_item
+        if isinstance(output_index, int):
+            key_by_output_index[output_index] = key
+        for alias in (raw_key, item.get("id"), item.get("call_id")):
+            if isinstance(alias, str) and alias.strip():
+                key_aliases[alias.strip()] = key
+
+    @staticmethod
+    def _record_responses_arguments_stream_event(
+        *,
+        parsed_chunk: dict,
+        output_items: Dict[str, dict],
+        ordered_keys: List[str],
+        key_aliases: Dict[str, str],
+        key_by_output_index: Dict[int, str],
+    ) -> None:
+        event_type = parsed_chunk.get("type")
+        item_id = parsed_chunk.get("item_id")
+        output_index = parsed_chunk.get("output_index")
+        raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
+            output_index=parsed_chunk.get("output_index"),
+            item_id=item_id,
+            fallback_index=len(ordered_keys),
+        )
+        if isinstance(output_index, int) and output_index in key_by_output_index:
+            key = key_by_output_index[output_index]
+        else:
+            key = key_aliases.get(raw_key, raw_key)
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+        existing = output_items.get(key, {})
+        if not existing:
+            item_type = "mcp_call" if "mcp_call" in str(event_type) else "function_call"
+            existing = {
+                "type": item_type,
+                "id": item_id,
+            }
+            if item_type == "function_call" and isinstance(item_id, str) and item_id:
+                existing["call_id"] = item_id
+        value = parsed_chunk.get("arguments")
+        if not isinstance(value, str):
+            value = parsed_chunk.get("delta")
+        if isinstance(value, str):
+            if str(event_type).endswith(".delta"):
+                existing["arguments"] = f"{existing.get('arguments', '')}{value}"
+            else:
+                existing["arguments"] = value
+        output_items[key] = existing
+        if isinstance(output_index, int):
+            key_by_output_index[output_index] = key
+        if isinstance(item_id, str) and item_id.strip():
+            key_aliases[item_id.strip()] = key
+
+    @staticmethod
     def _reconstruct_responses_output_items_from_stream(
         all_chunks: List[str],
     ) -> List[dict]:
@@ -655,35 +736,13 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
             event_type = parsed_chunk.get("type")
             if event_type in {"response.output_item.added", "response.output_item.done"}:
-                item = parsed_chunk.get("item")
-                if not isinstance(item, dict):
-                    continue
-                raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
-                    item=item,
-                    output_index=parsed_chunk.get("output_index"),
-                    fallback_index=len(ordered_keys),
+                OpenAIPassthroughLoggingHandler._record_responses_output_item_stream_event(
+                    parsed_chunk=parsed_chunk,
+                    output_items=output_items,
+                    ordered_keys=ordered_keys,
+                    key_aliases=key_aliases,
+                    key_by_output_index=key_by_output_index,
                 )
-                output_index = parsed_chunk.get("output_index")
-                if isinstance(output_index, int) and output_index in key_by_output_index:
-                    key = key_by_output_index[output_index]
-                else:
-                    key = key_aliases.get(raw_key, raw_key)
-                if key not in ordered_keys:
-                    ordered_keys.append(key)
-                existing = output_items.get(key, {})
-                merged_item = {**existing, **item}
-                if "arguments" in existing and "arguments" not in item:
-                    merged_item["arguments"] = existing["arguments"]
-                output_items[key] = merged_item
-                if isinstance(output_index, int):
-                    key_by_output_index[output_index] = key
-                for alias in (
-                    raw_key,
-                    item.get("id"),
-                    item.get("call_id"),
-                ):
-                    if isinstance(alias, str) and alias.strip():
-                        key_aliases[alias.strip()] = key
                 continue
 
             if event_type in {
@@ -692,43 +751,114 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 "response.mcp_call_arguments.delta",
                 "response.mcp_call_arguments.done",
             }:
-                item_id = parsed_chunk.get("item_id")
-                output_index = parsed_chunk.get("output_index")
-                raw_key = OpenAIPassthroughLoggingHandler._response_output_stream_key(
-                    output_index=parsed_chunk.get("output_index"),
-                    item_id=item_id,
-                    fallback_index=len(ordered_keys),
+                OpenAIPassthroughLoggingHandler._record_responses_arguments_stream_event(
+                    parsed_chunk=parsed_chunk,
+                    output_items=output_items,
+                    ordered_keys=ordered_keys,
+                    key_aliases=key_aliases,
+                    key_by_output_index=key_by_output_index,
                 )
-                if isinstance(output_index, int) and output_index in key_by_output_index:
-                    key = key_by_output_index[output_index]
-                else:
-                    key = key_aliases.get(raw_key, raw_key)
-                if key not in ordered_keys:
-                    ordered_keys.append(key)
-                existing = output_items.get(key, {})
-                if not existing:
-                    item_type = "mcp_call" if "mcp_call" in str(event_type) else "function_call"
-                    existing = {
-                        "type": item_type,
-                        "id": item_id,
-                    }
-                    if item_type == "function_call" and isinstance(item_id, str) and item_id:
-                        existing["call_id"] = item_id
-                value = parsed_chunk.get("arguments")
-                if not isinstance(value, str):
-                    value = parsed_chunk.get("delta")
-                if isinstance(value, str):
-                    if str(event_type).endswith(".delta"):
-                        existing["arguments"] = f"{existing.get('arguments', '')}{value}"
-                    else:
-                        existing["arguments"] = value
-                output_items[key] = existing
-                if isinstance(output_index, int):
-                    key_by_output_index[output_index] = key
-                if isinstance(item_id, str) and item_id.strip():
-                    key_aliases[item_id.strip()] = key
 
         return [output_items[key] for key in ordered_keys if key in output_items]
+
+    @staticmethod
+    def _responses_stream_tool_argument_text(item: dict) -> str:
+        for key in ("arguments", "input", "action", "patch"):
+            value = item.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                return value[:1000]
+            try:
+                return json.dumps(value, sort_keys=True)[:1000]
+            except (TypeError, ValueError):
+                return str(value)[:1000]
+        return ""
+
+    @staticmethod
+    def _summarize_responses_stream_tool_state(
+        all_chunks: List[str],
+    ) -> Dict[str, Any]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        event_types: List[str] = []
+        event_counts: Dict[str, int] = {}
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+            event_type = parsed_chunk.get("type")
+            if not isinstance(event_type, str) or not event_type:
+                continue
+            if event_type not in event_types:
+                event_types.append(event_type)
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+
+        tool_state: List[Dict[str, Any]] = []
+        for item in OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
+            all_chunks
+        ):
+            item_type = item.get("type")
+            if item_type not in {
+                "function_call",
+                "local_shell_call",
+                "apply_patch_call",
+                "custom_tool_call",
+                "mcp_call",
+            }:
+                continue
+            tool_name = item.get("name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                tool_name = item_type
+            tool_state.append(
+                {
+                    "type": item_type,
+                    "name": tool_name,
+                    "call_id": item.get("call_id") or item.get("id"),
+                    "arguments": OpenAIPassthroughLoggingHandler._responses_stream_tool_argument_text(
+                        item
+                    ),
+                }
+            )
+
+        return {
+            "event_types": event_types,
+            "event_counts": event_counts,
+            "tool_call_count": len(tool_state),
+            "tool_names": [
+                item["name"]
+                for item in tool_state
+                if isinstance(item.get("name"), str) and item.get("name")
+            ],
+            "tool_state": tool_state,
+        }
+
+    @staticmethod
+    def _record_responses_stream_tool_state_metadata(
+        kwargs: dict,
+        all_chunks: List[str],
+    ) -> None:
+        summary = OpenAIPassthroughLoggingHandler._summarize_responses_stream_tool_state(
+            all_chunks
+        )
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        metadata["responses_stream_event_types"] = summary["event_types"]
+        metadata["responses_stream_event_counts"] = summary["event_counts"]
+        metadata["responses_stream_tool_call_count"] = summary["tool_call_count"]
+        metadata["responses_stream_tool_names"] = summary["tool_names"]
+        metadata["responses_stream_tool_state"] = summary["tool_state"]
+        litellm_params["metadata"] = metadata
+        kwargs["litellm_params"] = litellm_params
 
     @staticmethod
     def _calculate_image_generation_cost(
@@ -1330,6 +1460,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             )
             if passthrough_logging_payload:
                 kwargs["passthrough_logging_payload"] = passthrough_logging_payload
+
+            if is_responses:
+                handler._record_responses_stream_tool_state_metadata(
+                    kwargs,
+                    all_chunks,
+                )
 
             apply_passthrough_logging_contract(
                 litellm_response=complete_response,
