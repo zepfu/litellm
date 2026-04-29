@@ -2,6 +2,28 @@
 
 ## 2026-04-29
 
+- Cleared the previously noted focused Ruff debt in
+  `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`. The
+  file now passes
+  `./.venv/bin/ruff check litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+  after behavior-preserving helper extraction around Google Code Assist request
+  compaction, native tool aliasing, request-shape/debug summaries, Anthropic
+  Google completion-adapter preparation/execution, and Gemini passthrough debug
+  function-name scanning. Focused validation passed for the alias/builder pair
+  (`2 passed`), request-shape and persisted-output compaction paths
+  (`9 passed`), Anthropic Google adapter plus Gemini passthrough route paths
+  (`7 passed`), and the new debug/release-guard helper tests (`3 passed`).
+  `py_compile` for the touched implementation/test files and `git diff --check`
+  also passed. Dead-end notes: the first alias/builder pytest commands used
+  stale class nodes (`TestGoogleCodeAssistBuilder` and
+  `TestAnthropicGoogleCompletionAdapterRoute`) and failed at collection; the
+  first route pytest command used stale class nodes for the persisted-output /
+  Gemini adapter tests under
+  `TestAnthropicAdapterClaudeCodeAgentProjectMetadata` and also failed at
+  collection. Use the current nodes under
+  `TestGoogleAdapterRequestShapePolicy` and `TestClaudePersistedOutputExpansion`
+  for this file.
+
 - Failed/dead-end note for the NVIDIA hosted-tool policy gate: the first live
   dev run of `claude_adapter_nvidia_hosted_tool_policy` returned 200 from
   `nvidia/deepseek-ai/deepseek-v3.2` with final content `hosted policy`, but

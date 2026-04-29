@@ -54,13 +54,16 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _wait_for_google_adapter_cooldown_if_needed,
     _expand_claude_persisted_output_in_anthropic_request_body,
     _extract_google_adapter_error_reason,
+    _extract_google_code_assist_function_names,
     _expand_claude_persisted_output_text,
     _prepare_anthropic_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
     _handle_anthropic_google_completion_adapter_route,
     _iterate_responses_sse_events,
+    _log_google_completion_adapter_debug,
     _maybe_force_explicit_bash_tool_choice_for_completion_adapter,
     _maybe_force_explicit_bash_tool_choice_for_responses_adapter,
+    _release_google_adapter_semaphore_once,
     _wrap_streaming_response_with_release_callback,
     anthropic_proxy_route,
     bedrock_llm_proxy_route,
@@ -8237,6 +8240,92 @@ async def test_gemini_proxy_route_code_assist_oauth_passthrough_target():
     assert captured_call["custom_llm_provider"] == "gemini"
     assert captured_call["_forward_headers"] is True
     assert captured_call["query_params"] == {}
+
+
+def test_extract_google_code_assist_function_names_supports_camel_and_snake_case():
+    request_block = {
+        "tools": [
+            {
+                "functionDeclarations": [
+                    {"name": "run_shell_command"},
+                    {"name": "read_file"},
+                ]
+            },
+            {
+                "function_declarations": [
+                    {"name": "glob"},
+                    {"name": 123},
+                ]
+            },
+            {"not_functions": [{"name": "ignored"}]},
+        ]
+    }
+
+    assert _extract_google_code_assist_function_names(request_block) == [
+        "run_shell_command",
+        "read_file",
+        "glob",
+    ]
+
+
+def test_google_completion_adapter_debug_logs_function_names_from_wrapped_request(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_GEMINI_ROUTE_DEBUG", "1")
+    wrapped_request_body = {
+        "request": {
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {"name": "read_file"},
+                        {"name": "glob"},
+                    ]
+                }
+            ],
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        }
+    }
+    prepared_request_body = {
+        "litellm_metadata": {
+            "google_adapter_persisted_output_compacted_count": 1,
+            "google_adapter_completion_message_window": {"trimmed": True},
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+    ) as mock_info:
+        _log_google_completion_adapter_debug(
+            prepared_request_body=prepared_request_body,
+            wrapped_request_body=wrapped_request_body,
+            google_model="gemini-3-flash-preview",
+            adapter_headers={"Authorization": "Bearer ya29.test"},
+            sanitized_schema_fix_count=2,
+            generation_policy_changes={"compacted": True},
+        )
+
+    mock_info.assert_called_once()
+    assert mock_info.call_args.args[-1] == ["read_file", "glob"]
+
+
+def test_release_google_adapter_semaphore_once_releases_only_once(monkeypatch):
+    monkeypatch.delenv("AAWM_GEMINI_ROUTE_DEBUG", raising=False)
+    release_state = {"released": False}
+    semaphore = Mock()
+
+    _release_google_adapter_semaphore_once(
+        semaphore,
+        release_state,
+        google_model="gemini-3-flash-preview",
+    )
+    _release_google_adapter_semaphore_once(
+        semaphore,
+        release_state,
+        google_model="gemini-3-flash-preview",
+    )
+
+    semaphore.release.assert_called_once()
+    assert release_state["released"] is True
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple, Union, cast
+from typing import Any, Awaitable, Callable, Optional, Tuple, Union, cast
 from urllib.parse import quote, urlencode, urlparse
 
 import httpx
@@ -37,7 +37,6 @@ from litellm.constants import (
     ALLOWED_VERTEX_AI_PASSTHROUGH_HEADERS,
     BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES,
 )
-from litellm.llms.anthropic.common_utils import AnthropicModelInfo
 from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
@@ -93,9 +92,6 @@ from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 
 from .passthrough_endpoint_router import PassthroughEndpointRouter
-
-if TYPE_CHECKING:
-    import asyncpg
 
 vertex_llm_base = VertexBase()
 router = APIRouter()
@@ -1617,6 +1613,72 @@ def _split_google_adapter_inline_context_and_prompt(request_block: dict[str, Any
     }
 
 
+def _compact_google_adapter_oversized_text_part(
+    part: Any,
+    *,
+    cap: int,
+    pure_context_cap: int,
+    head_keep: int,
+    tail_keep: int,
+    is_followup_request: bool,
+) -> tuple[Any, bool, dict[str, int]]:
+    stats = {
+        "original_text_chars": 0,
+        "compacted_text_chars": 0,
+        "compacted_count": 0,
+        "pure_context_compacted_count": 0,
+        "subagent_context_compacted_count": 0,
+    }
+    if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+        return part, False, stats
+
+    text_value = part["text"]
+    stats["original_text_chars"] = len(text_value)
+    stripped_text = text_value.strip()
+    reminder_matches = list(
+        re.finditer(r"<system-reminder>.*?</system-reminder>\n*", text_value, re.DOTALL)
+    )
+    trailing_text = text_value[reminder_matches[-1].end():].strip() if reminder_matches else None
+    is_reminder_only_context = bool(reminder_matches) and stripped_text.startswith("<system-reminder>") and not trailing_text
+    is_subagent_context = (
+        "SubagentStart hook additional context:" in text_value
+        or "SubAgentStart hook additional context:" in text_value
+    )
+    reminder_only_context_cap = pure_context_cap if is_followup_request else cap
+    if is_subagent_context:
+        reminder_only_context_cap = (
+            _get_google_adapter_followup_subagent_context_text_part_char_cap()
+            if is_followup_request
+            else _get_google_adapter_subagent_context_text_part_char_cap()
+        )
+
+    if is_reminder_only_context and len(text_value) > reminder_only_context_cap:
+        updated_part = dict(part)
+        updated_part["text"] = text_value[:reminder_only_context_cap].rstrip()
+        stats["compacted_text_chars"] = len(updated_part["text"])
+        stats["compacted_count"] = 1
+        stats["pure_context_compacted_count"] = 1
+        stats["subagent_context_compacted_count"] = int(is_subagent_context)
+        return updated_part, True, stats
+
+    if len(text_value) <= cap:
+        stats["compacted_text_chars"] = len(text_value)
+        return part, False, stats
+
+    prefix = text_value[:head_keep].rstrip()
+    suffix = text_value[-tail_keep:].lstrip()
+    compacted_text = (
+        f"{prefix}\n\n"
+        f"[Gemini adapter compacted oversized user text from {len(text_value)} chars to preserve head/tail context.]\n\n"
+        f"{suffix}"
+    )
+    updated_part = dict(part)
+    updated_part["text"] = compacted_text
+    stats["compacted_text_chars"] = len(compacted_text)
+    stats["compacted_count"] = 1
+    return updated_part, True, stats
+
+
 def _compact_google_adapter_oversized_text_parts(request_block: dict[str, Any]) -> dict[str, Any]:
     contents = request_block.get("contents")
     if not isinstance(contents, list):
@@ -1646,55 +1708,20 @@ def _compact_google_adapter_oversized_text_parts(request_block: dict[str, Any]) 
         updated_parts: list[Any] = []
         part_changed = False
         for part in parts:
-            if not isinstance(part, dict) or not isinstance(part.get("text"), str):
-                updated_parts.append(part)
-                continue
-            text_value = part["text"]
-            original_text_chars += len(text_value)
-            stripped_text = text_value.strip()
-            reminder_matches = list(
-                re.finditer(r"<system-reminder>.*?</system-reminder>\n*", text_value, re.DOTALL)
+            updated_part, changed, stats = _compact_google_adapter_oversized_text_part(
+                part,
+                cap=cap,
+                pure_context_cap=pure_context_cap,
+                head_keep=head_keep,
+                tail_keep=tail_keep,
+                is_followup_request=is_followup_request,
             )
-            trailing_text = text_value[reminder_matches[-1].end():].strip() if reminder_matches else None
-            is_reminder_only_context = bool(reminder_matches) and stripped_text.startswith("<system-reminder>") and not trailing_text
-            is_subagent_context = (
-                "SubagentStart hook additional context:" in text_value
-                or "SubAgentStart hook additional context:" in text_value
-            )
-            reminder_only_context_cap = pure_context_cap if is_followup_request else cap
-            if is_subagent_context:
-                reminder_only_context_cap = (
-                    _get_google_adapter_followup_subagent_context_text_part_char_cap()
-                    if is_followup_request
-                    else _get_google_adapter_subagent_context_text_part_char_cap()
-                )
-            if is_reminder_only_context and len(text_value) > reminder_only_context_cap:
-                compacted_count += 1
-                pure_context_compacted_count += 1
-                if is_subagent_context:
-                    subagent_context_compacted_count += 1
-                part_changed = True
-                updated_part = dict(part)
-                updated_part["text"] = text_value[:reminder_only_context_cap].rstrip()
-                compacted_text_chars += len(updated_part["text"])
-                updated_parts.append(updated_part)
-                continue
-            if len(text_value) <= cap:
-                compacted_text_chars += len(text_value)
-                updated_parts.append(part)
-                continue
-            compacted_count += 1
-            part_changed = True
-            prefix = text_value[:head_keep].rstrip()
-            suffix = text_value[-tail_keep:].lstrip()
-            compacted_text = (
-                f"{prefix}\n\n"
-                f"[Gemini adapter compacted oversized user text from {len(text_value)} chars to preserve head/tail context.]\n\n"
-                f"{suffix}"
-            )
-            compacted_text_chars += len(compacted_text)
-            updated_part = dict(part)
-            updated_part["text"] = compacted_text
+            original_text_chars += stats["original_text_chars"]
+            compacted_text_chars += stats["compacted_text_chars"]
+            compacted_count += stats["compacted_count"]
+            pure_context_compacted_count += stats["pure_context_compacted_count"]
+            subagent_context_compacted_count += stats["subagent_context_compacted_count"]
+            part_changed = part_changed or changed
             updated_parts.append(updated_part)
 
         if part_changed:
@@ -3282,6 +3309,105 @@ def _get_google_code_assist_native_tool_aliases() -> dict[str, str]:
     }
 
 
+def _apply_google_code_assist_alias_to_function_block(
+    function_block: dict[str, Any],
+    *,
+    aliases: dict[str, str],
+    tool_name_mapping: dict[str, str],
+) -> tuple[dict[str, Any], Optional[str]]:
+    original_name = function_block.get("name")
+    alias_name = aliases.get(original_name)
+    if not isinstance(alias_name, str) or not alias_name:
+        return function_block, None
+
+    updated_function = dict(function_block)
+    updated_function["name"] = alias_name
+    tool_name_mapping[alias_name] = tool_name_mapping.get(original_name, original_name)
+    return updated_function, alias_name
+
+
+def _apply_google_code_assist_alias_to_tool(
+    tool: Any,
+    *,
+    aliases: dict[str, str],
+    tool_name_mapping: dict[str, str],
+) -> tuple[Any, Optional[str]]:
+    if not isinstance(tool, dict):
+        return tool, None
+    if tool.get("type") != "function" or not isinstance(tool.get("function"), dict):
+        return tool, None
+
+    updated_function, alias_name = _apply_google_code_assist_alias_to_function_block(
+        dict(tool["function"]),
+        aliases=aliases,
+        tool_name_mapping=tool_name_mapping,
+    )
+    if alias_name is None:
+        return tool, None
+
+    updated_tool = dict(tool)
+    updated_tool["function"] = updated_function
+    return updated_tool, alias_name
+
+
+def _apply_google_code_assist_aliases_to_tool_calls(
+    tool_calls: Any,
+    *,
+    aliases: dict[str, str],
+    tool_name_mapping: dict[str, str],
+) -> tuple[Any, set[str]]:
+    if not isinstance(tool_calls, list):
+        return tool_calls, set()
+
+    updated_tool_calls: list[Any] = []
+    aliased_names: set[str] = set()
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            updated_tool_calls.append(tool_call)
+            continue
+        function_block = tool_call.get("function")
+        if not isinstance(function_block, dict):
+            updated_tool_calls.append(tool_call)
+            continue
+
+        updated_function, alias_name = _apply_google_code_assist_alias_to_function_block(
+            function_block,
+            aliases=aliases,
+            tool_name_mapping=tool_name_mapping,
+        )
+        if alias_name is None:
+            updated_tool_calls.append(tool_call)
+            continue
+
+        updated_tool_call = dict(tool_call)
+        updated_tool_call["function"] = updated_function
+        updated_tool_calls.append(updated_tool_call)
+        aliased_names.add(alias_name)
+
+    return updated_tool_calls, aliased_names
+
+
+def _apply_google_code_assist_aliases_to_message(
+    message: Any,
+    *,
+    aliases: dict[str, str],
+    tool_name_mapping: dict[str, str],
+) -> tuple[Any, set[str]]:
+    if not isinstance(message, dict):
+        return message, set()
+    updated_tool_calls, aliased_names = _apply_google_code_assist_aliases_to_tool_calls(
+        message.get("tool_calls"),
+        aliases=aliases,
+        tool_name_mapping=tool_name_mapping,
+    )
+    if not aliased_names:
+        return message, set()
+
+    updated_message = dict(message)
+    updated_message["tool_calls"] = updated_tool_calls
+    return updated_message, aliased_names
+
+
 def _apply_google_code_assist_native_tool_aliases(
     completion_kwargs: dict[str, Any],
     tool_name_mapping: dict[str, str],
@@ -3294,67 +3420,28 @@ def _apply_google_code_assist_native_tool_aliases(
     if isinstance(tools, list):
         updated_tools = []
         for tool in tools:
-            if not isinstance(tool, dict):
-                updated_tools.append(tool)
-                continue
-            if tool.get("type") != "function" or not isinstance(tool.get("function"), dict):
-                updated_tools.append(tool)
-                continue
-            function_block = dict(tool["function"])
-            original_name = function_block.get("name")
-            alias_name = aliases.get(original_name)
-            if isinstance(alias_name, str) and alias_name:
-                function_block["name"] = alias_name
-                updated_tool = dict(tool)
-                updated_tool["function"] = function_block
-                updated_tools.append(updated_tool)
-                tool_name_mapping[alias_name] = tool_name_mapping.get(original_name, original_name)
+            updated_tool, alias_name = _apply_google_code_assist_alias_to_tool(
+                tool,
+                aliases=aliases,
+                tool_name_mapping=tool_name_mapping,
+            )
+            updated_tools.append(updated_tool)
+            if alias_name is not None:
                 alias_count += 1
                 aliased_names.add(alias_name)
-            else:
-                updated_tools.append(tool)
         completion_kwargs["tools"] = updated_tools
 
     messages = completion_kwargs.get("messages")
     if isinstance(messages, list):
         updated_messages = []
         for message in messages:
-            if not isinstance(message, dict):
-                updated_messages.append(message)
-                continue
-            tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                updated_messages.append(message)
-                continue
-            updated_tool_calls = []
-            message_changed = False
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    updated_tool_calls.append(tool_call)
-                    continue
-                function_block = tool_call.get("function")
-                if not isinstance(function_block, dict):
-                    updated_tool_calls.append(tool_call)
-                    continue
-                original_name = function_block.get("name")
-                alias_name = aliases.get(original_name)
-                if isinstance(alias_name, str) and alias_name:
-                    updated_function = dict(function_block)
-                    updated_function["name"] = alias_name
-                    updated_tool_call = dict(tool_call)
-                    updated_tool_call["function"] = updated_function
-                    updated_tool_calls.append(updated_tool_call)
-                    tool_name_mapping[alias_name] = tool_name_mapping.get(original_name, original_name)
-                    message_changed = True
-                    aliased_names.add(alias_name)
-                else:
-                    updated_tool_calls.append(tool_call)
-            if message_changed:
-                updated_message = dict(message)
-                updated_message["tool_calls"] = updated_tool_calls
-                updated_messages.append(updated_message)
-            else:
-                updated_messages.append(message)
+            updated_message, message_aliases = _apply_google_code_assist_aliases_to_message(
+                message,
+                aliases=aliases,
+                tool_name_mapping=tool_name_mapping,
+            )
+            updated_messages.append(updated_message)
+            aliased_names.update(message_aliases)
         completion_kwargs["messages"] = updated_messages
 
     tool_choice = completion_kwargs.get("tool_choice")
@@ -3362,14 +3449,14 @@ def _apply_google_code_assist_native_tool_aliases(
         updated_tool_choice = dict(tool_choice)
         function_block = updated_tool_choice.get("function")
         if isinstance(function_block, dict):
-            original_name = function_block.get("name")
-            alias_name = aliases.get(original_name)
-            if isinstance(alias_name, str) and alias_name:
-                updated_function = dict(function_block)
-                updated_function["name"] = alias_name
+            updated_function, alias_name = _apply_google_code_assist_alias_to_function_block(
+                function_block,
+                aliases=aliases,
+                tool_name_mapping=tool_name_mapping,
+            )
+            if alias_name is not None:
                 updated_tool_choice["function"] = updated_function
                 completion_kwargs["tool_choice"] = updated_tool_choice
-                tool_name_mapping[alias_name] = tool_name_mapping.get(original_name, original_name)
                 aliased_names.add(alias_name)
                 alias_count += 1
 
@@ -3846,24 +3933,141 @@ def _annotate_google_code_assist_duplicate_tool_responses(
     }
 
 
-def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
-    def _extract_text_metrics(content_block: Any) -> tuple[int, int]:
-        part_count = 0
-        char_count = 0
-        if not isinstance(content_block, dict):
-            return part_count, char_count
-        parts = content_block.get("parts")
-        if not isinstance(parts, list):
-            return part_count, char_count
+def _extract_google_code_assist_text_metrics(content_block: Any) -> tuple[int, int]:
+    part_count = 0
+    char_count = 0
+    if not isinstance(content_block, dict):
+        return part_count, char_count
+    parts = content_block.get("parts")
+    if not isinstance(parts, list):
+        return part_count, char_count
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        part_count += 1
+        text = part.get("text")
+        if isinstance(text, str):
+            char_count += len(text)
+    return part_count, char_count
+
+
+def _summarize_google_code_assist_content_preview_entry(
+    content_entry: dict[str, Any],
+) -> dict[str, Any]:
+    role = content_entry.get("role")
+    parts = content_entry.get("parts")
+    part_kinds = []
+    text_preview = None
+    preview_parts, preview_chars = _extract_google_code_assist_text_metrics(content_entry)
+    if isinstance(parts, list):
         for part in parts:
             if not isinstance(part, dict):
                 continue
-            part_count += 1
-            text = part.get("text")
-            if isinstance(text, str):
-                char_count += len(text)
-        return part_count, char_count
+            keys = [
+                key
+                for key in ("text", "functionCall", "functionResponse", "thought")
+                if key in part
+            ]
+            if keys:
+                part_kinds.extend(keys)
+            if text_preview is None and isinstance(part.get("text"), str):
+                text_preview = part.get("text")[:120].replace("\n", "\\n")
+            function_response = part.get("functionResponse")
+            if isinstance(function_response, dict):
+                response_payload = function_response.get("response")
+                if isinstance(response_payload, dict):
+                    response_keys = sorted(response_payload.keys())
+                    part_kinds.append(
+                        f"functionResponseKeys:{','.join(response_keys)}"
+                    )
+                    if text_preview is None and isinstance(
+                        response_payload.get("content"),
+                        str,
+                    ):
+                        text_preview = response_payload.get("content")[:120].replace("\n", "\\n")
+    return {
+        "role": role,
+        "part_count": preview_parts,
+        "text_chars": preview_chars,
+        "part_kinds": part_kinds,
+        "text_preview": text_preview,
+    }
 
+
+def _summarize_google_code_assist_request_contents_shape(
+    request_block: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    contents = request_block.get("contents")
+    if not isinstance(contents, list):
+        return
+
+    summary["contents_count"] = len(contents)
+    content_part_count = 0
+    content_text_chars = 0
+    text_entry_count = 0
+    preview_entries = []
+    for content_entry in contents:
+        parts, chars = _extract_google_code_assist_text_metrics(content_entry)
+        content_part_count += parts
+        content_text_chars += chars
+        if chars > 0:
+            text_entry_count += 1
+    for content_entry in contents[-4:]:
+        if isinstance(content_entry, dict):
+            preview_entries.append(
+                _summarize_google_code_assist_content_preview_entry(content_entry)
+            )
+    summary["contents_part_count"] = content_part_count
+    summary["contents_text_chars"] = content_text_chars
+    summary["contents_text_entry_count"] = text_entry_count
+    summary["contents_tail_preview"] = preview_entries
+
+
+def _summarize_google_code_assist_generation_config_shape(
+    request_block: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    generation_config = request_block.get("generationConfig")
+    if not isinstance(generation_config, dict):
+        return
+
+    summary["generation_config_keys"] = sorted(generation_config.keys())
+    generation_config_summary = {}
+    for key in ("max_output_tokens", "temperature", "top_p", "candidate_count"):
+        if key in generation_config:
+            generation_config_summary[key] = generation_config.get(key)
+    thinking_config = generation_config.get("thinkingConfig")
+    if isinstance(thinking_config, dict):
+        generation_config_summary["thinking_config_keys"] = sorted(thinking_config.keys())
+        if "thinkingBudgetTokens" in thinking_config:
+            generation_config_summary["thinking_budget_tokens"] = thinking_config.get("thinkingBudgetTokens")
+    if generation_config_summary:
+        summary["generation_config_values"] = generation_config_summary
+
+
+def _extract_google_code_assist_function_names(request_block: Any) -> list[str]:
+    request_tools = request_block.get("tools") if isinstance(request_block, dict) else None
+    function_names: list[str] = []
+    if not isinstance(request_tools, list):
+        return function_names
+
+    for tool_entry in request_tools:
+        if not isinstance(tool_entry, dict):
+            continue
+        decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
+        if not isinstance(decls, list):
+            continue
+        for declaration in decls:
+            if not isinstance(declaration, dict):
+                continue
+            name = declaration.get("name")
+            if isinstance(name, str):
+                function_names.append(name)
+    return function_names
+
+
+def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     if not isinstance(payload, dict):
         summary["payload_type"] = type(payload).__name__
@@ -3877,57 +4081,7 @@ def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
     request_block = payload.get("request") if isinstance(payload.get("request"), dict) else payload
     if isinstance(request_block, dict):
         summary["request_keys"] = sorted(request_block.keys())
-        contents = request_block.get("contents")
-        if isinstance(contents, list):
-            summary["contents_count"] = len(contents)
-            content_part_count = 0
-            content_text_chars = 0
-            text_entry_count = 0
-            preview_entries = []
-            for content_entry in contents:
-                parts, chars = _extract_text_metrics(content_entry)
-                content_part_count += parts
-                content_text_chars += chars
-                if chars > 0:
-                    text_entry_count += 1
-            for content_entry in contents[-4:]:
-                if not isinstance(content_entry, dict):
-                    continue
-                role = content_entry.get("role")
-                parts = content_entry.get("parts")
-                part_kinds = []
-                text_preview = None
-                preview_parts, preview_chars = _extract_text_metrics(content_entry)
-                if isinstance(parts, list):
-                    for part in parts:
-                        if not isinstance(part, dict):
-                            continue
-                        keys = [key for key in ("text", "functionCall", "functionResponse", "thought") if key in part]
-                        if keys:
-                            part_kinds.extend(keys)
-                        if text_preview is None and isinstance(part.get("text"), str):
-                            text_preview = part.get("text")[:120].replace("\n", "\\n")
-                        function_response = part.get("functionResponse")
-                        if isinstance(function_response, dict):
-                            response_payload = function_response.get("response")
-                            if isinstance(response_payload, dict):
-                                response_keys = sorted(response_payload.keys())
-                                part_kinds.append(
-                                    f"functionResponseKeys:{','.join(response_keys)}"
-                                )
-                                if text_preview is None and isinstance(response_payload.get("content"), str):
-                                    text_preview = response_payload.get("content")[:120].replace("\n", "\\n")
-                preview_entries.append({
-                    "role": role,
-                    "part_count": preview_parts,
-                    "text_chars": preview_chars,
-                    "part_kinds": part_kinds,
-                    "text_preview": text_preview,
-                })
-            summary["contents_part_count"] = content_part_count
-            summary["contents_text_chars"] = content_text_chars
-            summary["contents_text_entry_count"] = text_entry_count
-            summary["contents_tail_preview"] = preview_entries
+        _summarize_google_code_assist_request_contents_shape(request_block, summary)
         tools = request_block.get("tools")
         if isinstance(tools, list):
             summary["tools_count"] = len(tools)
@@ -3941,27 +4095,16 @@ def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
         session_id = request_block.get("session_id")
         if isinstance(session_id, str) and session_id:
             summary["session_id_hash"] = hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8]
-        generation_config = request_block.get("generationConfig")
-        if isinstance(generation_config, dict):
-            summary["generation_config_keys"] = sorted(generation_config.keys())
-            generation_config_summary = {}
-            for key in ("max_output_tokens", "temperature", "top_p", "candidate_count"):
-                if key in generation_config:
-                    generation_config_summary[key] = generation_config.get(key)
-            thinking_config = generation_config.get("thinkingConfig")
-            if isinstance(thinking_config, dict):
-                generation_config_summary["thinking_config_keys"] = sorted(thinking_config.keys())
-                if "thinkingBudgetTokens" in thinking_config:
-                    generation_config_summary["thinking_budget_tokens"] = thinking_config.get("thinkingBudgetTokens")
-            if generation_config_summary:
-                summary["generation_config_values"] = generation_config_summary
+        _summarize_google_code_assist_generation_config_shape(request_block, summary)
         tool_config = request_block.get("toolConfig")
         if isinstance(tool_config, dict):
             summary["tool_config_keys"] = sorted(tool_config.keys())
         system_instruction = request_block.get("systemInstruction")
         if isinstance(system_instruction, dict):
             summary["has_system_instruction"] = True
-            system_parts, system_chars = _extract_text_metrics(system_instruction)
+            system_parts, system_chars = _extract_google_code_assist_text_metrics(
+                system_instruction
+            )
             summary["system_instruction_part_count"] = system_parts
             summary["system_instruction_text_chars"] = system_chars
     return summary
@@ -5788,17 +5931,87 @@ def _build_anthropic_streaming_response_from_completion_adapter_stream(
     )
 
 
-async def _handle_anthropic_google_completion_adapter_route(
+def _sanitize_google_code_assist_request_schemas(wrapped_request_body: Any) -> int:
+    sanitized_schema_fix_count = 0
+    request_payload = (
+        wrapped_request_body.get("request")
+        if isinstance(wrapped_request_body, dict)
+        else None
+    )
+    request_tools = request_payload.get("tools") if isinstance(request_payload, dict) else None
+    if not isinstance(request_tools, list):
+        return sanitized_schema_fix_count
+
+    for tool_entry in request_tools:
+        if not isinstance(tool_entry, dict):
+            continue
+        decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
+        if not isinstance(decls, list):
+            continue
+        for declaration in decls:
+            if isinstance(declaration, dict):
+                sanitized_schema_fix_count += _sanitize_google_schema_array_items(
+                    declaration.get("parameters")
+                )
+    return sanitized_schema_fix_count
+
+
+def _log_google_completion_adapter_debug(
     *,
-    endpoint: str,
+    prepared_request_body: dict[str, Any],
+    wrapped_request_body: dict[str, Any],
+    google_model: str,
+    adapter_headers: dict[str, str],
+    sanitized_schema_fix_count: int,
+    generation_policy_changes: dict[str, Any],
+) -> None:
+    if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") != "1":
+        return
+
+    try:
+        debug_shape = _summarize_google_code_assist_request_shape(wrapped_request_body)
+        request_payload = (
+            wrapped_request_body.get("request")
+            if isinstance(wrapped_request_body, dict)
+            else None
+        )
+        function_names = _extract_google_code_assist_function_names(request_payload)
+        litellm_metadata = (
+            prepared_request_body.get("litellm_metadata")
+            if isinstance(prepared_request_body, dict)
+            else None
+        )
+        google_persisted_output_compacted_count = (
+            litellm_metadata.get("google_adapter_persisted_output_compacted_count")
+            if isinstance(litellm_metadata, dict)
+            else None
+        )
+        completion_message_window_debug = (
+            litellm_metadata.get("google_adapter_completion_message_window")
+            if isinstance(litellm_metadata, dict)
+            else None
+        )
+        verbose_proxy_logger.info(
+            "Gemini adapter debug: model=%s upstream_headers=%s schema_fixes=%s google_persisted_output_compacted_count=%s completion_message_window=%s generation_policy_changes=%s body_shape=%s function_names=%s",
+            google_model,
+            _build_google_debug_header_summary(adapter_headers),
+            sanitized_schema_fix_count,
+            google_persisted_output_compacted_count,
+            completion_message_window_debug,
+            generation_policy_changes,
+            debug_shape,
+            function_names,
+        )
+    except Exception:
+        verbose_proxy_logger.exception("Gemini adapter debug logging failed")
+
+
+async def _prepare_anthropic_google_completion_adapter_request(
+    *,
     request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
-) -> Response:
-    from litellm.litellm_core_utils.litellm_logging import Logging
-
+) -> SimpleNamespace:
     google_access_token = await _load_valid_local_google_oauth_access_token()
     google_project = await _get_or_load_google_code_assist_project(google_access_token)
     await _prime_google_code_assist_session(google_access_token, google_project)
@@ -5817,7 +6030,11 @@ async def _handle_anthropic_google_completion_adapter_route(
     target_endpoint_label = "/v1internal:streamGenerateContent"
     target_query_params = {"alt": "sse"}
     target_url = f"{google_target_base.rstrip('/')}{target_endpoint_label}"
-    annotated_target_url = httpx.URL(target_url).copy_with(params=target_query_params) if target_query_params else httpx.URL(target_url)
+    annotated_target_url = (
+        httpx.URL(target_url).copy_with(params=target_query_params)
+        if target_query_params
+        else httpx.URL(target_url)
+    )
 
     (
         prepared_request_body,
@@ -5893,109 +6110,98 @@ async def _handle_anthropic_google_completion_adapter_route(
         if generation_policy_changes:
             wrapped_request_body["litellm_metadata"]["google_adapter_request_shape_policy"] = generation_policy_changes
 
-    sanitized_schema_fix_count = 0
-    request_payload = wrapped_request_body.get("request") if isinstance(wrapped_request_body, dict) else None
-    request_tools = request_payload.get("tools") if isinstance(request_payload, dict) else None
-    if isinstance(request_tools, list):
-        for tool_entry in request_tools:
-            if not isinstance(tool_entry, dict):
-                continue
-            decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
-            if isinstance(decls, list):
-                for declaration in decls:
-                    if isinstance(declaration, dict):
-                        sanitized_schema_fix_count += _sanitize_google_schema_array_items(declaration.get("parameters"))
+    sanitized_schema_fix_count = _sanitize_google_code_assist_request_schemas(
+        wrapped_request_body
+    )
+    _log_google_completion_adapter_debug(
+        prepared_request_body=prepared_request_body,
+        wrapped_request_body=wrapped_request_body,
+        google_model=google_model,
+        adapter_headers=adapter_headers,
+        sanitized_schema_fix_count=sanitized_schema_fix_count,
+        generation_policy_changes=generation_policy_changes,
+    )
 
+    return SimpleNamespace(
+        adapter_headers=adapter_headers,
+        annotated_target_url=annotated_target_url,
+        client_requested_stream=client_requested_stream,
+        completion_messages=completion_messages,
+        gemini_optional_params=gemini_optional_params,
+        google_adapter_rate_limit_key=google_adapter_rate_limit_key,
+        google_model=google_model,
+        is_stream=is_stream,
+        litellm_params=litellm_params,
+        target_query_params=target_query_params,
+        target_url=target_url,
+        tool_name_mapping=tool_name_mapping,
+        wrapped_request_body=wrapped_request_body,
+    )
+
+
+def _release_google_adapter_semaphore_once(
+    google_adapter_semaphore: Any,
+    release_state: dict[str, bool],
+    *,
+    google_model: str,
+) -> None:
+    if release_state.get("released"):
+        return
+    release_state["released"] = True
+    google_adapter_semaphore.release()
     if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
-        try:
-            debug_shape = _summarize_google_code_assist_request_shape(wrapped_request_body)
-            request_payload = wrapped_request_body.get("request") if isinstance(wrapped_request_body, dict) else None
-            request_tools = request_payload.get("tools") if isinstance(request_payload, dict) else None
-            function_names: list[str] = []
-            if isinstance(request_tools, list):
-                for tool_entry in request_tools:
-                    if not isinstance(tool_entry, dict):
-                        continue
-                    decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
-                    if isinstance(decls, list):
-                        for declaration in decls:
-                            if isinstance(declaration, dict):
-                                name = declaration.get("name")
-                                if isinstance(name, str):
-                                    function_names.append(name)
-            litellm_metadata = prepared_request_body.get("litellm_metadata") if isinstance(prepared_request_body, dict) else None
-            google_persisted_output_compacted_count = (
-                litellm_metadata.get("google_adapter_persisted_output_compacted_count")
-                if isinstance(litellm_metadata, dict)
-                else None
-            )
-            completion_message_window_debug = (
-                litellm_metadata.get("google_adapter_completion_message_window")
-                if isinstance(litellm_metadata, dict)
-                else None
-            )
-            verbose_proxy_logger.info(
-                "Gemini adapter debug: model=%s upstream_headers=%s schema_fixes=%s google_persisted_output_compacted_count=%s completion_message_window=%s generation_policy_changes=%s body_shape=%s function_names=%s",
-                google_model,
-                _build_google_debug_header_summary(adapter_headers),
-                sanitized_schema_fix_count,
-                google_persisted_output_compacted_count,
-                completion_message_window_debug,
-                generation_policy_changes,
-                debug_shape,
-                function_names,
-            )
-        except Exception:
-            verbose_proxy_logger.exception("Gemini adapter debug logging failed")
+        verbose_proxy_logger.info(
+            "Google adapter semaphore released for model=%s",
+            google_model,
+        )
+
+
+async def _perform_anthropic_google_completion_adapter_request(
+    *,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth,
+    adapter_request: SimpleNamespace,
+) -> Response:
+    from litellm.litellm_core_utils.litellm_logging import Logging
 
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-        url=str(annotated_target_url),
-        headers=adapter_headers,
+        url=str(adapter_request.annotated_target_url),
+        headers=adapter_request.adapter_headers,
         credential_family="google",
         expected_target_family="google",
     )
-    _annotate_request_scope_for_adapted_access_log(request, annotated_target_url)
+    _annotate_request_scope_for_adapted_access_log(
+        request,
+        adapter_request.annotated_target_url,
+    )
 
     google_adapter_semaphore = _get_google_adapter_semaphore(
-        rate_limit_key=google_adapter_rate_limit_key
+        rate_limit_key=adapter_request.google_adapter_rate_limit_key
     )
     await google_adapter_semaphore.acquire()
-    semaphore_released = False
-
-    def _release_google_adapter_semaphore() -> None:
-        nonlocal semaphore_released
-        if semaphore_released:
-            return
-        semaphore_released = True
-        google_adapter_semaphore.release()
-        if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
-            verbose_proxy_logger.info(
-                "Google adapter semaphore released for model=%s",
-                google_model,
-            )
-
+    release_state = {"released": False}
     if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
         verbose_proxy_logger.info(
             "Google adapter semaphore acquired for model=%s stream=%s",
-            google_model,
-            is_stream,
+            adapter_request.google_model,
+            adapter_request.is_stream,
         )
 
     stream_release_attached = False
     try:
         upstream_response = await _perform_google_adapter_pass_through_request(
             request=request,
-            target=target_url,
-            custom_headers=adapter_headers,
+            target=adapter_request.target_url,
+            custom_headers=adapter_request.adapter_headers,
             user_api_key_dict=user_api_key_dict,
-            custom_body=wrapped_request_body,
+            custom_body=adapter_request.wrapped_request_body,
             forward_headers=False,
-            query_params=target_query_params,
-            stream=is_stream,
+            query_params=adapter_request.target_query_params,
+            stream=adapter_request.is_stream,
             custom_llm_provider=litellm.LlmProviders.GEMINI.value,
             egress_credential_family="google",
             expected_target_family="google",
-            google_adapter_rate_limit_key=google_adapter_rate_limit_key,
+            google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
         )
 
         if not isinstance(upstream_response, StreamingResponse):
@@ -6004,40 +6210,69 @@ async def _handle_anthropic_google_completion_adapter_route(
                 detail="Google Code Assist adapter expected a streaming response.",
             )
 
-        if client_requested_stream:
+        if adapter_request.client_requested_stream:
             streaming_response = _build_anthropic_streaming_response_from_google_code_assist_stream(
                 response=upstream_response,
-                adapter_model=google_model,
-                tool_name_mapping=tool_name_mapping,
-                gemini_optional_params=gemini_optional_params,
-                rate_limit_key=google_adapter_rate_limit_key,
+                adapter_model=adapter_request.google_model,
+                tool_name_mapping=adapter_request.tool_name_mapping,
+                gemini_optional_params=adapter_request.gemini_optional_params,
+                rate_limit_key=adapter_request.google_adapter_rate_limit_key,
             )
             stream_release_attached = True
             return _wrap_streaming_response_with_release_callback(
                 streaming_response,
-                _release_google_adapter_semaphore,
+                lambda: _release_google_adapter_semaphore_once(
+                    google_adapter_semaphore,
+                    release_state,
+                    google_model=adapter_request.google_model,
+                ),
             )
 
         logging_obj = Logging(
-            model=google_model,
-            messages=completion_messages,
+            model=adapter_request.google_model,
+            messages=adapter_request.completion_messages,
             stream=False,
             call_type="completion",
             start_time=datetime.now(),
             litellm_call_id=str(uuid4()),
             function_id="anthropic_google_completion_adapter",
         )
-        logging_obj.optional_params = gemini_optional_params
+        logging_obj.optional_params = adapter_request.gemini_optional_params
 
         return await _collect_google_code_assist_response_from_stream(
             response=upstream_response,
-            adapter_model=google_model,
-            tool_name_mapping=tool_name_mapping,
+            adapter_model=adapter_request.google_model,
+            tool_name_mapping=adapter_request.tool_name_mapping,
             logging_obj=logging_obj,
         )
     finally:
-        if not is_stream or not stream_release_attached:
-            _release_google_adapter_semaphore()
+        if not adapter_request.is_stream or not stream_release_attached:
+            _release_google_adapter_semaphore_once(
+                google_adapter_semaphore,
+                release_state,
+                google_model=adapter_request.google_model,
+            )
+
+
+async def _handle_anthropic_google_completion_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    adapter_request = await _prepare_anthropic_google_completion_adapter_request(
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+    )
+    return await _perform_anthropic_google_completion_adapter_request(
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        adapter_request=adapter_request,
+    )
 
 
 async def _handle_anthropic_openai_responses_adapter_route(
@@ -6736,13 +6971,11 @@ def _get_google_adapter_followup_auxiliary_context_char_cap() -> int:
     return max(256, parsed)
 
 
-def _compact_expanded_claude_persisted_output_text_for_google_adapter(
+def _compact_google_adapter_persisted_output_preview_and_expanded_text(
     text: str,
     *,
-    persisted_output_char_cap: Optional[int] = None,
-    auxiliary_context_char_cap: Optional[int] = None,
-) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
-    cap = persisted_output_char_cap or _get_google_adapter_persisted_output_char_cap()
+    cap: int,
+) -> tuple[str, int, set[str], list[dict[str, Any]]]:
     updated_text = text
     compacted_count = 0
     hooks: set[str] = set()
@@ -6804,6 +7037,30 @@ def _compact_expanded_claude_persisted_output_text_for_google_adapter(
                 "kept_chars": len(truncated),
             }
         )
+
+    return updated_text, compacted_count, hooks, metadata_items
+
+
+def _compact_expanded_claude_persisted_output_text_for_google_adapter(
+    text: str,
+    *,
+    persisted_output_char_cap: Optional[int] = None,
+    auxiliary_context_char_cap: Optional[int] = None,
+) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
+    cap = persisted_output_char_cap or _get_google_adapter_persisted_output_char_cap()
+    updated_text = text
+    compacted_count = 0
+    hooks: set[str] = set()
+    metadata_items: list[dict[str, Any]] = []
+    (
+        updated_text,
+        compacted_count,
+        hooks,
+        metadata_items,
+    ) = _compact_google_adapter_persisted_output_preview_and_expanded_text(
+        updated_text,
+        cap=cap,
+    )
 
     auxiliary_cap = auxiliary_context_char_cap or _get_google_adapter_auxiliary_context_char_cap()
     auxiliary_matches = list(
@@ -9566,20 +9823,13 @@ async def gemini_proxy_route(
         if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and _is_google_oauth:
             debug_headers = _build_google_debug_header_summary(dict(request.headers))
             debug_body_summary = _summarize_google_code_assist_request_shape(request_body)
-            request_block = request_body.get("request") if isinstance(request_body, dict) and isinstance(request_body.get("request"), dict) else request_body
-            request_tools = request_block.get("tools") if isinstance(request_block, dict) else None
-            function_names: list[str] = []
-            if isinstance(request_tools, list):
-                for tool_entry in request_tools:
-                    if not isinstance(tool_entry, dict):
-                        continue
-                    decls = tool_entry.get("functionDeclarations") or tool_entry.get("function_declarations")
-                    if isinstance(decls, list):
-                        for declaration in decls:
-                            if isinstance(declaration, dict):
-                                name = declaration.get("name")
-                                if isinstance(name, str):
-                                    function_names.append(name)
+            request_block = (
+                request_body.get("request")
+                if isinstance(request_body, dict)
+                and isinstance(request_body.get("request"), dict)
+                else request_body
+            )
+            function_names = _extract_google_code_assist_function_names(request_block)
             verbose_proxy_logger.info(
                 "Gemini passthrough debug: endpoint=%s headers=%s body_shape=%s function_names=%s",
                 endpoint,
