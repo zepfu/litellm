@@ -231,6 +231,11 @@ _PASSTHROUGH_REPOSITORY_HEADER_NAMES = (
     "x-repository",
     "x-git-repository",
 )
+_PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = (
+    re.compile(r"AGENTS\.md instructions for (?P<path>/[^\n<]+)"),
+    re.compile(r"<cwd>(?P<path>[^<]+)</cwd>"),
+    re.compile(r"\bcwd\b\s*[:=]\s*['\"]?(?P<path>/[^'\"\n<]+)"),
+)
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
     {"/messages", "/v1/messages"}
 )
@@ -7838,27 +7843,57 @@ def _extract_passthrough_session_id(
     return None
 
 
+def _normalize_passthrough_repository(value: str) -> Optional[str]:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("git@") and ":" in cleaned:
+        cleaned = cleaned.split(":", 1)[1]
+    elif "://" in cleaned:
+        parsed = urlparse(cleaned)
+        path = parsed.path.strip("/")
+        netloc = parsed.netloc.split("@", 1)[-1]
+        if netloc.lower().endswith("github.com") and path:
+            cleaned = path
+        else:
+            cleaned = f"{netloc}/{path}".strip("/")
+    elif cleaned.startswith("/"):
+        cleaned = cleaned.rstrip("/").rsplit("/", 1)[-1]
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+    return cleaned.strip("/") or None
+
+
+def _extract_passthrough_repository_from_text(value: str) -> Optional[str]:
+    for pattern in _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS:
+        match = pattern.search(value)
+        if not match:
+            continue
+        repository = _normalize_passthrough_repository(match.group("path"))
+        if repository:
+            return repository
+    return None
+
+
+def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return _extract_passthrough_repository_from_text(value)
+    if isinstance(value, dict):
+        for child in value.values():
+            repository = _extract_passthrough_repository_from_body_text(child)
+            if repository:
+                return repository
+    if isinstance(value, list):
+        for child in value:
+            repository = _extract_passthrough_repository_from_body_text(child)
+            if repository:
+                return repository
+    return None
+
+
 def _extract_passthrough_repository(
     request: Request, request_body: Optional[dict[str, Any]] = None
 ) -> Optional[str]:
-    def normalize(value: str) -> Optional[str]:
-        cleaned = value.strip()
-        if not cleaned:
-            return None
-        if cleaned.startswith("git@") and ":" in cleaned:
-            cleaned = cleaned.split(":", 1)[1]
-        elif "://" in cleaned:
-            parsed = urlparse(cleaned)
-            path = parsed.path.strip("/")
-            netloc = parsed.netloc.split("@", 1)[-1]
-            if netloc.lower().endswith("github.com") and path:
-                cleaned = path
-            else:
-                cleaned = f"{netloc}/{path}".strip("/")
-        if cleaned.endswith(".git"):
-            cleaned = cleaned[:-4]
-        return cleaned.strip("/") or None
-
     if isinstance(request_body, dict):
         for path in (
             ("repository",),
@@ -7871,13 +7906,16 @@ def _extract_passthrough_repository(
         ):
             value = _get_nested_str_value(request_body, path)
             if value:
-                return normalize(value)
+                return _normalize_passthrough_repository(value)
+        repository = _extract_passthrough_repository_from_body_text(request_body)
+        if repository:
+            return repository
 
     headers = _safe_get_request_headers(request)
     for header_name in _PASSTHROUGH_REPOSITORY_HEADER_NAMES:
         value = headers.get(header_name)
         if isinstance(value, str) and value.strip():
-            return normalize(value)
+            return _normalize_passthrough_repository(value)
     return None
 
 

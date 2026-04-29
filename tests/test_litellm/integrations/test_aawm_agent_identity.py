@@ -489,6 +489,110 @@ def test_build_session_history_record_uses_repository_header_and_metadata() -> N
     assert payload[46] == "zepfu/litellm"
 
 
+def test_build_session_history_record_uses_prepared_body_litellm_metadata_repository() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-prepared-body-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-prepared-body-repository"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "input": "hello",
+        "litellm_metadata": {
+            "repository": "https://github.com/zepfu/aawm.git",
+        },
+    }
+
+    result = {
+        "id": "resp-prepared-body-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-29T10:00:00Z",
+        end_time="2026-04-29T10:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "zepfu/aawm"
+    assert record["metadata"]["repository"] == "zepfu/aawm"
+
+
+def test_build_session_history_record_uses_litellm_params_litellm_metadata_repository() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-litellm-params-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-litellm-params-repository"
+    )
+    kwargs["litellm_params"]["litellm_metadata"] = {
+        "repository": "git@github.com:zepfu/aawm.git",
+    }
+
+    result = {
+        "id": "resp-litellm-params-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-29T10:00:00Z",
+        end_time="2026-04-29T10:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "zepfu/aawm"
+    assert record["metadata"]["repository"] == "zepfu/aawm"
+
+
+def test_build_session_history_record_infers_repository_from_codex_workspace_text() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-workspace-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-codex-workspace-repository"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "instructions": (
+            "# AGENTS.md instructions for /home/zepfu/projects/aawm\n\n"
+            "<environment_context>\n"
+            "  <cwd>/home/zepfu/projects/aawm</cwd>\n"
+            "</environment_context>"
+        ),
+        "input": "hello",
+    }
+
+    result = {
+        "id": "resp-codex-workspace-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-29T10:00:00Z",
+        end_time="2026-04-29T10:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "aawm"
+    assert record["metadata"]["repository"] == "aawm"
+
+
 def test_build_session_history_record_marks_claude_permission_check() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "claude-opus-4-6"
