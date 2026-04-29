@@ -162,12 +162,9 @@ these docs only as needed:
   scope.
 
   OpenAI/Codex Responses adapter:
-  - Preserve intra-assistant content ordering in
-    `translate_messages_to_responses_input()` when a prior Anthropic assistant
-    turn mixes text and `tool_use` blocks; add a regression with text before
-    and after a tool call. Also decide whether prior Anthropic `thinking`
-    history should be dropped, mapped to Responses reasoning items, or kept as
-    encrypted reasoning metadata instead of visible assistant `output_text`.
+  - Decide whether prior Anthropic `thinking` history should be dropped, mapped
+    to Responses reasoning items, or kept as encrypted reasoning metadata
+    instead of visible assistant `output_text`.
   - Track raw MCP parity separately: the transformation layer can map
     `mcp_servers` / `mcp_toolset` into Responses `mcp` tools, but the proxy
     route rejects raw MCP for adapted `/anthropic` requests. Either de-scope the
@@ -196,23 +193,12 @@ these docs only as needed:
     streaming restored names, and native Gemini `functionDeclaration` names.
 
   NVIDIA/OpenRouter completion adapters:
-  - Preserve parallel streaming tool calls by tracking each upstream
-    `delta.tool_calls[index]` as a separate Anthropic content block. The
-    non-stream adapter emits one `tool_use` per OpenAI tool call, but the
-    streaming translator currently starts from `tool_calls[0]` and concatenates
-    all streamed argument deltas into one `input_json_delta`.
-  - Delay the initial streaming `content_block_start` until the first upstream
-    chunk identifies text, thinking, or tool output. The completion stream
-    wrapper currently opens an empty text block before reading the first chunk,
-    so tool-only responses can differ from native Anthropic and from the
-    non-stream adapter.
   - Add an explicit hosted-tool compatibility policy for completion adapters:
     translate supported Anthropic hosted/beta tools to the target provider
     shape, or reject/drop unsupported tools with metadata explaining the
     downgrade.
-  - Focused coverage to add before live harness work: one chunk containing two
-    `delta.tool_calls` entries, a tool-only stream with no leading empty text
-    block, and provider-specific hosted-tool translation/rejection assertions.
+  - Focused coverage to add before live harness work: provider-specific
+    hosted-tool translation/rejection assertions.
 
   OpenRouter Responses adapter:
   - Treat it as the OpenAI Responses parity path plus OpenRouter-specific

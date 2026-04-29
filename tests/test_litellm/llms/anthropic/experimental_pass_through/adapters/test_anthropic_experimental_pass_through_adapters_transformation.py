@@ -1,5 +1,6 @@
 import os
 import sys
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -12,6 +13,9 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.transformation im
     LiteLLMAnthropicMessagesAdapter,
     create_tool_name_mapping,
     truncate_tool_name,
+)
+from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
+    AnthropicStreamWrapper,
 )
 from litellm.types.llms.anthropic import (
     AnthopicMessagesAssistantMessageParam,
@@ -460,6 +464,214 @@ def test_translate_streaming_openai_chunk_to_anthropic_with_partial_json():
     assert type_of_content == "input_json_delta"
     assert content_block_delta["type"] == "input_json_delta"
     assert content_block_delta["partial_json"] == ': "San '
+
+
+def test_stream_wrapper_does_not_emit_leading_text_block_for_tool_only_stream():
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=None,
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        role="assistant",
+                        function_call=None,
+                        tool_calls=None,
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=None,
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        role=None,
+                        function_call=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_weather",
+                                function=SimpleNamespace(
+                                    arguments='{"location":"Boston"}',
+                                    name="get_weather",
+                                ),
+                                type="function",
+                                index=0,
+                            )
+                        ],
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="tool_calls",
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        role=None,
+                        function_call=None,
+                        tool_calls=None,
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+        ),
+    ]
+
+    events = list(
+        AnthropicStreamWrapper(
+            completion_stream=iter(chunks),
+            model="openrouter/test-model",
+        )
+    )
+    content_block_starts = [
+        event for event in events if event.get("type") == "content_block_start"
+    ]
+
+    assert content_block_starts == [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_weather",
+                "name": "get_weather",
+                "input": {},
+            },
+        }
+    ]
+    assert not any(
+        event.get("type") == "content_block_start"
+        and event.get("content_block") == {"type": "text", "text": ""}
+        for event in events
+    )
+
+
+def test_stream_wrapper_emits_distinct_blocks_for_parallel_tool_calls_in_one_chunk():
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=None,
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        role="assistant",
+                        function_call=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_weather",
+                                function=SimpleNamespace(
+                                    arguments='{"location":"Boston"}',
+                                    name="get_weather",
+                                ),
+                                type="function",
+                                index=0,
+                            ),
+                            SimpleNamespace(
+                                id="call_time",
+                                function=SimpleNamespace(
+                                    arguments='{"timezone":"UTC"}',
+                                    name="get_time",
+                                ),
+                                type="function",
+                                index=1,
+                            ),
+                        ],
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="tool_calls",
+                    index=0,
+                    delta=SimpleNamespace(
+                        content=None,
+                        role=None,
+                        function_call=None,
+                        tool_calls=None,
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+        ),
+    ]
+
+    events = list(
+        AnthropicStreamWrapper(
+            completion_stream=iter(chunks),
+            model="openrouter/test-model",
+        )
+    )
+    content_block_starts = [
+        event for event in events if event.get("type") == "content_block_start"
+    ]
+    input_json_deltas = [
+        event for event in events if event.get("type") == "content_block_delta"
+    ]
+    content_block_stops = [
+        event for event in events if event.get("type") == "content_block_stop"
+    ]
+
+    assert content_block_starts == [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_weather",
+                "name": "get_weather",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_time",
+                "name": "get_time",
+                "input": {},
+            },
+        },
+    ]
+    assert input_json_deltas == [
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": '{"location":"Boston"}',
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": '{"timezone":"UTC"}',
+            },
+        },
+    ]
+    assert content_block_stops == [
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_stop", "index": 1},
+    ]
 
 
 def test_translate_openai_content_to_anthropic_thinking_and_redacted_thinking():

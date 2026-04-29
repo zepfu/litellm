@@ -44,6 +44,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
     )
     chunk_queue: deque = deque()  # Queue for buffering multiple chunks
     buffered_tool_calls: Dict[int, Dict[str, Any]]
+    tool_call_content_block_indices: Dict[Any, int]
+    tool_call_names: Dict[Any, str]
 
     def __init__(
         self,
@@ -67,6 +69,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         self.current_content_block_start = self.TextBlock(type="text", text="")
         self.chunk_queue = deque()
         self.buffered_tool_calls = {}
+        self.tool_call_content_block_indices = {}
+        self.tool_call_names = {}
 
     def _create_initial_usage_delta(self) -> UsageDelta:
         """
@@ -177,6 +181,204 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             getattr(tool_call, "function", None) is not None
             for tool_call in tool_calls
         )
+
+    @staticmethod
+    def _chunk_has_content_block_signal(chunk: "ModelResponseStream") -> bool:
+        try:
+            delta = chunk.choices[0].delta
+        except (AttributeError, IndexError, TypeError):
+            return False
+
+        content = getattr(delta, "content", None)
+        if isinstance(content, str) and content:
+            return True
+
+        tool_calls = getattr(delta, "tool_calls", None) or []
+        if any(
+            getattr(tool_call, "function", None) is not None
+            for tool_call in tool_calls
+        ):
+            return True
+
+        thinking_blocks = getattr(delta, "thinking_blocks", None) or []
+        for thinking_block in thinking_blocks:
+            if not isinstance(thinking_block, dict):
+                continue
+            if thinking_block.get("thinking") or thinking_block.get("signature"):
+                return True
+
+        reasoning_content = getattr(delta, "reasoning_content", None)
+        return isinstance(reasoning_content, str) and bool(reasoning_content)
+
+    @staticmethod
+    def _get_tool_call_stream_key(tool_call: Any, ordinal: int) -> Any:
+        raw_index = getattr(tool_call, "index", None)
+        if isinstance(raw_index, int):
+            return ("index", raw_index)
+        tool_call_id = getattr(tool_call, "id", None)
+        if isinstance(tool_call_id, str) and tool_call_id:
+            return ("id", tool_call_id)
+        return ("ordinal", ordinal)
+
+    def _restore_tool_name(self, tool_name: str) -> str:
+        return self.tool_name_mapping.get(tool_name, tool_name)
+
+    def _queue_initial_content_block_for_chunk(
+        self, chunk: "ModelResponseStream"
+    ) -> bool:
+        if self.sent_content_block_start:
+            return False
+        if not self._chunk_has_content_block_signal(chunk):
+            return False
+
+        from .transformation import LiteLLMAnthropicMessagesAdapter
+
+        (
+            block_type,
+            content_block_start,
+        ) = LiteLLMAnthropicMessagesAdapter()._translate_streaming_openai_chunk_to_anthropic_content_block(
+            choices=chunk.choices  # type: ignore
+        )
+        if block_type == "thinking" and self._should_suppress_provider_thinking_blocks():
+            return False
+
+        if block_type == "tool_use":
+            from typing import cast
+
+            from litellm.types.llms.anthropic import ToolUseBlock
+
+            tool_block = cast(ToolUseBlock, content_block_start)
+            if tool_block.get("name"):
+                tool_block["name"] = self._restore_tool_name(tool_block["name"])
+
+        self.current_content_block_type = block_type
+        self.current_content_block_start = content_block_start
+        self.sent_content_block_start = True
+        self.sent_content_block_finish = False
+        self.chunk_queue.append(
+            {
+                "type": "content_block_start",
+                "index": self.current_content_block_index,
+                "content_block": self.current_content_block_start,
+            }
+        )
+        return True
+
+    def _queue_streaming_tool_calls_by_index(
+        self, chunk: "ModelResponseStream", hold_terminal_message_delta: bool = False
+    ) -> bool:
+        try:
+            choice = chunk.choices[0]
+            tool_calls = choice.delta.tool_calls or []
+        except (AttributeError, IndexError, TypeError):
+            return False
+
+        if not tool_calls and not self.tool_call_content_block_indices:
+            return False
+        if len(tool_calls) <= 1 and not self.tool_call_content_block_indices:
+            return False
+
+        from .transformation import sanitize_anthropic_tool_use_id
+
+        queued_any_tool_delta = False
+        for ordinal, tool_call in enumerate(tool_calls):
+            function = getattr(tool_call, "function", None)
+            if function is None:
+                continue
+
+            key = self._get_tool_call_stream_key(tool_call, ordinal)
+            block_index = self.tool_call_content_block_indices.get(key)
+            function_name = getattr(function, "name", None)
+            if block_index is None:
+                if (
+                    self.sent_content_block_start
+                    and self.current_content_block_type != "tool_use"
+                    and self.sent_content_block_finish is False
+                ):
+                    self.chunk_queue.append(
+                        {
+                            "type": "content_block_stop",
+                            "index": self.current_content_block_index,
+                        }
+                    )
+                    self.sent_content_block_finish = True
+
+                if self.sent_content_block_start:
+                    self._increment_content_block_index()
+                else:
+                    self.sent_content_block_start = True
+
+                block_index = self.current_content_block_index
+                self.tool_call_content_block_indices[key] = block_index
+                original_tool_name = self._restore_tool_name(function_name or "")
+                self.tool_call_names[key] = original_tool_name
+                self.current_content_block_type = "tool_use"
+                self.current_content_block_start = {
+                    "type": "tool_use",
+                    "id": sanitize_anthropic_tool_use_id(getattr(tool_call, "id", None))
+                    or str(uuid.uuid4()),
+                    "name": original_tool_name,
+                    "input": {},
+                }
+                self.sent_content_block_finish = False
+                self.chunk_queue.append(
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": self.current_content_block_start,
+                    }
+                )
+
+            arguments = getattr(function, "arguments", None)
+            if isinstance(arguments, str) and arguments:
+                from .transformation import sanitize_anthropic_tool_use_input_json_delta
+
+                tool_name = self.tool_call_names.get(key, function_name or "")
+                self.chunk_queue.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": sanitize_anthropic_tool_use_input_json_delta(
+                                tool_name=tool_name,
+                                partial_json=arguments,
+                            ),
+                        },
+                    }
+                )
+            queued_any_tool_delta = True
+
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason is not None:
+            for _, block_index in sorted(
+                self.tool_call_content_block_indices.items(),
+                key=lambda item: item[1],
+            ):
+                self.chunk_queue.append(
+                    {
+                        "type": "content_block_stop",
+                        "index": block_index,
+                    }
+            )
+            self.tool_call_content_block_indices.clear()
+            self.tool_call_names.clear()
+            self.sent_content_block_finish = True
+            from .transformation import LiteLLMAnthropicMessagesAdapter
+
+            message_delta = (
+                LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
+                    response=chunk,
+                    current_content_block_index=self.current_content_block_index,
+                )
+            )
+            if hold_terminal_message_delta:
+                self.holding_stop_reason_chunk = message_delta
+            else:
+                self.chunk_queue.append(message_delta)
+            return True
+
+        return queued_any_tool_delta
 
     def _should_buffer_gemini_tool_calls(self, chunk: "ModelResponseStream") -> bool:
         return "gemini" in self.model.lower() and (
@@ -337,7 +539,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         self.holding_stop_reason_chunk = None
         return True
 
-    def __next__(self):
+    def __next__(self):  # noqa: PLR0915
         from .transformation import LiteLLMAnthropicMessagesAdapter
 
         try:
@@ -365,17 +567,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 )
                 return self.chunk_queue.popleft()
 
-            if self.sent_content_block_start is False:
-                self.sent_content_block_start = True
-                self.chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": self.current_content_block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                )
-                return self.chunk_queue.popleft()
-
             for chunk in self.completion_stream:
                 if chunk == "None" or chunk is None:
                     raise Exception
@@ -385,9 +576,20 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         return self.chunk_queue.popleft()
                     continue
 
-                should_start_new_block = self._should_start_new_content_block(chunk)
-                if should_start_new_block:
-                    self._increment_content_block_index()
+                if self._queue_streaming_tool_calls_by_index(chunk):
+                    if self.chunk_queue:
+                        return self.chunk_queue.popleft()
+                    continue
+
+                if self._queue_initial_content_block_for_chunk(chunk):
+                    should_start_new_block = False
+                elif self.sent_content_block_start is False:
+                    continue
+                else:
+                    should_start_new_block = self._should_start_new_content_block(chunk)
+                    if should_start_new_block:
+                        self._increment_content_block_index()
+
 
                 if (
                     getattr(chunk.choices[0], "finish_reason", None) is not None
@@ -534,17 +736,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 )
                 return self.chunk_queue.popleft()
 
-            if self.sent_content_block_start is False:
-                self.sent_content_block_start = True
-                self.chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": self.current_content_block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                )
-                return self.chunk_queue.popleft()
-
             async for chunk in self.completion_stream:
                 if chunk == "None" or chunk is None:
                     raise Exception
@@ -554,10 +745,22 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         return self.chunk_queue.popleft()
                     continue
 
+                if self._queue_streaming_tool_calls_by_index(
+                    chunk, hold_terminal_message_delta=True
+                ):
+                    if self.chunk_queue:
+                        return self.chunk_queue.popleft()
+                    continue
+
                 # Check if we need to start a new content block
-                should_start_new_block = self._should_start_new_content_block(chunk)
-                if should_start_new_block:
-                    self._increment_content_block_index()
+                if self._queue_initial_content_block_for_chunk(chunk):
+                    should_start_new_block = False
+                elif self.sent_content_block_start is False:
+                    continue
+                else:
+                    should_start_new_block = self._should_start_new_content_block(chunk)
+                    if should_start_new_block:
+                        self._increment_content_block_index()
 
                 if (
                     getattr(chunk.choices[0], "finish_reason", None) is not None
