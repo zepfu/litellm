@@ -92,6 +92,47 @@ def test_warning_only_timeout_still_fails_hard():
     assert result.get("soft_failures") in (None, [])
 
 
+def test_empty_success_validation_hard_fails_zero_usage_success():
+    harness = _load_harness_module()
+
+    summary, failures = harness._validate_no_successful_empty_command_output(
+        family="claude_adapter_openrouter_ling_26_flash",
+        stdout=json.dumps(
+            {
+                "is_error": False,
+                "result": "",
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        ),
+        stderr="",
+        checks={"fail_empty_success": True},
+    )
+
+    assert summary["result_empty"] is True
+    assert summary["input_tokens"] == 0
+    assert summary["output_tokens"] == 0
+    assert any("successful empty command result" in failure for failure in failures)
+    assert any("successful empty command usage" in failure for failure in failures)
+
+
+def test_empty_success_validation_catches_adapter_diagnostic():
+    harness = _load_harness_module()
+
+    _, failures = harness._validate_no_successful_empty_command_output(
+        family="claude_adapter_openrouter_ling_26_flash",
+        stdout="",
+        stderr=(
+            "OpenRouter Responses adapter returned empty successful response: "
+            '{"events":[]}'
+        ),
+        checks={"fail_empty_success": True},
+    )
+
+    assert failures == [
+        "claude_adapter_openrouter_ling_26_flash successful empty OpenRouter adapter diagnostic surfaced"
+    ]
+
+
 def test_provider_unavailable_timeout_can_soft_fail_with_exact_log_signature(monkeypatch):
     harness = _load_harness_module()
 
@@ -774,6 +815,23 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
                 "tools",
             ):
                 assert path in required_paths
+
+
+def test_openrouter_ling_smoke_hard_fails_empty_success():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"]["claude_adapter_openrouter_ling_26_flash"]
+
+    assert case_config["warning_only"] is True
+    assert case_config["fail_empty_success"] is True
+
+
+def test_openrouter_ling_parallel_hard_fails_empty_success():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][
+        "claude_adapter_openrouter_ling_child_parallel_read_tools"
+    ]
+
+    assert case_config["fail_empty_success"] is True
 
 
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):

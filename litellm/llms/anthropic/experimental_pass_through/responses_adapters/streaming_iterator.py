@@ -13,6 +13,10 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.transformation im
 )
 
 
+class AnthropicResponsesEmptySuccessError(RuntimeError):
+    pass
+
+
 class AnthropicResponsesStreamWrapper:
     """
     Wraps a Responses API streaming iterator and re-emits events in Anthropic SSE format.
@@ -32,10 +36,12 @@ class AnthropicResponsesStreamWrapper:
         responses_stream: Any,
         model: str,
         request_body: Optional[dict[str, Any]] = None,
+        reject_empty_success: bool = False,
     ) -> None:
         self.responses_stream = responses_stream
         self.model = model
         self.request_body = request_body or {}
+        self.reject_empty_success = reject_empty_success
         self._message_id: str = f"msg_{uuid.uuid4()}"
         self._current_block_index: int = -1
         # Map item_id -> content_block_index so we can stop the right block later
@@ -53,6 +59,8 @@ class AnthropicResponsesStreamWrapper:
         self._chunk_queue: deque = deque()
         self._output_text_parts: list[str] = []
         self._text_delta_keys_seen: set[str] = set()
+        self._meaningful_output_seen = False
+        self._event_summaries: list[dict[str, Any]] = []
 
     @staticmethod
     def _estimate_token_count(value: Any) -> int:
@@ -106,6 +114,117 @@ class AnthropicResponsesStreamWrapper:
                 "".join(self._output_text_parts)
             ),
         }
+
+    @staticmethod
+    def _get_value(value: Any, key: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    @classmethod
+    def _usage_summary(cls, usage: Any) -> dict[str, Any]:
+        if usage is None:
+            return {}
+        return {
+            "input_tokens": cls._get_value(usage, "input_tokens", 0) or 0,
+            "output_tokens": cls._get_value(usage, "output_tokens", 0) or 0,
+        }
+
+    @classmethod
+    def _output_item_has_meaningful_content(cls, item: Any) -> bool:
+        item_type = cls._get_value(item, "type")
+        if item_type in {"function_call", "mcp_call"}:
+            return True
+        if item_type == "message":
+            content = cls._get_value(item, "content", []) or []
+            if not isinstance(content, list):
+                return False
+            for part in content:
+                part_type = cls._get_value(part, "type")
+                text = cls._get_value(part, "text")
+                if part_type in {"output_text", "text"} and isinstance(text, str) and text.strip():
+                    return True
+            return False
+        if item_type == "reasoning":
+            summary = cls._get_value(item, "summary", []) or []
+            if not isinstance(summary, list):
+                return False
+            for part in summary:
+                text = cls._get_value(part, "text")
+                if isinstance(text, str) and text.strip():
+                    return True
+        return False
+
+    @classmethod
+    def _response_has_meaningful_output(cls, response_obj: Any) -> bool:
+        output = cls._get_value(response_obj, "output", []) or []
+        if not isinstance(output, list):
+            return False
+        return any(cls._output_item_has_meaningful_content(item) for item in output)
+
+    @classmethod
+    def _event_summary(cls, event: Any, event_type: Any) -> dict[str, Any]:
+        summary: dict[str, Any] = {"type": event_type}
+        if event_type in {
+            "response.output_item.added",
+            "response.output_item.done",
+        }:
+            item = cls._get_value(event, "item")
+            if item is not None:
+                summary["item_type"] = cls._get_value(item, "type")
+                summary["item_id"] = cls._get_value(item, "id")
+                summary["item_name"] = cls._get_value(item, "name")
+        elif event_type in {
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.function_call_arguments.delta",
+            "response.reasoning_summary_text.delta",
+        }:
+            summary["item_id"] = cls._get_value(event, "item_id")
+            text = cls._get_value(event, "delta")
+            if text is None:
+                text = cls._get_value(event, "text")
+            if isinstance(text, str):
+                summary["text_len"] = len(text)
+                summary["text_preview"] = text[:200]
+        elif event_type in {
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        }:
+            response_obj = cls._get_value(event, "response")
+            if response_obj is not None:
+                output = cls._get_value(response_obj, "output", []) or []
+                summary["response_id"] = cls._get_value(response_obj, "id")
+                summary["response_status"] = cls._get_value(response_obj, "status")
+                summary["response_model"] = cls._get_value(response_obj, "model")
+                summary["output_count"] = len(output) if isinstance(output, list) else 0
+                if isinstance(output, list):
+                    summary["output_types"] = [
+                        cls._get_value(item, "type") for item in output[:20]
+                    ]
+                summary["usage"] = cls._usage_summary(
+                    cls._get_value(response_obj, "usage")
+                )
+        return summary
+
+    def _record_event_summary(self, event: Any, event_type: Any) -> None:
+        if len(self._event_summaries) >= 50:
+            return
+        self._event_summaries.append(self._event_summary(event, event_type))
+
+    def _empty_success_error(self, reason: str) -> AnthropicResponsesEmptySuccessError:
+        diagnostic = {
+            "reason": reason,
+            "model": self.model,
+            "events": self._event_summaries[-20:],
+            "request_model": self.request_body.get("model"),
+            "request_stream": self.request_body.get("stream"),
+        }
+        return AnthropicResponsesEmptySuccessError(
+            "OpenRouter Responses adapter returned empty successful response: "
+            + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)
+        )
 
     def _queue_synthetic_message_stop(self) -> None:
         self._chunk_queue.append(
@@ -167,6 +286,8 @@ class AnthropicResponsesStreamWrapper:
 
         if event_type is None:
             return
+        if self.reject_empty_success:
+            self._record_event_summary(event, event_type)
 
         # ---- message_start ----
         if event_type == "response.created":
@@ -200,6 +321,7 @@ class AnthropicResponsesStreamWrapper:
                     }
                 )
             elif item_type == "function_call":
+                self._meaningful_output_seen = True
                 call_id = (
                     getattr(item, "call_id", None)
                     or (item.get("call_id") if isinstance(item, dict) else None)
@@ -238,6 +360,7 @@ class AnthropicResponsesStreamWrapper:
                     }
                 )
             elif item_type == "mcp_call":
+                self._meaningful_output_seen = True
                 call_id = (
                     getattr(item, "id", None)
                     or (item.get("id") if isinstance(item, dict) else None)
@@ -297,6 +420,7 @@ class AnthropicResponsesStreamWrapper:
                 event.get("delta", "") if isinstance(event, dict) else ""
             )
             if isinstance(delta, str) and delta:
+                self._meaningful_output_seen = True
                 self._output_text_parts.append(delta)
                 self._text_delta_keys_seen.add(self._event_text_key(event))
             block_idx = self._get_or_create_text_block_index(item_id)
@@ -321,6 +445,7 @@ class AnthropicResponsesStreamWrapper:
             text_key = self._event_text_key(event)
             if not isinstance(text, str) or not text or text_key in self._text_delta_keys_seen:
                 return
+            self._meaningful_output_seen = True
             self._output_text_parts.append(text)
             block_idx = self._get_or_create_text_block_index(item_id)
             self._chunk_queue.append(
@@ -340,6 +465,8 @@ class AnthropicResponsesStreamWrapper:
             delta = getattr(event, "delta", "") or (
                 event.get("delta", "") if isinstance(event, dict) else ""
             )
+            if isinstance(delta, str) and delta.strip():
+                self._meaningful_output_seen = True
             block_idx = (
                 self._item_id_to_block_index.get(item_id, self._current_block_index)
                 if item_id
@@ -499,6 +626,7 @@ class AnthropicResponsesStreamWrapper:
                 else self._current_block_index
             )
             if item_type in {"function_call", "mcp_call"} and item_id:
+                self._meaningful_output_seen = True
                 input_data = self._deserialize_tool_input(
                     getattr(item, "arguments", None)
                     or (item.get("arguments") if isinstance(item, dict) else None)
@@ -552,6 +680,17 @@ class AnthropicResponsesStreamWrapper:
             output_tokens = 0
             cache_creation_tokens = 0
             cache_read_tokens = 0
+
+            if (
+                self.reject_empty_success
+                and event_type == "response.completed"
+                and not self._meaningful_output_seen
+                and (
+                    response_obj is None
+                    or not self._response_has_meaningful_output(response_obj)
+                )
+            ):
+                raise self._empty_success_error("completed_without_output")
 
             if response_obj is not None:
                 status = getattr(response_obj, "status", None)
@@ -626,6 +765,9 @@ class AnthropicResponsesStreamWrapper:
                     return self._chunk_queue.popleft()
         except StopAsyncIteration:
             pass
+        except AnthropicResponsesEmptySuccessError as e:
+            verbose_logger.error(str(e))
+            raise
         except Exception as e:
             verbose_logger.error(
                 f"AnthropicResponsesStreamWrapper error: {e}\n{traceback.format_exc()}"
@@ -638,10 +780,14 @@ class AnthropicResponsesStreamWrapper:
         # If the upstream stream never emitted response.created but did yield no data,
         # synthesize a single message_start as the minimal Anthropic envelope.
         if not self._sent_message_start and not self._sent_message_stop:
+            if self.reject_empty_success:
+                raise self._empty_success_error("stream_ended_without_events")
             self._sent_message_start = True
             return self._make_message_start()
 
         if self._sent_message_start and not self._sent_message_stop:
+            if self.reject_empty_success and not self._meaningful_output_seen:
+                raise self._empty_success_error("stream_ended_without_output")
             self._queue_synthetic_message_stop()
             return self._chunk_queue.popleft()
 

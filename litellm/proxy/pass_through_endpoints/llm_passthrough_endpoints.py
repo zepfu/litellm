@@ -4809,11 +4809,31 @@ def _apply_openrouter_adapter_parallel_instruction_policy(
 
 def _build_anthropic_response_from_responses_response(
     response_body: dict[str, Any],
+    *,
+    reject_empty_success: bool = False,
+    diagnostic_context: Optional[dict[str, Any]] = None,
 ) -> Response:
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
         LiteLLMAnthropicToResponsesAPIAdapter,
     )
     from litellm.types.llms.openai import ResponsesAPIResponse
+
+    if reject_empty_success and _is_empty_success_responses_body(response_body):
+        diagnostic = _build_empty_success_responses_diagnostic(
+            response_body=response_body,
+            diagnostic_context=diagnostic_context,
+        )
+        verbose_proxy_logger.warning(
+            "OpenRouter Responses adapter returned empty successful response: %s",
+            json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)[:8000],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "OpenRouter Responses adapter returned empty successful response",
+                "diagnostic": diagnostic,
+            },
+        )
 
     adapter = LiteLLMAnthropicToResponsesAPIAdapter()
     translated_response = adapter.translate_response(ResponsesAPIResponse(**response_body))
@@ -5076,18 +5096,198 @@ def _coerce_namespace_to_mapping(value: Any) -> Any:
     return value
 
 
+def _responses_event_text_key(event: Any) -> str:
+    item_id = getattr(event, "item_id", None) or (
+        event.get("item_id") if isinstance(event, dict) else None
+    )
+    if isinstance(item_id, str) and item_id:
+        return item_id
+    output_index = getattr(event, "output_index", None) or (
+        event.get("output_index") if isinstance(event, dict) else None
+    )
+    if isinstance(output_index, int):
+        return f"output:{output_index}"
+    return "output:0"
+
+
+def _responses_stream_event_summary(event: Any) -> dict[str, Any]:
+    event_type = getattr(event, "type", None) or (
+        event.get("type") if isinstance(event, dict) else None
+    )
+    summary: dict[str, Any] = {"type": event_type}
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        item = getattr(event, "item", None) or (
+            event.get("item") if isinstance(event, dict) else None
+        )
+        if item is not None:
+            summary["item_type"] = getattr(item, "type", None) or (
+                item.get("type") if isinstance(item, dict) else None
+            )
+            summary["item_id"] = getattr(item, "id", None) or (
+                item.get("id") if isinstance(item, dict) else None
+            )
+            summary["item_name"] = getattr(item, "name", None) or (
+                item.get("name") if isinstance(item, dict) else None
+            )
+        return summary
+    if event_type in {
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.function_call_arguments.delta",
+        "response.reasoning_summary_text.delta",
+    }:
+        summary["item_id"] = getattr(event, "item_id", None) or (
+            event.get("item_id") if isinstance(event, dict) else None
+        )
+        text = getattr(event, "delta", None) or (
+            event.get("delta") if isinstance(event, dict) else None
+        )
+        if text is None:
+            text = getattr(event, "text", None) or (
+                event.get("text") if isinstance(event, dict) else None
+            )
+        if isinstance(text, str):
+            summary["text_len"] = len(text)
+            summary["text_preview"] = text[:200]
+        return summary
+    if event_type in {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+    }:
+        response_payload = getattr(event, "response", None) or (
+            event.get("response") if isinstance(event, dict) else None
+        )
+        response_dict = _coerce_namespace_to_mapping(response_payload)
+        if isinstance(response_dict, dict):
+            output = response_dict.get("output") or []
+            usage = response_dict.get("usage") or {}
+            summary.update(
+                {
+                    "response_id": response_dict.get("id"),
+                    "response_status": response_dict.get("status"),
+                    "response_model": response_dict.get("model"),
+                    "output_count": len(output) if isinstance(output, list) else 0,
+                    "output_types": [
+                        item.get("type")
+                        for item in output[:20]
+                        if isinstance(item, dict)
+                    ]
+                    if isinstance(output, list)
+                    else [],
+                    "usage": {
+                        "input_tokens": usage.get("input_tokens", 0)
+                        if isinstance(usage, dict)
+                        else 0,
+                        "output_tokens": usage.get("output_tokens", 0)
+                        if isinstance(usage, dict)
+                        else 0,
+                    },
+                }
+            )
+    return summary
+
+
+def _responses_output_item_has_meaningful_content(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    item_type = item.get("type")
+    if item_type in {"function_call", "mcp_call"}:
+        return True
+    if item_type == "message":
+        content = item.get("content") or []
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"output_text", "text"}:
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    return True
+        return False
+    if item_type == "reasoning":
+        summary = item.get("summary") or []
+        if not isinstance(summary, list):
+            return False
+        for part in summary:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    return True
+        return False
+    return False
+
+
+def _is_empty_success_responses_body(response_body: dict[str, Any]) -> bool:
+    status = response_body.get("status")
+    if status not in {None, "completed"}:
+        return False
+    output = response_body.get("output") or []
+    if not isinstance(output, list):
+        return False
+    if any(_responses_output_item_has_meaningful_content(item) for item in output):
+        return False
+    output_text = response_body.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return False
+    return True
+
+
+def _build_empty_success_responses_diagnostic(
+    *,
+    response_body: dict[str, Any],
+    diagnostic_context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    output = response_body.get("output") or []
+    usage = response_body.get("usage") or {}
+    diagnostic = {
+        "id": response_body.get("id"),
+        "status": response_body.get("status"),
+        "model": response_body.get("model"),
+        "output_count": len(output) if isinstance(output, list) else 0,
+        "output_types": [
+            item.get("type") for item in output[:20] if isinstance(item, dict)
+        ]
+        if isinstance(output, list)
+        else [],
+        "usage": usage if isinstance(usage, dict) else {},
+        "error": response_body.get("error"),
+        "incomplete_details": response_body.get("incomplete_details"),
+    }
+    if diagnostic_context:
+        diagnostic["context"] = diagnostic_context
+    return diagnostic
+
+
 async def _collect_responses_response_from_stream(
     response: StreamingResponse,
+    *,
+    event_summaries: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     output_text_parts: list[str] = []
+    text_done_keys_seen: set[str] = set()
     event_iterator = _iterate_responses_sse_events(response.body_iterator)
     try:
         async for event in event_iterator:
             event_type = getattr(event, "type", None)
+            if event_summaries is not None and len(event_summaries) < 50:
+                event_summaries.append(_responses_stream_event_summary(event))
             if event_type == "response.output_text.delta":
                 delta = getattr(event, "delta", None)
                 if isinstance(delta, str):
                     output_text_parts.append(delta)
+                    text_done_keys_seen.add(_responses_event_text_key(event))
+            if event_type == "response.output_text.done":
+                text = getattr(event, "text", None)
+                text_key = _responses_event_text_key(event)
+                if (
+                    isinstance(text, str)
+                    and text
+                    and text_key not in text_done_keys_seen
+                ):
+                    output_text_parts.append(text)
+                    text_done_keys_seen.add(text_key)
             if event_type == "response.completed":
                 response_payload = getattr(event, "response", None)
                 if response_payload is None:
@@ -5128,6 +5328,7 @@ def _build_anthropic_streaming_response_from_responses_stream(
     *,
     model: str,
     request_body: Optional[dict[str, Any]] = None,
+    reject_empty_success: bool = False,
 ) -> StreamingResponse:
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
         AnthropicResponsesStreamWrapper,
@@ -5137,6 +5338,7 @@ def _build_anthropic_streaming_response_from_responses_stream(
         responses_stream=_iterate_responses_sse_events(response.body_iterator),
         model=model,
         request_body=request_body,
+        reject_empty_success=reject_empty_success,
     )
     return StreamingResponse(
         wrapper.async_anthropic_sse_wrapper(),
@@ -5985,11 +6187,21 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
 
     if isinstance(upstream_response, StreamingResponse):
         if not client_requested_stream:
+            response_event_summaries: list[dict[str, Any]] = []
             response_body = await _collect_responses_response_from_stream(
-                upstream_response
+                upstream_response,
+                event_summaries=response_event_summaries,
             )
             translated_response = _build_anthropic_response_from_responses_response(
-                response_body
+                response_body,
+                reject_empty_success=True,
+                diagnostic_context={
+                    "adapter": "openrouter_responses",
+                    "adapter_model": adapter_model,
+                    "stream_events": response_event_summaries,
+                    "request_model": translated_request_body.get("model"),
+                    "request_stream": translated_request_body.get("stream"),
+                },
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -6001,6 +6213,7 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
             upstream_response,
             model=adapter_model,
             request_body=translated_request_body,
+            reject_empty_success=True,
         )
 
     if not isinstance(upstream_response, Response):
@@ -6011,7 +6224,14 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
 
     response_body = json.loads(upstream_response.body.decode("utf-8"))
     translated_response = _build_anthropic_response_from_responses_response(
-        response_body
+        response_body,
+        reject_empty_success=True,
+        diagnostic_context={
+            "adapter": "openrouter_responses",
+            "adapter_model": adapter_model,
+            "request_model": translated_request_body.get("model"),
+            "request_stream": translated_request_body.get("stream"),
+        },
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
