@@ -136,6 +136,116 @@ these docs only as needed:
   for the parallel read-tool proof, then run only that focused case before
   reconsidering any peeromega fanout rerun.
 
+- Keep the native Codex/Gemini repository-attribution gap as an explicit
+  regression gate. The original issue was Codex CLI and Gemini CLI runs through
+  LiteLLM not populating `public.session_history.repository`; the 2026-04-28
+  fix added the top-level column, header propagation, metadata mirroring, and
+  focused dev proof. Until the next prod/default validation proves it again,
+  run only the focused native cases
+  `native_openai_passthrough_responses_codex`,
+  `native_gemini_passthrough_generate_content`, and
+  `native_gemini_passthrough_stream_generate_content` when touching this path.
+  They must keep requiring top-level `repository` containing `litellm` plus
+  `metadata.repository`; relevant files are
+  `litellm/integrations/aawm_agent_identity.py`,
+  `.wheel-build/aawm_litellm_callbacks/agent_identity.py`,
+  `scripts/local-ci/run_anthropic_adapter_acceptance.py`, and
+  `scripts/local-ci/anthropic_adapter_config.json`.
+
+- Streaming/tool-call parity audit follow-up: do not run the full multi-path
+  harness for this work until the focused unit/path tests below pass. The target
+  is pixel-close behavior for agents entering `/anthropic` and fanning out to
+  OpenAI/Codex, Google/Gemini, NVIDIA, and OpenRouter compared with native
+  Codex CLI and Gemini CLI traffic.
+
+  OpenAI/Codex Responses adapter:
+  - Add `response.function_call_arguments.done` support to
+    `AnthropicResponsesStreamWrapper`; native OpenAI passthrough reconstructs
+    arguments from both `.delta` and `.done` in
+    `OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream`,
+    while the Anthropic Responses stream wrapper currently handles only
+    `.delta` plus some `response.output_item.done` state. Cover the native
+    Codex shape where arguments arrive only in `.done`.
+  - Reuse or mirror native OpenAI Responses stream reconstruction when
+    collecting forced-stream ChatGPT/Codex responses for non-stream
+    `/anthropic` callers. `_collect_responses_response_from_stream()` currently
+    reconstructs final text, but not `function_call` / `mcp_call` output items
+    or `.done` arguments, even though `use_chatgpt_codex_defaults` forces
+    upstream `stream=true`.
+  - Preserve intra-assistant content ordering in
+    `translate_messages_to_responses_input()` when a prior Anthropic assistant
+    turn mixes text and `tool_use` blocks; add a regression with text before
+    and after a tool call. Also decide whether prior Anthropic `thinking`
+    history should be dropped, mapped to Responses reasoning items, or kept as
+    encrypted reasoning metadata instead of visible assistant `output_text`.
+  - Track raw MCP parity separately: the transformation layer can map
+    `mcp_servers` / `mcp_toolset` into Responses `mcp` tools, but the proxy
+    route rejects raw MCP for adapted `/anthropic` requests. Either de-scope the
+    dead translation path or implement end-to-end parity with native OpenAI
+    Responses passthrough.
+  - Add one hard-gated parity fixture that runs a native Codex streaming tool
+    call and one `/anthropic`-adapted Claude Code tool call, then compares
+    reconstructed `response.output_item.*` /
+    `response.function_call_arguments.*` state plus
+    `session_history_tool_activity`.
+
+  Google/Gemini Code Assist adapter:
+  - Add Anthropic-to-Google streaming fixtures for partial and parallel
+    `functionCall` chunks. The adapter always sends upstream
+    `v1internal:streamGenerateContent`; the Anthropic wrapper currently buffers
+    Gemini tool-call deltas until a terminal chunk, while native Gemini/Google
+    adapter code can emit a function call once accumulated JSON parses and flush
+    leftovers at stream end.
+  - Add a Code Assist SSE unit fixture containing text, `functionCall`,
+    thought/signature, `usageMetadata`, and `traceId`, then assert streamed
+    Anthropic events and non-stream collection are identical after
+    normalization. Current route coverage proves `alt=sse` targeting but mocks
+    too much of the Google SSE -> Vertex iterator -> Anthropic SSE path.
+  - Document and test the session/id contract against native Gemini CLI:
+    native Gemini passthrough preserves CLI `request.session_id`, while
+    Anthropic-to-Google derives a model-scoped Code Assist session and
+    hand-builds `user_prompt_id`. Add a golden-envelope comparison for the same
+    prompt/session, especially across follow-up tool turns.
+  - Add round-trip coverage for two same-name parallel Claude `tool_use` blocks
+    with distinct ids followed by `tool_result` blocks, asserting Code Assist
+    receives unambiguous `functionResponse` parts and Claude receives restored
+    tool names. Add explicit alias-contract tests for every Claude core tool
+    (`Read`, `Grep`, `Bash`, etc.) across tools, `tool_choice`, assistant
+    tool calls, streaming restored names, and native Gemini
+    `functionDeclaration` names.
+
+  NVIDIA/OpenRouter completion adapters:
+  - Preserve parallel streaming tool calls by tracking each upstream
+    `delta.tool_calls[index]` as a separate Anthropic content block. The
+    non-stream adapter emits one `tool_use` per OpenAI tool call, but the
+    streaming translator currently starts from `tool_calls[0]` and concatenates
+    all streamed argument deltas into one `input_json_delta`.
+  - Mirror Responses adapter tool-choice semantics in the completion adapter:
+    support Anthropic `tool_choice.type="none"` and map
+    `disable_parallel_tool_use` to OpenAI-style `parallel_tool_calls=false`
+    where the target provider supports it.
+  - Delay the initial streaming `content_block_start` until the first upstream
+    chunk identifies text, thinking, or tool output. The completion stream
+    wrapper currently opens an empty text block before reading the first chunk,
+    so tool-only responses can differ from native Anthropic and from the
+    non-stream adapter.
+  - Add an explicit hosted-tool compatibility policy for completion adapters:
+    translate supported Anthropic hosted/beta tools to the target provider
+    shape, or reject/drop unsupported tools with metadata explaining the
+    downgrade.
+  - Focused coverage to add before live harness work: one chunk containing two
+    `delta.tool_calls` entries, `tool_choice={"type":"auto",
+    "disable_parallel_tool_use":true}`, `tool_choice={"type":"none"}`, a
+    tool-only stream with no leading empty text block, and provider-specific
+    hosted-tool translation/rejection assertions.
+
+  OpenRouter Responses adapter:
+  - Treat it as the OpenAI Responses parity path plus OpenRouter-specific
+    routing/empty-success behavior. There is no first-party OpenRouter CLI
+    baseline, so compare request/stream reconstruction to native OpenAI/Codex
+    passthrough and then run a single currently available free-model
+    OpenRouter case before any peeromega fanout rerun.
+
 ## Ongoing
 
 - Keep Codex/OpenAI streaming tool activity aligned across Langfuse and `session_history`.
