@@ -401,6 +401,40 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
 
+    def test_codex_native_tool_alias_maps_bash_history_to_exec_command(self):
+        """Codex-native mode maps Claude Bash history to native Responses shape."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_pwd",
+                        "name": "Bash",
+                        "input": {
+                            "command": "pwd",
+                            "timeout": 120000,
+                            "description": "show cwd",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = _ADAPTER.translate_messages_to_responses_input(
+            messages,  # type: ignore[arg-type]
+            use_codex_native_tools=True,
+        )
+
+        assert result == [
+            {
+                "type": "function_call",
+                "call_id": "toolu_pwd",
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "pwd"}),
+            }
+        ]
+
     def test_assistant_mixed_text_tool_use_preserves_block_order(self):
         """Mixed assistant text/tool_use blocks stay ordered in Responses input."""
         messages = [
@@ -632,6 +666,37 @@ class TestTranslateToolsToResponsesAPI:
                 },
             }
         ]
+
+    def test_codex_native_tool_alias_maps_bash_schema_to_exec_command(self):
+        tools = [
+            {
+                "name": "Bash",
+                "description": "Run a shell command.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            }
+        ]
+
+        result = _ADAPTER.translate_tools_to_responses_api(  # type: ignore[arg-type]
+            tools,
+            use_codex_native_tools=True,
+        )
+
+        assert result[0]["name"] == "exec_command"
+        assert result[0]["parameters"]["required"] == ["cmd"]
+        assert set(result[0]["parameters"]["properties"]) == {
+            "cmd",
+            "login",
+            "tty",
+            "yield_time_ms",
+            "max_output_tokens",
+        }
 
     def test_tool_without_description(self):
         """Tool without a description omits the description key."""
@@ -1476,6 +1541,30 @@ class TestTranslateResponse:
         response = _make_mock_response(output=[output_item])
         result: Any = _ADAPTER.translate_response(response)
         assert result["content"][0]["input"] == {"command": "git status"}
+        assert result["stop_reason"] == "tool_use"
+
+    def test_codex_native_tool_alias_maps_exec_command_response_to_bash(self):
+        output_item = {
+            "type": "function_call",
+            "call_id": "call_pwd",
+            "name": "exec_command",
+            "arguments": {
+                "cmd": "pwd",
+                "login": True,
+                "tty": False,
+                "yield_time_ms": 1000,
+                "max_output_tokens": 200,
+            },
+        }
+        response = _make_mock_response(output=[output_item])
+
+        result: Any = _ADAPTER.translate_response(
+            response,
+            use_codex_native_tools=True,
+        )
+
+        assert result["content"][0]["name"] == "Bash"
+        assert result["content"][0]["input"] == {"command": "pwd"}
         assert result["stop_reason"] == "tool_use"
 
     def test_dict_output_message_item(self):

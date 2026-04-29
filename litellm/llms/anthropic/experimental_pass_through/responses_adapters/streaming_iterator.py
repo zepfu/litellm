@@ -11,6 +11,9 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.transformation im
     sanitize_anthropic_tool_use_input,
     sanitize_anthropic_tool_use_input_json_delta,
 )
+from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+    LiteLLMAnthropicToResponsesAPIAdapter,
+)
 
 
 class AnthropicResponsesEmptySuccessError(RuntimeError):
@@ -38,11 +41,13 @@ class AnthropicResponsesStreamWrapper:
         model: str,
         request_body: Optional[dict[str, Any]] = None,
         reject_empty_success: bool = False,
+        use_codex_native_tools: bool = False,
     ) -> None:
         self.responses_stream = responses_stream
         self.model = model
         self.request_body = request_body or {}
         self.reject_empty_success = reject_empty_success
+        self.use_codex_native_tools = use_codex_native_tools
         self._message_id: str = f"msg_{uuid.uuid4()}"
         self._current_block_index: int = -1
         # Map item_id -> content_block_index so we can stop the right block later
@@ -52,9 +57,11 @@ class AnthropicResponsesStreamWrapper:
             str, str
         ] = {}  # item_id -> call_id / name accumulator
         self._pending_tool_names: Dict[str, str] = {}
+        self._pending_upstream_tool_names: Dict[str, str] = {}
         self._tool_inputs_seeded: set[str] = set()
         self._tool_argument_deltas_seen: set[str] = set()
         self._read_tool_argument_buffers: Dict[str, str] = {}
+        self._codex_tool_argument_buffers: Dict[str, str] = {}
         self._sent_message_start = False
         self._sent_message_stop = False
         self._chunk_queue: deque = deque()
@@ -338,19 +345,30 @@ class AnthropicResponsesStreamWrapper:
                     or (item.get("name") if isinstance(item, dict) else None)
                     or ""
                 )
+                upstream_name = name
+                anthropic_name = LiteLLMAnthropicToResponsesAPIAdapter.codex_native_tool_name_from_responses(
+                    upstream_name,
+                    use_codex_native_tools=self.use_codex_native_tools,
+                )
                 input_data = self._deserialize_tool_input(
                     getattr(item, "arguments", None)
                     or (item.get("arguments") if isinstance(item, dict) else None)
                 )
+                input_data = LiteLLMAnthropicToResponsesAPIAdapter.codex_native_tool_input_from_responses(
+                    upstream_name,
+                    input_data,
+                    use_codex_native_tools=self.use_codex_native_tools,
+                )
                 input_data = sanitize_anthropic_tool_use_input(
-                    tool_name=name,
+                    tool_name=anthropic_name,
                     tool_input=input_data,
                 )
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
                     self._pending_tool_ids[item_id] = call_id
-                    self._pending_tool_names[item_id] = name
+                    self._pending_tool_names[item_id] = anthropic_name
+                    self._pending_upstream_tool_names[item_id] = upstream_name
                     if input_data:
                         self._tool_inputs_seeded.add(item_id)
                 self._chunk_queue.append(
@@ -360,7 +378,7 @@ class AnthropicResponsesStreamWrapper:
                         "content_block": {
                             "type": "tool_use",
                             "id": call_id,
-                            "name": name,
+                            "name": anthropic_name,
                             "input": input_data,
                         },
                     }
@@ -498,7 +516,26 @@ class AnthropicResponsesStreamWrapper:
             tool_name = (
                 self._pending_tool_names.get(item_id, "") if item_id else ""
             )
-            if item_id and tool_name == "Read":
+            upstream_tool_name = (
+                self._pending_upstream_tool_names.get(item_id, "") if item_id else ""
+            )
+            if item_id and upstream_tool_name == "exec_command" and self.use_codex_native_tools:
+                buffered_delta = (
+                    self._codex_tool_argument_buffers.get(item_id, "") + delta
+                )
+                try:
+                    json.loads(buffered_delta)
+                except json.JSONDecodeError:
+                    self._codex_tool_argument_buffers[item_id] = buffered_delta
+                    return
+                delta = LiteLLMAnthropicToResponsesAPIAdapter.codex_native_tool_input_json_from_responses(
+                    upstream_tool_name,
+                    buffered_delta,
+                    use_codex_native_tools=self.use_codex_native_tools,
+                )
+                self._codex_tool_argument_buffers.pop(item_id, None)
+                self._tool_argument_deltas_seen.add(item_id)
+            elif item_id and tool_name == "Read":
                 buffered_delta = self._read_tool_argument_buffers.get(item_id, "") + delta
                 try:
                     json.loads(buffered_delta)
@@ -558,6 +595,12 @@ class AnthropicResponsesStreamWrapper:
             else:
                 return
             tool_name = self._pending_tool_names.get(item_id, "")
+            upstream_tool_name = self._pending_upstream_tool_names.get(item_id, "")
+            arguments_json = LiteLLMAnthropicToResponsesAPIAdapter.codex_native_tool_input_json_from_responses(
+                upstream_tool_name,
+                arguments_json,
+                use_codex_native_tools=self.use_codex_native_tools,
+            )
             arguments_json = sanitize_anthropic_tool_use_input_json_delta(
                 tool_name=tool_name,
                 partial_json=arguments_json,
@@ -725,10 +768,24 @@ class AnthropicResponsesStreamWrapper:
                     or (item.get("arguments") if isinstance(item, dict) else None)
                 )
                 if item_type == "function_call":
+                    upstream_tool_name = (
+                        getattr(item, "name", None)
+                        or (item.get("name") if isinstance(item, dict) else None)
+                        or self._pending_upstream_tool_names.get(item_id, "")
+                    )
                     tool_name = (
                         getattr(item, "name", None)
                         or (item.get("name") if isinstance(item, dict) else None)
                         or self._pending_tool_names.get(item_id, "")
+                    )
+                    tool_name = LiteLLMAnthropicToResponsesAPIAdapter.codex_native_tool_name_from_responses(
+                        upstream_tool_name,
+                        use_codex_native_tools=self.use_codex_native_tools,
+                    )
+                    input_data = LiteLLMAnthropicToResponsesAPIAdapter.codex_native_tool_input_from_responses(
+                        upstream_tool_name,
+                        input_data,
+                        use_codex_native_tools=self.use_codex_native_tools,
                     )
                     input_data = sanitize_anthropic_tool_use_input(
                         tool_name=tool_name,

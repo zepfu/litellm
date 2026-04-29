@@ -690,8 +690,18 @@ def test_codex_tool_activity_parity_cases_have_stream_state_gates():
     ] == "pwd"
 
     claude_stream_gate = claude_case["stream_tool_call_state_validation"]
-    assert claude_stream_gate["expected_tools"][0]["tool_name"] == "Bash"
+    assert "anthropic-openai-codex-native-tools" in claude_case[
+        "required_trace_tags"
+    ]
+    assert "anthropic_adapter_codex_native_tool_aliases" in claude_case[
+        "required_generation_metadata_truthy"
+    ]
+    assert claude_stream_gate["expected_tools"][0]["tool_name"] == "exec_command"
     assert claude_stream_gate["expected_tools"][0]["tool_type"] == "function_call"
+    assert claude_case["tool_activity_validation"]["expected_rows"][0][
+        "tool_name"
+    ] == "exec_command"
+    assert "Bash" in claude_case["command"]
     assert "response.function_call_arguments.done" in claude_stream_gate[
         "required_any_event_type_groups"
     ][0]
