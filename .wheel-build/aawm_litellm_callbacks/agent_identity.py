@@ -608,6 +608,18 @@ _AAWM_REPOSITORY_METADATA_KEYS = (
     "repository_name",
     "git_repository",
     "vcs_repository",
+    "workspace_root",
+    "workspaceRoot",
+    "project_root",
+    "projectRoot",
+    "root_path",
+    "rootPath",
+    "working_directory",
+    "workingDirectory",
+    "cwd_path",
+    "cwdPath",
+    "cwd_uri",
+    "cwdUri",
 )
 _AAWM_REPOSITORY_HEADER_NAMES = (
     "x-aawm-repository",
@@ -616,9 +628,13 @@ _AAWM_REPOSITORY_HEADER_NAMES = (
     "x-git-repository",
 )
 _AAWM_REPOSITORY_TEXT_PATTERNS = (
-    re.compile(r"AGENTS\.md instructions for (?P<path>/[^\n<]+)"),
-    re.compile(r"<cwd>(?P<path>[^<]+)</cwd>"),
-    re.compile(r"\bcwd\b\s*[:=]\s*['\"]?(?P<path>/[^'\"\n<]+)"),
+    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
+    re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
+    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)"),
+    re.compile(
+        r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
+        re.IGNORECASE,
+    ),
 )
 _AAWM_SESSION_HISTORY_BATCH_SIZE = 32
 _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
@@ -1072,6 +1088,7 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
     cleaned = _clean_non_empty_string(value)
     if not cleaned:
         return None
+    cleaned = cleaned.strip("`'\"")
 
     if cleaned.startswith("git@") and ":" in cleaned:
         cleaned = cleaned.split(":", 1)[1]
@@ -1080,7 +1097,9 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
             parsed = urlsplit(cleaned)
             netloc = parsed.netloc.split("@", 1)[-1]
             path = parsed.path.strip("/")
-            if netloc.lower().endswith("github.com") and path:
+            if parsed.scheme == "file" and path:
+                cleaned = path.rstrip("/").rsplit("/", 1)[-1]
+            elif netloc.lower().endswith("github.com") and path:
                 cleaned = path
             else:
                 cleaned = urlunsplit(("", netloc, path, "", "")).strip("/")
@@ -1109,7 +1128,11 @@ def _extract_repository_identity_from_value(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return _extract_repository_identity_from_text(value)
     if isinstance(value, dict):
-        for child in value.values():
+        for key, child in value.items():
+            if key in _AAWM_REPOSITORY_METADATA_KEYS:
+                repository = _normalize_repository_identity(child)
+                if repository:
+                    return repository
             repository = _extract_repository_identity_from_value(child)
             if repository:
                 return repository

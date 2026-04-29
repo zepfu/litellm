@@ -151,17 +151,22 @@ these docs only as needed:
   `/home/zepfu/projects/aawm` showed the missing-harness-header gap still
   existed for normal Codex traffic; the follow-up fix infers repository from
   prepared `litellm_metadata` and workspace context text such as
-  `AGENTS.md instructions for /path` / `<cwd>/path</cwd>`. Dev proof:
-  `session_history` session `019dd8b8-c4f5-7c21-81bd-f4cab0715d6c` now has
-  `repository=aawm` and `metadata.repository=aawm`; focused Gemini native proof
-  passed at `/tmp/native_gemini_repository_regression_after_inference.json`.
+  `AGENTS.md instructions for /path` / `<cwd>/path</cwd>`. A second 2026-04-29
+  report from `mcp-pg` exposed the Gemini CLI shape
+  `- **Workspace Directories:**\n  - /path`, plus the need to recursively honor
+  structured workspace-root keys. Dev proofs now include Codex session
+  `019dd8b8-c4f5-7c21-81bd-f4cab0715d6c` with `repository=aawm`, Codex session
+  `019dd8d1-931c-7b81-8e81-a720f5df048c` with `repository=mcp-pg`, Gemini
+  session `f52dd42a-ef02-4592-beef-ee9d81267778` with `repository=mcp-pg`, and
+  focused Gemini native proof at
+  `/tmp/native_gemini_repository_regression_after_inference.json`.
   Until the next prod/default validation proves it again, run only the focused
   native cases
   `native_openai_passthrough_responses_codex`,
   `native_gemini_passthrough_generate_content`, and
   `native_gemini_passthrough_stream_generate_content` when touching this path.
   They must keep requiring top-level `repository` plus `metadata.repository`
-  and should include at least one non-harness-header Codex workspace-text proof;
+  and should include non-harness-header Codex and Gemini workspace-text proofs;
   relevant files are
   `litellm/integrations/aawm_agent_identity.py`,
   `.wheel-build/aawm_litellm_callbacks/agent_identity.py`,
