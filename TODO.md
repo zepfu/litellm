@@ -152,16 +152,20 @@ these docs only as needed:
   `scripts/local-ci/run_anthropic_adapter_acceptance.py`, and
   `scripts/local-ci/anthropic_adapter_config.json`.
 
-- Streaming/tool-call parity audit follow-up: do not run the full multi-path
-  harness for this work until the focused unit/path tests below pass. The target
-  is pixel-close behavior for agents entering `/anthropic` and fanning out to
-  OpenAI/Codex, Google/Gemini, NVIDIA, and OpenRouter compared with native
-  Codex CLI and Gemini CLI traffic.
+- `/anthropic` streaming/tool-call parity audit follow-up: do not run the full
+  multi-path harness for this work until the focused unit/path tests below pass.
+  The implementation target is only traffic that enters LiteLLM through
+  `/anthropic` and then fans out to OpenAI/Codex, Google/Gemini, NVIDIA, or
+  OpenRouter. Native Codex CLI and Gemini CLI traffic is comparison evidence
+  only: use it to capture provider-native envelopes, stream event ordering, and
+  durable logging expectations, not as extra non-`/anthropic` implementation
+  scope.
 
   OpenAI/Codex Responses adapter:
   - Add `response.function_call_arguments.done` support to
-    `AnthropicResponsesStreamWrapper`; native OpenAI passthrough reconstructs
-    arguments from both `.delta` and `.done` in
+    `AnthropicResponsesStreamWrapper` for `/anthropic` requests adapted to
+    OpenAI Responses; native OpenAI passthrough is only the baseline showing
+    that arguments can arrive through both `.delta` and `.done` in
     `OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream`,
     while the Anthropic Responses stream wrapper currently handles only
     `.delta` plus some `response.output_item.done` state. Cover the native
@@ -183,9 +187,9 @@ these docs only as needed:
     route rejects raw MCP for adapted `/anthropic` requests. Either de-scope the
     dead translation path or implement end-to-end parity with native OpenAI
     Responses passthrough.
-  - Add one hard-gated parity fixture that runs a native Codex streaming tool
-    call and one `/anthropic`-adapted Claude Code tool call, then compares
-    reconstructed `response.output_item.*` /
+  - Add one hard-gated parity fixture that uses a native Codex streaming tool
+    call as the baseline and a `/anthropic`-adapted Claude Code tool call as
+    the system under test, then compares reconstructed `response.output_item.*` /
     `response.function_call_arguments.*` state plus
     `session_history_tool_activity`.
 
@@ -202,10 +206,10 @@ these docs only as needed:
     normalization. Current route coverage proves `alt=sse` targeting but mocks
     too much of the Google SSE -> Vertex iterator -> Anthropic SSE path.
   - Document and test the session/id contract against native Gemini CLI:
-    native Gemini passthrough preserves CLI `request.session_id`, while
-    Anthropic-to-Google derives a model-scoped Code Assist session and
-    hand-builds `user_prompt_id`. Add a golden-envelope comparison for the same
-    prompt/session, especially across follow-up tool turns.
+    native Gemini passthrough preserves CLI `request.session_id` as baseline
+    behavior, while `/anthropic` to Google derives a model-scoped Code Assist
+    session and hand-builds `user_prompt_id`. Add a golden-envelope comparison
+    for the same prompt/session, especially across follow-up tool turns.
   - Add round-trip coverage for two same-name parallel Claude `tool_use` blocks
     with distinct ids followed by `tool_result` blocks, asserting Code Assist
     receives unambiguous `functionResponse` parts and Claude receives restored
@@ -241,10 +245,11 @@ these docs only as needed:
 
   OpenRouter Responses adapter:
   - Treat it as the OpenAI Responses parity path plus OpenRouter-specific
-    routing/empty-success behavior. There is no first-party OpenRouter CLI
-    baseline, so compare request/stream reconstruction to native OpenAI/Codex
-    passthrough and then run a single currently available free-model
-    OpenRouter case before any peeromega fanout rerun.
+    routing/empty-success behavior for `/anthropic` traffic. There is no
+    first-party OpenRouter CLI baseline, so compare request/stream
+    reconstruction to the native OpenAI/Codex baseline and then run a single
+    currently available free-model OpenRouter `/anthropic` case before any
+    peeromega fanout rerun.
 
 ## Ongoing
 
