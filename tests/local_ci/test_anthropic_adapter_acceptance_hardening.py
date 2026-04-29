@@ -710,6 +710,53 @@ def test_codex_tool_activity_parity_cases_have_stream_state_gates():
     ]
 
 
+def test_native_gemini_cases_have_code_assist_request_payload_gates():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name in (
+        "native_gemini_passthrough_generate_content",
+        "native_gemini_passthrough_stream_generate_content",
+    ):
+        case_config = config["cases"][case_name]
+        assert case_config["cli_passthrough"] == "gemini"
+        assert case_config["allowed_generation_routes"] == [
+            "/gemini/v1internal:streamGenerateContent"
+        ]
+        for metadata_key in (
+            "gemini_project",
+            "gemini_user_prompt_id",
+            "gemini_thinking_config_present",
+            "gemini_tools_present",
+        ):
+            assert metadata_key in case_config["required_generation_metadata_truthy"]
+
+        request_payload_checks = case_config["request_payload_checks"]
+        for path in (
+            "model",
+            "project",
+            "user_prompt_id",
+            "request.contents",
+            "request.session_id",
+            "request.systemInstruction",
+            "request.generationConfig.thinkingConfig",
+            "request.tools",
+        ):
+            assert path in request_payload_checks["required_paths"]
+        assert request_payload_checks["required_equals"]["model"] == "gemini-2.5-flash"
+        assert (
+            request_payload_checks["required_equals"][
+                "request.generationConfig.thinkingConfig.includeThoughts"
+            ]
+            is True
+        )
+        assert (
+            request_payload_checks["required_equals"][
+                "request.generationConfig.thinkingConfig.thinkingBudget"
+            ]
+            == 8192
+        )
+
+
 def test_target_profile_appends_case_local_claude_agents(monkeypatch):
     harness = _load_harness_module()
 

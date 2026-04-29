@@ -397,7 +397,30 @@
       "post_run_wait_seconds": 4,
       "allowed_generation_routes": ["/gemini/v1internal:streamGenerateContent"],
       "required_trace_tags": ["route:gemini_stream_generate_content"],
-      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "gemini_project",
+        "gemini_user_prompt_id",
+        "gemini_thinking_config_present",
+        "gemini_tools_present"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "project",
+          "user_prompt_id",
+          "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
+          "request.generationConfig.thinkingConfig",
+          "request.tools"
+        ],
+        "required_equals": {
+          "model": "gemini-2.5-flash",
+          "request.generationConfig.thinkingConfig.includeThoughts": true,
+          "request.generationConfig.thinkingConfig.thinkingBudget": 8192
+        }
+      },
       "session_history_validation": {
         "db_host": "127.0.0.1",
         "db_port": 5434,
@@ -443,7 +466,30 @@
       "post_run_wait_seconds": 4,
       "allowed_generation_routes": ["/gemini/v1internal:streamGenerateContent"],
       "required_trace_tags": ["route:gemini_stream_generate_content"],
-      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "gemini_project",
+        "gemini_user_prompt_id",
+        "gemini_thinking_config_present",
+        "gemini_tools_present"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "project",
+          "user_prompt_id",
+          "request.contents",
+          "request.session_id",
+          "request.systemInstruction",
+          "request.generationConfig.thinkingConfig",
+          "request.tools"
+        ],
+        "required_equals": {
+          "model": "gemini-2.5-flash",
+          "request.generationConfig.thinkingConfig.includeThoughts": true,
+          "request.generationConfig.thinkingConfig.thinkingBudget": 8192
+        }
+      },
       "session_history_validation": {
         "db_host": "127.0.0.1",
         "db_port": 5434,

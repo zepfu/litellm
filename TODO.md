@@ -172,13 +172,27 @@ these docs only as needed:
     Codex-backed `/anthropic` route.
 
   Google/Gemini Code Assist adapter:
-  - Live-compare the newly covered `/anthropic` Code Assist request envelope
-    against native Gemini CLI captures before treating the session/id contract
+  - Native Gemini CLI Code Assist envelope gates are now live-proven for both
+    normal and stream-json CLI modes at
+    `/tmp/native_gemini_payload_gates_after_config.json`: the captured provider
+    request includes top-level `model`, `project`, `user_prompt_id`,
+    `request.session_id`, `request.contents`, `request.systemInstruction`,
+    `request.generationConfig.thinkingConfig`, and `request.tools`, with
+    `gemini-2.5-flash`, `includeThoughts=true`, and `thinkingBudget=8192`.
+    Next Gemini work should live-compare the `/anthropic` Code Assist request
+    envelope against that native capture before treating the session/id contract
     as fully proven. Unit coverage now pins the model-scoped Code Assist
     `session_id`, hand-built `user_prompt_id`, native function declaration
     aliases, full Claude-core native alias mapping, `tool_choice`, assistant
     tool-call aliases, restored streaming tool names, parallel tool-call
     buffering, and terminal usage preservation.
+  - Track the live policy drift explicitly: native Gemini CLI defaults its
+    thinking config to `thinkingBudget=8192`, while the current `/anthropic`
+    Gemini adapter effort path has been observed using `thinkingLevel` for
+    selected Gemini 3 cases. Decide whether that difference is intentional
+    model/API behavior or should become an adapter default-alignment fix.
+    Native Gemini tool-use capture is still only envelope evidence, not a
+    first-party tool-call parity baseline.
   - If live Gemini captures show true partial `functionCall.args` fragments
     across valid Code Assist SSE events, add a focused fixture for that exact
     shape. Current focused coverage proves multiple function calls spread across

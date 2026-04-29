@@ -2,6 +2,27 @@
 
 ## 2026-04-29
 
+- Added native Gemini CLI Code Assist request-payload gates to the focused
+  adapter harness. Both native Gemini passthrough cases now require the Code
+  Assist envelope fields `model`, `project`, `user_prompt_id`,
+  `request.contents`, `request.session_id`, `request.systemInstruction`,
+  `request.generationConfig.thinkingConfig`, and `request.tools`, and pin the
+  native `gemini-2.5-flash` defaults `includeThoughts=true` plus
+  `thinkingBudget=8192`. The config-shape test
+  `test_native_gemini_cases_have_code_assist_request_payload_gates` covers the
+  gate so future config edits do not silently drop the native comparison
+  baseline.
+
+- Focused validation for the native Gemini payload-gate slice passed: the
+  config-shape pytest passed, JSON parsing passed for
+  `scripts/local-ci/anthropic_adapter_config.json`, `git diff --check` passed,
+  and the live dev harness pair
+  `native_gemini_passthrough_generate_content,native_gemini_passthrough_stream_generate_content`
+  passed with zero failures and zero warnings at
+  `/tmp/native_gemini_payload_gates_after_config.json`. Trace ids were
+  `91c433d5-d59d-4b69-8fb8-bfb751393c9e` and
+  `0a4697df-e3fd-402a-a93f-af4c53e8d7cb`.
+
 - Implemented the Codex-native tool alias layer for `/anthropic` traffic that
   targets OpenAI/Codex Responses. The adapter now maps Claude-side `Bash`
   definitions, `tool_choice`, and prior assistant tool-use history to upstream
