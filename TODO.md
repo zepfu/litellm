@@ -218,6 +218,13 @@ these docs only as needed:
     of OpenAI-compatible `tools`, preserves web search as `web_search_options`,
     removes forced `tool_choice` values that target dropped hosted tools, and
     records unsupported hosted tool downgrades in metadata.
+    The NVIDIA live gate now passes via
+    `claude_adapter_nvidia_hosted_tool_policy`; keep the remaining unresolved
+    work scoped to any future OpenRouter-style completion target that can
+    exercise the same policy. Do not restore `request_payload_checks` for the
+    NVIDIA case unless the harness gains transformed upstream-payload capture;
+    the current Langfuse generation input does not expose NVIDIA completion
+    `tools`, `web_search_options`, or adapter metadata reliably for that path.
 
   OpenRouter Responses adapter:
   - Treat it as the OpenAI Responses parity path plus OpenRouter-specific
