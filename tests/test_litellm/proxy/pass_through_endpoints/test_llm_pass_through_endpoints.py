@@ -7708,6 +7708,33 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["trace_environment"] == "dev"
         assert litellm_metadata["source_trace_environment"] == "prod"
 
+    def test_prepare_request_body_for_passthrough_observability_infers_codex_workspace_repository(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-session-abc"}
+        request_body = {
+            "model": "gpt-5.5",
+            "instructions": (
+                "# AGENTS.md instructions for /home/zepfu/projects/aawm\n\n"
+                "<environment_context>\n"
+                "  <cwd>/home/zepfu/projects/aawm</cwd>\n"
+                "</environment_context>"
+            ),
+            "input": "hello",
+        }
+
+        updated_body = _prepare_request_body_for_passthrough_observability(
+            mock_request,
+            request_body,
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "codex-session-abc"
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert litellm_metadata["repository"] == "aawm"
+
     @pytest.mark.parametrize(
         ("endpoint", "expected_route_family"),
         [

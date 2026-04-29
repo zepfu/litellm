@@ -615,6 +615,11 @@ _AAWM_REPOSITORY_HEADER_NAMES = (
     "x-repository",
     "x-git-repository",
 )
+_AAWM_REPOSITORY_TEXT_PATTERNS = (
+    re.compile(r"AGENTS\.md instructions for (?P<path>/[^\n<]+)"),
+    re.compile(r"<cwd>(?P<path>[^<]+)</cwd>"),
+    re.compile(r"\bcwd\b\s*[:=]\s*['\"]?(?P<path>/[^'\"\n<]+)"),
+)
 _AAWM_SESSION_HISTORY_BATCH_SIZE = 32
 _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
 _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS = 0.1
@@ -1081,10 +1086,39 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
                 cleaned = urlunsplit(("", netloc, path, "", "")).strip("/")
         except Exception:
             pass
+    elif cleaned.startswith("/"):
+        cleaned = cleaned.rstrip("/").rsplit("/", 1)[-1]
 
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
     return cleaned.strip().strip("/") or None
+
+
+def _extract_repository_identity_from_text(value: str) -> Optional[str]:
+    for pattern in _AAWM_REPOSITORY_TEXT_PATTERNS:
+        match = pattern.search(value)
+        if not match:
+            continue
+        repository = _normalize_repository_identity(match.group("path"))
+        if repository:
+            return repository
+    return None
+
+
+def _extract_repository_identity_from_value(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return _extract_repository_identity_from_text(value)
+    if isinstance(value, dict):
+        for child in value.values():
+            repository = _extract_repository_identity_from_value(child)
+            if repository:
+                return repository
+    if isinstance(value, list):
+        for child in value:
+            repository = _extract_repository_identity_from_value(child)
+            if repository:
+                return repository
+    return None
 
 
 def _extract_repository_identity_from_metadata_sources(
@@ -1099,7 +1133,12 @@ def _extract_repository_identity_from_metadata_sources(
             if repository:
                 return repository
 
-        for nested_key in ("metadata", "request_metadata", "user_api_key_metadata"):
+        for nested_key in (
+            "metadata",
+            "litellm_metadata",
+            "request_metadata",
+            "user_api_key_metadata",
+        ):
             nested_source = _coerce_mapping(source.get(nested_key))
             if not nested_source:
                 continue
@@ -1107,6 +1146,10 @@ def _extract_repository_identity_from_metadata_sources(
                 repository = _normalize_repository_identity(nested_source.get(key))
                 if repository:
                     return repository
+
+        repository = _extract_repository_identity_from_value(source)
+        if repository:
+            return repository
 
     return None
 
@@ -1126,13 +1169,16 @@ def _extract_repository_identity_from_kwargs(
 
     repository = _extract_repository_identity_from_metadata_sources(
         ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
+        ("litellm_params.litellm_metadata", litellm_params.get("litellm_metadata")),
         ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
         ("kwargs.metadata", kwargs.get("metadata")),
         ("litellm_params.proxy_server_request.body", proxy_body),
         ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
+        ("litellm_params.proxy_server_request.body.litellm_metadata", proxy_body.get("litellm_metadata")),
         ("passthrough_logging_payload", passthrough_payload),
         ("passthrough_logging_payload.request_body", passthrough_body),
         ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
+        ("passthrough_logging_payload.request_body.litellm_metadata", passthrough_body.get("litellm_metadata")),
         ("standard_logging_object", standard_logging_object),
         ("kwargs", kwargs),
     )
