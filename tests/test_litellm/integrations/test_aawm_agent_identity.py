@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import litellm
 from litellm.integrations import aawm_agent_identity
 from litellm.integrations.aawm_agent_identity import (
     AawmAgentIdentity,
@@ -489,6 +490,39 @@ def test_build_session_history_record_uses_repository_header_and_metadata() -> N
     assert payload[46] == "zepfu/litellm"
 
 
+def test_build_session_history_record_uses_repository_as_tenant_fallback() -> None:
+    kwargs = _base_kwargs()
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = []
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-repository-tenant"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-repository-tenant"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-aawm-repository": "https://github.com/zepfu/litellm.git"}
+    }
+
+    result = {
+        "id": "resp-repository-tenant",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-29T10:00:00Z",
+        end_time="2026-04-29T10:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "zepfu/litellm"
+    assert record["tenant_id"] == "zepfu/litellm"
+    assert record["metadata"]["repository"] == "zepfu/litellm"
+    assert record["metadata"]["tenant_id"] == "zepfu/litellm"
+    assert record["metadata"]["tenant_id_source"] == "repository"
+
+
 def test_build_session_history_record_uses_prepared_body_litellm_metadata_repository() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "gpt-5.5"
@@ -590,7 +624,9 @@ def test_build_session_history_record_infers_repository_from_codex_workspace_tex
 
     assert record is not None
     assert record["repository"] == "aawm"
+    assert record["tenant_id"] == "aawm"
     assert record["metadata"]["repository"] == "aawm"
+    assert record["metadata"]["tenant_id"] == "aawm"
 
 
 def test_build_session_history_record_infers_repository_from_gemini_workspace_directories() -> None:
@@ -644,7 +680,9 @@ def test_build_session_history_record_infers_repository_from_gemini_workspace_di
 
     assert record is not None
     assert record["repository"] == "mcp-pg"
+    assert record["tenant_id"] == "mcp-pg"
     assert record["metadata"]["repository"] == "mcp-pg"
+    assert record["metadata"]["tenant_id"] == "mcp-pg"
 
 
 def test_build_session_history_record_infers_repository_from_structured_workspace_root() -> None:
@@ -683,7 +721,9 @@ def test_build_session_history_record_infers_repository_from_structured_workspac
 
     assert record is not None
     assert record["repository"] == "mcp-pg"
+    assert record["tenant_id"] == "mcp-pg"
     assert record["metadata"]["repository"] == "mcp-pg"
+    assert record["metadata"]["tenant_id"] == "mcp-pg"
 
 
 def test_build_session_history_record_marks_claude_permission_check() -> None:
@@ -1245,6 +1285,9 @@ def test_build_session_history_record_prefers_explicit_metadata_tenant() -> None
     kwargs["litellm_call_id"] = "call-explicit-tenant"
     kwargs["litellm_params"]["metadata"]["session_id"] = "session-explicit-tenant"
     kwargs["litellm_params"]["metadata"]["user_api_key_org_id"] = "org-aawm"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-aawm-repository": "https://github.com/zepfu/litellm.git"}
+    }
 
     record = _build_session_history_record(
         kwargs=kwargs,
@@ -1255,7 +1298,9 @@ def test_build_session_history_record_prefers_explicit_metadata_tenant() -> None
 
     assert record is not None
     assert record["tenant_id"] == "org-aawm"
+    assert record["repository"] == "zepfu/litellm"
     assert record["metadata"]["tenant_id"] == "org-aawm"
+    assert record["metadata"]["repository"] == "zepfu/litellm"
     assert record["metadata"]["tenant_id_source"] == "litellm_params.metadata.user_api_key_org_id"
 
 
@@ -1306,7 +1351,12 @@ def test_build_session_history_record_calculates_gpt_5_5_cost_from_current_price
     )
 
     assert record is not None
-    assert record["response_cost_usd"] == pytest.approx(0.035)
+    model_prices = litellm.model_cost["gpt-5.5"]
+    expected_cost = (
+        (1000 * model_prices["input_cost_per_token"])
+        + (1000 * model_prices["output_cost_per_token"])
+    )
+    assert record["response_cost_usd"] == pytest.approx(expected_cost)
 
 
 def test_build_session_history_record_estimates_openrouter_rerank_tokens_from_request() -> None:
@@ -3174,6 +3224,38 @@ def test_build_session_history_record_from_langfuse_trace_observation_prefers_me
     assert record["tenant_id"] == "org-aawm"
     assert record["metadata"]["tenant_id"] == "org-aawm"
     assert record["metadata"]["tenant_id_source"] == "observation.metadata.user_api_key_org_id"
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_uses_repository_as_tenant_fallback() -> None:
+    trace = {
+        "id": "trace-repository-tenant",
+        "name": "codex",
+        "sessionId": "session-repository-tenant",
+        "input": {},
+    }
+    observation = {
+        "id": "call-repository-langfuse-tenant",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.5",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "metadata": {"repository": "https://github.com/zepfu/mcp-pg.git"},
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-repository-tenant",
+    )
+
+    assert record is not None
+    assert record["repository"] == "zepfu/mcp-pg"
+    assert record["tenant_id"] == "zepfu/mcp-pg"
+    assert record["metadata"]["repository"] == "zepfu/mcp-pg"
+    assert record["metadata"]["tenant_id"] == "zepfu/mcp-pg"
+    assert record["metadata"]["tenant_id_source"] == "repository"
 
 
 def test_build_session_history_record_from_langfuse_trace_observation_uses_tool_name_fallback() -> None:

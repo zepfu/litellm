@@ -90,6 +90,45 @@ def test_should_recalculate_rows_where_cache_tokens_exceed_input_tokens() -> Non
     assert cost > 0
 
 
+def test_should_derive_missing_tenant_from_session_history_metadata_repository() -> None:
+    tenant_id, source = backfill_session_history._derive_session_history_tenant_identity(
+        {
+            "tenant_id": None,
+            "repository": None,
+            "metadata": {"repository": "https://github.com/zepfu/mcp-pg.git"},
+        }
+    )
+
+    assert tenant_id == "zepfu/mcp-pg"
+    assert source == "session_history.metadata.repository"
+
+
+def test_should_derive_missing_tenant_from_session_history_repository_column() -> None:
+    tenant_id, source = backfill_session_history._derive_session_history_tenant_identity(
+        {
+            "tenant_id": "",
+            "repository": "mcp-pg",
+            "metadata": {},
+        }
+    )
+
+    assert tenant_id == "mcp-pg"
+    assert source == "session_history.repository"
+
+
+def test_should_not_derive_repository_tenant_when_session_history_tenant_exists() -> None:
+    tenant_id, source = backfill_session_history._derive_session_history_tenant_identity(
+        {
+            "tenant_id": "existing-tenant",
+            "repository": "mcp-pg",
+            "metadata": {"repository": "mcp-pg"},
+        }
+    )
+
+    assert tenant_id is None
+    assert source is None
+
+
 def test_should_extract_gemini_control_plane_methods_from_routes() -> None:
     for method in (
         "loadCodeAssist",
