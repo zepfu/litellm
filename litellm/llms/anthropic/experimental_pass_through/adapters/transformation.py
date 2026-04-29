@@ -872,6 +872,8 @@ class LiteLLMAnthropicMessagesAdapter:
             return "required"
         elif tool_choice["type"] == "auto":
             return "auto"
+        elif tool_choice["type"] == "none":
+            return "none"
         elif tool_choice["type"] == "tool":
             # Truncate tool name if it exceeds OpenAI's 64-char limit
             original_name = tool_choice.get("name", "")
@@ -886,6 +888,21 @@ class LiteLLMAnthropicMessagesAdapter:
             raise ValueError(
                 "Incompatible tool choice param submitted - {}".format(tool_choice)
             )
+
+    @staticmethod
+    def translate_anthropic_parallel_tool_calls_to_openai(
+        tool_choice: Optional[AnthropicMessagesToolChoice],
+        translated_tools: Optional[List[ChatCompletionToolParam]],
+    ) -> Optional[bool]:
+        if not tool_choice or not translated_tools:
+            return None
+        if tool_choice.get("type") == "none":
+            return None
+        if not tool_choice.get("disable_parallel_tool_use"):
+            return None
+        if not any(tool.get("type") == "function" for tool in translated_tools):
+            return None
+        return False
 
     def translate_anthropic_tools_to_openai(
         self,
@@ -1091,13 +1108,15 @@ class LiteLLMAnthropicMessagesAdapter:
                 new_kwargs["metadata"] = litellm_metadata
 
         ## CONVERT TOOL CHOICE
+        tool_choice: Optional[AnthropicMessagesToolChoice] = None
         if "tool_choice" in anthropic_message_request:
-            tool_choice = anthropic_message_request["tool_choice"]
-            if tool_choice:
+            raw_tool_choice = anthropic_message_request["tool_choice"]
+            if raw_tool_choice:
+                tool_choice = cast(AnthropicMessagesToolChoice, raw_tool_choice)
                 new_kwargs[
                     "tool_choice"
                 ] = self.translate_anthropic_tool_choice_to_openai(
-                    tool_choice=cast(AnthropicMessagesToolChoice, tool_choice)
+                    tool_choice=tool_choice
                 )
         ## CONVERT TOOLS
         if "tools" in anthropic_message_request:
@@ -1126,6 +1145,15 @@ class LiteLLMAnthropicMessagesAdapter:
                         model=new_kwargs.get("model"),
                         custom_llm_provider=custom_llm_provider,
                     )
+
+                    parallel_tool_calls = (
+                        self.translate_anthropic_parallel_tool_calls_to_openai(
+                            tool_choice=tool_choice,
+                            translated_tools=new_kwargs["tools"],
+                        )
+                    )
+                    if parallel_tool_calls is not None:
+                        new_kwargs["parallel_tool_calls"] = parallel_tool_calls
 
         ## CONVERT THINKING
         thinking = anthropic_message_request.get("thinking")

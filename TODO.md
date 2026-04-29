@@ -162,20 +162,6 @@ these docs only as needed:
   scope.
 
   OpenAI/Codex Responses adapter:
-  - Add `response.function_call_arguments.done` support to
-    `AnthropicResponsesStreamWrapper` for `/anthropic` requests adapted to
-    OpenAI Responses; native OpenAI passthrough is only the baseline showing
-    that arguments can arrive through both `.delta` and `.done` in
-    `OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream`,
-    while the Anthropic Responses stream wrapper currently handles only
-    `.delta` plus some `response.output_item.done` state. Cover the native
-    Codex shape where arguments arrive only in `.done`.
-  - Reuse or mirror native OpenAI Responses stream reconstruction when
-    collecting forced-stream ChatGPT/Codex responses for non-stream
-    `/anthropic` callers. `_collect_responses_response_from_stream()` currently
-    reconstructs final text, but not `function_call` / `mcp_call` output items
-    or `.done` arguments, even though `use_chatgpt_codex_defaults` forces
-    upstream `stream=true`.
   - Preserve intra-assistant content ordering in
     `translate_messages_to_responses_input()` when a prior Anthropic assistant
     turn mixes text and `tool_use` blocks; add a regression with text before
@@ -194,29 +180,20 @@ these docs only as needed:
     `session_history_tool_activity`.
 
   Google/Gemini Code Assist adapter:
-  - Add Anthropic-to-Google streaming fixtures for partial and parallel
+  - Add Anthropic-to-Google streaming behavior checks for partial and parallel
     `functionCall` chunks. The adapter always sends upstream
     `v1internal:streamGenerateContent`; the Anthropic wrapper currently buffers
     Gemini tool-call deltas until a terminal chunk, while native Gemini/Google
     adapter code can emit a function call once accumulated JSON parses and flush
     leftovers at stream end.
-  - Add a Code Assist SSE unit fixture containing text, `functionCall`,
-    thought/signature, `usageMetadata`, and `traceId`, then assert streamed
-    Anthropic events and non-stream collection are identical after
-    normalization. Current route coverage proves `alt=sse` targeting but mocks
-    too much of the Google SSE -> Vertex iterator -> Anthropic SSE path.
   - Document and test the session/id contract against native Gemini CLI:
     native Gemini passthrough preserves CLI `request.session_id` as baseline
     behavior, while `/anthropic` to Google derives a model-scoped Code Assist
     session and hand-builds `user_prompt_id`. Add a golden-envelope comparison
     for the same prompt/session, especially across follow-up tool turns.
-  - Add round-trip coverage for two same-name parallel Claude `tool_use` blocks
-    with distinct ids followed by `tool_result` blocks, asserting Code Assist
-    receives unambiguous `functionResponse` parts and Claude receives restored
-    tool names. Add explicit alias-contract tests for every Claude core tool
-    (`Read`, `Grep`, `Bash`, etc.) across tools, `tool_choice`, assistant
-    tool calls, streaming restored names, and native Gemini
-    `functionDeclaration` names.
+  - Add explicit alias-contract tests for every Claude core tool (`Read`,
+    `Grep`, `Bash`, etc.) across tools, `tool_choice`, assistant tool calls,
+    streaming restored names, and native Gemini `functionDeclaration` names.
 
   NVIDIA/OpenRouter completion adapters:
   - Preserve parallel streaming tool calls by tracking each upstream
@@ -224,10 +201,6 @@ these docs only as needed:
     non-stream adapter emits one `tool_use` per OpenAI tool call, but the
     streaming translator currently starts from `tool_calls[0]` and concatenates
     all streamed argument deltas into one `input_json_delta`.
-  - Mirror Responses adapter tool-choice semantics in the completion adapter:
-    support Anthropic `tool_choice.type="none"` and map
-    `disable_parallel_tool_use` to OpenAI-style `parallel_tool_calls=false`
-    where the target provider supports it.
   - Delay the initial streaming `content_block_start` until the first upstream
     chunk identifies text, thinking, or tool output. The completion stream
     wrapper currently opens an empty text block before reading the first chunk,
@@ -238,10 +211,8 @@ these docs only as needed:
     shape, or reject/drop unsupported tools with metadata explaining the
     downgrade.
   - Focused coverage to add before live harness work: one chunk containing two
-    `delta.tool_calls` entries, `tool_choice={"type":"auto",
-    "disable_parallel_tool_use":true}`, `tool_choice={"type":"none"}`, a
-    tool-only stream with no leading empty text block, and provider-specific
-    hosted-tool translation/rejection assertions.
+    `delta.tool_calls` entries, a tool-only stream with no leading empty text
+    block, and provider-specific hosted-tool translation/rejection assertions.
 
   OpenRouter Responses adapter:
   - Treat it as the OpenAI Responses parity path plus OpenRouter-specific
