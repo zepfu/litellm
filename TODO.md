@@ -167,6 +167,9 @@ these docs only as needed:
   only: use it to capture provider-native envelopes, stream event ordering, and
   durable logging expectations, not as extra non-`/anthropic` implementation
   scope.
+  After the focused NVIDIA and Gemini refinements, the broad dev default
+  `/anthropic` harness passed at
+  `/tmp/anthropic_full_dev_after_streaming_refinements.json`.
 
   OpenAI/Codex Responses adapter:
   - Codex stream/tool parity is now validated for the narrow focused pair.

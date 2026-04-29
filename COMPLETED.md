@@ -80,6 +80,19 @@
   trace ids included `86d81389-a6d3-4dea-9a1b-fe5f72f3ebb3` and
   `6bb7c51c-d63d-444e-b360-4b6d2ba86db6`.
 
+- Broad dev `/anthropic` harness regression passed after the NVIDIA hosted-tool
+  and Gemini Code Assist envelope refinements. Artifact:
+  `/tmp/anthropic_full_dev_after_streaming_refinements.json`. The run reported
+  `passed=true` with zero failures and zero warnings across the default dev
+  suite cases:
+  `claude_adapter_gpt54`, `claude_adapter_gpt55`,
+  `claude_adapter_gpt54_mini`, `claude_adapter_ctx_marker`,
+  `claude_adapter_ctx_marker_escaped`, `claude_adapter_codex_tool_activity`,
+  `claude_adapter_gemini_fanout`, `claude_adapter_peeromega_fanout`,
+  `claude_adapter_gpt55_read_pages_sanitizer`, `claude_adapter_spark`,
+  `claude_adapter_gemini31_pro`, `claude_adapter_openrouter_free`,
+  `claude_adapter_nemotron_super`, and `claude_adapter_gemini31_flash`.
+
 - Added native Gemini CLI Code Assist request-payload gates to the focused
   adapter harness. Both native Gemini passthrough cases now require the Code
   Assist envelope fields `model`, `project`, `user_prompt_id`,
