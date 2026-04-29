@@ -4933,6 +4933,7 @@
         "route:anthropic_messages",
         "route:anthropic_openai_responses_adapter",
         "anthropic-openai-responses-adapter",
+        "anthropic-openai-codex-native-tools",
         "anthropic-adapter-model:gpt-5.3-codex-spark",
         "anthropic-adapter-target:/v1/responses"
       ],
@@ -4946,6 +4947,7 @@
         "anthropic_adapter_model",
         "anthropic_adapter_original_model",
         "anthropic_adapter_target_endpoint",
+        "anthropic_adapter_codex_native_tool_aliases",
         "passthrough_route_family",
         "responses_stream_event_types",
         "responses_stream_tool_state"
@@ -4976,7 +4978,7 @@
         ],
         "expected_tools": [
           {
-            "tool_name": "Bash",
+            "tool_name": "exec_command",
             "tool_type": "function_call",
             "arguments_required_substrings": ["pwd"],
             "minimum_count": 1
@@ -5021,7 +5023,7 @@
           {
             "provider": "openai",
             "model": "gpt-5.3-codex-spark",
-            "tool_name": "Bash",
+            "tool_name": "exec_command",
             "tool_kind": "command",
             "minimum_count": 1,
             "command_text_contains": "pwd"

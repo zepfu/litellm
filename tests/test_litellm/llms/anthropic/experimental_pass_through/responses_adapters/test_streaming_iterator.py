@@ -503,6 +503,100 @@ async def test_stream_wrapper_emits_arguments_from_done_when_delta_is_absent():
 
 
 @pytest.mark.asyncio
+async def test_stream_wrapper_maps_codex_exec_command_deltas_back_to_bash():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=12,
+            output_tokens=7,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[
+            {
+                "type": "function_call",
+                "id": "fc_pwd",
+                "call_id": "call_pwd",
+                "name": "exec_command",
+                "arguments": {
+                    "cmd": "pwd",
+                    "login": True,
+                    "tty": False,
+                    "yield_time_ms": 1000,
+                    "max_output_tokens": 200,
+                },
+            }
+        ],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_pwd",
+                call_id="call_pwd",
+                name="exec_command",
+                arguments=None,
+            ),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_pwd",
+            delta='{"cmd":"p',
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_pwd",
+            delta='wd","login":true,"tty":false,"yield_time_ms":1000,"max_output_tokens":200}',
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_pwd",
+                call_id="call_pwd",
+                name="exec_command",
+                arguments={
+                    "cmd": "pwd",
+                    "login": True,
+                    "tty": False,
+                    "yield_time_ms": 1000,
+                    "max_output_tokens": 200,
+                },
+            ),
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="gpt-5.3-codex-spark",
+        use_codex_native_tools=True,
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    assert [chunk["type"] for chunk in chunks] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert chunks[1]["content_block"] == {
+        "type": "tool_use",
+        "id": "call_pwd",
+        "name": "Bash",
+        "input": {},
+    }
+    assert chunks[2]["delta"] == {
+        "type": "input_json_delta",
+        "partial_json": '{"command":"pwd"}',
+    }
+
+
+@pytest.mark.asyncio
 async def test_stream_wrapper_synthesizes_stop_and_usage_when_completed_is_missing():
     events = [
         SimpleNamespace(type="response.created"),

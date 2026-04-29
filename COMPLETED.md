@@ -2,6 +2,48 @@
 
 ## 2026-04-29
 
+- Implemented the Codex-native tool alias layer for `/anthropic` traffic that
+  targets OpenAI/Codex Responses. The adapter now maps Claude-side `Bash`
+  definitions, `tool_choice`, and prior assistant tool-use history to upstream
+  `exec_command` with `cmd`, while non-streaming and streaming Responses output
+  maps `exec_command` back to Claude-visible `Bash` / `command`. The alias is
+  opt-in only for the Codex-backed `/anthropic` route and records
+  `anthropic-openai-codex-native-tools` plus
+  `anthropic_adapter_codex_native_tool_aliases`.
+
+- Focused local validation for the Codex alias slice passed: exact adapter,
+  streaming, proxy-helper, route-scoping, and harness-config tests (`8 passed`);
+  the broader focused shard covering the full Responses streaming iterator,
+  proxy tool-choice class, route-scoping pair, and stream-state harness
+  validators (`25 passed`); `py_compile` for the touched adapter/proxy/harness
+  files; JSON parse for `scripts/local-ci/anthropic_adapter_config.json`;
+  `ruff check` for the touched Responses adapter implementation files; and
+  `git diff --check`.
+
+- Focused live dev validation for the Codex alias slice passed at
+  `/tmp/anthropic_codex_tool_alias_after_fix.json` with zero failures and zero
+  warnings for
+  `native_openai_passthrough_responses_codex_tool_activity,claude_adapter_codex_tool_activity`.
+  The Claude `/anthropic` trace was
+  `e820038c-4889-4408-9867-802b855af8ec`; Langfuse carried
+  `anthropic-openai-codex-native-tools` and
+  `anthropic_adapter_codex_native_tool_aliases`, `usage_tool_names` was
+  `["exec_command"]`, and `session_history_tool_activity` recorded
+  `tool_name=exec_command` with native Codex-style arguments including
+  `{"cmd": "pwd"}`. The native Codex baseline also passed. Installation note:
+  direct `docker cp` onto imported `/app/litellm/...` files failed with
+  `device or resource busy`; the working dev-container update path was
+  `docker cp` to `/tmp`, in-container `cp` to `/app/litellm/...`, then
+  `docker compose -f docker-compose.dev.yml restart litellm-dev`.
+
+- Failed/dead-end notes from the Codex alias slice: do not run the whole
+  `test_responses_adapters_transformation.py` file as the focused gate for this
+  path, because the known unrelated hang recurred after a single dot and had to
+  be killed. Use exact test node ids for the Codex alias cases instead. Also,
+  the first route-scoping pytest command used the wrong class node
+  (`TestAnthropicProxyRoute`) and failed at collection with `not found`; the
+  correct node is under `TestClaudePersistedOutputExpansion`.
+
 - Added the focused Codex stream-state parity gate for `/anthropic` work. The
   OpenAI passthrough streaming logger now records bounded
   `responses_stream_event_types`, event counts, reconstructed tool-call count,

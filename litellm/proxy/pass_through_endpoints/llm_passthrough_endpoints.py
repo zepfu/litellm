@@ -4679,6 +4679,18 @@ def _get_anthropic_adapter_openai_target_base(
     return os.getenv("OPENAI_API_BASE") or "https://api.openai.com/"
 
 
+def _add_codex_native_tool_alias_adapter_metadata(
+    adapter_tags: list[str],
+    adapter_extra_fields: dict[str, Any],
+    *,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    adapter_tags.append("anthropic-openai-codex-native-tools")
+    adapter_extra_fields["anthropic_adapter_codex_native_tool_aliases"] = True
+
+
 def _build_anthropic_responses_adapter_request_body(
     request_body: dict[str, Any],
     *,
@@ -4725,6 +4737,7 @@ def _build_anthropic_responses_adapter_request_body(
     translated_body = adapter.translate_request(
         anthropic_request,
         custom_llm_provider=translation_provider,
+        use_codex_native_tools=use_chatgpt_codex_defaults,
     )
     _normalize_openai_function_tool_schemas(translated_body)
 
@@ -4762,6 +4775,11 @@ def _build_anthropic_responses_adapter_request_body(
     )
     adapter_tags: list[str] = []
     adapter_extra_fields: dict[str, Any] = {}
+    _add_codex_native_tool_alias_adapter_metadata(
+        adapter_tags,
+        adapter_extra_fields,
+        enabled=use_chatgpt_codex_defaults,
+    )
     if normalized_effort is not None:
         adapter_tags.extend(normalized_effort.tags())
         adapter_extra_fields.update(normalized_effort.metadata())
@@ -4928,6 +4946,7 @@ def _build_anthropic_response_from_responses_response(
     *,
     reject_empty_success: bool = False,
     diagnostic_context: Optional[dict[str, Any]] = None,
+    use_codex_native_tools: bool = False,
 ) -> Response:
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
         LiteLLMAnthropicToResponsesAPIAdapter,
@@ -4952,7 +4971,10 @@ def _build_anthropic_response_from_responses_response(
         )
 
     adapter = LiteLLMAnthropicToResponsesAPIAdapter()
-    translated_response = adapter.translate_response(ResponsesAPIResponse(**response_body))
+    translated_response = adapter.translate_response(
+        ResponsesAPIResponse(**response_body),
+        use_codex_native_tools=use_codex_native_tools,
+    )
     if hasattr(translated_response, "model_dump_json"):
         serialized_response = translated_response.model_dump_json(exclude_none=True)
     elif hasattr(translated_response, "json"):
@@ -5667,6 +5689,7 @@ def _build_anthropic_streaming_response_from_responses_stream(
     model: str,
     request_body: Optional[dict[str, Any]] = None,
     reject_empty_success: bool = False,
+    use_codex_native_tools: bool = False,
 ) -> StreamingResponse:
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
         AnthropicResponsesStreamWrapper,
@@ -5677,6 +5700,7 @@ def _build_anthropic_streaming_response_from_responses_stream(
         model=model,
         request_body=request_body,
         reject_empty_success=reject_empty_success,
+        use_codex_native_tools=use_codex_native_tools,
     )
     return StreamingResponse(
         wrapper.async_anthropic_sse_wrapper(),
@@ -6138,7 +6162,8 @@ async def _handle_anthropic_openai_responses_adapter_route(
                 upstream_response
             )
             translated_response = _build_anthropic_response_from_responses_response(
-                response_body
+                response_body,
+                use_codex_native_tools=use_chatgpt_codex_defaults,
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -6150,6 +6175,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
             upstream_response,
             model=adapter_model,
             request_body=translated_request_body,
+            use_codex_native_tools=use_chatgpt_codex_defaults,
         )
 
     if not isinstance(upstream_response, Response):
@@ -6160,7 +6186,8 @@ async def _handle_anthropic_openai_responses_adapter_route(
 
     response_body = json.loads(upstream_response.body.decode("utf-8"))
     translated_response = _build_anthropic_response_from_responses_response(
-        response_body
+        response_body,
+        use_codex_native_tools=use_chatgpt_codex_defaults,
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,

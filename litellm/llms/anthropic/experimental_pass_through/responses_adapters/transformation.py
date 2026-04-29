@@ -151,6 +151,163 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         return {}
 
     @staticmethod
+    def _codex_native_exec_command_parameters() -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string",
+                    "description": "The shell command to execute.",
+                },
+                "login": {
+                    "type": "boolean",
+                    "description": "Run the command through a login shell.",
+                },
+                "tty": {
+                    "type": "boolean",
+                    "description": "Allocate a TTY for the command.",
+                },
+                "yield_time_ms": {
+                    "type": "integer",
+                    "description": "Milliseconds to wait before yielding output.",
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "description": "Maximum output tokens to return.",
+                },
+            },
+            "required": ["cmd"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _codex_native_tool_name_to_responses(
+        tool_name: Any,
+        *,
+        use_codex_native_tools: bool,
+    ) -> Any:
+        if use_codex_native_tools and tool_name == "Bash":
+            return "exec_command"
+        return tool_name
+
+    @staticmethod
+    def codex_native_tool_name_from_responses(
+        tool_name: Any,
+        *,
+        use_codex_native_tools: bool,
+    ) -> Any:
+        if use_codex_native_tools and tool_name == "exec_command":
+            return "Bash"
+        return tool_name
+
+    @staticmethod
+    def _codex_native_tool_input_to_responses(
+        tool_name: Any,
+        tool_input: Any,
+        *,
+        use_codex_native_tools: bool,
+    ) -> Any:
+        if not use_codex_native_tools or tool_name != "Bash":
+            return tool_input
+        if not isinstance(tool_input, dict):
+            return tool_input
+
+        mapped: Dict[str, Any] = {}
+        command = tool_input.get("command")
+        if command is not None:
+            mapped["cmd"] = command
+        for key in ("login", "tty", "yield_time_ms", "max_output_tokens"):
+            if key in tool_input:
+                mapped[key] = tool_input[key]
+        return mapped
+
+    @staticmethod
+    def codex_native_tool_input_from_responses(
+        tool_name: Any,
+        tool_input: Any,
+        *,
+        use_codex_native_tools: bool,
+    ) -> Any:
+        if not use_codex_native_tools or tool_name != "exec_command":
+            return tool_input
+        if not isinstance(tool_input, dict):
+            return tool_input
+
+        mapped: Dict[str, Any] = {}
+        command = tool_input.get("cmd")
+        if command is not None:
+            mapped["command"] = command
+        for key, value in tool_input.items():
+            if key in {"cmd", "login", "tty", "yield_time_ms", "max_output_tokens"}:
+                continue
+            mapped[key] = value
+        return mapped
+
+    @classmethod
+    def codex_native_tool_input_json_from_responses(
+        cls,
+        tool_name: Any,
+        arguments_json: str,
+        *,
+        use_codex_native_tools: bool,
+    ) -> str:
+        if not use_codex_native_tools or tool_name != "exec_command":
+            return arguments_json
+        try:
+            parsed = json.loads(arguments_json)
+        except json.JSONDecodeError:
+            return arguments_json
+        mapped = cls.codex_native_tool_input_from_responses(
+            tool_name,
+            parsed,
+            use_codex_native_tools=use_codex_native_tools,
+        )
+        if mapped == parsed:
+            return arguments_json
+        return json.dumps(mapped, separators=(",", ":"))
+
+    def _responses_function_call_to_anthropic_tool_use(
+        self,
+        *,
+        upstream_tool_name: Any,
+        arguments: Any,
+        call_id: Any,
+        fallback_id: Any,
+        use_codex_native_tools: bool,
+    ) -> Dict[str, Any]:
+        anthropic_tool_name = self.codex_native_tool_name_from_responses(
+            upstream_tool_name,
+            use_codex_native_tools=use_codex_native_tools,
+        )
+        tool_input = self.codex_native_tool_input_from_responses(
+            upstream_tool_name,
+            self._deserialize_tool_input(arguments),
+            use_codex_native_tools=use_codex_native_tools,
+        )
+        input_data = sanitize_anthropic_tool_use_input(
+            tool_name=anthropic_tool_name,
+            tool_input=tool_input,
+        )
+        return AnthropicResponseContentBlockToolUse(
+            type="tool_use",
+            id=call_id or fallback_id or "",
+            name=anthropic_tool_name,
+            input=input_data,
+        ).model_dump()
+
+    @classmethod
+    def _codex_native_tool_schema_to_responses(
+        cls,
+        tool_name: Any,
+        schema: Any,
+        *,
+        use_codex_native_tools: bool,
+    ) -> Any:
+        if not use_codex_native_tools or tool_name != "Bash":
+            return schema
+        return cls._codex_native_exec_command_parameters()
+
+    @staticmethod
     def _extract_allowed_tools_from_mcp_toolset(
         toolset: AnthropicMcpToolset,
     ) -> Optional[List[str]]:
@@ -235,6 +392,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 AnthopicMessagesAssistantMessageParam,
             ]
         ],
+        *,
+        use_codex_native_tools: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Convert Anthropic messages list to Responses API `input` items.
@@ -336,13 +495,23 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                             )
                         elif btype == "tool_use":
                             flush_assistant_parts()
+                            tool_name = block.get("name", "")
+                            responses_tool_name = self._codex_native_tool_name_to_responses(
+                                tool_name,
+                                use_codex_native_tools=use_codex_native_tools,
+                            )
+                            tool_input = self._codex_native_tool_input_to_responses(
+                                tool_name,
+                                block.get("input", {}),
+                                use_codex_native_tools=use_codex_native_tools,
+                            )
                             # tool_use becomes a top-level function_call item
                             input_items.append(
                                 {
                                     "type": "function_call",
                                     "call_id": block.get("id", ""),
-                                    "name": block.get("name", ""),
-                                    "arguments": json.dumps(block.get("input", {})),
+                                    "name": responses_tool_name,
+                                    "arguments": json.dumps(tool_input),
                                 }
                             )
                         elif btype == "mcp_tool_result":
@@ -373,6 +542,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     def translate_tools_to_responses_api(
         self,
         tools: List[AllAnthropicToolsValues],
+        *,
+        use_codex_native_tools: bool = False,
     ) -> List[Dict[str, Any]]:
         """Convert Anthropic tool definitions to Responses API function tools."""
         result: List[Dict[str, Any]] = []
@@ -386,17 +557,28 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             ) or tool_name == "web_search":
                 result.append({"type": "web_search_preview"})
                 continue
-            func_tool: Dict[str, Any] = {"type": "function", "name": tool_name}
+            responses_tool_name = self._codex_native_tool_name_to_responses(
+                tool_name,
+                use_codex_native_tools=use_codex_native_tools,
+            )
+            func_tool: Dict[str, Any] = {"type": "function", "name": responses_tool_name}
             if "description" in tool_dict:
                 func_tool["description"] = tool_dict["description"]
             if "input_schema" in tool_dict:
-                func_tool["parameters"] = tool_dict["input_schema"]
+                func_tool["parameters"] = self._codex_native_tool_schema_to_responses(
+                    tool_name,
+                    tool_dict["input_schema"],
+                    use_codex_native_tools=use_codex_native_tools,
+                )
             result.append(func_tool)
         return result
 
-    @staticmethod
+    @classmethod
     def translate_tool_choice_to_responses_api(
+        cls,
         tool_choice: AnthropicMessagesToolChoice,
+        *,
+        use_codex_native_tools: bool = False,
     ) -> Any:
         """Convert Anthropic tool_choice to Responses API tool_choice."""
         tc_type = tool_choice.get("type")
@@ -407,7 +589,13 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         elif tc_type == "auto":
             return "auto"
         elif tc_type == "tool":
-            return {"type": "function", "name": tool_choice.get("name", "")}
+            return {
+                "type": "function",
+                "name": cls._codex_native_tool_name_to_responses(
+                    tool_choice.get("name", ""),
+                    use_codex_native_tools=use_codex_native_tools,
+                ),
+            }
         return "auto"
 
     @staticmethod
@@ -518,6 +706,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         anthropic_request: AnthropicMessagesRequest,
         *,
         custom_llm_provider: Optional[str] = None,
+        use_codex_native_tools: bool = False,
     ) -> Dict[str, Any]:
         """
         Translate a full Anthropic /v1/messages request dict to
@@ -536,7 +725,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
         responses_kwargs: Dict[str, Any] = {
             "model": model,
-            "input": self.translate_messages_to_responses_input(messages_list),
+            "input": self.translate_messages_to_responses_input(
+                messages_list,
+                use_codex_native_tools=use_codex_native_tools,
+            ),
         }
 
         # system -> instructions
@@ -578,7 +770,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             ]
             translated_tools_list.extend(
                 self.translate_tools_to_responses_api(
-                    cast(List[AllAnthropicToolsValues], standard_tools)
+                    cast(List[AllAnthropicToolsValues], standard_tools),
+                    use_codex_native_tools=use_codex_native_tools,
                 )
             )
         if mcp_servers:
@@ -596,7 +789,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         tool_choice = anthropic_request.get("tool_choice")
         if tool_choice:
             translated_tool_choice = self.translate_tool_choice_to_responses_api(
-                cast(AnthropicMessagesToolChoice, tool_choice)
+                cast(AnthropicMessagesToolChoice, tool_choice),
+                use_codex_native_tools=use_codex_native_tools,
             )
             tool_choice_type = cast(AnthropicMessagesToolChoice, tool_choice).get("type")
             if not (tool_choice_type == "none" and not translated_tools):
@@ -690,6 +884,8 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     def translate_response(
         self,
         response: ResponsesAPIResponse,
+        *,
+        use_codex_native_tools: bool = False,
     ) -> AnthropicMessagesResponse:
         """
         Translate an OpenAI ResponsesAPIResponse to AnthropicMessagesResponse.
@@ -776,17 +972,14 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         )
 
             elif isinstance(item, ResponseFunctionToolCall):
-                input_data = sanitize_anthropic_tool_use_input(
-                    tool_name=item.name,
-                    tool_input=self._deserialize_tool_input(item.arguments),
-                )
                 content.append(
-                    AnthropicResponseContentBlockToolUse(
-                        type="tool_use",
-                        id=item.call_id or item.id or "",
-                        name=item.name,
-                        input=input_data,
-                    ).model_dump()
+                    self._responses_function_call_to_anthropic_tool_use(
+                        upstream_tool_name=item.name,
+                        arguments=item.arguments,
+                        call_id=item.call_id,
+                        fallback_id=item.id,
+                        use_codex_native_tools=use_codex_native_tools,
+                    )
                 )
                 stop_reason = "tool_use"
             elif isinstance(item, dict):
@@ -799,17 +992,14 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 ).model_dump()
                             )
                 elif item_type == "function_call":
-                    input_data = sanitize_anthropic_tool_use_input(
-                        tool_name=item.get("name", ""),
-                        tool_input=self._deserialize_tool_input(item.get("arguments")),
-                    )
                     content.append(
-                        AnthropicResponseContentBlockToolUse(
-                            type="tool_use",
-                            id=item.get("call_id") or item.get("id", ""),
-                            name=item.get("name", ""),
-                            input=input_data,
-                        ).model_dump()
+                        self._responses_function_call_to_anthropic_tool_use(
+                            upstream_tool_name=item.get("name", ""),
+                            arguments=item.get("arguments"),
+                            call_id=item.get("call_id"),
+                            fallback_id=item.get("id"),
+                            use_codex_native_tools=use_codex_native_tools,
+                        )
                     )
                     stop_reason = "tool_use"
 
