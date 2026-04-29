@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -2015,6 +2016,50 @@ def test_translate_anthropic_tools_mixed_names():
     assert len(result[1]["function"]["name"]) <= 64
     # Only long name in mapping
     assert len(tool_name_mapping) == 1
+
+
+def test_translate_anthropic_tools_strips_anthropic_only_metadata_from_schema():
+    tools = [
+        {
+            "type": "custom",
+            "name": "write_file",
+            "description": "Write a file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+            },
+            "defer_loading": True,
+            "eager_input_streaming": True,
+            "allowed_callers": ["tool_search_tool_regex"],
+            "input_examples": [{"content": "hello"}],
+            "custom": {"defer_loading": True},
+        }
+    ]
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result, tool_name_mapping = adapter.translate_anthropic_tools_to_openai(
+        tools=tools, model="openrouter/test-model"
+    )
+
+    assert tool_name_mapping == {}
+    assert len(result) == 1
+    function = result[0]["function"]
+    assert function["name"] == "write_file"
+    assert function["parameters"] == {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+        "required": ["content"],
+    }
+    serialized_tool = json.dumps(result[0])
+    for metadata_key in (
+        "defer_loading",
+        "eager_input_streaming",
+        "allowed_callers",
+        "input_examples",
+        "custom",
+    ):
+        assert metadata_key not in serialized_tool
 
 
 def test_translate_openai_response_restores_tool_names():

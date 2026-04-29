@@ -18,6 +18,24 @@ from typing import (
 OPENAI_MAX_TOOL_NAME_LENGTH = 64
 TOOL_NAME_HASH_LENGTH = 8
 TOOL_NAME_PREFIX_LENGTH = OPENAI_MAX_TOOL_NAME_LENGTH - TOOL_NAME_HASH_LENGTH - 1  # 55
+ANTHROPIC_ONLY_TOOL_METADATA_KEYS = frozenset(
+    {
+        "allowed_callers",
+        "defer_loading",
+        "eager_input_streaming",
+        "input_examples",
+    }
+)
+ANTHROPIC_TOOL_ENVELOPE_KEYS = frozenset(
+    {
+        "cache_control",
+        "description",
+        "input_schema",
+        "name",
+        "type",
+        *ANTHROPIC_ONLY_TOOL_METADATA_KEYS,
+    }
+)
 
 
 def truncate_tool_name(name: str) -> str:
@@ -130,6 +148,18 @@ def sanitize_anthropic_tool_use_id(tool_use_id: Any) -> str:
     if separator and base_id:
         return base_id
     return tool_use_id
+
+
+def _strip_anthropic_only_tool_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_anthropic_only_tool_metadata(child)
+            for key, child in value.items()
+            if key not in ANTHROPIC_ONLY_TOOL_METADATA_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_anthropic_only_tool_metadata(child) for child in value]
+    return value
 
 
 from openai.types.chat.chat_completion_chunk import Choice as OpenAIStreamingChoice
@@ -946,7 +976,6 @@ class LiteLLMAnthropicMessagesAdapter:
         """
         new_tools: List[ChatCompletionToolParam] = []
         tool_name_mapping: Dict[str, str] = {}
-        mapped_tool_params = ["name", "input_schema", "description", "cache_control"]
         preserve_cache_control = self._should_preserve_cache_control_for_target(
             model=model,
             custom_llm_provider=custom_llm_provider,
@@ -976,8 +1005,16 @@ class LiteLLMAnthropicMessagesAdapter:
                 function_chunk["description"] = tool["description"]  # type: ignore
 
             for k, v in tool.items():
-                if k not in mapped_tool_params:  # pass additional computer kwargs
-                    function_chunk.setdefault("parameters", {}).update({k: v})
+                if k in ANTHROPIC_TOOL_ENVELOPE_KEYS:
+                    continue
+                cleaned_value = _strip_anthropic_only_tool_metadata(v)
+                if k == "custom" and cleaned_value == {}:
+                    continue
+                parameters = function_chunk.get("parameters")
+                if not isinstance(parameters, dict):
+                    parameters = {}
+                    function_chunk["parameters"] = parameters  # type: ignore
+                parameters.update({k: cleaned_value})
             tool_param = ChatCompletionToolParam(
                 type="function", function=function_chunk
             )

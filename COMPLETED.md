@@ -2,6 +2,38 @@
 
 ## 2026-04-29
 
+- Validation note for the non-deferred `/anthropic` schema-safety
+  cleanup: the OpenAI-compatible chat adapter now strips Anthropic-only tool
+  metadata (`defer_loading`, `eager_input_streaming`, `allowed_callers`, and
+  `input_examples`) before forwarding non-Anthropic provider tool schemas, and
+  the OpenAI Responses adapter has a regression test pinning that the same
+  fields stay absent there. Focused local validation passed with `81 passed`
+  across the chat adapter transformation file plus
+  `TestTranslateToolsToResponsesAPI`; `py_compile`, targeted Ruff
+  `E9,F821,F823`, and `git diff --check` passed.
+
+  Live dev `:4001` validation refreshed `litellm-dev` by restart; the edited
+  chat adapter file is bind-mounted into the container. The first broad dev
+  harness at `/tmp/anthropic_tool_metadata_strip_full_dev.json` failed two
+  unrelated live checks: `claude_adapter_codex_tool_activity` persisted the
+  expected `openai/gpt-5.3-codex-spark` `exec_command` / `pwd` tool activity
+  row, but the final natural-language JSON `result` typoed
+  `/home/zepvu/projects/litellm`; `claude_adapter_gemini_fanout` missed the
+  Gemini 3.1 Pro child trace/session rows because Google Code Assist returned
+  upstream `429 RESOURCE_EXHAUSTED / MODEL_CAPACITY_EXHAUSTED`. The focused
+  failed-case rerun passed both cases with zero failures/warnings at
+  `/tmp/anthropic_tool_metadata_strip_failed_cases_rerun.json`.
+
+  A second broad dev harness rerun at
+  `/tmp/anthropic_tool_metadata_strip_full_dev_rerun.json` cleared the
+  OpenAI/Codex path and every non-fanout default case, but still failed the
+  Gemini fanout gates because Gemini 3.1 Pro again returned upstream
+  `MODEL_CAPACITY_EXHAUSTED`; `claude_adapter_peeromega_fanout` also failed
+  only the expected Gemini 3.1 Pro session-history row for the same capacity
+  reason. Treat these as live provider-capacity gate failures, not as evidence
+  of schema-strip regression. Rerun the broad harness when Gemini 3.1 Pro
+  capacity is available.
+
 - Fixed the remaining native Codex/Gemini attribution mismatch with the
   reporting query: `tenant_id` is now populated from the resolved repository
   when no explicit tenant is present, and `metadata.tenant_id` /
