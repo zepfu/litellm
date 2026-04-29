@@ -100,20 +100,21 @@ identity through `x-aawm-repository` and hard-gate that
 `public.session_history.repository` is populated for the emitted provider
 session.
 
-OpenRouter Responses hard gates must also catch streams that finish without a
-`response.completed` event. The adapter should still emit a valid Anthropic
-`message_delta` / `message_stop`, and passthrough logging should persist
-non-zero estimated usage/cost using the checked-in/bundled model-price JSON
-when LiteLLM's loaded runtime cost map does not yet include the OpenRouter free
-model alias.
+OpenRouter Responses hard gates must catch both incomplete-but-useful streams
+and successful-empty streams. If OpenRouter omits `response.completed` but emits
+usable text, the adapter may synthesize a valid Anthropic `message_delta` /
+`message_stop` and persist estimated usage/cost. If OpenRouter returns a
+successful stream/body with no usable assistant text, tool call, or thinking
+content, the OpenRouter adapter rejects it and logs bounded raw event/body
+diagnostics. Harness cases with `fail_empty_success` hard-fail empty successful
+Claude command output even when the case is otherwise warning-only.
 
-OpenRouter/Ling has a separate unresolved failure mode after the aawm.37 prod
-cutover: `inclusionai/ling-2.6-flash:free` can return a successful-but-empty
-Claude Code child result with zero tokens, no assistant message, and no
-completion notification even though LiteLLM records a quick successful request.
-Until the raw response/chunk shape is captured and classified, keep Ling/free
-as warning-only and make future focused Ling harness work hard-fail empty
-successful responses with per-child completion state in the artifact.
+OpenRouter/Ling remains a legacy warning-only canary, not a release gate. The
+aawm.37 prod cutover exposed successful-empty Ling/free behavior, and the
+focused dev rerun on 2026-04-29 now shows OpenRouter returning `404` because
+`inclusionai/ling-2.6-flash:free` is no longer available as a free model. Use a
+currently available replacement OpenRouter model for future parallel read-tool
+proofs.
 
 OpenRouter GPT-OSS edge cases remain explicit opt-in checks, not default hard
 gates. When selected, `claude_adapter_gpt_oss_120b` has one narrow allowed
@@ -210,9 +211,8 @@ noisy on some OpenRouter-adapted runs.
 
 Important lane note:
 - `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic ->
-  OpenRouter `Responses` lane with the other `vendor/model:free` adapters, but
-  successful-empty / zero-token Ling results are unresolved and should not be
-  promoted to hard-gate proof without stricter no-empty-response capture
+  OpenRouter `Responses` lane as a legacy canary only. It is not a hard-gate
+  proof target because OpenRouter now reports that the free model is unavailable.
 - `openrouter/elephant-alpha` remains the special Anthropic -> OpenRouter
   `chat/completions` detour for the legacy agent/model mapping
 

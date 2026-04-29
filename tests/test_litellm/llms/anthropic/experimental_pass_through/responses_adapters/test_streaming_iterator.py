@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
+    AnthropicResponsesEmptySuccessError,
     AnthropicResponsesStreamWrapper,
 )
 
@@ -463,3 +464,39 @@ async def test_stream_wrapper_synthesizes_stop_and_usage_when_completed_is_missi
     }
     assert chunks[3]["usage"]["input_tokens"] >= 1
     assert chunks[3]["usage"]["output_tokens"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_rejects_empty_success_when_enabled():
+    response_obj = SimpleNamespace(
+        id="resp_empty",
+        status="completed",
+        model="inclusionai/ling-2.6-flash:free",
+        usage=SimpleNamespace(
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="inclusionai/ling-2.6-flash:free",
+        request_body={
+            "model": "inclusionai/ling-2.6-flash:free",
+            "stream": True,
+        },
+        reject_empty_success=True,
+    )
+
+    with pytest.raises(AnthropicResponsesEmptySuccessError) as exc_info:
+        [chunk async for chunk in wrapper]
+
+    assert "empty successful response" in str(exc_info.value)
+    assert "resp_empty" in str(exc_info.value)

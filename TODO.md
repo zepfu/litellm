@@ -91,14 +91,16 @@ these docs only as needed:
   artifact:
   `/tmp/claude_adapter_gpt55_child_parallel_read_tools_parallel_instruction_policy.json`.
 
-- OpenRouter and NVIDIA `/anthropic` parallel read-tool proofs are now validated
-  on dev `:4001`. OpenRouter proof uses
-  `openrouter/inclusionai/ling-2.6-flash:free`; the earlier
-  `openrouter/qwen/qwen3-coder:free` attempt hit provider 429 from Venice before
-  adapter validation and should remain a dead-end breadcrumb, not a regression.
-  NVIDIA proof uses `nvidia/deepseek-ai/deepseek-v3.2`; no separate
-  completion-side parallel policy was needed because the model emitted the three
-  tools together once the child trace-name metadata merge was fixed. Artifacts:
+- OpenRouter and NVIDIA `/anthropic` parallel read-tool proofs were validated
+  historically on dev `:4001`. The old OpenRouter proof used
+  `openrouter/inclusionai/ling-2.6-flash:free`, but that alias is now a legacy
+  canary because OpenRouter reports Ling 2.6 Flash is no longer available as a
+  free model. The earlier `openrouter/qwen/qwen3-coder:free` attempt hit
+  provider 429 from Venice before adapter validation and should remain a
+  dead-end breadcrumb, not a regression. NVIDIA proof uses
+  `nvidia/deepseek-ai/deepseek-v3.2`; no separate completion-side parallel
+  policy was needed because the model emitted the three tools together once the
+  child trace-name metadata merge was fixed. Artifacts:
   `/tmp/claude_adapter_openrouter_ling_nvidia_parallel_read_tools.json` and
   `/tmp/claude_adapter_nvidia_parallel_read_tools_trace_fix.json`.
 
@@ -111,43 +113,25 @@ these docs only as needed:
   `/tmp/litellm-prod-aawm37-cb12-focused-no-openrouter.json`; do not redo that
   fix unless the same trace-header overwrite signature recurs.
 
-- Next deep dive: determine why OpenRouter
-  `inclusionai/ling-2.6-flash:free` returns successful-but-empty Claude Code
-  child results through `/anthropic`. Treat this as a likely adapter/translation
-  issue until disproven: OpenRouter did return a `200 OK`/successful request, so
-  the next session should inspect the raw OpenRouter response shape, the
-  OpenAI/Responses-to-Anthropic translation path, stop/finish reasons, streaming
-  chunk handling, usage extraction, and empty-content handling before
-  classifying it as purely provider behavior. The concrete failing prod case is
-  `/tmp/litellm-prod-harness-aawm37-cb12.json` /
-  `claude_adapter_peeromega_fanout`: the parent Claude command timed out after
-  `420s` with empty stdout/stderr because it kept waiting on only
-  `ling-2-6-flash`. Parent session
-  `9db3bb66-6898-4257-a597-95090851414d` launched all eight agents; seven
-  completed. Its final transcript line says it was still waiting on
-  `ling-2-6-flash`. The Ling child transcript at
-  `/home/zepfu/.claude/projects/-home-zepfu-projects-litellm/9db3bb66-6898-4257-a597-95090851414d/subagents/agent-a71b22a70294d7082.jsonl`
-  contains only the user prompt plus injected context and no assistant message
-  or completion notification. Prod `session_history` recorded an OpenRouter Ling
-  row for the same session from `2026-04-28T22:09:15.779Z` to
-  `22:09:16.416Z` with `input_tokens=0`, `output_tokens=0`,
-  `tool_call_count=0`, and `response_cost_usd=0`. The isolated parallel proof
-  `/tmp/litellm-prod-aawm37-cb12-openrouter-parallel.json` also timed out after
-  `300s` with no stdout/stderr, no response excerpt, and zero Langfuse traces.
-  Preserve the next harness requirements: hard-fail empty successful Ling
-  responses, capture per-child completion state before the parent timeout, and
-  include the raw translated response/chunks in the artifact when the adapter
-  emits an empty Anthropic response.
+- OpenRouter `inclusionai/ling-2.6-flash:free` is no longer a viable release
+  gate. The focused dev rerun at
+  `/tmp/litellm-dev-ling-26-flash-empty-success-rerun.json` now receives a live
+  OpenRouter `404` saying `Ling-2.6-flash is no longer available as a free
+  model`; keep the Ling cases warning-only/legacy and do not spend fanout
+  validation time on them unless the model is intentionally moved to a paid
+  target. The old prod failure is still useful history: prod artifact
+  `/tmp/litellm-prod-harness-aawm37-cb12.json` timed out because the
+  `ling-2-6-flash` child never produced an assistant completion, and
+  `session_history` recorded a zero-token OpenRouter Ling row for parent session
+  `9db3bb66-6898-4257-a597-95090851414d`.
 
-- Keep OpenRouter Ling/free behavior as an unresolved provider-lane follow-up,
-  not as the old trace-name bug. The isolated OpenRouter parallel proof
-  `/tmp/litellm-prod-aawm37-cb12-openrouter-parallel.json` timed out after
-  `300s` with no stdout/stderr, no response excerpt, and zero Langfuse traces.
-  The default OpenRouter free/Ling cases returned successful empty Claude CLI
-  results with zero usage and missing `Bash` tool activity, and passed only
-  because they are warning-only. Re-test with either a more reliable OpenRouter
-  model or a stricter no-empty-response classifier before promoting OpenRouter
-  Ling/free coverage from warning-only to release-gating.
+- The no-empty-response classifier is now in place for OpenRouter Responses:
+  the adapter rejects empty successful OpenRouter Responses streams/non-stream
+  bodies and logs a bounded raw event/body diagnostic, while the harness
+  hard-fails successful empty command output even for warning-only Ling canaries.
+  Next OpenRouter work should pick a currently available replacement free model
+  for the parallel read-tool proof, then run only that focused case before
+  reconsidering any peeromega fanout rerun.
 
 ## Ongoing
 

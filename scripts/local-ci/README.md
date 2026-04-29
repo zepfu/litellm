@@ -74,14 +74,14 @@ Current first-wave adapted coverage:
 - OpenRouter opt-in edge-lane check: `openai/gpt-oss-120b:free`
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - this case remains available by explicit `--cases claude_adapter_gpt_oss_120b`, but is excluded from the default suite because OpenRouter frequently returns provider-unavailable `503 provider=OpenInference raw=no healthy upstream`
-- OpenRouter preferred free targets under active validation: `inclusionai/ling-2.6-flash:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+- OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
 - OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `openai/gpt-oss-120b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
   - `openai/gpt-oss-20b:free` and `openai/gpt-oss-120b:free` remain available in config but are excluded from the default full suite because they are edge OpenRouter targets with noisy upstream availability
   - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain available in config but are excluded from the default full suite
   - run them only by explicit selection, for example:
     `--cases claude_adapter_gpt_oss_20b,claude_adapter_gpt_oss_120b,claude_adapter_gemma_31b,claude_adapter_gemma_26b_a4b`
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
-- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane with the other `vendor/model:free` targets, but post-aawm.37 prod validation left Ling/free behavior unresolved: successful-empty or no-response cases remain warning-only until raw response/chunk capture and no-empty-response classification are added
+- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane only as a legacy warning-only canary. The no-empty-response classifier is now in place, and the latest focused dev run shows OpenRouter returning `404` because Ling 2.6 Flash is no longer available as a free model.
 - current dev OpenRouter pacing on `:4001`:
   - `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
@@ -176,6 +176,6 @@ Important notes:
 - For Gemini fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_gemini_fanout` should persist at least three `Agent` rows, `claude_adapter_peeromega_fanout` should persist at least eight, and `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model.
 - Harness `0.0.14` keeps the OpenRouter GPT-OSS edge cases available as explicit opt-in checks while excluding them from the default suite; the adapter should still persist non-zero estimated usage/cost from streamed output plus checked-in/bundled model-price JSON when those cases are selected. If `gpt-oss-120b` times out or command-fails solely because the overlapping runtime logs show the exact OpenRouter provider-unavailable signature (`503`, `provider=OpenInference`, `raw=no healthy upstream`), the harness soft-fails it as upstream availability without masking local adapter/logging failures.
 - Fanout prompts should continue using the Claude agent names from `~/.claude/agents` such as `gemini-3-flash-preview`; those agent files now carry explicit provider-prefixed `model:` values like `google/gemini-3-flash-preview`.
-- `openrouter/free` and `inclusionai/ling-2.6-flash:free` are canaries, not hard gates; upstream routing / rate limits can make them noisy even when the local adapter path is correct.
+- `openrouter/free` and `inclusionai/ling-2.6-flash:free` are canaries, not hard gates; upstream routing, rate limits, or model availability can make them noisy even when the local adapter path is correct.
 - `warning_only` canaries stay non-gating even when the subprocess itself times out; those conditions should surface as `soft_failures` / warnings in the artifact, not as suite-stopping failures.
-- `ling-2-6-flash` should keep the same trace tags / metadata / `session_history` shaping as the other free-model response adapters, but do not treat it as fully validated after the aawm.37 prod run. The unresolved behavior is successful-empty / zero-token OpenRouter responses that can leave Claude Code child sessions incomplete.
+- `ling-2-6-flash` should keep the same trace tags / metadata / `session_history` shaping as the other response adapters when it is available, but do not treat the old free alias as validated. Use a replacement OpenRouter model for future release-gating parallel proofs.
