@@ -3263,6 +3263,28 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
     record["repository"] = repository
 
 
+def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
+    tenant_id = _clean_non_empty_string(record.get("tenant_id"))
+    if tenant_id:
+        record["tenant_id"] = tenant_id
+        return
+
+    repository = _normalize_repository_identity(record.get("repository"))
+    if repository is None:
+        record["tenant_id"] = None
+        return
+
+    record["tenant_id"] = repository
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    metadata["tenant_id"] = repository
+    metadata["tenant_id_source"] = "repository"
+    record["metadata"] = metadata
+
+
 def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
@@ -3329,6 +3351,10 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     if repository is not None:
         metadata["repository"] = repository
 
+    tenant_id = _clean_non_empty_string(record.get("tenant_id"))
+    if tenant_id is not None:
+        metadata["tenant_id"] = tenant_id
+
     record["metadata"] = metadata
 
 
@@ -3337,6 +3363,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_provider_cache_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
     _normalize_session_repository_on_record(record)
+    _normalize_session_tenant_on_record(record)
     _sync_session_history_record_metadata(record)
     return record
 

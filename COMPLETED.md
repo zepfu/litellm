@@ -2,6 +2,34 @@
 
 ## 2026-04-29
 
+- Fixed the remaining native Codex/Gemini attribution mismatch with the
+  reporting query: `tenant_id` is now populated from the resolved repository
+  when no explicit tenant is present, and `metadata.tenant_id` /
+  `metadata.tenant_id_source=repository` are mirrored at normalization time.
+  Explicit tenant metadata and request headers still win over repository
+  fallback. The callback overlay in `.wheel-build` was kept in parity, and
+  `scripts/backfill_session_history.py --repair-session-history
+  --repair-tenant-ids` can now derive missing tenants from
+  `metadata.repository` or the top-level `repository` column without applying
+  that repository fallback to rows that already have `tenant_id`.
+
+  Focused validation passed for repository-only live rows, Codex workspace text,
+  Gemini workspace directories, structured workspace roots, explicit-tenant
+  precedence, Langfuse trace reconstruction, and the repair derivation helper:
+  `102 passed` across
+  `tests/test_litellm/integrations/test_aawm_agent_identity.py` and
+  `tests/test_scripts/test_backfill_session_history_gemini_control_plane.py`.
+  `py_compile`, targeted Ruff `E9,F821,F823`, and `git diff --check` passed.
+  The first full focused unit run failed on an unrelated stale GPT-5.5 price
+  constant (`0.035` expected, current bundled map computes `0.03`); the test now
+  derives its expectation from the current price map. A dry-run tenant repair
+  scanned 76,758 rows and found only four actual tenant updates, but also
+  16,593 metadata-only sync updates from the existing general repair behavior,
+  so the dev DB backfill was applied with scoped SQL only where `tenant_id` was
+  empty and repository metadata/column data existed. Updated rows were
+  `116092` (`aawm`) and `116165`, `116271`, `116439` (`mcp-pg`); post-check
+  found zero remaining empty-tenant rows with repository attribution.
+
 - Fixed the native Codex/Gemini repository-attribution regression that remained
   after the header-based harness proof. Normal Codex CLI traffic does not
   always send `x-aawm-repository`, so passthrough request preparation now infers
