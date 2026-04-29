@@ -31,6 +31,31 @@
   module-level nodes in
   `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`.
 
+- Closed the follow-up `mcp-pg` repository-attribution miss. The live Gemini
+  trace showed the real CLI does not use the Codex-style context markers; it
+  sends Markdown context with `- **Workspace Directories:**` followed by the
+  workspace path. The repository extractor now recognizes that shape,
+  backtick-wrapped workspace paths, `file://` workspace URIs, and common
+  structured workspace-root keys such as `workspaceRoot`, `projectRoot`,
+  `workingDirectory`, and `cwdUri`. The recursive callback path now checks
+  those keys at any nested level before falling back to text-pattern scans, and
+  `.wheel-build` callback source was kept in parity.
+
+  Focused tests for the exact Gemini workspace-directories shape, structured
+  workspace roots, and existing repository-attribution paths passed
+  (`10 passed`) after first failing with null repository, which reproduced the
+  bug. `py_compile`, targeted Ruff `E9,F821,F823`, and `git diff --check` also
+  passed. After hot-patching `litellm-dev` and restarting `:4001`, real smokes
+  from `/home/zepfu/projects/mcp-pg` passed without
+  repository headers: Codex session
+  `019dd8d1-931c-7b81-8e81-a720f5df048c` stored `repository=mcp-pg`, and Gemini
+  session `f52dd42a-ef02-4592-beef-ee9d81267778` stored
+  `repository=mcp-pg`. Diagnostic note: the user's earlier Gemini rows
+  `3f73ff42-5b70-4804-8745-73e0c33733b2` were recorded by the prod runtime
+  (`litellm_environment=prod`, `aawm-litellm-callbacks==0.0.12`), not the
+  patched dev callback, so prod will need the updated callback wheel before the
+  same inference works on `:4000`.
+
 - Cleared the previously noted focused Ruff debt in
   `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`. The
   file now passes

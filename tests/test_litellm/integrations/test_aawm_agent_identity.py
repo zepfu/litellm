@@ -593,6 +593,99 @@ def test_build_session_history_record_infers_repository_from_codex_workspace_tex
     assert record["metadata"]["repository"] == "aawm"
 
 
+def test_build_session_history_record_infers_repository_from_gemini_workspace_directories() -> None:
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "gemini-3-flash-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-gemini-workspace-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-gemini-workspace-repository"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gemini-3-flash-preview",
+        "request": {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                "<session_context>\n"
+                                "The project's temporary directory is: "
+                                "/home/zepfu/.gemini/tmp/mcp-pg\n"
+                                "- **Workspace Directories:**\n"
+                                "  - /home/zepfu/projects/mcp-pg\n"
+                                "</session_context>"
+                            )
+                        }
+                    ],
+                }
+            ],
+            "session_id": "session-gemini-workspace-repository",
+        },
+    }
+
+    result = {
+        "candidates": [{"content": {"parts": [{"text": "ack"}]}}],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 2,
+            "totalTokenCount": 12,
+        },
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-29T10:00:00Z",
+        end_time="2026-04-29T10:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "mcp-pg"
+    assert record["metadata"]["repository"] == "mcp-pg"
+
+
+def test_build_session_history_record_infers_repository_from_structured_workspace_root() -> None:
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "gemini-3-flash-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-structured-workspace-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-structured-workspace-repository"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gemini-3-flash-preview",
+        "request": {
+            "metadata": {
+                "workspaceRoot": "file:///home/zepfu/projects/mcp-pg",
+            }
+        },
+    }
+
+    result = {
+        "candidates": [{"content": {"parts": [{"text": "ack"}]}}],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 2,
+            "totalTokenCount": 12,
+        },
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-29T10:00:00Z",
+        end_time="2026-04-29T10:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "mcp-pg"
+    assert record["metadata"]["repository"] == "mcp-pg"
+
+
 def test_build_session_history_record_marks_claude_permission_check() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "claude-opus-4-6"

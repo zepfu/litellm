@@ -7735,6 +7735,44 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["trace_environment"] == "dev"
         assert litellm_metadata["repository"] == "aawm"
 
+    def test_prepare_request_body_for_passthrough_observability_infers_gemini_workspace_repository(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        request_body = {
+            "model": "gemini-3-flash-preview",
+            "request": {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "text": (
+                                    "<session_context>\n"
+                                    "- **Workspace Directories:**\n"
+                                    "  - /home/zepfu/projects/mcp-pg\n"
+                                    "</session_context>"
+                                )
+                            }
+                        ],
+                    }
+                ],
+                "session_id": "gemini-session-abc",
+            },
+        }
+
+        updated_body = _prepare_request_body_for_passthrough_observability(
+            mock_request,
+            request_body,
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "gemini-session-abc"
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert litellm_metadata["repository"] == "mcp-pg"
+
     @pytest.mark.parametrize(
         ("endpoint", "expected_route_family"),
         [

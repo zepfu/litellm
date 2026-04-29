@@ -231,10 +231,32 @@ _PASSTHROUGH_REPOSITORY_HEADER_NAMES = (
     "x-repository",
     "x-git-repository",
 )
+_PASSTHROUGH_REPOSITORY_BODY_KEYS = frozenset(
+    {
+        "repository",
+        "repo",
+        "workspace_root",
+        "workspaceRoot",
+        "project_root",
+        "projectRoot",
+        "root_path",
+        "rootPath",
+        "working_directory",
+        "workingDirectory",
+        "cwd_path",
+        "cwdPath",
+        "cwd_uri",
+        "cwdUri",
+    }
+)
 _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = (
-    re.compile(r"AGENTS\.md instructions for (?P<path>/[^\n<]+)"),
-    re.compile(r"<cwd>(?P<path>[^<]+)</cwd>"),
-    re.compile(r"\bcwd\b\s*[:=]\s*['\"]?(?P<path>/[^'\"\n<]+)"),
+    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
+    re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
+    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)"),
+    re.compile(
+        r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
+        re.IGNORECASE,
+    ),
 )
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
     {"/messages", "/v1/messages"}
@@ -7844,7 +7866,7 @@ def _extract_passthrough_session_id(
 
 
 def _normalize_passthrough_repository(value: str) -> Optional[str]:
-    cleaned = value.strip()
+    cleaned = value.strip().strip("`'\"")
     if not cleaned:
         return None
     if cleaned.startswith("git@") and ":" in cleaned:
@@ -7853,7 +7875,9 @@ def _normalize_passthrough_repository(value: str) -> Optional[str]:
         parsed = urlparse(cleaned)
         path = parsed.path.strip("/")
         netloc = parsed.netloc.split("@", 1)[-1]
-        if netloc.lower().endswith("github.com") and path:
+        if parsed.scheme == "file" and path:
+            cleaned = path.rstrip("/").rsplit("/", 1)[-1]
+        elif netloc.lower().endswith("github.com") and path:
             cleaned = path
         else:
             cleaned = f"{netloc}/{path}".strip("/")
@@ -7879,7 +7903,11 @@ def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return _extract_passthrough_repository_from_text(value)
     if isinstance(value, dict):
-        for child in value.values():
+        for key, child in value.items():
+            if key in _PASSTHROUGH_REPOSITORY_BODY_KEYS and isinstance(child, str):
+                repository = _normalize_passthrough_repository(child)
+                if repository:
+                    return repository
             repository = _extract_passthrough_repository_from_body_text(child)
             if repository:
                 return repository
@@ -7898,11 +7926,39 @@ def _extract_passthrough_repository(
         for path in (
             ("repository",),
             ("repo",),
+            ("workspace_root",),
+            ("workspaceRoot",),
+            ("project_root",),
+            ("projectRoot",),
+            ("root_path",),
+            ("rootPath",),
+            ("working_directory",),
+            ("workingDirectory",),
+            ("cwd_path",),
+            ("cwdPath",),
+            ("cwd_uri",),
+            ("cwdUri",),
             ("metadata", "repository"),
             ("metadata", "repo"),
+            ("metadata", "workspace_root"),
+            ("metadata", "workspaceRoot"),
             ("litellm_metadata", "repository"),
             ("request", "repository"),
+            ("request", "workspace_root"),
+            ("request", "workspaceRoot"),
+            ("request", "project_root"),
+            ("request", "projectRoot"),
+            ("request", "root_path"),
+            ("request", "rootPath"),
+            ("request", "working_directory"),
+            ("request", "workingDirectory"),
+            ("request", "cwd_path"),
+            ("request", "cwdPath"),
+            ("request", "cwd_uri"),
+            ("request", "cwdUri"),
             ("request", "metadata", "repository"),
+            ("request", "metadata", "workspace_root"),
+            ("request", "metadata", "workspaceRoot"),
         ):
             value = _get_nested_str_value(request_body, path)
             if value:
