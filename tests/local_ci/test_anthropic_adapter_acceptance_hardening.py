@@ -39,12 +39,6 @@ PARALLEL_CASE_AGENTS = {
         "gpt-5.5",
         {"Read", "Glob", "Grep"},
     ),
-    "claude_adapter_openrouter_ling_child_parallel_read_tools": (
-        "harness-openrouter-ling-parallel-read-tools",
-        "openrouter",
-        "inclusionai/ling-2.6-flash:free",
-        {"Read", "Glob", "Grep"},
-    ),
     "claude_adapter_nvidia_deepseek_child_parallel_read_tools": (
         "harness-nvidia-deepseek-parallel-read-tools",
         "nvidia_nim",
@@ -82,7 +76,7 @@ def test_warning_only_timeout_still_fails_hard():
     harness = _load_harness_module()
 
     result = harness._warning_only_error_result(
-        "claude_adapter_openrouter_ling_26_flash",
+        "warning_only_fixture",
         subprocess.TimeoutExpired(["claude"], 180),
         {"warning_only": True},
     )
@@ -96,7 +90,7 @@ def test_empty_success_validation_hard_fails_zero_usage_success():
     harness = _load_harness_module()
 
     summary, failures = harness._validate_no_successful_empty_command_output(
-        family="claude_adapter_openrouter_ling_26_flash",
+        family="openrouter_empty_success_fixture",
         stdout=json.dumps(
             {
                 "is_error": False,
@@ -119,7 +113,7 @@ def test_empty_success_validation_catches_adapter_diagnostic():
     harness = _load_harness_module()
 
     _, failures = harness._validate_no_successful_empty_command_output(
-        family="claude_adapter_openrouter_ling_26_flash",
+        family="openrouter_empty_success_fixture",
         stdout="",
         stderr=(
             "OpenRouter Responses adapter returned empty successful response: "
@@ -129,7 +123,7 @@ def test_empty_success_validation_catches_adapter_diagnostic():
     )
 
     assert failures == [
-        "claude_adapter_openrouter_ling_26_flash successful empty OpenRouter adapter diagnostic surfaced"
+        "openrouter_empty_success_fixture successful empty OpenRouter adapter diagnostic surfaced"
     ]
 
 
@@ -424,7 +418,7 @@ def test_runtime_log_defaults_catch_async_and_content_length_errors(monkeypatch)
     )
 
     summary, failures, warnings = harness._validate_runtime_logs(
-        family="claude_adapter_openrouter_ling_26_flash",
+        family="openrouter_runtime_log_fixture",
         started="2026-04-23T14:06:00+00:00",
         checks={},
         runtime_postconditions={"docker_container_name": "litellm-dev"},
@@ -815,23 +809,6 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
                 "tools",
             ):
                 assert path in required_paths
-
-
-def test_openrouter_ling_smoke_hard_fails_empty_success():
-    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-    case_config = config["cases"]["claude_adapter_openrouter_ling_26_flash"]
-
-    assert case_config["warning_only"] is True
-    assert case_config["fail_empty_success"] is True
-
-
-def test_openrouter_ling_parallel_hard_fails_empty_success():
-    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-    case_config = config["cases"][
-        "claude_adapter_openrouter_ling_child_parallel_read_tools"
-    ]
-
-    assert case_config["fail_empty_success"] is True
 
 
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):

@@ -471,7 +471,7 @@ async def test_stream_wrapper_rejects_empty_success_when_enabled():
     response_obj = SimpleNamespace(
         id="resp_empty",
         status="completed",
-        model="inclusionai/ling-2.6-flash:free",
+        model="google/gemma-4-31b-it:free",
         usage=SimpleNamespace(
             input_tokens=0,
             output_tokens=0,
@@ -487,9 +487,9 @@ async def test_stream_wrapper_rejects_empty_success_when_enabled():
 
     wrapper = AnthropicResponsesStreamWrapper(
         responses_stream=_make_stream(*events),
-        model="inclusionai/ling-2.6-flash:free",
+        model="google/gemma-4-31b-it:free",
         request_body={
-            "model": "inclusionai/ling-2.6-flash:free",
+            "model": "google/gemma-4-31b-it:free",
             "stream": True,
         },
         reject_empty_success=True,

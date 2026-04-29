@@ -259,7 +259,7 @@ coverage.
 ./.venv/bin/python -m dotenv run -- \
   ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
     --target prod \
-    --cases claude_adapter_openrouter_ling_26_flash,claude_adapter_peeromega_fanout \
+    --cases claude_adapter_gemma_31b,claude_adapter_peeromega_fanout \
     --write-artifact /tmp/litellm-prod-focused.json
 ```
 
@@ -429,18 +429,16 @@ gaps, and session-history gaps remain hard failures.
   fanout timeout. Record the exact timed-out case, artifact, stdout/stderr,
   Langfuse trace count, and next isolation plan in `TODO.md`; rerun a focused
   per-child or narrower fanout case before broad retesting.
-- OpenRouter free/Ling lanes can produce successful Claude CLI exits with empty
+- OpenRouter free lanes can produce successful Claude CLI exits with empty
   `result`, zero usage, and no tool activity. Keep those warning-only unless the
   harness is deliberately tightened, and do not let those warnings mask a hard
   default-suite failure. If an OpenRouter focused child proof times out before
   any Langfuse trace exists, classify it as provider/model no-response or
   latency until additional transcript capture proves an adapter bug.
-- In multi-agent fanout, a single OpenRouter Ling empty response can leave the
-  Claude Code child without an assistant message or completion notification even
-  though LiteLLM/session history records a quick zero-token request. When this
-  happens, the parent waits for that child until the command timeout. Future
-  fanout gates should record per-child completion state and hard-fail zero-token
-  successful OpenRouter/Ling responses.
+- Ling is retired from active fanout and focused prod checks because the old
+  OpenRouter free alias now returns `404`. Future OpenRouter fanout gates should
+  use a currently available replacement model, record per-child completion
+  state, and hard-fail zero-token successful OpenRouter responses.
 
 ## Finalization
 

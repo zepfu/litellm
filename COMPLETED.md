@@ -25,9 +25,14 @@
   After moving the adapter guard onto the OpenRouter route, the rerun at
   `/tmp/litellm-dev-ling-26-flash-empty-success-rerun.json` no longer accepted
   an empty success; OpenRouter now returns `404` stating
-  `Ling-2.6-flash is no longer available as a free model`. The Ling cases remain
-  warning-only legacy canaries, and future OpenRouter release-gating should use
-  a currently available replacement model.
+  `Ling-2.6-flash is no longer available as a free model`. Future OpenRouter
+  release-gating should use a currently available replacement model.
+
+- Deprecated Ling as an active OpenRouter harness target. Removed the Ling
+  smoke cases, the OpenRouter Ling parallel child case, the `ling-2-6-flash`
+  peeromega fanout child, and the Anthropic OpenRouter adapter's plain Ling
+  alias/allowlist entry. The mixed fanout now expects seven delegated `Agent`
+  rows instead of eight.
 
 ## 2026-04-28
 

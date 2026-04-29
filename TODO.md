@@ -93,11 +93,12 @@ these docs only as needed:
 
 - OpenRouter and NVIDIA `/anthropic` parallel read-tool proofs were validated
   historically on dev `:4001`. The old OpenRouter proof used
-  `openrouter/inclusionai/ling-2.6-flash:free`, but that alias is now a legacy
-  canary because OpenRouter reports Ling 2.6 Flash is no longer available as a
-  free model. The earlier `openrouter/qwen/qwen3-coder:free` attempt hit
-  provider 429 from Venice before adapter validation and should remain a
-  dead-end breadcrumb, not a regression. NVIDIA proof uses
+  `openrouter/inclusionai/ling-2.6-flash:free`, but that target is now retired
+  from active harness config because OpenRouter reports Ling 2.6 Flash is no
+  longer available as a free model. The earlier
+  `openrouter/qwen/qwen3-coder:free` attempt hit provider 429 from Venice
+  before adapter validation and should remain a dead-end breadcrumb, not a
+  regression. NVIDIA proof uses
   `nvidia/deepseek-ai/deepseek-v3.2`; no separate completion-side parallel
   policy was needed because the model emitted the three tools together once the
   child trace-name metadata merge was fixed. Artifacts:
@@ -114,12 +115,14 @@ these docs only as needed:
   fix unless the same trace-header overwrite signature recurs.
 
 - OpenRouter `inclusionai/ling-2.6-flash:free` is no longer a viable release
-  gate. The focused dev rerun at
+  gate or active target path. The focused dev rerun at
   `/tmp/litellm-dev-ling-26-flash-empty-success-rerun.json` now receives a live
   OpenRouter `404` saying `Ling-2.6-flash is no longer available as a free
-  model`; keep the Ling cases warning-only/legacy and do not spend fanout
-  validation time on them unless the model is intentionally moved to a paid
-  target. The old prod failure is still useful history: prod artifact
+  model`; the Ling smoke, OpenRouter-prefixed smoke, parallel child case, and
+  mixed-fanout child were removed from active config. Do not spend fanout
+  validation time on Ling unless the model is intentionally moved to a paid
+  target and the agent file is restored. The old prod failure is still useful
+  history: prod artifact
   `/tmp/litellm-prod-harness-aawm37-cb12.json` timed out because the
   `ling-2-6-flash` child never produced an assistant completion, and
   `session_history` recorded a zero-token OpenRouter Ling row for parent session
@@ -128,7 +131,7 @@ these docs only as needed:
 - The no-empty-response classifier is now in place for OpenRouter Responses:
   the adapter rejects empty successful OpenRouter Responses streams/non-stream
   bodies and logs a bounded raw event/body diagnostic, while the harness
-  hard-fails successful empty command output even for warning-only Ling canaries.
+  hard-fails successful empty command output when a selected case opts in.
   Next OpenRouter work should pick a currently available replacement free model
   for the parallel read-tool proof, then run only that focused case before
   reconsidering any peeromega fanout rerun.

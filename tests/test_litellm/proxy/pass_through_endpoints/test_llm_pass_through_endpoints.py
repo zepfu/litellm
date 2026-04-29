@@ -2421,7 +2421,7 @@ class TestOpenRouterAdapterRetry:
             param="None",
             code=429,
         )
-        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
+        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
         successful_response = Response(content='{"ok": true}', media_type="application/json")
         set_cooldown = AsyncMock()
 
@@ -2436,13 +2436,13 @@ class TestOpenRouterAdapterRetry:
             new=set_cooldown,
         ):
             result = await _perform_openrouter_adapter_pass_through_request(
-                adapter_model="inclusionai/ling-2.6-flash:free",
+                adapter_model="google/gemma-4-31b-it:free",
                 request=MagicMock(),
             )
 
         assert result is successful_response
         assert mock_pass_through.await_count == 2
-        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 2.0)
+        set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 2.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_adapter_request_uses_upstream_retry_after_header(
@@ -2494,7 +2494,6 @@ class TestOpenRouterAdapterRetry:
         "adapter_model",
         [
             "google/gemma-4-31b-it:free",
-            "inclusionai/ling-2.6-flash:free",
             "meta-llama/llama-3.3-70b-instruct:free",
             "minimax/minimax-m2.5:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
@@ -2539,7 +2538,7 @@ class TestOpenRouterAdapterRetry:
         assert mock_pass_through.await_count == 2
         set_cooldown.assert_awaited_once_with(adapter_model, 2.0)
 
-    def test_openrouter_ling_free_model_info_has_zero_cost(self):
+    def test_openrouter_free_model_info_has_zero_cost(self):
         from pathlib import Path
 
         repo_root = Path(__file__).resolve().parents[4]
@@ -2552,18 +2551,16 @@ class TestOpenRouterAdapterRetry:
 
         for pricing_map_path in pricing_map_paths:
             pricing_map = json.loads(pricing_map_path.read_text())
-            model_info = pricing_map["inclusionai/ling-2.6-flash:free"]
-            prefixed_model_info = pricing_map[
-                "openrouter/inclusionai/ling-2.6-flash:free"
-            ]
+            model_info = pricing_map["openrouter/free"]
+            prefixed_model_info = pricing_map["openrouter/openrouter/free"]
 
             assert "openrouter/elephant-alpha" not in pricing_map
             assert "openrouter/openrouter/elephant-alpha" not in pricing_map
             assert model_info["litellm_provider"] == "openrouter"
             assert model_info["input_cost_per_token"] == 0
             assert model_info["output_cost_per_token"] == 0
-            assert model_info["max_input_tokens"] == 262144
-            assert model_info["max_tokens"] == 262144
+            assert model_info["max_input_tokens"] == 200000
+            assert model_info["max_tokens"] == 200000
             assert prefixed_model_info["input_cost_per_token"] == 0
             assert prefixed_model_info["output_cost_per_token"] == 0
 
@@ -2578,7 +2575,7 @@ class TestOpenRouterAdapterRetry:
             param="None",
             code=429,
         )
-        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
+        first_error.detail = """429: b'{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly.","provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'"""
         second_error = ProxyException(
             message="Provider returned error",
             type="None",
@@ -2600,12 +2597,12 @@ class TestOpenRouterAdapterRetry:
         ):
             with pytest.raises(ProxyException):
                 await _perform_openrouter_adapter_pass_through_request(
-                    adapter_model="inclusionai/ling-2.6-flash:free",
+                    adapter_model="google/gemma-4-31b-it:free",
                     request=MagicMock(),
                 )
 
         assert mock_pass_through.await_count == 2
-        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 2.0)
+        set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 2.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_adapter_request_fast_fails_when_failure_circuit_open(self, monkeypatch):
@@ -2669,7 +2666,7 @@ class TestOpenRouterAdapterRetry:
                 return (
                     'litellm.RateLimitError: RateLimitError: OpenrouterException - '
                     '{"error":{"message":"Provider returned error","code":429,'
-                    '"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.",'
+                    '"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly.",'
                     '"provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'
                 )
 
@@ -2684,13 +2681,13 @@ class TestOpenRouterAdapterRetry:
             new=set_cooldown,
         ):
             result = await _perform_openrouter_completion_adapter_operation(
-                adapter_model="inclusionai/ling-2.6-flash:free",
+                adapter_model="google/gemma-4-31b-it:free",
                 operation=operation,
             )
 
         assert result == "ok"
         assert operation.await_count == 2
-        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 2.0)
+        set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 2.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_adapter_request_fails_fast_on_long_window_rate_limit(self, monkeypatch):
@@ -2735,12 +2732,12 @@ class TestOpenRouterAdapterRetry:
         ):
             with pytest.raises(ProxyException):
                 await _perform_openrouter_adapter_pass_through_request(
-                    adapter_model="inclusionai/ling-2.6-flash:free",
+                    adapter_model="google/gemma-4-31b-it:free",
                     request=MagicMock(),
                 )
 
         assert mock_pass_through.await_count == 1
-        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 300.0)
+        set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 300.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_free_model_request_uses_retry_after_and_shared_cooldown(self, monkeypatch):
@@ -2888,12 +2885,12 @@ class TestOpenRouterAdapterRetry:
         ):
             with pytest.raises(FakeRateLimitError):
                 await _perform_openrouter_completion_adapter_operation(
-                    adapter_model="inclusionai/ling-2.6-flash:free",
+                    adapter_model="google/gemma-4-31b-it:free",
                     operation=operation,
                 )
 
         assert operation.await_count == 1
-        set_cooldown.assert_awaited_once_with("inclusionai/ling-2.6-flash:free", 300.0)
+        set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 300.0)
 
     @pytest.mark.asyncio
     async def test_openrouter_completion_adapter_uses_hidden_retry_budget_beyond_attempt_cap(self, monkeypatch):
@@ -2906,7 +2903,7 @@ class TestOpenRouterAdapterRetry:
                 return (
                     'litellm.RateLimitError: RateLimitError: OpenrouterException - '
                     '{"error":{"message":"Provider returned error","code":429,'
-                    '"metadata":{"raw":"inclusionai/ling-2.6-flash:free is temporarily rate-limited upstream. Please retry shortly.",'
+                    '"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly.",'
                     '"provider_name":"Stealth","is_byok":false}},"user_id":"user_test"}'
                 )
 
@@ -2921,15 +2918,15 @@ class TestOpenRouterAdapterRetry:
             new=set_cooldown,
         ):
             result = await _perform_openrouter_completion_adapter_operation(
-                adapter_model="inclusionai/ling-2.6-flash:free",
+                adapter_model="google/gemma-4-31b-it:free",
                 operation=operation,
             )
 
         assert result == "ok"
         assert operation.await_count == 3
         assert [await_call.args for await_call in set_cooldown.await_args_list] == [
-            ("inclusionai/ling-2.6-flash:free", 2.0),
-            ("inclusionai/ling-2.6-flash:free", 10.0),
+            ("google/gemma-4-31b-it:free", 2.0),
+            ("google/gemma-4-31b-it:free", 10.0),
         ]
 
 
@@ -3063,12 +3060,12 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         self,
     ):
         prepared_body = await _prepare_claude_code_agent_project_request_body(
-            "openrouter/inclusionai/ling-2.6-flash:free"
+            "openrouter/google/gemma-4-31b-it:free"
         )
 
         translated_body = _build_anthropic_responses_adapter_request_body(
             prepared_body,
-            adapter_model="inclusionai/ling-2.6-flash:free",
+            adapter_model="google/gemma-4-31b-it:free",
             route_family="anthropic_openrouter_responses_adapter",
             tag_prefix="anthropic-openrouter-responses-adapter",
             span_name="anthropic.openrouter_responses_adapter",
@@ -4050,13 +4047,13 @@ class TestClaudePersistedOutputExpansion:
             _resolve_anthropic_openrouter_responses_adapter_model,
         )
 
-        request_body = {"model": "openrouter/inclusionai/ling-2.6-flash:free"}
+        request_body = {"model": "openrouter/google/gemma-4-31b-it:free"}
 
         assert (
             _resolve_anthropic_openrouter_responses_adapter_model(
                 request_body, endpoint="v1/messages"
             )
-            == "inclusionai/ling-2.6-flash:free"
+            == "google/gemma-4-31b-it:free"
         )
 
     def test_load_claude_agent_declared_model_tolerates_cp1252_agent_file(
@@ -4214,13 +4211,13 @@ class TestClaudePersistedOutputExpansion:
 
 
     @pytest.mark.asyncio
-    async def test_anthropic_proxy_route_adapts_plain_ling_alias_to_openrouter_responses(
+    async def test_anthropic_proxy_route_adapts_openrouter_prefixed_gemma_model_to_responses(
         self,
     ):
         request_body = {
-            "model": "ling-2-6-flash",
+            "model": "openrouter/google/gemma-4-31b-it:free",
             "max_tokens": 128,
-            "messages": [{"role": "user", "content": "Say ling alias ok"}],
+            "messages": [{"role": "user", "content": "Say gemma prefix ok"}],
         }
 
         mock_request = MagicMock(spec=Request)
@@ -4256,12 +4253,22 @@ class TestClaudePersistedOutputExpansion:
                 return_value=Response(
                     content=json.dumps(
                         {
-                            "id": "resp_ling_alias",
+                            "id": "resp_gemma_prefix",
                             "object": "response",
                             "created_at": 1744974432,
-                            "model": "inclusionai/ling-2.6-flash:free",
+                            "model": "google/gemma-4-31b-it:free",
                             "status": "completed",
-                            "output": [],
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "gemma prefix ok",
+                                        }
+                                    ],
+                                }
+                            ],
                             "usage": {
                                 "input_tokens": 1,
                                 "output_tokens": 1,
@@ -4282,12 +4289,12 @@ class TestClaudePersistedOutputExpansion:
             )
 
         translated_body = json.loads(result.body.decode("utf-8"))
-        assert translated_body["model"] == "inclusionai/ling-2.6-flash:free"
+        assert translated_body["model"] == "google/gemma-4-31b-it:free"
         call_kwargs = mock_pass_through_request.await_args.kwargs
         assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
         assert call_kwargs["forward_headers"] is False
-        assert call_kwargs["custom_body"]["model"] == "inclusionai/ling-2.6-flash:free"
+        assert call_kwargs["custom_body"]["model"] == "google/gemma-4-31b-it:free"
         assert (
             call_kwargs["custom_body"]["litellm_metadata"]["passthrough_route_family"]
             == "anthropic_openrouter_responses_adapter"
@@ -4298,14 +4305,14 @@ class TestClaudePersistedOutputExpansion:
         )
 
     @pytest.mark.asyncio
-    async def test_anthropic_proxy_route_adapts_allowlisted_ling_model_to_responses(
+    async def test_anthropic_proxy_route_adapts_allowlisted_gemma_model_to_responses(
         self,
     ):
         request_body = {
-            "model": "inclusionai/ling-2.6-flash:free",
+            "model": "google/gemma-4-31b-it:free",
             "max_tokens": 256,
             "system": "You are helpful.",
-            "messages": [{"role": "user", "content": "Say ling ok"}],
+            "messages": [{"role": "user", "content": "Say gemma ok"}],
         }
 
         mock_request = MagicMock(spec=Request)
@@ -4341,12 +4348,22 @@ class TestClaudePersistedOutputExpansion:
                 return_value=Response(
                     content=json.dumps(
                         {
-                            "id": "resp_ling",
+                            "id": "resp_gemma",
                             "object": "response",
                             "created_at": 1744974432,
-                            "model": "inclusionai/ling-2.6-flash:free",
+                            "model": "google/gemma-4-31b-it:free",
                             "status": "completed",
-                            "output": [],
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "gemma ok",
+                                        }
+                                    ],
+                                }
+                            ],
                             "usage": {
                                 "input_tokens": 1,
                                 "output_tokens": 1,
@@ -4372,14 +4389,14 @@ class TestClaudePersistedOutputExpansion:
             )
 
         translated_body = json.loads(result.body.decode("utf-8"))
-        assert translated_body["model"] == "inclusionai/ling-2.6-flash:free"
+        assert translated_body["model"] == "google/gemma-4-31b-it:free"
         assert result.headers["content-length"] == str(len(result.body))
         assert result.headers.get("content-encoding") is None
         assert result.headers["x-upstream-trace"] == "openrouter-test"
         call_kwargs = mock_pass_through_request.await_args.kwargs
         assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
-        assert call_kwargs["custom_body"]["model"] == "inclusionai/ling-2.6-flash:free"
+        assert call_kwargs["custom_body"]["model"] == "google/gemma-4-31b-it:free"
         assert (
             call_kwargs["custom_body"]["litellm_metadata"]["passthrough_route_family"]
             == "anthropic_openrouter_responses_adapter"

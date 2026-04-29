@@ -66,7 +66,7 @@ Current first-wave adapted coverage:
   - the full suite runs this before `claude_adapter_peeromega_fanout` so the
     dedicated Gemini gate is not polluted by the mixed fanout's short-window
     upstream pressure
-- Mixed fanout dispatch target set: `analyst`, `data`, `gpt-5-3-codex-spark`, `gpt-5-4`, `gemini-3-flash-preview`, `gemini-3-1-pro-preview`, `gemini-3-1-flash-lite-preview`, `ling-2-6-flash`
+- Mixed fanout dispatch target set: `analyst`, `data`, `gpt-5-3-codex-spark`, `gpt-5-4`, `gemini-3-flash-preview`, `gemini-3-1-pro-preview`, `gemini-3-1-flash-lite-preview`
 - Google Code Assist canaries: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
   - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist on `:4001`
   - `gemini-3.1-pro-preview` and `gemini-3-flash-preview` are the main real-Claude validation targets; `gemini-3.1-flash-lite-preview` remains quota-sensitive
@@ -75,13 +75,13 @@ Current first-wave adapted coverage:
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - this case remains available by explicit `--cases claude_adapter_gpt_oss_120b`, but is excluded from the default suite because OpenRouter frequently returns provider-unavailable `503 provider=OpenInference raw=no healthy upstream`
 - OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
-- OpenRouter warning-only canaries: `openrouter/free`, `inclusionai/ling-2.6-flash:free`, `openai/gpt-oss-20b:free`, `openai/gpt-oss-120b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+- OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `openai/gpt-oss-120b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
   - `openai/gpt-oss-20b:free` and `openai/gpt-oss-120b:free` remain available in config but are excluded from the default full suite because they are edge OpenRouter targets with noisy upstream availability
   - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain available in config but are excluded from the default full suite
   - run them only by explicit selection, for example:
     `--cases claude_adapter_gpt_oss_20b,claude_adapter_gpt_oss_120b,claude_adapter_gemma_31b,claude_adapter_gemma_26b_a4b`
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
-- `inclusionai/ling-2.6-flash:free` stays on the generic Anthropic -> OpenRouter `Responses` lane only as a legacy warning-only canary. The no-empty-response classifier is now in place, and the latest focused dev run shows OpenRouter returning `404` because Ling 2.6 Flash is no longer available as a free model.
+- `inclusionai/ling-2.6-flash:free` / `ling-2-6-flash` is retired from active harness targets after OpenRouter started returning `404` for the old free alias. Keep the historical artifacts as breadcrumbs only; choose a currently available OpenRouter model before adding any replacement parallel proof.
 - current dev OpenRouter pacing on `:4001`:
   - `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
@@ -91,7 +91,7 @@ Current first-wave adapted coverage:
 Preferred Anthropic-adapter model spellings:
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
 - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
-- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/inclusionai/ling-2.6-flash:free`, `openrouter/google/gemma-4-31b-it:free`
+- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because routing is now provider-first
 
 Run it with repo env loaded so Langfuse and DB credentials are available:
@@ -152,7 +152,7 @@ Provider credentials:
 
 Important notes:
 - top-level Claude runs without an adapted model are not the acceptance target for this suite.
-- for adapted free models, LiteLLM / `session_history` are the source of truth for cost, not Claude CLI display cost. For OpenRouter free models, mirror the paid counterpart cost when a non-free twin exists; keep `openrouter/free` and `inclusionai/ling-2.6-flash:free` at zero because OpenRouter does not publish a paid twin for them.
+- for adapted free models, LiteLLM / `session_history` are the source of truth for cost, not Claude CLI display cost. For OpenRouter free models, mirror the paid counterpart cost when a non-free twin exists; keep `openrouter/free` at zero because OpenRouter does not publish a paid twin for it.
 - The Google Code Assist lane is warning-only in the harness; the route works, but `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` can all hit real `429` / `RESOURCE_EXHAUSTED` responses from `cloudcode-pa.googleapis.com`.
 - The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. When standalone Gemini CLI use is healthy, treat `claude_adapter_gemini_fanout` failures first as local pacing/serialization bugs, not as authoritative provider-capacity proof.
 - When explicit Gemini reasoning token counts are absent but thought signatures are present, treat `provider_signature_present` as the expected fallback source in Langfuse generation metadata and `session_history`.
@@ -173,9 +173,9 @@ Important notes:
 - `claude_adapter_nvidia_minimax_m27` now uses upstream non-stream plus Anthropic-compatible fake streaming. Keep the exact `nvidia/minimaxai/minimax-m2.7` spelling, and treat it as an explicit opt-in spot check rather than a default-suite canary because MiniMax is materially slower than the other NVIDIA targets.
 - These NVIDIA spot checks validate the Anthropic -> NVIDIA completion adapter on `nvidia:/v1/chat/completions` via `provider=nvidia_nim`.
 - For NVIDIA-adapted runs, expect the same observability parity as the other adapted providers: `session_history.provider=nvidia_nim` with the normalized upstream model and non-zero cost when pricing is mapped, `session_history_tool_activity` rows when tool or agent-dispatch work occurs, Langfuse trace environment matching the selected `--target`, `route:anthropic_nvidia_completion_adapter` / `anthropic-nvidia-completion-adapter` / `anthropic-adapter-target:nvidia:/v1/chat/completions` tags plus the `anthropic.nvidia_completion_adapter` span, and usable cost tracking. If NVIDIA pricing is not available for a target model, fall back to the closest equivalent OpenRouter pricing rather than leaving long-term cost tracking unmapped.
-- For Gemini fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_gemini_fanout` should persist at least three `Agent` rows, `claude_adapter_peeromega_fanout` should persist at least eight, and `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model.
+- For Gemini fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_gemini_fanout` should persist at least three `Agent` rows, `claude_adapter_peeromega_fanout` should persist at least seven, and `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model.
 - Harness `0.0.14` keeps the OpenRouter GPT-OSS edge cases available as explicit opt-in checks while excluding them from the default suite; the adapter should still persist non-zero estimated usage/cost from streamed output plus checked-in/bundled model-price JSON when those cases are selected. If `gpt-oss-120b` times out or command-fails solely because the overlapping runtime logs show the exact OpenRouter provider-unavailable signature (`503`, `provider=OpenInference`, `raw=no healthy upstream`), the harness soft-fails it as upstream availability without masking local adapter/logging failures.
 - Fanout prompts should continue using the Claude agent names from `~/.claude/agents` such as `gemini-3-flash-preview`; those agent files now carry explicit provider-prefixed `model:` values like `google/gemini-3-flash-preview`.
-- `openrouter/free` and `inclusionai/ling-2.6-flash:free` are canaries, not hard gates; upstream routing, rate limits, or model availability can make them noisy even when the local adapter path is correct.
+- `openrouter/free` is a canary, not a hard gate; upstream routing, rate limits, or model availability can make it noisy even when the local adapter path is correct.
 - `warning_only` canaries stay non-gating even when the subprocess itself times out; those conditions should surface as `soft_failures` / warnings in the artifact, not as suite-stopping failures.
-- `ling-2-6-flash` should keep the same trace tags / metadata / `session_history` shaping as the other response adapters when it is available, but do not treat the old free alias as validated. Use a replacement OpenRouter model for future release-gating parallel proofs.
+- Do not re-add `ling-2-6-flash` as a harness target unless the model is intentionally moved to a currently available paid target and the agent file is restored. Use a replacement OpenRouter model for future release-gating parallel proofs.
