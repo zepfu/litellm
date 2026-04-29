@@ -23,6 +23,31 @@
   `91c433d5-d59d-4b69-8fb8-bfb751393c9e` and
   `0a4697df-e3fd-402a-a93f-af4c53e8d7cb`.
 
+- Dead-end note for the OpenRouter replacement parallel proof: the first
+  attempt used `poolside/laguna-m.1:free` because OpenRouter currently lists it
+  as a free tool-capable model. The focused live dev artifact
+  `/tmp/claude_adapter_openrouter_laguna_parallel_read_tools.json` failed
+  before exercising LiteLLM's OpenRouter adapter because Claude Code rejected
+  the child-agent model `openrouter/poolside/laguna-m.1:free` as
+  unavailable/inaccessible. No child trace, OpenRouter generation, or durable
+  tool activity was produced, so this is a Claude Code model-resolution dead
+  end rather than an adapter parity signal.
+
+- Added and validated the replacement OpenRouter `/anthropic` parallel
+  read-tool proof with `nvidia/nemotron-3-super-120b-a12b:free`. The focused
+  live dev case `claude_adapter_openrouter_nemotron_child_parallel_read_tools`
+  passed with zero failures and zero warnings at
+  `/tmp/claude_adapter_openrouter_nemotron_parallel_read_tools.json`. The
+  command session was `c03d1906-b6f5-4592-9c19-8bd79243bee1`; filtered trace
+  ids were `1958a094-f471-4d20-8642-e96ae937b4a1`,
+  `25304cc9-2b9e-44c7-a667-d0b906e2253b`,
+  `515d6e7d-7cc2-474b-a9f3-60b51f51044c`, and
+  `ebe19741-47ac-4e84-be06-cc30d2e0cb23`. The durable checks saw OpenRouter
+  session-history rows for the Nemotron model and tool-activity rows for
+  exactly one `Read`, one `Glob`, and one `Grep`; the transcript validator
+  confirmed all three tool calls were emitted in one child assistant message
+  with no tool-result errors.
+
 - Implemented the Codex-native tool alias layer for `/anthropic` traffic that
   targets OpenAI/Codex Responses. The adapter now maps Claude-side `Bash`
   definitions, `tool_choice`, and prior assistant tool-use history to upstream
