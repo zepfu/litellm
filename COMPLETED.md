@@ -42,6 +42,44 @@
   `/tmp/anthropic_nvidia_hosted_tool_policy_after_container_refresh.json`;
   trace id `b28b3ce6-bbc1-4fa4-9162-3bfd5b90c05f`.
 
+- Failed validation note for the Gemini Code Assist envelope comparison: the
+  first focused live dev run of
+  `claude_adapter_gemini3_flash_child_parallel_read_tools` with the new
+  request-payload gate failed only the three tool declaration casing checks at
+  `/tmp/anthropic_gemini3_flash_parallel_envelope_gate.json`. The run itself
+  succeeded (`GEMINI3 FLASH PARALLEL TOOLS PASSED`), and model/project,
+  `user_prompt_id`, `request.session_id`, `request.systemInstruction`, and
+  Gemini 3 `thinkingLevel=high` all passed. The failure exposed real envelope
+  drift: the `/anthropic` Code Assist payload logged `request.tools` with
+  `function_declarations`, while the native Gemini CLI baseline uses
+  `functionDeclarations`. Treat this as a normalizer/parity fix, not a tool
+  execution failure.
+
+- Added and validated the Gemini `/anthropic` Code Assist tool-envelope gate.
+  The Code Assist payload normalizer now converts the explicit native schema
+  keys `function_declarations` -> `functionDeclarations` and
+  `allowed_function_names` -> `allowedFunctionNames` without broad snake-case
+  rewriting that could corrupt tool JSON-schema properties. The focused
+  `claude_adapter_gemini3_flash_child_parallel_read_tools` case now hard-gates
+  model/project/`user_prompt_id`/`request.session_id`,
+  `request.systemInstruction`, Gemini native tool declaration names
+  `read_file`, `glob`, `grep_search`, and Gemini 3 `thinkingLevel=high` with
+  no `thinkingBudget`. Focused local validation passed for the two Code Assist
+  builder tests and two harness config-shape tests (`4 passed`), plus
+  `py_compile`, JSON parse, and `git diff --check`. The first local pytest
+  command used the wrong class node and failed at collection, and pytest
+  collection needed sandbox escalation because `pytest_rerunfailures` opens a
+  local socket; use the exact `TestGoogleAdapterRequestShapePolicy::*` nodes
+  for this path. A focused `ruff check` on the entire passthrough file still
+  reports pre-existing unrelated lint debt (`F401` imports and `PLR0915` long
+  functions), so do not use that whole-file ruff command as the blocker for
+  this narrow casing fix. After copying the patched passthrough file into
+  `litellm-dev` and restarting, the focused live dev run passed with zero failures/warnings
+  at
+  `/tmp/anthropic_gemini3_flash_parallel_envelope_gate_after_case_fix.json`;
+  trace ids included `86d81389-a6d3-4dea-9a1b-fe5f72f3ebb3` and
+  `6bb7c51c-d63d-444e-b360-4b6d2ba86db6`.
+
 - Added native Gemini CLI Code Assist request-payload gates to the focused
   adapter harness. Both native Gemini passthrough cases now require the Code
   Assist envelope fields `model`, `project`, `user_prompt_id`,

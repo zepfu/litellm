@@ -1555,7 +1555,26 @@ class TestGoogleAdapterRequestShapePolicy:
                 "contents": [
                     {"role": "model", "parts": [{"function_call": {"name": "Bash", "args": {"command": "date -u"}}}]},
                     {"role": "user", "parts": [{"function_response": {"name": "Bash", "response": {"content": "ok"}}}]},
-                ]
+                ],
+                "tools": [
+                    {
+                        "function_declarations": [
+                            {
+                                "name": "read_file",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"file_path": {"type": "string"}},
+                                },
+                            }
+                        ]
+                    }
+                ],
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowed_function_names": ["read_file"],
+                    }
+                },
             },
         ):
             wrapped_request, _, _, _, _, _ = await _build_google_code_assist_request_from_completion_kwargs(
@@ -1575,6 +1594,17 @@ class TestGoogleAdapterRequestShapePolicy:
         assert not any("function_call" in part for part in all_parts)
         assert any("functionResponse" in part for part in all_parts)
         assert not any("function_response" in part for part in all_parts)
+        assert "functionDeclarations" in wrapped_request["request"]["tools"][0]
+        assert (
+            "function_declarations" not in wrapped_request["request"]["tools"][0]
+        )
+        assert wrapped_request["request"]["toolConfig"]["functionCallingConfig"][
+            "allowedFunctionNames"
+        ] == ["read_file"]
+        assert (
+            "allowed_function_names"
+            not in wrapped_request["request"]["toolConfig"]["functionCallingConfig"]
+        )
 
     def test_google_request_shape_policy_recompacts_followup_persisted_output_blocks(self, monkeypatch):
         monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_PERSISTED_OUTPUT_CHAR_CAP", "256")
@@ -1946,9 +1976,8 @@ class TestGoogleAdapterRequestShapePolicy:
         )
 
         request_payload = wrapped_request["request"]
-        declarations = request_payload["tools"][0].get(
-            "functionDeclarations"
-        ) or request_payload["tools"][0].get("function_declarations")
+        assert "function_declarations" not in request_payload["tools"][0]
+        declarations = request_payload["tools"][0]["functionDeclarations"]
         function_names = [declaration["name"] for declaration in declarations]
         model_parts = request_payload["contents"][1]["parts"]
         tool_call_names = [
@@ -1962,7 +1991,7 @@ class TestGoogleAdapterRequestShapePolicy:
         assert function_names == ["run_shell_command", "read_file", "grep_search"]
         assert request_payload["toolConfig"]["functionCallingConfig"] == {
             "mode": "ANY",
-            "allowed_function_names": ["run_shell_command"],
+            "allowedFunctionNames": ["run_shell_command"],
         }
         assert tool_call_names == ["run_shell_command", "read_file"]
         assert completion_messages[1]["tool_calls"][0]["function"]["name"] == "run_shell_command"
