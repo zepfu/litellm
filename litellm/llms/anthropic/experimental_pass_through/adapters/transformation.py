@@ -458,6 +458,32 @@ class LiteLLMAnthropicMessagesAdapter:
             isinstance(tool_type, str) and tool_type.startswith("web_search")
         ) or tool_name == "web_search"
 
+    def _is_unsupported_anthropic_hosted_tool(self, tool: Dict[str, Any]) -> bool:
+        """
+        Check if a tool is an Anthropic hosted tool without a chat-completion mapping.
+
+        Only web search is translated to OpenAI-compatible request fields in this
+        adapter. Other hosted tools are intentionally dropped to avoid leaking
+        Anthropic-shaped objects into the OpenAI `tools` array.
+        """
+        tool_type = tool.get("type", "")
+        tool_name = tool.get("name", "")
+        hosted_tool_prefixes = tuple(t.value for t in ANTHROPIC_HOSTED_TOOLS) + (
+            "computer",
+            "mcp_toolset",
+        )
+        hosted_tool_names = {
+            *{t.value for t in ANTHROPIC_HOSTED_TOOLS},
+            "computer",
+            "mcp_toolset",
+        }
+        is_hosted_tool = False
+        if isinstance(tool_type, str) and tool_type.startswith(hosted_tool_prefixes):
+            is_hosted_tool = True
+        elif isinstance(tool_name, str) and tool_name in hosted_tool_names:
+            is_hosted_tool = True
+        return is_hosted_tool and self._is_web_search_tool(tool) is False
+
     def translate_anthropic_messages_to_openai(  # noqa: PLR0915
         self,
         messages: List[
@@ -1125,15 +1151,50 @@ class LiteLLMAnthropicMessagesAdapter:
                 # Separate web search tools from regular tools
                 web_search_tools = []
                 regular_tools = []
+                unsupported_hosted_tools = []
                 for tool in tools:
                     if self._is_web_search_tool(cast(Dict[str, Any], tool)):
                         web_search_tools.append(tool)
+                    elif self._is_unsupported_anthropic_hosted_tool(
+                        cast(Dict[str, Any], tool)
+                    ):
+                        unsupported_hosted_tools.append(tool)
                     else:
                         regular_tools.append(tool)
 
                 # If web search tools are present, add web_search_options parameter
                 if web_search_tools:
                     new_kwargs["web_search_options"] = {}  # type: ignore
+
+                if unsupported_hosted_tools:
+                    existing_metadata = new_kwargs.get("metadata")
+                    metadata = (
+                        dict(existing_metadata)
+                        if isinstance(existing_metadata, dict)
+                        else {}
+                    )
+                    metadata["anthropic_adapter_unsupported_hosted_tools"] = [
+                        {
+                            "type": cast(Dict[str, Any], tool).get("type"),
+                            "name": cast(Dict[str, Any], tool).get("name"),
+                        }
+                        for tool in unsupported_hosted_tools
+                    ]
+                    new_kwargs["metadata"] = metadata  # type: ignore[typeddict-item]
+                    if tool_choice and tool_choice.get("type") != "none":
+                        unsupported_tool_names = {
+                            cast(Dict[str, Any], tool).get("name")
+                            for tool in unsupported_hosted_tools
+                        }
+                        tool_choice_targets_dropped_tool = (
+                            tool_choice.get("type") == "tool"
+                            and tool_choice.get("name") in unsupported_tool_names
+                        )
+                        if not regular_tools or tool_choice_targets_dropped_tool:
+                            metadata[
+                                "anthropic_adapter_unsupported_hosted_tool_choice"
+                            ] = dict(tool_choice)
+                            new_kwargs.pop("tool_choice", None)
 
                 # Only translate regular tools (non-web-search)
                 if regular_tools:

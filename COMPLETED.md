@@ -2,6 +2,44 @@
 
 ## 2026-04-29
 
+- Continued the `/anthropic` parity refinement pass with three focused fixes and
+  coverage additions. The OpenAI/Codex Responses adapter no longer turns prior
+  assistant `thinking` / `redacted_thinking` history into visible
+  `output_text`; it now preserves those blocks as Responses `reasoning` input
+  items while keeping adjacent assistant text and `tool_use` ordering intact.
+  Raw MCP remains intentionally rejected at the adapted `/anthropic` proxy
+  boundary; the focused guard still passes (`2 passed, 246 deselected`).
+  NVIDIA/OpenRouter-style completion translation now drops unsupported
+  Anthropic hosted/beta tools from OpenAI-compatible `tools`, preserves
+  Anthropic web search as `web_search_options`, and records dropped hosted
+  tools in `metadata.anthropic_adapter_unsupported_hosted_tools`. If a forced
+  Anthropic `tool_choice` targets a dropped hosted tool, the adapter now removes
+  that incompatible `tool_choice` and records it in metadata too.
+
+- Added the next Google/Gemini Code Assist `/anthropic` parity coverage and a
+  stream usage fix. The request builder now has a golden-envelope test covering
+  model/project shape, model-scoped Code Assist `session_id`, deterministic
+  `user_prompt_id`, representative native Gemini function declaration aliases,
+  `tool_choice`, assistant tool-call aliases, and reverse tool-name mapping.
+  The direct alias helper now covers the full Claude core alias set (`Bash`,
+  `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebFetch`, `WebSearch`) across
+  tools, assistant tool calls, `tool_choice`, and reverse mappings. The Code
+  Assist streaming path now proves multiple function calls across upstream
+  chunks are emitted as separate Claude-visible `tool_use` blocks with restored
+  names. A focused test initially failed because Gemini's buffered tool-call
+  stream emitted `message_delta` with `0/0` usage when the terminal usage
+  arrived in a later chunk; the wrapper now holds the buffered terminal message
+  until the usage-bearing chunk, preserving terminal token counts.
+
+- Focused validation for this slice passed:
+  `tests/test_litellm/llms/anthropic/experimental_pass_through/adapters/test_anthropic_experimental_pass_through_adapters_transformation.py`
+  (`71 passed`), the two Gemini wrapper parallel-tool tests (`2 passed`), the
+  targeted Responses thinking/order tests (`6 passed`), the focused Code Assist
+  proxy tests (`4 passed`), `py_compile` for all touched Python files,
+  `ruff check` for the touched implementation files, and `git diff --check`.
+  The full multi-path harness has not been run yet because live focused
+  `/anthropic` parity gates remain open in [TODO.md](TODO.md).
+
 - Continued the `/anthropic` parity refinement pass with the remaining
   OpenAI/Codex Responses input-ordering fix and completion-adapter streaming
   behavior fixes. `translate_messages_to_responses_input()` now preserves

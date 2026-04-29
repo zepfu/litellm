@@ -97,6 +97,43 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         return str(content)
 
     @staticmethod
+    def _anthropic_thinking_block_to_reasoning_item(
+        block: Dict[str, Any],
+        reasoning_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Convert Anthropic thinking blocks into hidden Responses reasoning items.
+
+        The conservative choice is to preserve the hidden block as a reasoning
+        item rather than surface it as assistant `output_text`.
+        """
+        block_type = block.get("type")
+        if block_type not in ("thinking", "redacted_thinking"):
+            return None
+
+        thinking_text = block.get("thinking", "")
+        encrypted_content = block.get("data", "") if block_type == "redacted_thinking" else ""
+
+        if not thinking_text and not encrypted_content:
+            return None
+
+        reasoning_item: Dict[str, Any] = {
+            "type": "reasoning",
+            "id": reasoning_id,
+            "summary": [{"type": "summary_text", "text": ""}],
+            "status": "completed",
+        }
+
+        if thinking_text:
+            reasoning_item["content"] = [
+                {"type": "reasoning_text", "text": thinking_text}
+            ]
+        if encrypted_content:
+            reasoning_item["encrypted_content"] = encrypted_content
+
+        return reasoning_item
+
+    @staticmethod
     def _deserialize_tool_input(arguments: Any) -> Dict[str, Any]:
         if arguments in (None, ""):
             return {}
@@ -210,6 +247,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
           assistant tool_use -> function_call
         """
         input_items: List[Dict[str, Any]] = []
+        reasoning_item_index = 0
 
         for m in messages:
             role = m["role"]
@@ -315,12 +353,19 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 asst_parts.append(
                                     {"type": "output_text", "text": output_text}
                                 )
-                        elif btype == "thinking":
-                            thinking_text = block.get("thinking", "")
-                            if thinking_text:
-                                asst_parts.append(
-                                    {"type": "output_text", "text": thinking_text}
-                                )
+                        elif btype in ("thinking", "redacted_thinking"):
+                            reasoning_item = self._anthropic_thinking_block_to_reasoning_item(
+                                block,
+                                reasoning_id=str(
+                                    block.get("signature")
+                                    or block.get("id")
+                                    or f"anthropic-thinking-{reasoning_item_index + 1}"
+                                ),
+                            )
+                            if reasoning_item is not None:
+                                flush_assistant_parts()
+                                reasoning_item_index += 1
+                                input_items.append(reasoning_item)
                     flush_assistant_parts()
 
         return input_items

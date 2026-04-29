@@ -2606,3 +2606,113 @@ def test_translate_anthropic_to_openai_with_mixed_tools():
 
     # tool_name_mapping should be empty for short tool names
     assert tool_name_mapping == {}
+
+
+def test_translate_anthropic_to_openai_drops_unsupported_hosted_tools_with_metadata():
+    from litellm.types.llms.anthropic import AnthropicMessagesRequest
+
+    anthropic_request = AnthropicMessagesRequest(
+        model="gemini-2.5-flash-lite",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": "Run the helper tool",
+            }
+        ],
+        tools=[
+            {
+                "type": "bash_20250124",
+                "name": "bash",
+            }
+        ],
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, tool_name_mapping = adapter.translate_anthropic_to_openai(
+        anthropic_message_request=anthropic_request
+    )
+
+    assert "tools" not in openai_request
+    assert "web_search_options" not in openai_request
+    assert openai_request["metadata"]["anthropic_adapter_unsupported_hosted_tools"] == [
+        {"type": "bash_20250124", "name": "bash"}
+    ]
+    assert tool_name_mapping == {}
+
+
+def test_translate_anthropic_to_openai_removes_tool_choice_for_dropped_hosted_tool():
+    from litellm.types.llms.anthropic import AnthropicMessagesRequest
+
+    anthropic_request = AnthropicMessagesRequest(
+        model="gemini-2.5-flash-lite",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": "Run the hosted shell tool"}],
+        tools=[{"type": "bash_20250124", "name": "bash"}],
+        tool_choice={"type": "tool", "name": "bash"},
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, tool_name_mapping = adapter.translate_anthropic_to_openai(
+        anthropic_message_request=anthropic_request
+    )
+
+    assert "tools" not in openai_request
+    assert "tool_choice" not in openai_request
+    assert openai_request["metadata"]["anthropic_adapter_unsupported_hosted_tools"] == [
+        {"type": "bash_20250124", "name": "bash"}
+    ]
+    assert openai_request["metadata"][
+        "anthropic_adapter_unsupported_hosted_tool_choice"
+    ] == {"type": "tool", "name": "bash"}
+    assert tool_name_mapping == {}
+
+
+def test_translate_anthropic_to_openai_with_mixed_hosted_and_regular_tools():
+    from litellm.types.llms.anthropic import AnthropicMessagesRequest
+
+    anthropic_request = AnthropicMessagesRequest(
+        model="gemini-2.5-flash-lite",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": "Get weather and search the web",
+            }
+        ],
+        tools=[
+            {
+                "type": "web_search_20260209",
+                "name": "web_search",
+            },
+            {
+                "type": "text_editor_20250124",
+                "name": "text_editor",
+            },
+            {
+                "name": "get_weather",
+                "description": "Get weather information",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                },
+            },
+        ],
+    )
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_request, tool_name_mapping = adapter.translate_anthropic_to_openai(
+        anthropic_message_request=anthropic_request
+    )
+
+    assert "web_search_options" in openai_request
+    assert openai_request["web_search_options"] == {}
+    assert "tools" in openai_request
+    assert len(openai_request["tools"]) == 1
+    assert openai_request["tools"][0]["function"]["name"] == "get_weather"
+    assert openai_request["metadata"]["anthropic_adapter_unsupported_hosted_tools"] == [
+        {"type": "text_editor_20250124", "name": "text_editor"}
+    ]
+    assert tool_name_mapping == {}
