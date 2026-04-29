@@ -415,21 +415,11 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             if isinstance(arguments, str) and arguments:
                 buffered["arguments"] += arguments
 
-    def _queue_buffered_gemini_tool_calls(
-        self, chunk: "ModelResponseStream"
-    ) -> bool:
-        if not self._should_buffer_gemini_tool_calls(chunk):
-            return False
-
-        self._buffer_tool_call_delta(chunk)
-        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-        if finish_reason is None:
-            return True
+    def _queue_buffered_gemini_tool_call_blocks(self) -> bool:
         if not self.buffered_tool_calls:
             return False
 
         from .transformation import (
-            LiteLLMAnthropicMessagesAdapter,
             sanitize_anthropic_tool_use_id,
             sanitize_anthropic_tool_use_input_json_delta,
         )
@@ -485,13 +475,40 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
         self.buffered_tool_calls.clear()
         self.sent_content_block_finish = True
+        return True
+
+    def _queue_buffered_gemini_tool_calls(
+        self,
+        chunk: "ModelResponseStream",
+        hold_terminal_message_delta: bool = False,
+    ) -> bool:
+        if not self._should_buffer_gemini_tool_calls(chunk):
+            return False
+
+        self._buffer_tool_call_delta(chunk)
+        finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+        if finish_reason is None:
+            return True
+        if not self.buffered_tool_calls:
+            return False
+
+        from .transformation import LiteLLMAnthropicMessagesAdapter
+
         message_delta = (
             LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
                 response=chunk,
                 current_content_block_index=self.current_content_block_index,
             )
         )
-        self.chunk_queue.append(message_delta)
+        if hold_terminal_message_delta and getattr(chunk, "usage", None) is None:
+            self.holding_stop_reason_chunk = message_delta
+            return True
+
+        self._queue_buffered_gemini_tool_call_blocks()
+        if hold_terminal_message_delta:
+            self.holding_stop_reason_chunk = message_delta
+        else:
+            self.chunk_queue.append(message_delta)
         return True
 
     def _translate_terminal_tool_call_chunk(
@@ -685,7 +702,19 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 self.holding_chunk = None
 
             if not self._queue_held_stop_reason_if_needed():
-                self._queue_synthetic_end_turn_if_needed()
+                if self.buffered_tool_calls:
+                    self._queue_buffered_gemini_tool_call_blocks()
+                    if self.holding_stop_reason_chunk is None:
+                        self.holding_stop_reason_chunk = {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": "tool_use",
+                                "stop_sequence": None,
+                            },
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        }
+                if not self._queue_held_stop_reason_if_needed():
+                    self._queue_synthetic_end_turn_if_needed()
 
             if not self.sent_last_message:
                 self.sent_last_message = True
@@ -740,7 +769,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
-                if self._queue_buffered_gemini_tool_calls(chunk):
+                if self._queue_buffered_gemini_tool_calls(
+                    chunk, hold_terminal_message_delta=True
+                ):
                     if self.chunk_queue:
                         return self.chunk_queue.popleft()
                     continue
@@ -926,6 +957,18 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if self.holding_chunk is not None:
                     self.chunk_queue.append(self.holding_chunk)
                     self.holding_chunk = None
+
+                if self.buffered_tool_calls:
+                    self._queue_buffered_gemini_tool_call_blocks()
+                    if self.holding_stop_reason_chunk is None:
+                        self.holding_stop_reason_chunk = {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": "tool_use",
+                                "stop_sequence": None,
+                            },
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        }
 
                 if not self._queue_held_stop_reason_if_needed():
                     self._queue_synthetic_end_turn_if_needed()

@@ -440,8 +440,8 @@ class TestTranslateMessagesToResponsesInput:
             },
         ]
 
-    def test_assistant_thinking_block_becomes_output_text(self):
-        """Assistant thinking block text is included as output_text."""
+    def test_assistant_thinking_block_becomes_reasoning_item(self):
+        """Assistant thinking block is preserved as a hidden reasoning item."""
         messages = [
             {
                 "role": "assistant",
@@ -451,8 +451,19 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
         result = _translate_messages(messages)
-        assert result[0]["content"] == [
-            {"type": "output_text", "text": "Let me reason step by step."}
+        assert result == [
+            {
+                "type": "reasoning",
+                "id": "anthropic-thinking-1",
+                "summary": [{"type": "summary_text", "text": ""}],
+                "content": [
+                    {
+                        "type": "reasoning_text",
+                        "text": "Let me reason step by step.",
+                    }
+                ],
+                "status": "completed",
+            }
         ]
 
     def test_assistant_empty_thinking_block_skipped(self):
@@ -465,6 +476,57 @@ class TestTranslateMessagesToResponsesInput:
         ]
         result = _translate_messages(messages)
         assert result == []
+
+    def test_assistant_redacted_thinking_block_becomes_reasoning_item(self):
+        """Assistant redacted thinking is preserved as hidden reasoning data."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [{"type": "redacted_thinking", "data": "opaque-thought"}],
+            }
+        ]
+        result = _translate_messages(messages)
+        assert result == [
+            {
+                "type": "reasoning",
+                "id": "anthropic-thinking-1",
+                "summary": [{"type": "summary_text", "text": ""}],
+                "encrypted_content": "opaque-thought",
+                "status": "completed",
+            }
+        ]
+
+    def test_assistant_thinking_and_tool_use_preserve_order(self):
+        """Hidden thinking stays ordered around visible text and tool calls."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Before tool."},
+                    {"type": "thinking", "thinking": "Hidden step."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_02",
+                        "name": "get_weather",
+                        "input": {"city": "Boston"},
+                    },
+                    {"type": "redacted_thinking", "data": "opaque-thought"},
+                    {"type": "text", "text": "After tool."},
+                ],
+            }
+        ]
+        result = _translate_messages(messages)
+        assert [item["type"] for item in result] == [
+            "message",
+            "reasoning",
+            "function_call",
+            "reasoning",
+            "message",
+        ]
+        assert result[0]["content"] == [{"type": "output_text", "text": "Before tool."}]
+        assert result[1]["content"] == [{"type": "reasoning_text", "text": "Hidden step."}]
+        assert result[3]["encrypted_content"] == "opaque-thought"
+        assert result[4]["content"] == [{"type": "output_text", "text": "After tool."}]
 
     def test_mixed_messages_ordering(self):
         """Full multi-turn conversation is converted in order."""
