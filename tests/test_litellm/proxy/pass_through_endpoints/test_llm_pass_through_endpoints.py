@@ -630,24 +630,42 @@ class TestGoogleNativeToolAliases:
         assert changes["google_adapter_system_prompt_removed_claude_overhead_chars"] == 0
 
     def test_apply_google_code_assist_native_tool_aliases(self):
+        expected_aliases = {
+            "Bash": "run_shell_command",
+            "Read": "read_file",
+            "Write": "write_file",
+            "Edit": "replace",
+            "Glob": "glob",
+            "Grep": "grep_search",
+            "WebFetch": "web_fetch",
+            "WebSearch": "google_web_search",
+        }
         completion_kwargs = {
             "tools": [
-                {"type": "function", "function": {"name": "Bash", "parameters": {}}},
-                {"type": "function", "function": {"name": "Read", "parameters": {}}},
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in expected_aliases
+            ] + [
                 {"type": "function", "function": {"name": "UnchangedTool", "parameters": {}}},
             ],
             "messages": [
                 {
                     "role": "assistant",
                     "tool_calls": [
-                        {"id": "call_1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}},
-                        {"id": "call_2", "type": "function", "function": {"name": "Read", "arguments": "{}"}},
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": "{}"},
+                        }
+                        for index, name in enumerate(expected_aliases)
                     ],
                 }
             ],
-            "tool_choice": {"type": "function", "function": {"name": "Bash"}},
+            "tool_choice": {"type": "function", "function": {"name": "WebSearch"}},
         }
-        tool_name_mapping = {"Bash": "Bash", "Read": "Read", "UnchangedTool": "UnchangedTool"}
+        tool_name_mapping = {
+            **{name: name for name in expected_aliases},
+            "UnchangedTool": "UnchangedTool",
+        }
 
         updated_kwargs, changes = _apply_google_code_assist_native_tool_aliases(
             completion_kwargs,
@@ -655,13 +673,15 @@ class TestGoogleNativeToolAliases:
         )
 
         function_names = [tool["function"]["name"] for tool in updated_kwargs["tools"]]
-        assert function_names == ["run_shell_command", "read_file", "UnchangedTool"]
+        assert function_names == [*expected_aliases.values(), "UnchangedTool"]
         tool_call_names = [call["function"]["name"] for call in updated_kwargs["messages"][0]["tool_calls"]]
-        assert tool_call_names == ["run_shell_command", "read_file"]
-        assert updated_kwargs["tool_choice"]["function"]["name"] == "run_shell_command"
-        assert tool_name_mapping["run_shell_command"] == "Bash"
-        assert tool_name_mapping["read_file"] == "Read"
-        assert changes["google_native_tool_aliases"] == ["read_file", "run_shell_command"]
+        assert tool_call_names == list(expected_aliases.values())
+        assert updated_kwargs["tool_choice"]["function"]["name"] == "google_web_search"
+        for original_name, alias_name in expected_aliases.items():
+            assert tool_name_mapping[alias_name] == original_name
+        assert changes["google_native_tool_aliases"] == sorted(
+            expected_aliases.values()
+        )
 
 
 class TestGoogleCodeAssistPrimeCache:
@@ -1818,6 +1838,104 @@ class TestGoogleAdapterRequestShapePolicy:
             wrapped_request["litellm_metadata"]["google_adapter_system_prompt_policy"]
             == "replace_compact"
         )
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_builder_preserves_core_tool_alias_envelope(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "native-session-1"}
+
+        wrapped_request, tool_name_mapping, completion_messages, _, _, changes = await _build_google_code_assist_request_from_completion_kwargs(
+            completion_kwargs={
+                "max_tokens": 32,
+                "messages": [
+                    {"role": "user", "content": "Use Bash and Read."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "I will call tools."},
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_bash",
+                                "name": "Bash",
+                                "input": {"command": "date -u"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_read",
+                                "name": "Read",
+                                "input": {"file_path": "/tmp/a.txt"},
+                            },
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "name": "Bash",
+                        "description": "Run shell",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                    {
+                        "name": "Read",
+                        "description": "Read file",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                        },
+                    },
+                    {
+                        "name": "Grep",
+                        "description": "Search",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"pattern": {"type": "string"}},
+                            "required": ["pattern"],
+                        },
+                    },
+                ],
+                "tool_choice": {"type": "tool", "name": "Bash"},
+            },
+            adapter_model="gemini-3-flash-preview",
+            project="test-project",
+            request=mock_request,
+        )
+
+        request_payload = wrapped_request["request"]
+        declarations = request_payload["tools"][0].get(
+            "functionDeclarations"
+        ) or request_payload["tools"][0].get("function_declarations")
+        function_names = [declaration["name"] for declaration in declarations]
+        model_parts = request_payload["contents"][1]["parts"]
+        tool_call_names = [
+            part["functionCall"]["name"] for part in model_parts if "functionCall" in part
+        ]
+
+        assert wrapped_request["model"] == "gemini-3-flash-preview"
+        assert wrapped_request["project"] == "test-project"
+        assert wrapped_request["user_prompt_id"] == "c0c2a79b-f32a-5a0b-be0f-13586c8dc09f"
+        assert request_payload["session_id"] == "df8d0bd4-bce2-5ecf-8192-42ecfcb4e058"
+        assert function_names == ["run_shell_command", "read_file", "grep_search"]
+        assert request_payload["toolConfig"]["functionCallingConfig"] == {
+            "mode": "ANY",
+            "allowed_function_names": ["run_shell_command"],
+        }
+        assert tool_call_names == ["run_shell_command", "read_file"]
+        assert completion_messages[1]["tool_calls"][0]["function"]["name"] == "run_shell_command"
+        assert completion_messages[1]["tool_calls"][1]["function"]["name"] == "read_file"
+        assert tool_name_mapping == {
+            "run_shell_command": "Bash",
+            "read_file": "Read",
+            "grep_search": "Grep",
+        }
+        assert changes["google_native_tool_aliases"] == [
+            "grep_search",
+            "read_file",
+            "run_shell_command",
+        ]
 
     @pytest.mark.asyncio
     async def test_wrap_streaming_response_with_release_callback_releases_after_stream_completion(self):
@@ -7671,6 +7789,65 @@ async def test_google_code_assist_anthropic_stream_preserves_tool_use_and_usage_
     assert message_delta_events[-1]["delta"]["stop_reason"] == "tool_use"
     assert message_delta_events[-1]["usage"]["input_tokens"] == 7
     assert message_delta_events[-1]["usage"]["output_tokens"] == 3
+    assert events[-1]["type"] == "message_stop"
+
+
+@pytest.mark.asyncio
+async def test_google_code_assist_anthropic_stream_buffers_parallel_tool_calls_across_chunks():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _build_anthropic_streaming_response_from_google_code_assist_stream,
+    )
+
+    async def _body_iterator():
+        yield (
+            b'data: {"traceId":"trace-code-assist-2","response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"file_path":"/tmp/a.txt"}}}]}}]}}\n\n'
+        )
+        yield (
+            b'data: {"traceId":"trace-code-assist-2","response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"run_shell_command","args":{"command":"pwd"}}}]}}]}}\n\n'
+        )
+        yield (
+            b'data: {"traceId":"trace-code-assist-2","response":{"candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":4,"totalTokenCount":13,"trafficType":"ON_DEMAND"}}}\n\n'
+        )
+
+    google_stream = StreamingResponse(_body_iterator(), media_type="text/event-stream")
+    anthropic_stream = _build_anthropic_streaming_response_from_google_code_assist_stream(
+        response=google_stream,
+        adapter_model="gemini-3-flash-preview",
+        tool_name_mapping={"read_file": "Read", "run_shell_command": "Bash"},
+        gemini_optional_params={},
+    )
+
+    chunks = [chunk async for chunk in anthropic_stream.body_iterator]
+    events = _decode_anthropic_sse_events(chunks)
+
+    tool_start_events = [
+        event
+        for event in events
+        if event.get("type") == "content_block_start"
+        and event.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert [event["content_block"]["name"] for event in tool_start_events] == [
+        "Read",
+        "Bash",
+    ]
+
+    tool_delta_events = [
+        event
+        for event in events
+        if event.get("type") == "content_block_delta"
+        and event.get("delta", {}).get("type") == "input_json_delta"
+    ]
+    assert [json.loads(event["delta"]["partial_json"]) for event in tool_delta_events] == [
+        {"file_path": "/tmp/a.txt"},
+        {"command": "pwd"},
+    ]
+
+    message_delta_events = [
+        event for event in events if event.get("type") == "message_delta"
+    ]
+    assert message_delta_events[-1]["delta"]["stop_reason"] == "tool_use"
+    assert message_delta_events[-1]["usage"]["input_tokens"] == 9
+    assert message_delta_events[-1]["usage"]["output_tokens"] == 4
     assert events[-1]["type"] == "message_stop"
 
 

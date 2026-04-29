@@ -162,14 +162,6 @@ these docs only as needed:
   scope.
 
   OpenAI/Codex Responses adapter:
-  - Decide whether prior Anthropic `thinking` history should be dropped, mapped
-    to Responses reasoning items, or kept as encrypted reasoning metadata
-    instead of visible assistant `output_text`.
-  - Track raw MCP parity separately: the transformation layer can map
-    `mcp_servers` / `mcp_toolset` into Responses `mcp` tools, but the proxy
-    route rejects raw MCP for adapted `/anthropic` requests. Either de-scope the
-    dead translation path or implement end-to-end parity with native OpenAI
-    Responses passthrough.
   - Add one hard-gated parity fixture that uses a native Codex streaming tool
     call as the baseline and a `/anthropic`-adapted Claude Code tool call as
     the system under test, then compares reconstructed `response.output_item.*` /
@@ -177,28 +169,26 @@ these docs only as needed:
     `session_history_tool_activity`.
 
   Google/Gemini Code Assist adapter:
-  - Add Anthropic-to-Google streaming behavior checks for partial and parallel
-    `functionCall` chunks. The adapter always sends upstream
-    `v1internal:streamGenerateContent`; the Anthropic wrapper currently buffers
-    Gemini tool-call deltas until a terminal chunk, while native Gemini/Google
-    adapter code can emit a function call once accumulated JSON parses and flush
-    leftovers at stream end.
-  - Document and test the session/id contract against native Gemini CLI:
-    native Gemini passthrough preserves CLI `request.session_id` as baseline
-    behavior, while `/anthropic` to Google derives a model-scoped Code Assist
-    session and hand-builds `user_prompt_id`. Add a golden-envelope comparison
-    for the same prompt/session, especially across follow-up tool turns.
-  - Add explicit alias-contract tests for every Claude core tool (`Read`,
-    `Grep`, `Bash`, etc.) across tools, `tool_choice`, assistant tool calls,
-    streaming restored names, and native Gemini `functionDeclaration` names.
+  - Live-compare the newly covered `/anthropic` Code Assist request envelope
+    against native Gemini CLI captures before treating the session/id contract
+    as fully proven. Unit coverage now pins the model-scoped Code Assist
+    `session_id`, hand-built `user_prompt_id`, native function declaration
+    aliases, full Claude-core native alias mapping, `tool_choice`, assistant
+    tool-call aliases, restored streaming tool names, parallel tool-call
+    buffering, and terminal usage preservation.
+  - If live Gemini captures show true partial `functionCall.args` fragments
+    across valid Code Assist SSE events, add a focused fixture for that exact
+    shape. Current focused coverage proves multiple function calls spread across
+    Code Assist chunks; add a route-level raw-transport split fixture only if
+    live captures make that shape relevant.
 
   NVIDIA/OpenRouter completion adapters:
-  - Add an explicit hosted-tool compatibility policy for completion adapters:
-    translate supported Anthropic hosted/beta tools to the target provider
-    shape, or reject/drop unsupported tools with metadata explaining the
-    downgrade.
-  - Focused coverage to add before live harness work: provider-specific
-    hosted-tool translation/rejection assertions.
+  - Run live focused `/anthropic` cases before broad harness work to confirm the
+    new hosted-tool policy behaves correctly against NVIDIA/OpenRouter-style
+    completion targets. Unit coverage now keeps Anthropic hosted/beta tools out
+    of OpenAI-compatible `tools`, preserves web search as `web_search_options`,
+    removes forced `tool_choice` values that target dropped hosted tools, and
+    records unsupported hosted tool downgrades in metadata.
 
   OpenRouter Responses adapter:
   - Treat it as the OpenAI Responses parity path plus OpenRouter-specific
