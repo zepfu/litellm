@@ -11,6 +11,7 @@ services:
       # Mount source for live code changes (key files only)
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
+      - ./litellm/integrations/langfuse/langfuse.py:/app/litellm/integrations/langfuse/langfuse.py
       - ./litellm/__init__.py:/app/litellm/__init__.py
       - ./litellm/_lazy_imports_registry.py:/app/litellm/_lazy_imports_registry.py
       - ./litellm/main.py:/app/litellm/main.py
@@ -89,8 +90,9 @@ services:
       - LITELLM_LOG=${LITELLM_LOG:-INFO}
       - AAWM_GEMINI_ROUTE_DEBUG=${AAWM_GEMINI_ROUTE_DEBUG:-0}
       - AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS=${AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS:-30}
-      - AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=${AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS:-20}
-      - AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS=${AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS:-2,4,8,12}
+      - AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=${AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS:-180}
+      - AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES=${AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES:-8}
+      - AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS=${AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS:-2,4,8,12,20,30,45,60}
       - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
       - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
       - LITELLM_CODEX_AUTH_FILE=${LITELLM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}

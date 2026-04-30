@@ -250,8 +250,28 @@
         "/openai_passthrough/v1/responses",
         "/openai_passthrough/responses"
       ],
-      "required_trace_tags": ["route:codex_responses"],
-      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "required_trace_tags": [
+        "route:codex_responses",
+        "codex-tool-description-patch",
+        "codex-tool-description-patch:spawn-agent-fanout-policy"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "codex_tool_description_patch_count"
+      ],
+      "request_text_checks": {
+        "required_substrings": [
+          "Use subagents to parallelize independent work",
+          "latest frontier model",
+          "latest Codex model",
+          "mini-class agents"
+        ],
+        "forbidden_substrings": [
+          "Only use `spawn_agent` if and only if",
+          "Only use spawn_agent if and only if",
+          "Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn"
+        ]
+      },
       "session_history_validation": {
         "db_host": "127.0.0.1",
         "db_port": 5434,
@@ -265,14 +285,27 @@
         "metadata_required_equals": {
           "trace_environment": "dev",
           "litellm_environment": "dev",
-          "client_name": "codex_exec"
+          "client_name": "codex_exec",
+          "prompt_overhead_breakdown_source": "request_body_estimate",
+          "prompt_overhead_counted_shape": "openai_responses",
+          "prompt_overhead_classifier_version": "deterministic-v1"
         },
-        "metadata_required_truthy": ["request_tags", "client_version"],
+        "metadata_required_truthy": [
+          "request_tags",
+          "client_version",
+          "prompt_overhead_component_paths",
+          "usage_input_system_tokens_estimated",
+          "usage_input_tool_advertisement_tokens_estimated",
+          "usage_input_conversation_tokens_estimated"
+        ],
         "required_contains": {
           "repository": "litellm"
         },
         "minimums": {
           "input_tokens": 1,
+          "input_system_tokens_estimated": 1,
+          "input_tool_advertisement_tokens_estimated": 1,
+          "input_conversation_tokens_estimated": 1,
           "output_tokens": 1,
           "total_tokens": 1
         }

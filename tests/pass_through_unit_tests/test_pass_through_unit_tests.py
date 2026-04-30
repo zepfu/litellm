@@ -34,6 +34,9 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _update_metadata_with_tags_in_header,
     HttpPassThroughEndpointHelpers,
 )
+from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
+    _get_user_from_passthrough_logging_payload,
+)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     PassthroughStandardLoggingPayload,
 )
@@ -192,6 +195,19 @@ def test_init_kwargs_for_pass_through_endpoint_uses_standard_end_user_header(
     assert (
         result["litellm_params"]["metadata"]["user_api_key_end_user_id"]
         == "header-user"
+    )
+
+
+def test_passthrough_logging_payload_reads_end_user_header_with_empty_body():
+    passthrough_payload = PassthroughStandardLoggingPayload(
+        url="https://test.com",
+        request_body={},
+        request_headers={"x-litellm-end-user-id": "pytest-classifier"},
+    )
+
+    assert (
+        _get_user_from_passthrough_logging_payload(passthrough_payload)
+        == "pytest-classifier"
     )
 
 

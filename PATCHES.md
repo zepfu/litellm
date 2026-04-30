@@ -1277,6 +1277,53 @@ out on the OpenRouter/Ling child lane; that follow-up is tracked in
 
 ---
 
+### aawm.38 — Codex `spawn_agent` tool-description fanout policy rewrite
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `scripts/local-ci/anthropic_adapter_config.json`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py`
+- `TODO.md`
+- `COMPLETED.md`
+- `PATCHES.md`
+- `TEST_HARNESS.md`
+- `scripts/local-ci/README.md`
+
+**Upstream issue:** Codex CLI can inject a `spawn_agent` tool description that
+tells the model to use subagents only when the user explicitly asks for
+subagents, delegation, or parallel agent work. That conflicts with AAWM's
+operator policy, where concrete independent work should fan out by default
+while the main thread keeps ownership of the critical path.
+
+**Fix:** On Codex-native Responses passthrough requests, rewrite only structured
+`tools[]` descriptors named `spawn_agent` when they contain the restrictive
+wording. Replace that block with AAWM's fanout policy: use independent
+subagents, keep one local critical-path owner, avoid duplicate work, prefer the
+latest frontier model for architecture/migration-risk/high-stakes DB reasoning,
+prefer the latest Codex model for bounded implementation with disjoint write
+ownership, and use mini-class agents for narrow scans and quick QA. The rewrite
+records `codex-tool-description-patch` /
+`codex-tool-description-patch:spawn-agent-fanout-policy` tags,
+`codex_tool_description_patch_*` metadata, and a
+`codex.tool_description_patch` span.
+
+**Why not upstream:** This is AAWM-specific Codex CLI context policy. The goal
+is to shape our local Codex-native passthrough request before upstream send,
+not to patch Codex CLI or alter generic OpenAI passthrough traffic.
+
+**Validation status:** Local focused tests pass for the structured rewrite,
+non-`spawn_agent` no-op behavior, Codex route integration, generic OpenAI
+Responses no-op behavior, harness config shape, `pytest-classifier` caller
+attribution, and passthrough callback ordering. Live dev `:4001` validation
+passed after refreshing `litellm-dev`:
+`AAWM_OBSERVE_SERVICE_NAME=pytest-classifier-scan ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py --config scripts/local-ci/anthropic_adapter_config.json --target dev --cases native_openai_passthrough_responses_codex --write-artifact /tmp/native_codex_spawn_agent_tool_description_patch.json`.
+The artifact recorded trace `092a1ac4-1cd5-4859-949b-9898b7ba3b1c`, Langfuse
+user `pytest-classifier`, the patch tags, required fanout text, and no
+restrictive `Only use spawn_agent if and only if...` text.
+
+---
+
 
 ## Dropped Patches
 

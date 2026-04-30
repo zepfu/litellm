@@ -1,5 +1,122 @@
 # Completed
 
+## 2026-04-30
+
+- Added harness-level prompt-overhead cost-share reporting for
+  `public.session_history`. `summary.prompt_overhead_cost_share` now groups by
+  case, client, route family, counted request shape, environment, provider, and
+  model; aggregates system/tool/conversation/other/residual/system-classifier
+  token buckets; and labels proportional `response_cost_usd` allocation as
+  estimated because exact input-cost fields are not yet stored.
+
+  Focused validation passed:
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`56 passed`),
+  `./.venv/bin/ruff check --ignore PLR0915,T201 scripts/local-ci/run_anthropic_adapter_acceptance.py tests/local_ci/test_anthropic_adapter_acceptance_hardening.py`,
+  and live dev `:4001` artifacts
+  `/tmp/native_codex_4001_prompt_overhead_cost_share.json` plus
+  `/tmp/native_openai_prompt_overhead_cost_share_4001.json`. Codex trace
+  `44babd14-58e7-46ed-875e-6aedd6f03e81`, session
+  `019ddfcd-8333-7732-848e-c4d5b4f4aee4`, was verified in exact database
+  `aawm_tristore` row `136103` with the new prompt-overhead columns populated.
+  The broader native report artifact
+  `/tmp/native_prompt_overhead_cost_share_4001_after_dedupe.json` populated rows across
+  Claude/OpenAI/Codex/Gemini native paths, but the suite itself was not clean
+  because the Gemini generateContent case's runtime-log check saw an
+  overlapping `429` substring.
+
+- Fixed and live-verified the plain `codex --profile litellm-dev` attribution
+  path on dev `:4001`. The profile was routing correctly to `litellm-dev`, but
+  both prod and dev Codex profiles also set `langfuse_trace_user_id=codex`; for
+  native Codex passthrough this generic profile header could overwrite the
+  repository-derived identity after AAWM enrichment. The fix promotes the
+  repository identity to `trace_user_id` only for native Codex passthrough when
+  the current trace user is missing or one of the generic Codex defaults, and it
+  rewrites the pending Langfuse header before Langfuse imports `langfuse_*`
+  headers.
+
+  Focused validation passed:
+  `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py -k 'codex_repository_over_generic_user_header or explicit_codex_user_header or child_dispatch_trace_metadata or stale_orchestrator_langfuse_trace_header' -q`
+  (`4 passed`),
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k 'codex_spawn_agent_tool_description_patch or base_openai_pass_through_handler_sets_trace_environment_and_session or generic_responses_does_not_patch_spawn_agent_tool or openai_passthrough_route_sets_repository_trace_environment_and_session' -q`
+  (`4 passed`),
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -k 'pytest_classifier_harness_user_id or target_profile_codex_cli_uses_pytest_classifier_harness_user_id or native_codex_case_hard_gates_spawn_agent_tool_description_patch' -q`
+  (`2 passed`), and
+  `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py -q`
+  (`91 passed`).
+
+  Live alias-shaped validation passed after restarting only `litellm-dev`:
+  `codex --profile litellm-dev exec -m gpt-5.4-mini --json ...` from
+  `/home/zepfu/projects/pytest-classifier` produced Langfuse trace
+  `6d1775c7-2a7b-49a2-9aa7-5ee5ff1436dd`, session
+  `019ddec6-9680-76d3-af3d-0d61673f94c4`, `environment=dev`,
+  `userId=pytest-classifier`, `repository=pytest-classifier`, patch tags
+  `codex-tool-description-patch` /
+  `codex-tool-description-patch:spawn-agent-fanout-policy`, required fanout
+  text, and no restrictive `Only use spawn_agent if and only if...` text.
+
+- Fixed and live-verified the native Codex `spawn_agent` policy patch regression
+  on dev `:4001`. The harness now derives `pytest-classifier` as the caller
+  user when launched under pytest-classifier observability, owns all Codex CLI
+  tracing header injection in `_ensure_cli_harness_context()`, and replaces
+  stale/missing Codex `-c model_providers.*.http_headers.*` entries instead of
+  relying on static JSON command text. Passthrough success logging now runs sync
+  `logging_hook()` enrichment before any `log_success_event()` callback, stores
+  proxy request headers as a plain dict, and Langfuse falls back to metadata
+  `user_api_key_end_user_id` / `trace_user_id` when the standard logging object
+  lacks an end-user id. Dev config now orders AAWM identity before Langfuse and
+  bind-mounts the Langfuse integration so `litellm-dev` picks up this path.
+
+  Focused validation passed:
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -k 'pytest_classifier_harness_user_id or native_codex_case_hard_gates_spawn_agent_tool_description_patch' -q`
+  (`2 passed`),
+  `./.venv/bin/python -m pytest tests/pass_through_unit_tests/test_pass_through_unit_tests.py -k 'standard_end_user_header or empty_body' -q`
+  (`2 passed`),
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_pass_through_endpoints.py -k 'success_handler_applies_logging_hooks or proxy_server_request' -q`
+  (`2 passed`), and
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k 'codex_spawn_agent_tool_description_patch or base_openai_pass_through_handler_sets_trace_environment_and_session or generic_responses_does_not_patch_spawn_agent_tool or openai_passthrough_route_sets_repository_trace_environment_and_session' -q`
+  (`4 passed`).
+
+  Live dev validation passed after restarting `litellm-dev`:
+  `AAWM_OBSERVE_SERVICE_NAME=pytest-classifier-scan ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py --config scripts/local-ci/anthropic_adapter_config.json --target dev --cases native_openai_passthrough_responses_codex --write-artifact /tmp/native_codex_spawn_agent_tool_description_patch.json`
+  (`passed=True`, zero failures/warnings). Artifact evidence:
+  trace `092a1ac4-1cd5-4859-949b-9898b7ba3b1c`, session
+  `019dde80-69f5-7800-ba0c-039fa72c4011`, actual Langfuse user
+  `pytest-classifier`, trace tags `codex-tool-description-patch` and
+  `codex-tool-description-patch:spawn-agent-fanout-policy`, required request
+  text `Use subagents to parallelize independent work`, `latest frontier model`,
+  `latest Codex model`, and `mini-class agents`, and no forbidden restrictive
+  `Only use spawn_agent if and only if...` text.
+
+- Added the native Codex `spawn_agent` tool-description rewrite on the
+  Codex-native Responses passthrough path. The patch only runs for Codex-native
+  `/openai_passthrough/*` / `/openai/*` Responses requests, only inspects
+  structured `tools[]` entries named `spawn_agent`, and replaces the restrictive
+  `Only use spawn_agent if and only if...` policy block with the AAWM fanout
+  policy that encourages independent subagents while keeping one local owner on
+  the critical path. The replacement uses generic model classes (`latest
+  frontier model`, `latest Codex model`, and `mini-class agents`) instead of a
+  pinned `GPT-5.5` reference, and records
+  `codex-tool-description-patch` /
+  `codex-tool-description-patch:spawn-agent-fanout-policy` tags plus
+  `codex_tool_description_patch_*` metadata and a
+  `codex.tool_description_patch` span.
+
+  The native Codex harness case now hard-gates the patch evidence:
+  `native_openai_passthrough_responses_codex` requires the new trace tags,
+  truthy `codex_tool_description_patch_count`, generic fanout text in the
+  logged request, and absence of the restrictive `Only use spawn_agent if and
+  only if...` request text. Local validation passed:
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k 'codex_spawn_agent_tool_description_patch or base_openai_pass_through_handler_sets_trace_environment_and_session or generic_responses_does_not_patch_spawn_agent_tool or openai_passthrough_route_sets_repository_trace_environment_and_session' -q`
+  (`4 passed`),
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -k 'codex and not openrouter' -q`
+  (`9 passed`), and
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -k 'native_codex_case_hard_gates_spawn_agent_tool_description_patch or codex_tool_activity_parity_cases_have_stream_state_gates' -q`
+  (`2 passed`). JSON validation, `py_compile`, Ruff `E9,F821,F823`, focused
+  Ruff `E9,F821,F823,F841` for the implementation and local-ci test, and
+  `git diff --check` passed. A broader F841 run over the full passthrough test
+  file still reports pre-existing unused locals outside this change.
+
 ## 2026-04-29
 
 - Validation note for the non-deferred `/anthropic` schema-safety
@@ -29,10 +146,64 @@
   OpenAI/Codex path and every non-fanout default case, but still failed the
   Gemini fanout gates because Gemini 3.1 Pro again returned upstream
   `MODEL_CAPACITY_EXHAUSTED`; `claude_adapter_peeromega_fanout` also failed
-  only the expected Gemini 3.1 Pro session-history row for the same capacity
-  reason. Treat these as live provider-capacity gate failures, not as evidence
-  of schema-strip regression. Rerun the broad harness when Gemini 3.1 Pro
-  capacity is available.
+  only the expected Gemini 3.1 Pro session-history row. Do not record this as
+  ordinary quota exhaustion yet: the standalone `claude_adapter_gemini31_pro`
+  lane passed in the same broad run, and the user's Google usage UI showed
+  available Pro capacity. Treat the failure as an open fanout-only Google Code
+  Assist investigation, not as evidence of schema-strip regression and not as a
+  reason to simply wait for quota reset.
+
+  Investigation note: the failing fanout logs show sibling Gemini requests
+  entering upstream `attempt 1/4` while the Pro retry loop is sleeping on a
+  cooldown key, which means the intended account/project semaphore was not
+  shared in that run. The most plausible local cause is pre-semaphore OAuth
+  refresh instability: dev mounts `.gemini` read-only, `_load_valid_local_google_oauth_access_token()`
+  refreshed stale credentials without an in-process cache, and concurrent
+  fanout children could receive different bearer tokens. Because the lane key
+  is token hash plus Code Assist project, different refreshed tokens split the
+  semaphore/cooldown lane. A fix is in progress to cache refreshed access
+  tokens and serialize Code Assist project/prime bootstrap before the focused
+  fanout rerun.
+
+  Implemented the focused repair for the fanout-only Pro failure: refreshed
+  Gemini OAuth access tokens are cached in-process, `loadCodeAssist` project
+  lookup is serialized and cached, and Code Assist prime preflight is now
+  serialized through the actual network preflight instead of only around the
+  cache check. Focused local validation passed for OAuth refresh fanout,
+  project-load fanout, prime-preflight fanout, existing shared semaphore/cooldown
+  behavior, and adjacent capacity retry/Google adapter route paths (`7 passed`
+  then `6 passed`), plus `py_compile`, targeted Ruff `E9,F821,F823`, and
+  `git diff --check`. After restarting `litellm-dev`, the two previously
+  failing live paths passed with zero failures/warnings:
+  `/tmp/gemini_fanout_after_oauth_lane_cache.json` recorded the
+  `gemini-3.1-pro-preview` child trace, session-history row, and
+  `run_shell_command` tool-activity row; `/tmp/peeromega_fanout_after_oauth_lane_cache.json`
+  recorded the missing Gemini 3.1 Pro session-history/tool-activity rows.
+
+  The first broad dev harness after that fix,
+  `/tmp/anthropic_full_dev_after_oauth_lane_cache.json`, narrowed the remaining
+  failure to one row: `claude_adapter_peeromega_fanout` missed only
+  `gemini-3.1-pro-preview`. This was not the original lane split: the preceding
+  `claude_adapter_gemini_fanout` passed with Pro rows, and the later standalone
+  `claude_adapter_gemini31_pro` passed after first receiving
+  `MODEL_CAPACITY_EXHAUSTED` and then waiting roughly a minute on the successful
+  upstream attempt. The dev retry envelope was too short for repeated Pro child
+  traffic in one full run, so `docker-compose.dev.yml` now makes the Code Assist
+  capacity retry budget explicit: 180s hidden retry budget, 8 capacity retries,
+  and a longer 2/4/8/12/20/30/45/60s backoff schedule. Treat this as server-side
+  Code Assist model-capacity pacing, not plan quota exhaustion.
+
+  After recreating `litellm-dev` so the new environment was active, the focused
+  peeromega rerun passed with zero failures/warnings at
+  `/tmp/peeromega_fanout_after_capacity_retry_budget.json`. The artifact
+  recorded `gemini-3.1-pro-preview` session
+  `4d41ba32-6e46-4674-be50-232bd2e3b841` with trace name
+  `claude-code.gemini-3-1-pro-preview`, plus a Gemini Pro
+  `run_shell_command` tool-activity row. Fallout to carry forward: the broad
+  default dev harness was not rerun after this retry-envelope update because
+  the user explicitly paused additional changes/testing; the latest broad
+  artifact remains `/tmp/anthropic_full_dev_after_oauth_lane_cache.json`, which
+  failed only peeromega before the retry-envelope update.
 
 - Fixed the remaining native Codex/Gemini attribution mismatch with the
   reporting query: `tenant_id` is now populated from the resolved repository

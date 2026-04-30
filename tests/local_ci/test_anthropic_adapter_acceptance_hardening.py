@@ -576,6 +576,76 @@ def test_target_profile_sets_session_history_runtime_identity_expectations(monke
     assert "harness_run_id" in updated["cases"]["claude_adapter_gpt55"]
 
 
+def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeypatch):
+    monkeypatch.delenv("AAWM_HARNESS_USER_ID", raising=False)
+    monkeypatch.delenv("PYTEST_CLASSIFIER_HARNESS_USER_ID", raising=False)
+    monkeypatch.delenv("AAWM_CLAUDE_HARNESS_USER_ID", raising=False)
+    monkeypatch.setenv("AAWM_OBSERVE_SERVICE_NAME", "pytest-classifier-scan")
+    harness = _load_harness_module()
+
+    config = {
+        "cases": {
+            "native_openai_passthrough_responses_codex": {
+                "cli_passthrough": "codex",
+                "command": [
+                    "codex",
+                    "exec",
+                    "-p",
+                    "{codex_profile}",
+                    "--json",
+                    "Reply ok",
+                ],
+                "session_history_validation": {"expected_provider": "openai"},
+            }
+        }
+    }
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    case_config = updated["cases"]["native_openai_passthrough_responses_codex"]
+    command = case_config["command"]
+    config_values = [
+        str(command[index + 1])
+        for index, item in enumerate(command[:-1])
+        if item == "-c"
+    ]
+
+    assert case_config["expected_user_ids"] == ["pytest-classifier"]
+    assert case_config["expected_trace_session_id"] == "pytest-classifier.session"
+    assert (
+        'model_providers.litellm-dev.http_headers.x-litellm-end-user-id="pytest-classifier"'
+        in config_values
+    )
+    assert (
+        'model_providers.litellm-dev.http_headers.langfuse_trace_user_id="pytest-classifier"'
+        in config_values
+    )
+    assert (
+        'model_providers.litellm-dev.http_headers.langfuse_trace_name="native_openai_passthrough_responses_codex"'
+        in config_values
+    )
+    assert (
+        'model_providers.litellm-dev.http_headers.session_id="pytest-classifier.session"'
+        in config_values
+    )
+    assert (
+        'model_providers.litellm-dev.http_headers.x-aawm-tenant-id="adapter-harness-tenant"'
+        in config_values
+    )
+    assert (
+        'model_providers.litellm-dev.http_headers.x-aawm-repository="zepfu/litellm"'
+        in config_values
+    )
+
+
 def test_target_profile_formats_claude_case_harness_run_id(monkeypatch):
     harness = _load_harness_module()
 
@@ -714,6 +784,59 @@ def test_codex_tool_activity_parity_cases_have_stream_state_gates():
     assert "responses_stream_tool_call_count" in claude_case[
         "required_generation_metadata_minimums"
     ]
+
+
+def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"]["native_openai_passthrough_responses_codex"]
+
+    assert "codex-tool-description-patch" in case_config["required_trace_tags"]
+    assert (
+        "codex-tool-description-patch:spawn-agent-fanout-policy"
+        in case_config["required_trace_tags"]
+    )
+    assert "codex_tool_description_patch_count" in case_config[
+        "required_generation_metadata_truthy"
+    ]
+
+    request_text_checks = case_config["request_text_checks"]
+    assert "Use subagents to parallelize independent work" in request_text_checks[
+        "required_substrings"
+    ]
+    assert "latest frontier model" in request_text_checks["required_substrings"]
+    assert "latest Codex model" in request_text_checks["required_substrings"]
+    assert "mini-class agents" in request_text_checks["required_substrings"]
+    assert "Only use `spawn_agent` if and only if" in request_text_checks[
+        "forbidden_substrings"
+    ]
+    assert "Only use spawn_agent if and only if" in request_text_checks[
+        "forbidden_substrings"
+    ]
+    assert "GPT-5.5" not in request_text_checks["forbidden_substrings"]
+
+    session_history_validation = case_config["session_history_validation"]
+    assert session_history_validation["metadata_required_equals"][
+        "prompt_overhead_breakdown_source"
+    ] == "request_body_estimate"
+    assert session_history_validation["metadata_required_equals"][
+        "prompt_overhead_counted_shape"
+    ] == "openai_responses"
+    assert session_history_validation["metadata_required_equals"][
+        "prompt_overhead_classifier_version"
+    ] == "deterministic-v1"
+    for metadata_key in (
+        "prompt_overhead_component_paths",
+        "usage_input_system_tokens_estimated",
+        "usage_input_tool_advertisement_tokens_estimated",
+        "usage_input_conversation_tokens_estimated",
+    ):
+        assert metadata_key in session_history_validation["metadata_required_truthy"]
+    for column_name in (
+        "input_system_tokens_estimated",
+        "input_tool_advertisement_tokens_estimated",
+        "input_conversation_tokens_estimated",
+    ):
+        assert session_history_validation["minimums"][column_name] == 1
 
 
 def test_native_gemini_cases_have_code_assist_request_payload_gates():
@@ -1417,12 +1540,26 @@ def test_session_history_expected_rows_can_require_multiple_shared_session_rows(
             "model": "gpt-5-mini",
             "tenant_id": "adapter-harness-tenant",
             "cache_read_input_tokens": 0,
+            "input_system_tokens_estimated": 10,
+            "input_tool_advertisement_tokens_estimated": 20,
+            "input_conversation_tokens_estimated": 5,
+            "metadata": {
+                "prompt_overhead_counted_shape": "openai_responses",
+                "prompt_overhead_component_paths": {"system": ["instructions"]},
+            },
         },
         {
             "provider": "openai",
             "model": "gpt-5-mini",
             "tenant_id": "adapter-harness-tenant",
             "cache_read_input_tokens": 2048,
+            "input_system_tokens_estimated": 12,
+            "input_tool_advertisement_tokens_estimated": 30,
+            "input_conversation_tokens_estimated": 8,
+            "metadata": {
+                "prompt_overhead_counted_shape": "openai_responses",
+                "prompt_overhead_component_paths": {"system": ["instructions"]},
+            },
         },
     ]
 
@@ -1434,6 +1571,15 @@ def test_session_history_expected_rows_can_require_multiple_shared_session_rows(
                 "provider": "openai",
                 "model": "gpt-5-mini",
                 "required_equals": {"tenant_id": "adapter-harness-tenant"},
+                "minimums": {
+                    "input_system_tokens_estimated": 1,
+                    "input_tool_advertisement_tokens_estimated": 1,
+                    "input_conversation_tokens_estimated": 1,
+                },
+                "metadata_required_equals": {
+                    "prompt_overhead_counted_shape": "openai_responses",
+                },
+                "metadata_required_truthy": ["prompt_overhead_component_paths"],
                 "minimum_count": 2,
             }
         ],
@@ -1441,6 +1587,190 @@ def test_session_history_expected_rows_can_require_multiple_shared_session_rows(
 
     assert failures == []
     assert len(matched_records) == 2
+
+
+def test_prompt_overhead_cost_share_report_groups_estimated_rows():
+    harness = _load_harness_module()
+
+    report = harness._build_prompt_overhead_cost_share_report(
+        {
+            "native_codex": {
+                "session_history": {
+                    "records": [
+                        {
+                            "client_name": "codex_exec",
+                            "litellm_environment": "dev",
+                            "provider": "openai",
+                            "model": "gpt-5.4-mini",
+                            "input_tokens": 100,
+                            "output_tokens": 10,
+                            "total_tokens": 110,
+                            "response_cost_usd": 1.0,
+                            "input_system_tokens_estimated": 20,
+                            "input_tool_advertisement_tokens_estimated": 30,
+                            "input_conversation_tokens_estimated": 40,
+                            "input_other_tokens_estimated": 10,
+                            "input_breakdown_residual_tokens": 10,
+                            "system_behavior_tokens_estimated": 12,
+                            "system_safety_tokens_estimated": 3,
+                            "system_instructional_tokens_estimated": 4,
+                            "system_unclassified_tokens_estimated": 1,
+                            "metadata": {
+                                "prompt_overhead_breakdown_source": (
+                                    "request_body_estimate"
+                                ),
+                                "prompt_overhead_route_family": "codex_responses",
+                                "prompt_overhead_counted_shape": (
+                                    "openai_responses"
+                                ),
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    assert report["totals"]["calls"] == 1
+    assert report["totals"]["estimated_calls"] == 1
+    assert report["totals"]["explicit_prompt_overhead_tokens_estimated"] == 50
+    assert report["totals"]["prompt_overhead_plus_other_tokens_estimated"] == 60
+    assert report["totals"]["explicit_prompt_overhead_input_share"] == 0.5
+    assert report["totals"]["prompt_overhead_plus_other_input_share"] == 0.6
+    assert report["totals"]["explicit_prompt_overhead_cost_usd_estimated"] == 0.5
+    assert report["totals"]["prompt_overhead_plus_other_cost_usd_estimated"] == 0.6
+
+    group = report["groups"][0]
+    assert group["case_name"] == "native_codex"
+    assert group["client_name"] == "codex_exec"
+    assert group["route_family"] == "codex_responses"
+    assert group["counted_shape"] == "openai_responses"
+    assert group["provider"] == "openai"
+    assert group["model"] == "gpt-5.4-mini"
+    assert group["system_unclassified_tokens_estimated"] == 1
+
+
+def test_prompt_overhead_cost_share_report_tracks_unestimated_rows():
+    harness = _load_harness_module()
+
+    report = harness._build_prompt_overhead_cost_share_report(
+        {
+            "native_anthropic": {
+                "session_history": {
+                    "all_records": [
+                        {
+                            "client_name": "claude-cli",
+                            "litellm_environment": "dev",
+                            "provider": "anthropic",
+                            "model": "claude-opus-4-6",
+                            "input_tokens": 100,
+                            "output_tokens": 10,
+                            "total_tokens": 110,
+                            "response_cost_usd": 2.0,
+                            "metadata": {"passthrough_route_family": "anthropic"},
+                        },
+                        {
+                            "client_name": "claude-cli",
+                            "litellm_environment": "dev",
+                            "provider": "anthropic",
+                            "model": "claude-opus-4-6",
+                            "input_tokens": 0,
+                            "output_tokens": 1,
+                            "total_tokens": 1,
+                            "response_cost_usd": 0.1,
+                            "metadata": {
+                                "prompt_overhead_breakdown_source": (
+                                    "request_body_estimate"
+                                ),
+                                "prompt_overhead_route_family": "anthropic",
+                                "prompt_overhead_counted_shape": (
+                                    "anthropic_messages_semantic"
+                                ),
+                            },
+                        },
+                    ],
+                    "records": [],
+                }
+            }
+        }
+    )
+
+    assert report["totals"]["calls"] == 2
+    assert report["totals"]["estimated_calls"] == 1
+    assert report["totals"]["unestimated_calls"] == 1
+    assert report["totals"]["input_tokens_with_breakdown"] == 0
+    assert report["totals"]["breakdown_input_token_coverage_share"] == 0.0
+    assert report["totals"]["explicit_prompt_overhead_input_share"] is None
+    assert len(report["groups"]) == 2
+
+
+def test_prompt_overhead_cost_share_report_prefers_selected_record_for_shared_sessions():
+    harness = _load_harness_module()
+
+    report = harness._build_prompt_overhead_cost_share_report(
+        {
+            "native_openai_responses": {
+                "session_history": {
+                    "record": {
+                        "client_name": "openai-python",
+                        "provider": "openai",
+                        "model": "gpt-5.4-mini",
+                        "input_tokens": 10,
+                        "response_cost_usd": 0.01,
+                        "metadata": {
+                            "prompt_overhead_breakdown_source": (
+                                "request_body_estimate"
+                            ),
+                            "prompt_overhead_route_family": "openai_responses",
+                            "prompt_overhead_counted_shape": "openai_responses",
+                        },
+                    },
+                    "records": [
+                        {
+                            "client_name": "openai-python",
+                            "provider": "openai",
+                            "model": "gpt-5.4-mini",
+                            "input_tokens": 10,
+                            "response_cost_usd": 0.01,
+                            "metadata": {
+                                "prompt_overhead_breakdown_source": (
+                                    "request_body_estimate"
+                                ),
+                                "prompt_overhead_route_family": (
+                                    "openai_responses"
+                                ),
+                                "prompt_overhead_counted_shape": (
+                                    "openai_responses"
+                                ),
+                            },
+                        },
+                        {
+                            "client_name": "openai-python",
+                            "provider": "openai",
+                            "model": "gpt-5.4-mini",
+                            "input_tokens": 99,
+                            "response_cost_usd": 0.99,
+                            "metadata": {
+                                "prompt_overhead_breakdown_source": (
+                                    "request_body_estimate"
+                                ),
+                                "prompt_overhead_route_family": (
+                                    "openai_chat_completions"
+                                ),
+                                "prompt_overhead_counted_shape": (
+                                    "openai_chat_completions"
+                                ),
+                            },
+                        },
+                    ],
+                }
+            }
+        }
+    )
+
+    assert report["totals"]["calls"] == 1
+    assert report["totals"]["input_tokens"] == 10
+    assert report["groups"][0]["route_family"] == "openai_responses"
 
 
 def test_validation_db_connection_reuses_open_connection_and_closes(monkeypatch):
@@ -2220,6 +2550,19 @@ def test_session_history_and_tool_activity_validators_share_db_connection(monkey
     assert tool_summary["record"]["tool_name"] == "Bash"
     assert len(connections) == 1
     assert len(connections[0][1].executed) == 2
+    session_history_query = connections[0][1].executed[0][0]
+    for column_name in (
+        "input_system_tokens_estimated",
+        "input_tool_advertisement_tokens_estimated",
+        "input_conversation_tokens_estimated",
+        "input_other_tokens_estimated",
+        "input_breakdown_residual_tokens",
+        "system_behavior_tokens_estimated",
+        "system_safety_tokens_estimated",
+        "system_instructional_tokens_estimated",
+        "system_unclassified_tokens_estimated",
+    ):
+        assert column_name in session_history_query
     assert connections[0][0]["autocommit"] is True
 
     harness._close_validation_db_connections()
@@ -2257,7 +2600,15 @@ def test_session_history_validation_polls_until_expected_rows_are_visible(monkey
                     "reasoning_tokens_source": "not_applicable",
                     "tool_call_count": 1,
                     "tool_names": ["run_shell_command"],
-                    "metadata": {},
+                    "input_system_tokens_estimated": 14,
+                    "input_tool_advertisement_tokens_estimated": 22,
+                    "input_conversation_tokens_estimated": 6,
+                    "metadata": {
+                        "prompt_overhead_counted_shape": "gemini_generate_content",
+                        "prompt_overhead_component_paths": {
+                            "system": ["request.systemInstruction"]
+                        },
+                    },
                     "start_time": None,
                     "end_time": None,
                 }
@@ -2287,7 +2638,19 @@ def test_session_history_validation_polls_until_expected_rows_are_visible(monkey
                 {
                     "provider": "gemini",
                     "model": "gemini-3-flash-preview",
-                    "minimums": {"input_tokens": 1, "output_tokens": 1},
+                    "minimums": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "input_system_tokens_estimated": 1,
+                        "input_tool_advertisement_tokens_estimated": 1,
+                        "input_conversation_tokens_estimated": 1,
+                    },
+                    "metadata_required_equals": {
+                        "prompt_overhead_counted_shape": "gemini_generate_content"
+                    },
+                    "metadata_required_truthy": [
+                        "prompt_overhead_component_paths"
+                    ],
                 }
             ],
         },
@@ -2330,7 +2693,11 @@ def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeyp
                     "reasoning_tokens_source": "not_applicable",
                     "tool_call_count": 1,
                     "tool_names": ["run_shell_command"],
-                    "metadata": {"tenant_id": "litellm"},
+                    "input_system_tokens_estimated": 0,
+                    "metadata": {
+                        "tenant_id": "litellm",
+                        "prompt_overhead_counted_shape": "anthropic_messages_semantic",
+                    },
                     "start_time": None,
                     "end_time": None,
                 }
@@ -2357,8 +2724,15 @@ def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeyp
                 {
                     "provider": "gemini",
                     "model": "gemini-3-flash-preview",
-                    "minimums": {"input_tokens": 1, "output_tokens": 1},
+                    "minimums": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "input_system_tokens_estimated": 1,
+                    },
                     "required_equals": {"tenant_id": "adapter-harness-tenant"},
+                    "metadata_required_equals": {
+                        "prompt_overhead_counted_shape": "gemini_generate_content"
+                    },
                 }
             ],
         },
@@ -2370,6 +2744,8 @@ def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeyp
     assert "candidate rows" in failures[0]
     assert '"actual": "litellm"' in failures[0]
     assert '"expected": "adapter-harness-tenant"' in failures[0]
+    assert '"input_system_tokens_estimated"' in failures[0]
+    assert '"metadata.prompt_overhead_counted_shape"' in failures[0]
 
     harness._close_validation_db_connections()
 
