@@ -20,7 +20,9 @@ from litellm._logging import (
     get_egress_guard_alert_state,
     reset_egress_guard_alert_state,
 )
+from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import ProxyException
+from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
     pass_through_request,
@@ -90,6 +92,68 @@ def test_validate_outgoing_egress_blocks_openai_markers_to_anthropic():
     assert alert_state["last_target_family"] == "anthropic"
     reset_egress_guard_alert_state()
 
+
+@pytest.mark.asyncio
+async def test_passthrough_success_handler_applies_logging_hooks_before_success_callbacks(
+    monkeypatch,
+):
+    events = []
+
+    class ImmediateExecutor:
+        def submit(self, fn, *args):
+            fn(*args)
+            return None
+
+    class Enricher:
+        def logging_hook(self, kwargs, result, call_type):
+            events.append(("hook", call_type))
+            updated_kwargs = dict(kwargs)
+            litellm_params = dict(updated_kwargs.get("litellm_params") or {})
+            metadata = dict(litellm_params.get("metadata") or {})
+            metadata["trace_user_id"] = "pytest-classifier"
+            litellm_params["metadata"] = metadata
+            updated_kwargs["litellm_params"] = litellm_params
+            return updated_kwargs, result
+
+    class Recorder:
+        def log_success_event(self, kwargs, response_obj, start_time, end_time):
+            events.append(
+                (
+                    "success",
+                    kwargs["litellm_params"]["metadata"].get("trace_user_id"),
+                )
+            )
+
+    monkeypatch.setattr(success_handler, "thread_pool_executor", ImmediateExecutor())
+    monkeypatch.setattr(
+        success_handler.litellm,
+        "success_callback",
+        [Enricher(), Recorder()],
+    )
+    logging_obj = LiteLLMLoggingObj(
+        model="gpt-5.4-mini",
+        messages=[],
+        stream=False,
+        call_type="pass_through_endpoint",
+        start_time=datetime.now(),
+        litellm_call_id="test-call-id",
+        function_id="test-function-id",
+    )
+
+    await PassThroughEndpointLogging()._handle_logging(
+        logging_obj=logging_obj,
+        standard_logging_response_object={},
+        result="{}",
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+        cache_hit=False,
+        litellm_params={"metadata": {}},
+    )
+
+    assert events == [
+        ("hook", "pass_through_endpoint"),
+        ("success", "pytest-classifier"),
+    ]
 
 
 def test_validate_outgoing_egress_allows_matching_openrouter_headers():

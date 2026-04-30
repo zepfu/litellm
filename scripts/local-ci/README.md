@@ -121,7 +121,19 @@ plus `public.session_history` for the actual provider session id emitted or
 derived by that client.
 Codex and Gemini CLI cases also send the current git repository identity via
 `x-aawm-repository` and require `public.session_history.repository` to be
-populated.
+populated. Codex CLI cases inject harness-owned tracing headers via `-c
+model_providers.<profile>.http_headers.*` overrides. Set `AAWM_HARNESS_USER_ID`
+for a stable caller identity; pytest-classifier observability maps to
+`pytest-classifier` automatically.
+
+The native Codex Responses case additionally checks the Codex `spawn_agent`
+tool-description rewrite. It requires the
+`codex-tool-description-patch` /
+`codex-tool-description-patch:spawn-agent-fanout-policy` trace tags, verifies
+the generic fanout policy text appears in the logged request, and fails if the
+restrictive `Only use spawn_agent if and only if...` language is still present.
+This is the deterministic default proof; behavioral subagent fanout can remain
+a separate canary.
 
 ```bash
 python3 run_anthropic_adapter_acceptance.py \
@@ -159,6 +171,15 @@ Important notes:
 - for adapted free models, LiteLLM / `session_history` are the source of truth for cost, not Claude CLI display cost. For OpenRouter free models, mirror the paid counterpart cost when a non-free twin exists; keep `openrouter/free` at zero because OpenRouter does not publish a paid twin for it.
 - The Google Code Assist lane is warning-only in the harness; the route works, but `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` can all hit real `429` / `RESOURCE_EXHAUSTED` responses from `cloudcode-pa.googleapis.com`.
 - The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. When standalone Gemini CLI use is healthy, treat `claude_adapter_gemini_fanout` failures first as local pacing/serialization bugs, not as authoritative provider-capacity proof.
+- Harness artifacts include `summary.prompt_overhead_cost_share`, an aggregate of
+  the `public.session_history` prompt-overhead fields for each validated case.
+  The report groups by case, client, route family, counted request shape,
+  environment, provider, and model, and breaks input tokens into system,
+  tool-advertisement, conversation, residual/other, and system classifier
+  buckets. Cost-share fields are estimates derived by weighting
+  `response_cost_usd` by each row's prompt-overhead input-token share; treat
+  token shares as the primary signal until `session_history` stores exact input
+  cost fields.
 - When explicit Gemini reasoning token counts are absent but thought signatures are present, treat `provider_signature_present` as the expected fallback source in Langfuse generation metadata and `session_history`.
 - For Anthropic rows, `reasoning_tokens_source=provider_reported` is only valid when the provider supplied a positive count; zero placeholders should fall through to estimation or remain unset.
 - `reasoning_tokens_source` should not remain null in repaired or newly written `session_history` rows; use `not_applicable` when no reasoning is present and `not_available` when reasoning is present but no positive provider/estimated count exists.

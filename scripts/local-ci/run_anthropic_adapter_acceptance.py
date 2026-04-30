@@ -433,9 +433,13 @@ def _append_codex_header_config_arg(
     header_value: str,
 ) -> list[Any]:
     header_config = f'model_providers.{{codex_profile}}.http_headers.{header_name}="{header_value}"'
-    if any(str(item) == header_config for item in command):
-        return command
     updated = list(command)
+    header_path = f'.http_headers.{header_name}='
+    for index, item in enumerate(updated):
+        item_text = str(item)
+        if item_text.startswith('model_providers.') and header_path in item_text:
+            updated[index] = header_config
+            return updated
     try:
         insert_at = updated.index('--json')
     except ValueError:
@@ -562,12 +566,12 @@ def _ensure_cli_harness_context(
         controlled_headers.append(('session_id', session_id))
         command = updated.get('command')
         if isinstance(command, list):
-            command = _append_codex_tenant_config_arg(command, tenant_id)
-            command = _append_codex_header_config_arg(
-                command,
-                "x-aawm-repository",
-                repository,
-            )
+            for header_name, header_value in controlled_headers:
+                command = _append_codex_header_config_arg(
+                    command,
+                    header_name,
+                    header_value,
+                )
             updated['command'] = _format_harness_template(
                 command,
                 context,
@@ -1366,6 +1370,15 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
                response_cost_usd,
                litellm_environment, litellm_version, litellm_fork_version,
                litellm_wheel_versions, client_name, client_version, client_user_agent,
+               input_system_tokens_estimated,
+               input_tool_advertisement_tokens_estimated,
+               input_conversation_tokens_estimated,
+               input_other_tokens_estimated,
+               input_breakdown_residual_tokens,
+               system_behavior_tokens_estimated,
+               system_safety_tokens_estimated,
+               system_instructional_tokens_estimated,
+               system_unclassified_tokens_estimated,
                metadata, start_time, end_time
         from public.session_history
         where session_id = %s
@@ -1671,6 +1684,21 @@ def _session_history_record_matches_expected(
         actual = row.get(key)
         if not isinstance(actual, str) or expected_substring not in actual:
             return False
+    metadata = row.get('metadata')
+    if not isinstance(metadata, dict):
+        metadata = {}
+    for key, expected in (expected_row.get('metadata_required_equals') or {}).items():
+        if metadata.get(key) != expected:
+            return False
+    for key in expected_row.get('metadata_required_truthy') or []:
+        if not metadata.get(key):
+            return False
+    for key, expected_substring in (
+        expected_row.get('metadata_required_contains') or {}
+    ).items():
+        actual = metadata.get(key)
+        if not isinstance(actual, str) or expected_substring not in actual:
+            return False
     for key, minimum in (expected_row.get('minimums') or {}).items():
         actual = row.get(key)
         if not isinstance(actual, (int, float)) or actual < minimum:
@@ -1687,18 +1715,59 @@ def _session_history_candidate_summary(
         'model': row.get('model'),
         'tenant_id': row.get('tenant_id'),
         'input_tokens': row.get('input_tokens'),
+        'input_system_tokens_estimated': row.get('input_system_tokens_estimated'),
+        'input_tool_advertisement_tokens_estimated': row.get('input_tool_advertisement_tokens_estimated'),
+        'input_conversation_tokens_estimated': row.get('input_conversation_tokens_estimated'),
+        'input_other_tokens_estimated': row.get('input_other_tokens_estimated'),
+        'input_breakdown_residual_tokens': row.get('input_breakdown_residual_tokens'),
         'output_tokens': row.get('output_tokens'),
         'response_cost_usd': row.get('response_cost_usd'),
     }
     metadata = row.get('metadata')
     if isinstance(metadata, dict) and metadata.get('tenant_id') is not None:
         summary['metadata.tenant_id'] = metadata.get('tenant_id')
+    if isinstance(metadata, dict):
+        for key in (
+            'prompt_overhead_breakdown_source',
+            'prompt_overhead_counted_shape',
+            'prompt_overhead_classifier_version',
+        ):
+            if metadata.get(key) is not None:
+                summary[f'metadata.{key}'] = metadata.get(key)
 
     mismatches: dict[str, Any] = {}
     for key, expected in (expected_row.get('required_equals') or {}).items():
         actual = row.get(key)
         if actual != expected:
             mismatches[key] = {'expected': expected, 'actual': actual}
+    if isinstance(metadata, dict):
+        for key, expected in (
+            expected_row.get('metadata_required_equals') or {}
+        ).items():
+            actual = metadata.get(key)
+            if actual != expected:
+                mismatches[f'metadata.{key}'] = {
+                    'expected': expected,
+                    'actual': actual,
+                }
+        for key in expected_row.get('metadata_required_truthy') or []:
+            actual = metadata.get(key)
+            if not actual:
+                mismatches[f'metadata.{key}'] = {
+                    'expected': 'truthy',
+                    'actual': actual,
+                }
+    else:
+        for key in expected_row.get('metadata_required_equals') or {}:
+            mismatches[f'metadata.{key}'] = {
+                'expected': expected_row['metadata_required_equals'][key],
+                'actual': None,
+            }
+        for key in expected_row.get('metadata_required_truthy') or []:
+            mismatches[f'metadata.{key}'] = {
+                'expected': 'truthy',
+                'actual': None,
+            }
     for key, minimum in (expected_row.get('minimums') or {}).items():
         actual = row.get(key)
         if not isinstance(actual, (int, float)) or actual < minimum:
@@ -3078,6 +3147,294 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     }
 
 
+def _session_history_rows_for_prompt_overhead_report(
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    session_history = result.get('session_history')
+    if not isinstance(session_history, dict):
+        return []
+
+    records = session_history.get('records')
+    all_records = session_history.get('all_records')
+    if isinstance(all_records, list):
+        if isinstance(records, list) and records:
+            return [row for row in records if isinstance(row, dict)]
+        return [row for row in all_records if isinstance(row, dict)]
+
+    record = session_history.get('record')
+    if isinstance(record, dict) and record:
+        return [record]
+    if isinstance(records, list):
+        return [row for row in records if isinstance(row, dict)]
+    return []
+
+
+def _prompt_report_int(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _prompt_report_float(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _prompt_report_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = row.get('metadata')
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            parsed = json.loads(metadata)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _prompt_report_value(*values: Any, default: str = 'unknown') -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return default
+
+
+def _new_prompt_overhead_group(
+    *,
+    case_name: str,
+    row: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        'case_name': case_name,
+        'client_name': _prompt_report_value(row.get('client_name')),
+        'route_family': _prompt_report_value(
+            metadata.get('prompt_overhead_route_family'),
+            metadata.get('passthrough_route_family'),
+            metadata.get('adapter_route_family'),
+            metadata.get('route_family'),
+        ),
+        'counted_shape': _prompt_report_value(
+            metadata.get('prompt_overhead_counted_shape')
+        ),
+        'litellm_environment': _prompt_report_value(row.get('litellm_environment')),
+        'provider': _prompt_report_value(row.get('provider')),
+        'model': _prompt_report_value(row.get('model')),
+        'calls': 0,
+        'estimated_calls': 0,
+        'unestimated_calls': 0,
+        'input_tokens': 0,
+        'input_tokens_with_breakdown': 0,
+        'output_tokens': 0,
+        'total_tokens': 0,
+        'response_cost_usd': 0.0,
+        'response_cost_usd_with_breakdown': 0.0,
+        'input_system_tokens_estimated': 0,
+        'input_tool_advertisement_tokens_estimated': 0,
+        'input_conversation_tokens_estimated': 0,
+        'input_other_tokens_estimated': 0,
+        'input_breakdown_residual_tokens': 0,
+        'system_behavior_tokens_estimated': 0,
+        'system_safety_tokens_estimated': 0,
+        'system_instructional_tokens_estimated': 0,
+        'system_unclassified_tokens_estimated': 0,
+        'explicit_prompt_overhead_tokens_estimated': 0,
+        'prompt_overhead_plus_other_tokens_estimated': 0,
+        'explicit_prompt_overhead_cost_usd_estimated': 0.0,
+        'prompt_overhead_plus_other_cost_usd_estimated': 0.0,
+    }
+
+
+def _prompt_overhead_group_key(
+    *,
+    case_name: str,
+    row: dict[str, Any],
+    metadata: dict[str, Any],
+) -> tuple[str, str, str, str, str, str, str]:
+    return (
+        case_name,
+        _prompt_report_value(row.get('client_name')),
+        _prompt_report_value(
+            metadata.get('prompt_overhead_route_family'),
+            metadata.get('passthrough_route_family'),
+            metadata.get('adapter_route_family'),
+            metadata.get('route_family'),
+        ),
+        _prompt_report_value(metadata.get('prompt_overhead_counted_shape')),
+        _prompt_report_value(row.get('litellm_environment')),
+        _prompt_report_value(row.get('provider')),
+        _prompt_report_value(row.get('model')),
+    )
+
+
+def _add_prompt_overhead_row(
+    group: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    metadata: dict[str, Any],
+) -> None:
+    input_tokens = _prompt_report_int(row.get('input_tokens'))
+    output_tokens = _prompt_report_int(row.get('output_tokens'))
+    total_tokens = _prompt_report_int(row.get('total_tokens'))
+    response_cost_usd = _prompt_report_float(row.get('response_cost_usd'))
+
+    system_tokens = _prompt_report_int(row.get('input_system_tokens_estimated'))
+    tool_tokens = _prompt_report_int(
+        row.get('input_tool_advertisement_tokens_estimated')
+    )
+    other_tokens = _prompt_report_int(row.get('input_other_tokens_estimated'))
+    explicit_overhead_tokens = system_tokens + tool_tokens
+    overhead_plus_other_tokens = explicit_overhead_tokens + other_tokens
+    has_breakdown = (
+        metadata.get('prompt_overhead_breakdown_source') == 'request_body_estimate'
+    )
+
+    group['calls'] += 1
+    group['input_tokens'] += input_tokens
+    group['output_tokens'] += output_tokens
+    group['total_tokens'] += total_tokens
+    group['response_cost_usd'] += response_cost_usd
+
+    if has_breakdown:
+        group['estimated_calls'] += 1
+        group['input_tokens_with_breakdown'] += input_tokens
+        group['response_cost_usd_with_breakdown'] += response_cost_usd
+    else:
+        group['unestimated_calls'] += 1
+
+    for key in (
+        'input_system_tokens_estimated',
+        'input_tool_advertisement_tokens_estimated',
+        'input_conversation_tokens_estimated',
+        'input_other_tokens_estimated',
+        'input_breakdown_residual_tokens',
+        'system_behavior_tokens_estimated',
+        'system_safety_tokens_estimated',
+        'system_instructional_tokens_estimated',
+        'system_unclassified_tokens_estimated',
+    ):
+        group[key] += _prompt_report_int(row.get(key))
+
+    group['explicit_prompt_overhead_tokens_estimated'] += explicit_overhead_tokens
+    group['prompt_overhead_plus_other_tokens_estimated'] += overhead_plus_other_tokens
+    if input_tokens > 0 and has_breakdown:
+        group['explicit_prompt_overhead_cost_usd_estimated'] += (
+            response_cost_usd * explicit_overhead_tokens / input_tokens
+        )
+        group['prompt_overhead_plus_other_cost_usd_estimated'] += (
+            response_cost_usd * overhead_plus_other_tokens / input_tokens
+        )
+
+
+def _ratio(numerator: int | float, denominator: int | float) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(float(numerator) / float(denominator), 6)
+
+
+def _finalize_prompt_overhead_group(group: dict[str, Any]) -> dict[str, Any]:
+    finalized = dict(group)
+    finalized['breakdown_input_token_coverage_share'] = _ratio(
+        finalized['input_tokens_with_breakdown'],
+        finalized['input_tokens'],
+    )
+    finalized['explicit_prompt_overhead_input_share'] = _ratio(
+        finalized['explicit_prompt_overhead_tokens_estimated'],
+        finalized['input_tokens_with_breakdown'],
+    )
+    finalized['prompt_overhead_plus_other_input_share'] = _ratio(
+        finalized['prompt_overhead_plus_other_tokens_estimated'],
+        finalized['input_tokens_with_breakdown'],
+    )
+    for key in (
+        'response_cost_usd',
+        'response_cost_usd_with_breakdown',
+        'explicit_prompt_overhead_cost_usd_estimated',
+        'prompt_overhead_plus_other_cost_usd_estimated',
+    ):
+        finalized[key] = round(float(finalized[key]), 12)
+    return finalized
+
+
+def _build_prompt_overhead_cost_share_report(
+    results: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    groups: dict[tuple[str, str, str, str, str, str, str], dict[str, Any]] = {}
+    totals = _new_prompt_overhead_group(
+        case_name='__all__',
+        row={},
+        metadata={},
+    )
+    totals['case_name'] = 'all'
+
+    for case_name, result in results.items():
+        for row in _session_history_rows_for_prompt_overhead_report(result):
+            metadata = _prompt_report_metadata(row)
+            key = _prompt_overhead_group_key(
+                case_name=case_name,
+                row=row,
+                metadata=metadata,
+            )
+            group = groups.get(key)
+            if group is None:
+                group = _new_prompt_overhead_group(
+                    case_name=case_name,
+                    row=row,
+                    metadata=metadata,
+                )
+                groups[key] = group
+            _add_prompt_overhead_row(group, row=row, metadata=metadata)
+            _add_prompt_overhead_row(totals, row=row, metadata=metadata)
+
+    finalized_groups = [_finalize_prompt_overhead_group(group) for group in groups.values()]
+    finalized_groups.sort(
+        key=lambda group: (
+            -float(group['prompt_overhead_plus_other_cost_usd_estimated']),
+            -int(group['prompt_overhead_plus_other_tokens_estimated']),
+            str(group['case_name']),
+            str(group['provider']),
+            str(group['model']),
+        )
+    )
+
+    return {
+        'cost_allocation_basis': (
+            'estimated from response_cost_usd weighted by each row prompt-overhead '
+            'input-token share; session_history does not yet store exact input cost'
+        ),
+        'group_by': [
+            'case_name',
+            'client_name',
+            'route_family',
+            'counted_shape',
+            'litellm_environment',
+            'provider',
+            'model',
+        ],
+        'totals': _finalize_prompt_overhead_group(totals),
+        'groups': finalized_groups,
+    }
+
+
 def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
@@ -3086,7 +3443,14 @@ def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
             failures.append(f'{family}: {failure}')
         for warning in result.get('warnings', []):
             warnings.append(f'{family}: {warning}')
-    return {'passed': not failures, 'failures': failures, 'warnings': warnings}
+    return {
+        'passed': not failures,
+        'failures': failures,
+        'warnings': warnings,
+        'prompt_overhead_cost_share': _build_prompt_overhead_cost_share_report(
+            results
+        ),
+    }
 
 
 def _warning_only_error_result(

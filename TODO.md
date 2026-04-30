@@ -107,6 +107,14 @@ these docs only as needed:
 
 ## Next
 
+- D1-060 prompt-overhead tracking now has live `session_history` fields,
+  translated-shape unit coverage, native Codex assertions, and
+  `summary.prompt_overhead_cost_share` in the local harness artifact. Native
+  live coverage on dev `:4001` has populated Claude/OpenAI/Codex/Gemini rows;
+  keep the item open for adapted-route cost-share coverage across Anthropic ->
+  OpenAI/Gemini/NVIDIA/OpenRouter and for a later exact input-cost field if the
+  proportional `response_cost_usd` estimate is not enough.
+
 - Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
   `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and
   the `h-v0.0.21` harness. The stale `langfuse_trace_name:
@@ -212,13 +220,41 @@ these docs only as needed:
     dev `/anthropic` harness reruns at
     `/tmp/anthropic_tool_metadata_strip_full_dev.json` and
     `/tmp/anthropic_tool_metadata_strip_full_dev_rerun.json` are not clean
-    because live Gemini 3.1 Pro child-agent requests intermittently hit
-    upstream Google Code Assist `MODEL_CAPACITY_EXHAUSTED`; the second run
-    otherwise cleared the OpenAI/Codex path and every non-fanout default case.
-    Next action for this item is a later broad rerun when Gemini 3.1 Pro
-    capacity is available; do not chase this as a schema-strip regression and
-    do not start the broader deferred-search control loop as part of this
-    cleanup.
+    because live Gemini 3.1 Pro child-agent requests in fanout hit upstream
+    Google Code Assist `MODEL_CAPACITY_EXHAUSTED`; the second run otherwise
+    cleared the OpenAI/Codex path and every non-fanout default case, and the
+    standalone `claude_adapter_gemini31_pro` lane passed in the same broad run.
+    Do not classify this as ordinary quota/capacity exhaustion without checking:
+    the user's Google usage UI showed available Flash, Flash Lite, and Pro
+    capacity. Next action is a focused fanout-only investigation comparing the
+    failing child-agent Pro request against the standalone Pro request,
+    including model, project, access-token lane, session/user-prompt ids,
+    request shape, adapter semaphore/cooldown behavior, and any child-agent
+    scheduling differences. Do not chase this as a schema-strip regression, do
+    not run the full multi-path harness again until the focused Gemini fanout
+    question is resolved, and do not start the broader deferred-search control
+    loop as part of this cleanup.
+    The focused repair now caches refreshed Gemini OAuth access tokens
+    in-process and serializes Code Assist project/prime bootstrap so fanout
+    children stay on the intended account/project lane. Focused local
+    concurrency/retry tests passed, and the two previously failing live paths
+    now pass on dev:
+    `/tmp/gemini_fanout_after_oauth_lane_cache.json` and
+    `/tmp/peeromega_fanout_after_oauth_lane_cache.json`. The first broad rerun
+    at `/tmp/anthropic_full_dev_after_oauth_lane_cache.json` narrowed the
+    remaining failure to repeated Pro model-capacity pacing in
+    `claude_adapter_peeromega_fanout`; the preceding Gemini fanout and later
+    standalone Pro case both passed. Dev now uses a longer explicit Code Assist
+    capacity retry envelope in `docker-compose.dev.yml`. After recreating
+    `litellm-dev` with the new environment, the focused peeromega rerun passed
+    at `/tmp/peeromega_fanout_after_capacity_retry_budget.json` with the
+    Gemini 3.1 Pro session-history and tool-activity rows present. Per the
+    2026-04-29 user pause, do not make additional changes or run additional
+    harness coverage in this session unless explicitly resumed. Remaining
+    validation gap: the broad default dev `/anthropic` harness has not been
+    rerun after the longer retry envelope; the latest broad artifact is still
+    `/tmp/anthropic_full_dev_after_oauth_lane_cache.json`, which failed only
+    `claude_adapter_peeromega_fanout` before the retry-envelope update.
   - Deferred/parked: adapter-owned support for Anthropic deferred tool loading
     on `/anthropic` to non-Anthropic paths. The preferred design is still a
     bounded internal tool-search loop: hold `defer_loading=true` tool
