@@ -487,7 +487,10 @@ _aawm_dynamic_injection_pool_lock = asyncio.Lock()
 _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
 _claude_agent_model_cache: dict[Path, tuple[Optional[int], Optional[str]]] = {}
+_google_oauth_access_token_cache: dict[str, tuple[str, int]] = {}
+_google_oauth_access_token_lock = asyncio.Lock()
 _google_code_assist_project_cache: dict[str, str] = {}
+_google_code_assist_project_lock = asyncio.Lock()
 _google_code_assist_prime_until_monotonic_by_key: dict[str, float] = {}
 _google_code_assist_prime_lock = asyncio.Lock()
 _google_adapter_semaphores: dict[tuple[str, int], asyncio.Semaphore] = {}
@@ -498,6 +501,43 @@ _google_adapter_user_prompt_turn_counters: dict[str, int] = {}
 _openrouter_adapter_rate_limit_lock = asyncio.Lock()
 _openrouter_adapter_rate_limit_until_monotonic_by_key: dict[str, float] = {}
 _openrouter_adapter_failure_circuit_until_monotonic_by_key: dict[str, float] = {}
+_CODEX_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
+_CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID = "spawn-agent-fanout-policy"
+_CODEX_SPAWN_AGENT_FANOUT_POLICY = (
+    "Use subagents to parallelize independent work while keeping one local owner "
+    "on the critical path. Do not duplicate the same task across agents.\n\n"
+    "Use the latest frontier model for cross-document architecture, migration-risk "
+    "review, and high-stakes database safety reasoning. Use the latest Codex model "
+    "for bounded implementation tasks with clear, disjoint write ownership. Use "
+    "mini-class agents for narrow grep/read-only scans, documentation consistency "
+    "checks, test inventory, and quick QA passes.\n\n"
+    "For coding fanout, assign disjoint write sets and tell workers they are not "
+    "alone in the codebase. They must not revert unrelated edits. For database "
+    "or migration work, prefer read-only explorer subagents; the main owner "
+    "should run live database commands so target verification and credential "
+    "handling stay in one place."
+)
+_CODEX_SPAWN_AGENT_RESTRICTIVE_DESCRIPTION_PATTERNS = (
+    re.compile(
+        r"Only use `?spawn_agent`? if and only if the user explicitly asks for "
+        r"sub-?agents, delegation, or parallel agent work\.\s*"
+        r"Requests for depth, thoroughness, research, investigation, or detailed "
+        r"codebase analysis do not count as permission to spawn\.\s*"
+        r"Agent-role guidance below only helps choose which agent to use after "
+        r"spawning is already authorized; it never authorizes spawning by itself\.",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"Only use `?spawn_agent`? if and only if the user explicitly asks for "
+        r"sub-?agents, delegation, or parallel agent work\.",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"I may only use `?spawn_agent`? when the user explicitly asks for "
+        r"sub-?agents, delegation, or parallel agent work\.",
+        re.IGNORECASE,
+    ),
+)
 
 
 def _is_openai_responses_endpoint(endpoint: str) -> bool:
@@ -918,8 +958,23 @@ def _google_oauth_token_is_valid(auth_data: dict[str, Any]) -> bool:
     return int(expiry_date) > now_ms + 60_000
 
 
+def _google_oauth_cached_token_is_valid(cached_token: tuple[str, int]) -> bool:
+    _access_token, expiry_date = cached_token
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return expiry_date > now_ms + 60_000
+
+
+def _get_google_oauth_expiry_date(auth_data: dict[str, Any]) -> Optional[int]:
+    expiry_date = auth_data.get("expiry_date")
+    if isinstance(expiry_date, (int, float)):
+        return int(expiry_date)
+    return None
+
+
 def _get_google_oauth_client_value(
-    auth_data: dict[str, Any], candidate_keys: tuple[str, ...], env_var_names: tuple[str, ...]
+    auth_data: dict[str, Any],
+    candidate_keys: tuple[str, ...],
+    env_var_names: tuple[str, ...],
 ) -> Optional[str]:
     for key in candidate_keys:
         value = _clean_codex_auth_value(auth_data.get(key))
@@ -1005,16 +1060,32 @@ async def _refresh_local_google_oauth_credentials(
 
 async def _load_valid_local_google_oauth_access_token() -> str:
     auth_data, _auth_path = await _load_local_google_oauth_credentials()
-    if not _google_oauth_token_is_valid(auth_data):
-        auth_data = await _refresh_local_google_oauth_credentials(auth_data)
+    cache_key = str(_auth_path.expanduser())
+    cached_token = _google_oauth_access_token_cache.get(cache_key)
+    if cached_token is not None and _google_oauth_cached_token_is_valid(cached_token):
+        return cached_token[0]
 
-    access_token = _clean_codex_auth_value(auth_data.get("access_token"))
-    if access_token is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Gemini OAuth credentials did not yield a valid access_token.",
-        )
-    return access_token
+    async with _google_oauth_access_token_lock:
+        cached_token = _google_oauth_access_token_cache.get(cache_key)
+        if cached_token is not None and _google_oauth_cached_token_is_valid(
+            cached_token
+        ):
+            return cached_token[0]
+
+        auth_data, _auth_path = await _load_local_google_oauth_credentials()
+        if not _google_oauth_token_is_valid(auth_data):
+            auth_data = await _refresh_local_google_oauth_credentials(auth_data)
+
+        access_token = _clean_codex_auth_value(auth_data.get("access_token"))
+        if access_token is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Gemini OAuth credentials did not yield a valid access_token.",
+            )
+        expiry_date = _get_google_oauth_expiry_date(auth_data)
+        if expiry_date is not None:
+            _google_oauth_access_token_cache[cache_key] = (access_token, expiry_date)
+        return access_token
 
 
 def _extract_google_adapter_agent_name_from_completion_messages(
@@ -1136,51 +1207,56 @@ async def _get_or_load_google_code_assist_project(
     if isinstance(cached_project, str) and cached_project:
         return cached_project
 
-    target_base = _get_anthropic_adapter_google_target_base()
-    load_url = f"{target_base.rstrip('/')}/v1internal:loadCodeAssist"
-    request_body = {
-        "metadata": {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI",
-        },
-    }
-    headers = _build_google_adapter_native_headers(
-        access_token=access_token,
-        model=None,
-        accept="application/json",
-    )
-    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-        url=load_url,
-        headers=headers,
-        credential_family="google",
-        expected_target_family="google",
-    )
+    async with _google_code_assist_project_lock:
+        cached_project = _google_code_assist_project_cache.get(cache_key)
+        if isinstance(cached_project, str) and cached_project:
+            return cached_project
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(load_url, headers=headers, json=request_body)
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to load Google Code Assist project for Anthropic adapter models: "
-                f"{response.text}"
-            ),
+        target_base = _get_anthropic_adapter_google_target_base()
+        load_url = f"{target_base.rstrip('/')}/v1internal:loadCodeAssist"
+        request_body = {
+            "metadata": {
+                "ideType": "IDE_UNSPECIFIED",
+                "platform": "PLATFORM_UNSPECIFIED",
+                "pluginType": "GEMINI",
+            },
+        }
+        headers = _build_google_adapter_native_headers(
+            access_token=access_token,
+            model=None,
+            accept="application/json",
+        )
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url=load_url,
+            headers=headers,
+            credential_family="google",
+            expected_target_family="google",
         )
 
-    response_body = response.json()
-    project = _clean_codex_auth_value(response_body.get("cloudaicompanionProject"))
-    if project is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Google Code Assist bootstrap did not return a cloudaicompanionProject."
-            ),
-        )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(load_url, headers=headers, json=request_body)
 
-    _google_code_assist_project_cache[cache_key] = project
-    return project
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Failed to load Google Code Assist project for Anthropic adapter models: "
+                    f"{response.text}"
+                ),
+            )
+
+        response_body = response.json()
+        project = _clean_codex_auth_value(response_body.get("cloudaicompanionProject"))
+        if project is None:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Google Code Assist bootstrap did not return a cloudaicompanionProject."
+                ),
+            )
+
+        _google_code_assist_project_cache[cache_key] = project
+        return project
 
 
 def _get_google_code_assist_prime_ttl_seconds() -> float:
@@ -2764,50 +2840,58 @@ async def _prime_google_code_assist_session(
         access_token,
         companion_project,
     )
-    if ttl_seconds > 0:
-        async with _google_code_assist_prime_lock:
+    async with _google_code_assist_prime_lock:
+        if ttl_seconds > 0:
             cached_until = _google_code_assist_prime_until_monotonic_by_key.get(
                 cache_key, 0.0
             )
-        if cached_until > time.monotonic():
-            if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
-                verbose_proxy_logger.info(
-                    "Google adapter prime cache hit for project=%s",
-                    companion_project,
+            if cached_until > time.monotonic():
+                if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
+                    verbose_proxy_logger.info(
+                        "Google adapter prime cache hit for project=%s",
+                        companion_project,
+                    )
+                return
+
+        target_base = _get_anthropic_adapter_google_target_base().rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        metadata = {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+            "duetProject": companion_project,
+        }
+        preflight_requests = (
+            (
+                f"{target_base}/v1internal:retrieveUserQuota",
+                {"project": companion_project},
+            ),
+            (
+                f"{target_base}/v1internal:fetchAdminControls",
+                {"project": companion_project},
+            ),
+            (
+                f"{target_base}/v1internal:listExperiments",
+                {"project": companion_project, "metadata": metadata},
+            ),
+        )
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for url, body in preflight_requests:
+                HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+                    url=url,
+                    headers=headers,
+                    credential_family="google",
+                    expected_target_family="google",
                 )
-            return
-
-    target_base = _get_anthropic_adapter_google_target_base().rstrip("/")
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-    metadata = {
-        "ideType": "IDE_UNSPECIFIED",
-        "platform": "PLATFORM_UNSPECIFIED",
-        "pluginType": "GEMINI",
-        "duetProject": companion_project,
-    }
-    preflight_requests = (
-        (f"{target_base}/v1internal:retrieveUserQuota", {"project": companion_project}),
-        (f"{target_base}/v1internal:fetchAdminControls", {"project": companion_project}),
-        (f"{target_base}/v1internal:listExperiments", {"project": companion_project, "metadata": metadata}),
-    )
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        for url, body in preflight_requests:
-            HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-                url=url,
-                headers=headers,
-                credential_family="google",
-                expected_target_family="google",
-            )
-            try:
-                await client.post(url, headers=headers, json=body)
-            except Exception:
-                continue
-    if ttl_seconds > 0:
-        async with _google_code_assist_prime_lock:
+                try:
+                    await client.post(url, headers=headers, json=body)
+                except Exception:
+                    continue
+        if ttl_seconds > 0:
             _google_code_assist_prime_until_monotonic_by_key[cache_key] = (
                 time.monotonic() + ttl_seconds
             )
@@ -8295,6 +8379,169 @@ def _add_gemini_request_breakout_logging_metadata(
     )
 
 
+def _patch_codex_spawn_agent_description_text(description: str) -> tuple[str, int]:
+    updated_description = description
+    replacement_count = 0
+    for pattern in _CODEX_SPAWN_AGENT_RESTRICTIVE_DESCRIPTION_PATTERNS:
+        updated_description, count = pattern.subn(
+            _CODEX_SPAWN_AGENT_FANOUT_POLICY,
+            updated_description,
+            count=1,
+        )
+        replacement_count += count
+    return updated_description, replacement_count
+
+
+def _get_openai_tool_name(tool: dict[str, Any]) -> Optional[str]:
+    name = tool.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    function = tool.get("function")
+    if isinstance(function, dict):
+        function_name = function.get("name")
+        if isinstance(function_name, str) and function_name.strip():
+            return function_name.strip()
+    return None
+
+
+def _patch_codex_spawn_agent_tool_description(
+    tool: dict[str, Any],
+    *,
+    tool_index: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if _get_openai_tool_name(tool) != _CODEX_SPAWN_AGENT_TOOL_NAME:
+        return tool, []
+
+    updated_tool = tool
+    patch_events: list[dict[str, Any]] = []
+    description_targets: list[tuple[dict[str, Any], str, str]] = [
+        (tool, "description", f"tools.{tool_index}.description")
+    ]
+    function = tool.get("function")
+    if isinstance(function, dict):
+        description_targets.append(
+            (
+                function,
+                "description",
+                f"tools.{tool_index}.function.description",
+            )
+        )
+
+    for container, key, path in description_targets:
+        description = container.get(key)
+        if not isinstance(description, str):
+            continue
+
+        updated_description, replacement_count = (
+            _patch_codex_spawn_agent_description_text(description)
+        )
+        if replacement_count == 0 or updated_description == description:
+            continue
+
+        if updated_tool is tool:
+            updated_tool = dict(tool)
+
+        if container is tool:
+            updated_tool[key] = updated_description
+        else:
+            updated_function = dict(container)
+            updated_function[key] = updated_description
+            updated_tool["function"] = updated_function
+
+        patch_events.append(
+            {
+                "id": _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID,
+                "status": "applied",
+                "tool_name": _CODEX_SPAWN_AGENT_TOOL_NAME,
+                "path": path,
+                "occurrences": replacement_count,
+            }
+        )
+
+    return updated_tool, patch_events
+
+
+def _add_codex_tool_description_patch_logging_metadata(
+    request_body: dict[str, Any],
+    patch_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    patch_ids = _dedupe_sorted_str_list(
+        [
+            event["id"]
+            for event in patch_events
+            if isinstance(event.get("id"), str) and event["id"]
+        ]
+    )
+    replacement_count = sum(
+        event["occurrences"]
+        for event in patch_events
+        if isinstance(event.get("occurrences"), int)
+    )
+    span_metadata: dict[str, Any] = {
+        "patch_count": len(patch_events),
+        "replacement_count": replacement_count,
+    }
+    if patch_ids:
+        span_metadata["patch_ids"] = patch_ids
+
+    tags_to_add = ["codex-tool-description-patch"]
+    tags_to_add.extend(
+        f"codex-tool-description-patch:{patch_id}" for patch_id in patch_ids
+    )
+
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields={
+            "codex_tool_description_patch_count": len(patch_events),
+            "codex_tool_description_patch_replacement_count": replacement_count,
+            "codex_tool_description_patch_ids": patch_ids,
+            "codex_tool_description_patch_events": patch_events,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.tool_description_patch",
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _apply_codex_tool_description_patches_to_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return request_body, []
+
+    updated_tools: list[Any] = []
+    patch_events: list[dict[str, Any]] = []
+    changed = False
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            updated_tools.append(tool)
+            continue
+        updated_tool, tool_patch_events = _patch_codex_spawn_agent_tool_description(
+            tool,
+            tool_index=index,
+        )
+        updated_tools.append(updated_tool)
+        patch_events.extend(tool_patch_events)
+        if updated_tool is not tool:
+            changed = True
+
+    if not changed or not patch_events:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["tools"] = updated_tools
+    updated_body = _add_codex_tool_description_patch_logging_metadata(
+        updated_body,
+        patch_events,
+    )
+    return updated_body, patch_events
+
+
 def _extract_openai_passthrough_tool_choice(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return _normalize_low_cardinality_tag_value(value)
@@ -11848,6 +12095,11 @@ class BaseOpenAIPassThroughHandler:
                 prepared_request_body = _add_route_family_logging_metadata(
                     prepared_request_body,
                     "codex_responses",
+                )
+                prepared_request_body, _codex_tool_description_patch_events = (
+                    _apply_codex_tool_description_patches_to_request_body(
+                        prepared_request_body
+                    )
                 )
                 prepared_request_body = _add_codex_request_breakout_logging_metadata(
                     prepared_request_body

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -22,6 +23,7 @@ import litellm
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     RouteChecks,
+    _apply_codex_tool_description_patches_to_request_body,
     _apply_google_adapter_completion_message_window,
     _apply_google_adapter_request_shape_policy,
     _apply_google_adapter_system_prompt_policy,
@@ -35,12 +37,15 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _get_google_adapter_rate_limit_key,
+    _get_or_load_google_code_assist_project,
     _get_google_code_assist_prime_cache_key,
     _get_google_code_assist_prime_ttl_seconds,
     _get_gemini_passthrough_route_family,
     _get_openai_passthrough_route_family,
     _google_adapter_rate_limit_until_monotonic_by_key,
+    _google_code_assist_project_cache,
     _google_code_assist_prime_until_monotonic_by_key,
+    _google_oauth_access_token_cache,
     _get_google_adapter_semaphore,
     _get_openrouter_adapter_hidden_retry_budget_seconds,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
@@ -61,6 +66,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _handle_anthropic_google_completion_adapter_route,
     _iterate_responses_sse_events,
     _log_google_completion_adapter_debug,
+    _load_valid_local_google_oauth_access_token,
     _maybe_force_explicit_bash_tool_choice_for_completion_adapter,
     _maybe_force_explicit_bash_tool_choice_for_responses_adapter,
     _release_google_adapter_semaphore_once,
@@ -90,6 +96,15 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
 _CLAUDE_CODE_AGENT_PROJECT_TEXT = (
     "You are 'gpt5-5' and you are working on the 'aawm-tap' project.\n"
     "Return ok."
+)
+_CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION = (
+    "Spawn an agent.\n\n"
+    "Only use `spawn_agent` if and only if the user explicitly asks for "
+    "sub-agents, delegation, or parallel agent work. "
+    "Requests for depth, thoroughness, research, investigation, or detailed "
+    "codebase analysis do not count as permission to spawn. "
+    "Agent-role guidance below only helps choose which agent to use after "
+    "spawning is already authorized; it never authorizes spawning by itself."
 )
 
 
@@ -757,6 +772,73 @@ class TestGoogleCodeAssistPrimeCache:
         cache_key = _get_google_code_assist_prime_cache_key("token-123", "project-123")
         assert _google_code_assist_prime_until_monotonic_by_key.get(cache_key, 0.0) > time.monotonic()
 
+    @pytest.mark.asyncio
+    async def test_google_code_assist_prime_cache_serializes_concurrent_preflight(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS", "300")
+        _google_code_assist_prime_until_monotonic_by_key.clear()
+
+        async def post_response(*_args, **_kwargs):
+            await asyncio.sleep(0.01)
+            return httpx.Response(200, json={})
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = post_response
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = mock_client
+        mock_context.__aexit__.return_value = False
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+            return_value=mock_context,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ):
+            await asyncio.gather(
+                _prime_google_code_assist_session("token-123", "project-123"),
+                _prime_google_code_assist_session("token-123", "project-123"),
+            )
+
+        assert mock_client.post.await_count == 3
+        cache_key = _get_google_code_assist_prime_cache_key("token-123", "project-123")
+        assert _google_code_assist_prime_until_monotonic_by_key.get(cache_key, 0.0) > time.monotonic()
+
+
+class TestGoogleCodeAssistProjectCache:
+    @pytest.mark.asyncio
+    async def test_google_code_assist_project_cache_serializes_concurrent_loads(
+        self,
+    ):
+        _google_code_assist_project_cache.clear()
+
+        async def post_response(*_args, **_kwargs):
+            await asyncio.sleep(0.01)
+            return httpx.Response(
+                200,
+                json={"cloudaicompanionProject": "project-123"},
+            )
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = post_response
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = mock_client
+        mock_context.__aexit__.return_value = False
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+            return_value=mock_context,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ):
+            projects = await asyncio.gather(
+                _get_or_load_google_code_assist_project("token-123"),
+                _get_or_load_google_code_assist_project("token-123"),
+            )
+
+        assert projects == ["project-123", "project-123"]
+        assert mock_client.post.await_count == 1
+
 
 class TestGoogleOAuthFallbacks:
     def test_load_google_oauth_client_values_from_local_gemini_cli_bundle(
@@ -828,6 +910,42 @@ class TestGoogleOAuthFallbacks:
             "refresh_token": "refresh-token-123",
             "grant_type": "refresh_token",
         }
+
+    @pytest.mark.asyncio
+    async def test_load_valid_google_oauth_access_token_caches_concurrent_refresh(
+        self, tmp_path
+    ):
+        _google_oauth_access_token_cache.clear()
+        auth_path = tmp_path / "oauth_creds.json"
+        expired_auth = {
+            "access_token": "ya29.expired",
+            "expiry_date": 0,
+            "refresh_token": "refresh-token-123",
+        }
+        future_expiry = int(time.time() * 1000) + 3_600_000
+
+        async def refresh_credentials(_auth_data):
+            await asyncio.sleep(0.01)
+            return {
+                "access_token": "ya29.refreshed",
+                "expiry_date": future_expiry,
+                "refresh_token": "refresh-token-123",
+            }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_google_oauth_credentials",
+            new=AsyncMock(return_value=(expired_auth, auth_path)),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._refresh_local_google_oauth_credentials",
+            new=AsyncMock(side_effect=refresh_credentials),
+        ) as refresh_mock:
+            tokens = await asyncio.gather(
+                _load_valid_local_google_oauth_access_token(),
+                _load_valid_local_google_oauth_access_token(),
+            )
+
+        assert tokens == ["ya29.refreshed", "ya29.refreshed"]
+        assert refresh_mock.await_count == 1
 
 
 class TestGoogleAdapterRequestShapePolicy:
@@ -8393,6 +8511,79 @@ def test_release_google_adapter_semaphore_once_releases_only_once(monkeypatch):
     assert release_state["released"] is True
 
 
+def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
+    request_body = {
+        "model": "gpt-5.4-mini",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a local file.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+
+    updated_body, patch_events = _apply_codex_tool_description_patches_to_request_body(
+        request_body
+    )
+
+    assert len(patch_events) == 1
+    assert patch_events[0]["id"] == "spawn-agent-fanout-policy"
+    assert patch_events[0]["path"] == "tools.0.description"
+    patched_description = updated_body["tools"][0]["description"]
+    assert "Use subagents to parallelize independent work" in patched_description
+    assert "latest frontier model" in patched_description
+    assert "latest Codex model" in patched_description
+    assert "mini-class agents" in patched_description
+    assert "GPT-5.5" not in patched_description
+    assert "Only use `spawn_agent` if and only if" not in patched_description
+    assert updated_body["tools"][1] == request_body["tools"][1]
+
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert "existing-tag" in litellm_metadata["tags"]
+    assert "codex-tool-description-patch" in litellm_metadata["tags"]
+    assert (
+        "codex-tool-description-patch:spawn-agent-fanout-policy"
+        in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["codex_tool_description_patch_count"] == 1
+    assert litellm_metadata["codex_tool_description_patch_replacement_count"] == 1
+    assert litellm_metadata["codex_tool_description_patch_ids"] == [
+        "spawn-agent-fanout-policy"
+    ]
+    assert litellm_metadata["langfuse_spans"][0]["name"] == (
+        "codex.tool_description_patch"
+    )
+
+
+def test_codex_spawn_agent_tool_description_patch_ignores_other_tools():
+    request_body = {
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
+            }
+        ]
+    }
+
+    updated_body, patch_events = _apply_codex_tool_description_patches_to_request_body(
+        request_body
+    )
+
+    assert updated_body is request_body
+    assert patch_events == []
+    assert "litellm_metadata" not in updated_body
+
+
 @pytest.mark.asyncio
 async def test_openai_passthrough_route_sets_repository_trace_environment_and_session(
     monkeypatch,
@@ -8613,6 +8804,14 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
                     "parallel_tool_calls": True,
                     "include": ["reasoning.encrypted_content"],
                     "prompt_cache_key": "prompt-cache-key-123",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
                 }
             ),
         ), patch(
@@ -8644,11 +8843,88 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
         assert litellm_metadata["codex_prompt_cache_key_present"] is True
         assert litellm_metadata["passthrough_route_family"] == "codex_responses"
         assert "route:codex_responses" in litellm_metadata["tags"]
+        assert "codex-tool-description-patch" in litellm_metadata["tags"]
+        assert (
+            "codex-tool-description-patch:spawn-agent-fanout-policy"
+            in litellm_metadata["tags"]
+        )
+        assert litellm_metadata["codex_tool_description_patch_count"] == 1
         assert "codex-effort:xhigh" in litellm_metadata["tags"]
         assert "effort:xhigh" in litellm_metadata["tags"]
         assert "codex-tool-choice:auto" in litellm_metadata["tags"]
         assert "codex-parallel-tools:true" in litellm_metadata["tags"]
         assert "codex-include:reasoning.encrypted_content" in litellm_metadata["tags"]
+        assert "Use subagents to parallelize independent work" in prepared_body[
+            "tools"
+        ][0]["description"]
+        assert (
+            "Only use `spawn_agent` if and only if"
+            not in prepared_body["tools"][0]["description"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_generic_responses_does_not_patch_spawn_agent_tool(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = {
+        "authorization": "Bearer generic-openai-token",
+        "user-agent": "openai-python/1.0",
+    }
+    mock_request.query_params = {}
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(
+            return_value={
+                "model": "gpt-5.4-mini",
+                "input": "hello",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            }
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=AsyncMock(return_value={"ok": True}),
+    ):
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://api.openai.com",
+            api_key=None,
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            forward_headers=True,
+        )
+
+    assert result == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    prepared_body = mock_set_parsed_body.call_args.args[1]
+    assert prepared_body["litellm_metadata"]["passthrough_route_family"] == (
+        "openai_responses"
+    )
+    assert "codex-tool-description-patch" not in prepared_body["litellm_metadata"][
+        "tags"
+    ]
+    assert (
+        "Only use `spawn_agent` if and only if"
+        in prepared_body["tools"][0]["description"]
+    )
 
 
 class TestVertexAIPassThroughHandler:

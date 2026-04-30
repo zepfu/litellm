@@ -615,6 +615,13 @@ class LangFuseLogger:
                     ),
                 )
 
+            if end_user_id is None and isinstance(metadata, dict):
+                end_user_id = (
+                    metadata.get("user_api_key_end_user_id")
+                    or metadata.get("trace_user_id")
+                    or user_id
+                )
+
             # Clean Metadata before logging - never log raw metadata
             # the raw metadata can contain circular references which leads to infinite recursion
             # we clean out all extra litellm metadata params before logging

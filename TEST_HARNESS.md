@@ -80,7 +80,9 @@ per-run Claude `--settings` overlay for `ANTHROPIC_BASE_URL` and
 `ANTHROPIC_CUSTOM_HEADERS`; this is required because local Claude user/project
 settings can otherwise override process-level header env vars. The overlay must
 not contain secrets. Set `AAWM_CLAUDE_HARNESS_USER_ID` only when a run needs a
-stable known identity.
+stable known identity. New harness work should prefer the generic
+`AAWM_HARNESS_USER_ID`; when the harness is launched under pytest-classifier
+observability, it derives `pytest-classifier` as the caller user id.
 
 This suite shells out to the real Claude CLI and then validates:
 
@@ -98,7 +100,18 @@ trace/user/session context, runtime logs, and `session_history` invariants.
 Native Codex and Gemini CLI passthrough cases inject the current git repository
 identity through `x-aawm-repository` and hard-gate that
 `public.session_history.repository` is populated for the emitted provider
-session.
+session. Codex CLI cases also inject harness-owned `x-litellm-end-user-id`,
+`langfuse_trace_user_id`, `langfuse_trace_name`, and `session_id` config
+overrides so stale ambient Codex profile headers cannot own attribution.
+
+The native Codex Responses case also hard-gates the AAWM `spawn_agent`
+tool-description policy rewrite. It validates the real Codex request logged in
+Langfuse, requiring the `codex-tool-description-patch` /
+`codex-tool-description-patch:spawn-agent-fanout-policy` trace tags, the generic
+fanout policy text in the request, and absence of the restrictive
+`Only use spawn_agent if and only if...` wording. This check is intentionally
+request-shape based rather than requiring Codex to actually spawn subagents on
+every smoke run.
 
 OpenRouter Responses hard gates must catch both incomplete-but-useful streams
 and successful-empty streams. If OpenRouter omits `response.completed` but emits

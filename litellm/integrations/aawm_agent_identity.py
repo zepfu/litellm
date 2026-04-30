@@ -204,7 +204,16 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     token_permission_output INTEGER NOT NULL DEFAULT 0,
     permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    repository TEXT
+    repository TEXT,
+    input_system_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    input_tool_advertisement_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    input_conversation_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    input_other_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    input_breakdown_residual_tokens INTEGER NOT NULL DEFAULT 0,
+    system_behavior_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    system_safety_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    system_instructional_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    system_unclassified_tokens_estimated INTEGER NOT NULL DEFAULT 0
 )
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
@@ -230,6 +239,15 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_output INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS repository TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_system_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_tool_advertisement_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_conversation_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_other_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_breakdown_residual_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_behavior_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_safety_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_instructional_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_unclassified_tokens_estimated INTEGER NOT NULL DEFAULT 0",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
@@ -314,12 +332,22 @@ INSERT INTO public.session_history (
     token_permission_output,
     permission_usd_cost,
     metadata,
-    repository
+    repository,
+    input_system_tokens_estimated,
+    input_tool_advertisement_tokens_estimated,
+    input_conversation_tokens_estimated,
+    input_other_tokens_estimated,
+    input_breakdown_residual_tokens,
+    system_behavior_tokens_estimated,
+    system_safety_tokens_estimated,
+    system_instructional_tokens_estimated,
+    system_unclassified_tokens_estimated
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb,
-    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb, $47
+    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb, $47,
+    $48, $49, $50, $51, $52, $53, $54, $55, $56
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -451,6 +479,42 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         session_history.client_user_agent
     ),
     repository = COALESCE(NULLIF(EXCLUDED.repository, ''), session_history.repository),
+    input_system_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_system_tokens_estimated
+        ELSE session_history.input_system_tokens_estimated
+    END,
+    input_tool_advertisement_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_tool_advertisement_tokens_estimated
+        ELSE session_history.input_tool_advertisement_tokens_estimated
+    END,
+    input_conversation_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_conversation_tokens_estimated
+        ELSE session_history.input_conversation_tokens_estimated
+    END,
+    input_other_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_other_tokens_estimated
+        ELSE session_history.input_other_tokens_estimated
+    END,
+    input_breakdown_residual_tokens = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_breakdown_residual_tokens
+        ELSE session_history.input_breakdown_residual_tokens
+    END,
+    system_behavior_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_behavior_tokens_estimated
+        ELSE session_history.system_behavior_tokens_estimated
+    END,
+    system_safety_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_safety_tokens_estimated
+        ELSE session_history.system_safety_tokens_estimated
+    END,
+    system_instructional_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_instructional_tokens_estimated
+        ELSE session_history.system_instructional_tokens_estimated
+    END,
+    system_unclassified_tokens_estimated = CASE
+        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_unclassified_tokens_estimated
+        ELSE session_history.system_unclassified_tokens_estimated
+    END,
     metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL = """
@@ -579,7 +643,34 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "aawm_total_proxy_duration_ms",
     "aawm_stream_chunk_count",
     "aawm_stream_total_bytes",
+    "usage_input_system_tokens_estimated",
+    "usage_input_tool_advertisement_tokens_estimated",
+    "usage_input_conversation_tokens_estimated",
+    "usage_input_other_tokens_estimated",
+    "usage_input_breakdown_residual_tokens",
+    "usage_system_behavior_tokens_estimated",
+    "usage_system_safety_tokens_estimated",
+    "usage_system_instructional_tokens_estimated",
+    "usage_system_unclassified_tokens_estimated",
+    "prompt_overhead_breakdown_source",
+    "prompt_overhead_counted_shape",
+    "prompt_overhead_route_family",
+    "prompt_overhead_tokenizer",
+    "prompt_overhead_classifier_version",
+    "prompt_overhead_component_paths",
 )
+_PROMPT_OVERHEAD_TOKEN_FIELDS = (
+    "input_system_tokens_estimated",
+    "input_tool_advertisement_tokens_estimated",
+    "input_conversation_tokens_estimated",
+    "input_other_tokens_estimated",
+    "input_breakdown_residual_tokens",
+    "system_behavior_tokens_estimated",
+    "system_safety_tokens_estimated",
+    "system_instructional_tokens_estimated",
+    "system_unclassified_tokens_estimated",
+)
+_PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v1"
 _AAWM_TENANT_ID_METADATA_KEYS = (
     "tenant_id",
     "aawm_tenant_id",
@@ -1524,6 +1615,78 @@ def _ensure_mutable_metadata(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     litellm_params["metadata"] = metadata
     kwargs["litellm_params"] = litellm_params
     return metadata
+
+
+def _is_generic_codex_trace_user_id(value: Any) -> bool:
+    normalized = _clean_non_empty_string(value)
+    return normalized is not None and normalized.lower() in {
+        "codex",
+        "codex-cli",
+        "codex-tui",
+    }
+
+
+def _is_native_codex_passthrough_context(
+    metadata: Dict[str, Any], headers: Dict[str, Any]
+) -> bool:
+    route_family = _clean_non_empty_string(metadata.get("passthrough_route_family"))
+    if route_family and route_family.lower() == "codex_responses":
+        return True
+
+    trace_name = _first_non_empty_string(
+        metadata.get("trace_name"),
+        _get_header_value(headers, "langfuse_trace_name"),
+    )
+    user_agent = _get_header_value(headers, "user-agent")
+    return bool(
+        trace_name
+        and trace_name.lower() == "codex"
+        and user_agent
+        and "codex" in user_agent.lower()
+    )
+
+
+def _promote_codex_repository_trace_user_id(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+    headers: Dict[str, Any],
+) -> None:
+    if not _is_native_codex_passthrough_context(metadata, headers):
+        return
+
+    metadata_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
+    header_trace_user_id = _get_header_value(headers, "langfuse_trace_user_id")
+    repository = _extract_repository_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+    )
+
+    desired_trace_user_id: Optional[str] = None
+    if metadata_trace_user_id and not _is_generic_codex_trace_user_id(
+        metadata_trace_user_id
+    ):
+        desired_trace_user_id = metadata_trace_user_id
+    elif (
+        repository
+        and (
+            metadata_trace_user_id is None
+            or _is_generic_codex_trace_user_id(metadata_trace_user_id)
+        )
+        and (
+            header_trace_user_id is None
+            or _is_generic_codex_trace_user_id(header_trace_user_id)
+        )
+    ):
+        desired_trace_user_id = repository
+
+    if not desired_trace_user_id:
+        return
+
+    metadata["trace_user_id"] = desired_trace_user_id
+    if header_trace_user_id is None or _is_generic_codex_trace_user_id(
+        header_trace_user_id
+    ):
+        headers["langfuse_trace_user_id"] = desired_trace_user_id
 
 
 def _merge_tags(metadata: Dict[str, Any], tags_to_add: List[str]) -> None:
@@ -2960,6 +3123,396 @@ def _fallback_text_token_estimate(text: str) -> int:
     return max(1, (len(stripped) + 3) // 4)
 
 
+def _empty_prompt_overhead_breakdown() -> Dict[str, Any]:
+    return {field: 0 for field in _PROMPT_OVERHEAD_TOKEN_FIELDS}
+
+
+def _serialize_prompt_overhead_component(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    try:
+        return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    except Exception:
+        return str(value)
+
+
+def _estimate_prompt_overhead_tokens(model: str, value: Any) -> int:
+    text = _serialize_prompt_overhead_component(value).strip()
+    if not text:
+        return 0
+    try:
+        import litellm
+
+        token_count = litellm.token_counter(model=model or "", text=text)
+        coerced = _safe_int(token_count)
+        if coerced is not None and coerced >= 0:
+            return coerced
+    except Exception as exc:
+        verbose_logger.debug(
+            "AawmAgentIdentity: failed to estimate prompt-overhead tokens for model=%s: %s",
+            model,
+            exc,
+        )
+    return _fallback_text_token_estimate(text)
+
+
+def _extract_prompt_text_blocks(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [
+            block.strip()
+            for block in re.split(r"\n{2,}", value)
+            if block.strip()
+        ]
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    if isinstance(value, list):
+        blocks: List[str] = []
+        for item in value:
+            blocks.extend(_extract_prompt_text_blocks(item))
+        return blocks
+    if isinstance(value, dict):
+        blocks = []
+        for key in ("text", "content", "parts", "systemInstruction", "system_instruction"):
+            if key in value:
+                blocks.extend(_extract_prompt_text_blocks(value.get(key)))
+        if blocks:
+            return blocks
+        return [_serialize_prompt_overhead_component(value)]
+    return [str(value)]
+
+
+def _classify_system_prompt_block(block: str) -> str:
+    lowered = block.lower()
+    safety_markers = (
+        "safety",
+        "unsafe",
+        "policy",
+        "refuse",
+        "disallowed",
+        "forbidden",
+        "harm",
+        "malicious",
+        "secret",
+        "credential",
+        "privacy",
+        "security",
+        "do not reveal",
+        "never reveal",
+    )
+    if any(marker in lowered for marker in safety_markers):
+        return "safety"
+
+    behavior_markers = (
+        "you are",
+        "persona",
+        "personality",
+        "tone",
+        "style",
+        "respond as",
+        "communication",
+        "be concise",
+        "be direct",
+    )
+    if any(marker in lowered for marker in behavior_markers):
+        return "behavior"
+
+    instructional_markers = (
+        "always",
+        "must",
+        "should",
+        "use ",
+        "follow",
+        "workflow",
+        "steps",
+        "when ",
+        "before ",
+        "after ",
+        "tool",
+        "repository",
+        "codebase",
+        "task",
+        "instruction",
+    )
+    if any(marker in lowered for marker in instructional_markers):
+        return "instructional"
+    return "unclassified"
+
+
+def _estimate_system_prompt_bucket_tokens(
+    *,
+    model: str,
+    system_components: List[Dict[str, Any]],
+) -> Tuple[Dict[str, int], List[str]]:
+    bucket_tokens = {
+        "behavior": 0,
+        "safety": 0,
+        "instructional": 0,
+        "unclassified": 0,
+    }
+    component_paths: List[str] = []
+    for component in system_components:
+        path = str(component.get("path") or "system")
+        value = component.get("value")
+        blocks = _extract_prompt_text_blocks(value)
+        if not blocks:
+            continue
+        component_paths.append(path)
+        for block in blocks:
+            bucket = _classify_system_prompt_block(block)
+            bucket_tokens[bucket] += _estimate_prompt_overhead_tokens(model, block)
+    return bucket_tokens, component_paths
+
+
+def _append_prompt_component(
+    components: Dict[str, List[Dict[str, Any]]],
+    name: str,
+    *,
+    path: str,
+    value: Any,
+) -> None:
+    if value is None:
+        return
+    if isinstance(value, str) and not value.strip():
+        return
+    if isinstance(value, list) and not value:
+        return
+    if isinstance(value, dict) and not value:
+        return
+    components[name].append({"path": path, "value": value})
+
+
+def _split_chat_prompt_messages(messages: Any) -> Tuple[List[Any], List[Any]]:
+    if not isinstance(messages, list):
+        return [], []
+    system_messages: List[Any] = []
+    conversation_messages: List[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") in {"system", "developer"}:
+            system_messages.append(message)
+        else:
+            conversation_messages.append(message)
+    return system_messages, conversation_messages
+
+
+def _extract_prompt_overhead_components(
+    request_body: Dict[str, Any],
+    route_family: Optional[str],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
+    components: Dict[str, List[Dict[str, Any]]] = {
+        "system": [],
+        "tools": [],
+        "conversation": [],
+    }
+    route_family_lower = (route_family or "").lower()
+    request_block = request_body.get("request")
+    is_nested_gemini = isinstance(request_block, dict) and (
+        "gemini" in route_family_lower
+        or "google" in route_family_lower
+        or "contents" in request_block
+        or "systemInstruction" in request_block
+    )
+    if is_nested_gemini:
+        _append_prompt_component(
+            components,
+            "system",
+            path="request.systemInstruction",
+            value=request_block.get("systemInstruction")
+            or request_block.get("system_instruction"),
+        )
+        _append_prompt_component(
+            components,
+            "tools",
+            path="request.tools",
+            value=request_block.get("tools") or request_body.get("tools"),
+        )
+        _append_prompt_component(
+            components,
+            "conversation",
+            path="request.contents",
+            value=request_block.get("contents"),
+        )
+        return components, "gemini_generate_content"
+
+    if request_body.get("systemInstruction") is not None or request_body.get("contents") is not None:
+        _append_prompt_component(
+            components,
+            "system",
+            path="systemInstruction",
+            value=request_body.get("systemInstruction")
+            or request_body.get("system_instruction"),
+        )
+        _append_prompt_component(
+            components,
+            "tools",
+            path="tools",
+            value=request_body.get("tools"),
+        )
+        _append_prompt_component(
+            components,
+            "conversation",
+            path="contents",
+            value=request_body.get("contents"),
+        )
+        return components, "gemini_generate_content"
+
+    if request_body.get("instructions") is not None or request_body.get("input") is not None:
+        _append_prompt_component(
+            components,
+            "system",
+            path="instructions",
+            value=request_body.get("instructions"),
+        )
+        _append_prompt_component(
+            components,
+            "tools",
+            path="tools",
+            value=request_body.get("tools"),
+        )
+        _append_prompt_component(
+            components,
+            "conversation",
+            path="input",
+            value=request_body.get("input"),
+        )
+        return components, "openai_responses"
+
+    if request_body.get("messages") is not None:
+        if request_body.get("system") is not None:
+            _append_prompt_component(
+                components,
+                "system",
+                path="system",
+                value=request_body.get("system"),
+            )
+            _append_prompt_component(
+                components,
+                "conversation",
+                path="messages",
+                value=request_body.get("messages"),
+            )
+            counted_shape = (
+                "anthropic_messages_semantic"
+                if "anthropic" in route_family_lower
+                else "chat_messages_with_top_level_system"
+            )
+        else:
+            system_messages, conversation_messages = _split_chat_prompt_messages(
+                request_body.get("messages")
+            )
+            _append_prompt_component(
+                components,
+                "system",
+                path="messages[role=system|developer]",
+                value=system_messages,
+            )
+            _append_prompt_component(
+                components,
+                "conversation",
+                path="messages[role!=system|developer]",
+                value=conversation_messages,
+            )
+            counted_shape = "openai_chat_completions"
+        _append_prompt_component(
+            components,
+            "tools",
+            path="tools",
+            value=request_body.get("tools"),
+        )
+        _append_prompt_component(
+            components,
+            "tools",
+            path="mcp_servers",
+            value=request_body.get("mcp_servers"),
+        )
+        return components, counted_shape
+
+    return components, "unknown"
+
+
+def _build_prompt_overhead_breakdown(
+    *,
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+    model: str,
+    prompt_tokens: int,
+    request_body: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    breakdown = _empty_prompt_overhead_breakdown()
+    if not isinstance(request_body, dict) or prompt_tokens <= 0:
+        return breakdown
+
+    route_family = metadata.get("passthrough_route_family")
+    if not isinstance(route_family, str) or not route_family.strip():
+        route_family = _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"),
+            "request_body",
+            "litellm_metadata",
+            "passthrough_route_family",
+        )
+    route_family = route_family if isinstance(route_family, str) else None
+
+    components, counted_shape = _extract_prompt_overhead_components(
+        request_body,
+        route_family,
+    )
+    bucket_tokens, system_paths = _estimate_system_prompt_bucket_tokens(
+        model=model,
+        system_components=components["system"],
+    )
+    system_tokens = sum(bucket_tokens.values())
+    tool_tokens = sum(
+        _estimate_prompt_overhead_tokens(model, component["value"])
+        for component in components["tools"]
+    )
+    conversation_tokens = sum(
+        _estimate_prompt_overhead_tokens(model, component["value"])
+        for component in components["conversation"]
+    )
+    component_total = system_tokens + tool_tokens + conversation_tokens
+    residual_tokens = prompt_tokens - component_total
+
+    breakdown.update(
+        {
+            "input_system_tokens_estimated": system_tokens,
+            "input_tool_advertisement_tokens_estimated": tool_tokens,
+            "input_conversation_tokens_estimated": conversation_tokens,
+            "input_other_tokens_estimated": max(residual_tokens, 0),
+            "input_breakdown_residual_tokens": residual_tokens,
+            "system_behavior_tokens_estimated": bucket_tokens["behavior"],
+            "system_safety_tokens_estimated": bucket_tokens["safety"],
+            "system_instructional_tokens_estimated": bucket_tokens["instructional"],
+            "system_unclassified_tokens_estimated": bucket_tokens["unclassified"],
+        }
+    )
+
+    component_paths = {
+        "system": system_paths,
+        "tools": [str(component.get("path")) for component in components["tools"]],
+        "conversation": [
+            str(component.get("path")) for component in components["conversation"]
+        ],
+    }
+    metadata.update(
+        {
+            "prompt_overhead_breakdown_source": "request_body_estimate",
+            "prompt_overhead_counted_shape": counted_shape,
+            "prompt_overhead_route_family": route_family,
+            "prompt_overhead_tokenizer": "litellm.token_counter_with_char_fallback",
+            "prompt_overhead_classifier_version": _PROMPT_OVERHEAD_CLASSIFIER_VERSION,
+            "prompt_overhead_component_paths": component_paths,
+        }
+    )
+    for key, value in breakdown.items():
+        metadata[f"usage_{key}"] = value
+    return breakdown
+
+
 def _estimate_rerank_request_tokens(
     *,
     kwargs: Dict[str, Any],
@@ -3306,6 +3859,9 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     else:
         metadata.pop("usage_reasoning_tokens_estimated", None)
 
+    for field in _PROMPT_OVERHEAD_TOKEN_FIELDS:
+        metadata[f"usage_{field}"] = int(record.get(field) or 0)
+
     provider_family = _normalize_provider_cache_family(
         record.get("provider"),
         str(record.get("model") or ""),
@@ -3358,9 +3914,16 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     record["metadata"] = metadata
 
 
+def _normalize_prompt_overhead_state_on_record(record: Dict[str, Any]) -> None:
+    for field in _PROMPT_OVERHEAD_TOKEN_FIELDS:
+        value = _safe_int(record.get(field))
+        record[field] = value if value is not None else 0
+
+
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
+    _normalize_prompt_overhead_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
     _normalize_session_repository_on_record(record)
     _normalize_session_tenant_on_record(record)
@@ -5396,12 +5959,21 @@ def _build_session_history_record(
         response_cost_usd=response_cost_usd,
     )
 
+    request_body = _extract_provider_cache_request_body(kwargs)
+    prompt_overhead_breakdown = _build_prompt_overhead_breakdown(
+        kwargs=kwargs,
+        metadata=metadata,
+        model=resolved_model,
+        prompt_tokens=prompt_tokens,
+        request_body=request_body,
+    )
+
     provider_cache_state = _resolve_provider_cache_state(
         provider=resolved_provider,
         model=resolved_model,
         usage_obj=usage_obj,
         metadata=metadata,
-        request_body=_extract_provider_cache_request_body(kwargs),
+        request_body=request_body,
     )
     provider_cache_state = dict(provider_cache_state or {})
     if provider_cache_state:
@@ -5483,6 +6055,7 @@ def _build_session_history_record(
         "client_name": runtime_identity["client_name"],
         "client_version": runtime_identity["client_version"],
         "client_user_agent": runtime_identity["client_user_agent"],
+        **prompt_overhead_breakdown,
         "metadata": _build_session_history_metadata(
             metadata=metadata,
             request_tags=[tag for tag in request_tags if isinstance(tag, str)],
@@ -5613,6 +6186,15 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("permission_usd_cost", 0),
         json.dumps(record["metadata"]),
         record.get("repository"),
+        record.get("input_system_tokens_estimated", 0),
+        record.get("input_tool_advertisement_tokens_estimated", 0),
+        record.get("input_conversation_tokens_estimated", 0),
+        record.get("input_other_tokens_estimated", 0),
+        record.get("input_breakdown_residual_tokens", 0),
+        record.get("system_behavior_tokens_estimated", 0),
+        record.get("system_safety_tokens_estimated", 0),
+        record.get("system_instructional_tokens_estimated", 0),
+        record.get("system_unclassified_tokens_estimated", 0),
     )
 
 
@@ -6054,6 +6636,7 @@ def _enrich_trace_name_and_provider_metadata(
     if session_id and not metadata.get("session_id"):
         metadata["session_id"] = session_id
 
+    _promote_codex_repository_trace_user_id(kwargs, metadata, headers)
     _enrich_session_runtime_identity_metadata(kwargs)
 
     message = _extract_first_response_message(result)

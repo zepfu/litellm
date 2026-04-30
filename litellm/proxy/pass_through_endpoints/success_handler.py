@@ -6,6 +6,7 @@ import httpx
 
 import litellm
 
+from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
@@ -108,13 +109,26 @@ class PassThroughEndpointLogging:
         for callback in sync_callbacks:
             logging_hook = getattr(callback, "logging_hook", None)
             if callable(logging_hook):
-                thread_pool_executor.submit(
-                    logging_hook,
-                    current_kwargs,
-                    current_result,
-                    call_type,
-                )
+                try:
+                    hook_result = logging_hook(
+                        current_kwargs,
+                        current_result,
+                        call_type,
+                    )
+                    if (
+                        isinstance(hook_result, tuple)
+                        and len(hook_result) == 2
+                        and isinstance(hook_result[0], dict)
+                    ):
+                        current_kwargs, current_result = hook_result
+                except Exception as exc:
+                    verbose_proxy_logger.warning(
+                        "Pass-through logging_hook failed for callback=%s: %s",
+                        callback,
+                        exc,
+                    )
 
+        for callback in sync_callbacks:
             log_success_event = getattr(callback, "log_success_event", None)
             if callable(log_success_event):
                 thread_pool_executor.submit(

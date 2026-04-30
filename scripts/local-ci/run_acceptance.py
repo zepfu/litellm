@@ -29,6 +29,12 @@ _CLAUDE_HARNESS_HEADER_KEYS = {
     "langfuse_trace_user_id",
     "langfuse_trace_name",
 }
+_HARNESS_USER_ID_ENV_KEYS = (
+    "AAWM_HARNESS_USER_ID",
+    "PYTEST_CLASSIFIER_HARNESS_USER_ID",
+    "AAWM_CLAUDE_HARNESS_USER_ID",
+)
+_PYTEST_CLASSIFIER_SERVICE_RE = re.compile(r"(^|[-_.])pytest-classifier($|[-_.])")
 
 
 def _utcnow() -> dt.datetime:
@@ -53,9 +59,22 @@ def _resolve_litellm_base_url(config: dict[str, Any]) -> str:
 def _build_claude_harness_user_id(
     *, target: str | None = None, case_name: str | None = None
 ) -> str:
-    override = os.environ.get("AAWM_CLAUDE_HARNESS_USER_ID")
-    if override and override.strip():
-        return override.strip()
+    for env_key in _HARNESS_USER_ID_ENV_KEYS:
+        override = os.environ.get(env_key)
+        if override and override.strip():
+            return override.strip()
+
+    service_name = os.environ.get("AAWM_OBSERVE_SERVICE_NAME", "")
+    if _PYTEST_CLASSIFIER_SERVICE_RE.search(service_name.strip()):
+        return "pytest-classifier"
+
+    if os.environ.get("PYTEST_CLASSIFIER_ENABLE_OBSERVABILITY", "").strip().lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }:
+        return "pytest-classifier"
 
     run_id = os.environ.get("AAWM_HARNESS_RUN_ID")
     if not run_id or not run_id.strip():

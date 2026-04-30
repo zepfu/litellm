@@ -219,8 +219,8 @@ def _get_user_from_passthrough_logging_payload(
 ) -> Optional[str]:
     request_body = passthrough_logging_payload.get("request_body")
     request_headers = passthrough_logging_payload.get("request_headers")
-    if request_body:
-        return get_end_user_id_from_request_body(request_body, request_headers)
+    if request_body or request_headers:
+        return get_end_user_id_from_request_body(request_body or {}, request_headers)
     return None
 
 

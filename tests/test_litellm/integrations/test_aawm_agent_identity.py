@@ -161,6 +161,81 @@ def test_aawm_agent_identity_rewrites_stale_orchestrator_langfuse_trace_header()
     assert langfuse_metadata["trace_user_id"] == "aegis"
 
 
+def test_aawm_agent_identity_promotes_codex_repository_over_generic_user_header() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "pytest-classifier",
+            "session_id": "codex-session-123",
+            "trace_user_id": "codex",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "langfuse_trace_user_id": "codex",
+            "user-agent": "codex-tui/0.125.0",
+        }
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert metadata["trace_user_id"] == "pytest-classifier"
+    assert headers["langfuse_trace_user_id"] == "pytest-classifier"
+
+    langfuse_metadata = LangFuseLogger.add_metadata_from_header(
+        updated_kwargs["litellm_params"],
+        dict(metadata),
+    )
+    assert langfuse_metadata["trace_user_id"] == "pytest-classifier"
+
+
+def test_aawm_agent_identity_preserves_explicit_codex_user_header() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "zepfu/litellm",
+            "session_id": "codex-session-123",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "langfuse_trace_user_id": "pytest-classifier",
+            "user-agent": "codex-tui/0.125.0",
+        }
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert "trace_user_id" not in metadata
+    assert headers["langfuse_trace_user_id"] == "pytest-classifier"
+
+    langfuse_metadata = LangFuseLogger.add_metadata_from_header(
+        updated_kwargs["litellm_params"],
+        dict(metadata),
+    )
+    assert langfuse_metadata["trace_user_id"] == "pytest-classifier"
+
+
 def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
@@ -1275,6 +1350,410 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["metadata"]["request_tags"] == ["reasoning-present"]
     assert record["metadata"]["tenant_id"] == "aegis"
     assert record["metadata"]["cc_version"] == "2.1.112"
+
+
+def _fake_prompt_overhead_token_count(_model: str, value) -> int:
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    return len([part for part in text.replace("\n", " ").split(" ") if part])
+
+
+def _prompt_overhead_kwargs(
+    *,
+    route_family: str,
+    request_body: dict,
+    provider: str,
+    model: str,
+) -> dict:
+    kwargs = _base_kwargs(trace_name="prompt-overhead")
+    kwargs["model"] = model
+    kwargs["custom_llm_provider"] = provider
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = f"call-{route_family}"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": f"session-{route_family}",
+            "passthrough_route_family": route_family,
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = request_body
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {},
+        "body": request_body,
+    }
+    return kwargs
+
+
+def _prompt_overhead_result() -> dict:
+    return {
+        "id": "resp-prompt-overhead",
+        "usage": {"prompt_tokens": 200, "completion_tokens": 7, "total_tokens": 207},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+
+def _assert_prompt_overhead_record(
+    record: dict,
+    *,
+    counted_shape: str,
+    route_family: str | None = None,
+    component_paths: dict[str, list[str]] | None = None,
+) -> None:
+    system_tokens = record["input_system_tokens_estimated"]
+    tool_tokens = record["input_tool_advertisement_tokens_estimated"]
+    conversation_tokens = record["input_conversation_tokens_estimated"]
+    assert system_tokens > 0
+    assert tool_tokens > 0
+    assert conversation_tokens > 0
+    assert record["input_other_tokens_estimated"] >= 0
+    assert (
+        record["input_breakdown_residual_tokens"]
+        == record["input_tokens"] - system_tokens - tool_tokens - conversation_tokens
+    )
+    assert system_tokens == (
+        record["system_behavior_tokens_estimated"]
+        + record["system_safety_tokens_estimated"]
+        + record["system_instructional_tokens_estimated"]
+        + record["system_unclassified_tokens_estimated"]
+    )
+    metadata = record["metadata"]
+    assert metadata["prompt_overhead_breakdown_source"] == "request_body_estimate"
+    assert metadata["prompt_overhead_counted_shape"] == counted_shape
+    assert metadata["prompt_overhead_classifier_version"] == "deterministic-v1"
+    if route_family is not None:
+        assert metadata["prompt_overhead_route_family"] == route_family
+    if component_paths is not None:
+        assert metadata["prompt_overhead_component_paths"] == component_paths
+    assert metadata["usage_input_system_tokens_estimated"] == system_tokens
+    assert metadata["usage_input_tool_advertisement_tokens_estimated"] == tool_tokens
+    assert metadata["usage_input_conversation_tokens_estimated"] == conversation_tokens
+
+
+def test_build_session_history_record_estimates_native_anthropic_prompt_overhead(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": "claude-opus-4-6",
+        "system": (
+            "You are a direct coding assistant.\n\n"
+            "Never reveal secrets or credentials.\n\n"
+            "Always follow repository instructions."
+        ),
+        "tools": [{"name": "Bash", "description": "Run a shell command."}],
+        "messages": [{"role": "user", "content": "Inspect the code."}],
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family="anthropic_messages",
+        request_body=request_body,
+        provider="anthropic",
+        model="claude-opus-4-6",
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_prompt_overhead_result(),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    _assert_prompt_overhead_record(record, counted_shape="anthropic_messages_semantic")
+    assert record["system_behavior_tokens_estimated"] > 0
+    assert record["system_safety_tokens_estimated"] > 0
+    assert record["system_instructional_tokens_estimated"] > 0
+
+
+def test_build_session_history_record_estimates_codex_responses_prompt_overhead(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": "gpt-5.3-codex",
+        "instructions": (
+            "Always use parallel work when it is safe.\n\n"
+            "Never expose secrets."
+        ),
+        "tools": [{"type": "function", "name": "apply_patch"}],
+        "input": [{"role": "user", "content": "Patch the tests."}],
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family="codex_responses",
+        request_body=request_body,
+        provider="openai",
+        model="gpt-5.3-codex",
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_prompt_overhead_result(),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    _assert_prompt_overhead_record(record, counted_shape="openai_responses")
+    assert record["system_safety_tokens_estimated"] > 0
+    assert record["system_instructional_tokens_estimated"] > 0
+
+
+def test_build_session_history_record_estimates_anthropic_openai_responses_prompt_overhead(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": "gpt-5.4",
+        "instructions": (
+            "You are an OpenAI Responses adapter target.\n\n"
+            "Never expose secrets.\n\n"
+            "Always preserve Anthropic tool-call intent."
+        ),
+        "tools": [{"type": "function", "name": "Bash"}],
+        "input": [{"role": "user", "content": "Run a command."}],
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family="anthropic_openai_responses_adapter",
+        request_body=request_body,
+        provider="openai",
+        model="gpt-5.4",
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_prompt_overhead_result(),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    _assert_prompt_overhead_record(
+        record,
+        counted_shape="openai_responses",
+        route_family="anthropic_openai_responses_adapter",
+        component_paths={
+            "system": ["instructions"],
+            "tools": ["tools"],
+            "conversation": ["input"],
+        },
+    )
+    assert record["system_behavior_tokens_estimated"] > 0
+    assert record["system_safety_tokens_estimated"] > 0
+    assert record["system_instructional_tokens_estimated"] > 0
+
+
+def test_build_session_history_record_estimates_gemini_prompt_overhead(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": "gemini-3-flash-preview",
+        "request": {
+            "systemInstruction": {
+                "parts": [
+                    {
+                        "text": (
+                            "You are Gemini CLI.\n\n"
+                            "Follow repository instructions."
+                        )
+                    }
+                ]
+            },
+            "tools": [{"functionDeclarations": [{"name": "run_shell_command"}]}],
+            "contents": [{"role": "user", "parts": [{"text": "Run date."}]}],
+        },
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family="gemini_generate_content",
+        request_body=request_body,
+        provider="gemini",
+        model="gemini-3-flash-preview",
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_prompt_overhead_result(),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    _assert_prompt_overhead_record(record, counted_shape="gemini_generate_content")
+
+
+def test_build_session_history_record_estimates_anthropic_google_adapter_prompt_overhead(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": "gemini-3-flash-preview",
+        "project": "dev-project",
+        "user_prompt_id": "prompt-123",
+        "request": {
+            "systemInstruction": {
+                "parts": [
+                    {
+                        "text": (
+                            "You are a Google Code Assist adapter target.\n\n"
+                            "Never reveal credentials.\n\n"
+                            "Always follow repository instructions."
+                        )
+                    }
+                ]
+            },
+            "tools": [{"functionDeclarations": [{"name": "run_shell_command"}]}],
+            "contents": [{"role": "user", "parts": [{"text": "Run date."}]}],
+        },
+        "litellm_metadata": {
+            "google_adapter_system_prompt_policy": "replace_compact",
+            "google_adapter_system_prompt_policy_version": "2026-04-27.v2",
+            "google_adapter_system_prompt_original_chars": 1234,
+            "google_adapter_system_prompt_rewritten_chars": 456,
+        },
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family="anthropic_google_completion_adapter",
+        request_body=request_body,
+        provider="gemini",
+        model="gemini-3-flash-preview",
+    )
+    kwargs["litellm_params"]["metadata"].update(request_body["litellm_metadata"])
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_prompt_overhead_result(),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    _assert_prompt_overhead_record(
+        record,
+        counted_shape="gemini_generate_content",
+        route_family="anthropic_google_completion_adapter",
+        component_paths={
+            "system": ["request.systemInstruction"],
+            "tools": ["request.tools"],
+            "conversation": ["request.contents"],
+        },
+    )
+    metadata = record["metadata"]
+    assert metadata["google_adapter_system_prompt_policy"] == "replace_compact"
+    assert (
+        metadata["google_adapter_system_prompt_policy_version"]
+        == "2026-04-27.v2"
+    )
+    assert metadata["google_adapter_system_prompt_original_chars"] == 1234
+    assert metadata["google_adapter_system_prompt_rewritten_chars"] == 456
+    assert record["system_behavior_tokens_estimated"] > 0
+    assert record["system_safety_tokens_estimated"] > 0
+    assert record["system_instructional_tokens_estimated"] > 0
+
+
+@pytest.mark.parametrize(
+    ("route_family", "provider", "model"),
+    [
+        ("anthropic_nvidia_completion_adapter", "nvidia_nim", "nvidia/nemotron"),
+        (
+            "anthropic_openrouter_completion_adapter",
+            "openrouter",
+            "openrouter/elephant-alpha",
+        ),
+    ],
+)
+def test_build_session_history_record_estimates_anthropic_chat_adapter_prompt_overhead(
+    monkeypatch,
+    route_family: str,
+    provider: str,
+    model: str,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": model,
+        "system": (
+            "You are an adapter target.\n\n"
+            "Always preserve tool-use intent."
+        ),
+        "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": "Use Bash."}],
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family=route_family,
+        request_body=request_body,
+        provider=provider,
+        model=model,
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_prompt_overhead_result(),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    _assert_prompt_overhead_record(record, counted_shape="anthropic_messages_semantic")
+
+
+def test_build_session_history_record_estimates_openrouter_responses_prompt_overhead(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": "openrouter/auto",
+        "instructions": (
+            "You are an OpenRouter Responses adapter.\n\n"
+            "Never expose secrets.\n\n"
+            "Always maintain tool-call compatibility."
+        ),
+        "tools": [{"type": "function", "name": "Bash"}],
+        "input": [{"role": "user", "content": "Run a command."}],
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family="anthropic_openrouter_responses_adapter",
+        request_body=request_body,
+        provider="openrouter",
+        model="openrouter/auto",
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=_prompt_overhead_result(),
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    _assert_prompt_overhead_record(record, counted_shape="openai_responses")
+    assert record["system_behavior_tokens_estimated"] > 0
+    assert record["system_safety_tokens_estimated"] > 0
+    assert record["system_instructional_tokens_estimated"] > 0
 
 
 def test_build_session_history_record_prefers_explicit_metadata_tenant() -> None:
