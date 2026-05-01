@@ -281,6 +281,9 @@ Acceptance requires:
 - session tags tied to the initiating parent session
 - `public.session_history` rows with provider, model, cost, runtime identity,
   client identity, reasoning attribution, and provider-cache telemetry
+- for prompt/CLI-overhead changes, populated `public.session_history`
+  prompt-overhead columns plus a non-empty harness
+  `summary.prompt_overhead_cost_share` report
 - `public.session_history_tool_activity` rows for cases that invoke tools or
   dispatch child agents
 - no overlapping prod log blockers

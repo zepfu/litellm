@@ -1,5 +1,50 @@
 # Completed
 
+## 2026-05-01
+
+- Audited and refreshed the harness/release documentation against the current
+  repo-local adapter harness behavior. The docs now distinguish the standalone
+  `h-v*` baseline harness archive from the repo-local Anthropic adapter harness,
+  list the current default hard cases and warning-only cases from
+  `scripts/local-ci/anthropic_adapter_config.json`, document that
+  `claude_adapter_gpt_oss_120b` is an opt-in hard gate with only the narrow
+  OpenRouter provider-unavailable soft-fail, and include the
+  `summary.prompt_overhead_cost_share` prompt-overhead report in the runbook and
+  overlay docs.
+
+  Documentation changed:
+  `TEST_HARNESS.md`, `scripts/local-ci/README.md`, `WHEEL.md`, `CLAUDE.md`,
+  `PROD_RELEASE.md`, `PATCHES.md`, `TODO.md`, `.analysis/todo.md`,
+  `.analysis/completed.md`, and supporting `.analysis` design notes.
+
+- Closed the documentation-test regressions surfaced by the full-suite
+  collection pass. `config_settings.md` now documents the AAWM adapter env vars,
+  the missing general settings, Claude persisted-output env vars, Code Assist,
+  NVIDIA NIM, and OpenRouter API-base settings; `exception_mapping.md` now
+  lists public `RejectedRequestError` and `BadGatewayError`; and
+  `test_exception_types.py` now resolves the repo root from `__file__` and
+  parses the exception table by columns.
+
+  Validation passed:
+  `./.venv/bin/python tests/documentation_tests/test_env_keys.py`,
+  `./.venv/bin/python tests/documentation_tests/test_general_setting_keys.py`,
+  `./.venv/bin/python tests/documentation_tests/test_exception_types.py`,
+  `./.venv/bin/ruff check tests/documentation_tests/test_exception_types.py`,
+  `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py -q`
+  (`99 passed`),
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`56 passed`),
+  JSON validation for both local-ci config files, and `git diff --check`.
+
+  Full-suite status: `make test` now collects `18172 items / 83 errors`. This
+  is down from the earlier `86 errors`; the three documentation collection
+  failures were resolved. The remaining collection/setup blockers are broad
+  suite/environment issues such as duplicate test basenames in a monolithic
+  collection, missing optional dependencies (`PIL`, `google.genai`), missing
+  live credentials (`OPENAI_API_KEY`, AWS), old proxy/live tests executing at
+  import time, and the pre-existing
+  `litellm.llms.vertex_ai.vector_stores.transformation` import gap.
+
 ## 2026-04-30
 
 - Added harness-level prompt-overhead cost-share reporting for

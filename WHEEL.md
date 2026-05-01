@@ -53,10 +53,14 @@ Current responsibilities:
 - `public.session_history` persistence into the AAWM tristore
 - `public.session_history_tool_activity` classification for delegated agents and
   provider-native tool names
-- repository attribution for native CLI passthrough rows when clients send
-  explicit repository metadata or `x-aawm-repository`
+- repository and tenant fallback attribution for native CLI passthrough rows
+  from explicit metadata, `x-aawm-repository`, prepared `litellm_metadata`, and
+  Codex/Gemini workspace context text
 - background batching for `session_history` writes with configurable batch/flush tuning
 - Gemini/Codex usage breakout normalization for cache, reasoning, and tool-call fields
+- prompt-overhead token breakdown estimates in `public.session_history`,
+  including system/provider-equivalent, tool-advertisement, conversation,
+  residual/other, and deterministic system-classifier buckets
 
 ### Claude control-plane wheel
 
@@ -91,7 +95,10 @@ Published source:
 - `scripts/local-ci/README.md`
 - `scripts/local-ci/run_acceptance.sh`
 - `scripts/local-ci/run_acceptance.py`
+- `scripts/local-ci/compare_artifacts.py`
 - `scripts/local-ci/config.json`
+- `scripts/local-ci/claude_acceptance_prompt.txt`
+- `scripts/local-ci/claude_acceptance_prompt_full_fanout.txt`
 - `scripts/local-ci/build_harness_bundle.py`
 
 Release workflow:
@@ -113,6 +120,10 @@ Current responsibilities:
 - Claude request rewrite verification, including prompt-shape watchpoints like
   future `verbosity` payload adoption
 - repeatable local regression validation outside the main repo checkout
+- repo-local adapter/native harness reporting for session-history
+  prompt-overhead assertions and `summary.prompt_overhead_cost_share` route
+  comparisons; this adapter harness is not currently packaged into the
+  standalone `h-v*` archive
 
 ## Model Config Archive
 

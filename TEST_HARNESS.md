@@ -140,12 +140,18 @@ hidden.
 
 ### Hard gates
 
-These are expected to pass on the real Claude CLI path:
+These default adapter cases are expected to pass on the real Claude CLI path:
 
-- `gpt-5.4`
-- `gpt-5.4-mini`
-- `gpt-5.3-codex-spark`
+- `claude_adapter_gpt54`
+- `claude_adapter_gpt55`
+- `claude_adapter_gpt54_mini`
+- `claude_adapter_gpt55_read_pages_sanitizer`
+- `claude_adapter_ctx_marker`
+- `claude_adapter_ctx_marker_escaped`
+- `claude_adapter_codex_tool_activity`
 - `claude_adapter_gemini_fanout`
+- `claude_adapter_peeromega_fanout`
+- `claude_adapter_spark`
 
 The full adapter suite intentionally runs `claude_adapter_gemini_fanout`
 before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not
@@ -156,21 +162,24 @@ contaminated by the mixed fanout's short-window upstream pressure.
 These are real validations, but they are allowed to warn instead of failing the
 suite when the upstream provider is noisy:
 
-- `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
+- Google Code Assist: `claude_adapter_gemini31_pro`,
+  `claude_adapter_gemini31_flash`
   - route to Google Code Assist directly
   - single-model `429` / `RESOURCE_EXHAUSTED` responses can still be upstream
     noise, which is why the individual model cases remain warning-only
-- `openrouter/free`
-- `openai/gpt-oss-20b:free`
+- `claude_adapter_openrouter_free`
+- `claude_adapter_gpt_oss_20b`
   - excluded from the default full suite; run explicitly with
     `--cases claude_adapter_gpt_oss_20b` when this edge OpenRouter target needs
     validation
-- `openai/gpt-oss-120b:free`
-  - excluded from the default full suite; run explicitly with
-    `--cases claude_adapter_gpt_oss_120b` when this edge OpenRouter target needs
-    validation
-- `google/gemma-4-31b-it:free`
-- `google/gemma-4-26b-a4b-it:free`
+- `claude_adapter_gemma_31b`
+- `claude_adapter_gemma_26b_a4b`
+- `claude_adapter_nemotron_super`
+
+`claude_adapter_gpt_oss_120b` is not warning-only. It is an excluded opt-in
+hard gate with one narrow provider-unavailable soft-fail: the overlapping
+runtime logs must show the OpenRouter adapter attempt plus `503`,
+`provider=OpenInference`, and `raw=no healthy upstream`.
 
 The focused OpenRouter replacement parallel proof is not a warning-only
 canary:
@@ -198,7 +207,7 @@ Keep these out of the standard adapter harness run for now:
 
 ### Preferred Anthropic-adapter model spellings
 
-- direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
+- direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
 - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
 - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
@@ -381,9 +390,13 @@ Telemetry expectation:
   - session-wide delegated `Agent` rows are present on the parent session
   - `claude_adapter_gemini_fanout` should persist at least three parent-session
     `Agent` rows and `claude_adapter_peeromega_fanout` should persist at least
-    eight
+    seven
   - `public.session_history` still contains provider/model/cost rows for each
     expected Gemini child model
+- for prompt/CLI-overhead changes, `public.session_history` should also carry
+  the estimated input-token breakdown fields and the harness should populate
+  `summary.prompt_overhead_cost_share`; treat those token shares as estimates
+  unless a provider reports exact component-level token usage
 
 ## Latency and lifecycle debugging
 
@@ -434,10 +447,11 @@ The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
 
-Current minimum harness bundle version is `h-v0.0.21` for the aawm.37 /
-`cb-v0.0.12` prod validation line. It includes the controlled Claude settings
-overlay, tenant-only trace-user validation, the longer peeromega fanout timeout
-for prod `:4000` validation, the narrow OpenRouter provider-unavailable timeout
-/ command-failure classifier, and the default-suite GPT-OSS exclusions used by
-the prod promotion suite. Older `h-v0.0.13` / `h-v0.0.14` notes are historical
-only.
+Current local harness source version is `0.0.22` in
+`scripts/local-ci/harness-version.txt`. The current minimum released bundle for
+the aawm.37 / `cb-v0.0.12` prod validation line remains `h-v0.0.21`; it
+includes the controlled Claude settings overlay, tenant-only trace-user
+validation, the longer peeromega fanout timeout for prod `:4000` validation,
+the narrow OpenRouter provider-unavailable timeout / command-failure classifier,
+and the default-suite GPT-OSS exclusions used by the prod promotion suite.
+Older `h-v0.0.13` / `h-v0.0.14` notes are historical only.
