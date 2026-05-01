@@ -29,7 +29,7 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current carried patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34`, `aawm.35`, `aawm.36`, `aawm.37` (36 active carried patches)
+Current promoted patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34`, `aawm.35`, `aawm.36`, `aawm.37` (36 active carried patches). `develop` additionally contains unreleased `aawm.38` work for Codex `spawn_agent` fanout policy and prompt-overhead telemetry.
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -1277,12 +1277,16 @@ out on the OpenRouter/Ling child lane; that follow-up is tracked in
 
 ---
 
-### aawm.38 — Codex `spawn_agent` tool-description fanout policy rewrite
+### aawm.38 — Codex `spawn_agent` fanout policy and prompt-overhead telemetry
 
 **Files:**
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
 - `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
 - `scripts/local-ci/anthropic_adapter_config.json`
+- `scripts/local-ci/run_anthropic_adapter_acceptance.py`
 - `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
 - `tests/local_ci/test_anthropic_adapter_acceptance_hardening.py`
 - `TODO.md`
 - `COMPLETED.md`
@@ -1308,9 +1312,19 @@ records `codex-tool-description-patch` /
 `codex_tool_description_patch_*` metadata, and a
 `codex.tool_description_patch` span.
 
+The same development patch line also adds D1-060 prompt-overhead telemetry to
+`public.session_history`. The callback now stores estimated system /
+provider-equivalent, tool-advertisement, conversation, residual/other, and
+system-classifier token buckets, and the adapter/native harness summarizes
+those rows under `summary.prompt_overhead_cost_share` for route/client/model
+comparisons. Counts and proportional cost-share dollars are explicitly labeled
+estimated unless the provider reports exact component-level values.
+
 **Why not upstream:** This is AAWM-specific Codex CLI context policy. The goal
 is to shape our local Codex-native passthrough request before upstream send,
-not to patch Codex CLI or alter generic OpenAI passthrough traffic.
+not to patch Codex CLI or alter generic OpenAI passthrough traffic. The
+prompt-overhead reporting is AAWM-specific billing/observability analysis for
+CLI prompt overhead.
 
 **Validation status:** Local focused tests pass for the structured rewrite,
 non-`spawn_agent` no-op behavior, Codex route integration, generic OpenAI
@@ -1321,6 +1335,18 @@ passed after refreshing `litellm-dev`:
 The artifact recorded trace `092a1ac4-1cd5-4859-949b-9898b7ba3b1c`, Langfuse
 user `pytest-classifier`, the patch tags, required fanout text, and no
 restrictive `Only use spawn_agent if and only if...` text.
+
+Prompt-overhead validation also passed on dev `:4001`: unit coverage proves the
+native and translated/billed request shapes are counted for Anthropic, OpenAI /
+Codex Responses, Gemini / Code Assist, NVIDIA chat completions, OpenRouter chat
+completions, and OpenRouter Responses; the native Codex harness assertion
+populated `input_system_tokens_estimated`,
+`input_tool_advertisement_tokens_estimated`,
+`input_conversation_tokens_estimated`, `input_other_tokens_estimated`, and
+`prompt_overhead_counted_shape=openai_responses`; and
+`/tmp/native_codex_4001_prompt_overhead_cost_share.json` plus
+`/tmp/native_openai_prompt_overhead_cost_share_4001.json` populated the harness
+`summary.prompt_overhead_cost_share` report.
 
 ---
 

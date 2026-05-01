@@ -107,6 +107,16 @@ these docs only as needed:
 
 ## Next
 
+- Full monolithic `make test` is still not a clean local release gate. The
+  2026-05-01 rerun collected `18172 items / 83 errors` after fixing the three
+  documentation collection regressions from the earlier `86`-error run. Keep
+  using focused unit/doc/harness gates for this release lane unless the broader
+  suite is split or the remaining collection/setup blockers are intentionally
+  addressed: duplicate test module basenames in one pytest invocation, missing
+  optional deps (`PIL`, `google.genai`), missing live credentials, old proxy/live
+  tests executing at import time, and the Vertex vector-store transformation
+  import gap.
+
 - D1-060 prompt-overhead tracking now has live `session_history` fields,
   translated-shape unit coverage, native Codex assertions, and
   `summary.prompt_overhead_cost_share` in the local harness artifact. Native
@@ -379,10 +389,13 @@ these docs only as needed:
   Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:` via the rewritten request body instead of a brittle exact model reply, `claude_adapter_ctx_marker_escaped` must keep validating `\\:#name.ctx#\\:` literal escaping, dispatched child-agent backtick and bare-acronym lookups should stay aligned with the same `tristore_search_exact` semantics, the CommonMark system-prompt identifier list rewrite should stay aligned with the tenant/agent-scoped raw-content query until the stored procedure lands, the provider-cache canary should keep finding at least one Anthropic `hit` / `write` row in the default suite, Gemini fanout should now deliberately hard-gate child native `run_shell_command` rows rather than relying on plausible final text, and the direct Gemini Read gate is `claude_adapter_gemini31_pro_read_tool_id_sanitizer` rather than the fanout case. The post-tool-result Gemini gate is `claude_adapter_gemini31_pro_bash_then_read_stream_state`; keep it default-excluded but run it explicitly when Claude-dispatched Gemini fails after an initial tool call. Persisted Gemini tool activity uses native `read_file` / `run_shell_command` while Claude Code sees restored `Read` / `Bash`, so validators should match the stored native tool names and require the matching tool-call rows instead of the latest no-tool final row. `--target dev` / `--target prod` should continue enforcing the correct port, Docker container, and Langfuse trace environment. Claude trace-user validation should validate tenant-only Langfuse user ids (`userId=<tenant_id>`) while trace names carry the agent (`claude-code.<agent>`); do not use `project.agent` as the user id. Basic OpenAI smoke cases should validate success, usage, cost, routing, Langfuse, and session-history invariants rather than brittle exact natural-language output. Keep the prod-cutover failure guards active by default: async task exceptions, ASGI exceptions, `KeyError: choices`, stale `Content-Length` / `h11` protocol failures, upstream passthrough 429/5xx traces, and the OpenAI Responses nested-object-schema regression must fail the run instead of surfacing only as downstream session-history gaps; warning-only optional cases must not mask command timeouts or runtime-log hard failures. Before future prod promotions, add a production-style preflight that validates the exact image / installed wheel path on `:4001` plus a small explicit promotion-gate set for opt-in provider lanes, so packaging and adapter metadata gaps are caught before touching `:4000`.
 
 - Keep future harness bundle publishes ahead of `h-v0.0.21` for the current
-  aawm.37 prod-validation line. `h-v0.0.21` is the minimum known-good bundle for
-  the rebuilt `cb-v0.0.12` prod image: it includes controlled Claude trace
+  aawm.37 prod-validation line. `h-v0.0.21` is the minimum known-good released
+  bundle for the rebuilt `cb-v0.0.12` prod image, while the repo-local harness
+  source is now `0.0.22`. The released bundle includes controlled Claude trace
   `userId` validation, explicit per-run Claude settings overlay, longer
   peeromega fanout timeout, the narrow OpenRouter provider-unavailable timeout /
   command-failure classifier, the default-suite exclusion for GPT-OSS edge
   cases, and the focused prod child trace-name coverage used during the latest
-  `:4000` validation.
+  `:4000` validation. The repo-local Anthropic adapter/native harness is broader
+  than the standalone `h-v*` archive and now reports
+  `summary.prompt_overhead_cost_share` for prompt-overhead analysis.
