@@ -346,7 +346,7 @@ In other words: OpenAI/Codex, Google Code Assist, and OpenRouter adaptation on
 ### What infra should pin
 
 - base fork image / release tag:
-  - example: `ghcr.io/zepfu/litellm:1.82.3-aawm.27`
+  - example: `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
 
 ### What infra should float
 

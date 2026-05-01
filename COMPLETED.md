@@ -2,6 +2,30 @@
 
 ## 2026-05-01
 
+- Prepared the `aawm.38` release candidate for a later prod cutover without
+  touching infrastructure. The published candidate was cut from
+  `b022a0271c`; the fork release `v1.82.3-aawm.38` exists and publishes
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.38`; overlay releases and assets are
+  present for `cb-v0.0.15`
+  (`aawm_litellm_callbacks-0.0.15-py3-none-any.whl`), `cp-v0.0.6`
+  (`aawm_litellm_control_plane-0.0.6-py3-none-any.whl`), `h-v0.0.24`
+  (`litellm-local-ci-harness-0.0.24.tar.gz`), and `cfg-v0.0.7`
+  (`litellm-model-config-0.0.7.tar.gz`). The image workflow
+  `Build and publish AAWM fork image` run `25209548874` completed
+  successfully for head `b022a0271c`.
+
+  Remaining prod work is intentionally pending in
+  `/home/zepfu/projects/aawm-infrastructure`: pin
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.38`, rebuild with cache busting, inspect
+  installed package versions, restart `aawm-litellm`, and run focused/default
+  prod harness validation on `:4000`. No prod infrastructure process was
+  touched during this prep.
+
+  Release-prep documentation changed:
+  `TODO.md`, `COMPLETED.md`, `.analysis/todo.md`, `.analysis/completed.md`,
+  `PATCHES.md`, `PROD_RELEASE.md`, `TEST_HARNESS.md`,
+  `scripts/local-ci/README.md`, and `WHEEL.md`.
+
 - Audited and refreshed the harness/release documentation against the current
   repo-local adapter harness behavior. The docs now distinguish the standalone
   `h-v*` baseline harness archive from the repo-local Anthropic adapter harness,

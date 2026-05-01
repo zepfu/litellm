@@ -125,6 +125,17 @@ these docs only as needed:
   OpenAI/Gemini/NVIDIA/OpenRouter and for a later exact input-cost field if the
   proportional `response_cost_usd` estimate is not enough.
 
+- The `aawm.38` release candidate is prepared and published but not promoted
+  into prod. The published candidate was cut from `b022a0271c`; the fork image
+  release `v1.82.3-aawm.38` publishes
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.38`; overlay releases are present for
+  `cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.24`, and `cfg-v0.0.7`. Remaining prod
+  work is infrastructure-only: update the image pin in
+  `/home/zepfu/projects/aawm-infrastructure`, build with cache busting, inspect
+  installed package versions, then restart and run focused/default prod
+  harnesses on `:4000`. Do not touch or restart prod infrastructure until the
+  user explicitly approves that deployment step.
+
 - Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
   `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and
   the `h-v0.0.21` harness. The stale `langfuse_trace_name:
@@ -388,10 +399,11 @@ these docs only as needed:
 - Keep the adapter harness aligned with the real stored session shapes on both `:4001` dev and `:4000` prod targets.
   Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:` via the rewritten request body instead of a brittle exact model reply, `claude_adapter_ctx_marker_escaped` must keep validating `\\:#name.ctx#\\:` literal escaping, dispatched child-agent backtick and bare-acronym lookups should stay aligned with the same `tristore_search_exact` semantics, the CommonMark system-prompt identifier list rewrite should stay aligned with the tenant/agent-scoped raw-content query until the stored procedure lands, the provider-cache canary should keep finding at least one Anthropic `hit` / `write` row in the default suite, Gemini fanout should now deliberately hard-gate child native `run_shell_command` rows rather than relying on plausible final text, and the direct Gemini Read gate is `claude_adapter_gemini31_pro_read_tool_id_sanitizer` rather than the fanout case. The post-tool-result Gemini gate is `claude_adapter_gemini31_pro_bash_then_read_stream_state`; keep it default-excluded but run it explicitly when Claude-dispatched Gemini fails after an initial tool call. Persisted Gemini tool activity uses native `read_file` / `run_shell_command` while Claude Code sees restored `Read` / `Bash`, so validators should match the stored native tool names and require the matching tool-call rows instead of the latest no-tool final row. `--target dev` / `--target prod` should continue enforcing the correct port, Docker container, and Langfuse trace environment. Claude trace-user validation should validate tenant-only Langfuse user ids (`userId=<tenant_id>`) while trace names carry the agent (`claude-code.<agent>`); do not use `project.agent` as the user id. Basic OpenAI smoke cases should validate success, usage, cost, routing, Langfuse, and session-history invariants rather than brittle exact natural-language output. Keep the prod-cutover failure guards active by default: async task exceptions, ASGI exceptions, `KeyError: choices`, stale `Content-Length` / `h11` protocol failures, upstream passthrough 429/5xx traces, and the OpenAI Responses nested-object-schema regression must fail the run instead of surfacing only as downstream session-history gaps; warning-only optional cases must not mask command timeouts or runtime-log hard failures. Before future prod promotions, add a production-style preflight that validates the exact image / installed wheel path on `:4001` plus a small explicit promotion-gate set for opt-in provider lanes, so packaging and adapter metadata gaps are caught before touching `:4000`.
 
-- Keep future harness bundle publishes ahead of `h-v0.0.21` for the current
-  aawm.37 prod-validation line. `h-v0.0.21` is the minimum known-good released
+- Keep the aawm.37 harness note historical and use `h-v0.0.24` for the prepared
+  aawm.38 release candidate. `h-v0.0.21` is the minimum known-good released
   bundle for the rebuilt `cb-v0.0.12` prod image, while the repo-local harness
-  source is now `0.0.22`. The released bundle includes controlled Claude trace
+  source and current released candidate bundle are now `0.0.24`. The aawm.37
+  bundle includes controlled Claude trace
   `userId` validation, explicit per-run Claude settings overlay, longer
   peeromega fanout timeout, the narrow OpenRouter provider-unavailable timeout /
   command-failure classifier, the default-suite exclusion for GPT-OSS edge
