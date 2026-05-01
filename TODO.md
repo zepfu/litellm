@@ -136,6 +136,16 @@ these docs only as needed:
   harnesses on `:4000`. Do not touch or restart prod infrastructure until the
   user explicitly approves that deployment step.
 
+- Post-`aawm.38` model-config work is now present on `develop`: current
+  OpenRouter rerank/embedding catalog entries plus NVIDIA NIM free endpoint
+  rerank/embedding entries were added to the model map, bundled fallback, dev
+  config, and infrastructure config template. The direct NVIDIA config set now
+  includes the older NIM rerank entries already present in the model map, not
+  only the newly added embed/rerank entries. Before a prod promotion includes
+  this work, publish the next model-config artifact, rebuild infrastructure so
+  the template exposes the new model list, and verify `NVIDIA_NIM_API_KEY` is
+  present where direct NVIDIA NIM routes should be callable.
+
 - Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
   `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and
   the `h-v0.0.21` harness. The stale `langfuse_trace_name:

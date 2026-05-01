@@ -2,6 +2,43 @@
 
 ## 2026-05-01
 
+- Added config support for the current OpenRouter rerank/embedding catalog and
+  the NVIDIA NIM free endpoint rerank/embedding models discussed in the
+  release prep. The canonical model map and bundled fallback now include all
+  OpenRouter `output_modalities=rerank` results
+  (`cohere/rerank-4-fast`, `cohere/rerank-4-pro`, `cohere/rerank-v3.5`), all
+  OpenRouter `output_modalities=embeddings` results from the current API
+  response, and direct NVIDIA NIM entries for
+  `nvidia/rerank-qa-mistral-4b`, `nvidia/nv-rerankqa-mistral-4b-v3`,
+  `nvidia/llama-3_2-nv-rerankqa-1b-v2`,
+  `ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2`,
+  `nvidia/nv-embedcode-7b-v1`, `nvidia/nv-embed-v1`, and
+  `nvidia/llama-3_2-nemoretriever-300m-embed-v1`.
+
+  Dev config now exposes those models in `litellm-dev-config.yaml`; the prod
+  infrastructure template at
+  `/home/zepfu/projects/aawm-infrastructure/config/litellm-config.yaml.tmpl`
+  was also updated so a later infrastructure deployment can expose the same
+  routes. Dev NVIDIA entries now use `NVIDIA_NIM_API_KEY`, matching the infra
+  template. This is a config/model-map change only; no running prod process was
+  touched.
+
+  Validation passed:
+  `make check-model-cost-map-sync`,
+  `./.venv/bin/python -m pytest tests/test_litellm/test_cost_calculator.py -k 'openrouter_embedding_catalog_metadata or openrouter_rerank_catalog_metadata or nvidia_free_endpoint_catalog_metadata or openrouter_qwen3_embedding_8b_metadata_and_cost or openrouter_cohere_rerank_4_pro_metadata_and_cost' -q`
+  (`37 passed`),
+  `./.venv/bin/python -m pytest tests/test_litellm/llms/openrouter/rerank/test_openrouter_rerank_transformation.py tests/test_litellm/llms/openrouter/test_openrouter_embedding_transformation.py -q`
+  (`10 passed`),
+  `./.venv/bin/python -m pytest tests/llm_translation/test_nvidia_nim.py -k 'test_embedding_nvidia_nim or test_nvidia_nim_rerank_ranking_endpoint' -q`
+  (`2 passed`),
+  JSON validation for both model map files, YAML validation for both LiteLLM
+  configs, duplicate-free config inventory (`36` dev entries and `79` infra
+  template entries),
+  `ruff check --ignore T201 tests/test_litellm/test_cost_calculator.py`,
+  and `git diff --check` in both repos. A broader NVIDIA test selection that
+  included the inherited live-style rerank base test failed because
+  `NVIDIA_NIM_API_KEY` is not set; the mocked NVIDIA translation tests passed.
+
 - Prepared the `aawm.38` release candidate for a later prod cutover without
   touching infrastructure. The published candidate was cut from
   `b022a0271c`; the fork release `v1.82.3-aawm.38` exists and publishes
