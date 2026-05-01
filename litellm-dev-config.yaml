@@ -2,14 +2,186 @@ model_list:
   - model_name: "claude-sonnet-4-6"
     litellm_params:
       model: "anthropic/claude-sonnet-4-6"
+  - model_name: "openrouter/baai/bge-base-en-v1.5"
+    litellm_params:
+      model: "openrouter/baai/bge-base-en-v1.5"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/baai/bge-large-en-v1.5"
+    litellm_params:
+      model: "openrouter/baai/bge-large-en-v1.5"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/baai/bge-m3"
+    litellm_params:
+      model: "openrouter/baai/bge-m3"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/cohere/rerank-4-fast"
+    litellm_params:
+      model: "openrouter/cohere/rerank-4-fast"
+    model_info:
+      mode: rerank
+  - model_name: "openrouter/cohere/rerank-4-pro"
+    litellm_params:
+      model: "openrouter/cohere/rerank-4-pro"
+    model_info:
+      mode: rerank
+  - model_name: "openrouter/cohere/rerank-v3.5"
+    litellm_params:
+      model: "openrouter/cohere/rerank-v3.5"
+    model_info:
+      mode: rerank
+  - model_name: "openrouter/google/gemini-embedding-001"
+    litellm_params:
+      model: "openrouter/google/gemini-embedding-001"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/google/gemini-embedding-2-preview"
+    litellm_params:
+      model: "openrouter/google/gemini-embedding-2-preview"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/intfloat/e5-base-v2"
+    litellm_params:
+      model: "openrouter/intfloat/e5-base-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/intfloat/e5-large-v2"
+    litellm_params:
+      model: "openrouter/intfloat/e5-large-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/intfloat/multilingual-e5-large"
+    litellm_params:
+      model: "openrouter/intfloat/multilingual-e5-large"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/mistralai/codestral-embed-2505"
+    litellm_params:
+      model: "openrouter/mistralai/codestral-embed-2505"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/mistralai/mistral-embed-2312"
+    litellm_params:
+      model: "openrouter/mistralai/mistral-embed-2312"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    litellm_params:
+      model: "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/openai/text-embedding-3-large"
+    litellm_params:
+      model: "openrouter/openai/text-embedding-3-large"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/openai/text-embedding-3-small"
+    litellm_params:
+      model: "openrouter/openai/text-embedding-3-small"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/openai/text-embedding-ada-002"
+    litellm_params:
+      model: "openrouter/openai/text-embedding-ada-002"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/perplexity/pplx-embed-v1-0.6b"
+    litellm_params:
+      model: "openrouter/perplexity/pplx-embed-v1-0.6b"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/perplexity/pplx-embed-v1-4b"
+    litellm_params:
+      model: "openrouter/perplexity/pplx-embed-v1-4b"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/qwen/qwen3-embedding-4b"
+    litellm_params:
+      model: "openrouter/qwen/qwen3-embedding-4b"
+    model_info:
+      mode: embedding
   - model_name: "openrouter/qwen/qwen3-embedding-8b"
     litellm_params:
       model: "openrouter/qwen/qwen3-embedding-8b"
     model_info:
       mode: embedding
-  - model_name: "openrouter/cohere/rerank-4-pro"
+  - model_name: "openrouter/sentence-transformers/all-minilm-l12-v2"
     litellm_params:
-      model: "openrouter/cohere/rerank-4-pro"
+      model: "openrouter/sentence-transformers/all-minilm-l12-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/all-minilm-l6-v2"
+    litellm_params:
+      model: "openrouter/sentence-transformers/all-minilm-l6-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/all-mpnet-base-v2"
+    litellm_params:
+      model: "openrouter/sentence-transformers/all-mpnet-base-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/multi-qa-mpnet-base-dot-v1"
+    litellm_params:
+      model: "openrouter/sentence-transformers/multi-qa-mpnet-base-dot-v1"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/sentence-transformers/paraphrase-minilm-l6-v2"
+    litellm_params:
+      model: "openrouter/sentence-transformers/paraphrase-minilm-l6-v2"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/thenlper/gte-base"
+    litellm_params:
+      model: "openrouter/thenlper/gte-base"
+    model_info:
+      mode: embedding
+  - model_name: "openrouter/thenlper/gte-large"
+    litellm_params:
+      model: "openrouter/thenlper/gte-large"
+    model_info:
+      mode: embedding
+  - model_name: "nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1"
+    litellm_params:
+      model: "nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: embedding
+  - model_name: "nvidia_nim/nvidia/nv-embed-v1"
+    litellm_params:
+      model: "nvidia_nim/nvidia/nv-embed-v1"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: embedding
+  - model_name: "nvidia_nim/nvidia/nv-embedcode-7b-v1"
+    litellm_params:
+      model: "nvidia_nim/nvidia/nv-embedcode-7b-v1"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: embedding
+  - model_name: "nvidia_nim/nvidia/rerank-qa-mistral-4b"
+    litellm_params:
+      model: "nvidia_nim/nvidia/rerank-qa-mistral-4b"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: rerank
+  - model_name: "nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3"
+    litellm_params:
+      model: "nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: rerank
+  - model_name: "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2"
+    litellm_params:
+      model: "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
+    model_info:
+      mode: rerank
+  - model_name: "nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2"
+    litellm_params:
+      model: "nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2"
+      api_key: "os.environ/NVIDIA_NIM_API_KEY"
     model_info:
       mode: rerank
 

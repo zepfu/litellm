@@ -2057,6 +2057,99 @@ def test_cost_calculator_openrouter_gpt_oss_20b_free_alias():
     assert response_cost == 0
 
 
+@pytest.mark.parametrize(
+    ("model", "max_input_tokens", "input_cost_per_token"),
+    [
+        ("openrouter/baai/bge-base-en-v1.5", 512, 5e-09),
+        ("openrouter/baai/bge-large-en-v1.5", 512, 1e-08),
+        ("openrouter/baai/bge-m3", 8192, 1e-08),
+        ("openrouter/google/gemini-embedding-001", 20000, 1.5e-07),
+        ("openrouter/google/gemini-embedding-2-preview", 8192, 2e-07),
+        ("openrouter/intfloat/e5-base-v2", 512, 5e-09),
+        ("openrouter/intfloat/e5-large-v2", 512, 1e-08),
+        ("openrouter/intfloat/multilingual-e5-large", 512, 1e-08),
+        ("openrouter/mistralai/codestral-embed-2505", 8192, 1.5e-07),
+        ("openrouter/mistralai/mistral-embed-2312", 8192, 1e-07),
+        ("openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free", 131072, 0.0),
+        ("openrouter/openai/text-embedding-3-large", 8192, 1.3e-07),
+        ("openrouter/openai/text-embedding-3-small", 8192, 2e-08),
+        ("openrouter/openai/text-embedding-ada-002", 8192, 1e-07),
+        ("openrouter/perplexity/pplx-embed-v1-0.6b", 32000, 4e-09),
+        ("openrouter/perplexity/pplx-embed-v1-4b", 32000, 3e-08),
+        ("openrouter/qwen/qwen3-embedding-4b", 32768, 2e-08),
+        ("openrouter/qwen/qwen3-embedding-8b", 32000, 1e-08),
+        ("openrouter/sentence-transformers/all-minilm-l12-v2", 512, 5e-09),
+        ("openrouter/sentence-transformers/all-minilm-l6-v2", 512, 5e-09),
+        ("openrouter/sentence-transformers/all-mpnet-base-v2", 512, 5e-09),
+        ("openrouter/sentence-transformers/multi-qa-mpnet-base-dot-v1", 512, 5e-09),
+        ("openrouter/sentence-transformers/paraphrase-minilm-l6-v2", 512, 5e-09),
+        ("openrouter/thenlper/gte-base", 512, 5e-09),
+        ("openrouter/thenlper/gte-large", 512, 1e-08),
+    ],
+)
+def test_cost_calculator_openrouter_embedding_catalog_metadata(
+    model, max_input_tokens, input_cost_per_token
+):
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model_info = litellm.get_model_info(model)
+
+    assert model_info["mode"] == "embedding"
+    assert model_info["litellm_provider"] == "openrouter"
+    assert model_info["max_input_tokens"] == max_input_tokens
+    assert model_info["input_cost_per_token"] == input_cost_per_token
+    assert model_info["output_cost_per_token"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("model", "max_input_tokens"),
+    [
+        ("openrouter/cohere/rerank-4-fast", 32768),
+        ("openrouter/cohere/rerank-4-pro", 32768),
+        ("openrouter/cohere/rerank-v3.5", 4096),
+    ],
+)
+def test_cost_calculator_openrouter_rerank_catalog_metadata(model, max_input_tokens):
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model_info = litellm.get_model_info(model)
+
+    assert model_info["mode"] == "rerank"
+    assert model_info["litellm_provider"] == "openrouter"
+    assert model_info["max_input_tokens"] == max_input_tokens
+    assert model_info["input_cost_per_query"] == 0.0
+    assert model_info["input_cost_per_token"] == 0.0
+    assert model_info["output_cost_per_token"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("model", "mode"),
+    [
+        ("nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1", "embedding"),
+        ("nvidia_nim/nvidia/nv-embed-v1", "embedding"),
+        ("nvidia_nim/nvidia/nv-embedcode-7b-v1", "embedding"),
+        ("nvidia_nim/nvidia/rerank-qa-mistral-4b", "rerank"),
+        ("nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3", "rerank"),
+        ("nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2", "rerank"),
+        ("nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2", "rerank"),
+    ],
+)
+def test_cost_calculator_nvidia_free_endpoint_catalog_metadata(model, mode):
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model_info = litellm.get_model_info(model)
+
+    assert model_info["mode"] == mode
+    assert model_info["litellm_provider"] == "nvidia_nim"
+    assert model_info["input_cost_per_token"] == 0.0
+    assert model_info["output_cost_per_token"] == 0.0
+    if mode == "rerank":
+        assert model_info["input_cost_per_query"] == 0.0
+
+
 def test_cost_calculator_openrouter_qwen3_embedding_8b_metadata_and_cost():
     os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     litellm.model_cost = litellm.get_model_cost_map(url="")
@@ -2099,7 +2192,7 @@ def test_cost_calculator_openrouter_cohere_rerank_4_pro_metadata_and_cost():
     assert model_info["litellm_provider"] == "openrouter"
     assert model_info["max_input_tokens"] == 32768
     assert model_info["max_tokens"] == 32768
-    assert model_info["input_cost_per_query"] == 0.0025
+    assert model_info["input_cost_per_query"] == 0.0
     assert model_info["input_cost_per_token"] == 0.0
     assert model_info["output_cost_per_token"] == 0.0
 
@@ -2116,4 +2209,4 @@ def test_cost_calculator_openrouter_cohere_rerank_4_pro_metadata_and_cost():
         call_type="rerank",
     )
 
-    assert response_cost == pytest.approx(2 * 0.0025, rel=1e-12)
+    assert response_cost == 0.0
