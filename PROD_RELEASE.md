@@ -248,7 +248,10 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
 Do not use `:latest` as the prod base image pin. Production infrastructure
 should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
-or the current promoted line, `ghcr.io/zepfu/litellm:1.82.3-aawm.37`.
+or the current promoted prod line. As of 2026-05-01, the last promoted prod
+line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the prepared but not yet
+promoted candidate is `ghcr.io/zepfu/litellm:1.82.3-aawm.38` with
+`cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.24`, and `cfg-v0.0.7`.
 
 ## Prod Validation
 
