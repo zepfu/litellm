@@ -251,10 +251,10 @@ should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n
 or the current promoted prod line. As of 2026-05-01, the last promoted prod
 line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the prepared but not yet
 promoted base candidate is `ghcr.io/zepfu/litellm:1.82.3-aawm.38` with
-`cb-v0.0.15`, `cp-v0.0.6`, and `h-v0.0.24`. The OpenRouter/NVIDIA
-rerank+embedding catalog work landed after that base image was cut and must be
-promoted through `cfg-v0.0.8` or newer plus an infrastructure rebuild with the
-updated config template.
+`cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.8`. The
+OpenRouter/NVIDIA rerank+embedding catalog work landed after that base image
+was cut and is promoted through the `cfg-v0.0.8` overlay plus an infrastructure
+rebuild with the updated config template.
 
 ## Prod Validation
 
