@@ -103,7 +103,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - `scripts/local-ci/run_anthropic_adapter_acceptance.py`
   - `scripts/local-ci/anthropic_adapter_config.json`
 - Current real-Claude adapted baseline on `:4001`:
-  - OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`
+  - OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`
   - Codex/OpenAI tool-activity hard gate: `claude_adapter_codex_tool_activity`
     - validates the reconstructed `response.output_item.*` /
       `response.function_call_arguments.*` stream path
@@ -140,38 +140,45 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
     - use the exact `nvidia/minimaxai/minimax-m2.7` spelling for MiniMax probes; the Anthropic adapter intentionally uses upstream non-stream plus fake streaming for this model because its native stream latency is much higher than the other NVIDIA targets
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
-  - OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `openai/gpt-oss-120b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+  - OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
     - warning-only semantics include subprocess timeouts; those should surface
       as harness warnings / `soft_failures`, not hard suite failures
+    - `openai/gpt-oss-120b:free` is excluded from the default suite but is not
+      `warning_only`; it has only the documented provider-unavailable soft-fail
+      signature
     - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` are
       no longer part of the default full suite; run them only by explicit
       `--cases` selection when you want Gemma-specific coverage
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
 - Current upstream-rate-limited / unstable OpenRouter candidates:
   - `openrouter/free` (moving router)
-
-### Model cost map process
-- `model_prices_and_context_window.json` is the only canonical editable model/cost map.
-- `litellm/bundled_model_prices_and_context_window_fallback.json` is the packaged fallback mirror used for `LITELLM_LOCAL_MODEL_COST_MAP=True`.
-- After changing the canonical file, run `make sync-model-cost-map` and avoid hand-editing the packaged fallback directly.
-  - `openrouter/free`
   - `google/gemma-4-31b-it:free`
   - `google/gemma-4-26b-a4b-it:free`
   - `nvidia/nemotron-3-super-120b-a12b:free`
   - `minimax/minimax-m2.5:free`
   - `qwen/qwen3-coder:free`
+
+### Model cost map process
+- `model_prices_and_context_window.json` is the only canonical editable model/cost map.
+- `litellm/bundled_model_prices_and_context_window_fallback.json` is the packaged fallback mirror used for `LITELLM_LOCAL_MODEL_COST_MAP=True`.
+- After changing the canonical file, run `make sync-model-cost-map` and avoid hand-editing the packaged fallback directly.
 - For adapted models, treat LiteLLM / `session_history` / Langfuse as the cost source of truth, not Claude CLI display cost.
 - The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. If standalone Gemini CLI use is healthy but `claude_adapter_gemini_fanout` fails, treat that first as a local pacing/serialization bug rather than authoritative provider-capacity proof.
 - For Google Code Assist adapter work, treat successful real-Claude runs on `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` as proof of routing correctness. Do not treat `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED` on their own as authoritative upstream truth; only close those as provider issues after interactive Gemini CLI `/model` corroboration on the same account context.
 - `inclusionai/ling-2.6-flash:free` / `ling-2-6-flash` is retired from active harness targets and adapter aliasing after OpenRouter started returning `404` for the old free alias. Keep the old artifacts as history only; choose a currently available OpenRouter model before adding a replacement parallel proof.
 - `session_history` now also tracks normalized provider-cache state for Anthropic, OpenAI, Gemini, and OpenRouter rows. Use `provider_cache_status` / `provider_cache_miss_reason` when checking whether cache hints were attempted, hit, or missed on adapted calls. When the missed cache token count is explicit, `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` capture the extra write-vs-read cost of that miss.
+- `session_history` also tracks estimated prompt-overhead token buckets for
+  system/provider-equivalent prompt, tool advertisement, conversation,
+  residual/other, and deterministic system classifications. Harness artifacts
+  expose those fields through `summary.prompt_overhead_cost_share`; cost-share
+  dollars are proportional estimates until exact input-cost fields are stored.
 - `session_history` also tracks the LiteLLM runtime and initiating client identity. Expect `litellm_environment`, `litellm_version`, `litellm_fork_version`, `litellm_wheel_versions`, `client_name`, `client_version`, and `client_user_agent` on new rows; the adapter harness should fail dev/prod rows that do not carry the expected environment or that omit runtime/client version fields.
 - Dev OpenRouter pacing on `:4001` now uses:
   - short hidden retry budget: `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - longer per-model post-failure cooldown: `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
 - Adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may still appear as adapter warning/backoff lines in `litellm-dev`, but they should not emit the generic `pass_through_endpoint(): Exception occured - ...` traceback for the current request path.
 - Preferred Anthropic-adapter model spellings:
-  - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
+  - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
   - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
   - direct NVIDIA targets: `nvidia/deepseek-ai/deepseek-v3.2`, `nvidia/deepseek-ai/deepseek-v3.1-terminus`, `nvidia/mistralai/devstral-2-123b-instruct-2512`, `nvidia/z-ai/glm4.7`, `nvidia/minimaxai/minimax-m2.7`
   - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
@@ -192,6 +199,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - `session_history` persistence now uses a background batch writer instead of inline per-call writes. Tune with:
   - `AAWM_SESSION_HISTORY_BATCH_SIZE` (default `32`)
   - `AAWM_SESSION_HISTORY_FLUSH_INTERVAL_MS` (default `250`)
+  - `AAWM_SESSION_HISTORY_POOL_MAX_SIZE` (default `2`)
 - Claude dynamic directive expansion now uses a short TTL cache to avoid repeated DB hits on the same `(session, agent, tenant)` context. Tune with:
   - `AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS` (default `15`)
 - Current low-overhead instrumentation surfaces for these optimizations:

@@ -277,6 +277,30 @@ router_settings:
 | enable_oauth2_proxy_auth | boolean | (Enterprise Feature) If true, enables oauth2.0 authentication |
 | forward_openai_org_id | boolean | If true, forwards the OpenAI Organization ID to the backend LLM call (if it's OpenAI). |
 | forward_client_headers_to_llm_api | boolean | If true, forwards the client headers (any `x-` headers and `anthropic-beta` headers) to the backend LLM call |
+| forward_llm_provider_auth_headers | boolean | If true, forwards provider auth headers on pass-through routes when supported. |
+| always_include_stream_usage | boolean | If true, includes usage information in streamed responses when the provider path supports it. |
+| auto_redirect_ui_login_to_sso | boolean | If true, redirects UI login to SSO when SSO is configured. |
+| custom_auth_run_common_checks | boolean | If true, runs common auth checks in addition to custom auth. |
+| custom_ui_sso_sign_in_handler | string | Path to a custom UI SSO sign-in handler. |
+| database_connection_pool_timeout | integer | Timeout in seconds for waiting on a database connection from the pool. |
+| disable_error_logs | boolean | If true, suppresses proxy error logs. |
+| enable_mcp_registry | boolean | If true, enables MCP registry functionality. |
+| enforce_rbac | boolean | If true, enforces role-based access control. |
+| health_check_concurrency | integer | Maximum number of concurrent health checks. |
+| maximum_spend_logs_cleanup_cron | string | Cron expression for spend-log cleanup scheduling. |
+| mcp_client_side_auth_header_name | string | Header name used for client-side MCP auth forwarding. |
+| mcp_internal_ip_ranges | List[str] | Internal IP ranges used by MCP access checks. |
+| mcp_required_fields | List[str] | Required fields for MCP server definitions. |
+| mcp_trusted_proxy_ranges | List[str] | Trusted proxy IP ranges for MCP request forwarding. |
+| require_end_user_mcp_access_defined | boolean | If true, requires explicit end-user MCP access configuration. |
+| role_permissions | Dict[str, Any] | Role-to-permission mapping for RBAC. |
+| search_tools | List[Dict[str, Any]] | Search tool configuration exposed through the proxy. |
+| token_rate_limit_type | string | Token rate-limit mode. |
+| use_redis_transaction_buffer | boolean | If true, buffers transaction state in Redis. |
+| use_shared_health_check | boolean | If true, shares health-check state across proxy workers. |
+| user_header_mappings | Dict[str, str] | Mapping of inbound user headers to internal user fields. |
+| user_header_name | string | Header name to use for end-user identity extraction. |
+| alert_type_config | Dict[str, Any] | Per-alert-type configuration. |
 | maximum_spend_logs_retention_period               | str                   | Used to set the max retention time for spend logs in the db, after which they will be auto-purged                                                                                                                                                                                                                             |
 | maximum_spend_logs_retention_interval             | str                   | Used to set the interval in which the spend log cleanup task should run in.                                                                                                                                                                                                                                                   |
 
@@ -401,6 +425,43 @@ router_settings:
 | AUTH_STRATEGY | Strategy used for authentication (e.g., OAuth, API key)
 | AUTO_REDIRECT_UI_LOGIN_TO_SSO | Flag to enable automatic redirect of UI login page to SSO when SSO is configured. Default is **false**
 | AUDIO_SPEECH_CHUNK_SIZE | Chunk size for audio speech processing. Default is 1024
+| AAWM_GEMINI_ROUTE_DEBUG | Enables AAWM Gemini route debug logging.
+| AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP | Character cap for auxiliary context in the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL | Default thinking level sent by the AAWM Google adapter when applicable.
+| AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG | If true, disables the AAWM Google adapter default thinking configuration.
+| AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP | Character cap for fallback context in the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_FOLLOWUP_ALLOWED_TOOL_NAMES | Comma-separated allowlist of tool names retained for follow-up AAWM Google adapter turns.
+| AAWM_GOOGLE_ADAPTER_FOLLOWUP_AUXILIARY_CONTEXT_CHAR_CAP | Character cap for follow-up auxiliary context in the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_FOLLOWUP_PERSISTED_OUTPUT_CHAR_CAP | Character cap for persisted output in follow-up AAWM Google adapter turns.
+| AAWM_GOOGLE_ADAPTER_FOLLOWUP_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP | Text-part character cap for follow-up subagent context in the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS | Hidden retry budget in seconds for AAWM Google adapter transient recovery.
+| AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW | Maximum completion-message window retained by the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_MAX_CONCURRENT | Maximum concurrent AAWM Google adapter upstream requests.
+| AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_TEXT_CHARS | Maximum total text characters retained in AAWM Google adapter contents.
+| AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW | Maximum contents window retained by the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP | Maximum output-token cap applied by the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM Google adapter requests.
+| AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS | Comma-separated backoff schedule for AAWM Google adapter model-capacity retries.
+| AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES | Maximum model-capacity retry attempts for the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_NATIVE_USER_AGENT | User-Agent value used for native Google Code Assist adapter requests.
+| AAWM_GOOGLE_ADAPTER_NATIVE_X_GOOG_API_CLIENT | `x-goog-api-client` value used for native Google Code Assist adapter requests.
+| AAWM_GOOGLE_ADAPTER_OVERSIZED_TEXT_PART_CHAR_CAP | Character cap for oversized text parts in the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_PERSISTED_OUTPUT_CHAR_CAP | Character cap for persisted output retained by the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_POST_TOOL_COOLDOWN_SECONDS | Cooldown in seconds after Google adapter tool-call turns.
+| AAWM_GOOGLE_ADAPTER_PRESERVED_TASK_STATE_CHAR_CAP | Character cap for preserved task state in the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_PURE_CONTEXT_TEXT_PART_CHAR_CAP | Text-part character cap for pure context entries in the AAWM Google adapter.
+| AAWM_GOOGLE_ADAPTER_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP | Text-part character cap for subagent context in the AAWM Google adapter.
+| AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS | TTL in seconds for AAWM Google Code Assist prime/preflight caching.
+| AAWM_NVIDIA_ADAPTER_FORCE_FAKE_STREAM_MODELS | Comma-separated NVIDIA model list that should use fake streaming in the AAWM adapter.
+| AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES | Inner retry count for AAWM NVIDIA adapter upstream calls.
+| AAWM_NVIDIA_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM NVIDIA adapter requests.
+| AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS | Request timeout in seconds for AAWM NVIDIA adapter upstream calls.
+| AAWM_NVIDIA_API_BASE | Base URL for AAWM NVIDIA adapter requests.
+| AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP | Character cap for Claude context transformed by the AAWM OpenAI adapter.
+| AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS | Comma-separated retry backoff schedule for AAWM OpenRouter adapter requests.
+| AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS | Hidden retry budget in seconds for AAWM OpenRouter adapter transient recovery.
+| AAWM_OPENROUTER_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM OpenRouter adapter requests.
+| AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS | Cooldown in seconds after AAWM OpenRouter adapter failures.
 | ANTHROPIC_API_KEY | API key for Anthropic service
 | ANTHROPIC_API_BASE | Base URL for Anthropic API. Default is https://api.anthropic.com
 | ANTHROPIC_TOKEN_COUNTING_BETA_VERSION | Beta version header for Anthropic token counting API. Default is `token-counting-2024-11-01`
@@ -461,6 +522,7 @@ router_settings:
 | BRAINTRUST_MOCK | Enable mock mode for Braintrust integration testing. When set to true, intercepts Braintrust API calls and returns mock responses without making actual network calls. Default is false
 | BRAINTRUST_MOCK_LATENCY_MS | Mock latency in milliseconds for Braintrust API calls when mock mode is enabled. Simulates network round-trip time. Default is 100ms
 | CACHED_STREAMING_CHUNK_DELAY | Delay in seconds for cached streaming chunks. Default is 0.02
+| CODE_ASSIST_ENDPOINT | Base URL for Google Code Assist API requests.
 | CHATGPT_API_BASE | Base URL for ChatGPT API. Default is https://chatgpt.com/backend-api/codex
 | CHATGPT_AUTH_FILE | Filename for ChatGPT authentication data. Default is "auth.json"
 | CHATGPT_DEFAULT_INSTRUCTIONS | Default system instructions for ChatGPT provider
@@ -789,6 +851,8 @@ router_settings:
 | LITELLM_KEY_ROTATION_CHECK_INTERVAL_SECONDS | Interval in seconds for how often to run job that auto-rotates keys. Default is 86400 (24 hours).
 | LITELLM_KEY_ROTATION_GRACE_PERIOD | Duration to keep old key valid after rotation (e.g. "24h", "2d"). Default is empty (immediate revoke). Used for scheduled rotations and as fallback when not specified in regenerate request.
 | LITELLM_LICENSE | License key for LiteLLM usage
+| LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT | Directory used for Claude persisted-output files.
+| LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT | If true, expands Claude persisted-output references when preparing requests.
 | LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS | Set to `True` to use the local bundled Anthropic beta headers config only, disabling remote fetching. Default is `False`
 | LITELLM_LOCAL_BLOG_POSTS | When set to `True`, uses the local bundled blog posts only, disabling remote fetching from GitHub. Default is `False`
 | LITELLM_LOCAL_MODEL_COST_MAP | Local configuration for model cost mapping in LiteLLM
@@ -876,6 +940,7 @@ router_settings:
 | NO_REDOC | Flag to disable Redoc documentation
 | NO_PROXY | List of addresses to bypass proxy
 | NON_LLM_CONNECTION_TIMEOUT | Timeout in seconds for non-LLM service connections. Default is 15
+| NVIDIA_NIM_API_BASE | Base URL for NVIDIA NIM API requests.
 | OAUTH_TOKEN_INFO_ENDPOINT | Endpoint for OAuth token info retrieval
 | OPENAI_BASE_URL | Base URL for OpenAI API
 | OPENAI_API_BASE | Base URL for OpenAI API. Default is https://api.openai.com/
@@ -889,6 +954,7 @@ router_settings:
 | OPENMETER_API_ENDPOINT | API endpoint for OpenMeter integration
 | OPENMETER_API_KEY | API key for OpenMeter services
 | OPENMETER_EVENT_TYPE | Type of events sent to OpenMeter
+| OPENROUTER_API_BASE | Base URL for OpenRouter API requests.
 | ONYX_API_BASE | Base URL for Onyx Security AI Guard service (defaults to https://ai-guard.onyx.security)
 | ONYX_API_KEY | API key for Onyx Security AI Guard service
 | ONYX_TIMEOUT | Timeout in seconds for Onyx Guard server requests. Default is 10

@@ -1,18 +1,16 @@
 import os
 import sys
-import traceback
 
 from dotenv import load_dotenv
 
 load_dotenv()
-import io
 import re
+from pathlib import Path
 
-# Backup the original sys.path
-original_sys_path = sys.path.copy()
+repo_base = Path(__file__).resolve().parents[2]
 
 sys.path.insert(
-    0, os.path.abspath("../..")
+    0, str(repo_base)
 )  # Adds the parent directory to the system path
 import litellm
 
@@ -32,10 +30,7 @@ error_names = {
 
 
 # Parse the documentation to extract documented keys
-# repo_base = "./"
-repo_base = "../../"
-print(os.listdir(repo_base))
-docs_path = f"{repo_base}/docs/my-website/docs/exception_mapping.md"  # Path to the documentation
+docs_path = repo_base / "docs/my-website/docs/exception_mapping.md"
 documented_keys = set()
 try:
     with open(docs_path, "r", encoding="utf-8") as docs_file:
@@ -45,30 +40,22 @@ try:
             r"## LiteLLM Exceptions(.*?)\n##", content, re.DOTALL
         )
         if exceptions_section:
-            # Step 2: Extract the table content
             table_content = exceptions_section.group(1)
 
-            # Step 3: Create a pattern to capture the Error Types from each row
-            error_type_pattern = re.compile(r"\|\s*[^|]+\s*\|\s*([^\|]+?)\s*\|")
-
-            # Extract the error types
-            exceptions = error_type_pattern.findall(table_content)
-            print(f"exceptions: {exceptions}")
-
-            # Remove extra spaces if any
-            exceptions = [exception.strip() for exception in exceptions]
-
-            print(exceptions)
+            exceptions = []
+            for line in table_content.splitlines():
+                if not line.startswith("|") or "---" in line:
+                    continue
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                if len(cells) < 2 or cells[1] == "Error Type":
+                    continue
+                exceptions.append(cells[1].rsplit(".", 1)[-1])
             documented_keys.update(exceptions)
 
 except Exception as e:
     raise Exception(
         f"Error reading documentation: {e}, \n repo base - {os.listdir(repo_base)}"
     )
-
-print(documented_keys)
-print(public_exceptions)
-print(error_names)
 
 # Compare and find undocumented keys
 undocumented_keys = error_names - documented_keys
@@ -77,5 +64,3 @@ if undocumented_keys:
     raise Exception(
         f"\nKeys not documented in 'LiteLLM Exceptions': {undocumented_keys}"
     )
-else:
-    print("\nAll keys are documented in 'LiteLLM Exceptions'. - {}".format(error_names))
