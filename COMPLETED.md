@@ -39,6 +39,12 @@
   included the inherited live-style rerank base test failed because
   `NVIDIA_NIM_API_KEY` is not set; the mocked NVIDIA translation tests passed.
 
+- Re-prepped the prod release state after the model-config additions. The
+  intended prod release shape is the already-published
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.38` base image plus the next model-config
+  overlay (`cfg-v0.0.8` or newer) and the updated infrastructure config
+  template. No running prod process was touched.
+
 - Prepared the `aawm.38` release candidate for a later prod cutover without
   touching infrastructure. The published candidate was cut from
   `b022a0271c`; the fork release `v1.82.3-aawm.38` exists and publishes
