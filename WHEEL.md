@@ -153,6 +153,9 @@ Current responsibilities:
 - fast drift checks when model metadata changes without a full base release
 - current adapter-cost policy support, including paid-equivalent pricing for
   selected OpenRouter `:free` aliases when OpenRouter publishes a non-free twin
+- current OpenRouter rerank/embedding catalog metadata and direct NVIDIA NIM
+  free endpoint embedding/rerank metadata once `cfg-v0.0.8` or newer is
+  published
 
 Source-of-truth rule:
 

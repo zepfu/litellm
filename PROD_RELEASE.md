@@ -217,7 +217,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    ```bash
    docker run --rm --entrypoint python3 aawm-litellm:latest -c \
-     "import json,pathlib; p=pathlib.Path('/usr/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json'); d=json.loads(p.read_text()); print(d.get('openrouter/qwen/qwen3-embedding-8b')); print(d.get('openrouter/cohere/rerank-4-pro'))"
+     "import json,pathlib; p=pathlib.Path('/usr/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json'); d=json.loads(p.read_text()); keys=['openrouter/qwen/qwen3-embedding-8b','openrouter/cohere/rerank-4-pro','openrouter/google/gemini-embedding-2-preview','nvidia_nim/nvidia/rerank-qa-mistral-4b','nvidia_nim/nvidia/nv-embed-v1']; print({k:d.get(k) for k in keys})"
    ```
 
 3. Start the prod container.
@@ -237,7 +237,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    ```bash
    docker exec aawm-litellm sh -lc \
-     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro' /etc/litellm/config.yaml"
+     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1' /etc/litellm/config.yaml"
    ```
 
 6. Inspect startup logs.
@@ -250,8 +250,11 @@ Do not use `:latest` as the prod base image pin. Production infrastructure
 should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
 or the current promoted prod line. As of 2026-05-01, the last promoted prod
 line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the prepared but not yet
-promoted candidate is `ghcr.io/zepfu/litellm:1.82.3-aawm.38` with
-`cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.24`, and `cfg-v0.0.7`.
+promoted base candidate is `ghcr.io/zepfu/litellm:1.82.3-aawm.38` with
+`cb-v0.0.15`, `cp-v0.0.6`, and `h-v0.0.24`. The OpenRouter/NVIDIA
+rerank+embedding catalog work landed after that base image was cut and must be
+promoted through `cfg-v0.0.8` or newer plus an infrastructure rebuild with the
+updated config template.
 
 ## Prod Validation
 
