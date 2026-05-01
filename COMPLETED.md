@@ -41,9 +41,17 @@
 
 - Re-prepped the prod release state after the model-config additions. The
   intended prod release shape is the already-published
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.38` base image plus the next model-config
-  overlay (`cfg-v0.0.8` or newer) and the updated infrastructure config
-  template. No running prod process was touched.
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.38` base image plus the published
+  `cfg-v0.0.8` model-config overlay and the updated infrastructure config
+  template. `cfg-v0.0.8` publishes
+  `litellm-model-config-0.0.8.tar.gz` with release asset digest
+  `sha256:a6d2ab4d3cfb089612a510c6d3c21429c4222dacc9ccdf08620c7cc8312d9768`;
+  the bundle manifest reports source SHA-256
+  `19c727f5ab997701bf7db129e4628a1355d4f5e24530ae6b52a8f3a1e75ca4ea` and
+  `2651` model entries. The release-prep merge also bumped/published
+  `h-v0.0.25` with `litellm-local-ci-harness-0.0.25.tar.gz` asset digest
+  `sha256:51a82b855d4df3b9924ef70f16ce46dd6dd72a0bd8f2cc27286d576df0fbf836`.
+  No running prod process was touched.
 
 - Prepared the `aawm.38` release candidate for a later prod cutover without
   touching infrastructure. The published candidate was cut from

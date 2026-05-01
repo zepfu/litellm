@@ -129,24 +129,25 @@ these docs only as needed:
   into prod. The published base image was cut from `b022a0271c`; the fork image
   release `v1.82.3-aawm.38` publishes
   `ghcr.io/zepfu/litellm:1.82.3-aawm.38`; overlay releases are present for
-  `cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.24`, and `cfg-v0.0.7`. The later
+  `cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.8`. The later
   OpenRouter/NVIDIA rerank+embedding catalog work is post-image model-config
-  work, so prod promotion should use `cfg-v0.0.8` or newer once published.
-  Remaining prod work is infrastructure-only: update the image pin in
-  `/home/zepfu/projects/aawm-infrastructure`, build with cache busting, inspect
-  installed package versions and model-config contents, then restart and run
-  focused/default prod harnesses on `:4000`. Do not touch or restart prod
-  infrastructure until the user explicitly approves that deployment step.
+  work and is carried by `cfg-v0.0.8`. Remaining prod work is
+  infrastructure-only: build with cache busting from the updated
+  `/home/zepfu/projects/aawm-infrastructure` state, inspect installed package
+  versions and model-config contents, then restart and run focused/default prod
+  harnesses on `:4000`. Do not touch or restart prod infrastructure until the
+  user explicitly approves that deployment step.
 
 - Post-`aawm.38` model-config work is now present on `develop`: current
   OpenRouter rerank/embedding catalog entries plus NVIDIA NIM free endpoint
   rerank/embedding entries were added to the model map, bundled fallback, dev
   config, and infrastructure config template. The direct NVIDIA config set now
   includes the older NIM rerank entries already present in the model map, not
-  only the newly added embed/rerank entries. Before a prod promotion includes
-  this work, publish/verify `cfg-v0.0.8`, rebuild infrastructure so the
-  template exposes the new model list, and verify `NVIDIA_NIM_API_KEY` is
-  present where direct NVIDIA NIM routes should be callable.
+  only the newly added embed/rerank entries. `cfg-v0.0.8` is published and the
+  infrastructure template is updated; before prod cutover, rebuild
+  infrastructure so the template exposes the new model list, inspect the built
+  image's model-config overlay, and verify `NVIDIA_NIM_API_KEY` is present
+  where direct NVIDIA NIM routes should be callable.
 
 - Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
   `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and
