@@ -91,6 +91,32 @@ def test_embedding_nvidia_nim():
         assert request_body["model"] == "nvidia/nv-embedqa-e5-v5"
         assert request_body["extra_body"]["input_type"] == "passage"
         assert request_body["dimensions"] == 1024
+        assert "encoding_format" not in request_body
+
+
+def test_embedding_nvidia_nim_drops_health_check_max_tokens_from_extra_body():
+    litellm.set_verbose = True
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key="fake-api-key",
+    )
+    with patch.object(client.embeddings.with_raw_response, "create") as mock_client:
+        try:
+            litellm.embedding(
+                model="nvidia_nim/nvidia/nv-embed-v1",
+                input=["What is the meaning of life?"],
+                input_type="query",
+                max_tokens=1,
+                client=client,
+            )
+        except Exception as e:
+            print(e)
+        mock_client.assert_called_once()
+        request_body = mock_client.call_args.kwargs
+        assert "encoding_format" not in request_body
+        assert request_body["extra_body"]["input_type"] == "query"
+        assert "max_tokens" not in request_body["extra_body"]
 
 
 def test_chat_completion_nvidia_nim_with_tools():
@@ -245,6 +271,78 @@ async def test_nvidia_nim_rerank_ranking_endpoint():
 
         # Model name in body should NOT have "ranking/" prefix
         assert request_data["model"] == "nvidia/llama-3.2-nv-rerankqa-1b-v2"
+
+
+@pytest.mark.asyncio()
+async def test_nvidia_nim_rerank_uses_hosted_base_when_embedding_base_env_set(
+    monkeypatch,
+):
+    mock_response = AsyncMock()
+    mock_response.json = lambda: {"rankings": [{"index": 0, "logit": 0.95}]}
+    mock_response.headers = {"key": "value"}
+    mock_response.status_code = 200
+    monkeypatch.setenv("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1")
+    monkeypatch.delenv("NVIDIA_NIM_RERANK_API_BASE", raising=False)
+
+    with patch(
+        "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+        return_value=mock_response,
+    ) as mock_post:
+        await litellm.arerank(
+            model="nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2",
+            query="What is the GPU memory bandwidth?",
+            documents=["H100 delivers 3TB/s memory bandwidth"],
+            api_key="fake-api-key",
+        )
+
+        assert (
+            mock_post.call_args.kwargs["url"]
+            == "https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-3_2-nv-rerankqa-1b-v2/reranking"
+        )
+
+
+@pytest.mark.asyncio()
+async def test_nvidia_nim_rerank_mistral_models_use_shared_hosted_endpoint():
+    mock_response = AsyncMock()
+    mock_response.json = lambda: {"rankings": [{"index": 0, "logit": 0.95}]}
+    mock_response.headers = {"key": "value"}
+    mock_response.status_code = 200
+
+    with patch(
+        "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+        return_value=mock_response,
+    ) as mock_post:
+        await litellm.arerank(
+            model="nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3",
+            query="What is the GPU memory bandwidth?",
+            documents=["H100 delivers 3TB/s memory bandwidth"],
+            api_key="fake-api-key",
+        )
+
+        assert (
+            mock_post.call_args.kwargs["url"]
+            == "https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking"
+        )
+        request_data = json.loads(mock_post.call_args.kwargs["data"])
+        assert request_data["model"] == "nvidia/nv-rerankqa-mistral-4b-v3"
+
+    with patch(
+        "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+        return_value=mock_response,
+    ) as mock_post:
+        await litellm.arerank(
+            model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
+            query="What is the GPU memory bandwidth?",
+            documents=["H100 delivers 3TB/s memory bandwidth"],
+            api_key="fake-api-key",
+        )
+
+        assert (
+            mock_post.call_args.kwargs["url"]
+            == "https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking"
+        )
+        request_data = json.loads(mock_post.call_args.kwargs["data"])
+        assert request_data["model"] == "nv-rerank-qa-mistral-4b:1"
 
 
 class TestNvidiaNim(BaseLLMRerankTest):

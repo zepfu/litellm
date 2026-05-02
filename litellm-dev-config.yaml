@@ -144,7 +144,7 @@ model_list:
       mode: embedding
   - model_name: "nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1"
     litellm_params:
-      model: "nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1"
+      model: "nvidia_nim/nvidia/llama-3.2-nemoretriever-300m-embed-v1"
       api_key: "os.environ/NVIDIA_NIM_API_KEY"
     model_info:
       mode: embedding
@@ -166,25 +166,12 @@ model_list:
       api_key: "os.environ/NVIDIA_NIM_API_KEY"
     model_info:
       mode: rerank
-  - model_name: "nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3"
-    litellm_params:
-      model: "nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3"
-      api_key: "os.environ/NVIDIA_NIM_API_KEY"
-    model_info:
-      mode: rerank
   - model_name: "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2"
     litellm_params:
       model: "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2"
       api_key: "os.environ/NVIDIA_NIM_API_KEY"
     model_info:
       mode: rerank
-  - model_name: "nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2"
-    litellm_params:
-      model: "nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2"
-      api_key: "os.environ/NVIDIA_NIM_API_KEY"
-    model_info:
-      mode: rerank
-
 litellm_settings:
   drop_params: true
   success_callback: ["litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance", "langfuse", "litellm.integrations.aawm_payload_capture.aawm_payload_capture_instance"]

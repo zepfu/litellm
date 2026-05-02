@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     container_name: litellm-dev
+    restart: always
     command: ["litellm", "--config", "/app/litellm-dev-config.yaml", "--port", "4001"]
     ports:
       - "4001:4001"
@@ -23,6 +24,8 @@ services:
       - ./litellm/types/llms/anthropic_messages/anthropic_response.py:/app/litellm/types/llms/anthropic_messages/anthropic_response.py
       - ./litellm/types/llms/openai.py:/app/litellm/types/llms/openai.py
       - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
+      - ./litellm/llms/nvidia_nim/embed.py:/app/litellm/llms/nvidia_nim/embed.py
+      - ./litellm/llms/nvidia_nim/rerank/transformation.py:/app/litellm/llms/nvidia_nim/rerank/transformation.py
       - ./litellm/llms/openrouter/embedding/transformation.py:/app/litellm/llms/openrouter/embedding/transformation.py
       - ./litellm/llms/openrouter/rerank/transformation.py:/app/litellm/llms/openrouter/rerank/transformation.py
       - ./litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py:/app/litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py
@@ -32,7 +35,9 @@ services:
       - ./litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py
       - ./litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py:/app/litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py
       - ./litellm/_logging.py:/app/litellm/_logging.py
+      - ./litellm/litellm_core_utils/health_check_helpers.py:/app/litellm/litellm_core_utils/health_check_helpers.py
       - ./litellm/passthrough/utils.py:/app/litellm/passthrough/utils.py
+      - ./litellm/rerank_api/main.py:/app/litellm/rerank_api/main.py
       - ./litellm/proxy/pass_through_endpoints/pass_through_endpoints.py:/app/litellm/proxy/pass_through_endpoints/pass_through_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/streaming_handler.py:/app/litellm/proxy/pass_through_endpoints/streaming_handler.py
       - ./litellm/proxy/pass_through_endpoints/success_handler.py:/app/litellm/proxy/pass_through_endpoints/success_handler.py
@@ -101,9 +106,10 @@ services:
       - LITELLM_GEMINI_OAUTH_CLIENT_SECRET=${LITELLM_GEMINI_OAUTH_CLIENT_SECRET:-}
       - LITELLM_GEMINI_CLI_BUNDLE_PATH=${LITELLM_GEMINI_CLI_BUNDLE_PATH:-}
       - AAWM_NVIDIA_API_KEY=${AAWM_NVIDIA_API_KEY:-}
-      - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY:-}
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
       - NVIDIA_NIM_API_BASE=${NVIDIA_NIM_API_BASE:-https://integrate.api.nvidia.com/v1}
+      - NVIDIA_NIM_RERANK_API_BASE=${NVIDIA_NIM_RERANK_API_BASE:-https://ai.api.nvidia.com}
       - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api}

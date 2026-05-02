@@ -2128,6 +2128,7 @@ def test_cost_calculator_openrouter_rerank_catalog_metadata(model, max_input_tok
     ("model", "mode"),
     [
         ("nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1", "embedding"),
+        ("nvidia_nim/nvidia/llama-3.2-nemoretriever-300m-embed-v1", "embedding"),
         ("nvidia_nim/nvidia/nv-embed-v1", "embedding"),
         ("nvidia_nim/nvidia/nv-embedcode-7b-v1", "embedding"),
         ("nvidia_nim/nvidia/rerank-qa-mistral-4b", "rerank"),

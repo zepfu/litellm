@@ -332,12 +332,18 @@ def rerank(  # noqa: PLR0915
                     "Nvidia NIM API key is required, please set 'NVIDIA_NIM_API_KEY' in your environment"
                 )
 
-            # Note: For rerank, the base URL is different from chat/embeddings
-            # Rerank uses ai.api.nvidia.com instead of integrate.api.nvidia.com
+            nvidia_nim_api_base = get_secret("NVIDIA_NIM_API_BASE")  # type: ignore
+            if (
+                isinstance(nvidia_nim_api_base, str)
+                and "integrate.api.nvidia.com" in nvidia_nim_api_base
+            ):
+                nvidia_nim_api_base = None
+
             api_base = (
                 optional_params.api_base
-                or get_secret("NVIDIA_NIM_API_BASE")  # type: ignore
-                or "https://ai.api.nvidia.com"  # Default for rerank
+                or get_secret("NVIDIA_NIM_RERANK_API_BASE")  # type: ignore
+                or nvidia_nim_api_base
+                or "https://ai.api.nvidia.com"
             )
 
             response = base_llm_http_handler.rerank(
