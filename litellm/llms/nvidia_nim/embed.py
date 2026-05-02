@@ -69,6 +69,8 @@ class NvidiaNimEmbeddingConfig:
         if "extra_body" not in optional_params:
             optional_params["extra_body"] = {}
         for k, v in non_default_params.items():
+            if v is None or k == "max_tokens":
+                continue
             if k == "input_type":
                 optional_params["extra_body"].update({"input_type": v})
             elif k == "truncate":
@@ -77,6 +79,9 @@ class NvidiaNimEmbeddingConfig:
                 optional_params[k] = v
 
         if kwargs is not None:
-            # pass kwargs in extra_body
-            optional_params["extra_body"].update(kwargs)
+            # Pass supported NVIDIA embedding kwargs in extra_body.
+            for key, value in kwargs.items():
+                if value is None or key == "max_tokens":
+                    continue
+                optional_params["extra_body"][key] = value
         return optional_params

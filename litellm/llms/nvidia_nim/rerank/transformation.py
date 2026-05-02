@@ -52,6 +52,14 @@ class NvidiaNimRerankConfig(BaseRerankConfig):
     """
 
     DEFAULT_NIM_RERANK_API_BASE = "https://ai.api.nvidia.com"
+    SHARED_RERANKING_ENDPOINT_MODELS = {
+        "nvidia/nv-rerankqa-mistral-4b-v3",
+        "nvidia/rerank-qa-mistral-4b",
+        "nv-rerank-qa-mistral-4b:1",
+    }
+    BODY_MODEL_ALIASES = {
+        "nvidia/rerank-qa-mistral-4b": "nv-rerank-qa-mistral-4b:1",
+    }
 
     def __init__(self) -> None:
         pass
@@ -61,6 +69,16 @@ class NvidiaNimRerankConfig(BaseRerankConfig):
         if model.startswith("nvidia_nim/"):
             return model[len("nvidia_nim/") :]
         return model
+
+    def _uses_shared_reranking_endpoint(self, model: str) -> bool:
+        clean_model = self._get_clean_model_name(model)
+        return clean_model in self.SHARED_RERANKING_ENDPOINT_MODELS
+
+    def _get_model_name_for_body(self, model: str) -> str:
+        clean_model = self._get_clean_model_name(model)
+        if clean_model in self.BODY_MODEL_ALIASES:
+            return self.BODY_MODEL_ALIASES[clean_model]
+        return clean_model.replace("_", ".")
 
     def get_complete_url(
         self,
@@ -89,8 +107,9 @@ class NvidiaNimRerankConfig(BaseRerankConfig):
         if api_base.endswith("/v1"):
             api_base = api_base[:-3]
 
-        # Strip nvidia_nim/ prefix from model name if present
         clean_model = self._get_clean_model_name(model)
+        if self._uses_shared_reranking_endpoint(clean_model):
+            return f"{api_base}/v1/retrieval/nvidia/reranking"
 
         return f"{api_base}/v1/retrieval/{clean_model}/reranking"
 
@@ -218,16 +237,9 @@ class NvidiaNimRerankConfig(BaseRerankConfig):
             else:
                 passages.append({"text": str(doc)})
 
-        # Strip nvidia_nim/ prefix from model name if present
-        clean_model = self._get_clean_model_name(model)
-
-        # Note: URL path uses underscores (llama-3_2) but JSON body uses periods (llama-3.2)
-        # Convert underscores back to periods for the model field in request body
-        model_for_body = clean_model.replace("_", ".")
-
         # Build request using TypedDict
         request_data: NvidiaNimRerankRequest = {
-            "model": model_for_body,
+            "model": self._get_model_name_for_body(model),
             "query": query_obj,
             "passages": passages,
         }

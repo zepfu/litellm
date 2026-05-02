@@ -86,6 +86,30 @@ class HealthCheckHelpers:
         }
 
     @staticmethod
+    def _get_embedding_health_check_params(
+        model_params: dict,
+        custom_llm_provider: str,
+    ) -> dict:
+        from litellm.litellm_core_utils.health_check_utils import _filter_model_params
+
+        filtered_params = _filter_model_params(model_params=model_params)
+        filtered_params.pop("max_tokens", None)
+
+        if custom_llm_provider == "nvidia_nim":
+            filtered_params.setdefault("encoding_format", "float")
+            filtered_params.setdefault("input_type", "query")
+
+        return filtered_params
+
+    @staticmethod
+    def _get_rerank_health_check_params(model_params: dict) -> dict:
+        from litellm.litellm_core_utils.health_check_utils import _filter_model_params
+
+        filtered_params = _filter_model_params(model_params=model_params)
+        filtered_params.pop("max_tokens", None)
+        return filtered_params
+
+    @staticmethod
     async def _batch_health_check(
         custom_llm_provider: str,
         model_params: dict,
@@ -161,7 +185,10 @@ class HealthCheckHelpers:
                 prompt=prompt or "test",
             ),
             "embedding": lambda: litellm.aembedding(
-                **_filter_model_params(model_params=model_params),
+                **HealthCheckHelpers._get_embedding_health_check_params(
+                    model_params=model_params,
+                    custom_llm_provider=custom_llm_provider,
+                ),
                 input=input or ["test"],
             ),
             "audio_speech": lambda: litellm.aspeech(
@@ -189,7 +216,9 @@ class HealthCheckHelpers:
                 prompt=prompt or "test video generation",
             ),
             "rerank": lambda: litellm.arerank(
-                **_filter_model_params(model_params=model_params),
+                **HealthCheckHelpers._get_rerank_health_check_params(
+                    model_params=model_params,
+                ),
                 query=prompt or "",
                 documents=["my sample text"],
             ),

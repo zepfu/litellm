@@ -44,6 +44,41 @@ async def test_update_litellm_params_max_tokens_wildcard():
     assert "max_tokens" not in updated_params or updated_params["max_tokens"] != 1
 
 
+def test_nvidia_embedding_health_check_params_are_embedding_safe():
+    model_params = {
+        "model": "nvidia_nim/nvidia/nv-embed-v1",
+        "api_key": "fake-key",
+        "messages": [{"role": "user", "content": "test"}],
+        "max_tokens": 1,
+    }
+
+    filtered_params = HealthCheckHelpers._get_embedding_health_check_params(
+        model_params=model_params,
+        custom_llm_provider="nvidia_nim",
+    )
+
+    assert "messages" not in filtered_params
+    assert "max_tokens" not in filtered_params
+    assert filtered_params["encoding_format"] == "float"
+    assert filtered_params["input_type"] == "query"
+
+
+def test_rerank_health_check_params_drop_max_tokens():
+    model_params = {
+        "model": "nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3",
+        "api_key": "fake-key",
+        "messages": [{"role": "user", "content": "test"}],
+        "max_tokens": 1,
+    }
+
+    filtered_params = HealthCheckHelpers._get_rerank_health_check_params(
+        model_params=model_params,
+    )
+
+    assert "messages" not in filtered_params
+    assert "max_tokens" not in filtered_params
+
+
 @pytest.mark.asyncio
 async def test_ahealth_check_wildcard_models_respects_max_tokens():
     """

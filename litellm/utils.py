@@ -3560,6 +3560,9 @@ def get_optional_params_embeddings(  # noqa: PLR0915
     else:
         optional_params = non_default_params
 
+    if custom_llm_provider == "nvidia_nim":
+        passed_params.pop("max_tokens", None)
+
     final_params = add_provider_specific_params_to_optional_params(
         optional_params=optional_params,
         passed_params=passed_params,
