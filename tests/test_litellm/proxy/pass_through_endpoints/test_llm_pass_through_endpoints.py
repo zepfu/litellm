@@ -512,6 +512,62 @@ class TestResponsesAdapterToolChoice:
         assert "anthropic-openai-codex-native-tools" in litellm_metadata["tags"]
         assert litellm_metadata["anthropic_adapter_codex_native_tool_aliases"] is True
 
+    def test_responses_adapter_reasoning_input_omits_status(self):
+        translated_body = _build_anthropic_responses_adapter_request_body(
+            {
+                "model": "gpt-5.5",
+                "messages": [
+                    {"role": "user", "content": "Use the Read tool once."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "I should inspect the requested file.",
+                                "signature": "reasoning_1",
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "Read",
+                                "input": {"file_path": "TODO.md"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "# TODO\n",
+                            }
+                        ],
+                    },
+                ],
+                "max_tokens": 32,
+                "tools": [
+                    {
+                        "name": "Read",
+                        "description": "Read a file.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                        },
+                    }
+                ],
+            },
+            adapter_model="gpt-5.5",
+            use_chatgpt_codex_defaults=True,
+        )
+
+        reasoning_items = [
+            item for item in translated_body["input"] if item.get("type") == "reasoning"
+        ]
+        assert reasoning_items
+        assert all("status" not in item for item in reasoning_items)
+
     def test_forces_explicit_bash_tool_choice_when_prompt_requires_bash(self):
         translated_body = {
             "tools": [
