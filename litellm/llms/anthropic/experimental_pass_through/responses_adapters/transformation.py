@@ -121,7 +121,6 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             "type": "reasoning",
             "id": reasoning_id,
             "summary": [{"type": "summary_text", "text": ""}],
-            "status": "completed",
         }
 
         if thinking_text:
