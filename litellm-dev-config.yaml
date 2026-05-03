@@ -2,6 +2,54 @@ model_list:
   - model_name: "claude-sonnet-4-6"
     litellm_params:
       model: "anthropic/claude-sonnet-4-6"
+  - model_name: "tei-medcpt-article"
+    litellm_params:
+      model: "local_embed/ncbi/MedCPT-Article-Encoder"
+      api_base: "http://172.20.0.1:8083/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "ncbi/MedCPT-Article-Encoder"
+  - model_name: "tei-medcpt-query"
+    litellm_params:
+      model: "local_embed/ncbi/MedCPT-Query-Encoder"
+      api_base: "http://172.20.0.1:8084/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "ncbi/MedCPT-Query-Encoder"
+  - model_name: "specter2-adapter"
+    litellm_params:
+      model: "local_embed/allenai/specter2_base"
+      api_base: "http://172.20.0.1:8086/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "allenai/specter2_base"
+  - model_name: "tei-indus"
+    litellm_params:
+      model: "local_embed/nasa-impact/nasa-ibm-st.38m"
+      api_base: "http://172.20.0.1:8087/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "nasa-impact/nasa-ibm-st.38m"
+  - model_name: "tei-sapbert"
+    litellm_params:
+      model: "local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+      api_base: "http://172.20.0.1:8088/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+  - model_name: "tei-reranker"
+    litellm_params:
+      model: "local_rerank/BAAI/bge-reranker-v2-m3"
+      api_base: "http://172.20.0.1:8090"
+      api_key: "fake-api-key"
+    model_info:
+      mode: rerank
+      base_model: "BAAI/bge-reranker-v2-m3"
   - model_name: "openrouter/baai/bge-base-en-v1.5"
     litellm_params:
       model: "openrouter/baai/bge-base-en-v1.5"

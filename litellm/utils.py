@@ -8304,7 +8304,10 @@ class ProviderConfigManager:
             return VercelAIGatewayEmbeddingConfig()
         elif litellm.LlmProviders.GIGACHAT == provider:
             return litellm.GigaChatEmbeddingConfig()
-        elif litellm.LlmProviders.HOSTED_VLLM == provider:
+        elif (
+            litellm.LlmProviders.HOSTED_VLLM == provider
+            or litellm.LlmProviders.LOCAL_EMBED == provider
+        ):
             return litellm.HostedVLLMEmbeddingConfig()
         elif litellm.LlmProviders.SAGEMAKER == provider:
             from litellm.llms.sagemaker.embedding.transformation import (
@@ -8340,6 +8343,8 @@ class ProviderConfigManager:
         elif litellm.LlmProviders.HOSTED_VLLM == provider:
             return litellm.HostedVLLMRerankConfig()
         elif litellm.LlmProviders.HUGGINGFACE == provider:
+            return litellm.HuggingFaceRerankConfig()
+        elif litellm.LlmProviders.LOCAL_RERANK == provider:
             return litellm.HuggingFaceRerankConfig()
         elif litellm.LlmProviders.DEEPINFRA == provider:
             return litellm.DeepinfraRerankConfig()
