@@ -2226,6 +2226,7 @@ def test_cost_calculator_openrouter_cohere_rerank_4_pro_metadata_and_cost():
             4.6e-09,
             768,
         ),
+        ("local_embed/nomic-embed-code.Q8_0.gguf", 32768, 1.5e-07, 3584),
     ],
 )
 def test_cost_calculator_local_embedding_catalog_metadata(

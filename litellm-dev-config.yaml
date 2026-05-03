@@ -52,6 +52,16 @@ model_list:
       base_model: "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
       input_cost_per_token: 4.6e-09
       output_cost_per_token: 0.0
+  - model_name: "nomic-embed-code"
+    litellm_params:
+      model: "local_embed/nomic-embed-code.Q8_0.gguf"
+      api_base: "http://172.20.0.1:8082/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: embedding
+      base_model: "nomic-embed-code.Q8_0.gguf"
+      input_cost_per_token: 1.5e-07
+      output_cost_per_token: 0.0
   - model_name: "tei-reranker"
     litellm_params:
       model: "local_rerank/BAAI/bge-reranker-v2-m3"

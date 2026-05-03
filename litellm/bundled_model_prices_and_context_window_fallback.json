@@ -38086,6 +38086,17 @@
         "output_vector_size": 768,
         "source": "local estimated commercial token pricing for litellm-dev"
     },
+    "local_embed/nomic-embed-code.Q8_0.gguf": {
+        "input_cost_per_token": 1.5e-07,
+        "litellm_provider": "local_embed",
+        "max_input_tokens": 32768,
+        "max_output_tokens": 32768,
+        "max_tokens": 32768,
+        "mode": "embedding",
+        "output_cost_per_token": 0.0,
+        "output_vector_size": 3584,
+        "source": "local estimated commercial token pricing for litellm-dev"
+    },
     "local_rerank/BAAI/bge-reranker-v2-m3": {
         "input_cost_per_query": 0.0,
         "input_cost_per_token": 2.5e-08,
