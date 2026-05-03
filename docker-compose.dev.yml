@@ -23,7 +23,9 @@ services:
       - ./litellm/types/llms/anthropic.py:/app/litellm/types/llms/anthropic.py
       - ./litellm/types/llms/anthropic_messages/anthropic_response.py:/app/litellm/types/llms/anthropic_messages/anthropic_response.py
       - ./litellm/types/llms/openai.py:/app/litellm/types/llms/openai.py
+      - ./litellm/types/utils.py:/app/litellm/types/utils.py
       - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
+      - ./litellm/llms/hosted_vllm/embedding/transformation.py:/app/litellm/llms/hosted_vllm/embedding/transformation.py
       - ./litellm/llms/nvidia_nim/embed.py:/app/litellm/llms/nvidia_nim/embed.py
       - ./litellm/llms/nvidia_nim/rerank/transformation.py:/app/litellm/llms/nvidia_nim/rerank/transformation.py
       - ./litellm/llms/openrouter/embedding/transformation.py:/app/litellm/llms/openrouter/embedding/transformation.py

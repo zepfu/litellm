@@ -106,9 +106,11 @@ class HostedVLLMEmbeddingConfig(BaseEmbeddingConfig):
         if isinstance(input, str):
             input = [input]
 
-        # Strip 'hosted_vllm/' prefix if present
-        if model.startswith("hosted_vllm/"):
-            model = model.replace("hosted_vllm/", "", 1)
+        # Strip LiteLLM routing prefixes if present
+        for provider_prefix in ("hosted_vllm/", "local_embed/"):
+            if model.startswith(provider_prefix):
+                model = model.replace(provider_prefix, "", 1)
+                break
 
         return {
             "model": model,

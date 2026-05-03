@@ -39,6 +39,7 @@ async def arerank(
             "voyage",
             "watsonx",
             "openrouter",
+            "local_rerank",
         ]
     ] = None,
     top_n: Optional[int] = None,
@@ -98,6 +99,7 @@ def rerank(  # noqa: PLR0915
             "voyage",
             "watsonx",
             "openrouter",
+            "local_rerank",
         ]
     ] = None,
     top_n: Optional[int] = None,
