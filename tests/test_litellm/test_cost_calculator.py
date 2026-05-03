@@ -2211,3 +2211,85 @@ def test_cost_calculator_openrouter_cohere_rerank_4_pro_metadata_and_cost():
     )
 
     assert response_cost == 0.0
+
+
+@pytest.mark.parametrize(
+    ("model", "max_input_tokens", "input_cost_per_token", "output_vector_size"),
+    [
+        ("local_embed/ncbi/MedCPT-Article-Encoder", 512, 4.6e-09, 768),
+        ("local_embed/ncbi/MedCPT-Query-Encoder", 512, 2.8e-09, 768),
+        ("local_embed/allenai/specter2_base", 512, 4.6e-09, 768),
+        ("local_embed/nasa-impact/nasa-ibm-st.38m", 512, 5.6e-09, 576),
+        (
+            "local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+            512,
+            4.6e-09,
+            768,
+        ),
+    ],
+)
+def test_cost_calculator_local_embedding_catalog_metadata(
+    model, max_input_tokens, input_cost_per_token, output_vector_size
+):
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model_info = litellm.get_model_info(model)
+
+    assert model_info["mode"] == "embedding"
+    assert model_info["litellm_provider"] == "local_embed"
+    assert model_info["max_input_tokens"] == max_input_tokens
+    assert model_info["input_cost_per_token"] == input_cost_per_token
+    assert model_info["output_cost_per_token"] == 0.0
+    assert model_info["output_vector_size"] == output_vector_size
+
+
+def test_cost_calculator_local_embedding_estimated_cost():
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model = "local_embed/ncbi/MedCPT-Article-Encoder"
+    response = EmbeddingResponse(
+        model=model,
+        data=[],
+        usage=Usage(prompt_tokens=1000, completion_tokens=0, total_tokens=1000),
+    )
+
+    response_cost = litellm.cost_calculator.completion_cost(
+        completion_response=response,
+        model=model,
+        custom_llm_provider="local_embed",
+        call_type="embedding",
+    )
+
+    assert response_cost == pytest.approx(1000 * 4.6e-09, rel=1e-12)
+
+
+def test_cost_calculator_local_rerank_catalog_metadata_and_estimated_cost():
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model = "local_rerank/BAAI/bge-reranker-v2-m3"
+    model_info = litellm.get_model_info(model)
+
+    assert model_info["mode"] == "rerank"
+    assert model_info["litellm_provider"] == "local_rerank"
+    assert model_info["max_input_tokens"] == 8192
+    assert model_info["input_cost_per_query"] == 0.0
+    assert model_info["input_cost_per_token"] == 2.5e-08
+    assert model_info["output_cost_per_token"] == 0.0
+
+    response = RerankResponse(
+        id="local-rerank-test",
+        results=[],
+        meta={"billed_units": {"search_units": 1, "total_tokens": 240}},
+    )
+
+    response_cost = litellm.cost_calculator.completion_cost(
+        completion_response=response,
+        model=model,
+        custom_llm_provider="local_rerank",
+        call_type="rerank",
+    )
+
+    assert response_cost == pytest.approx(240 * 2.5e-08, rel=1e-12)

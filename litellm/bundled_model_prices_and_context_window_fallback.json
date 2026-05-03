@@ -38030,5 +38030,72 @@
         "supports_function_calling": true,
         "supports_tool_choice": true,
         "source": "https://openrouter.ai/meta-llama/llama-3.3-70b-instruct"
+    },
+    "local_embed/ncbi/MedCPT-Article-Encoder": {
+        "input_cost_per_token": 4.6e-09,
+        "litellm_provider": "local_embed",
+        "max_input_tokens": 512,
+        "max_output_tokens": 512,
+        "max_tokens": 512,
+        "mode": "embedding",
+        "output_cost_per_token": 0.0,
+        "output_vector_size": 768,
+        "source": "local estimated commercial token pricing for litellm-dev"
+    },
+    "local_embed/ncbi/MedCPT-Query-Encoder": {
+        "input_cost_per_token": 2.8e-09,
+        "litellm_provider": "local_embed",
+        "max_input_tokens": 512,
+        "max_output_tokens": 512,
+        "max_tokens": 512,
+        "mode": "embedding",
+        "output_cost_per_token": 0.0,
+        "output_vector_size": 768,
+        "source": "local estimated commercial token pricing for litellm-dev"
+    },
+    "local_embed/allenai/specter2_base": {
+        "input_cost_per_token": 4.6e-09,
+        "litellm_provider": "local_embed",
+        "max_input_tokens": 512,
+        "max_output_tokens": 512,
+        "max_tokens": 512,
+        "mode": "embedding",
+        "output_cost_per_token": 0.0,
+        "output_vector_size": 768,
+        "source": "local estimated commercial token pricing for litellm-dev"
+    },
+    "local_embed/nasa-impact/nasa-ibm-st.38m": {
+        "input_cost_per_token": 5.6e-09,
+        "litellm_provider": "local_embed",
+        "max_input_tokens": 512,
+        "max_output_tokens": 512,
+        "max_tokens": 512,
+        "mode": "embedding",
+        "output_cost_per_token": 0.0,
+        "output_vector_size": 576,
+        "source": "local estimated commercial token pricing for litellm-dev"
+    },
+    "local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext": {
+        "input_cost_per_token": 4.6e-09,
+        "litellm_provider": "local_embed",
+        "max_input_tokens": 512,
+        "max_output_tokens": 512,
+        "max_tokens": 512,
+        "mode": "embedding",
+        "output_cost_per_token": 0.0,
+        "output_vector_size": 768,
+        "source": "local estimated commercial token pricing for litellm-dev"
+    },
+    "local_rerank/BAAI/bge-reranker-v2-m3": {
+        "input_cost_per_query": 0.0,
+        "input_cost_per_token": 2.5e-08,
+        "litellm_provider": "local_rerank",
+        "max_input_tokens": 8192,
+        "max_output_tokens": 8192,
+        "max_query_tokens": 8192,
+        "max_tokens": 8192,
+        "mode": "rerank",
+        "output_cost_per_token": 0.0,
+        "source": "local estimated commercial token pricing for litellm-dev"
     }
 }
