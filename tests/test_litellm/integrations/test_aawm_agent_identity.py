@@ -1975,6 +1975,106 @@ def test_build_session_history_record_calculates_openrouter_embedding_cost() -> 
     assert record["response_cost_usd"] == pytest.approx(0.00002)
 
 
+def test_build_session_history_record_calculates_local_embedding_estimated_cost() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "ncbi/MedCPT-Article-Encoder"
+    kwargs["custom_llm_provider"] = "local_embed"
+    kwargs["call_type"] = "embedding"
+    kwargs["litellm_call_id"] = "call-local-medcpt-embedding-cost"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-local-medcpt-embedding-cost"
+    )
+    kwargs["litellm_params"]["metadata"]["model_group"] = "tei-medcpt-article"
+    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
+        "model": "tei-medcpt-article",
+        "input": "Embed this clinical text.",
+    }}
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "ncbi/MedCPT-Article-Encoder",
+        "input": "Embed this clinical text.",
+    }
+
+    result = {
+        "id": "local-embedding-response-1",
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 0,
+            "total_tokens": 1000,
+        },
+        "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "local_embed"
+    assert record["model"] == "ncbi/MedCPT-Article-Encoder"
+    assert record["model_group"] == "tei-medcpt-article"
+    assert record["call_type"] == "embedding"
+    assert record["input_tokens"] == 1000
+    assert record["total_tokens"] == 1000
+    assert record["response_cost_usd"] == pytest.approx(1000 * 4.6e-09)
+
+
+def test_build_session_history_record_calculates_local_rerank_estimated_cost() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "BAAI/bge-reranker-v2-m3"
+    kwargs["custom_llm_provider"] = "local_rerank"
+    kwargs["call_type"] = "rerank"
+    kwargs["litellm_call_id"] = "call-local-rerank-cost"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-local-rerank-cost"
+    kwargs["litellm_params"]["metadata"]["model_group"] = "tei-reranker"
+    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
+        "model": "tei-reranker",
+        "query": "What is LiteLLM?",
+        "documents": [
+            "LiteLLM records local rerank usage in session history.",
+            "A separate document about unrelated material.",
+        ],
+    }}
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "query": "What is LiteLLM?",
+        "texts": [
+            "LiteLLM records local rerank usage in session history.",
+            "A separate document about unrelated material.",
+        ],
+    }
+
+    result = SimpleNamespace(
+        id="local-rerank-response-1",
+        meta={
+            "billed_units": {"search_units": 1},
+            "tokens": {"input_tokens": 240, "output_tokens": 30},
+        },
+        results=[{"index": 0, "relevance_score": 0.98}],
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "local_rerank"
+    assert record["model"] == "BAAI/bge-reranker-v2-m3"
+    assert record["model_group"] == "tei-reranker"
+    assert record["call_type"] == "rerank"
+    assert record["input_tokens"] == 240
+    assert record["output_tokens"] == 0
+    assert record["total_tokens"] == 240
+    assert record["metadata"]["usage_search_units"] == 1
+    assert record["response_cost_usd"] == pytest.approx(240 * 2.5e-08)
+
+
 def test_build_session_history_record_estimates_reasoning_when_provider_reports_zero() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"

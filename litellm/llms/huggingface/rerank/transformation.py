@@ -215,7 +215,10 @@ class HuggingFaceRerankConfig(BaseRerankConfig):
                 len(input_text) * 4 if "input_text" in locals() else 0
             )
 
-        _billed_units = RerankBilledUnits(search_units=1)
+        _billed_units = RerankBilledUnits(
+            search_units=1,
+            total_tokens=estimated_input_tokens,
+        )
         _tokens = RerankTokens(
             input_tokens=estimated_input_tokens, output_tokens=estimated_output_tokens
         )

@@ -2309,13 +2309,16 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
 
     meta_obj = _maybe_get(result, "meta")
     billed_units = _maybe_get(meta_obj, "billed_units")
+    token_units = _maybe_get(meta_obj, "tokens")
     if billed_units is not None:
         search_units = _safe_int(_maybe_get(billed_units, "search_units"))
         total_tokens = _safe_int(_maybe_get(billed_units, "total_tokens"))
+        input_tokens = _safe_int(_maybe_get(token_units, "input_tokens"))
+        prompt_tokens = total_tokens or input_tokens
         rerank_usage: Dict[str, Any] = {
-            "prompt_tokens": total_tokens,
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": 0,
-            "total_tokens": total_tokens,
+            "total_tokens": total_tokens or prompt_tokens,
         }
         if search_units:
             rerank_usage["search_units"] = search_units
@@ -3073,7 +3076,10 @@ def _extract_rerank_request_payload(kwargs: Dict[str, Any]) -> Optional[Dict[str
         if (
             isinstance(candidate, dict)
             and candidate.get("query") is not None
-            and candidate.get("documents") is not None
+            and (
+                candidate.get("documents") is not None
+                or candidate.get("texts") is not None
+            )
         ):
             return candidate
     return None
@@ -3524,6 +3530,8 @@ def _estimate_rerank_request_tokens(
 
     query_text = _coerce_rerank_text(request_payload.get("query")).strip()
     documents = request_payload.get("documents")
+    if documents is None:
+        documents = request_payload.get("texts")
     if not isinstance(documents, list):
         return None
 
@@ -3661,7 +3669,7 @@ def _calculate_response_cost_from_bundled_model_cost_map(
 
     search_units = _safe_int(_maybe_get(usage_obj, "search_units"))
     input_cost_per_query = _safe_float(model_info.get("input_cost_per_query"))
-    if search_units and input_cost_per_query is not None:
+    if search_units and input_cost_per_query is not None and input_cost_per_query > 0:
         return search_units * input_cost_per_query
 
     has_token_pricing = (
