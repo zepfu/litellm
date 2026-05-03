@@ -3181,6 +3181,8 @@ class LlmProviders(str, Enum):
     DOCKER_MODEL_RUNNER = "docker_model_runner"
     CUSTOM = "custom"
     LITELLM_PROXY = "litellm_proxy"
+    LOCAL_EMBED = "local_embed"
+    LOCAL_RERANK = "local_rerank"
     HOSTED_VLLM = "hosted_vllm"
     LLAMAFILE = "llamafile"
     LM_STUDIO = "lm_studio"

@@ -4958,14 +4958,19 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
             )
-        elif custom_llm_provider == "hosted_vllm":
-            api_base = (
-                api_base or litellm.api_base or get_secret_str("HOSTED_VLLM_API_BASE")
-            )
+        elif custom_llm_provider == "hosted_vllm" or custom_llm_provider == "local_embed":
+            if custom_llm_provider == "local_embed":
+                provider_api_base = get_secret_str("LOCAL_EMBED_API_BASE")
+                provider_api_key = get_secret_str("LOCAL_EMBED_API_KEY")
+            else:
+                provider_api_base = get_secret_str("HOSTED_VLLM_API_BASE")
+                provider_api_key = get_secret_str("HOSTED_VLLM_API_KEY")
+
+            api_base = api_base or litellm.api_base or provider_api_base
 
             # set API KEY
             if api_key is None:
-                api_key = litellm.api_key or get_secret_str("HOSTED_VLLM_API_KEY")
+                api_key = litellm.api_key or provider_api_key
 
             response = base_llm_http_handler.embedding(
                 model=model,
