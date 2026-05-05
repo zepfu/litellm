@@ -457,12 +457,9 @@ The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
 
-Current local harness source version is `0.0.27` in
-`scripts/local-ci/harness-version.txt`, and the current aawm.42 release prep
-uses `h-v0.0.27`. The current minimum released bundle for the
-historical aawm.37 / `cb-v0.0.12` prod validation line remains `h-v0.0.21`; it
-includes the controlled Claude settings overlay, tenant-only trace-user
-validation, the longer peeromega fanout timeout for prod `:4000` validation,
-the narrow OpenRouter provider-unavailable timeout / command-failure classifier,
-and the default-suite GPT-OSS exclusions used by the prod promotion suite.
-Older `h-v0.0.13` / `h-v0.0.14` notes are historical only.
+Read the current local harness source version from
+`scripts/local-ci/harness-version.txt`, then verify that the matching `h-v*`
+GitHub Release exists before using it in an image build. Keep exact harness
+artifact versions in `COMPLETED.md` release evidence and in historical patch
+entries, not in this reusable harness runbook. Older `h-v*` release notes are
+historical only unless a release or rollback intentionally pins them.
