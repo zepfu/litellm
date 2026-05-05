@@ -2,6 +2,32 @@
 
 ## 2026-05-05
 
+- Prepared `aawm.40` as the current source release candidate after adding the
+  explicit NVIDIA Claude adapter wildcard. `aawm.39` remains a published
+  historical candidate for local embed/rerank/Nomic plus OpenRouter wildcard,
+  but it predates `nvidia/*` low-touch routing and should not be promoted for
+  current `develop`.
+
+  Changed/prepped release docs and version metadata:
+  `pyproject.toml`, `PATCHES.md`, `PROD_RELEASE.md`, `TODO.md`,
+  `TEST_HARNESS.md`, `CLAUDE.md`, and `scripts/local-ci/README.md`.
+
+  Validation evidence:
+  `./.venv/bin/python -m py_compile litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`,
+  `./.venv/bin/ruff check --ignore F401,T201,F841,F811,PLR0915,F541 litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`,
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -q`
+  (`273 passed`), and `git diff --check` all passed. Live dev Claude CLI
+  artifact `/tmp/nvidia-qwen3-coder-wildcard-cli-4001.json` passed with
+  `nvidia/qwen/qwen3-coder-480b-a35b-instruct`, proving the real Claude Code
+  subagent path, parallel `Read` / `Glob` / `Grep`, `Bash`, `Write`,
+  `provider=nvidia_nim`, and normalized model
+  `qwen/qwen3-coder-480b-a35b-instruct`.
+
+  No prod `aawm-litellm` restart was performed. The remaining release-prep work
+  is to commit/push, publish `v1.82.3-aawm.40`, update/rebuild
+  `/home/zepfu/projects/aawm-infrastructure`, inspect the built image, and only
+  recreate prod `:4000` after explicit deployment approval.
+
 - Reopened the 2026-05-01 `aawm.38` cutover shape for current `develop`.
   `v1.82.3-aawm.38` remains a published historical candidate cut from
   `b022a0271c`, but current `develop` head `649cb61b6f` is post-tag and

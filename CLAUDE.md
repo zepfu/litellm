@@ -137,6 +137,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
     - these validate the Anthropic -> NVIDIA completion adapter on `nvidia:/v1/chat/completions` via `provider=nvidia_nim`
     - these are excluded from the default full suite and should be run only by explicit `--cases` selection while the NVIDIA lane is still under active validation
     - compatibility alias: `nvidia/minimax/minimax-m2.7` should still resolve to `minimaxai/minimax-m2.7`
+    - explicit `nvidia/*` model names may route by wildcard for early NVIDIA NIM testing; mapped models remain preferred when release gates require non-zero cost assertions
     - use the exact `nvidia/minimaxai/minimax-m2.7` spelling for MiniMax probes; the Anthropic adapter intentionally uses upstream non-stream plus fake streaming for this model because its native stream latency is much higher than the other NVIDIA targets
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
@@ -182,6 +183,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
   - direct NVIDIA targets: `nvidia/deepseek-ai/deepseek-v3.2`, `nvidia/deepseek-ai/deepseek-v3.1-terminus`, `nvidia/mistralai/devstral-2-123b-instruct-2512`, `nvidia/z-ai/glm4.7`, `nvidia/minimaxai/minimax-m2.7`
   - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
+  - explicit NVIDIA wildcard targets: any normalized `nvidia/*` model may route through the NVIDIA completion adapter for early testing, except known OpenRouter namespace models that intentionally remain on OpenRouter
   - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
   This keeps brief transient recovery local while preventing repeated manual retests from re-burning ~40 seconds on the same throttled backend.
 - NVIDIA-adapted Anthropic runs should reach the same observability parity as the other adapted providers:
