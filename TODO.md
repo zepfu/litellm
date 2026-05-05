@@ -140,12 +140,13 @@ these docs only as needed:
   Indus, SapBERT, Nomic code embeddings, and
   `local_rerank/BAAI/bge-reranker-v2-m3`. `cfg-v0.0.9` is published with the
   local-route cost-map entries, and the new base image is published as
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.39`. Before prod cutover, rebuild
-  infrastructure so the template exposes the full model list, inspect the
-  built image's installed versions and
-  model-config overlay, verify `NVIDIA_NIM_API_KEY` where direct NVIDIA NIM
-  routes should be callable, and verify local TEI/Nomic/rerank services are
-  reachable from the container via `host.docker.internal`.
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.39`. Build-only infrastructure validation
+  has produced local `aawm-litellm:latest` with the expected installed versions,
+  model-config overlay, and local route template. Before declaring prod cutover
+  complete, recreate/restart `aawm-litellm` only after explicit deployment
+  approval, then verify `NVIDIA_NIM_API_KEY` where direct NVIDIA NIM routes
+  should be callable and verify local TEI/Nomic/rerank services are reachable
+  from the running container via `host.docker.internal`.
 
 - Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
   `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and

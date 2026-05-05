@@ -20,6 +20,18 @@
   Release assets verified/published: `v1.82.3-aawm.39`, `cb-v0.0.16`,
   `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.9`.
 
+  Infrastructure build-only validation also passed in
+  `/home/zepfu/projects/aawm-infrastructure` without restarting prod:
+  `docker compose -f docker-compose.litellm.yml build --pull --no-cache litellm`
+  built local `aawm-litellm:latest`; image inspection reported
+  `litellm=1.82.3+aawm.39`, `aawm-litellm-callbacks=0.0.16`, and
+  `aawm-litellm-control-plane=0.0.6`; the installed
+  `model_prices_and_context_window_backup.json` contains
+  `local_embed/nomic-embed-code.Q8_0.gguf` at `1.5e-07` per token and
+  `local_rerank/BAAI/bge-reranker-v2-m3` at `2.5e-08` per token; the built
+  `/etc/litellm/config.yaml.tmpl` contains all seven local route aliases with
+  `host.docker.internal` bases.
+
   Documentation/prep changed:
   `pyproject.toml`, `PATCHES.md`, `PROD_RELEASE.md`, `TODO.md`,
   `COMPLETED.md`, `TEST_HARNESS.md`, and `WHEEL.md`.
