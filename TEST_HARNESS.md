@@ -457,9 +457,9 @@ The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
 
-Current local harness source version is `0.0.25` in
-`scripts/local-ci/harness-version.txt`, and the current post-aawm.38 release
-prep uses `h-v0.0.25`. The current minimum released bundle for the
+Current local harness source version is `0.0.26` in
+`scripts/local-ci/harness-version.txt`, and the current aawm.41 release prep
+uses `h-v0.0.26`. The current minimum released bundle for the
 historical aawm.37 / `cb-v0.0.12` prod validation line remains `h-v0.0.21`; it
 includes the controlled Claude settings overlay, tenant-only trace-user
 validation, the longer peeromega fanout timeout for prod `:4000` validation,

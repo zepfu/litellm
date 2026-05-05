@@ -125,22 +125,24 @@ these docs only as needed:
   OpenAI/Gemini/NVIDIA/OpenRouter and for a later exact input-cost field if the
   proportional `response_cost_usd` estimate is not enough.
 
-- The `aawm.38` and `aawm.39` release candidates are prepared/published but are
-  superseded for current `develop`. The `aawm.38` image predates the local
-  embed/rerank/Nomic routes and explicit `openrouter/*` Claude adapter routing;
-  the `aawm.39` image predates explicit `nvidia/*` Claude adapter wildcard
-  routing. Do not promote either as the final cutover candidate for current
-  code. The next prod candidate is `v1.82.3-aawm.40`, which should be rebuilt
-  through infrastructure and validated on prod `:4000` only after deployment
-  approval.
+- The `aawm.38`, `aawm.39`, and stale pre-publication `aawm.40` release
+  candidates are superseded for current `develop`. The `aawm.38` image predates
+  the local embed/rerank/Nomic routes and explicit `openrouter/*` Claude
+  adapter routing; the `aawm.39` image predates explicit `nvidia/*` Claude
+  adapter wildcard routing; and the `aawm.40` tag predates the `h-v0.0.26`
+  harness autobump on current `main`. Do not promote those lines as the final
+  cutover candidate for current code. The next prod candidate is
+  `v1.82.3-aawm.41`, which should be rebuilt through infrastructure and
+  validated on prod `:4000` only after deployment approval.
 
 - Post-`aawm.38` config/code is now present on `develop`: current OpenRouter
   rerank/embedding catalog entries, NVIDIA NIM free endpoint rerank/embedding
   entries, local `local_embed/*` routes for MedCPT article/query, SPECTER2,
   Indus, SapBERT, Nomic code embeddings, and
   `local_rerank/BAAI/bge-reranker-v2-m3`. `cfg-v0.0.9` is published with the
-  local-route cost-map entries, and the next base image line is
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.40`. Before declaring prod cutover
+  local-route cost-map entries, `h-v0.0.26` is the current harness overlay, and
+  the next base image line is
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.41`. Before declaring prod cutover
   complete, rebuild infrastructure, recreate/restart `aawm-litellm` only after
   explicit deployment approval, then verify `NVIDIA_NIM_API_KEY` where direct
   NVIDIA NIM routes should be callable and verify local TEI/Nomic/rerank
@@ -409,10 +411,10 @@ these docs only as needed:
 - Keep the adapter harness aligned with the real stored session shapes on both `:4001` dev and `:4000` prod targets.
   Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:` via the rewritten request body instead of a brittle exact model reply, `claude_adapter_ctx_marker_escaped` must keep validating `\\:#name.ctx#\\:` literal escaping, dispatched child-agent backtick and bare-acronym lookups should stay aligned with the same `tristore_search_exact` semantics, the CommonMark system-prompt identifier list rewrite should stay aligned with the tenant/agent-scoped raw-content query until the stored procedure lands, the provider-cache canary should keep finding at least one Anthropic `hit` / `write` row in the default suite, Gemini fanout should now deliberately hard-gate child native `run_shell_command` rows rather than relying on plausible final text, and the direct Gemini Read gate is `claude_adapter_gemini31_pro_read_tool_id_sanitizer` rather than the fanout case. The post-tool-result Gemini gate is `claude_adapter_gemini31_pro_bash_then_read_stream_state`; keep it default-excluded but run it explicitly when Claude-dispatched Gemini fails after an initial tool call. Persisted Gemini tool activity uses native `read_file` / `run_shell_command` while Claude Code sees restored `Read` / `Bash`, so validators should match the stored native tool names and require the matching tool-call rows instead of the latest no-tool final row. `--target dev` / `--target prod` should continue enforcing the correct port, Docker container, and Langfuse trace environment. Claude trace-user validation should validate tenant-only Langfuse user ids (`userId=<tenant_id>`) while trace names carry the agent (`claude-code.<agent>`); do not use `project.agent` as the user id. Basic OpenAI smoke cases should validate success, usage, cost, routing, Langfuse, and session-history invariants rather than brittle exact natural-language output. Keep the prod-cutover failure guards active by default: async task exceptions, ASGI exceptions, `KeyError: choices`, stale `Content-Length` / `h11` protocol failures, upstream passthrough 429/5xx traces, and the OpenAI Responses nested-object-schema regression must fail the run instead of surfacing only as downstream session-history gaps; warning-only optional cases must not mask command timeouts or runtime-log hard failures. Before future prod promotions, add a production-style preflight that validates the exact image / installed wheel path on `:4001` plus a small explicit promotion-gate set for opt-in provider lanes, so packaging and adapter metadata gaps are caught before touching `:4000`.
 
-- Keep the aawm.37 harness note historical and use `h-v0.0.25` for the prepared
-  post-aawm.38 release candidate. `h-v0.0.21` is the minimum known-good released
+- Keep the aawm.37 harness note historical and use `h-v0.0.26` for the prepared
+  aawm.41 release candidate. `h-v0.0.21` is the minimum known-good released
   bundle for the rebuilt `cb-v0.0.12` prod image, while the repo-local harness
-  source and current released candidate bundle are now `0.0.25`. The aawm.37
+  source and current released candidate bundle are now `0.0.26`. The aawm.37
   bundle includes controlled Claude trace
   `userId` validation, explicit per-run Claude settings overlay, longer
   peeromega fanout timeout, the narrow OpenRouter provider-unavailable timeout /

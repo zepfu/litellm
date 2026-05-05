@@ -2,11 +2,35 @@
 
 ## 2026-05-05
 
-- Prepared `aawm.40` as the current source release candidate after adding the
+- Prepared `aawm.41` as the current source release candidate after the
+  `h-v0.0.26` artifact autobump advanced `main` beyond the stale
+  `v1.82.3-aawm.40` tag. The `aawm.40` tag was not force-moved; it remains a
+  stale pre-publication candidate with no GitHub Release/image.
+
+  Changed/prepped release docs and version metadata:
+  `pyproject.toml`, `PATCHES.md`, `PROD_RELEASE.md`, `TODO.md`,
+  `COMPLETED.md`, `TEST_HARNESS.md`, `.analysis/todo.md`, and
+  `.analysis/completed.md`.
+
+  Release asset evidence:
+  `h-v0.0.26` was missing a GitHub Release after the autobump tag, so
+  `./.venv/bin/python scripts/local-ci/build_harness_bundle.py --outdir /tmp/aawm-h-dist`
+  built `/tmp/aawm-h-dist/litellm-local-ci-harness-0.0.26.tar.gz` with SHA256
+  `87e59db3488ffc8c4356c39f15cef06dd36c78d4a868b83a0e7dc020a5f9c787`, and the
+  release was published at `https://github.com/zepfu/litellm/releases/tag/h-v0.0.26`.
+
+  No prod `aawm-litellm` restart was performed. The remaining release-prep work
+  is to commit/push, publish `v1.82.3-aawm.41`, update/rebuild
+  `/home/zepfu/projects/aawm-infrastructure`, inspect the built image, and only
+  recreate prod `:4000` after explicit deployment approval.
+
+- Prepared `aawm.40` as a now-superseded source release candidate after adding the
   explicit NVIDIA Claude adapter wildcard. `aawm.39` remains a published
   historical candidate for local embed/rerank/Nomic plus OpenRouter wildcard,
   but it predates `nvidia/*` low-touch routing and should not be promoted for
-  current `develop`.
+  current `develop`. `aawm.40` itself was superseded before image publication
+  when the harness artifact autobump advanced `main` to `h-v0.0.26`; cut
+  `aawm.41` from current `main` instead of moving the stale tag.
 
   Changed/prepped release docs and version metadata:
   `pyproject.toml`, `PATCHES.md`, `PROD_RELEASE.md`, `TODO.md`,
@@ -23,10 +47,7 @@
   `provider=nvidia_nim`, and normalized model
   `qwen/qwen3-coder-480b-a35b-instruct`.
 
-  No prod `aawm-litellm` restart was performed. The remaining release-prep work
-  is to commit/push, publish `v1.82.3-aawm.40`, update/rebuild
-  `/home/zepfu/projects/aawm-infrastructure`, inspect the built image, and only
-  recreate prod `:4000` after explicit deployment approval.
+  No prod `aawm-litellm` restart was performed.
 
 - Reopened the 2026-05-01 `aawm.38` cutover shape for current `develop`.
   `v1.82.3-aawm.38` remains a published historical candidate cut from
