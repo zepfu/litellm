@@ -29,16 +29,18 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current release-prep patch set carries `aawm.2` through `aawm.40` (39 active
+Current release-prep patch set carries `aawm.2` through `aawm.41` (40 active
 carried patches; `aawm.1` is dropped). The published `aawm.38` release
 candidate was cut at `b022a0271c` as `v1.82.3-aawm.38` /
 `ghcr.io/zepfu/litellm:1.82.3-aawm.38`. The current release-prep overlay
-assets are `cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.9`, but
-current `develop` is post-`aawm.39` and must not promote either the `aawm.38`
-or `aawm.39` image as the final cutover candidate. The current prod candidate
-is `v1.82.3-aawm.40` / `ghcr.io/zepfu/litellm:1.82.3-aawm.40`, which includes
-the post-tag local embed/rerank/Nomic routes, explicit `openrouter/*` Claude
-adapter routing, and explicit `nvidia/*` Claude adapter routing.
+assets are `cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.26`, and `cfg-v0.0.9`, but
+current `develop` is post-`aawm.40` and must not promote the `aawm.38`,
+`aawm.39`, or stale `aawm.40` image lines as the final cutover candidate. The
+current prod candidate is `v1.82.3-aawm.41` /
+`ghcr.io/zepfu/litellm:1.82.3-aawm.41`, which includes the post-tag local
+embed/rerank/Nomic routes, explicit `openrouter/*` Claude adapter routing,
+explicit `nvidia/*` Claude adapter routing, and the `h-v0.0.26` harness
+autobump on current `main`.
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -47,7 +49,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.40`.
+`1.82.3+aawm.41`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1439,6 +1441,38 @@ model `nvidia/qwen/qwen3-coder-480b-a35b-instruct` and passed with artifact
 Claude Code child agent, recorded `provider=nvidia_nim` and
 `model=qwen/qwen3-coder-480b-a35b-instruct` in `public.session_history`, and
 proved parallel `Read` / `Glob` / `Grep`, `Bash`, and `Write` tool calls.
+
+---
+
+### aawm.41 — Post-autobump release candidate retag
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `PROD_RELEASE.md`
+- `TODO.md`
+- `COMPLETED.md`
+- `TEST_HARNESS.md`
+- `.analysis/todo.md`
+- `.analysis/completed.md`
+
+**Upstream issue:** The `v1.82.3-aawm.40` tag was cut before the GitHub artifact
+autobump advanced `main` to `h-v0.0.26`. The fork image workflow requires the
+tagged commit to be reachable from current `main`, and the release runbook says
+to cut a new image tag from the new `main` head instead of force-moving an
+already-pushed release tag.
+
+**Fix:** Bump the fork metadata and release docs to `1.82.3+aawm.41`, preserve
+`aawm.40` as a stale pre-publication candidate, and document `h-v0.0.26` as the
+current harness overlay release for the pending prod promotion.
+
+**Why not upstream:** This is AAWM release orchestration and artifact-version
+bookkeeping.
+
+**Validation status:** The missing `h-v0.0.26` GitHub Release asset was built
+from `scripts/local-ci/harness-version.txt` and published as
+`litellm-local-ci-harness-0.0.26.tar.gz` before the `aawm.41` source candidate
+was cut.
 
 ---
 
