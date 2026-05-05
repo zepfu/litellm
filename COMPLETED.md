@@ -2,6 +2,18 @@
 
 ## 2026-05-05
 
+- Removed hard-coded "current release" version lines from reusable release
+  process docs so they do not go stale after each promotion. `PROD_RELEASE.md`
+  now instructs agents to keep exact image, overlay, container, and artifact
+  versions in release evidence rather than in the runbook; `TEST_HARNESS.md`
+  points to `scripts/local-ci/harness-version.txt` and the matching `h-v*`
+  GitHub Release; `PATCHES.md` directs current release-state lookup to
+  `pyproject.toml`, GitHub Releases/tags, and `COMPLETED.md`.
+
+  Validation passed: `git diff --check`, plus a targeted `rg` scan for stale
+  hard-coded current-version wording across `PROD_RELEASE.md`,
+  `TEST_HARNESS.md`, `PATCHES.md`, and `TODO.md`.
+
 - Promoted the prepared `aawm.42` LiteLLM release to prod `:4000` after explicit
   approval. `/home/zepfu/projects/aawm-infrastructure` had already pinned
   `Dockerfile.litellm` and `docker-compose.litellm.yml` to
