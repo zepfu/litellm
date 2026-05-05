@@ -29,16 +29,16 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current release-prep patch set carries `aawm.2` through `aawm.39` (38 active
+Current release-prep patch set carries `aawm.2` through `aawm.40` (39 active
 carried patches; `aawm.1` is dropped). The published `aawm.38` release
 candidate was cut at `b022a0271c` as `v1.82.3-aawm.38` /
 `ghcr.io/zepfu/litellm:1.82.3-aawm.38`. The current release-prep overlay
 assets are `cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.9`, but
-current `develop` is
-post-`aawm.38` and must not promote that image as the final cutover candidate.
-The current prod candidate is `v1.82.3-aawm.39` /
-`ghcr.io/zepfu/litellm:1.82.3-aawm.39`, which includes the post-tag local
-embed/rerank/Nomic routes and explicit `openrouter/*` Claude adapter routing.
+current `develop` is post-`aawm.39` and must not promote either the `aawm.38`
+or `aawm.39` image as the final cutover candidate. The current prod candidate
+is `v1.82.3-aawm.40` / `ghcr.io/zepfu/litellm:1.82.3-aawm.40`, which includes
+the post-tag local embed/rerank/Nomic routes, explicit `openrouter/*` Claude
+adapter routing, and explicit `nvidia/*` Claude adapter routing.
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -47,7 +47,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.39`.
+`1.82.3+aawm.40`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1407,6 +1407,38 @@ dev harness on `:4001` passed all non-Codex lanes in
 `/tmp/litellm-dev-harness-2026-05-04-openrouter-wildcard.json`; the remaining
 red cases were the known Codex `gpt-5.3-codex-spark` `usage_limit_reached`
 path with reset at `2026-05-05T22:08:30Z`.
+
+---
+
+### aawm.40 — Explicit NVIDIA adapter wildcard for early model testing
+
+**Files:**
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+
+**Upstream issue:** Early NVIDIA NIM chat testing should not require a full
+LiteLLM config/model allowlist buildout for every newly exposed NVIDIA model.
+The existing NVIDIA adapter path only routed locally allowed bare model names,
+while explicit `nvidia/*` operator intent was not enough by itself.
+
+**Fix:** Treat literal `nvidia/*` Anthropic/Claude adapter model requests as an
+explicit NVIDIA NIM target and forward the stripped upstream model after the
+existing alias normalization. Unknown bare names, `nvidia_nim/*`, and
+`openrouter/*` do not receive this wildcard behavior. Existing OpenRouter
+namespace models such as `nvidia/nemotron-3-super-120b-a12b:free` remain on the
+OpenRouter adapter instead of being hijacked by the NVIDIA resolver.
+
+**Why not upstream:** This is an AAWM Claude adapter routing policy for local
+operator-driven model trials.
+
+**Validation status:** The full pass-through endpoint test module passed
+(`273 passed`) after the resolver and route coverage were added. Focused live
+Claude CLI validation on dev `:4001` used the current NVIDIA free endpoint
+model `nvidia/qwen/qwen3-coder-480b-a35b-instruct` and passed with artifact
+`/tmp/nvidia-qwen3-coder-wildcard-cli-4001.json`. The run dispatched a real
+Claude Code child agent, recorded `provider=nvidia_nim` and
+`model=qwen/qwen3-coder-480b-a35b-instruct` in `public.session_history`, and
+proved parallel `Read` / `Glob` / `Grep`, `Bash`, and `Write` tool calls.
 
 ---
 

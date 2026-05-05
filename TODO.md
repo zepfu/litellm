@@ -125,28 +125,26 @@ these docs only as needed:
   OpenAI/Gemini/NVIDIA/OpenRouter and for a later exact input-cost field if the
   proportional `response_cost_usd` estimate is not enough.
 
-- The `aawm.38` release candidate is prepared and published but is superseded
-  for current `develop`. The published base image was cut from `b022a0271c`;
-  current `develop` head `649cb61b6f` is post-`aawm.38` and includes additional
-  local embed/rerank/Nomic routes plus explicit `openrouter/*` Claude adapter
-  routing. Do not promote `ghcr.io/zepfu/litellm:1.82.3-aawm.38` as the final
-  cutover candidate for current code. The next prod candidate is the published
-  `v1.82.3-aawm.39` image/release, which should be rebuilt through
-  infrastructure and validated on prod `:4000` only after deployment approval.
+- The `aawm.38` and `aawm.39` release candidates are prepared/published but are
+  superseded for current `develop`. The `aawm.38` image predates the local
+  embed/rerank/Nomic routes and explicit `openrouter/*` Claude adapter routing;
+  the `aawm.39` image predates explicit `nvidia/*` Claude adapter wildcard
+  routing. Do not promote either as the final cutover candidate for current
+  code. The next prod candidate is `v1.82.3-aawm.40`, which should be rebuilt
+  through infrastructure and validated on prod `:4000` only after deployment
+  approval.
 
 - Post-`aawm.38` config/code is now present on `develop`: current OpenRouter
   rerank/embedding catalog entries, NVIDIA NIM free endpoint rerank/embedding
   entries, local `local_embed/*` routes for MedCPT article/query, SPECTER2,
   Indus, SapBERT, Nomic code embeddings, and
   `local_rerank/BAAI/bge-reranker-v2-m3`. `cfg-v0.0.9` is published with the
-  local-route cost-map entries, and the new base image is published as
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.39`. Build-only infrastructure validation
-  has produced local `aawm-litellm:latest` with the expected installed versions,
-  model-config overlay, and local route template. Before declaring prod cutover
-  complete, recreate/restart `aawm-litellm` only after explicit deployment
-  approval, then verify `NVIDIA_NIM_API_KEY` where direct NVIDIA NIM routes
-  should be callable and verify local TEI/Nomic/rerank services are reachable
-  from the running container via `host.docker.internal`.
+  local-route cost-map entries, and the next base image line is
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.40`. Before declaring prod cutover
+  complete, rebuild infrastructure, recreate/restart `aawm-litellm` only after
+  explicit deployment approval, then verify `NVIDIA_NIM_API_KEY` where direct
+  NVIDIA NIM routes should be callable and verify local TEI/Nomic/rerank
+  services are reachable from the running container via `host.docker.internal`.
 
 - Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
   `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and

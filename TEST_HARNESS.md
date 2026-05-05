@@ -212,6 +212,9 @@ Keep these out of the standard adapter harness run for now:
 - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
 - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
 - explicit OpenRouter wildcard targets: any normalized `openrouter/*` model may route through the OpenRouter Responses adapter, even when the exact model is not hardcoded in the local canary allowlist
+- explicit NVIDIA wildcard targets: any normalized `nvidia/*` model may route
+  through the NVIDIA completion adapter for early testing, except known
+  OpenRouter namespace models that intentionally remain on OpenRouter
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
 
 ## How to interpret results
@@ -367,6 +370,11 @@ Telemetry expectation:
   `claude_adapter_nvidia_glm47`, and `claude_adapter_nvidia_minimax_m27`; all
   are excluded from the default suite and should be run explicitly with
   `--cases`
+- Explicit `nvidia/*` model names may also route through the NVIDIA completion
+  adapter by wildcard for early NVIDIA NIM testing. Prefer mapped model names
+  for release gates when cost assertions matter; wildcard trials should still
+  prove `provider=nvidia_nim`, normalized upstream model attribution, route
+  tags, and tool activity when tools are involved.
 - `claude_adapter_nvidia_minimax_m27` is now an explicit opt-in harness case;
   keep the exact `nvidia/minimaxai/minimax-m2.7` spelling and expect this case
   to use upstream non-stream plus Anthropic-compatible fake streaming because

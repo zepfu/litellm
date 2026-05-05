@@ -686,6 +686,8 @@ def _normalize_anthropic_nvidia_responses_adapter_model_name(
     if explicit_provider not in (None, "nvidia") or candidate is None:
         return None
 
+    requested_model = model.strip() if isinstance(model, str) else ""
+    has_explicit_nvidia_prefix = requested_model.startswith("nvidia/")
     normalized_candidate = candidate.strip()
     nvidia_model_aliases = {
         "minimax/minimax-m2.7": "minimaxai/minimax-m2.7",
@@ -693,6 +695,11 @@ def _normalize_anthropic_nvidia_responses_adapter_model_name(
     normalized_candidate = nvidia_model_aliases.get(
         normalized_candidate, normalized_candidate
     )
+    is_openrouter_namespace_model = (
+        requested_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS
+    )
+    if has_explicit_nvidia_prefix and not is_openrouter_namespace_model:
+        return normalized_candidate or None
     if normalized_candidate in _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS:
         return normalized_candidate
     return None

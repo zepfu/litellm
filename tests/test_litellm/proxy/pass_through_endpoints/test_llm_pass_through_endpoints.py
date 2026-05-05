@@ -4383,6 +4383,68 @@ class TestClaudePersistedOutputExpansion:
             == expected_model
         )
 
+    def test_resolve_anthropic_nvidia_responses_adapter_model_supports_unknown_nvidia_prefix(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_nvidia_responses_adapter_model,
+        )
+
+        request_body = {"model": "nvidia/acme/new-model"}
+
+        assert (
+            _resolve_anthropic_nvidia_responses_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == "acme/new-model"
+        )
+
+    @pytest.mark.parametrize(
+        "requested_model",
+        [
+            "acme/new-model",
+            "nvidia_nim/acme/new-model",
+            "openrouter/acme/new-model",
+        ],
+    )
+    def test_resolve_anthropic_nvidia_responses_adapter_model_skips_unknown_non_nvidia_prefixes(
+        self,
+        requested_model: str,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_nvidia_responses_adapter_model,
+        )
+
+        assert (
+            _resolve_anthropic_nvidia_responses_adapter_model(
+                {"model": requested_model}, endpoint="v1/messages"
+            )
+            is None
+        )
+
+    def test_resolve_anthropic_nvidia_responses_adapter_model_preserves_openrouter_nvidia_namespace(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_nvidia_responses_adapter_model,
+            _resolve_anthropic_openrouter_responses_adapter_model,
+        )
+
+        request_body = {"model": "nvidia/nemotron-3-super-120b-a12b:free"}
+
+        assert (
+            _resolve_anthropic_nvidia_responses_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            is None
+        )
+        assert (
+            _resolve_anthropic_openrouter_responses_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == "nvidia/nemotron-3-super-120b-a12b:free"
+        )
+
     def test_resolve_anthropic_google_completion_adapter_model_skips_openrouter_google_namespace(
         self,
     ):
@@ -5218,7 +5280,151 @@ class TestClaudePersistedOutputExpansion:
             in call_kwargs["litellm_metadata"]["tags"]
         )
         assert (
-            f"anthropic-adapter-target:nvidia:/v1/chat/completions"
+            "anthropic-adapter-target:nvidia:/v1/chat/completions"
+            in call_kwargs["litellm_metadata"]["tags"]
+        )
+        assert call_kwargs["litellm_metadata"]["langfuse_spans"][0]["name"] == (
+            "anthropic.nvidia_completion_adapter"
+        )
+        assert (
+            mock_request.scope["query_string"]
+            == b"beta=true -> integrate.api.nvidia.com/v1/chat/completions"
+        )
+        mock_validate_egress.assert_called_once_with(
+            url="https://integrate.api.nvidia.com/v1/chat/completions",
+            headers={"Authorization": "Bearer nvidia-test-key"},
+            credential_family="nvidia",
+            expected_target_family="nvidia",
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_adapts_unknown_nvidia_prefixed_model_to_completion_adapter(
+        self,
+    ):
+        request_body = {
+            "model": "nvidia/acme/new-model",
+            "max_tokens": 256,
+            "metadata": {"existing_key": "existing-value"},
+            "litellm_metadata": {
+                "session_id": "nvidia-session-unknown",
+                "trace_environment": "prod",
+            },
+            "messages": [{"role": "user", "content": "Say unknown nvidia ok"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer anthropic-cli-token",
+            "anthropic-version": "2023-06-01",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
+            return_value="nvidia-test-key",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ) as mock_validate_egress, patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+            new=AsyncMock(
+                return_value={
+                    "id": "msg_unknown_nvidia_prefix",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "acme/new-model",
+                    "content": [{"type": "text", "text": "unknown nvidia ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                    },
+                }
+            ),
+        ) as mock_completion_adapter:
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        translated_body = json.loads(result.body.decode("utf-8"))
+        assert translated_body["model"] == "acme/new-model"
+        call_kwargs = mock_completion_adapter.await_args.kwargs
+        assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.NVIDIA_NIM.value
+        assert call_kwargs["api_key"] == "nvidia-test-key"
+        assert call_kwargs["api_base"] == "https://integrate.api.nvidia.com/v1"
+        assert call_kwargs["model"] == "acme/new-model"
+        assert (
+            call_kwargs["metadata"]["passthrough_route_family"]
+            == "anthropic_nvidia_completion_adapter"
+        )
+        assert call_kwargs["metadata"]["anthropic_adapter_model"] == "acme/new-model"
+        assert (
+            call_kwargs["metadata"]["anthropic_adapter_original_model"]
+            == "nvidia/acme/new-model"
+        )
+        assert (
+            call_kwargs["metadata"]["anthropic_adapter_target_endpoint"]
+            == "nvidia:/v1/chat/completions"
+        )
+        assert (
+            "anthropic-nvidia-completion-adapter" in call_kwargs["metadata"]["tags"]
+        )
+        assert (
+            "anthropic-adapter-model:acme/new-model"
+            in call_kwargs["metadata"]["tags"]
+        )
+        assert (
+            "anthropic-adapter-target:nvidia:/v1/chat/completions"
+            in call_kwargs["metadata"]["tags"]
+        )
+        assert call_kwargs["metadata"]["langfuse_spans"][0]["name"] == (
+            "anthropic.nvidia_completion_adapter"
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["passthrough_route_family"]
+            == "anthropic_nvidia_completion_adapter"
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["anthropic_adapter_model"]
+            == "acme/new-model"
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["anthropic_adapter_original_model"]
+            == "nvidia/acme/new-model"
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["anthropic_adapter_target_endpoint"]
+            == "nvidia:/v1/chat/completions"
+        )
+        assert (
+            "anthropic-nvidia-completion-adapter"
+            in call_kwargs["litellm_metadata"]["tags"]
+        )
+        assert (
+            "anthropic-adapter-model:acme/new-model"
+            in call_kwargs["litellm_metadata"]["tags"]
+        )
+        assert (
+            "anthropic-adapter-target:nvidia:/v1/chat/completions"
             in call_kwargs["litellm_metadata"]["tags"]
         )
         assert call_kwargs["litellm_metadata"]["langfuse_spans"][0]["name"] == (
