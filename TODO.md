@@ -125,38 +125,10 @@ these docs only as needed:
   OpenAI/Gemini/NVIDIA/OpenRouter and for a later exact input-cost field if the
   proportional `response_cost_usd` estimate is not enough.
 
-- The `aawm.38`, `aawm.39`, and stale pre-publication `aawm.40` / `aawm.41` release
-  candidates are superseded for current `develop`. The `aawm.38` image predates
-  the local embed/rerank/Nomic routes and explicit `openrouter/*` Claude
-  adapter routing; the `aawm.39` image predates explicit `nvidia/*` Claude
-  adapter wildcard routing; and the `aawm.40` / `aawm.41` tags predate harness
-  autobumps on current `main`. Do not promote those lines as the final cutover
-  candidate for current code. The next prod candidate is
-  `v1.82.3-aawm.42`, which is published and has passed infrastructure
-  build-only inspection. Validate it on prod `:4000` only after deployment
-  approval.
-
-- Post-`aawm.38` config/code is now present on `develop`: current OpenRouter
-  rerank/embedding catalog entries, NVIDIA NIM free endpoint rerank/embedding
-  entries, local `local_embed/*` routes for MedCPT article/query, SPECTER2,
-  Indus, SapBERT, Nomic code embeddings, and
-  `local_rerank/BAAI/bge-reranker-v2-m3`. `cfg-v0.0.9` is published with the
-  local-route cost-map entries, `h-v0.0.27` is the current harness overlay, and
-  the next base image line is
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.42`. Infrastructure commit `3eaf1e7` on
-  `develop` pins the standalone build to that image and build-only validation
-  passed locally. Before declaring prod cutover complete, recreate/restart
-  `aawm-litellm` only after explicit deployment approval, then verify
-  `NVIDIA_NIM_API_KEY` where direct NVIDIA NIM routes should be callable and
-  verify local TEI/Nomic/rerank services are reachable from the running
-  container via `host.docker.internal`.
-
-- Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
-  `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and
-  the `h-v0.0.21` harness. The stale `langfuse_trace_name:
-  claude-code.orchestrator` child trace-name overwrite is resolved and proven in
-  `/tmp/litellm-prod-aawm37-cb12-focused-no-openrouter.json`; do not redo that
-  fix unless the same trace-header overwrite signature recurs.
+- Prod `:4000` is on `v1.82.3-aawm.42`; detailed cutover, smoke, and harness
+  evidence lives in [COMPLETED.md](COMPLETED.md). The only release follow-up is
+  to rerun the Codex/Spark slices after the documented ChatGPT/Codex quota reset
+  (`2026-05-05T22:08:30Z`) if a fully green prod artifact is required.
 
 - OpenRouter `inclusionai/ling-2.6-flash:free` is no longer a viable release
   gate or active target path. The focused dev rerun at

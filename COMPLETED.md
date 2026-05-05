@@ -2,11 +2,76 @@
 
 ## 2026-05-05
 
-- Prepared `aawm.42` as the current source release candidate after the
+- Promoted the prepared `aawm.42` LiteLLM release to prod `:4000` after explicit
+  approval. `/home/zepfu/projects/aawm-infrastructure` had already pinned
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.42`; running
+  `docker compose -f docker-compose.litellm.yml up -d litellm` recreated
+  `aawm-litellm` from the prepared local image.
+
+  Runtime evidence:
+  container id `9a393cd2e8592cbd875765fb57c7bc6ff2bc70c01a4c6dfa00ce403cee58600d`,
+  image digest
+  `sha256:4c983f7498352d8347313a1a84c42b983d379ad84fbe2809ade8684e1764d965`,
+  started `2026-05-05T15:24:04.367723754Z`, Docker health `healthy`, and
+  `127.0.0.1:4000->4000/tcp`. `/health/readiness` returned `status=healthy`,
+  `litellm_version=1.82.3+aawm.42`, and success callbacks including
+  `LangfusePromptManagement` and `AawmAgentIdentity`. Package inspection inside
+  the container reported `litellm=1.82.3+aawm.42`,
+  `aawm-litellm-callbacks=0.0.16`, and
+  `aawm-litellm-control-plane=0.0.6`.
+
+  Config and smoke evidence:
+  the rendered `/etc/litellm/config.yaml` contains the expected local,
+  OpenRouter, and NVIDIA embed/rerank routes, including
+  `local_embed/nomic-embed-code.Q8_0.gguf`,
+  `local_rerank/BAAI/bge-reranker-v2-m3`,
+  `openrouter/qwen/qwen3-embedding-8b`,
+  `openrouter/cohere/rerank-4-pro`,
+  `openrouter/google/gemini-embedding-2-preview`,
+  `nvidia_nim/nvidia/nv-embed-v1`, and
+  `nvidia_nim/nvidia/rerank-qa-mistral-4b`.
+  OpenRouter smoke session `prod-or-embed-rerank-1777994780` returned
+  embedding dims `4096` and rerank results `2`. Local smoke session
+  `prod-local-embed-rerank-1777994797` returned embedding dims `3584` and
+  rerank results `2`. `public.session_history` recorded the expected prod rows
+  for `openrouter/qwen/qwen3-embedding-8b`,
+  `openrouter/cohere/rerank-4-pro`,
+  `local_embed/nomic-embed-code.Q8_0.gguf`, and
+  `local_rerank/BAAI/bge-reranker-v2-m3`, with `litellm_environment=prod` and
+  `litellm_version=1.82.3+aawm.42`.
+
+  Harness evidence:
+  focused prod artifact `/tmp/litellm-prod-focused-aawm42.json` proved the
+  changed OpenRouter/free and peeromega lanes, with the peeromega red result
+  limited to the expected missing Codex Spark row from quota pressure. Default
+  prod artifact `/tmp/litellm-prod-harness-1.82.3-aawm.42.json` passed
+  `claude_adapter_gpt54`, `claude_adapter_gpt55`,
+  `claude_adapter_gpt54_mini`, both context-marker cases,
+  `claude_adapter_gemini_fanout`,
+  `claude_adapter_gpt55_read_pages_sanitizer`,
+  `claude_adapter_gemini31_pro`, `claude_adapter_openrouter_free`,
+  `claude_adapter_nemotron_super`, and `claude_adapter_gemini31_flash`. The
+  only failing cases were `claude_adapter_codex_tool_activity`,
+  `claude_adapter_peeromega_fanout`, and `claude_adapter_spark`, all matching
+  the documented ChatGPT/Codex `usage_limit_reached` quota path with
+  `resets_at=1778018910` (`2026-05-05T22:08:30Z`). Post-harness log scan found
+  no `Content-Length`, `h11`, `KeyError: choices`, ASGI task, or database
+  blockers. It did show the same Codex quota tracebacks, OpenRouter free-tier
+  upstream 429 pacing, and one non-blocking Anthropic
+  `/messages/count_tokens` 404 for `model: openai/gpt-5.5`; the associated
+  `claude_adapter_gpt55` message case still passed.
+
+  Documentation changed:
+  `TODO.md`, `COMPLETED.md`, `.analysis/todo.md`, and
+  `.analysis/completed.md`.
+
+- Prepared `aawm.42` as the source release candidate after the
   `h-v0.0.27` artifact autobump advanced `main` beyond the stale
   `v1.82.3-aawm.41` tag. The `aawm.40` and `aawm.41` tags were not
   force-moved; they remain stale pre-publication candidates with no GitHub
-  Release/image.
+  Release/image. This entry records the pre-cutover prep state; the later
+  `aawm.42` prod promotion is recorded above.
 
   Changed/prepped release docs and version metadata:
   `pyproject.toml`, `PATCHES.md`, `PROD_RELEASE.md`, `TODO.md`,
@@ -37,11 +102,11 @@
   `aawm-litellm-control-plane=0.0.6`, and contains the expected
   local/OpenRouter/NVIDIA embed/rerank config and cost-map entries.
 
-  No prod `aawm-litellm` restart was performed. The running prod container
-  remains container id `d23e6347f2da`, image digest `86d47957357f`, started at
-  `2026-05-02T20:23:17.641026988Z`, healthy on `127.0.0.1:4000->4000/tcp`.
-  The remaining action is only the explicit approved recreate/restart plus prod
-  `:4000` validation harness.
+  At prep time, no prod `aawm-litellm` restart was performed. The then-running
+  prod container was id `d23e6347f2da`, image digest `86d47957357f`, started at
+  `2026-05-02T20:23:17.641026988Z`, healthy on
+  `127.0.0.1:4000->4000/tcp`. This was subsequently superseded by the approved
+  `aawm.42` prod cutover recorded above.
 
 - Prepared `aawm.41` as a now-superseded source release candidate after the
   `h-v0.0.26` artifact autobump advanced `main` beyond the stale
