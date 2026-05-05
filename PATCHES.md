@@ -29,7 +29,15 @@ and is no longer carried as a separate patch.
 
 **Versioning scheme:** `{upstream_version}+aawm.{patch_number}` (PEP 440 local version)
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
-Current release-prep patch set: `aawm.2`, `aawm.3`, `aawm.4`, `aawm.5`, `aawm.6`, `aawm.7`, `aawm.8`, `aawm.9`, `aawm.10`, `aawm.11`, `aawm.12`, `aawm.13`, `aawm.14`, `aawm.15`, `aawm.16`, `aawm.17`, `aawm.18`, `aawm.19`, `aawm.20`, `aawm.21`, `aawm.22`, `aawm.23`, `aawm.24`, `aawm.25`, `aawm.26`, `aawm.27`, `aawm.28`, `aawm.29`, `aawm.30`, `aawm.31`, `aawm.32`, `aawm.33`, `aawm.34`, `aawm.35`, `aawm.36`, `aawm.37`, `aawm.38` (37 active carried patches). The `aawm.38` release candidate is published as `v1.82.3-aawm.38` / `ghcr.io/zepfu/litellm:1.82.3-aawm.38` with overlay assets `cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.24`, and `cfg-v0.0.7`; prod remains on the last validated image until infrastructure is rebuilt and validated on `:4000`.
+Current release-prep patch set carries `aawm.2` through `aawm.39` (38 active
+carried patches; `aawm.1` is dropped). The published `aawm.38` release
+candidate was cut at `b022a0271c` as `v1.82.3-aawm.38` /
+`ghcr.io/zepfu/litellm:1.82.3-aawm.38` with overlay assets `cb-v0.0.15`,
+`cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.8`, but current `develop` is
+post-`aawm.38` and must not promote that image as the final cutover candidate.
+Current `develop` needs a new fork image/tag from `649cb61b6f` or newer so prod
+includes the post-tag local embed/rerank/Nomic routes and explicit
+`openrouter/*` Claude adapter routing.
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -38,7 +46,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.38`.
+`1.82.3+aawm.39`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1347,6 +1355,57 @@ populated `input_system_tokens_estimated`,
 `/tmp/native_codex_4001_prompt_overhead_cost_share.json` plus
 `/tmp/native_openai_prompt_overhead_cost_share_4001.json` populated the harness
 `summary.prompt_overhead_cost_share` report.
+
+---
+
+### aawm.39 — Local embed/rerank routes and explicit OpenRouter adapter wildcard
+
+**Files:**
+- `pyproject.toml`
+- `litellm-dev-config.yaml`
+- `model_prices_and_context_window.json`
+- `litellm/bundled_model_prices_and_context_window_fallback.json`
+- `litellm/integrations/aawm_agent_identity.py`
+- `litellm/llms/base_llm/rerank/transformation.py`
+- `litellm/llms/huggingface/rerank/transformation.py`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `tests/test_litellm/test_cost_calculator.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `LOCAL_EMBED_RERANK_CONSUMER.md`
+
+**Upstream issue:** AAWM now runs local TEI, Nomic code embedding, and BGE
+rerank services that should be consumed through LiteLLM rather than direct
+service ports, while still producing usable `session_history` provider/model
+and cost rows. Claude adapter routing also needed a low-touch path for explicit
+`openrouter/*` model names that are not hardcoded in the local allowlist.
+
+**Fix:** Add local provider/cost-map entries under `local_embed/*` and
+`local_rerank/*`, including MedCPT article/query, SPECTER2, Indus, SapBERT,
+Nomic code embeddings, and `BAAI/bge-reranker-v2-m3`. Dev config exposes those
+routes through local TEI/Nomic/rerank services and applies estimated
+commercial-equivalent prices so `session_history.response_cost_usd` remains
+populated. The local consumer doc records the proxy-facing aliases and
+required attribution headers.
+
+The same patch line allows explicitly prefixed `openrouter/*` Anthropic
+adapter model requests to route through the OpenRouter Responses adapter after
+normalization, without changing the separate OpenRouter embedding/rerank
+process.
+
+**Why not upstream:** The local service topology, pricing estimates,
+consumer-facing aliases, and `session_history` attribution policy are
+AAWM-specific. The OpenRouter wildcard is also scoped to AAWM's Claude adapter
+routing policy.
+
+**Validation status:** Focused local provider, cost, and session-history unit
+tests passed, including local rerank token/cost attribution and Nomic
+embedding metadata. The pass-through endpoint test module passed
+(`267 passed`) after the explicit `openrouter/*` adapter routing change. Full
+dev harness on `:4001` passed all non-Codex lanes in
+`/tmp/litellm-dev-harness-2026-05-04-openrouter-wildcard.json`; the remaining
+red cases were the known Codex `gpt-5.3-codex-spark` `usage_limit_reached`
+path with reset at `2026-05-05T22:08:30Z`.
 
 ---
 

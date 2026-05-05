@@ -1,5 +1,25 @@
 # Completed
 
+## 2026-05-05
+
+- Reopened the 2026-05-01 `aawm.38` cutover shape for current `develop`.
+  `v1.82.3-aawm.38` remains a published historical candidate cut from
+  `b022a0271c`, but current `develop` head `649cb61b6f` is post-tag and
+  requires a new fork image/tag before prod cutover. The release-prep source
+  now targets `1.82.3+aawm.39` so the next image includes the local
+  embed/rerank/Nomic routes and explicit `openrouter/*` Claude adapter routing.
+
+  Validation evidence carried forward: focused pass-through tests passed
+  (`267 passed`), and the full dev harness artifact
+  `/tmp/litellm-dev-harness-2026-05-04-openrouter-wildcard.json` passed every
+  non-Codex lane. The only red default-harness cases were the known Codex
+  `gpt-5.3-codex-spark` `usage_limit_reached` path with reset at
+  `2026-05-05T22:08:30Z`. No prod restart was performed.
+
+  Documentation/prep changed:
+  `pyproject.toml`, `PATCHES.md`, `PROD_RELEASE.md`, `TODO.md`,
+  `COMPLETED.md`, `TEST_HARNESS.md`, and `WHEEL.md`.
+
 ## 2026-05-01
 
 - Added config support for the current OpenRouter rerank/embedding catalog and

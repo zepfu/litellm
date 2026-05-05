@@ -6,7 +6,8 @@ This repository has two distinct local validation paths:
 - the Anthropic-route adapter harness for real Claude CLI validation on `:4001`
 
 The adapter suite is the one that matters for the Anthropic -> OpenAI/Codex,
-Anthropic -> Google Code Assist, and Anthropic -> OpenRouter work.
+Anthropic -> Google Code Assist, Anthropic -> OpenRouter, and Anthropic ->
+NVIDIA work.
 
 For the production promotion process, see `PROD_RELEASE.md`.
 
@@ -210,6 +211,7 @@ Keep these out of the standard adapter harness run for now:
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
 - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
 - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
+- explicit OpenRouter wildcard targets: any normalized `openrouter/*` model may route through the OpenRouter Responses adapter, even when the exact model is not hardcoded in the local canary allowlist
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
 
 ## How to interpret results
@@ -447,9 +449,9 @@ The harness is also published separately as a compressed artifact under `h-v*`
 releases. See `WHEEL.md` for the artifact layout and `scripts/local-ci/README.md`
 for the bundle-local usage notes.
 
-Current local harness source version is `0.0.24` in
-`scripts/local-ci/harness-version.txt`, and the prepared aawm.38 release
-candidate uses `h-v0.0.24`. The current minimum released bundle for the
+Current local harness source version is `0.0.25` in
+`scripts/local-ci/harness-version.txt`, and the current post-aawm.38 release
+prep uses `h-v0.0.25`. The current minimum released bundle for the
 historical aawm.37 / `cb-v0.0.12` prod validation line remains `h-v0.0.21`; it
 includes the controlled Claude settings overlay, tenant-only trace-user
 validation, the longer peeromega fanout timeout for prod `:4000` validation,
