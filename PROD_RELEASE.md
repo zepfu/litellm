@@ -251,17 +251,12 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
 Do not use `:latest` as the prod base image pin. Production infrastructure
 should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
-or the current promoted prod line. As of 2026-05-05, the last promoted prod
-line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the published but unpromoted
-base candidates `ghcr.io/zepfu/litellm:1.82.3-aawm.38` and
-`ghcr.io/zepfu/litellm:1.82.3-aawm.39` are no longer the correct cutover
-candidates for current `develop`. The stale `v1.82.3-aawm.40` and
-`v1.82.3-aawm.41` tags were cut before artifact autobumps advanced `main`, so
-do not force-move them; cut and promote the new current fork image candidate
-`ghcr.io/zepfu/litellm:1.82.3-aawm.42` instead. That candidate includes the
-explicit `nvidia/*` Claude adapter routing for low-touch NVIDIA NIM model
-trials. The current expected overlay line is
-`cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.27`, and `cfg-v0.0.9`.
+or the current promoted prod line recorded in `COMPLETED.md`. Do not hard-code
+the promoted version in this runbook; use it as process documentation and keep
+exact image, overlay, container, and artifact versions in release evidence.
+When artifact autobumps advance `main` after a candidate tag is cut, preserve
+the stale tag and cut a new tag from the current `main` head. Do not force-move
+published release tags.
 
 ## Prod Validation
 
@@ -486,7 +481,12 @@ After prod validation passes:
 - Update `COMPLETED.md` with the promoted image version, overlay artifact
   versions, harness artifact path, focused cases, default prod harness result,
   and any warning-only opt-in outcomes.
-- Keep unresolved follow-up hardening in `TODO.md`.
+- Keep unresolved follow-up hardening in `TODO.md`; move completed promotion
+  evidence out of `TODO.md` and into `COMPLETED.md`.
+- Check durable process docs for stale "current version" wording before closing
+  the release. Reusable runbooks should describe how to discover the current
+  image, overlay, and harness versions instead of pinning a specific release
+  line in prose.
 
 ## Rollback
 
