@@ -194,6 +194,9 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    The fork image and model-config archive can contain the code and pricing, but
    prod will not expose the model until the compose-rendered config includes a
    `model_list` entry and the required upstream key is available in `.env`.
+   For local TEI/Nomic/rerank services, production config should route through
+   `host.docker.internal:<port>` from the container rather than a Docker bridge
+   IP such as `172.20.0.1`.
 
 2. Build the prod image.
 
@@ -217,7 +220,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    ```bash
    docker run --rm --entrypoint python3 aawm-litellm:latest -c \
-     "import json,pathlib; p=pathlib.Path('/usr/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json'); d=json.loads(p.read_text()); keys=['openrouter/qwen/qwen3-embedding-8b','openrouter/cohere/rerank-4-pro','openrouter/google/gemini-embedding-2-preview','nvidia_nim/nvidia/rerank-qa-mistral-4b','nvidia_nim/nvidia/nv-embed-v1']; print({k:d.get(k) for k in keys})"
+     "import json,pathlib; p=pathlib.Path('/usr/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json'); d=json.loads(p.read_text()); keys=['openrouter/qwen/qwen3-embedding-8b','openrouter/cohere/rerank-4-pro','openrouter/google/gemini-embedding-2-preview','nvidia_nim/nvidia/rerank-qa-mistral-4b','nvidia_nim/nvidia/nv-embed-v1','local_embed/ncbi/MedCPT-Article-Encoder','local_embed/ncbi/MedCPT-Query-Encoder','local_embed/allenai/specter2_base','local_embed/nasa-impact/nasa-ibm-st.38m','local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext','local_embed/nomic-embed-code.Q8_0.gguf','local_rerank/BAAI/bge-reranker-v2-m3']; print({k:d.get(k) for k in keys})"
    ```
 
 3. Start the prod container.
@@ -237,7 +240,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    ```bash
    docker exec aawm-litellm sh -lc \
-     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1' /etc/litellm/config.yaml"
+     "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1|local_embed/nomic-embed-code.Q8_0.gguf|local_rerank/BAAI/bge-reranker-v2-m3' /etc/litellm/config.yaml"
    ```
 
 6. Inspect startup logs.
@@ -248,13 +251,15 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
 Do not use `:latest` as the prod base image pin. Production infrastructure
 should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
-or the current promoted prod line. As of 2026-05-01, the last promoted prod
-line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the prepared but not yet
-promoted base candidate is `ghcr.io/zepfu/litellm:1.82.3-aawm.38` with
-`cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.8`. The
-OpenRouter/NVIDIA rerank+embedding catalog work landed after that base image
-was cut and is promoted through the `cfg-v0.0.8` overlay plus an infrastructure
-rebuild with the updated config template.
+or the current promoted prod line. As of 2026-05-05, the last promoted prod
+line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the published but unpromoted
+base candidate `ghcr.io/zepfu/litellm:1.82.3-aawm.38` is no longer the correct
+cutover candidate for current `develop`. Current `develop` at `649cb61b6f`
+requires a new fork image/tag, prepared in source as `1.82.3+aawm.39`, because
+the `aawm.38` image predates the local embed/rerank/Nomic routes and explicit
+`openrouter/*` Claude adapter routing. The expected overlay line remains
+`cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.8` unless newer
+versioned releases are intentionally cut before the rebuild.
 
 ## Prod Validation
 
@@ -328,6 +333,26 @@ stored in `metadata` instead of dedicated columns:
 ```bash
 docker exec aawm-postgres18 psql -U aawm -d aawm_tristore -Atqc \
   "select provider, model, call_type, tenant_id, input_tokens, output_tokens, total_tokens, response_cost_usd, litellm_environment, litellm_version, metadata from public.session_history where session_id = '<session-id>' order by start_time;"
+```
+
+For local embedding/rerank promotion, also smoke one local embedding and one
+local rerank route through the proxy. This validates container access to the
+host-local services plus `session_history` provider/cost attribution:
+
+```bash
+LITELLM_API_KEY="${LITELLM_API_KEY:-prod-local-embed-rerank-smoke}" \
+./.venv/bin/python -c 'import json, os, time, urllib.request
+base="http://127.0.0.1:4000"
+session=f"prod-local-embed-rerank-{int(time.time())}"
+api_key=os.environ["LITELLM_API_KEY"]
+headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","x-litellm-session-id":session,"x-aawm-tenant-id":"tenant-local-prod-validation","x-litellm-end-user-id":"user-local-prod-validation","x-litellm-agent-id":"prod-cutover-local-smoke","langfuse_trace_user_id":"user-local-prod-validation"}
+def post(path,payload):
+    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers=headers,method="POST")
+    with urllib.request.urlopen(req,timeout=90) as r:
+        return json.loads(r.read().decode())
+emb=post("/v1/embeddings",{"model":"nomic-embed-code","input":"def add(a, b): return a + b"})
+rerank=post("/rerank",{"model":"tei-reranker","query":"Which document mentions local proxy routing?","documents":["Call the local service port directly.","Call AAWM LiteLLM and let it route local services."],"top_n":2,"return_documents":True})
+print(json.dumps({"session":session,"embedding_dims":len(emb["data"][0]["embedding"]),"embedding_usage":emb.get("usage"),"rerank_results":len(rerank.get("results",[])),"rerank_meta":rerank.get("meta")},sort_keys=True))'
 ```
 
 For native passthrough changes, run the opt-in native shard in the existing

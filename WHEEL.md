@@ -153,9 +153,9 @@ Current responsibilities:
 - fast drift checks when model metadata changes without a full base release
 - current adapter-cost policy support, including paid-equivalent pricing for
   selected OpenRouter `:free` aliases when OpenRouter publishes a non-free twin
-- current OpenRouter rerank/embedding catalog metadata and direct NVIDIA NIM
-  free endpoint embedding/rerank metadata once `cfg-v0.0.8` or newer is
-  published
+- current OpenRouter rerank/embedding catalog metadata, direct NVIDIA NIM free
+  endpoint embedding/rerank metadata, and local `local_embed/*` /
+  `local_rerank/*` metadata including `local_embed/nomic-embed-code.Q8_0.gguf`
 
 Source-of-truth rule:
 
@@ -343,8 +343,9 @@ The current Anthropic-route multi-provider adapter work is split intentionally:
 - harness/config artifacts:
   - validation policy and model/pricing distribution
 
-In other words: OpenAI/Codex, Google Code Assist, and OpenRouter adaptation on
-`/anthropic/v1/messages` is currently base-fork behavior, not an overlay wheel.
+In other words: OpenAI/Codex, Google Code Assist, OpenRouter, and NVIDIA
+adaptation on `/anthropic/v1/messages` is currently base-fork behavior, not an
+overlay wheel.
 
 ### What infra should pin
 
