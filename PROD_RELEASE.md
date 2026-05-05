@@ -254,12 +254,11 @@ should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n
 or the current promoted prod line. As of 2026-05-05, the last promoted prod
 line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the published but unpromoted
 base candidate `ghcr.io/zepfu/litellm:1.82.3-aawm.38` is no longer the correct
-cutover candidate for current `develop`. Current `develop` at `649cb61b6f`
-requires a new fork image/tag, prepared in source as `1.82.3+aawm.39`, because
-the `aawm.38` image predates the local embed/rerank/Nomic routes and explicit
-`openrouter/*` Claude adapter routing. The expected overlay line remains
-`cb-v0.0.15`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.8` unless newer
-versioned releases are intentionally cut before the rebuild.
+cutover candidate for current `develop`. The current fork image candidate is
+`ghcr.io/zepfu/litellm:1.82.3-aawm.39`, because the `aawm.38` image predates
+the local embed/rerank/Nomic routes and explicit `openrouter/*` Claude adapter
+routing. The current expected overlay line is
+`cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.9`.
 
 ## Prod Validation
 

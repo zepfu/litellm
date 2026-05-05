@@ -130,19 +130,19 @@ these docs only as needed:
   current `develop` head `649cb61b6f` is post-`aawm.38` and includes additional
   local embed/rerank/Nomic routes plus explicit `openrouter/*` Claude adapter
   routing. Do not promote `ghcr.io/zepfu/litellm:1.82.3-aawm.38` as the final
-  cutover candidate for current code. The next prod candidate needs a new fork
-  version/tag/image, currently prepared in source as `1.82.3+aawm.39`, before
-  infrastructure is rebuilt and prod `:4000` is restarted.
+  cutover candidate for current code. The next prod candidate is the published
+  `v1.82.3-aawm.39` image/release, which should be rebuilt through
+  infrastructure and validated on prod `:4000` only after deployment approval.
 
 - Post-`aawm.38` config/code is now present on `develop`: current OpenRouter
   rerank/embedding catalog entries, NVIDIA NIM free endpoint rerank/embedding
   entries, local `local_embed/*` routes for MedCPT article/query, SPECTER2,
   Indus, SapBERT, Nomic code embeddings, and
-  `local_rerank/BAAI/bge-reranker-v2-m3`. `cfg-v0.0.8` is published for the
-  OpenRouter/NVIDIA model-config work, while the local-route code and bundled
-  local cost-map entries require the new base image. Before prod cutover,
-  publish the new base image, rebuild infrastructure so the template exposes
-  the full model list, inspect the built image's installed versions and
+  `local_rerank/BAAI/bge-reranker-v2-m3`. `cfg-v0.0.9` is published with the
+  local-route cost-map entries, and the new base image is published as
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.39`. Before prod cutover, rebuild
+  infrastructure so the template exposes the full model list, inspect the
+  built image's installed versions and
   model-config overlay, verify `NVIDIA_NIM_API_KEY` where direct NVIDIA NIM
   routes should be callable, and verify local TEI/Nomic/rerank services are
   reachable from the container via `host.docker.internal`.
