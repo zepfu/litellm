@@ -20,10 +20,28 @@
   `c866e2115f2f14f32a7e5cb73f2d8f73bac1df9311359acf9484469f9db86e5c`, and the
   release was published at `https://github.com/zepfu/litellm/releases/tag/h-v0.0.27`.
 
-  No prod `aawm-litellm` restart was performed. The remaining release-prep work
-  is to commit/push, publish `v1.82.3-aawm.42`, update/rebuild
-  `/home/zepfu/projects/aawm-infrastructure`, inspect the built image, and only
-  recreate prod `:4000` after explicit deployment approval.
+  Published source/image evidence:
+  `v1.82.3-aawm.42` was published at
+  `https://github.com/zepfu/litellm/releases/tag/v1.82.3-aawm.42`, and the
+  fork image is `ghcr.io/zepfu/litellm:1.82.3-aawm.42`.
+
+  Infrastructure prep evidence:
+  `/home/zepfu/projects/aawm-infrastructure` commit `3eaf1e7` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.42`, adds `AAWM_OPENROUTER_API_KEY` and
+  `NVIDIA_NIM_API_KEY` to `.env.example`, and aligns the `CLIPROXYAPI_URL`
+  example with the compose default. Build-only validation passed with
+  `docker compose -f docker-compose.litellm.yml build --pull --no-cache litellm`.
+  Built image `aawm-litellm:latest` has image id `4c983f749835`, reports
+  `litellm=1.82.3+aawm.42`, `aawm-litellm-callbacks=0.0.16`, and
+  `aawm-litellm-control-plane=0.0.6`, and contains the expected
+  local/OpenRouter/NVIDIA embed/rerank config and cost-map entries.
+
+  No prod `aawm-litellm` restart was performed. The running prod container
+  remains container id `d23e6347f2da`, image digest `86d47957357f`, started at
+  `2026-05-02T20:23:17.641026988Z`, healthy on `127.0.0.1:4000->4000/tcp`.
+  The remaining action is only the explicit approved recreate/restart plus prod
+  `:4000` validation harness.
 
 - Prepared `aawm.41` as a now-superseded source release candidate after the
   `h-v0.0.26` artifact autobump advanced `main` beyond the stale

@@ -132,8 +132,9 @@ these docs only as needed:
   adapter wildcard routing; and the `aawm.40` / `aawm.41` tags predate harness
   autobumps on current `main`. Do not promote those lines as the final cutover
   candidate for current code. The next prod candidate is
-  `v1.82.3-aawm.42`, which should be rebuilt through infrastructure and
-  validated on prod `:4000` only after deployment approval.
+  `v1.82.3-aawm.42`, which is published and has passed infrastructure
+  build-only inspection. Validate it on prod `:4000` only after deployment
+  approval.
 
 - Post-`aawm.38` config/code is now present on `develop`: current OpenRouter
   rerank/embedding catalog entries, NVIDIA NIM free endpoint rerank/embedding
@@ -142,11 +143,13 @@ these docs only as needed:
   `local_rerank/BAAI/bge-reranker-v2-m3`. `cfg-v0.0.9` is published with the
   local-route cost-map entries, `h-v0.0.27` is the current harness overlay, and
   the next base image line is
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.42`. Before declaring prod cutover
-  complete, rebuild infrastructure, recreate/restart `aawm-litellm` only after
-  explicit deployment approval, then verify `NVIDIA_NIM_API_KEY` where direct
-  NVIDIA NIM routes should be callable and verify local TEI/Nomic/rerank
-  services are reachable from the running container via `host.docker.internal`.
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.42`. Infrastructure commit `3eaf1e7` on
+  `develop` pins the standalone build to that image and build-only validation
+  passed locally. Before declaring prod cutover complete, recreate/restart
+  `aawm-litellm` only after explicit deployment approval, then verify
+  `NVIDIA_NIM_API_KEY` where direct NVIDIA NIM routes should be callable and
+  verify local TEI/Nomic/rerank services are reachable from the running
+  container via `host.docker.internal`.
 
 - Prod `aawm-litellm` on `:4000` is running the rebuilt aawm.37 image with
   `aawm-litellm-callbacks==0.0.12`, `aawm-litellm-control-plane==0.0.6`, and
