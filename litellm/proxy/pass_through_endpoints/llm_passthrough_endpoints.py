@@ -790,6 +790,9 @@ def _resolve_anthropic_openrouter_responses_adapter_model(
         normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
         if normalized_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS:
             return normalized_model
+        explicit_provider, _ = _split_anthropic_adapter_provider_prefix(candidate)
+        if explicit_provider == "openrouter" and normalized_model is not None:
+            return normalized_model
     return None
 
 

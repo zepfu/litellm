@@ -4422,6 +4422,22 @@ class TestClaudePersistedOutputExpansion:
             == "google/gemma-4-31b-it:free"
         )
 
+    def test_resolve_anthropic_openrouter_responses_adapter_model_supports_unknown_openrouter_prefix(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_anthropic_openrouter_responses_adapter_model,
+        )
+
+        request_body = {"model": "openrouter/acme/new-model"}
+
+        assert (
+            _resolve_anthropic_openrouter_responses_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == "acme/new-model"
+        )
+
     def test_load_claude_agent_declared_model_tolerates_cp1252_agent_file(
         self, tmp_path, monkeypatch
     ):
@@ -4671,6 +4687,100 @@ class TestClaudePersistedOutputExpansion:
         )
 
     @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_adapts_unknown_openrouter_prefixed_model_to_responses(
+        self,
+    ):
+        request_body = {
+            "model": "openrouter/acme/new-model",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "Say unknown prefix ok"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer anthropic-cli-token",
+            "anthropic-version": "2023-06-01",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
+            return_value="openrouter-test-key",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(
+                return_value=Response(
+                    content=json.dumps(
+                        {
+                            "id": "resp_unknown_openrouter_prefix",
+                            "object": "response",
+                            "created_at": 1744974432,
+                            "model": "acme/new-model",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "unknown prefix ok",
+                                        }
+                                    ],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        }
+                    ).encode("utf-8"),
+                    status_code=200,
+                    media_type="application/json",
+                )
+            ),
+        ) as mock_pass_through_request:
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        translated_body = json.loads(result.body.decode("utf-8"))
+        assert translated_body["model"] == "acme/new-model"
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
+        assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
+        assert call_kwargs["forward_headers"] is False
+        assert call_kwargs["custom_body"]["model"] == "acme/new-model"
+        assert (
+            call_kwargs["custom_body"]["litellm_metadata"]["passthrough_route_family"]
+            == "anthropic_openrouter_responses_adapter"
+        )
+        assert (
+            mock_request.scope["query_string"]
+            == b"beta=true -> openrouter.ai/api/v1/responses"
+        )
+
+    @pytest.mark.asyncio
     async def test_anthropic_proxy_route_adapts_allowlisted_gemma_model_to_responses(
         self,
     ):
@@ -4821,7 +4931,17 @@ class TestClaudePersistedOutputExpansion:
                             "created_at": 1744974432,
                             "model": "openai/gpt-oss-20b:free",
                             "status": "completed",
-                            "output": [],
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "oss ok",
+                                        }
+                                    ],
+                                }
+                            ],
                             "usage": {
                                 "input_tokens": 1,
                                 "output_tokens": 1,
@@ -4916,7 +5036,17 @@ class TestClaudePersistedOutputExpansion:
                             "created_at": 1744974432,
                             "model": requested_model,
                             "status": "completed",
-                            "output": [],
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "model ok",
+                                        }
+                                    ],
+                                }
+                            ],
                             "usage": {
                                 "input_tokens": 1,
                                 "output_tokens": 1,
