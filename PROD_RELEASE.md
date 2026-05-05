@@ -255,13 +255,13 @@ or the current promoted prod line. As of 2026-05-05, the last promoted prod
 line is `ghcr.io/zepfu/litellm:1.82.3-aawm.37`; the published but unpromoted
 base candidates `ghcr.io/zepfu/litellm:1.82.3-aawm.38` and
 `ghcr.io/zepfu/litellm:1.82.3-aawm.39` are no longer the correct cutover
-candidates for current `develop`. The stale `v1.82.3-aawm.40` tag was cut
-before the `h-v0.0.26` artifact autobump advanced `main`, so do not force-move
-it; cut and promote the new current fork image candidate
-`ghcr.io/zepfu/litellm:1.82.3-aawm.41` instead. That candidate includes the
+candidates for current `develop`. The stale `v1.82.3-aawm.40` and
+`v1.82.3-aawm.41` tags were cut before artifact autobumps advanced `main`, so
+do not force-move them; cut and promote the new current fork image candidate
+`ghcr.io/zepfu/litellm:1.82.3-aawm.42` instead. That candidate includes the
 explicit `nvidia/*` Claude adapter routing for low-touch NVIDIA NIM model
 trials. The current expected overlay line is
-`cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.26`, and `cfg-v0.0.9`.
+`cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.27`, and `cfg-v0.0.9`.
 
 ## Prod Validation
 

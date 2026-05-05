@@ -2,7 +2,30 @@
 
 ## 2026-05-05
 
-- Prepared `aawm.41` as the current source release candidate after the
+- Prepared `aawm.42` as the current source release candidate after the
+  `h-v0.0.27` artifact autobump advanced `main` beyond the stale
+  `v1.82.3-aawm.41` tag. The `aawm.40` and `aawm.41` tags were not
+  force-moved; they remain stale pre-publication candidates with no GitHub
+  Release/image.
+
+  Changed/prepped release docs and version metadata:
+  `pyproject.toml`, `PATCHES.md`, `PROD_RELEASE.md`, `TODO.md`,
+  `COMPLETED.md`, `TEST_HARNESS.md`, `.analysis/todo.md`, and
+  `.analysis/completed.md`.
+
+  Release asset evidence:
+  `h-v0.0.27` was missing a GitHub Release after the autobump tag, so
+  `./.venv/bin/python scripts/local-ci/build_harness_bundle.py --outdir /tmp/aawm-h-dist`
+  built `/tmp/aawm-h-dist/litellm-local-ci-harness-0.0.27.tar.gz` with SHA256
+  `c866e2115f2f14f32a7e5cb73f2d8f73bac1df9311359acf9484469f9db86e5c`, and the
+  release was published at `https://github.com/zepfu/litellm/releases/tag/h-v0.0.27`.
+
+  No prod `aawm-litellm` restart was performed. The remaining release-prep work
+  is to commit/push, publish `v1.82.3-aawm.42`, update/rebuild
+  `/home/zepfu/projects/aawm-infrastructure`, inspect the built image, and only
+  recreate prod `:4000` after explicit deployment approval.
+
+- Prepared `aawm.41` as a now-superseded source release candidate after the
   `h-v0.0.26` artifact autobump advanced `main` beyond the stale
   `v1.82.3-aawm.40` tag. The `aawm.40` tag was not force-moved; it remains a
   stale pre-publication candidate with no GitHub Release/image.
@@ -19,10 +42,10 @@
   `87e59db3488ffc8c4356c39f15cef06dd36c78d4a868b83a0e7dc020a5f9c787`, and the
   release was published at `https://github.com/zepfu/litellm/releases/tag/h-v0.0.26`.
 
-  No prod `aawm-litellm` restart was performed. The remaining release-prep work
-  is to commit/push, publish `v1.82.3-aawm.41`, update/rebuild
-  `/home/zepfu/projects/aawm-infrastructure`, inspect the built image, and only
-  recreate prod `:4000` after explicit deployment approval.
+  No prod `aawm-litellm` restart was performed. This candidate was superseded
+  before image publication when the harness artifact autobump advanced `main`
+  to `h-v0.0.27`; cut `aawm.42` from current `main` instead of moving the stale
+  tag.
 
 - Prepared `aawm.40` as a now-superseded source release candidate after adding the
   explicit NVIDIA Claude adapter wildcard. `aawm.39` remains a published
