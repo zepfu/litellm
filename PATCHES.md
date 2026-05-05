@@ -32,12 +32,13 @@ Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags a
 Current release-prep patch set carries `aawm.2` through `aawm.39` (38 active
 carried patches; `aawm.1` is dropped). The published `aawm.38` release
 candidate was cut at `b022a0271c` as `v1.82.3-aawm.38` /
-`ghcr.io/zepfu/litellm:1.82.3-aawm.38` with overlay assets `cb-v0.0.15`,
-`cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.8`, but current `develop` is
+`ghcr.io/zepfu/litellm:1.82.3-aawm.38`. The current release-prep overlay
+assets are `cb-v0.0.16`, `cp-v0.0.6`, `h-v0.0.25`, and `cfg-v0.0.9`, but
+current `develop` is
 post-`aawm.38` and must not promote that image as the final cutover candidate.
-Current `develop` needs a new fork image/tag from `649cb61b6f` or newer so prod
-includes the post-tag local embed/rerank/Nomic routes and explicit
-`openrouter/*` Claude adapter routing.
+The current prod candidate is `v1.82.3-aawm.39` /
+`ghcr.io/zepfu/litellm:1.82.3-aawm.39`, which includes the post-tag local
+embed/rerank/Nomic routes and explicit `openrouter/*` Claude adapter routing.
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
