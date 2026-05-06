@@ -785,18 +785,24 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
         event_types: List[str] = []
         event_counts: Dict[str, int] = {}
+        def record_event_type(event_type: Any) -> None:
+            if not isinstance(event_type, str) or not event_type:
+                return
+            if event_type not in event_types:
+                event_types.append(event_type)
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+
         for chunk_str in all_chunks:
+            stripped_line = chunk_str.strip()
+            if stripped_line.startswith("event:"):
+                record_event_type(stripped_line.split(":", 1)[1].strip())
+                continue
             parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
                 str_line=chunk_str
             )
             if not isinstance(parsed_chunk, dict):
                 continue
-            event_type = parsed_chunk.get("type")
-            if not isinstance(event_type, str) or not event_type:
-                continue
-            if event_type not in event_types:
-                event_types.append(event_type)
-            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+            record_event_type(parsed_chunk.get("type"))
 
         tool_state: List[Dict[str, Any]] = []
         for item in OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
@@ -857,6 +863,114 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         metadata["responses_stream_tool_call_count"] = summary["tool_call_count"]
         metadata["responses_stream_tool_names"] = summary["tool_names"]
         metadata["responses_stream_tool_state"] = summary["tool_state"]
+        litellm_params["metadata"] = metadata
+        kwargs["litellm_params"] = litellm_params
+
+    @staticmethod
+    def _extract_responses_stream_codex_token_count_event(
+        all_chunks: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        latest_token_count: Optional[Dict[str, Any]] = None
+        current_sse_event_type: Optional[str] = None
+        for chunk_str in all_chunks:
+            stripped_line = chunk_str.strip()
+            if stripped_line.startswith("event:"):
+                current_sse_event_type = stripped_line.split(":", 1)[1].strip()
+                continue
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+            candidate_events = [parsed_chunk]
+            payload = parsed_chunk.get("payload")
+            if isinstance(payload, dict):
+                candidate_events.insert(0, payload)
+            payload_type = payload.get("type") if isinstance(payload, dict) else None
+            for event in candidate_events:
+                rate_limits = event.get("rate_limits")
+                if not isinstance(rate_limits, dict):
+                    continue
+                if not (
+                    isinstance(rate_limits.get("primary"), dict)
+                    or isinstance(rate_limits.get("secondary"), dict)
+                ):
+                    continue
+                event_type = event.get("type")
+                parent_type = parsed_chunk.get("type")
+                if (
+                    event_type != "token_count"
+                    and parent_type != "token_count"
+                    and payload_type != "token_count"
+                    and current_sse_event_type != "token_count"
+                ):
+                    continue
+                token_count_source = (
+                    payload
+                    if event is parsed_chunk and isinstance(payload, dict)
+                    else event
+                )
+                latest_token_count = {
+                    key: token_count_source.get(key, event.get(key))
+                    for key in {
+                        "type",
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                        "cache_read_input_tokens",
+                        "reasoning_output_tokens",
+                        "rate_limits",
+                    }
+                    if token_count_source.get(key, event.get(key)) is not None
+                }
+                latest_token_count.update(
+                    {
+                        key: value
+                        for key, value in event.items()
+                        if key == "rate_limits"
+                    }
+                )
+                latest_token_count = {
+                    key: value
+                    for key, value in latest_token_count.items()
+                    if key
+                    in {
+                        "type",
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                        "cache_read_input_tokens",
+                        "reasoning_output_tokens",
+                        "rate_limits",
+                    }
+                }
+        return latest_token_count
+
+    @staticmethod
+    def _record_responses_stream_rate_limit_metadata(
+        kwargs: dict,
+        all_chunks: List[str],
+    ) -> None:
+        token_count_event = (
+            OpenAIPassthroughLoggingHandler._extract_responses_stream_codex_token_count_event(
+                all_chunks
+            )
+        )
+        if not token_count_event:
+            return
+
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        metadata["codex_token_count"] = token_count_event
         litellm_params["metadata"] = metadata
         kwargs["litellm_params"] = litellm_params
 
@@ -1404,6 +1518,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         start_time: datetime,
         all_chunks: List[str],
         end_time: datetime,
+        kwargs: Optional[dict] = None,
     ) -> PassThroughEndpointLoggingTypedDict:
         """
         Handle logging for collected OpenAI streaming chunks with cost tracking.
@@ -1415,9 +1530,25 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             # Build complete response from chunks using our streaming handler
             handler = OpenAIPassthroughLoggingHandler()
             is_responses = handler.is_openai_responses_route(url_route)
-            existing_litellm_params = (
-                litellm_logging_obj.model_call_details.get("litellm_params", {}) or {}
-            )
+            logging_kwargs = kwargs if isinstance(kwargs, dict) else {}
+            existing_litellm_params = logging_kwargs.get("litellm_params")
+            if not isinstance(existing_litellm_params, dict):
+                existing_litellm_params = (
+                    litellm_logging_obj.model_call_details.get("litellm_params", {})
+                    or {}
+                )
+            if not isinstance(existing_litellm_params, dict):
+                existing_litellm_params = {}
+            logging_kwargs["litellm_params"] = existing_litellm_params
+            if is_responses:
+                handler._record_responses_stream_tool_state_metadata(
+                    logging_kwargs,
+                    all_chunks,
+                )
+                handler._record_responses_stream_rate_limit_metadata(
+                    logging_kwargs,
+                    all_chunks,
+                )
             complete_response = handler._build_complete_streaming_response(
                 all_chunks=all_chunks,
                 litellm_logging_obj=litellm_logging_obj,
@@ -1433,7 +1564,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 )
                 return {
                     "result": None,
-                    "kwargs": {},
+                    "kwargs": logging_kwargs,
                 }
 
             custom_llm_provider = litellm_logging_obj.model_call_details.get(
@@ -1449,28 +1580,24 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
             # Preserve existing litellm_params to maintain metadata tags
             # Prepare kwargs for logging
-            kwargs = {
-                "response_cost": response_cost,
-                "model": model,
-                "custom_llm_provider": custom_llm_provider,
-                "litellm_params": existing_litellm_params.copy(),
-            }
+            logging_kwargs.update(
+                {
+                    "response_cost": response_cost,
+                    "model": model,
+                    "custom_llm_provider": custom_llm_provider,
+                    "litellm_params": existing_litellm_params,
+                }
+            )
             passthrough_logging_payload = litellm_logging_obj.model_call_details.get(
                 "passthrough_logging_payload"
             )
             if passthrough_logging_payload:
-                kwargs["passthrough_logging_payload"] = passthrough_logging_payload
-
-            if is_responses:
-                handler._record_responses_stream_tool_state_metadata(
-                    kwargs,
-                    all_chunks,
-                )
+                logging_kwargs["passthrough_logging_payload"] = passthrough_logging_payload
 
             apply_passthrough_logging_contract(
                 litellm_response=complete_response,
                 model=model,
-                kwargs=kwargs,
+                kwargs=logging_kwargs,
                 logging_obj=litellm_logging_obj,
                 response_cost=response_cost,
                 custom_llm_provider=custom_llm_provider,
@@ -1480,13 +1607,16 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             if (
                 is_responses
                 and (
-                    (kwargs.get("litellm_params", {}) or {}).get("metadata", {}) or {}
+                    (logging_kwargs.get("litellm_params", {}) or {}).get(
+                        "metadata", {}
+                    )
+                    or {}
                 ).get("passthrough_route_family")
                 == "codex_responses"
             ):
                 usage = getattr(complete_response, "usage", None)
                 handler._append_langfuse_span_to_kwargs(
-                    kwargs,
+                    logging_kwargs,
                     name="codex.usage_normalize",
                     span_metadata={
                         "streaming": True,
@@ -1495,8 +1625,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                         "response_cost": response_cost,
                     },
                 )
-            kwargs["standard_logging_object"] = get_standard_logging_object_payload(
-                kwargs=kwargs,
+            logging_kwargs["standard_logging_object"] = get_standard_logging_object_payload(
+                kwargs=logging_kwargs,
                 init_response_obj=complete_response,
                 start_time=start_time,
                 end_time=end_time,
@@ -1510,7 +1640,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
 
             return {
                 "result": complete_response,
-                "kwargs": kwargs,
+                "kwargs": logging_kwargs,
             }
 
         except Exception as e:

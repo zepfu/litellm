@@ -61,6 +61,9 @@ Current responsibilities:
 - prompt-overhead token breakdown estimates in `public.session_history`,
   including system/provider-equivalent, tool-advertisement, conversation,
   residual/other, and deterministic system-classifier buckets
+- provider-originated `public.rate_limit_observations` capture for Codex/OpenAI
+  response headers, Anthropic response headers, Google Code Assist quota
+  payloads, and provider quota/capacity errors
 
 ### Claude control-plane wheel
 

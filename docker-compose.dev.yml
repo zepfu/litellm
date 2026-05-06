@@ -12,6 +12,7 @@ services:
       # Mount source for live code changes (key files only)
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
+      - ./litellm/integrations/aawm_passthrough_shape_capture.py:/app/litellm/integrations/aawm_passthrough_shape_capture.py
       - ./litellm/integrations/langfuse/langfuse.py:/app/litellm/integrations/langfuse/langfuse.py
       - ./litellm/__init__.py:/app/litellm/__init__.py
       - ./litellm/_lazy_imports_registry.py:/app/litellm/_lazy_imports_registry.py
@@ -45,6 +46,7 @@ services:
       - ./litellm/proxy/pass_through_endpoints/pass_through_endpoints.py:/app/litellm/proxy/pass_through_endpoints/pass_through_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/streaming_handler.py:/app/litellm/proxy/pass_through_endpoints/streaming_handler.py
       - ./litellm/proxy/pass_through_endpoints/success_handler.py:/app/litellm/proxy/pass_through_endpoints/success_handler.py
+      - ./litellm/proxy/pass_through_endpoints/google_code_assist_quota.py:/app/litellm/proxy/pass_through_endpoints/google_code_assist_quota.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/base_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/base_passthrough_logging_handler.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/anthropic_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/anthropic_passthrough_logging_handler.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py
@@ -96,6 +98,7 @@ services:
       # No server-side ANTHROPIC_API_KEY — client provides via x-api-key header
       # Payload capture stays off by default; enable explicitly for debug sessions
       - AAWM_CAPTURE=${AAWM_CAPTURE:-0}
+      - AAWM_CAPTURE_PASSTHROUGH_SHAPES=${AAWM_CAPTURE_PASSTHROUGH_SHAPES:-0}
       - LITELLM_LOG=${LITELLM_LOG:-INFO}
       - AAWM_GEMINI_ROUTE_DEBUG=${AAWM_GEMINI_ROUTE_DEBUG:-0}
       - AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS=${AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS:-30}

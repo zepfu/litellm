@@ -2,6 +2,16 @@ model_list:
   - model_name: "claude-sonnet-4-6"
     litellm_params:
       model: "anthropic/claude-sonnet-4-6"
+  - model_name: "qwen3-heretic-gguf"
+    litellm_params:
+      model: "openai/qwen3-4b-heretic-q8"
+      api_base: "http://172.20.0.1:8093/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: chat
+      base_model: "qwen3-4b-heretic-q8"
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
   - model_name: "tei-medcpt-article"
     litellm_params:
       model: "local_embed/ncbi/MedCPT-Article-Encoder"

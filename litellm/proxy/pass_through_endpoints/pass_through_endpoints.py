@@ -35,6 +35,9 @@ from litellm._logging import trigger_egress_guard_alert, verbose_proxy_logger
 from litellm._uuid import uuid
 from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.integrations.aawm_passthrough_shape_capture import (
+    capture_passthrough_shape,
+)
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
@@ -1440,9 +1443,21 @@ async def pass_through_request(  # noqa: PLR0915
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
+                error_content = await e.response.aread()
+                capture_passthrough_shape(
+                    mode="stream_error",
+                    provider=custom_llm_provider or endpoint_type.value,
+                    endpoint_type=endpoint_type,
+                    url_route=str(url),
+                    request_body=_parsed_body,
+                    response=e.response,
+                    response_content=error_content,
+                    litellm_call_id=litellm_call_id,
+                    extra_metadata={"stream": True},
+                )
                 raise _build_http_exception_from_upstream_status_error(
                     e,
-                    await e.response.aread(),
+                    error_content,
                 )
 
             return StreamingResponse(
@@ -1494,9 +1509,21 @@ async def pass_through_request(  # noqa: PLR0915
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
+                error_content = await e.response.aread()
+                capture_passthrough_shape(
+                    mode="stream_error",
+                    provider=custom_llm_provider or endpoint_type.value,
+                    endpoint_type=endpoint_type,
+                    url_route=str(url),
+                    request_body=_parsed_body,
+                    response=e.response,
+                    response_content=error_content,
+                    litellm_call_id=litellm_call_id,
+                    extra_metadata={"stream": True},
+                )
                 raise _build_http_exception_from_upstream_status_error(
                     e,
-                    await e.response.aread(),
+                    error_content,
                 )
 
             return StreamingResponse(
@@ -1525,6 +1552,17 @@ async def pass_through_request(  # noqa: PLR0915
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
+            capture_passthrough_shape(
+                mode="nonstream_error",
+                provider=custom_llm_provider or endpoint_type.value,
+                endpoint_type=endpoint_type,
+                url_route=str(url),
+                request_body=_parsed_body,
+                response=e.response,
+                response_content=e.response.content,
+                litellm_call_id=litellm_call_id,
+                extra_metadata={"stream": False},
+            )
             raise _build_http_exception_from_upstream_status_error(
                 e,
                 e.response.text,
@@ -1547,6 +1585,18 @@ async def pass_through_request(  # noqa: PLR0915
         ## LOG SUCCESS
         response_body: Optional[dict] = get_response_body(response)
         passthrough_logging_payload["response_body"] = response_body
+        capture_passthrough_shape(
+            mode="nonstream",
+            provider=custom_llm_provider or endpoint_type.value,
+            endpoint_type=endpoint_type,
+            url_route=str(url),
+            request_body=_parsed_body,
+            response=response,
+            response_body=response_body,
+            response_content=content,
+            litellm_call_id=litellm_call_id,
+            extra_metadata={"stream": False},
+        )
         end_time = datetime.now()
         asyncio.create_task(
             pass_through_endpoint_logging.pass_through_async_success_handler(
