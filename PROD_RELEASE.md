@@ -243,6 +243,14 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
      "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1|local_embed/nomic-embed-code.Q8_0.gguf|local_rerank/BAAI/bge-reranker-v2-m3' /etc/litellm/config.yaml"
    ```
 
+   For local LLM route promotions, also verify the rendered config includes the
+   chat-only route and host-gateway API base:
+
+   ```bash
+   docker exec aawm-litellm sh -lc \
+     "grep -En 'qwen3-heretic-gguf|qwen3-4b-heretic-q8|host.docker.internal:8093' /etc/litellm/config.yaml"
+   ```
+
 6. Inspect startup logs.
 
    ```bash
@@ -350,6 +358,23 @@ def post(path,payload):
 emb=post("/v1/embeddings",{"model":"nomic-embed-code","input":"def add(a, b): return a + b"})
 rerank=post("/rerank",{"model":"tei-reranker","query":"Which document mentions local proxy routing?","documents":["Call the local service port directly.","Call AAWM LiteLLM and let it route local services."],"top_n":2,"return_documents":True})
 print(json.dumps({"session":session,"embedding_dims":len(emb["data"][0]["embedding"]),"embedding_usage":emb.get("usage"),"rerank_results":len(rerank.get("results",[])),"rerank_meta":rerank.get("meta")},sort_keys=True))'
+```
+
+For local LLM promotion, smoke the local chat route through the proxy. This
+validates container access to the host-local llama.cpp service plus
+`session_history` attribution for the LiteLLM-facing model alias:
+
+```bash
+LITELLM_API_KEY="${LITELLM_API_KEY:-prod-local-llm-smoke}" \
+./.venv/bin/python -c 'import json, os, time, urllib.request
+base="http://127.0.0.1:4000"
+session=f"prod-local-llm-{int(time.time())}"
+api_key=os.environ["LITELLM_API_KEY"]
+headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","x-litellm-session-id":session,"x-aawm-tenant-id":"tenant-local-prod-validation","x-litellm-end-user-id":"user-local-prod-validation","x-litellm-agent-id":"prod-cutover-local-llm-smoke","langfuse_trace_user_id":"user-local-prod-validation"}
+req=urllib.request.Request(base+"/v1/chat/completions",data=json.dumps({"model":"qwen3-heretic-gguf","messages":[{"role":"user","content":"Reply with OK only."}],"max_tokens":4,"temperature":0}).encode(),headers=headers,method="POST")
+with urllib.request.urlopen(req,timeout=90) as r:
+    response=json.loads(r.read().decode())
+print(json.dumps({"session":session,"model":response.get("model"),"content":response["choices"][0]["message"]["content"],"usage":response.get("usage")},sort_keys=True))'
 ```
 
 For native passthrough changes, run the opt-in native shard in the existing

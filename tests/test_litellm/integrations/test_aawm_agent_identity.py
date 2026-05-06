@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +9,8 @@ import litellm
 from litellm.integrations import aawm_agent_identity
 from litellm.integrations.aawm_agent_identity import (
     AawmAgentIdentity,
+    _build_rate_limit_observations,
+    _classify_rate_limit_transition,
     _build_session_runtime_identity,
     _build_session_history_record_from_langfuse_trace_observation,
     _build_session_history_record_from_spend_log_row,
@@ -3123,6 +3126,340 @@ async def test_async_log_success_event_enqueues_session_history_record(monkeypat
     assert queued_record["session_id"] == "session-enqueue-2"
 
 
+def test_build_rate_limit_observations_extracts_codex_spark_windows() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.3-codex-spark"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-codex-rate"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-rate",
+            "passthrough_route_family": "codex_responses",
+        }
+    )
+    end_time = datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc)
+    kwargs["standard_pass_through_logging_payload"] = {
+        "response_body": {
+            "payload": {
+                "rate_limits": {
+                    "limit_id": "codex_bengalfox",
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "primary": {
+                        "used_percent": 12.5,
+                        "window_minutes": 300,
+                        "resets_at": 1777996982,
+                    },
+                    "secondary": {
+                        "used_percent": 100.0,
+                        "window_minutes": 10080,
+                        "resets_at": 1778018910,
+                    },
+                    "plan_type": None,
+                    "rate_limit_reached_type": None,
+                }
+            }
+        }
+    }
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    assert by_scope["primary"]["source"] == "codex_token_count"
+    assert by_scope["primary"]["limit_id"] == "codex_bengalfox"
+    assert by_scope["primary"]["limit_name"] == "GPT-5.3-Codex-Spark"
+    assert by_scope["primary"]["quota_period"] == "five_hour"
+    assert by_scope["primary"]["used_percentage"] == 12.5
+    assert by_scope["secondary"]["quota_period"] == "seven_day"
+    assert by_scope["secondary"]["exhausted"] is True
+    assert "codex_bengalfox" in by_scope["secondary"]["limit_key"]
+
+
+def test_build_rate_limit_observations_extracts_codex_response_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-codex-header-rate"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-header-rate",
+            "passthrough_route_family": "codex_responses",
+            "codex_response_headers": {
+                "source": "codex_response_headers",
+                "x-codex-active-limit": "premium",
+                "x-codex-primary-reset-after-seconds": "14375",
+                "x-codex-primary-reset-at": "1778030614",
+                "x-codex-primary-used-percent": "18.25",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-secondary-reset-after-seconds": "528036",
+                "x-codex-secondary-reset-at": "1778544275",
+                "x-codex-secondary-used-percent": "4.5",
+                "x-codex-secondary-window-minutes": "10080",
+                "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+                "x-codex-bengalfox-primary-reset-after-seconds": "18000",
+                "x-codex-bengalfox-primary-reset-at": "1778034240",
+                "x-codex-bengalfox-primary-used-percent": "42",
+                "x-codex-bengalfox-primary-window-minutes": "300",
+                "x-codex-bengalfox-secondary-reset-after-seconds": "2671",
+                "x-codex-bengalfox-secondary-reset-at": "1778018910",
+                "x-codex-bengalfox-secondary-used-percent": "87.25",
+                "x-codex-bengalfox-secondary-window-minutes": "10080",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 4
+    by_limit_scope = {
+        (observation["limit_id"], observation["limit_scope"]): observation
+        for observation in observations
+    }
+    generic_primary = by_limit_scope[("codex", "primary")]
+    assert generic_primary["source"] == "codex_response_headers"
+    assert generic_primary["quota_period"] == "five_hour"
+    assert generic_primary["reset_hint_seconds"] == 14375
+    assert generic_primary["used_percentage"] == 18.25
+    assert aawm_agent_identity._build_rate_limit_observation_db_payload(generic_primary)[
+        10
+    ] == pytest.approx(81.75)
+    spark_secondary = by_limit_scope[("codex_bengalfox", "secondary")]
+    assert spark_secondary["limit_name"] == "GPT-5.3-Codex-Spark"
+    assert spark_secondary["quota_period"] == "seven_day"
+    assert spark_secondary["used_percentage"] == 87.25
+    assert aawm_agent_identity._build_rate_limit_observation_db_payload(
+        spark_secondary
+    )[10] == pytest.approx(12.75)
+    assert spark_secondary["provider_resets_at"].isoformat().startswith(
+        "2026-05-05T22:08:30"
+    )
+
+
+def test_build_rate_limit_observations_extracts_anthropic_response_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-rate-headers",
+            "client_name": "claude-cli",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-requests-limit": "2000",
+                "anthropic-ratelimit-requests-remaining": "1990",
+                "anthropic-ratelimit-requests-reset": "2026-05-05T17:00:00Z",
+                "anthropic-ratelimit-tokens-limit": "160000",
+                "anthropic-ratelimit-tokens-remaining": "159500",
+                "anthropic-ratelimit-tokens-reset": "2026-05-05T17:00:00Z",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    assert by_scope["requests"]["source"] == "anthropic_response_headers"
+    assert by_scope["requests"]["client_family"] == "claude"
+    assert by_scope["requests"]["remaining_requests"] == 1990
+    assert by_scope["requests"]["used_requests"] == 10
+    assert by_scope["requests"]["used_percentage"] == 0.5
+    assert by_scope["tokens"]["total_requests"] == 160000
+    assert by_scope["tokens"]["used_requests"] == 500
+
+
+def test_build_rate_limit_observations_extracts_anthropic_unified_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-unified-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-unified-rate-headers",
+            "client_name": "claude-cli",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-unified-5h-reset": "1778034000",
+                "anthropic-ratelimit-unified-5h-status": "allowed",
+                "anthropic-ratelimit-unified-5h-utilization": "0.01",
+                "anthropic-ratelimit-unified-7d-reset": "1778166000",
+                "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+                "anthropic-ratelimit-unified-7d-utilization": "0.94",
+                "anthropic-ratelimit-unified-7d_sonnet-reset": "1778166000",
+                "anthropic-ratelimit-unified-7d_sonnet-status": "allowed_warning",
+                "anthropic-ratelimit-unified-7d_sonnet-utilization": "0.83",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 3
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    assert by_scope["5h"]["used_percentage"] == 1.0
+    assert by_scope["7d"]["used_percentage"] == 94.0
+    assert by_scope["7d_sonnet"]["used_percentage"] == 83.0
+    assert by_scope["7d_sonnet"]["limit_id"] == "anthropic_unified_7d_sonnet"
+    assert by_scope["7d_sonnet"]["client_family"] == "claude"
+
+
+def test_build_rate_limit_observations_extracts_google_quota_buckets() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gemini/gemini-2.5-flash"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["litellm_call_id"] = "call-google-quota-buckets"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-google-quota-buckets",
+            "passthrough_route_family": "google_code_assist_generate_content",
+            "google_retrieve_user_quota": {
+                "source": "google_retrieve_user_quota",
+                "buckets": {
+                    "items": [
+                        {
+                            "modelId": "gemini-2.5-flash",
+                            "tokenType": "REQUESTS",
+                            "remainingFraction": 0.907,
+                            "resetTime": "2026-05-06T00:25:54Z",
+                        },
+                        {
+                            "modelId": "gemini-2.5-flash-lite",
+                            "tokenType": "REQUESTS",
+                            "remainingFraction": 0.9775,
+                            "resetTime": "2026-05-06T00:26:00Z",
+                        },
+                    ]
+                },
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_model = {observation["model"]: observation for observation in observations}
+    assert by_model["gemini-2.5-flash"]["source"] == "google_retrieve_user_quota"
+    assert by_model["gemini-2.5-flash"]["client_family"] == "google_code_assist"
+    assert by_model["gemini-2.5-flash"]["limit_scope"] == "model_requests"
+    assert by_model["gemini-2.5-flash"]["used_percentage"] == pytest.approx(9.3)
+    assert by_model["gemini-2.5-flash"]["quota_period"] == "daily"
+    assert by_model["gemini-2.5-flash-lite"]["used_percentage"] == pytest.approx(2.25)
+
+
+def test_build_rate_limit_observations_keeps_google_capacity_distinct_from_quota() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gemini/gemini-3.1-pro-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["litellm_call_id"] = "call-google-capacity"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-google-capacity",
+            "passthrough_route_family": "google_code_assist_generate_content",
+        }
+    )
+    error = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "The model is overloaded. quota will reset after 120s",
+            "details": [
+                {
+                    "reason": "MODEL_CAPACITY_EXHAUSTED",
+                    "domain": "cloudcode-pa.googleapis.com",
+                    "metadata": {"model": "gemini-3.1-pro-preview"},
+                }
+            ],
+        }
+    }
+    end_time = datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=error,
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["source"] == "google_model_capacity_error"
+    assert observation["status"] == "model_capacity_exhausted"
+    assert observation["exhausted"] is False
+    assert observation["exhaustion_kind"] == "model_capacity"
+    assert observation["reset_hint_seconds"] == 120
+    assert observation["evidence"]["corroboration_required"] is True
+
+
+def test_classify_rate_limit_transition_uses_resets_percent_and_counters() -> None:
+    previous = {
+        "limit_key": "openai:codex:test:codex:primary:300",
+        "observed_at": datetime(2026, 5, 5, 11, 59, tzinfo=timezone.utc),
+        "provider_resets_at": datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc),
+        "used_percentage": 99.0,
+        "used_requests": 1490,
+        "remaining_requests": 10,
+        "total_requests": 1500,
+        "exhausted": True,
+    }
+    current = {
+        "limit_key": previous["limit_key"],
+        "observed_at": datetime(2026, 5, 5, 12, 1, tzinfo=timezone.utc),
+        "provider_resets_at": datetime(2026, 5, 5, 17, 0, tzinfo=timezone.utc),
+        "used_percentage": 1.0,
+        "used_requests": 10,
+        "remaining_requests": 1490,
+        "total_requests": 1500,
+        "exhausted": False,
+    }
+
+    classification = _classify_rate_limit_transition(previous, current)
+
+    assert classification is not None
+    assert classification["transition_type"] == "expected_rollover"
+    assert "resets_at_change" in classification["signals"]
+    assert "counter_drop" in classification["signals"]
+    assert "usage_percent_drop" in classification["signals"]
+    assert "success_after_exhaustion" in classification["signals"]
+
+    tiny_drop = dict(current, provider_resets_at=previous["provider_resets_at"], used_percentage=98.2, used_requests=1491, remaining_requests=9, exhausted=True)
+    assert _classify_rate_limit_transition(previous, tiny_drop) is None
+
+    meaningful_drop = dict(tiny_drop, used_percentage=80.0)
+    percent_classification = _classify_rate_limit_transition(previous, meaningful_drop)
+    assert percent_classification is not None
+    assert percent_classification["transition_type"] == "usage_percent_drop"
+
+
 @pytest.mark.asyncio
 async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch) -> None:
     created_pool = AsyncMock()
@@ -4353,3 +4690,188 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert fake_pool.acquire_contexts[0].enter_count == 1
     assert fake_pool.acquire_contexts[0].exit_count == 1
     mock_conn.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_session_history_records_writes_rate_limit_observation_and_transition(
+    monkeypatch,
+) -> None:
+    observed_at = datetime(2026, 5, 5, 12, 1, tzinfo=timezone.utc)
+    previous = {
+        "observed_at": datetime(2026, 5, 5, 11, 59, tzinfo=timezone.utc),
+        "source": "codex_token_count",
+        "provider": "openai",
+        "client_family": "codex",
+        "account_hash": "acct",
+        "environment": "dev",
+        "tenant_id": "litellm",
+        "repository": "litellm",
+        "limit_key": "openai:codex:acct:codex_bengalfox:primary:300",
+        "limit_id": "codex_bengalfox",
+        "limit_name": "GPT-5.3-Codex-Spark",
+        "limit_scope": "primary",
+        "window_minutes": 300,
+        "quota_period": "five_hour",
+        "provider_resets_at": datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc),
+        "inferred_window_start_at": datetime(2026, 5, 5, 7, 0, tzinfo=timezone.utc),
+        "used_percentage": 99.0,
+        "remaining_requests": None,
+        "used_requests": None,
+        "total_requests": None,
+        "status": "exhausted",
+        "exhausted": True,
+        "exhaustion_kind": "usage_limit_reached",
+        "reset_hint_seconds": None,
+        "model": "gpt-5.3-codex-spark",
+        "model_family": "codex",
+        "model_tier": None,
+        "parent_limit_key": None,
+        "session_id": "session-rate",
+        "trace_id": "trace-rate",
+        "litellm_call_id": "call-rate-old",
+        "route_family": "codex_responses",
+        "request_model": "gpt-5.3-codex-spark",
+        "response_model": None,
+        "client_name": "codex",
+        "client_version": "0.1",
+        "client_user_agent": "codex/0.1",
+        "raw_provider_fields": {},
+        "evidence": {},
+        "metadata": {},
+    }
+    current = dict(
+        previous,
+        observed_at=observed_at,
+        provider_resets_at=datetime(2026, 5, 5, 17, 0, tzinfo=timezone.utc),
+        inferred_window_start_at=datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc),
+        used_percentage=1.0,
+        status="observed",
+        exhausted=False,
+        litellm_call_id="call-rate-new",
+        raw_provider_fields={"used_percent": 1.0},
+        evidence={"signals": ["provider_rate_limits"]},
+    )
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow.return_value = previous
+    fake_pool = _FakePool(mock_conn)
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+
+    await _persist_session_history_records(
+        [{"_skip_session_history": True, "rate_limit_observations": [current]}]
+    )
+
+    mock_conn.fetchrow.assert_awaited_once()
+    fetch_args = mock_conn.fetchrow.await_args.args
+    assert fetch_args[1:6] == (
+        "codex_bengalfox:primary",
+        "openai",
+        "codex",
+        "acct",
+        "codex_token_count",
+    )
+    assert mock_conn.executemany.await_count == 2
+    observation_args = mock_conn.executemany.await_args_list[0].args
+    assert "INSERT INTO public.rate_limit_observations" in observation_args[0]
+    assert observation_args[1][0][4] == "openai"
+    assert observation_args[1][0][6] == "codex_bengalfox:primary"
+    assert observation_args[1][0][10] == 99.0
+    transition_args = mock_conn.executemany.await_args_list[1].args
+    assert "INSERT INTO public.rate_limit_transitions" in transition_args[0]
+    assert transition_args[1][0][5] == "expected_rollover"
+
+
+@pytest.mark.asyncio
+async def test_persist_session_history_records_skips_repeated_rate_limit_snapshot(
+    monkeypatch,
+) -> None:
+    previous = {
+        "observed_at": datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc),
+        "limit_key": "anthropic:claude:acct:claude:seven_day:10080",
+        "provider_resets_at": datetime(2026, 5, 7, 15, 0, tzinfo=timezone.utc),
+        "used_percentage": 92.0,
+        "remaining_requests": None,
+        "used_requests": None,
+        "total_requests": None,
+        "status": "observed",
+        "exhausted": False,
+        "exhaustion_kind": None,
+        "reset_hint_seconds": None,
+    }
+    current = dict(
+        previous,
+        observed_at=datetime(2026, 5, 5, 12, 1, tzinfo=timezone.utc),
+        source="anthropic_response_headers",
+        provider="anthropic",
+        client_family="claude",
+        litellm_call_id="call-rate-duplicate",
+    )
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow.return_value = previous
+    fake_pool = _FakePool(mock_conn)
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+
+    await _persist_session_history_records(
+        [{"_skip_session_history": True, "rate_limit_observations": [current]}]
+    )
+
+    mock_conn.fetchrow.assert_awaited_once()
+    mock_conn.executemany.assert_not_awaited()
+
+
+def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() -> None:
+    sql = aawm_agent_identity._AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL
+
+    assert "pg_advisory_xact_lock" in sql
+    assert "WHERE NOT EXISTS" in sql
+    assert "latest.account_hash IS NOT DISTINCT FROM candidate.account_hash" in sql
+    assert "latest.expected_reset_at IS NOT DISTINCT FROM candidate.expected_reset_at" in sql
+    assert "ABS(EXTRACT(EPOCH FROM (candidate.expected_reset_at - latest.expected_reset_at))) < 900" in sql
+    assert "latest.remaining_pct IS NOT DISTINCT FROM candidate.remaining_pct" in sql
+
+
+def test_rate_limit_meaningful_change_ignores_reset_hint_when_reset_time_exists() -> None:
+    previous = {
+        "provider_resets_at": datetime(2026, 5, 5, 17, 0, tzinfo=timezone.utc),
+        "used_percentage": 0.0,
+        "status": "observed",
+        "exhausted": False,
+        "reset_hint_seconds": None,
+    }
+    current = {
+        "provider_resets_at": datetime(2026, 5, 5, 17, 3, tzinfo=timezone.utc),
+        "used_percentage": 0.0,
+        "status": "observed",
+        "exhausted": False,
+        "reset_hint_seconds": 18000,
+    }
+
+    assert (
+        aawm_agent_identity._rate_limit_observation_has_meaningful_change(
+            previous,
+            current,
+        )
+        is False
+    )
+
+    current["used_percentage"] = 1.0
+    assert (
+        aawm_agent_identity._rate_limit_observation_has_meaningful_change(
+            previous,
+            current,
+        )
+        is True
+    )
