@@ -37,6 +37,9 @@ from litellm.constants import (
     ALLOWED_VERTEX_AI_PASSTHROUGH_HEADERS,
     BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES,
 )
+from litellm.integrations.aawm_passthrough_shape_capture import (
+    capture_passthrough_shape,
+)
 from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
@@ -56,6 +59,9 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     create_websocket_passthrough_route,
     pass_through_request,
     websocket_passthrough_request,
+)
+from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
+    sanitize_google_code_assist_quota_for_logging as _sanitize_google_code_assist_quota_for_logging,
 )
 try:
     from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
@@ -492,6 +498,7 @@ _google_oauth_access_token_lock = asyncio.Lock()
 _google_code_assist_project_cache: dict[str, str] = {}
 _google_code_assist_project_lock = asyncio.Lock()
 _google_code_assist_prime_until_monotonic_by_key: dict[str, float] = {}
+_google_code_assist_prime_quota_by_key: dict[str, dict[str, Any]] = {}
 _google_code_assist_prime_lock = asyncio.Lock()
 _google_adapter_semaphores: dict[tuple[str, int], asyncio.Semaphore] = {}
 _google_adapter_rate_limit_lock = asyncio.Lock()
@@ -1246,6 +1253,20 @@ async def _get_or_load_google_code_assist_project(
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(load_url, headers=headers, json=request_body)
 
+        try:
+            response_body = response.json()
+        except Exception:
+            response_body = None
+        capture_passthrough_shape(
+            mode="google_code_assist_loadCodeAssist",
+            provider=litellm.LlmProviders.GEMINI.value,
+            url_route=load_url,
+            request_body=request_body,
+            response=response,
+            response_body=response_body,
+            response_content=response.content,
+            extra_metadata={"direct_google_code_assist_preflight": True},
+        )
         if response.status_code != 200:
             raise HTTPException(
                 status_code=500,
@@ -1255,7 +1276,8 @@ async def _get_or_load_google_code_assist_project(
                 ),
             )
 
-        response_body = response.json()
+        if not isinstance(response_body, dict):
+            response_body = response.json()
         project = _clean_codex_auth_value(response_body.get("cloudaicompanionProject"))
         if project is None:
             raise HTTPException(
@@ -2116,7 +2138,7 @@ def _parse_google_rate_limit_reset_seconds(exc: Any) -> float:
         return 5.0
 
 
-def _extract_google_adapter_error_reason(exc: Any) -> Optional[str]:
+def _extract_google_adapter_error_payloads(exc: Any) -> list[Any]:
     detail = _extract_google_adapter_exception_detail(exc)
     if isinstance(detail, bytes):
         detail_text = detail.decode("utf-8", errors="ignore")
@@ -2147,11 +2169,18 @@ def _extract_google_adapter_error_reason(exc: Any) -> Optional[str]:
         except Exception:
             pass
 
+    parsed_payloads: list[Any] = []
     for candidate in candidate_payloads:
         try:
             parsed = json.loads(candidate)
         except Exception:
             continue
+        parsed_payloads.append(parsed)
+    return parsed_payloads
+
+
+def _extract_google_adapter_error_reason(exc: Any) -> Optional[str]:
+    for parsed in _extract_google_adapter_error_payloads(exc):
         error_blocks: list[dict[str, Any]] = []
         if isinstance(parsed, dict):
             error_block = parsed.get("error")
@@ -2175,6 +2204,63 @@ def _extract_google_adapter_error_reason(exc: Any) -> Optional[str]:
                 if isinstance(reason, str) and reason:
                     return reason
     return None
+
+
+def _extract_google_adapter_error_payload_for_logging(exc: Any) -> dict[str, Any]:
+    for parsed in _extract_google_adapter_error_payloads(exc):
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            return dict(parsed)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and isinstance(item.get("error"), dict):
+                    return dict(item)
+            return {"payload": parsed}
+    return {}
+
+
+def _record_google_adapter_error_for_logging(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    exc: Any,
+    status_code: Optional[int],
+    error_reason: Optional[str],
+    attempt: int,
+    wait_seconds: float,
+) -> None:
+    custom_body = passthrough_kwargs.get("custom_body")
+    if not isinstance(custom_body, dict):
+        return
+    metadata = custom_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        custom_body["litellm_metadata"] = metadata
+
+    payload = _extract_google_adapter_error_payload_for_logging(exc)
+    if not isinstance(payload.get("error"), dict):
+        detail = _extract_google_adapter_exception_detail(exc)
+        if isinstance(detail, bytes):
+            detail_text = detail.decode("utf-8", errors="ignore")
+        else:
+            detail_text = str(detail)
+        synthesized_error: dict[str, Any] = {
+            "code": status_code,
+            "message": detail_text[:1000],
+        }
+        if status_code == 429:
+            synthesized_error["status"] = "RESOURCE_EXHAUSTED"
+        if error_reason:
+            synthesized_error["details"] = [{"reason": error_reason}]
+        payload["error"] = synthesized_error
+
+    payload["source"] = "google_generate_content_error"
+    payload["adapter_attempt"] = attempt
+    payload["adapter_wait_seconds"] = wait_seconds
+    payload["adapter_error_reason"] = error_reason
+    metadata["google_generate_content_error"] = payload
+    metadata["google_generate_content_error_count"] = (
+        int(metadata.get("google_generate_content_error_count") or 0) + 1
+    )
+
 
 def _get_google_adapter_model_capacity_max_retries() -> int:
     raw_value = _clean_codex_auth_value(
@@ -2271,6 +2357,18 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
                 wait_seconds = _get_google_adapter_capacity_backoff_seconds(attempt)
             else:
                 wait_seconds = _parse_google_rate_limit_reset_seconds(exc)
+            if status_code == 429 or error_reason in {
+                "MODEL_CAPACITY_EXHAUSTED",
+                "RATE_LIMIT_EXCEEDED",
+            }:
+                _record_google_adapter_error_for_logging(
+                    passthrough_kwargs,
+                    exc=exc,
+                    status_code=status_code,
+                    error_reason=error_reason,
+                    attempt=attempt,
+                    wait_seconds=wait_seconds,
+                )
             projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
             within_hidden_budget = (
                 hidden_retry_budget_seconds > 0
@@ -2844,7 +2942,7 @@ async def _perform_openrouter_adapter_pass_through_request(
 async def _prime_google_code_assist_session(
     access_token: str,
     companion_project: str,
-) -> None:
+) -> Optional[dict[str, Any]]:
     ttl_seconds = _get_google_code_assist_prime_ttl_seconds()
     cache_key = _get_google_code_assist_prime_cache_key(
         access_token,
@@ -2861,7 +2959,7 @@ async def _prime_google_code_assist_session(
                         "Google adapter prime cache hit for project=%s",
                         companion_project,
                     )
-                return
+                return _google_code_assist_prime_quota_by_key.get(cache_key)
 
         target_base = _get_anthropic_adapter_google_target_base().rstrip("/")
         headers = {
@@ -2890,6 +2988,7 @@ async def _prime_google_code_assist_session(
         )
 
         async with httpx.AsyncClient(timeout=20.0) as client:
+            sanitized_quota_response: Optional[dict[str, Any]] = None
             for url, body in preflight_requests:
                 HttpPassThroughEndpointHelpers.validate_outgoing_egress(
                     url=url,
@@ -2898,13 +2997,38 @@ async def _prime_google_code_assist_session(
                     expected_target_family="google",
                 )
                 try:
-                    await client.post(url, headers=headers, json=body)
+                    response = await client.post(url, headers=headers, json=body)
                 except Exception:
                     continue
+                try:
+                    response_body = response.json()
+                except Exception:
+                    response_body = None
+                capture_passthrough_shape(
+                    mode="google_code_assist_preflight",
+                    provider=litellm.LlmProviders.GEMINI.value,
+                    url_route=url,
+                    request_body=body,
+                    response=response,
+                    response_body=response_body,
+                    response_content=response.content,
+                    extra_metadata={
+                        "direct_google_code_assist_preflight": True,
+                        "preflight_endpoint": url.rsplit(":", 1)[-1],
+                    },
+                )
+                if "retrieveUserQuota" not in url:
+                    continue
+                sanitized_quota_response = _sanitize_google_code_assist_quota_for_logging(
+                    response_body
+                )
         if ttl_seconds > 0:
             _google_code_assist_prime_until_monotonic_by_key[cache_key] = (
                 time.monotonic() + ttl_seconds
             )
+        if sanitized_quota_response:
+            _google_code_assist_prime_quota_by_key[cache_key] = sanitized_quota_response
+        return sanitized_quota_response
 
 
 
@@ -6135,7 +6259,10 @@ async def _prepare_anthropic_google_completion_adapter_request(
 ) -> SimpleNamespace:
     google_access_token = await _load_valid_local_google_oauth_access_token()
     google_project = await _get_or_load_google_code_assist_project(google_access_token)
-    await _prime_google_code_assist_session(google_access_token, google_project)
+    google_quota_observation = await _prime_google_code_assist_session(
+        google_access_token,
+        google_project,
+    )
 
     route_family = "anthropic_google_completion_adapter"
     requested_model = prepared_request_body.get("model")
@@ -6191,6 +6318,11 @@ async def _prepare_anthropic_google_completion_adapter_request(
             "google_adapter_persisted_output_compacted_count": google_persisted_output_compacted_count,
             "google_adapter_persisted_output_hooks": sorted(google_persisted_output_hooks),
             "google_adapter_persisted_output_metadata": google_persisted_output_metadata,
+            **(
+                {"google_retrieve_user_quota": google_quota_observation}
+                if google_quota_observation
+                else {}
+            ),
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
                     name="anthropic.google_completion_adapter",

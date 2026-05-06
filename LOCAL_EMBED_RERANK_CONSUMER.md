@@ -2,6 +2,8 @@
 
 Use the AAWM LiteLLM proxy surface for locally hosted embeddings and rerank. Consumers authenticate to AAWM/LiteLLM with the LiteLLM virtual key issued to them; do not call the local TEI, llama.cpp, or reranker service ports directly from clients.
 
+For the local chat/completion LLM route, see [LOCAL_LLM_CONSUMER.md](LOCAL_LLM_CONSUMER.md).
+
 ## Base URL and Auth
 
 Replace `https://litellm.example.com` with the AAWM LiteLLM proxy URL.

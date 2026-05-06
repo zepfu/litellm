@@ -34,7 +34,7 @@ import re
 import shlex
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
 from typing import Any, Dict, List, Optional, Tuple
@@ -153,6 +153,10 @@ _USER_AGENT_PRODUCT_RE = re.compile(
 _USER_AGENT_PAREN_PRODUCT_RE = re.compile(
     r"\((?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})\s*;\s*"
     r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})\)"
+)
+_RESET_AFTER_SECONDS_RE = re.compile(
+    r"\breset(?:s|ting)?\s+after\s+(?P<seconds>\d+)s\b",
+    re.IGNORECASE,
 )
 _AAWM_SESSION_HISTORY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.session_history (
@@ -283,6 +287,328 @@ CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_tool_activity_session_created_idx ON public.session_history_tool_activity (session_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_tool_activity_tool_name_idx ON public.session_history_tool_activity (tool_name)",
+)
+_AAWM_RATE_LIMIT_OBSERVATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.rate_limit_observations (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    client TEXT,
+    client_version TEXT,
+    account_hash TEXT,
+    provider TEXT NOT NULL,
+    model TEXT,
+    quota_key TEXT NOT NULL,
+    quota_period TEXT,
+    quota_type TEXT,
+    expected_reset_at TIMESTAMPTZ,
+    remaining_pct DOUBLE PRECISION,
+    source TEXT,
+    session_id TEXT,
+    trace_id TEXT,
+    litellm_call_id TEXT
+)
+"""
+_AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS = (
+    "DROP INDEX IF EXISTS public.rate_limit_observations_limit_observed_idx",
+    "DROP INDEX IF EXISTS public.rate_limit_observations_provider_client_model_idx",
+    "DROP INDEX IF EXISTS public.rate_limit_observations_reset_idx",
+    "DROP INDEX IF EXISTS public.rate_limit_observations_session_idx",
+    "DROP INDEX IF EXISTS public.rate_limit_observations_trace_call_idx",
+    "DROP INDEX IF EXISTS public.rate_limit_observations_repository_idx",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS client TEXT",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_key TEXT",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_type TEXT",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS expected_reset_at TIMESTAMPTZ",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS remaining_pct DOUBLE PRECISION",
+    """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'client_family'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET client = COALESCE(client, client_family);
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'client_name'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET client = COALESCE(client, client_name);
+    END IF;
+
+    UPDATE public.rate_limit_observations
+    SET client = COALESCE(client, 'unknown');
+END $$;
+""",
+    """
+DO $$
+BEGIN
+    UPDATE public.rate_limit_observations
+    SET provider = CASE
+        WHEN lower(COALESCE(provider, '')) IN ('gemini', 'google_code_assist')
+          OR lower(COALESCE(client, '')) IN ('gemini', 'google_code_assist')
+          OR source LIKE 'google_%'
+          OR source LIKE 'gemini_%'
+            THEN 'google'
+        WHEN provider IS NULL OR provider = ''
+            THEN 'unknown'
+        ELSE provider
+    END;
+END $$;
+""",
+    """
+UPDATE public.rate_limit_observations
+SET client = 'google_code_assist'
+WHERE provider = 'google'
+  AND source = 'google_retrieve_user_quota'
+  AND client IN ('gemini', 'google');
+""",
+    """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'limit_id'
+    ) AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'limit_scope'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET quota_key = COALESCE(
+            quota_key,
+            NULLIF(CONCAT_WS(':', NULLIF(limit_id, ''), NULLIF(limit_scope, '')), '')
+        );
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'limit_key'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET quota_key = COALESCE(quota_key, limit_key);
+    END IF;
+
+    UPDATE public.rate_limit_observations
+    SET quota_key = COALESCE(
+        quota_key,
+        CONCAT_WS(':', COALESCE(source, 'unknown_source'), COALESCE(model, 'unknown_model'))
+    );
+END $$;
+""",
+    """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'provider_resets_at'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET expected_reset_at = COALESCE(expected_reset_at, provider_resets_at);
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'used_percentage'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET remaining_pct = COALESCE(
+            remaining_pct,
+            GREATEST(0.0, LEAST(100.0, 100.0 - used_percentage))
+        )
+        WHERE used_percentage IS NOT NULL;
+    END IF;
+END $$;
+""",
+    """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'limit_scope'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET quota_type = COALESCE(
+            quota_type,
+            CASE
+                WHEN limit_scope ILIKE '%request%' OR limit_scope = 'requests'
+                    THEN 'requests'
+                WHEN limit_scope ILIKE '%token%' OR limit_scope = 'tokens'
+                    THEN 'tokens'
+                WHEN limit_scope = 'model_capacity'
+                    THEN 'capacity'
+                ELSE NULL
+            END
+        );
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rate_limit_observations'
+          AND column_name = 'raw_provider_fields'
+    ) THEN
+        UPDATE public.rate_limit_observations
+        SET quota_type = COALESCE(
+            quota_type,
+            CASE
+                WHEN raw_provider_fields->>'tokenType' ILIKE 'REQUESTS'
+                    THEN 'requests'
+                WHEN raw_provider_fields->>'tokenType' ILIKE 'TOKENS'
+                    THEN 'tokens'
+                ELSE NULL
+            END
+        );
+    END IF;
+
+    UPDATE public.rate_limit_observations
+    SET quota_type = COALESCE(
+        quota_type,
+        CASE
+            WHEN source = 'google_model_capacity_error' THEN 'capacity'
+            WHEN provider = 'google' THEN 'requests'
+            WHEN provider IN ('openai', 'anthropic') THEN 'tokens'
+            ELSE 'unknown'
+        END
+    );
+END $$;
+""",
+    "ALTER TABLE public.rate_limit_observations ALTER COLUMN provider SET NOT NULL",
+    "ALTER TABLE public.rate_limit_observations ALTER COLUMN quota_key SET NOT NULL",
+    "ALTER TABLE public.rate_limit_observations ALTER COLUMN source DROP NOT NULL",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_family",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS environment",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS tenant_id",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS repository",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_key",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_id",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_name",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_scope",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS window_minutes",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS provider_resets_at",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS inferred_window_start_at",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS used_percentage",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS remaining_requests",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS used_requests",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS total_requests",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS status",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS exhausted",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS exhaustion_kind",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS reset_hint_seconds",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS model_family",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS model_tier",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS parent_limit_key",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS route_family",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS request_model",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS response_model",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_name",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_user_agent",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS raw_provider_fields",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS evidence",
+    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS metadata",
+    "DELETE FROM public.rate_limit_observations WHERE source LIKE 'claude_statusline%'",
+    """
+DELETE FROM public.rate_limit_observations AS doomed
+USING (
+    SELECT
+        id,
+        LAG(expected_reset_at) OVER identity_window AS previous_expected_reset_at,
+        LAG(remaining_pct) OVER identity_window AS previous_remaining_pct
+    FROM public.rate_limit_observations
+    WINDOW identity_window AS (
+        PARTITION BY
+            provider,
+            client,
+            account_hash,
+            quota_key,
+            source,
+            model,
+            quota_period,
+            quota_type
+        ORDER BY observed_at ASC, id ASC
+    )
+) AS ranked
+WHERE doomed.id = ranked.id
+  AND (
+      ranked.previous_expected_reset_at IS NOT DISTINCT FROM doomed.expected_reset_at
+      OR (
+          ranked.previous_expected_reset_at IS NOT NULL
+          AND doomed.expected_reset_at IS NOT NULL
+          AND ABS(EXTRACT(EPOCH FROM (doomed.expected_reset_at - ranked.previous_expected_reset_at))) < 900
+      )
+  )
+  AND ranked.previous_remaining_pct IS NOT DISTINCT FROM doomed.remaining_pct;
+""",
+)
+_AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_identity_latest_idx ON public.rate_limit_observations (provider, client, account_hash, quota_key, source, model, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_quota_observed_idx ON public.rate_limit_observations (quota_key, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_model_observed_idx ON public.rate_limit_observations (provider, model, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_client_observed_idx ON public.rate_limit_observations (client, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_reset_idx ON public.rate_limit_observations (expected_reset_at)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_session_idx ON public.rate_limit_observations (session_id, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_trace_call_idx ON public.rate_limit_observations (trace_id, litellm_call_id)",
+)
+_AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.rate_limit_transitions (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    transition_key TEXT NOT NULL UNIQUE,
+    limit_key TEXT NOT NULL,
+    provider TEXT,
+    client_family TEXT,
+    account_hash TEXT,
+    transition_type TEXT NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    signals JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source TEXT,
+    old_observed_at TIMESTAMPTZ,
+    new_observed_at TIMESTAMPTZ NOT NULL,
+    old_provider_resets_at TIMESTAMPTZ,
+    new_provider_resets_at TIMESTAMPTZ,
+    old_used_percentage DOUBLE PRECISION,
+    new_used_percentage DOUBLE PRECISION,
+    old_remaining_requests INTEGER,
+    new_remaining_requests INTEGER,
+    old_used_requests INTEGER,
+    new_used_requests INTEGER,
+    old_total_requests INTEGER,
+    new_total_requests INTEGER,
+    inferred_window_start_at TIMESTAMPTZ,
+    detection_window_start_at TIMESTAMPTZ,
+    detection_window_end_at TIMESTAMPTZ,
+    session_usage_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    old_observation JSONB NOT NULL DEFAULT '{}'::jsonb,
+    new_observation JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+_AAWM_RATE_LIMIT_TRANSITIONS_ALTER_STATEMENTS = (
+    "DELETE FROM public.rate_limit_transitions WHERE source LIKE 'claude_statusline%'",
+)
+_AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS rate_limit_transitions_limit_new_observed_idx ON public.rate_limit_transitions (limit_key, new_observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_transitions_provider_client_idx ON public.rate_limit_transitions (provider, client_family, new_observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_transitions_type_idx ON public.rate_limit_transitions (transition_type, new_observed_at DESC)",
 )
 _AAWM_SESSION_HISTORY_INSERT_SQL = """
 INSERT INTO public.session_history (
@@ -565,6 +891,199 @@ ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
     arguments = COALESCE(session_history_tool_activity.arguments, '{}'::jsonb) || COALESCE(EXCLUDED.arguments, '{}'::jsonb),
     metadata = COALESCE(session_history_tool_activity.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
+_AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL = """
+WITH candidate AS (
+    SELECT
+        $1::timestamptz AS observed_at,
+        $2::text AS client,
+        $3::text AS client_version,
+        $4::text AS account_hash,
+        $5::text AS provider,
+        $6::text AS model,
+        $7::text AS quota_key,
+        $8::text AS quota_period,
+        $9::text AS quota_type,
+        $10::timestamptz AS expected_reset_at,
+        $11::double precision AS remaining_pct,
+        $12::text AS source,
+        $13::text AS session_id,
+        $14::text AS trace_id,
+        $15::text AS litellm_call_id
+),
+locked AS (
+    SELECT pg_advisory_xact_lock(
+        hashtext(
+            CONCAT_WS(
+                '|',
+                candidate.provider,
+                COALESCE(candidate.client, '<null>'),
+                COALESCE(candidate.account_hash, '<null>'),
+                candidate.quota_key,
+                COALESCE(candidate.source, '<null>')
+            )
+        )::bigint
+    ) AS lock_acquired
+    FROM candidate
+)
+INSERT INTO public.rate_limit_observations (
+    observed_at,
+    client,
+    client_version,
+    account_hash,
+    provider,
+    model,
+    quota_key,
+    quota_period,
+    quota_type,
+    expected_reset_at,
+    remaining_pct,
+    source,
+    session_id,
+    trace_id,
+    litellm_call_id
+)
+SELECT
+    candidate.observed_at,
+    candidate.client,
+    candidate.client_version,
+    candidate.account_hash,
+    candidate.provider,
+    candidate.model,
+    candidate.quota_key,
+    candidate.quota_period,
+    candidate.quota_type,
+    candidate.expected_reset_at,
+    candidate.remaining_pct,
+    candidate.source,
+    candidate.session_id,
+    candidate.trace_id,
+    candidate.litellm_call_id
+FROM candidate
+CROSS JOIN locked
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM (
+        SELECT
+            latest.model,
+            latest.quota_period,
+            latest.quota_type,
+            latest.expected_reset_at,
+            latest.remaining_pct
+        FROM public.rate_limit_observations AS latest
+        WHERE latest.provider = candidate.provider
+          AND latest.quota_key = candidate.quota_key
+          AND latest.client IS NOT DISTINCT FROM candidate.client
+          AND latest.account_hash IS NOT DISTINCT FROM candidate.account_hash
+          AND latest.source IS NOT DISTINCT FROM candidate.source
+        ORDER BY latest.observed_at DESC, latest.id DESC
+        LIMIT 1
+    ) AS latest
+    WHERE latest.model IS NOT DISTINCT FROM candidate.model
+      AND latest.quota_period IS NOT DISTINCT FROM candidate.quota_period
+      AND latest.quota_type IS NOT DISTINCT FROM candidate.quota_type
+      AND (
+          latest.expected_reset_at IS NOT DISTINCT FROM candidate.expected_reset_at
+          OR (
+              latest.expected_reset_at IS NOT NULL
+              AND candidate.expected_reset_at IS NOT NULL
+              AND ABS(EXTRACT(EPOCH FROM (candidate.expected_reset_at - latest.expected_reset_at))) < 900
+          )
+      )
+      AND latest.remaining_pct IS NOT DISTINCT FROM candidate.remaining_pct
+)
+"""
+_AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL = """
+SELECT
+    observed_at,
+    source,
+    provider,
+    client AS client_family,
+    account_hash,
+    NULL::text AS environment,
+    NULL::text AS tenant_id,
+    NULL::text AS repository,
+    quota_key AS limit_key,
+    quota_key AS limit_id,
+    quota_key AS limit_name,
+    quota_type AS limit_scope,
+    NULL::integer AS window_minutes,
+    quota_period,
+    expected_reset_at AS provider_resets_at,
+    NULL::timestamptz AS inferred_window_start_at,
+    CASE
+        WHEN remaining_pct IS NULL THEN NULL
+        ELSE GREATEST(0.0, LEAST(100.0, 100.0 - remaining_pct))
+    END AS used_percentage,
+    NULL::integer AS remaining_requests,
+    NULL::integer AS used_requests,
+    NULL::integer AS total_requests,
+    CASE WHEN remaining_pct <= 0 THEN 'exhausted' ELSE 'observed' END AS status,
+    COALESCE(remaining_pct <= 0, FALSE) AS exhausted,
+    NULL::text AS exhaustion_kind,
+    NULL::integer AS reset_hint_seconds,
+    model,
+    NULL::text AS model_family,
+    NULL::text AS model_tier,
+    NULL::text AS parent_limit_key,
+    session_id,
+    trace_id,
+    litellm_call_id,
+    NULL::text AS route_family,
+    NULL::text AS request_model,
+    NULL::text AS response_model,
+    client AS client_name,
+    client_version,
+    NULL::text AS client_user_agent,
+    '{}'::jsonb AS raw_provider_fields,
+    '{}'::jsonb AS evidence,
+    '{}'::jsonb AS metadata
+FROM public.rate_limit_observations
+WHERE quota_key = $1
+  AND provider = $2
+  AND client IS NOT DISTINCT FROM $3::text
+  AND account_hash IS NOT DISTINCT FROM $4::text
+  AND source IS NOT DISTINCT FROM $5::text
+  AND observed_at < $6
+ORDER BY observed_at DESC, id DESC
+LIMIT 1
+"""
+_AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL = """
+INSERT INTO public.rate_limit_transitions (
+    transition_key,
+    limit_key,
+    provider,
+    client_family,
+    account_hash,
+    transition_type,
+    confidence,
+    signals,
+    source,
+    old_observed_at,
+    new_observed_at,
+    old_provider_resets_at,
+    new_provider_resets_at,
+    old_used_percentage,
+    new_used_percentage,
+    old_remaining_requests,
+    new_remaining_requests,
+    old_used_requests,
+    new_used_requests,
+    old_total_requests,
+    new_total_requests,
+    inferred_window_start_at,
+    detection_window_start_at,
+    detection_window_end_at,
+    session_usage_summary,
+    old_observation,
+    new_observation,
+    metadata
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10,
+    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+    $21, $22, $23, $24, $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb
+)
+ON CONFLICT (transition_key) DO NOTHING
+"""
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "tenant_id_source",
     "trace_name",
@@ -580,6 +1099,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "client_user_agent",
     "repository",
     "route_tag",
+    "passthrough_route_family",
     "claude_internal_check",
     "claude_internal_check_type",
     "claude_permission_check",
@@ -643,6 +1163,14 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "aawm_total_proxy_duration_ms",
     "aawm_stream_chunk_count",
     "aawm_stream_total_bytes",
+    "aawm_passthrough_endpoint_type",
+    "responses_stream_event_types",
+    "responses_stream_event_counts",
+    "responses_stream_tool_call_count",
+    "responses_stream_tool_names",
+    "aawm_stream_logging_endpoint_type",
+    "aawm_stream_logging_custom_llm_provider",
+    "aawm_stream_logging_is_openai_responses",
     "usage_input_system_tokens_estimated",
     "usage_input_tool_advertisement_tokens_estimated",
     "usage_input_conversation_tokens_estimated",
@@ -1054,7 +1582,7 @@ def _coerce_string_dict(value: Any) -> Dict[str, str]:
         return {}
 
     result: Dict[str, str] = {}
-    for key, nested_value in parsed_value.items():
+    for key, nested_value in list(parsed_value.items()):
         key_text = _clean_non_empty_string(key)
         value_text = _clean_non_empty_string(nested_value)
         if key_text and value_text:
@@ -1072,7 +1600,7 @@ def _get_header_value(headers: Any, *names: str) -> Optional[str]:
             return None
 
     wanted = {name.lower() for name in names}
-    for key, value in headers.items():
+    for key, value in list(headers.items()):
         if str(key).lower() in wanted:
             return _clean_non_empty_string(value)
     return None
@@ -1094,7 +1622,7 @@ def _extract_request_headers_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, An
                 headers = dict(headers)
             except (TypeError, ValueError):
                 continue
-        merged.update(headers)
+        merged.update(dict(headers))
     return merged
 
 
@@ -1221,7 +1749,7 @@ def _extract_repository_identity_from_value(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return _extract_repository_identity_from_text(value)
     if isinstance(value, dict):
-        for key, child in value.items():
+        for key, child in list(value.items()):
             if key in _AAWM_REPOSITORY_METADATA_KEYS:
                 repository = _normalize_repository_identity(child)
                 if repository:
@@ -1498,7 +2026,7 @@ def _enrich_session_runtime_identity_metadata(kwargs: Dict[str, Any]) -> None:
     if cc_entrypoint and not metadata.get("cc_entrypoint"):
         metadata["cc_entrypoint"] = cc_entrypoint
 
-    for key, value in identity.items():
+    for key, value in list(identity.items()):
         if key == "litellm_wheel_versions":
             if isinstance(value, dict) and value:
                 metadata[key] = value
@@ -1709,7 +2237,7 @@ def _sync_standard_logging_object(kwargs: Dict[str, Any], metadata: Dict[str, An
     standard_logging_metadata = standard_logging_object.get("metadata")
     if not isinstance(standard_logging_metadata, dict):
         standard_logging_metadata = {}
-    standard_logging_metadata.update(metadata)
+    standard_logging_metadata.update(dict(metadata))
     standard_logging_object["metadata"] = standard_logging_metadata
 
     tags = metadata.get("tags") or []
@@ -2129,6 +2657,1613 @@ def _parse_datetime_value(value: Any) -> Optional[datetime]:
     return None
 
 
+_AAWM_RATE_LIMIT_METADATA_KEYS = (
+    "trace_name",
+    "litellm_environment",
+    "client_name",
+    "client_version",
+    "repository",
+    "passthrough_route_family",
+)
+_AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP = 1.0
+_AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT = timedelta(minutes=15)
+_AAWM_RATE_LIMIT_SNAPSHOT_FIELDS = (
+    "provider_resets_at",
+    "used_percentage",
+    "remaining_requests",
+    "used_requests",
+    "total_requests",
+    "status",
+    "exhausted",
+    "exhaustion_kind",
+    "reset_hint_seconds",
+)
+
+
+def _parse_provider_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, (int, float)):
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if numeric_value <= 0:
+            return None
+        if numeric_value > 1_000_000_000_000:
+            numeric_value = numeric_value / 1000.0
+        try:
+            return datetime.fromtimestamp(numeric_value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    parsed = _parse_datetime_value(value)
+    if parsed is not None:
+        return parsed
+    if isinstance(value, str):
+        numeric_value = _safe_float(value.strip())
+        if numeric_value is not None:
+            return _parse_provider_timestamp(numeric_value)
+    return None
+
+
+def _infer_window_start_at(
+    provider_resets_at: Optional[datetime],
+    window_minutes: Optional[int],
+) -> Optional[datetime]:
+    if provider_resets_at is None or window_minutes is None or window_minutes <= 0:
+        return None
+    return provider_resets_at - timedelta(minutes=window_minutes)
+
+
+def _quota_period_from_window_minutes(window_minutes: Optional[int]) -> Optional[str]:
+    if window_minutes is None:
+        return None
+    if window_minutes == 300:
+        return "five_hour"
+    if window_minutes == 10080:
+        return "seven_day"
+    if window_minutes == 1440:
+        return "daily"
+    return f"{window_minutes}_minutes"
+
+
+def _parse_reset_hint_seconds(*values: Any) -> Optional[int]:
+    for value in values:
+        parsed = _safe_int(value)
+        if parsed is not None and parsed >= 0:
+            return parsed
+        if not isinstance(value, str):
+            continue
+        match = _RESET_AFTER_SECONDS_RE.search(value)
+        if match is None:
+            continue
+        parsed = _safe_int(match.group("seconds"))
+        if parsed is not None and parsed >= 0:
+            return parsed
+    return None
+
+
+def _json_safe_rate_limit_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return _format_langfuse_span_timestamp(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe_rate_limit_value(nested_value)
+            for key, nested_value in list(value.items())
+            if isinstance(key, (str, int, float, bool))
+        }
+    if isinstance(value, list):
+        return [_json_safe_rate_limit_value(item) for item in value[:100]]
+    if isinstance(value, tuple):
+        return [_json_safe_rate_limit_value(item) for item in value[:100]]
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")[:500]
+        except Exception:
+            return "<bytes>"
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str):
+            return value[:1000]
+        return value
+    return str(value)[:500]
+
+
+def _coerce_rate_limit_payload(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return _coerce_rate_limit_payload(value.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    parsed = _safe_json_load(stripped, None)
+    if parsed is not None:
+        return parsed
+    try:
+        literal_value = ast.literal_eval(stripped)
+    except Exception:
+        return None
+    if isinstance(literal_value, bytes):
+        return _coerce_rate_limit_payload(literal_value)
+    if isinstance(literal_value, (dict, list)):
+        return literal_value
+    return None
+
+
+def _iter_rate_limit_dicts(*roots: Any) -> List[Dict[str, Any]]:
+    pending: List[Tuple[Any, int]] = [(root, 0) for root in roots if root is not None]
+    seen: set = set()
+    dicts: List[Dict[str, Any]] = []
+    while pending and len(seen) < 512:
+        value, depth = pending.pop(0)
+        coerced = _coerce_rate_limit_payload(value)
+        if coerced is not None:
+            value = coerced
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+        if isinstance(value, dict):
+            dicts.append(value)
+            if depth >= 6:
+                continue
+            for nested_value in list(value.values()):
+                if isinstance(nested_value, (dict, list, str, bytes)):
+                    pending.append((nested_value, depth + 1))
+        elif isinstance(value, list):
+            if depth >= 6:
+                continue
+            for item in value[:200]:
+                if isinstance(item, (dict, list, str, bytes)):
+                    pending.append((item, depth + 1))
+    return dicts
+
+
+def _merged_rate_limit_metadata(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    standard_logging_object = kwargs.get("standard_logging_object")
+    if isinstance(standard_logging_object, dict):
+        standard_metadata = standard_logging_object.get("metadata")
+        if isinstance(standard_metadata, dict):
+            metadata.update(dict(standard_metadata))
+    litellm_params = kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        litellm_metadata = litellm_params.get("metadata")
+        if isinstance(litellm_metadata, dict):
+            metadata.update(dict(litellm_metadata))
+    return metadata
+
+
+def _extract_headers_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    for candidate in (
+        _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "headers"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers"),
+        _maybe_get_path(kwargs.get("standard_pass_through_logging_payload"), "request_headers"),
+        _maybe_get_path(kwargs.get("standard_logging_object"), "request_headers"),
+        kwargs.get("headers"),
+    ):
+        if not isinstance(candidate, dict):
+            continue
+        for key, value in list(candidate.items()):
+            if isinstance(key, str) and value is not None:
+                headers[key.lower()] = str(value)
+    return headers
+
+
+def _extract_rate_limit_account_hash(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    headers = _extract_headers_from_kwargs(kwargs)
+    user_api_key_dict = kwargs.get("user_api_key_dict") or kwargs.get("user_api_key")
+    candidates = [
+        metadata.get("user_api_key_hash"),
+        metadata.get("api_key_hash"),
+        metadata.get("provider_account_hash"),
+        metadata.get("provider_account_id"),
+        metadata.get("organization_id"),
+        metadata.get("org_id"),
+        kwargs.get("user_api_key_hash"),
+        _maybe_get(user_api_key_dict, "api_key_hash"),
+        _maybe_get(user_api_key_dict, "token"),
+        _maybe_get(user_api_key_dict, "api_key"),
+        headers.get("x-litellm-user-api-key-hash"),
+        headers.get("x-api-key-hash"),
+        headers.get("x-goog-user-project"),
+        headers.get("anthropic-organization-id"),
+        headers.get("openai-organization"),
+        headers.get("authorization"),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate_text = str(candidate).strip()
+        if not candidate_text:
+            continue
+        return _short_hash(candidate_text.encode("utf-8"))
+    return None
+
+
+def _resolve_rate_limit_model(
+    kwargs: Dict[str, Any],
+    result: Any,
+    metadata: Dict[str, Any],
+) -> str:
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    try:
+        model = _resolve_session_history_model(
+            kwargs=kwargs,
+            standard_logging_object=standard_logging_object,
+            metadata=metadata,
+            result=result,
+        )
+        if model and model != "unknown":
+            return model
+    except Exception:
+        pass
+    for candidate in (
+        kwargs.get("model"),
+        metadata.get("model"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
+        _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body", "model"),
+        _maybe_get(result, "model"),
+    ):
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return "unknown"
+
+
+def _infer_model_family_and_tier(*values: Any) -> Tuple[Optional[str], Optional[str]]:
+    text = " ".join(str(value) for value in values if value is not None).lower()
+    model_tier = None
+    if "sonnet" in text:
+        model_tier = "sonnet"
+    elif "opus" in text:
+        model_tier = "opus"
+    elif "haiku" in text:
+        model_tier = "haiku"
+    elif "flash-lite" in text or "flash_lite" in text:
+        model_tier = "flash_lite"
+    elif "flash" in text:
+        model_tier = "flash"
+    elif "pro" in text:
+        model_tier = "pro"
+
+    if "claude" in text or model_tier in {"sonnet", "opus", "haiku"}:
+        return "claude", model_tier
+    if "gemini" in text or model_tier in {"pro", "flash", "flash_lite"}:
+        return "gemini", model_tier
+    if "codex" in text:
+        return "codex", model_tier
+    if "gpt" in text or "openai" in text:
+        return "openai", model_tier
+    return None, model_tier
+
+
+def _infer_rate_limit_client_family(
+    provider: Optional[str],
+    model: str,
+    metadata: Dict[str, Any],
+    source: Optional[str],
+) -> Optional[str]:
+    source_lower = str(source or "").lower()
+    route_family = str(metadata.get("passthrough_route_family") or "").lower()
+    model_lower = str(model or "").lower()
+    client_text = " ".join(
+        str(value)
+        for value in (
+            metadata.get("client_name"),
+            metadata.get("client_version"),
+            metadata.get("trace_name"),
+            metadata.get("cc_version"),
+            metadata.get("cc_entrypoint"),
+        )
+        if value is not None
+    ).lower()
+    if "codex" in source_lower or "codex" in route_family or "codex" in model_lower:
+        return "codex"
+    if (
+        "google_code_assist" in source_lower
+        or "google_retrieve_user_quota" in source_lower
+        or "code_assist" in route_family
+    ):
+        return "google_code_assist"
+    if "gemini" in source_lower or "gemini" in route_family or "gemini" in model_lower:
+        return "gemini"
+    if (
+        "claude" in source_lower
+        or "claude" in route_family
+        or "claude" in client_text
+        or "cc_version" in metadata
+    ):
+        return "claude"
+    return provider
+
+
+def _build_rate_limit_key(
+    *,
+    provider: Optional[str],
+    client_family: Optional[str],
+    account_hash: Optional[str],
+    limit_id: Optional[str],
+    limit_name: Optional[str],
+    limit_scope: Optional[str],
+    quota_period: Optional[str],
+    window_minutes: Optional[int],
+    model: Optional[str],
+    model_family: Optional[str],
+) -> str:
+    identity = (
+        _clean_non_empty_string(limit_id)
+        or _clean_non_empty_string(limit_name)
+        or (
+            _clean_non_empty_string(model)
+            if str(limit_scope or "").startswith("model")
+            else None
+        )
+        or _clean_non_empty_string(model_family)
+        or "default"
+    )
+    parts = (
+        provider or "unknown_provider",
+        client_family or "unknown_client",
+        account_hash or "unknown_account",
+        identity,
+        limit_scope or quota_period or "unknown_scope",
+        str(window_minutes or "unknown_window"),
+    )
+    normalized_parts = [
+        re.sub(r"[^a-z0-9_.-]+", "_", str(part).strip().lower()).strip("_") or "unknown"
+        for part in parts
+    ]
+    return ":".join(normalized_parts)
+
+
+def _build_rate_limit_context(
+    kwargs: Dict[str, Any],
+    result: Any,
+    end_time: Any,
+    source: Optional[str],
+) -> Dict[str, Any]:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    model = _resolve_rate_limit_model(kwargs, result, metadata)
+    provider = _normalize_session_history_provider(
+        kwargs.get("custom_llm_provider"),
+        model,
+        metadata,
+    )
+    client_family = _infer_rate_limit_client_family(provider, model, metadata, source)
+    model_family, model_tier = _infer_model_family_and_tier(
+        model,
+        metadata.get("model"),
+        metadata.get("anthropic_adapter_model"),
+    )
+    runtime_identity = _build_session_runtime_identity(
+        metadata=metadata,
+        kwargs=kwargs,
+        allow_runtime=True,
+    )
+    tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=kwargs.get("standard_logging_object") or {},
+    )
+    repository = _extract_repository_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=kwargs.get("standard_logging_object") or {},
+    )
+    return {
+        "observed_at": _normalize_datetime(end_time) or datetime.now(timezone.utc),
+        "provider": provider,
+        "client_family": client_family,
+        "account_hash": _extract_rate_limit_account_hash(kwargs, metadata),
+        "environment": runtime_identity.get("litellm_environment"),
+        "tenant_id": tenant_id,
+        "repository": repository,
+        "session_id": _extract_session_id(kwargs),
+        "trace_id": _extract_trace_id(kwargs),
+        "litellm_call_id": kwargs.get("litellm_call_id"),
+        "route_family": metadata.get("passthrough_route_family"),
+        "request_model": _first_non_empty_string(
+            _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
+            _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body", "model"),
+        ),
+        "response_model": _first_non_empty_string(
+            _maybe_get(result, "model"),
+            _maybe_get_path(kwargs.get("standard_logging_object"), "response", "model"),
+        ),
+        "model": model,
+        "model_family": model_family,
+        "model_tier": model_tier,
+        "client_name": runtime_identity.get("client_name"),
+        "client_version": runtime_identity.get("client_version"),
+        "client_user_agent": runtime_identity.get("client_user_agent"),
+        "metadata": metadata,
+    }
+
+
+def _finalize_rate_limit_observation(
+    observation: Dict[str, Any],
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    finalized = dict(context)
+    finalized.update(observation)
+    finalized["observed_at"] = (
+        _normalize_datetime(finalized.get("observed_at"))
+        or context.get("observed_at")
+        or datetime.now(timezone.utc)
+    )
+    finalized["provider_resets_at"] = _parse_provider_timestamp(
+        finalized.get("provider_resets_at")
+    )
+    window_minutes = _safe_int(finalized.get("window_minutes"))
+    finalized["window_minutes"] = window_minutes
+    if finalized.get("quota_period") is None:
+        finalized["quota_period"] = _quota_period_from_window_minutes(window_minutes)
+    finalized["inferred_window_start_at"] = _infer_window_start_at(
+        finalized.get("provider_resets_at"),
+        window_minutes,
+    )
+    finalized["used_percentage"] = _safe_float(finalized.get("used_percentage"))
+    finalized["remaining_requests"] = _safe_int(finalized.get("remaining_requests"))
+    finalized["used_requests"] = _safe_int(finalized.get("used_requests"))
+    finalized["total_requests"] = _safe_int(finalized.get("total_requests"))
+    finalized["reset_hint_seconds"] = _safe_int(finalized.get("reset_hint_seconds"))
+    model_family, model_tier = _infer_model_family_and_tier(
+        finalized.get("model"),
+        finalized.get("limit_name"),
+        finalized.get("raw_provider_fields"),
+    )
+    finalized["model_family"] = finalized.get("model_family") or model_family
+    finalized["model_tier"] = finalized.get("model_tier") or model_tier
+    finalized["client_family"] = _infer_rate_limit_client_family(
+        finalized.get("provider"),
+        str(finalized.get("model") or ""),
+        finalized.get("metadata") if isinstance(finalized.get("metadata"), dict) else {},
+        finalized.get("source"),
+    )
+    finalized["limit_key"] = _build_rate_limit_key(
+        provider=finalized.get("provider"),
+        client_family=finalized.get("client_family"),
+        account_hash=finalized.get("account_hash"),
+        limit_id=_clean_non_empty_string(finalized.get("limit_id")),
+        limit_name=_clean_non_empty_string(finalized.get("limit_name")),
+        limit_scope=_clean_non_empty_string(finalized.get("limit_scope")),
+        quota_period=_clean_non_empty_string(finalized.get("quota_period")),
+        window_minutes=window_minutes,
+        model=_clean_non_empty_string(finalized.get("model")),
+        model_family=_clean_non_empty_string(finalized.get("model_family")),
+    )
+    raw_provider_fields = finalized.get("raw_provider_fields")
+    if not isinstance(raw_provider_fields, dict):
+        raw_provider_fields = {}
+    finalized["raw_provider_fields"] = raw_provider_fields
+    evidence = finalized.get("evidence")
+    if not isinstance(evidence, dict):
+        evidence = {}
+    finalized["evidence"] = evidence
+    metadata = finalized.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    finalized["metadata"] = {
+        key: _json_safe_rate_limit_value(metadata.get(key))
+        for key in _AAWM_RATE_LIMIT_METADATA_KEYS
+        if metadata.get(key) is not None
+    }
+    finalized["exhausted"] = bool(finalized.get("exhausted"))
+    if finalized.get("status") is None:
+        finalized["status"] = "exhausted" if finalized["exhausted"] else "observed"
+    return finalized
+
+
+def _dedupe_rate_limit_observations(
+    observations: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for observation in observations:
+        key = (
+            observation.get("source"),
+            observation.get("limit_key"),
+            observation.get("provider_resets_at"),
+            observation.get("used_percentage"),
+            observation.get("remaining_requests"),
+            observation.get("used_requests"),
+            observation.get("total_requests"),
+            observation.get("status"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(observation)
+    return deduped
+
+
+def _rate_limit_snapshot_signature(observation: Dict[str, Any]) -> Tuple[Any, ...]:
+    provider_resets_at = _parse_provider_timestamp(observation.get("provider_resets_at"))
+    return (
+        provider_resets_at,
+        _safe_float(observation.get("used_percentage")),
+        _safe_int(observation.get("remaining_requests")),
+        _safe_int(observation.get("used_requests")),
+        _safe_int(observation.get("total_requests")),
+        _clean_non_empty_string(observation.get("status")),
+        bool(observation.get("exhausted")),
+        _clean_non_empty_string(observation.get("exhaustion_kind")),
+        None
+        if provider_resets_at is not None
+        else _safe_int(observation.get("reset_hint_seconds")),
+    )
+
+
+def _rate_limit_observation_has_meaningful_change(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+) -> bool:
+    if previous is None:
+        return True
+
+    previous_reset = _parse_provider_timestamp(previous.get("provider_resets_at"))
+    current_reset = _parse_provider_timestamp(current.get("provider_resets_at"))
+    previous_without_reset = _rate_limit_snapshot_signature(previous)[1:]
+    current_without_reset = _rate_limit_snapshot_signature(current)[1:]
+    if previous_without_reset != current_without_reset:
+        return True
+    if previous_reset is None or current_reset is None:
+        return previous_reset != current_reset
+    return (
+        abs((current_reset - previous_reset).total_seconds())
+        >= _AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT.total_seconds()
+    )
+
+
+def _rate_limit_candidate_roots(kwargs: Dict[str, Any], result: Any) -> List[Any]:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    litellm_params = kwargs.get("litellm_params") or {}
+    roots: List[Any] = [
+        result,
+        metadata,
+        standard_logging_object.get("metadata") if isinstance(standard_logging_object, dict) else None,
+        standard_logging_object.get("response") if isinstance(standard_logging_object, dict) else None,
+        standard_logging_object.get("output") if isinstance(standard_logging_object, dict) else None,
+        kwargs.get("passthrough_logging_payload"),
+        kwargs.get("standard_pass_through_logging_payload"),
+        litellm_params.get("metadata") if isinstance(litellm_params, dict) else None,
+    ]
+    for key in (
+        "rate_limits",
+        "codex_rate_limits",
+        "codex_token_count",
+        "codex_response_headers",
+        "anthropic_response_headers",
+        "anthropic_rate_limit_headers",
+        "google_retrieve_user_quota",
+        "google_generate_content_error",
+        "google_user_quota",
+        "gemini_model_status",
+        "google_model_status",
+    ):
+        if key in metadata:
+            roots.append(metadata.get(key))
+    return [root for root in roots if root is not None]
+
+
+def _extract_codex_rate_limit_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(kwargs, result, observed_at, "codex_token_count")
+    observations: List[Dict[str, Any]] = []
+    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        rate_limits = candidate.get("rate_limits")
+        if not isinstance(rate_limits, dict):
+            continue
+        if not (
+            isinstance(rate_limits.get("primary"), dict)
+            or isinstance(rate_limits.get("secondary"), dict)
+        ):
+            continue
+        limit_id = _clean_non_empty_string(rate_limits.get("limit_id"))
+        limit_name = _clean_non_empty_string(rate_limits.get("limit_name"))
+        for limit_scope in ("primary", "secondary"):
+            window = rate_limits.get(limit_scope)
+            if not isinstance(window, dict):
+                continue
+            window_minutes = _safe_int(window.get("window_minutes"))
+            used_percentage = _safe_float(window.get("used_percent"))
+            provider_resets_at = _parse_provider_timestamp(window.get("resets_at"))
+            observations.append(
+                _finalize_rate_limit_observation(
+                    {
+                        "observed_at": context["observed_at"],
+                        "source": "codex_token_count",
+                        "provider": "openai",
+                        "client_family": "codex",
+                        "limit_id": limit_id,
+                        "limit_name": limit_name,
+                        "limit_scope": limit_scope,
+                        "window_minutes": window_minutes,
+                        "provider_resets_at": provider_resets_at,
+                        "used_percentage": used_percentage,
+                        "exhausted": bool(
+                            used_percentage is not None and used_percentage >= 100
+                        ),
+                        "exhaustion_kind": (
+                            rate_limits.get("rate_limit_reached_type")
+                            if rate_limits.get("rate_limit_reached_type")
+                            else None
+                        ),
+                        "raw_provider_fields": {
+                            "limit_id": limit_id,
+                            "limit_name": limit_name,
+                            "limit_scope": limit_scope,
+                            "window_minutes": window.get("window_minutes"),
+                            "used_percent": window.get("used_percent"),
+                            "resets_at": window.get("resets_at"),
+                            "plan_type": rate_limits.get("plan_type"),
+                            "rate_limit_reached_type": rate_limits.get("rate_limit_reached_type"),
+                        },
+                        "evidence": {
+                            "signals": ["provider_rate_limits"],
+                            "provider_fields": [
+                                f"rate_limits.{limit_scope}.used_percent",
+                                f"rate_limits.{limit_scope}.window_minutes",
+                                f"rate_limits.{limit_scope}.resets_at",
+                            ],
+                        },
+                    },
+                    context,
+                )
+            )
+    return _dedupe_rate_limit_observations(observations)
+
+
+def _extract_codex_header_rate_limit_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        "codex_response_headers",
+    )
+    observations: List[Dict[str, Any]] = []
+    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        source = str(candidate.get("source") or "").lower()
+        has_codex_header = any(
+            isinstance(key, str) and key.lower().startswith("x-codex-")
+            for key in list(candidate.keys())
+        )
+        if not has_codex_header and source != "codex_response_headers":
+            continue
+
+        header_groups = [
+            {
+                "header_prefix": "x-codex",
+                "limit_id": "codex",
+                "limit_name": (
+                    f"Codex {_get_rate_limit_header_value(candidate, 'x-codex-active-limit')}"
+                    if _get_rate_limit_header_value(candidate, "x-codex-active-limit")
+                    else "Codex"
+                ),
+            }
+        ]
+        bengalfox_limit_name = _clean_non_empty_string(
+            _get_rate_limit_header_value(candidate, "x-codex-bengalfox-limit-name")
+        )
+        if bengalfox_limit_name:
+            header_groups.append(
+                {
+                    "header_prefix": "x-codex-bengalfox",
+                    "limit_id": "codex_bengalfox",
+                    "limit_name": bengalfox_limit_name,
+                }
+            )
+
+        for header_group in header_groups:
+            header_prefix = header_group["header_prefix"]
+            for limit_scope, window_minutes in (
+                ("primary", 300),
+                ("secondary", 10080),
+            ):
+                reset_key = f"{header_prefix}-{limit_scope}-reset-at"
+                reset_after_key = f"{header_prefix}-{limit_scope}-reset-after-seconds"
+                used_percent_key = f"{header_prefix}-{limit_scope}-used-percent"
+                window_minutes_key = f"{header_prefix}-{limit_scope}-window-minutes"
+                over_limit_key = (
+                    f"{header_prefix}-{limit_scope}-over-secondary-limit-percent"
+                )
+                reset_value = _get_rate_limit_header_value(candidate, reset_key)
+                reset_hint_seconds = _safe_int(
+                    _get_rate_limit_header_value(candidate, reset_after_key)
+                )
+                used_percentage = _safe_float(
+                    _get_rate_limit_header_value(candidate, used_percent_key)
+                )
+                observed_window_minutes = (
+                    _safe_int(
+                        _get_rate_limit_header_value(candidate, window_minutes_key)
+                    )
+                    or window_minutes
+                )
+                over_limit_percent = _safe_float(
+                    _get_rate_limit_header_value(candidate, over_limit_key)
+                )
+                if (
+                    reset_value is None
+                    and reset_hint_seconds is None
+                    and used_percentage is None
+                    and over_limit_percent is None
+                ):
+                    continue
+                provider_resets_at = _parse_provider_timestamp(reset_value)
+                if provider_resets_at is None and reset_hint_seconds is not None:
+                    provider_resets_at = context["observed_at"] + timedelta(
+                        seconds=reset_hint_seconds
+                    )
+                observations.append(
+                    _finalize_rate_limit_observation(
+                        {
+                            "observed_at": context["observed_at"],
+                            "source": "codex_response_headers",
+                            "provider": "openai",
+                            "client_family": "codex",
+                            "limit_id": header_group["limit_id"],
+                            "limit_name": header_group["limit_name"],
+                            "limit_scope": limit_scope,
+                            "window_minutes": observed_window_minutes,
+                            "provider_resets_at": provider_resets_at,
+                            "used_percentage": used_percentage,
+                            "reset_hint_seconds": reset_hint_seconds,
+                            "exhausted": (
+                                (used_percentage is not None and used_percentage >= 100)
+                                or (
+                                    over_limit_percent is not None
+                                    and over_limit_percent > 0
+                                )
+                            ),
+                            "raw_provider_fields": {
+                                reset_key: reset_value,
+                                reset_after_key: _get_rate_limit_header_value(
+                                    candidate,
+                                    reset_after_key,
+                                ),
+                                over_limit_key: _get_rate_limit_header_value(
+                                    candidate,
+                                    over_limit_key,
+                                ),
+                                used_percent_key: _get_rate_limit_header_value(
+                                    candidate,
+                                    used_percent_key,
+                                ),
+                                window_minutes_key: _get_rate_limit_header_value(
+                                    candidate,
+                                    window_minutes_key,
+                                ),
+                                "x-codex-active-limit": _get_rate_limit_header_value(
+                                    candidate,
+                                    "x-codex-active-limit",
+                                ),
+                                "x-codex-credits-unlimited": _get_rate_limit_header_value(
+                                    candidate,
+                                    "x-codex-credits-unlimited",
+                                ),
+                            },
+                            "evidence": {
+                                "signals": ["codex_response_rate_limit_headers"],
+                                "provider_fields": [
+                                    reset_key,
+                                    reset_after_key,
+                                    used_percent_key,
+                                    window_minutes_key,
+                                    over_limit_key,
+                                ],
+                            },
+                        },
+                        context,
+                    )
+                )
+    return _dedupe_rate_limit_observations(observations)
+
+
+def _extract_error_payload_dicts(value: Any) -> List[Dict[str, Any]]:
+    roots: List[Any] = [value, str(value)]
+    for attr in ("detail", "body", "response", "message"):
+        try:
+            attr_value = getattr(value, attr)
+        except Exception:
+            attr_value = None
+        if attr_value is not None:
+            roots.append(attr_value)
+            if attr == "response":
+                roots.extend(
+                    [
+                        getattr(attr_value, "text", None),
+                        getattr(attr_value, "content", None),
+                        getattr(attr_value, "headers", None),
+                    ]
+                )
+    return _iter_rate_limit_dicts(*roots)
+
+
+def _extract_codex_usage_limit_error_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        "codex_usage_limit_error",
+    )
+    observations: List[Dict[str, Any]] = []
+    for candidate in _extract_error_payload_dicts(result) + _iter_rate_limit_dicts(
+        *_rate_limit_candidate_roots(kwargs, result)
+    ):
+        error = candidate.get("error") if isinstance(candidate.get("error"), dict) else candidate
+        if not isinstance(error, dict):
+            continue
+        error_type = _clean_non_empty_string(error.get("type")) or _clean_non_empty_string(
+            error.get("code")
+        )
+        message = _clean_non_empty_string(error.get("message"))
+        if error_type != "usage_limit_reached" and not (
+            isinstance(message, str) and "usage limit" in message.lower()
+        ):
+            continue
+        reset_hint_seconds = _parse_reset_hint_seconds(
+            error.get("resets_in_seconds"),
+            message,
+        )
+        provider_resets_at = _parse_provider_timestamp(error.get("resets_at"))
+        if provider_resets_at is None and reset_hint_seconds is not None:
+            provider_resets_at = context["observed_at"] + timedelta(
+                seconds=reset_hint_seconds
+            )
+        limit_name = (
+            _clean_non_empty_string(error.get("limit_name"))
+            or _clean_non_empty_string(context.get("model"))
+            or "codex"
+        )
+        observations.append(
+            _finalize_rate_limit_observation(
+                {
+                    "observed_at": context["observed_at"],
+                    "source": "codex_usage_limit_error",
+                    "provider": "openai",
+                    "client_family": "codex",
+                    "limit_id": _clean_non_empty_string(error.get("limit_id")),
+                    "limit_name": limit_name,
+                    "limit_scope": _clean_non_empty_string(
+                        error.get("rate_limit_reached_type")
+                    )
+                    or "usage_limit",
+                    "provider_resets_at": provider_resets_at,
+                    "used_percentage": 100.0,
+                    "status": "exhausted",
+                    "exhausted": True,
+                    "exhaustion_kind": "usage_limit_reached",
+                    "reset_hint_seconds": reset_hint_seconds,
+                    "raw_provider_fields": {
+                        "type": error_type,
+                        "message": message,
+                        "plan_type": error.get("plan_type"),
+                        "resets_at": error.get("resets_at"),
+                        "resets_in_seconds": error.get("resets_in_seconds"),
+                        "rate_limit_reached_type": error.get("rate_limit_reached_type"),
+                    },
+                    "evidence": {
+                        "signals": ["usage_limit_error"],
+                        "provider_fields": [
+                            "error.type",
+                            "error.resets_at",
+                            "error.resets_in_seconds",
+                        ],
+                    },
+                },
+                context,
+            )
+        )
+    return _dedupe_rate_limit_observations(observations)
+
+
+def _get_rate_limit_header_value(
+    candidate: Dict[str, Any],
+    *header_names: str,
+) -> Any:
+    lower_headers = {
+        str(key).lower(): value
+        for key, value in list(candidate.items())
+        if isinstance(key, str)
+    }
+    for header_name in header_names:
+        value = lower_headers.get(header_name.lower())
+        if value is not None:
+            return value
+    return None
+
+
+def _looks_like_claude_rate_limit_context(context: Dict[str, Any]) -> bool:
+    metadata = context.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    context_text = " ".join(
+        str(value)
+        for value in (
+            context.get("client_name"),
+            context.get("client_user_agent"),
+            context.get("route_family"),
+            metadata.get("trace_name"),
+            metadata.get("client_name"),
+            metadata.get("cc_version"),
+            metadata.get("cc_entrypoint"),
+        )
+        if value is not None
+    ).lower()
+    return "claude" in context_text or "cc_version" in metadata
+
+
+def _extract_anthropic_header_rate_limit_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        "anthropic_response_headers",
+    )
+    observations: List[Dict[str, Any]] = []
+    client_family = (
+        "claude" if _looks_like_claude_rate_limit_context(context) else "anthropic"
+    )
+    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        source = str(candidate.get("source") or "").lower()
+        has_anthropic_header = any(
+            isinstance(key, str) and key.lower().startswith("anthropic-ratelimit-")
+            for key in list(candidate.keys())
+        )
+        if not has_anthropic_header and source != "anthropic_response_headers":
+            continue
+        for limit_scope, display_name, window_minutes in (
+            ("5h", "Anthropic unified 5h", 300),
+            ("7d", "Anthropic unified 7d", 10080),
+            ("7d_sonnet", "Anthropic unified 7d Sonnet", 10080),
+        ):
+            reset_key = f"anthropic-ratelimit-unified-{limit_scope}-reset"
+            status_key = f"anthropic-ratelimit-unified-{limit_scope}-status"
+            utilization_key = (
+                f"anthropic-ratelimit-unified-{limit_scope}-utilization"
+            )
+            threshold_key = (
+                f"anthropic-ratelimit-unified-{limit_scope}-surpassed-threshold"
+            )
+            reset_value = _get_rate_limit_header_value(candidate, reset_key)
+            status_value = _clean_non_empty_string(
+                _get_rate_limit_header_value(candidate, status_key)
+            )
+            utilization = _safe_float(
+                _get_rate_limit_header_value(candidate, utilization_key)
+            )
+            threshold = _safe_float(
+                _get_rate_limit_header_value(candidate, threshold_key)
+            )
+            if reset_value is None and status_value is None and utilization is None:
+                continue
+            used_percentage = (
+                utilization * 100
+                if utilization is not None and utilization <= 1
+                else utilization
+            )
+            observations.append(
+                _finalize_rate_limit_observation(
+                    {
+                        "observed_at": context["observed_at"],
+                        "source": "anthropic_response_headers",
+                        "provider": "anthropic",
+                        "client_family": client_family,
+                        "limit_id": f"anthropic_unified_{limit_scope}",
+                        "limit_name": display_name,
+                        "limit_scope": limit_scope,
+                        "window_minutes": window_minutes,
+                        "provider_resets_at": _parse_provider_timestamp(reset_value),
+                        "used_percentage": used_percentage,
+                        "status": status_value,
+                        "exhausted": status_value in {"rejected", "exhausted"},
+                        "raw_provider_fields": {
+                            reset_key: reset_value,
+                            status_key: status_value,
+                            utilization_key: _get_rate_limit_header_value(
+                                candidate,
+                                utilization_key,
+                            ),
+                            threshold_key: _get_rate_limit_header_value(
+                                candidate,
+                                threshold_key,
+                            ),
+                            "surpassed_threshold": threshold,
+                            "anthropic-ratelimit-unified-representative-claim": _get_rate_limit_header_value(
+                                candidate,
+                                "anthropic-ratelimit-unified-representative-claim",
+                            ),
+                            "anthropic-ratelimit-unified-overage-status": _get_rate_limit_header_value(
+                                candidate,
+                                "anthropic-ratelimit-unified-overage-status",
+                            ),
+                        },
+                        "evidence": {
+                            "signals": ["anthropic_unified_rate_limit_headers"],
+                            "provider_fields": [
+                                reset_key,
+                                status_key,
+                                utilization_key,
+                                threshold_key,
+                            ],
+                        },
+                    },
+                    context,
+                )
+            )
+        for limit_scope, total_key, remaining_key, reset_key in (
+            (
+                "requests",
+                "anthropic-ratelimit-requests-limit",
+                "anthropic-ratelimit-requests-remaining",
+                "anthropic-ratelimit-requests-reset",
+            ),
+            (
+                "tokens",
+                "anthropic-ratelimit-tokens-limit",
+                "anthropic-ratelimit-tokens-remaining",
+                "anthropic-ratelimit-tokens-reset",
+            ),
+        ):
+            total = _safe_int(_get_rate_limit_header_value(candidate, total_key))
+            remaining = _safe_int(
+                _get_rate_limit_header_value(candidate, remaining_key)
+            )
+            reset_value = _get_rate_limit_header_value(candidate, reset_key)
+            if total is None and remaining is None and reset_value is None:
+                continue
+            used = total - remaining if total is not None and remaining is not None else None
+            used_percentage = (
+                (used / total) * 100
+                if used is not None and total is not None and total > 0
+                else None
+            )
+            observations.append(
+                _finalize_rate_limit_observation(
+                    {
+                        "observed_at": context["observed_at"],
+                        "source": "anthropic_response_headers",
+                        "provider": "anthropic",
+                        "client_family": client_family,
+                        "limit_id": f"anthropic_{limit_scope}",
+                        "limit_name": f"Anthropic {limit_scope} rate limit",
+                        "limit_scope": limit_scope,
+                        "provider_resets_at": _parse_provider_timestamp(reset_value),
+                        "used_percentage": used_percentage,
+                        "remaining_requests": remaining,
+                        "used_requests": used,
+                        "total_requests": total,
+                        "raw_provider_fields": {
+                            total_key: _get_rate_limit_header_value(candidate, total_key),
+                            remaining_key: _get_rate_limit_header_value(
+                                candidate,
+                                remaining_key,
+                            ),
+                            reset_key: reset_value,
+                        },
+                        "evidence": {
+                            "signals": ["anthropic_response_rate_limit_headers"],
+                            "provider_fields": [
+                                total_key,
+                                remaining_key,
+                                reset_key,
+                            ],
+                        },
+                    },
+                    context,
+                )
+            )
+    return _dedupe_rate_limit_observations(observations)
+
+
+def _first_quota_number(candidate: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        value = _safe_int(candidate.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _first_quota_float(candidate: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = _safe_float(candidate.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _looks_like_google_quota_candidate(candidate: Dict[str, Any]) -> bool:
+    request_quota_keys = {
+        "buckets",
+        "modelId",
+        "tokenType",
+        "remainingFraction",
+        "remainingRequests",
+        "remaining_requests",
+        "requestsRemaining",
+        "usedRequests",
+        "used_requests",
+        "requestsUsed",
+        "totalRequests",
+        "total_requests",
+        "requestLimit",
+        "dailyLimit",
+        "quotaId",
+        "quotaName",
+    }
+    weak_quota_keys = {
+        "usagePercentage",
+        "usedPercentage",
+        "used_percentage",
+    }
+    candidate_keys = set(candidate.keys())
+    if request_quota_keys.intersection(candidate_keys):
+        return True
+    source = str(candidate.get("source") or "").lower()
+    return bool(weak_quota_keys.intersection(candidate_keys)) and (
+        "google" in source or "gemini" in source
+    )
+
+
+def _extract_google_quota_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        "google_retrieve_user_quota",
+    )
+    observations: List[Dict[str, Any]] = []
+    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        if not _looks_like_google_quota_candidate(candidate):
+            continue
+        remaining_requests = _first_quota_number(
+            candidate,
+            "remainingRequests",
+            "remaining_requests",
+            "requestsRemaining",
+            "remaining",
+        )
+        used_requests = _first_quota_number(
+            candidate,
+            "usedRequests",
+            "used_requests",
+            "requestsUsed",
+            "currentUsage",
+            "used",
+        )
+        total_requests = _first_quota_number(
+            candidate,
+            "totalRequests",
+            "total_requests",
+            "requestLimit",
+            "dailyLimit",
+            "limit",
+            "quota",
+        )
+        used_percentage = _first_quota_float(
+            candidate,
+            "usedPercentage",
+            "used_percentage",
+            "usagePercentage",
+        )
+        remaining_fraction = _first_quota_float(
+            candidate,
+            "remainingFraction",
+            "remaining_fraction",
+        )
+        if used_percentage is None and used_requests is not None and total_requests:
+            used_percentage = (used_requests / total_requests) * 100
+        if used_percentage is None and remaining_fraction is not None:
+            used_percentage = max(0.0, min(100.0, (1 - remaining_fraction) * 100))
+        reset_source_value = _first_non_none(
+            candidate.get("resetsAt"),
+            candidate.get("resets_at"),
+            candidate.get("resetAt"),
+            candidate.get("resetTime"),
+        )
+        if (
+            remaining_requests is None
+            and used_requests is None
+            and total_requests is None
+            and used_percentage is None
+            and reset_source_value is None
+            and _clean_non_empty_string(candidate.get("quotaId")) is None
+            and _clean_non_empty_string(candidate.get("quotaName")) is None
+        ):
+            continue
+        model = (
+            _clean_non_empty_string(candidate.get("modelId"))
+            or _clean_non_empty_string(candidate.get("model"))
+            or context.get("model")
+        )
+        model_family, model_tier = _infer_model_family_and_tier(model)
+        quota_period = _clean_non_empty_string(candidate.get("quotaPeriod")) or _clean_non_empty_string(
+            candidate.get("period")
+        ) or "daily"
+        window_minutes = 1440 if quota_period == "daily" else None
+        limit_scope = (
+            "model_requests"
+            if _clean_non_empty_string(candidate.get("modelId"))
+            or _clean_non_empty_string(candidate.get("model"))
+            else "daily_request_pool"
+        )
+        token_type = _clean_non_empty_string(candidate.get("tokenType"))
+        observations.append(
+            _finalize_rate_limit_observation(
+                {
+                    "observed_at": context["observed_at"],
+                    "source": _clean_non_empty_string(candidate.get("source"))
+                    or "google_retrieve_user_quota",
+                    "provider": "gemini",
+                    "client_family": "google_code_assist",
+                    "limit_id": _clean_non_empty_string(candidate.get("quotaId"))
+                    or (
+                        f"google_code_assist_requests_{model}"
+                        if limit_scope == "model_requests" and model
+                        else "google_code_assist_requests"
+                    ),
+                    "limit_name": _clean_non_empty_string(candidate.get("quotaName"))
+                    or (
+                        f"Google Code Assist {model} requests"
+                        if model
+                        else "Google Code Assist requests"
+                    ),
+                    "limit_scope": limit_scope,
+                    "window_minutes": window_minutes,
+                    "quota_period": quota_period,
+                    "provider_resets_at": _parse_provider_timestamp(
+                        reset_source_value
+                    ),
+                    "used_percentage": used_percentage,
+                    "remaining_requests": remaining_requests,
+                    "used_requests": used_requests,
+                    "total_requests": total_requests,
+                    "model": model,
+                    "model_family": model_family,
+                    "model_tier": model_tier,
+                    "raw_provider_fields": {
+                        key: candidate.get(key)
+                        for key in (
+                            "modelId",
+                            "tokenType",
+                            "remainingFraction",
+                            "remainingRequests",
+                            "remaining_requests",
+                            "usedRequests",
+                            "used_requests",
+                            "totalRequests",
+                            "total_requests",
+                            "usagePercentage",
+                            "usedPercentage",
+                            "quotaPeriod",
+                            "period",
+                            "model",
+                            "quotaId",
+                            "resetTime",
+                        )
+                        if key in candidate
+                    },
+                    "evidence": {
+                        "signals": ["google_quota_payload"],
+                        "provider_fields": sorted(
+                            key
+                            for key in list(candidate.keys())
+                            if "quota" in key.lower()
+                            or "request" in key.lower()
+                            or "usage" in key.lower()
+                            or "fraction" in key.lower()
+                            or "reset" in key.lower()
+                            or key in {"modelId", "tokenType"}
+                        )[:20],
+                        "token_type": token_type,
+                    },
+                },
+                context,
+            )
+        )
+    return _dedupe_rate_limit_observations(observations)
+
+
+def _extract_google_error_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        "google_generate_content_error",
+    )
+    observations: List[Dict[str, Any]] = []
+    for candidate in _extract_error_payload_dicts(result) + _iter_rate_limit_dicts(
+        *_rate_limit_candidate_roots(kwargs, result)
+    ):
+        error = candidate.get("error") if isinstance(candidate.get("error"), dict) else candidate
+        if not isinstance(error, dict):
+            continue
+        status_text = _clean_non_empty_string(error.get("status"))
+        code = _safe_int(error.get("code"))
+        message = _clean_non_empty_string(error.get("message")) or ""
+        details = error.get("details") if isinstance(error.get("details"), list) else []
+        reasons = [
+            _clean_non_empty_string(_maybe_get(detail, "reason"))
+            for detail in details
+            if isinstance(detail, dict)
+        ]
+        reasons = [reason for reason in reasons if reason]
+        metadata_models = [
+            _clean_non_empty_string(_maybe_get_path(detail, "metadata", "model"))
+            for detail in details
+            if isinstance(detail, dict)
+        ]
+        metadata_models = [model for model in metadata_models if model]
+        is_resource_exhausted = (
+            code == 429
+            or status_text in {"RESOURCE_EXHAUSTED", "RATE_LIMIT_EXCEEDED"}
+            or any(reason in {"MODEL_CAPACITY_EXHAUSTED", "RATE_LIMIT_EXCEEDED"} for reason in reasons)
+        )
+        if not is_resource_exhausted:
+            continue
+        is_capacity = any(reason == "MODEL_CAPACITY_EXHAUSTED" for reason in reasons)
+        reset_hint_seconds = _parse_reset_hint_seconds(message)
+        provider_resets_at = (
+            context["observed_at"] + timedelta(seconds=reset_hint_seconds)
+            if reset_hint_seconds is not None
+            else None
+        )
+        model = metadata_models[0] if metadata_models else context.get("model")
+        model_family, model_tier = _infer_model_family_and_tier(model)
+        observations.append(
+            _finalize_rate_limit_observation(
+                {
+                    "observed_at": context["observed_at"],
+                    "source": (
+                        "google_model_capacity_error"
+                        if is_capacity
+                        else "google_generate_content_error"
+                    ),
+                    "provider": "gemini",
+                    "client_family": "google_code_assist",
+                    "limit_id": (
+                        "google_model_capacity"
+                        if is_capacity
+                        else "google_code_assist_requests"
+                    ),
+                    "limit_name": (
+                        "Google model capacity"
+                        if is_capacity
+                        else "Google Code Assist requests"
+                    ),
+                    "limit_scope": "model_capacity" if is_capacity else "daily_request_pool",
+                    "quota_period": None if is_capacity else "daily",
+                    "window_minutes": None if is_capacity else 1440,
+                    "provider_resets_at": provider_resets_at,
+                    "status": (
+                        "model_capacity_exhausted"
+                        if is_capacity
+                        else "quota_exhausted"
+                    ),
+                    "exhausted": not is_capacity,
+                    "exhaustion_kind": (
+                        "model_capacity"
+                        if is_capacity
+                        else "request_quota"
+                    ),
+                    "reset_hint_seconds": reset_hint_seconds,
+                    "model": model,
+                    "model_family": model_family,
+                    "model_tier": model_tier,
+                    "raw_provider_fields": {
+                        "code": code,
+                        "status": status_text,
+                        "message": message,
+                        "reasons": reasons,
+                        "metadata_models": metadata_models,
+                    },
+                    "evidence": {
+                        "signals": [
+                            "google_resource_exhausted",
+                            "model_capacity" if is_capacity else "quota_exhaustion",
+                        ],
+                        "corroboration_required": is_capacity,
+                    },
+                },
+                context,
+            )
+        )
+    return _dedupe_rate_limit_observations(observations)
+
+
+def _build_rate_limit_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    start_time: Any,
+    end_time: Any,
+) -> List[Dict[str, Any]]:
+    observed_at = _normalize_datetime(end_time) or _normalize_datetime(start_time) or datetime.now(timezone.utc)
+    observations: List[Dict[str, Any]] = []
+    observations.extend(_extract_codex_rate_limit_observations(kwargs, result, observed_at))
+    observations.extend(_extract_codex_header_rate_limit_observations(kwargs, result, observed_at))
+    observations.extend(_extract_codex_usage_limit_error_observations(kwargs, result, observed_at))
+    observations.extend(_extract_anthropic_header_rate_limit_observations(kwargs, result, observed_at))
+    observations.extend(_extract_google_quota_observations(kwargs, result, observed_at))
+    observations.extend(_extract_google_error_observations(kwargs, result, observed_at))
+    return _dedupe_rate_limit_observations(observations)
+
+
+def _classify_rate_limit_transition(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    signals: List[str] = []
+    transition_type: Optional[str] = None
+    confidence = 0.0
+
+    previous_reset = _parse_provider_timestamp(previous.get("provider_resets_at"))
+    current_reset = _parse_provider_timestamp(current.get("provider_resets_at"))
+    previous_observed = _parse_provider_timestamp(previous.get("observed_at"))
+    current_observed = _parse_provider_timestamp(current.get("observed_at"))
+    if previous_reset is not None and current_reset is not None:
+        if abs((current_reset - previous_reset).total_seconds()) > 1:
+            signals.append("resets_at_change")
+            confidence = 0.95
+            if previous_reset and current_observed and current_observed >= previous_reset - timedelta(minutes=2):
+                transition_type = "expected_rollover"
+            elif current_reset < previous_reset:
+                transition_type = "capacity_grant_or_random_reset"
+            else:
+                transition_type = "early_provider_reset"
+
+    previous_used_requests = _safe_int(previous.get("used_requests"))
+    current_used_requests = _safe_int(current.get("used_requests"))
+    if (
+        previous_used_requests is not None
+        and current_used_requests is not None
+        and current_used_requests < previous_used_requests
+    ):
+        signals.append("counter_drop")
+        transition_type = transition_type or "counter_drop_reset"
+        confidence = max(confidence, 0.9)
+
+    previous_remaining = _safe_int(previous.get("remaining_requests"))
+    current_remaining = _safe_int(current.get("remaining_requests"))
+    previous_total = _safe_int(previous.get("total_requests"))
+    current_total = _safe_int(current.get("total_requests"))
+    if (
+        previous_remaining is not None
+        and current_remaining is not None
+        and current_remaining > previous_remaining
+        and (previous_total is None or current_total is None or previous_total == current_total)
+    ):
+        signals.append("counter_drop")
+        transition_type = transition_type or "counter_drop_reset"
+        confidence = max(confidence, 0.85)
+
+    previous_used_percentage = _safe_float(previous.get("used_percentage"))
+    current_used_percentage = _safe_float(current.get("used_percentage"))
+    if (
+        previous_used_percentage is not None
+        and current_used_percentage is not None
+        and previous_used_percentage - current_used_percentage
+        >= _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP
+    ):
+        signals.append("usage_percent_drop")
+        transition_type = transition_type or "usage_percent_drop"
+        confidence = max(confidence, 0.75)
+
+    if previous_total is not None and current_total is not None and previous_total != current_total:
+        signals.append("limit_change")
+        transition_type = transition_type or "policy_change"
+        confidence = max(confidence, 0.65)
+
+    if bool(previous.get("exhausted")) and not bool(current.get("exhausted")):
+        signals.append("success_after_exhaustion")
+        transition_type = transition_type or "capacity_grant_or_random_reset"
+        confidence = max(confidence, 0.7)
+
+    if not transition_type or not signals:
+        return None
+
+    return {
+        "transition_type": transition_type,
+        "signals": sorted(set(signals)),
+        "confidence": confidence,
+        "previous_observed_at": previous_observed,
+        "current_observed_at": current_observed,
+    }
+
+
+def _rate_limit_observation_json(observation: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: _json_safe_rate_limit_value(value)
+        for key, value in list(observation.items())
+        if key not in {"metadata"}
+    }
+
+
+def _build_rate_limit_transition(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+    classification: Dict[str, Any],
+) -> Dict[str, Any]:
+    transition_material = "|".join(
+        str(value or "")
+        for value in (
+            current.get("limit_key"),
+            previous.get("observed_at"),
+            current.get("observed_at"),
+            classification.get("transition_type"),
+            ",".join(classification.get("signals") or []),
+            current.get("provider_resets_at"),
+        )
+    )
+    transition_key = "rlt_" + _short_hash(transition_material.encode("utf-8"))
+    return {
+        "transition_key": transition_key,
+        "limit_key": current.get("limit_key"),
+        "provider": current.get("provider"),
+        "client_family": current.get("client_family"),
+        "account_hash": current.get("account_hash"),
+        "transition_type": classification["transition_type"],
+        "confidence": classification["confidence"],
+        "signals": classification["signals"],
+        "source": current.get("source"),
+        "old_observed_at": _parse_provider_timestamp(previous.get("observed_at")),
+        "new_observed_at": _parse_provider_timestamp(current.get("observed_at")),
+        "old_provider_resets_at": _parse_provider_timestamp(previous.get("provider_resets_at")),
+        "new_provider_resets_at": _parse_provider_timestamp(current.get("provider_resets_at")),
+        "old_used_percentage": _safe_float(previous.get("used_percentage")),
+        "new_used_percentage": _safe_float(current.get("used_percentage")),
+        "old_remaining_requests": _safe_int(previous.get("remaining_requests")),
+        "new_remaining_requests": _safe_int(current.get("remaining_requests")),
+        "old_used_requests": _safe_int(previous.get("used_requests")),
+        "new_used_requests": _safe_int(current.get("used_requests")),
+        "old_total_requests": _safe_int(previous.get("total_requests")),
+        "new_total_requests": _safe_int(current.get("total_requests")),
+        "inferred_window_start_at": _parse_provider_timestamp(
+            current.get("inferred_window_start_at")
+        ),
+        "detection_window_start_at": _parse_provider_timestamp(previous.get("observed_at")),
+        "detection_window_end_at": _parse_provider_timestamp(current.get("observed_at")),
+        "session_usage_summary": {},
+        "old_observation": _rate_limit_observation_json(previous),
+        "new_observation": _rate_limit_observation_json(current),
+        "metadata": {
+            "transition_basis": "adjacent_observation_compare",
+            "meaningful_percent_drop_threshold": _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP,
+        },
+    }
+
+
 def _extract_responses_completed_payload_from_passthrough_fallback_text(
     response_text: Any,
 ) -> Optional[Dict[str, Any]]:
@@ -2293,7 +4428,7 @@ def _merge_usage_object_with_metadata(
         return metadata_usage_object
 
     merged_usage = dict(usage_dict)
-    for key, value in metadata_usage_object.items():
+    for key, value in list(metadata_usage_object.items()):
         if key not in merged_usage or merged_usage.get(key) in (None, {}, []):
             merged_usage[key] = value
 
@@ -2619,7 +4754,7 @@ def _request_contains_cache_control(payload: Any) -> bool:
     if isinstance(payload, dict):
         if payload.get("cache_control") is not None or payload.get("cacheControl") is not None:
             return True
-        return any(_request_contains_cache_control(value) for value in payload.values())
+        return any(_request_contains_cache_control(value) for value in list(payload.values()))
     if isinstance(payload, list):
         return any(_request_contains_cache_control(item) for item in payload)
     return False
@@ -2633,7 +4768,7 @@ def _request_contains_cached_content(payload: Any) -> bool:
         cached_content_alias = payload.get("cached_content")
         if isinstance(cached_content_alias, str) and cached_content_alias.strip():
             return True
-        return any(_request_contains_cached_content(value) for value in payload.values())
+        return any(_request_contains_cached_content(value) for value in list(payload.values()))
     if isinstance(payload, list):
         return any(_request_contains_cached_content(item) for item in payload)
     return False
@@ -4086,7 +6221,7 @@ def _collect_file_paths_from_value(value: Any) -> List[str]:
         for item in value:
             collected.extend(_collect_file_paths_from_value(item))
     elif isinstance(value, dict):
-        for nested_key, nested_value in value.items():
+        for nested_key, nested_value in list(value.items()):
             nested_key_lower = str(nested_key).lower()
             if nested_key_lower in _TOOL_ACTIVITY_SKIP_PATH_KEYS:
                 continue
@@ -4131,7 +6266,7 @@ def _find_command_text_in_value(value: Any, *, depth: int = 0) -> Optional[str]:
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
 
-    for key, nested_value in value.items():
+    for key, nested_value in list(value.items()):
         if str(key).lower() in _TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS:
             continue
         command_text = _find_command_text_in_value(nested_value, depth=depth + 1)
@@ -5326,7 +7461,7 @@ def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> Lis
     billing_header_fields = metadata.get("anthropic_billing_header_fields")
     if isinstance(billing_header_fields, dict) and billing_header_fields:
         normalized_tags.append("anthropic-billing-header")
-        for key, value in billing_header_fields.items():
+        for key, value in list(billing_header_fields.items()):
             if isinstance(key, str) and key.strip():
                 normalized_tags.append(f"anthropic-billing-header-key:{key}")
                 if value is not None and str(value).strip():
@@ -6140,6 +8275,16 @@ async def _ensure_session_history_schema(conn: Any) -> None:
         await conn.execute(_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL)
         for statement in _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS:
             await conn.execute(statement)
+        await conn.execute(_AAWM_RATE_LIMIT_OBSERVATIONS_TABLE_SQL)
+        for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS:
+            await conn.execute(statement)
+        for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS:
+            await conn.execute(statement)
+        await conn.execute(_AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL)
+        for statement in _AAWM_RATE_LIMIT_TRANSITIONS_ALTER_STATEMENTS:
+            await conn.execute(statement)
+        for statement in _AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS:
+            await conn.execute(statement)
 
         _aawm_session_history_schema_ready = True
 
@@ -6239,19 +8384,359 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
     return payloads
 
 
+def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
+    provider = _clean_non_empty_string(record.get("provider")) or "unknown"
+    source = str(record.get("source") or "").lower()
+    client_family = str(record.get("client_family") or "").lower()
+    if (
+        provider in {"gemini", "google_code_assist"}
+        or client_family in {"gemini", "google_code_assist"}
+        or source.startswith("google_")
+        or source.startswith("gemini_")
+    ):
+        return "google"
+    return provider
+
+
+def _rate_limit_storage_client(record: Dict[str, Any]) -> Optional[str]:
+    return _first_non_empty_string(
+        record.get("client_family"),
+        record.get("client_name"),
+        _maybe_get_path(record.get("metadata"), "client_name"),
+    )
+
+
+def _rate_limit_storage_quota_key(record: Dict[str, Any]) -> str:
+    limit_id = _clean_non_empty_string(record.get("limit_id"))
+    limit_scope = _clean_non_empty_string(record.get("limit_scope"))
+    if limit_id and limit_scope:
+        return f"{limit_id}:{limit_scope}"
+    return (
+        _clean_non_empty_string(record.get("limit_key"))
+        or _clean_non_empty_string(record.get("limit_name"))
+        or ":".join(
+            part
+            for part in (
+                _clean_non_empty_string(record.get("source")),
+                _clean_non_empty_string(record.get("model")),
+            )
+            if part
+        )
+        or "unknown_quota"
+    )
+
+
+def _rate_limit_storage_quota_type(record: Dict[str, Any]) -> str:
+    limit_scope = str(record.get("limit_scope") or "").lower()
+    raw_provider_fields = record.get("raw_provider_fields")
+    token_type = (
+        str(raw_provider_fields.get("tokenType") or "").lower()
+        if isinstance(raw_provider_fields, dict)
+        else ""
+    )
+    source = str(record.get("source") or "").lower()
+    provider = _rate_limit_storage_provider(record)
+
+    if "request" in limit_scope or limit_scope == "requests" or token_type == "requests":
+        return "requests"
+    if "token" in limit_scope or limit_scope == "tokens" or token_type == "tokens":
+        return "tokens"
+    if limit_scope == "model_capacity" or "capacity" in source:
+        return "capacity"
+    if provider == "google":
+        return "requests"
+    if provider in {"openai", "anthropic"}:
+        return "tokens"
+    return "unknown"
+
+
+def _rate_limit_storage_remaining_pct(record: Dict[str, Any]) -> Optional[float]:
+    remaining_pct = _safe_float(record.get("remaining_pct"))
+    if remaining_pct is not None:
+        return max(0.0, min(100.0, remaining_pct))
+
+    remaining_fraction = _safe_float(
+        _maybe_get_path(record.get("raw_provider_fields"), "remainingFraction")
+    )
+    if remaining_fraction is not None:
+        return max(0.0, min(100.0, remaining_fraction * 100.0))
+
+    used_percentage = _safe_float(record.get("used_percentage"))
+    if used_percentage is not None:
+        return max(0.0, min(100.0, 100.0 - used_percentage))
+
+    if bool(record.get("exhausted")):
+        return 0.0
+    return None
+
+
+def _build_rate_limit_observation_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        record["observed_at"],
+        _rate_limit_storage_client(record),
+        record.get("client_version"),
+        record.get("account_hash"),
+        _rate_limit_storage_provider(record),
+        record.get("model"),
+        _rate_limit_storage_quota_key(record),
+        record.get("quota_period"),
+        _rate_limit_storage_quota_type(record),
+        record.get("provider_resets_at"),
+        _rate_limit_storage_remaining_pct(record),
+        record.get("source"),
+        record.get("session_id"),
+        record.get("trace_id"),
+        record.get("litellm_call_id"),
+    )
+
+
+def _build_rate_limit_transition_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        record["transition_key"],
+        record["limit_key"],
+        record.get("provider"),
+        record.get("client_family"),
+        record.get("account_hash"),
+        record["transition_type"],
+        record.get("confidence") or 0.0,
+        json.dumps(_json_safe_rate_limit_value(record.get("signals") or [])),
+        record.get("source"),
+        record.get("old_observed_at"),
+        record["new_observed_at"],
+        record.get("old_provider_resets_at"),
+        record.get("new_provider_resets_at"),
+        record.get("old_used_percentage"),
+        record.get("new_used_percentage"),
+        record.get("old_remaining_requests"),
+        record.get("new_remaining_requests"),
+        record.get("old_used_requests"),
+        record.get("new_used_requests"),
+        record.get("old_total_requests"),
+        record.get("new_total_requests"),
+        record.get("inferred_window_start_at"),
+        record.get("detection_window_start_at"),
+        record.get("detection_window_end_at"),
+        json.dumps(_json_safe_rate_limit_value(record.get("session_usage_summary") or {})),
+        json.dumps(_json_safe_rate_limit_value(record.get("old_observation") or {})),
+        json.dumps(_json_safe_rate_limit_value(record.get("new_observation") or {})),
+        json.dumps(_json_safe_rate_limit_value(record.get("metadata") or {})),
+    )
+
+
+async def _fetch_previous_rate_limit_observation(
+    conn: Any,
+    observation: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    quota_key = _rate_limit_storage_quota_key(observation)
+    if not quota_key or not observation.get("observed_at"):
+        return None
+    row = await conn.fetchrow(
+        _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL,
+        quota_key,
+        _rate_limit_storage_provider(observation),
+        _rate_limit_storage_client(observation),
+        observation.get("account_hash"),
+        observation.get("source"),
+        observation["observed_at"],
+    )
+    if row is None:
+        return None
+    try:
+        return dict(row)
+    except Exception:
+        return {
+            key: _maybe_get(row, key)
+            for key in (
+                "observed_at",
+                "source",
+                "provider",
+                "client_family",
+                "account_hash",
+                "environment",
+                "tenant_id",
+                "repository",
+                "limit_key",
+                "limit_id",
+                "limit_name",
+                "limit_scope",
+                "window_minutes",
+                "quota_period",
+                "provider_resets_at",
+                "inferred_window_start_at",
+                "used_percentage",
+                "remaining_requests",
+                "used_requests",
+                "total_requests",
+                "status",
+                "exhausted",
+                "exhaustion_kind",
+                "reset_hint_seconds",
+                "model",
+                "model_family",
+                "model_tier",
+                "parent_limit_key",
+                "session_id",
+                "trace_id",
+                "litellm_call_id",
+                "route_family",
+                "request_model",
+                "response_model",
+                "client_name",
+                "client_version",
+                "client_user_agent",
+                "raw_provider_fields",
+                "evidence",
+                "metadata",
+            )
+        }
+
+
+async def _derive_rate_limit_transitions(
+    conn: Any,
+    observations: List[Dict[str, Any]],
+    initial_previous_by_limit_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+) -> List[Dict[str, Any]]:
+    transitions: List[Dict[str, Any]] = []
+    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = dict(
+        initial_previous_by_limit_key or {}
+    )
+    ordered_observations = sorted(
+        observations,
+        key=lambda item: (
+            str(item.get("limit_key") or ""),
+            item.get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
+        ),
+    )
+    for observation in ordered_observations:
+        limit_key = observation.get("limit_key")
+        if not isinstance(limit_key, str) or not limit_key:
+            continue
+        if limit_key not in previous_by_limit_key:
+            previous_by_limit_key[limit_key] = await _fetch_previous_rate_limit_observation(
+                conn,
+                observation,
+            )
+        previous = previous_by_limit_key.get(limit_key)
+        if previous is not None:
+            classification = _classify_rate_limit_transition(previous, observation)
+            if classification is not None:
+                transitions.append(
+                    _build_rate_limit_transition(previous, observation, classification)
+                )
+        previous_by_limit_key[limit_key] = observation
+    return transitions
+
+
+async def _filter_meaningful_rate_limit_observations(
+    conn: Any,
+    observations: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[Dict[str, Any]]]]:
+    kept_by_index: List[Tuple[int, Dict[str, Any]]] = []
+    rolling_previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {}
+    initial_previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {}
+    indexed_observations = [
+        (index, observation)
+        for index, observation in enumerate(observations)
+        if isinstance(observation.get("limit_key"), str)
+        and observation.get("limit_key")
+    ]
+    indexed_observations.sort(
+        key=lambda item: (
+            str(item[1].get("limit_key") or ""),
+            item[1].get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
+            item[0],
+        )
+    )
+
+    for index, observation in indexed_observations:
+        limit_key = observation["limit_key"]
+        if limit_key not in rolling_previous_by_limit_key:
+            previous = await _fetch_previous_rate_limit_observation(conn, observation)
+            rolling_previous_by_limit_key[limit_key] = previous
+            initial_previous_by_limit_key[limit_key] = previous
+
+        previous = rolling_previous_by_limit_key.get(limit_key)
+        if not _rate_limit_observation_has_meaningful_change(previous, observation):
+            continue
+
+        kept_by_index.append((index, observation))
+        rolling_previous_by_limit_key[limit_key] = observation
+
+    kept_by_index.sort(key=lambda item: item[0])
+    return [observation for _index, observation in kept_by_index], initial_previous_by_limit_key
+
+
+def _build_rate_limit_observation_only_record(
+    kwargs: Dict[str, Any],
+    observations: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    model = _resolve_rate_limit_model(kwargs, None, metadata)
+    return {
+        "_skip_session_history": True,
+        "litellm_call_id": kwargs.get("litellm_call_id"),
+        "session_id": _extract_session_id(kwargs),
+        "model": model,
+        "rate_limit_observations": observations,
+    }
+
+
+def _rate_limit_observation_only_requested(kwargs: Dict[str, Any]) -> bool:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    return bool(metadata.get("aawm_rate_limit_observation_only"))
+
+
 async def _persist_session_history_record(record: Dict[str, Any]) -> None:
     pool = await _get_aawm_session_history_pool()
     async with pool.acquire() as conn:
         await _ensure_session_history_schema(conn)
 
-        history_payload = _build_session_history_db_payload(record)
-        tool_activity_payloads = _build_tool_activity_db_payloads(record)
+        if not record.get("_skip_session_history"):
+            history_payload = _build_session_history_db_payload(record)
+            tool_activity_payloads = _build_tool_activity_db_payloads(record)
 
-        await conn.execute(_AAWM_SESSION_HISTORY_INSERT_SQL, *history_payload)
-        if tool_activity_payloads:
-            await conn.executemany(
-                _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
+            await conn.execute(_AAWM_SESSION_HISTORY_INSERT_SQL, *history_payload)
+            if tool_activity_payloads:
+                await conn.executemany(
+                    _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL,
+                    tool_activity_payloads,
+                )
+
+        observations = record.get("rate_limit_observations")
+        rate_limit_observations = [
+            observation
+            for observation in observations
+            if isinstance(observation, dict)
+        ] if isinstance(observations, list) else []
+        if rate_limit_observations:
+            (
+                rate_limit_observations,
+                initial_previous_by_limit_key,
+            ) = await _filter_meaningful_rate_limit_observations(
+                conn,
+                rate_limit_observations,
             )
+        if rate_limit_observations:
+            transitions = await _derive_rate_limit_transitions(
+                conn,
+                rate_limit_observations,
+                initial_previous_by_limit_key,
+            )
+            await conn.executemany(
+                _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+                [
+                    _build_rate_limit_observation_db_payload(observation)
+                    for observation in rate_limit_observations
+                ],
+            )
+            if transitions:
+                await conn.executemany(
+                    _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
+                    [
+                        _build_rate_limit_transition_db_payload(transition)
+                        for transition in transitions
+                    ],
+                )
 
 
 async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
@@ -6262,16 +8747,60 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
     async with pool.acquire() as conn:
         await _ensure_session_history_schema(conn)
 
-        payloads = [_build_session_history_db_payload(record) for record in records]
+        history_records = [
+            record for record in records if not record.get("_skip_session_history")
+        ]
+        payloads = [
+            _build_session_history_db_payload(record) for record in history_records
+        ]
         tool_activity_payloads: List[Tuple[Any, ...]] = []
-        for record in records:
+        for record in history_records:
             tool_activity_payloads.extend(_build_tool_activity_db_payloads(record))
 
-        await conn.executemany(_AAWM_SESSION_HISTORY_INSERT_SQL, payloads)
+        if payloads:
+            await conn.executemany(_AAWM_SESSION_HISTORY_INSERT_SQL, payloads)
         if tool_activity_payloads:
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
             )
+        rate_limit_observations: List[Dict[str, Any]] = []
+        for record in records:
+            observations = record.get("rate_limit_observations")
+            if isinstance(observations, list):
+                rate_limit_observations.extend(
+                    observation
+                    for observation in observations
+                    if isinstance(observation, dict)
+                )
+        if rate_limit_observations:
+            (
+                rate_limit_observations,
+                initial_previous_by_limit_key,
+            ) = await _filter_meaningful_rate_limit_observations(
+                conn,
+                rate_limit_observations,
+            )
+        if rate_limit_observations:
+            transitions = await _derive_rate_limit_transitions(
+                conn,
+                rate_limit_observations,
+                initial_previous_by_limit_key,
+            )
+            await conn.executemany(
+                _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+                [
+                    _build_rate_limit_observation_db_payload(observation)
+                    for observation in rate_limit_observations
+                ],
+            )
+            if transitions:
+                await conn.executemany(
+                    _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
+                    [
+                        _build_rate_limit_transition_db_payload(transition)
+                        for transition in transitions
+                    ],
+                )
 
 
 def _get_reasoning_state_tags(
@@ -6531,7 +9060,7 @@ def _enrich_gemini_thought_signature_metadata(
             metadata[f"gemini_tsig_{index}_shape_hash"] = summary["shape_hash"]
 
             indexed_fields = summary["indexed_fields"]
-            for key, value in indexed_fields.items():
+            for key, value in list(indexed_fields.items()):
                 if key.startswith("gemini_tsig_0_"):
                     metadata[key.replace("gemini_tsig_0_", f"gemini_tsig_{index}_")] = value
         except Exception as exc:
@@ -6700,6 +9229,22 @@ class AawmAgentIdentity(CustomLogger):
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
         """Queue one finalized session-history row per completed LiteLLM call."""
         try:
+            rate_limit_observations = _build_rate_limit_observations(
+                kwargs=kwargs,
+                result=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if rate_limit_observations and _rate_limit_observation_only_requested(
+                kwargs
+            ):
+                _enqueue_session_history_record(
+                    _build_rate_limit_observation_only_record(
+                        kwargs,
+                        rate_limit_observations,
+                    )
+                )
+                return
             record = _build_session_history_record(
                 kwargs=kwargs,
                 result=response_obj,
@@ -6707,8 +9252,17 @@ class AawmAgentIdentity(CustomLogger):
                 end_time=end_time,
             )
             if record is None:
+                if rate_limit_observations:
+                    _enqueue_session_history_record(
+                        _build_rate_limit_observation_only_record(
+                            kwargs,
+                            rate_limit_observations,
+                        )
+                    )
                 return
 
+            if rate_limit_observations:
+                record["rate_limit_observations"] = rate_limit_observations
             _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
@@ -6719,6 +9273,22 @@ class AawmAgentIdentity(CustomLogger):
         self, kwargs, response_obj, start_time, end_time
     ) -> None:
         try:
+            rate_limit_observations = _build_rate_limit_observations(
+                kwargs=kwargs,
+                result=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if rate_limit_observations and _rate_limit_observation_only_requested(
+                kwargs
+            ):
+                _enqueue_session_history_record(
+                    _build_rate_limit_observation_only_record(
+                        kwargs,
+                        rate_limit_observations,
+                    )
+                )
+                return
             record = _build_session_history_record(
                 kwargs=kwargs,
                 result=response_obj,
@@ -6726,13 +9296,99 @@ class AawmAgentIdentity(CustomLogger):
                 end_time=end_time,
             )
             if record is None:
+                if rate_limit_observations:
+                    _enqueue_session_history_record(
+                        _build_rate_limit_observation_only_record(
+                            kwargs,
+                            rate_limit_observations,
+                        )
+                    )
                 return
 
+            if rate_limit_observations:
+                record["rate_limit_observations"] = rate_limit_observations
             _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.async_log_success_event failed: %s", exc
             )
+
+    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        """Queue rate-limit observations from failed provider calls."""
+        try:
+            rate_limit_observations = _build_rate_limit_observations(
+                kwargs=kwargs,
+                result=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if not rate_limit_observations:
+                return
+            _enqueue_session_history_record(
+                _build_rate_limit_observation_only_record(
+                    kwargs,
+                    rate_limit_observations,
+                )
+            )
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity.log_failure_event failed: %s", exc
+            )
+
+    async def async_log_failure_event(
+        self, kwargs, response_obj, start_time, end_time
+    ) -> None:
+        try:
+            rate_limit_observations = _build_rate_limit_observations(
+                kwargs=kwargs,
+                result=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            if not rate_limit_observations:
+                return
+            _enqueue_session_history_record(
+                _build_rate_limit_observation_only_record(
+                    kwargs,
+                    rate_limit_observations,
+                )
+            )
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity.async_log_failure_event failed: %s", exc
+            )
+
+    async def async_post_call_failure_hook(
+        self,
+        request_data: dict,
+        original_exception: Exception,
+        user_api_key_dict: Any,
+        traceback_str: Optional[str] = None,
+    ) -> None:
+        try:
+            kwargs = dict(request_data or {})
+            kwargs.setdefault("user_api_key_dict", user_api_key_dict)
+            now = datetime.now(timezone.utc)
+            rate_limit_observations = _build_rate_limit_observations(
+                kwargs=kwargs,
+                result=original_exception,
+                start_time=now,
+                end_time=now,
+            )
+            if not rate_limit_observations:
+                return None
+            _enqueue_session_history_record(
+                _build_rate_limit_observation_only_record(
+                    kwargs,
+                    rate_limit_observations,
+                )
+            )
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity.async_post_call_failure_hook failed: %s",
+                exc,
+            )
+        return None
 
 
 # Module-level instance for config registration via get_instance_fn().

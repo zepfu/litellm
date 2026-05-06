@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import traceback
+from pathlib import Path
 from typing import Any
 from unittest import mock
 from types import SimpleNamespace
@@ -44,6 +45,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_openai_passthrough_route_family,
     _google_adapter_rate_limit_until_monotonic_by_key,
     _google_code_assist_project_cache,
+    _google_code_assist_prime_quota_by_key,
     _google_code_assist_prime_until_monotonic_by_key,
     _google_oauth_access_token_cache,
     _get_google_adapter_semaphore,
@@ -55,6 +57,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
     _resolve_google_adapter_session_id,
+    _sanitize_google_code_assist_quota_for_logging,
     _set_google_adapter_cooldown,
     _wait_for_google_adapter_cooldown_if_needed,
     _expand_claude_persisted_output_in_anthropic_request_body,
@@ -83,13 +86,27 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     vertex_proxy_route,
     vllm_proxy_route,
 )
+from litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler import (
+    OpenAIPassthroughLoggingHandler,
+)
+from litellm.proxy.pass_through_endpoints.success_handler import (
+    PassThroughEndpointLogging,
+)
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    PassThroughStreamingHandler,
+)
 from litellm.proxy._types import ProxyException
+from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
+from litellm.types.utils import StandardPassThroughResponseObject
 from litellm.types.passthrough_endpoints.vertex_ai import VertexPassThroughCredentials
 from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
     AnthropicStreamWrapper,
 )
 from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
     LiteLLMMessagesToCompletionTransformationHandler,
+)
+from litellm.integrations.aawm_passthrough_shape_capture import (
+    capture_passthrough_stream_shape,
 )
 
 
@@ -809,8 +826,10 @@ class TestGoogleCodeAssistPrimeCache:
     async def test_google_code_assist_prime_cache_skips_repeat_preflight(self, monkeypatch):
         monkeypatch.setenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS", "300")
         _google_code_assist_prime_until_monotonic_by_key.clear()
+        _google_code_assist_prime_quota_by_key.clear()
 
         mock_client = AsyncMock()
+        mock_client.post.return_value = httpx.Response(200, json={})
         mock_context = AsyncMock()
         mock_context.__aenter__.return_value = mock_client
         mock_context.__aexit__.return_value = False
@@ -834,6 +853,7 @@ class TestGoogleCodeAssistPrimeCache:
     ):
         monkeypatch.setenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS", "300")
         _google_code_assist_prime_until_monotonic_by_key.clear()
+        _google_code_assist_prime_quota_by_key.clear()
 
         async def post_response(*_args, **_kwargs):
             await asyncio.sleep(0.01)
@@ -859,6 +879,81 @@ class TestGoogleCodeAssistPrimeCache:
         assert mock_client.post.await_count == 3
         cache_key = _get_google_code_assist_prime_cache_key("token-123", "project-123")
         assert _google_code_assist_prime_until_monotonic_by_key.get(cache_key, 0.0) > time.monotonic()
+
+    def test_google_code_assist_quota_logging_sanitizes_identifiers(self):
+        sanitized = _sanitize_google_code_assist_quota_for_logging(
+            {
+                "remainingRequests": 1499,
+                "totalRequests": 1500,
+                "usagePercentage": 0.1,
+                "project": "raw-project-id",
+                "cloudaicompanionProject": "raw-companion-project",
+                "quota": {
+                    "usedRequests": 1,
+                    "totalRequests": 1500,
+                    "account": "raw-account",
+                },
+            }
+        )
+
+        assert sanitized == {
+            "remainingRequests": 1499,
+            "totalRequests": 1500,
+            "usagePercentage": 0.1,
+            "quota": {
+                "usedRequests": 1,
+                "totalRequests": 1500,
+                "source": "google_retrieve_user_quota",
+            },
+            "source": "google_retrieve_user_quota",
+        }
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_prime_returns_sanitized_quota(self, monkeypatch):
+        monkeypatch.setenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS", "300")
+        _google_code_assist_prime_until_monotonic_by_key.clear()
+        _google_code_assist_prime_quota_by_key.clear()
+
+        async def post_response(url, *_args, **_kwargs):
+            if "retrieveUserQuota" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "remainingRequests": 1499,
+                        "totalRequests": 1500,
+                        "project": "raw-project-id",
+                    },
+                )
+            return httpx.Response(200, json={})
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = post_response
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = mock_client
+        mock_context.__aexit__.return_value = False
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+            return_value=mock_context,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ):
+            quota = await _prime_google_code_assist_session(
+                "token-123",
+                "project-123",
+            )
+            cached_quota = await _prime_google_code_assist_session(
+                "token-123",
+                "project-123",
+            )
+
+        assert quota == {
+            "remainingRequests": 1499,
+            "totalRequests": 1500,
+            "source": "google_retrieve_user_quota",
+        }
+        assert cached_quota == quota
+        assert mock_client.post.await_count == 3
 
 
 class TestGoogleCodeAssistProjectCache:
@@ -2314,6 +2409,365 @@ class TestGoogleAdapterRequestShapePolicy:
         assert mock_pass_through.await_count == 2
         set_cooldown.assert_awaited_once_with('__default__', 8.0)
 
+    def test_openai_responses_stream_records_codex_rate_limit_metadata(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {"passthrough_route_family": "codex_responses"}
+            }
+        }
+        chunks = [
+            "event: token_count",
+            (
+                'data: {"type":"event_msg","payload":{"type":"token_count",'
+                '"input_tokens":12,"output_tokens":4,"total_tokens":16},'
+                '"rate_limits":{'
+                '"limit_id":"codex_bengalfox",'
+                '"limit_name":"GPT-5.3-Codex-Spark",'
+                '"primary":{"used_percent":1.5,"window_minutes":300,'
+                '"resets_at":1777996982},'
+                '"secondary":{"used_percent":51.0,"window_minutes":10080,'
+                '"resets_at":1778018910}}}'
+            ),
+        ]
+
+        OpenAIPassthroughLoggingHandler._record_responses_stream_rate_limit_metadata(
+            kwargs,
+            chunks,
+        )
+
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["codex_token_count"]["input_tokens"] == 12
+        assert (
+            metadata["codex_token_count"]["rate_limits"]["limit_name"]
+            == "GPT-5.3-Codex-Spark"
+        )
+
+    def test_openai_responses_stream_records_codex_rate_limit_metadata_from_sse_event(
+        self,
+    ):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {"passthrough_route_family": "codex_responses"}
+            }
+        }
+        chunks = [
+            "event: token_count",
+            (
+                'data: {"info":{"total_token_usage":{"input_tokens":12,'
+                '"output_tokens":4,"total_tokens":16}},'
+                '"rate_limits":{'
+                '"limit_id":"codex_bengalfox",'
+                '"limit_name":"GPT-5.3-Codex-Spark",'
+                '"primary":{"used_percent":1.5,"window_minutes":300,'
+                '"resets_at":1777996982},'
+                '"secondary":{"used_percent":51.0,"window_minutes":10080,'
+                '"resets_at":1778018910}}}'
+            ),
+        ]
+
+        OpenAIPassthroughLoggingHandler._record_responses_stream_rate_limit_metadata(
+            kwargs,
+            chunks,
+        )
+        OpenAIPassthroughLoggingHandler._record_responses_stream_tool_state_metadata(
+            kwargs,
+            chunks,
+        )
+
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert (
+            metadata["codex_token_count"]["rate_limits"]["limit_name"]
+            == "GPT-5.3-Codex-Spark"
+        )
+        assert metadata["codex_token_count"]["rate_limits"]["primary"][
+            "used_percent"
+        ] == 1.5
+        assert "token_count" in metadata["responses_stream_event_types"]
+
+    def test_passthrough_shape_capture_sanitizes_stream_payload(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", "1")
+        monkeypatch.setenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES_DIR", str(tmp_path))
+
+        artifact_path = capture_passthrough_stream_shape(
+            provider="openai",
+            endpoint_type=EndpointType.OPENAI,
+            url_route="https://chatgpt.com/backend-api/codex/responses?key=secret",
+            request_body={
+                "model": "gpt-5.3-codex-spark",
+                "input": "do not persist this prompt",
+            },
+            response=httpx.Response(
+                200,
+                headers={
+                    "authorization": "Bearer should-not-appear",
+                    "x-ratelimit-remaining-requests": "12",
+                    "content-type": "text/event-stream",
+                },
+            ),
+            all_chunks=[
+                "event: token_count",
+                (
+                    'data: {"input_text":"secret prompt",'
+                    '"rate_limits":{"primary":{"used_percent":2.5,'
+                    '"resets_at":1777996982}}}'
+                ),
+            ],
+            litellm_call_id="call-123",
+        )
+
+        assert artifact_path is not None
+        artifact = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        rendered = json.dumps(artifact)
+        assert "should-not-appear" not in rendered
+        assert "secret prompt" not in rendered
+        assert artifact["response"]["headers"]["selected_values"][
+            "x-ratelimit-remaining-requests"
+        ] == "12"
+        assert artifact["response"]["stream"]["event_counts"]["token_count"] == 1
+        assert (
+            artifact["response"]["stream"]["sample_events"][0]["quota_hits"][0][
+                "value"
+            ]
+            == 1777996982
+        )
+
+    @pytest.mark.asyncio
+    async def test_openai_stream_rate_limit_metadata_reaches_logging_object(
+        self,
+    ):
+        from datetime import datetime
+
+        class MockLoggingObj:
+            def __init__(self):
+                self.model_call_details = {
+                    "litellm_params": {
+                        "metadata": {
+                            "session_id": "codex-session",
+                            "passthrough_route_family": "codex_responses",
+                        }
+                    },
+                    "custom_llm_provider": "openai",
+                }
+                self.async_success_kwargs = None
+
+            async def async_success_handler(self, **kwargs):
+                self.async_success_kwargs = kwargs
+
+            def _should_run_sync_callbacks_for_async_calls(self):
+                return False
+
+        token_count = {
+            "rate_limits": {
+                "limit_id": "codex_bengalfox",
+                "limit_name": "GPT-5.3-Codex-Spark",
+                "primary": {
+                    "used_percent": 1.5,
+                    "window_minutes": 300,
+                    "resets_at": 1777996982,
+                },
+            }
+        }
+        handler_kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "session_id": "codex-session",
+                    "codex_token_count": token_count,
+                }
+            },
+            "model": "gpt-5.3-codex-spark",
+            "custom_llm_provider": "openai",
+            "response_cost": 0.0,
+            "standard_logging_object": {
+                "metadata": {
+                    "codex_token_count": token_count,
+                }
+            },
+        }
+        logging_obj = MockLoggingObj()
+
+        with patch.object(
+            OpenAIPassthroughLoggingHandler,
+            "_handle_logging_openai_collected_chunks",
+            return_value={
+                "result": StandardPassThroughResponseObject(response="ok"),
+                "kwargs": handler_kwargs,
+            },
+        ):
+            await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                litellm_logging_obj=logging_obj,
+                passthrough_success_handler_obj=PassThroughEndpointLogging(),
+                response=httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.3-codex-spark"},
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                raw_bytes=[b"event: token_count\n\n"],
+                end_time=datetime.now(),
+                success_handler_kwargs={
+                    "litellm_params": {
+                        "metadata": {
+                            "session_id": "codex-session",
+                            "passthrough_route_family": "codex_responses",
+                        }
+                    }
+                },
+            )
+
+        metadata = logging_obj.model_call_details["litellm_params"]["metadata"]
+        assert metadata["codex_token_count"] == token_count
+        assert (
+            logging_obj.model_call_details["standard_logging_object"]["metadata"][
+                "codex_token_count"
+            ]
+            == token_count
+        )
+        assert logging_obj.async_success_kwargs is not None
+
+    def test_streaming_handler_records_anthropic_rate_limit_headers(self):
+        kwargs = {"litellm_params": {"metadata": {"client_name": "claude-cli"}}}
+        response = httpx.Response(
+            status_code=200,
+            headers={
+                "anthropic-ratelimit-requests-limit": "2000",
+                "anthropic-ratelimit-requests-remaining": "1990",
+                "anthropic-ratelimit-requests-reset": "2026-05-05T17:00:00Z",
+                "anthropic-ratelimit-tokens-limit": "160000",
+                "anthropic-ratelimit-tokens-remaining": "159500",
+                "anthropic-ratelimit-tokens-reset": "2026-05-05T17:00:00Z",
+                "authorization": "Bearer should-not-be-logged",
+            },
+        )
+
+        PassThroughStreamingHandler._record_upstream_rate_limit_headers_metadata(
+            kwargs,
+            response=response,
+            endpoint_type=EndpointType.ANTHROPIC,
+            custom_llm_provider="anthropic",
+        )
+
+        headers = kwargs["litellm_params"]["metadata"]["anthropic_response_headers"]
+        assert headers["source"] == "anthropic_response_headers"
+        assert headers["anthropic-ratelimit-requests-limit"] == "2000"
+        assert headers["anthropic-ratelimit-tokens-remaining"] == "159500"
+        assert "authorization" not in headers
+
+    def test_streaming_handler_records_codex_rate_limit_headers(self):
+        kwargs = {"litellm_params": {"metadata": {"client_name": "codex_exec"}}}
+        response = httpx.Response(
+            status_code=200,
+            headers={
+                "x-codex-active-limit": "premium",
+                "x-codex-primary-reset-at": "1778030614",
+                "x-codex-secondary-reset-at": "1778544275",
+                "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+                "x-codex-bengalfox-primary-reset-at": "1778034240",
+                "x-oai-request-id": "req_123",
+                "authorization": "Bearer should-not-be-logged",
+            },
+        )
+
+        PassThroughStreamingHandler._record_upstream_rate_limit_headers_metadata(
+            kwargs,
+            response=response,
+            endpoint_type=EndpointType.OPENAI,
+            custom_llm_provider="openai",
+        )
+
+        headers = kwargs["litellm_params"]["metadata"]["codex_response_headers"]
+        assert headers["source"] == "codex_response_headers"
+        assert headers["x-codex-active-limit"] == "premium"
+        assert headers["x-codex-bengalfox-limit-name"] == "GPT-5.3-Codex-Spark"
+        assert headers["x-oai-request-id"] == "req_123"
+        assert "authorization" not in headers
+
+    def test_google_code_assist_quota_sanitizer_preserves_bucket_fields(self):
+        sanitized = _sanitize_google_code_assist_quota_for_logging(
+            {
+                "buckets": [
+                    {
+                        "modelId": "gemini-2.5-flash",
+                        "tokenType": "REQUESTS",
+                        "remainingFraction": 0.907,
+                        "resetTime": "2026-05-06T00:25:54Z",
+                        "ignoredContent": "do-not-keep",
+                    }
+                ]
+            }
+        )
+
+        assert sanitized is not None
+        bucket = sanitized["buckets"]["items"][0]
+        assert bucket["modelId"] == "gemini-2.5-flash"
+        assert bucket["tokenType"] == "REQUESTS"
+        assert bucket["remainingFraction"] == 0.907
+        assert bucket["resetTime"] == "2026-05-06T00:25:54Z"
+        assert "ignoredContent" not in bucket
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_retrieve_user_quota_logs_observation_only_metadata(
+        self,
+    ):
+        from datetime import datetime
+
+        handler = PassThroughEndpointLogging()
+        httpx_response = httpx.Response(
+            200,
+            json={
+                "buckets": [
+                    {
+                        "modelId": "gemini-2.5-flash",
+                        "tokenType": "REQUESTS",
+                        "remainingFraction": 0.91,
+                        "resetTime": "2026-05-06T00:00:00Z",
+                    }
+                ],
+                "privateProjectId": "project_123",
+            },
+            request=httpx.Request(
+                "POST",
+                "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+            ),
+        )
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {}
+
+        with patch.object(
+            handler,
+            "_handle_logging",
+            new_callable=AsyncMock,
+        ) as mock_handle_logging:
+            await handler.pass_through_async_success_handler(
+                httpx_response=httpx_response,
+                response_body=httpx_response.json(),
+                logging_obj=logging_obj,
+                url_route="https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+                result="",
+                start_time=datetime.now(),
+                end_time=datetime.now(),
+                cache_hit=False,
+                request_body={"project": "project_123"},
+                passthrough_logging_payload={},
+                custom_llm_provider="gemini",
+                litellm_params={"metadata": {}},
+            )
+
+        mock_handle_logging.assert_awaited_once()
+        metadata = mock_handle_logging.await_args.kwargs["litellm_params"][
+            "metadata"
+        ]
+        assert metadata["aawm_rate_limit_observation_only"] is True
+        quota = metadata["google_retrieve_user_quota"]
+        assert quota["source"] == "google_retrieve_user_quota"
+        assert "privateProjectId" not in quota
+        assert quota["buckets"]["items"][0]["modelId"] == "gemini-2.5-flash"
+
     @pytest.mark.asyncio
     async def test_google_adapter_request_strips_internal_wrapper_kwargs(self):
         successful_response = Response(
@@ -2397,6 +2851,45 @@ class TestGoogleAdapterRequestShapePolicy:
         assert result is successful_response
         assert mock_pass_through.await_count == 2
         set_cooldown.assert_awaited_once_with('__default__', 7.0)
+
+    @pytest.mark.asyncio
+    async def test_google_adapter_records_retry_error_in_request_metadata(self, monkeypatch):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES", "1")
+
+        first_error = ProxyException(
+            message="No capacity available for model gemini-3.1-pro-preview",
+            type="None",
+            param="None",
+            code=429,
+        )
+        first_error.detail = """429: b'{\n  "error": {\n    "code": 429,\n    "message": "No capacity available for model gemini-3.1-pro-preview",\n    "status": "RESOURCE_EXHAUSTED",\n    "details": [\n      {\n        "@type": "type.googleapis.com/google.rpc.ErrorInfo",\n        "reason": "MODEL_CAPACITY_EXHAUSTED",\n        "domain": "cloudcode-pa.googleapis.com",\n        "metadata": {\n          "model": "gemini-3.1-pro-preview"\n        }\n      }\n    ]\n  }\n}\n'"""
+        custom_body = {"litellm_metadata": {}}
+        successful_response = Response(content='{"ok": true}', media_type="application/json")
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(side_effect=[first_error, successful_response]),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_google_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._set_google_adapter_cooldown",
+            new=AsyncMock(),
+        ):
+            result = await _perform_google_adapter_pass_through_request(
+                request=MagicMock(),
+                custom_body=custom_body,
+            )
+
+        assert result is successful_response
+        metadata = custom_body["litellm_metadata"]
+        error_payload = metadata["google_generate_content_error"]
+        assert error_payload["source"] == "google_generate_content_error"
+        assert error_payload["adapter_error_reason"] == "MODEL_CAPACITY_EXHAUSTED"
+        assert error_payload["error"]["details"][0]["reason"] == (
+            "MODEL_CAPACITY_EXHAUSTED"
+        )
+        assert metadata["google_generate_content_error_count"] == 1
 
     @pytest.mark.asyncio
     async def test_google_adapter_request_retries_on_model_capacity_exhausted(self, monkeypatch):
@@ -3500,7 +3993,13 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             new=AsyncMock(return_value="project_123"),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
-            new=AsyncMock(),
+            new=AsyncMock(
+                return_value={
+                    "remainingRequests": 1499,
+                    "totalRequests": 1500,
+                    "source": "google_retrieve_user_quota",
+                }
+            ),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
             new=AsyncMock(
@@ -3550,6 +4049,11 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert "route:anthropic_messages" in litellm_metadata["tags"]
         assert "route:anthropic_google_completion_adapter" in litellm_metadata["tags"]
         assert "anthropic-google-completion-adapter" in litellm_metadata["tags"]
+        assert litellm_metadata["google_retrieve_user_quota"] == {
+            "remainingRequests": 1499,
+            "totalRequests": 1500,
+            "source": "google_retrieve_user_quota",
+        }
 
     @pytest.mark.asyncio
     async def test_nvidia_completion_adapter_preserves_agent_project_litellm_metadata(

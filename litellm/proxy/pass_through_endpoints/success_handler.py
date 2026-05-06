@@ -15,6 +15,9 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 from litellm.types.utils import StandardPassThroughResponseObject
 from litellm.utils import executor as thread_pool_executor
 
+from .google_code_assist_quota import (
+    sanitize_google_code_assist_quota_for_logging,
+)
 from .llm_provider_handlers.anthropic_passthrough_logging_handler import (
     AnthropicPassthroughLoggingHandler,
 )
@@ -361,9 +364,27 @@ class PassThroughEndpointLogging:
             url_route, custom_llm_provider
         ):
             # Gemini CLI performs Code Assist control-plane calls before model
-            # generation. They do not contain model/usage data and should not
-            # create fallback session_history rows.
-            return
+            # generation. Most do not contain model/usage data and should not
+            # create fallback session_history rows. retrieveUserQuota is the
+            # exception: it contains account quota state, so log it as a
+            # rate-limit observation only.
+            if "retrieveUserQuota" not in url_route:
+                return
+            sanitized_quota = sanitize_google_code_assist_quota_for_logging(
+                response_body
+            )
+            if not sanitized_quota:
+                return
+            litellm_params = kwargs.get("litellm_params")
+            if not isinstance(litellm_params, dict):
+                litellm_params = {}
+                kwargs["litellm_params"] = litellm_params
+            metadata = litellm_params.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                litellm_params["metadata"] = metadata
+            metadata["google_retrieve_user_quota"] = sanitized_quota
+            metadata["aawm_rate_limit_observation_only"] = True
         else:
             normalized_llm_passthrough_logging_payload = (
                 self.normalize_llm_passthrough_logging_payload(

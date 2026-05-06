@@ -1,5 +1,4 @@
 import asyncio
-import copy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +6,9 @@ import httpx
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.integrations.aawm_passthrough_shape_capture import (
+    capture_passthrough_stream_shape,
+)
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
@@ -33,6 +35,20 @@ from .success_handler import PassThroughEndpointLogging
 
 
 class PassThroughStreamingHandler:
+    _ANTHROPIC_RATE_LIMIT_HEADER_PREFIXES = (
+        "anthropic-ratelimit-",
+        "x-ratelimit-",
+    )
+    _ANTHROPIC_RATE_LIMIT_HEADER_NAMES = {
+        "retry-after",
+    }
+    _CODEX_RATE_LIMIT_HEADER_PREFIXES = (
+        "x-codex-",
+    )
+    _CODEX_RATE_LIMIT_HEADER_NAMES = {
+        "x-oai-request-id",
+    }
+
     @staticmethod
     def _ensure_streaming_metadata(success_handler_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(success_handler_kwargs, dict):
@@ -48,6 +64,89 @@ class PassThroughStreamingHandler:
             metadata = {}
             litellm_params["metadata"] = metadata
 
+        return metadata
+
+    @staticmethod
+    def _sanitize_anthropic_rate_limit_headers(
+        response_headers: httpx.Headers,
+    ) -> Dict[str, str]:
+        sanitized: Dict[str, str] = {}
+        for header_name, header_value in response_headers.items():
+            normalized_name = str(header_name).lower()
+            if not (
+                normalized_name.startswith(
+                    PassThroughStreamingHandler._ANTHROPIC_RATE_LIMIT_HEADER_PREFIXES
+                )
+                or normalized_name
+                in PassThroughStreamingHandler._ANTHROPIC_RATE_LIMIT_HEADER_NAMES
+            ):
+                continue
+            sanitized[normalized_name] = str(header_value)
+        if sanitized:
+            sanitized["source"] = "anthropic_response_headers"
+        return sanitized
+
+    @staticmethod
+    def _sanitize_codex_rate_limit_headers(
+        response_headers: httpx.Headers,
+    ) -> Dict[str, str]:
+        sanitized: Dict[str, str] = {}
+        for header_name, header_value in response_headers.items():
+            normalized_name = str(header_name).lower()
+            if not (
+                normalized_name.startswith(
+                    PassThroughStreamingHandler._CODEX_RATE_LIMIT_HEADER_PREFIXES
+                )
+                or normalized_name
+                in PassThroughStreamingHandler._CODEX_RATE_LIMIT_HEADER_NAMES
+            ):
+                continue
+            sanitized[normalized_name] = str(header_value)
+        if sanitized:
+            sanitized["source"] = "codex_response_headers"
+        return sanitized
+
+    @staticmethod
+    def _record_upstream_rate_limit_headers_metadata(
+        success_handler_kwargs: Optional[Dict[str, Any]],
+        *,
+        response: httpx.Response,
+        endpoint_type: EndpointType,
+        custom_llm_provider: Optional[str],
+    ) -> None:
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
+            success_handler_kwargs
+        )
+        if endpoint_type == EndpointType.ANTHROPIC or custom_llm_provider == "anthropic":
+            sanitized_headers = PassThroughStreamingHandler._sanitize_anthropic_rate_limit_headers(
+                response.headers
+            )
+            if sanitized_headers:
+                metadata["anthropic_response_headers"] = sanitized_headers
+        if endpoint_type == EndpointType.OPENAI or custom_llm_provider == "openai":
+            sanitized_headers = PassThroughStreamingHandler._sanitize_codex_rate_limit_headers(
+                response.headers
+            )
+            if sanitized_headers:
+                metadata["codex_response_headers"] = sanitized_headers
+
+    @staticmethod
+    def _prepare_streaming_metadata(
+        success_handler_kwargs: Optional[Dict[str, Any]],
+        *,
+        response: httpx.Response,
+        endpoint_type: EndpointType,
+        custom_llm_provider: Optional[str],
+    ) -> Dict[str, Any]:
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
+            success_handler_kwargs
+        )
+        PassThroughStreamingHandler._record_upstream_rate_limit_headers_metadata(
+            success_handler_kwargs,
+            response=response,
+            endpoint_type=endpoint_type,
+            custom_llm_provider=custom_llm_provider,
+        )
         return metadata
 
     @staticmethod
@@ -88,6 +187,29 @@ class PassThroughStreamingHandler:
         langfuse_spans.append(descriptor)
 
     @staticmethod
+    def _sync_logging_obj_model_call_details_from_kwargs(
+        litellm_logging_obj: LiteLLMLoggingObj,
+        kwargs: Dict[str, Any],
+    ) -> None:
+        model_call_details = getattr(litellm_logging_obj, "model_call_details", None)
+        if not isinstance(model_call_details, dict):
+            return
+
+        for key in (
+            "litellm_params",
+            "standard_logging_object",
+            "response_cost",
+            "model",
+            "custom_llm_provider",
+            "passthrough_logging_payload",
+            "call_type",
+            "litellm_call_id",
+            "completion_start_time",
+        ):
+            if key in kwargs:
+                model_call_details[key] = kwargs[key]
+
+    @staticmethod
     async def chunk_processor(
         response: httpx.Response,
         request_body: Optional[dict],
@@ -114,8 +236,11 @@ class PassThroughStreamingHandler:
             total_stream_bytes = 0
             first_chunk_at: Optional[datetime] = None
             first_emitted_at: Optional[datetime] = None
-            metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
-                success_handler_kwargs
+            metadata = PassThroughStreamingHandler._prepare_streaming_metadata(
+                success_handler_kwargs,
+                response=response,
+                endpoint_type=endpoint_type,
+                custom_llm_provider=custom_llm_provider,
             )
             # Extract model name for cost injection
             model_name = PassThroughStreamingHandler._extract_model_for_cost_injection(
@@ -235,6 +360,7 @@ class PassThroughStreamingHandler:
                 PassThroughStreamingHandler._route_streaming_logging_to_handler(
                     litellm_logging_obj=litellm_logging_obj,
                     passthrough_success_handler_obj=passthrough_success_handler_obj,
+                    response=response,
                     url_route=url_route,
                     request_body=request_body or {},
                     endpoint_type=endpoint_type,
@@ -255,6 +381,7 @@ class PassThroughStreamingHandler:
     async def _route_streaming_logging_to_handler(
         litellm_logging_obj: LiteLLMLoggingObj,
         passthrough_success_handler_obj: PassThroughEndpointLogging,
+        response: httpx.Response,
         url_route: str,
         request_body: dict,
         endpoint_type: EndpointType,
@@ -283,7 +410,34 @@ class PassThroughStreamingHandler:
             standard_logging_response_object: Optional[
                 PassThroughEndpointLoggingResultValues
             ] = None
-            kwargs: dict = copy.deepcopy(success_handler_kwargs or {})
+            kwargs: dict = (
+                success_handler_kwargs
+                if isinstance(success_handler_kwargs, dict)
+                else {}
+            )
+            metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
+            metadata["aawm_stream_logging_endpoint_type"] = endpoint_type.value
+            if custom_llm_provider:
+                metadata["aawm_stream_logging_custom_llm_provider"] = custom_llm_provider
+            metadata["aawm_stream_logging_is_openai_responses"] = (
+                OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+            )
+            capture_passthrough_stream_shape(
+                provider=custom_llm_provider or endpoint_type.value,
+                endpoint_type=endpoint_type,
+                url_route=url_route,
+                request_body=request_body,
+                response=response,
+                all_chunks=all_chunks,
+                litellm_call_id=kwargs.get("litellm_call_id")
+                or getattr(litellm_logging_obj, "litellm_call_id", None),
+                extra_metadata={
+                    "custom_llm_provider": custom_llm_provider,
+                    "is_openai_responses": metadata[
+                        "aawm_stream_logging_is_openai_responses"
+                    ],
+                },
+            )
             if custom_llm_provider == "gemini":
                 if not passthrough_success_handler_obj.is_gemini_route(
                     url_route, custom_llm_provider
@@ -315,6 +469,7 @@ class PassThroughStreamingHandler:
                     start_time=start_time,
                     all_chunks=all_chunks,
                     end_time=end_time,
+                    kwargs=kwargs,
                 )
                 standard_logging_response_object = (
                     openai_passthrough_logging_handler_result["result"]
@@ -382,6 +537,10 @@ class PassThroughStreamingHandler:
                     "duration_ms": local_stream_finalize_ms,
                     "stream": True,
                 },
+            )
+            PassThroughStreamingHandler._sync_logging_obj_model_call_details_from_kwargs(
+                litellm_logging_obj,
+                kwargs,
             )
             await litellm_logging_obj.async_success_handler(
                 result=standard_logging_response_object,

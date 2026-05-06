@@ -44,7 +44,7 @@ adapter harness and focused regression tests pass against the intended target.
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
 distribution version directly. The current promotion target is
-`1.82.3+aawm.42`.
+`1.82.3+aawm.43`.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1500,6 +1500,65 @@ bookkeeping.
 from `scripts/local-ci/harness-version.txt` and published as
 `litellm-local-ci-harness-0.0.27.tar.gz` before the `aawm.42` source candidate
 was cut.
+
+---
+
+### aawm.43 — Provider-originated rate-limit observations and local Qwen route
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `PROD_RELEASE.md`
+- `LOCAL_LLM_CONSUMER.md`
+- `LOCAL_EMBED_RERANK_CONSUMER.md`
+- `litellm-dev-config.yaml`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `litellm/integrations/aawm_passthrough_shape_capture.py`
+- `litellm/proxy/pass_through_endpoints/google_code_assist_quota.py`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `litellm/proxy/pass_through_endpoints/streaming_handler.py`
+- `litellm/proxy/pass_through_endpoints/success_handler.py`
+- `litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py`
+- `scripts/backfill_rate_limit_observations.py`
+- `tests/test_scripts/test_backfill_rate_limit_observations.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+
+**Upstream issue:** AAWM needs locally observed quota-window state for Codex,
+Claude, and Gemini without relying on status-line side channels or fixed
+provider reset schedules. The production proxy also needs to expose the new
+local `qwen3-heretic-gguf` LLM route separately from local embedding/rerank
+models.
+
+**Fix:** Capture provider-originated quota observations from Codex/OpenAI
+response headers, Anthropic response headers, Google Code Assist
+`retrieveUserQuota` payloads, and provider error payloads into the processed
+`public.rate_limit_observations` stream. Keep unchanged snapshots out of the
+table, normalize provider/client/quota keys, and preserve transition evidence
+for later reset-window inference. Codex/OpenAI response-header observations
+parse `x-codex-*-used-percent` into stored `remaining_pct` when the provider
+emits those percentage headers. Add sanitized pass-through shape capture for
+debugging, a historical backfill utility, and a dev-only chat route for
+`qwen3-heretic-gguf`.
+
+**Why not upstream:** This is AAWM-specific observability, local routing, and
+consumer documentation for the AAWM LiteLLM deployment.
+
+**Validation status:** Focused unit and script validation covers the callback
+extractors, processed insert guards, pass-through metadata plumbing, Google
+quota observation-only logging, and historical backfill. Live dev `:4001`
+validation proved Codex, Claude, and Gemini provider-originated rows in
+`aawm_tristore.public.rate_limit_observations`; Sonnet-specific
+`7d_sonnet` rows are only expected on Sonnet traffic because Anthropic only
+emits that header family for Sonnet responses. The local
+`qwen3-heretic-gguf` route was smoke-tested through the dev proxy on
+`/v1/chat/completions` and returned `OK`. A follow-up focused unit check
+verified Codex response-header `used-percent` values populate
+`remaining_pct`; older saved shape captures only retained the used-percent
+header names, not the values, so existing null OpenAI/Codex rows cannot be
+accurately backfilled from those artifacts.
 
 ---
 

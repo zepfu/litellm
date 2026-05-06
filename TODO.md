@@ -126,9 +126,13 @@ these docs only as needed:
   proportional `response_cost_usd` estimate is not enough.
 
 - Prod `:4000` is on `v1.82.3-aawm.42`; detailed cutover, smoke, and harness
-  evidence lives in [COMPLETED.md](COMPLETED.md). The only release follow-up is
-  to rerun the Codex/Spark slices after the documented ChatGPT/Codex quota reset
-  (`2026-05-05T22:08:30Z`) if a fully green prod artifact is required.
+  evidence lives in [COMPLETED.md](COMPLETED.md). The current release-prep
+  candidate is `1.82.3+aawm.43` for provider-originated rate-limit observations
+  and the local `qwen3-heretic-gguf` chat route. Before prod promotion, push the
+  source candidate to `main`, wait for the expected callback overlay autobump
+  and release (`cb-v0.0.17` from current `0.0.16`), then tag/publish the fork
+  image from the post-autobump main head and update `aawm-infrastructure` image
+  pins.
 
 - OpenRouter `inclusionai/ling-2.6-flash:free` is no longer a viable release
   gate or active target path. The focused dev rerun at
