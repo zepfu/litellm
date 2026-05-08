@@ -213,6 +213,7 @@ def _row_usage_object(row: Dict[str, Any]) -> Dict[str, Any]:
         "total_tokens": int(row.get("total_tokens") or 0),
         "cache_read_input_tokens": int(row.get("cache_read_input_tokens") or 0),
         "cache_creation_input_tokens": int(row.get("cache_creation_input_tokens") or 0),
+        "cost": row.get("response_cost_usd"),
     }
 
 
@@ -243,10 +244,26 @@ def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
         _ensure_session_history_schema(conn)
         while True:
             params: list[Any] = [cursor_id]
+            where_clauses = ["sh.id > %s"]
             if args.provider:
+                where_clauses.append("sh.provider = %s")
                 params.append(args.provider)
             if args.session_id:
+                where_clauses.append("sh.session_id = %s")
                 params.append(args.session_id)
+            if args.cache_misses_only:
+                where_clauses.append("sh.provider_cache_miss = TRUE")
+            if args.missing_cache_miss_fields_only:
+                where_clauses.append(
+                    """
+                    sh.provider_cache_miss = TRUE
+                    AND (
+                        sh.provider_cache_miss_token_count IS NULL
+                        OR sh.provider_cache_miss_cost_usd IS NULL
+                    )
+                    """
+                )
+            where_sql = " AND ".join(f"({clause})" for clause in where_clauses)
 
             query = f"""
                 SELECT
@@ -266,6 +283,7 @@ def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
                     sh.provider_cache_miss_reason,
                     sh.provider_cache_miss_token_count,
                     sh.provider_cache_miss_cost_usd,
+                    sh.response_cost_usd,
                     sh.reasoning_tokens_reported,
                     sh.reasoning_tokens_estimated,
                     sh.reasoning_tokens_source,
@@ -285,7 +303,7 @@ def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
                     FROM public.session_history_tool_activity
                     GROUP BY litellm_call_id
                 ) tool_activity ON tool_activity.litellm_call_id = sh.litellm_call_id
-                WHERE sh.id > %s{' AND sh.provider = %s' if args.provider else ''}{' AND sh.session_id = %s' if args.session_id else ''}
+                WHERE {where_sql}
                 ORDER BY sh.id ASC
                 LIMIT {int(args.batch_size)}
             """
@@ -327,6 +345,7 @@ def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
                                 usage_obj=_row_usage_object(row),
                                 cache_state=cache_state,
                                 metadata=metadata,
+                                response_cost_usd=row.get("response_cost_usd"),
                             )
                         )
 
@@ -456,6 +475,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true", help="Persist repaired values.")
     parser.add_argument("--provider", help="Restrict to a single provider.")
     parser.add_argument("--session-id", help="Restrict to a single session_id.")
+    parser.add_argument(
+        "--cache-misses-only",
+        action="store_true",
+        help="Restrict to rows already marked as provider cache misses.",
+    )
+    parser.add_argument(
+        "--missing-cache-miss-fields-only",
+        action="store_true",
+        help="Restrict to provider cache misses missing token count or miss cost.",
+    )
     parser.add_argument("--batch-size", type=int, default=500, help="Rows per batch.")
     parser.add_argument(
         "--limit",

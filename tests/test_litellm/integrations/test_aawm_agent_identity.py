@@ -1263,6 +1263,60 @@ def test_build_session_history_record_uses_standard_logging_response_output_for_
     assert record["tool_activity"][0]["command_text"] == "ls"
 
 
+def test_build_session_history_record_derives_passthrough_latency_breakdown() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-latency-breakdown"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-latency-breakdown",
+            "aawm_local_prepare_ms": 10.0,
+            "aawm_upstream_first_chunk_ms": 40.0,
+            "aawm_time_to_first_token_ms": 50.0,
+            "aawm_upstream_stream_complete_ms": 100.0,
+            "aawm_local_stream_finalize_ms": 15.0,
+            "aawm_total_proxy_duration_ms": 130.0,
+        }
+    )
+    result = {
+        "id": "resp-latency-breakdown",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "done"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc),
+        end_time=datetime(2026, 5, 7, 12, 0, 1, tzinfo=timezone.utc),
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["litellm_pre_send_ms"] == pytest.approx(10.0)
+    assert record["litellm_post_response_ms"] == pytest.approx(15.0)
+    assert record["litellm_processing_ms"] == pytest.approx(25.0)
+    assert record["llm_upstream_time_to_first_byte_ms"] == pytest.approx(40.0)
+    assert record["llm_upstream_stream_ms"] == pytest.approx(60.0)
+    assert record["llm_upstream_elapsed_ms"] == pytest.approx(100.0)
+    assert record["ttft_ms"] == pytest.approx(50.0)
+    assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
+    assert record["latency_unclassified_ms"] == pytest.approx(5.0)
+    payload = _build_session_history_db_payload(record)
+    assert len(payload) == 65
+    assert payload[56] == pytest.approx(25.0)
+    assert payload[57] == pytest.approx(100.0)
+    assert payload[58] == pytest.approx(130.0)
+    assert payload[59] == pytest.approx(50.0)
+    assert payload[60] == pytest.approx(10.0)
+    assert payload[61] == pytest.approx(15.0)
+    assert payload[62] == pytest.approx(40.0)
+    assert payload[63] == pytest.approx(60.0)
+    assert payload[64] == pytest.approx(5.0)
+
+
 def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -1421,7 +1475,7 @@ def _assert_prompt_overhead_record(
     metadata = record["metadata"]
     assert metadata["prompt_overhead_breakdown_source"] == "request_body_estimate"
     assert metadata["prompt_overhead_counted_shape"] == counted_shape
-    assert metadata["prompt_overhead_classifier_version"] == "deterministic-v1"
+    assert metadata["prompt_overhead_classifier_version"] == "deterministic-v2"
     if route_family is not None:
         assert metadata["prompt_overhead_route_family"] == route_family
     if component_paths is not None:
@@ -1547,12 +1601,98 @@ def test_build_session_history_record_estimates_anthropic_openai_responses_promp
         component_paths={
             "system": ["instructions"],
             "tools": ["tools"],
-            "conversation": ["input"],
+            "conversation": ["input[type=message][role=user].content"],
         },
     )
     assert record["system_behavior_tokens_estimated"] > 0
     assert record["system_safety_tokens_estimated"] > 0
     assert record["system_instructional_tokens_estimated"] > 0
+
+
+def test_build_session_history_record_excludes_openai_responses_opaque_state_from_conversation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_estimate_prompt_overhead_tokens",
+        _fake_prompt_overhead_token_count,
+    )
+    request_body = {
+        "model": "gpt-5.5",
+        "instructions": "Always keep token accounting semantic.",
+        "tools": [{"type": "function", "name": "exec_command"}],
+        "include": ["reasoning.encrypted_content"],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "visible user request"},
+                    {"type": "item_reference", "id": "opaque-prior-message"},
+                ],
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [],
+                "encrypted_content": "opaque " * 240,
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "exec_command",
+                "arguments": '{"cmd":"rg token"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "visible tool result text",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "visible assistant reply"}
+                ],
+            },
+        ],
+    }
+    kwargs = _prompt_overhead_kwargs(
+        route_family="codex_responses",
+        request_body=request_body,
+        provider="openai",
+        model="gpt-5.5",
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-opaque-state",
+            "usage": {"prompt_tokens": 80, "completion_tokens": 7, "total_tokens": 87},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    metadata = record["metadata"]
+    assert metadata["prompt_overhead_counted_shape"] == "openai_responses"
+    assert record["input_conversation_tokens_estimated"] == 10
+    assert record["input_breakdown_residual_tokens"] > 0
+    assert metadata["usage_input_opaque_state_tokens_estimated"] > 200
+    assert metadata["prompt_overhead_component_paths"]["conversation"] == [
+        "input[type=message][role=user].content",
+        "input[type=function_call_output].output",
+        "input[type=message][role=assistant].content",
+    ]
+    assert "input" not in metadata["prompt_overhead_component_paths"]["conversation"]
+    assert metadata["prompt_overhead_excluded_component_paths"] == [
+        "input[type=message].content[type=item_reference]",
+        "input[type=reasoning]",
+        "input[type=function_call]",
+    ]
 
 
 def test_build_session_history_record_estimates_gemini_prompt_overhead(
@@ -2025,6 +2165,66 @@ def test_build_session_history_record_calculates_local_embedding_estimated_cost(
     assert record["response_cost_usd"] == pytest.approx(1000 * 4.6e-09)
 
 
+def test_build_session_history_record_marks_local_openai_chat_route() -> None:
+    kwargs = _base_kwargs(trace_name="local-llm")
+    kwargs["model"] = "qwen3-4b-heretic-q8"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-local-qwen-chat"
+    kwargs["litellm_params"]["api_base"] = (
+        "http://user:secret@172.20.0.1:8093/v1?key=should-not-log"
+    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-local-qwen-chat"
+    kwargs["litellm_params"]["metadata"]["model_group"] = "qwen3-heretic-gguf"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": {
+            "model": "qwen3-heretic-gguf",
+            "messages": [{"role": "user", "content": "say OK"}],
+        },
+        "headers": {},
+    }
+    kwargs["standard_logging_object"] = {
+        "metadata": {},
+        "request_tags": [],
+        "api_base": "http://user:secret@172.20.0.1:8093/v1?key=should-not-log",
+        "model": "qwen3-4b-heretic-q8",
+        "model_group": "qwen3-heretic-gguf",
+        "call_type": "acompletion",
+    }
+
+    result = {
+        "id": "local-qwen-response-1",
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 1,
+            "total_tokens": 13,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "local_llm"
+    assert record["model"] == "qwen3-heretic-gguf"
+    assert record["model_group"] == "qwen3-heretic-gguf"
+    assert record["metadata"]["aawm_local_route"] is True
+    assert record["metadata"]["aawm_local_route_family"] == "local_llm_chat"
+    assert record["metadata"]["aawm_local_model_group"] == "qwen3-heretic-gguf"
+    assert record["metadata"]["aawm_local_upstream_provider"] == "openai"
+    assert record["metadata"]["aawm_local_upstream_model"] == "qwen3-4b-heretic-q8"
+    assert (
+        record["metadata"]["aawm_local_upstream_api_base"]
+        == "http://172.20.0.1:8093/v1"
+    )
+
+
 def test_build_session_history_record_calculates_local_rerank_estimated_cost() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "BAAI/bge-reranker-v2-m3"
@@ -2265,8 +2465,9 @@ def test_build_session_history_record_marks_openai_provider_cache_miss_from_zero
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
-    assert record["provider_cache_miss_token_count"] is None
-    assert record["provider_cache_miss_cost_usd"] is None
+    assert record["provider_cache_miss_token_count"] == 2048
+    assert record["provider_cache_miss_cost_usd"] is not None
+    assert record["provider_cache_miss_cost_usd"] > 0
 
 
 def test_build_session_history_record_tracks_git_global_option_commit_and_push() -> None:
@@ -2369,6 +2570,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
+    assert len(payload) == 65
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -2376,6 +2578,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
     assert payload[23] == "hit"
     assert payload[35] == "dev"
     assert payload[36] == "1.82.3+aawm.25"
+    assert payload[56:] == (None, None, None, None, None, None, None, None, None)
     assert payload[37] == "aawm.25"
     assert "aawm-litellm-callbacks" in payload[38]
     assert payload[39] == "codex-tui"
@@ -2472,8 +2675,7 @@ def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cach
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_content_requested_without_hit"
-    assert record["provider_cache_miss_token_count"] is None
-    assert record["provider_cache_miss_cost_usd"] is None
+    assert record["provider_cache_miss_token_count"] == 120
 
 
 def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cached_content_alias_request() -> None:
@@ -2510,6 +2712,7 @@ def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cach
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_content_requested_without_hit"
+    assert record["provider_cache_miss_token_count"] == 120
 
 
 @pytest.mark.parametrize(
@@ -2595,10 +2798,97 @@ def test_build_session_history_record_marks_openai_prompt_cache_key_as_cache_att
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "prompt_cache_key_requested_without_hit"
-    assert record["provider_cache_miss_token_count"] is None
-    assert record["provider_cache_miss_cost_usd"] is None
+    assert record["provider_cache_miss_token_count"] == 42
+    assert record["provider_cache_miss_cost_usd"] is not None
+    assert record["provider_cache_miss_cost_usd"] > 0
     assert record["metadata"]["openai_prompt_cache_key_present"] is True
     assert record["metadata"]["anthropic_adapter_cache_control_present"] is True
+
+
+def test_build_session_history_record_estimates_openai_alias_cache_miss_cost_from_response_cost() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "codex-auto-review"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["response_cost"] = 0.55
+    kwargs["litellm_call_id"] = "call-openai-alias-prompt-cache-key"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openai-alias-prompt-cache-key",
+            "passthrough_route_family": "codex_responses",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "codex-auto-review",
+        "input": "Use prompt cache key.",
+        "prompt_cache_key": "prompt-cache-key-123",
+    }
+
+    result = {
+        "id": "provider-response-openai-alias-prompt-cache-key",
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 110,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "openai output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss_reason"] == "prompt_cache_key_requested_without_hit"
+    assert record["provider_cache_miss_token_count"] == 100
+    assert record["provider_cache_miss_cost_usd"] == pytest.approx(0.5)
+
+
+def test_build_session_history_record_prices_nvidia_cache_miss_using_nvidia_nim_catalog() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.nvidia")
+    kwargs["model"] = "deepseek-ai/deepseek-v3.2"
+    kwargs["custom_llm_provider"] = "nvidia_nim"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-nvidia-cache-miss"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-nvidia-cache-miss",
+            "usage_provider_cache_attempted": True,
+            "usage_provider_cache_status": "miss",
+            "usage_provider_cache_miss": True,
+            "usage_provider_cache_miss_reason": "nvidia_no_native_prompt_cache",
+            "usage_provider_cache_source": "anthropic_adapter.cache_control",
+        }
+    )
+
+    result = {
+        "id": "provider-response-nvidia-cache-miss",
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "total_tokens": 1010,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "nvidia output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "nvidia_nim"
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss_reason"] == "nvidia_no_native_prompt_cache"
+    assert record["provider_cache_miss_token_count"] == 1000
+    assert record["provider_cache_miss_cost_usd"] == pytest.approx(0.00028)
 
 
 def test_build_session_history_record_ignores_nested_openai_prompt_cache_key_without_cached_token_evidence() -> None:
@@ -2694,8 +2984,7 @@ def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cache_control_requested_without_hit"
-    assert record["provider_cache_miss_token_count"] is None
-    assert record["provider_cache_miss_cost_usd"] is None
+    assert record["provider_cache_miss_token_count"] == 1536
 
 
 def test_build_session_history_record_flows_nvidia_provider_cache_metadata() -> None:
@@ -2738,8 +3027,7 @@ def test_build_session_history_record_flows_nvidia_provider_cache_metadata() -> 
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "nvidia_no_native_prompt_cache"
-    assert record["provider_cache_miss_token_count"] is None
-    assert record["provider_cache_miss_cost_usd"] is None
+    assert record["provider_cache_miss_token_count"] == 1536
 
 
 def test_build_session_history_record_keeps_unsupported_hosted_tool_metadata() -> None:
@@ -2824,8 +3112,7 @@ def test_build_session_history_record_marks_gemini_cache_miss_from_intent_metada
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cache_attempted_without_hit"
-    assert record["provider_cache_miss_token_count"] is None
-    assert record["provider_cache_miss_cost_usd"] is None
+    assert record["provider_cache_miss_token_count"] == 1536
 
 
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
@@ -3244,6 +3531,95 @@ def test_build_rate_limit_observations_extracts_codex_response_headers() -> None
     assert spark_secondary["provider_resets_at"].isoformat().startswith(
         "2026-05-05T22:08:30"
     )
+
+
+def test_build_rate_limit_observations_skips_malformed_codex_placeholder_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-codex-placeholder-rate"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-placeholder-rate",
+            "passthrough_route_family": "codex_responses",
+            "codex_response_headers": {
+                "source": "codex_response_headers",
+                "x-codex-active-limit": "premium",
+                "x-codex-primary-reset-after-seconds": "0",
+                "x-codex-primary-reset-at": "1778122108",
+                "x-codex-primary-used-percent": "0",
+                "x-codex-primary-window-minutes": "0",
+                "x-codex-secondary-reset-after-seconds": "0",
+                "x-codex-secondary-reset-at": "",
+                "x-codex-secondary-used-percent": "0",
+                "x-codex-secondary-window-minutes": "0",
+                "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+                "x-codex-bengalfox-primary-reset-after-seconds": "18000",
+                "x-codex-bengalfox-primary-reset-at": "1778140108",
+                "x-codex-bengalfox-primary-used-percent": "2",
+                "x-codex-bengalfox-primary-window-minutes": "300",
+                "x-codex-bengalfox-secondary-reset-after-seconds": "604800",
+                "x-codex-bengalfox-secondary-reset-at": "1778726908",
+                "x-codex-bengalfox-secondary-used-percent": "46",
+                "x-codex-bengalfox-secondary-window-minutes": "10080",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 7, 2, 48, 28, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_limit_scope = {
+        (observation["limit_id"], observation["limit_scope"]): observation
+        for observation in observations
+    }
+    assert ("codex", "primary") not in by_limit_scope
+    assert ("codex", "secondary") not in by_limit_scope
+    assert by_limit_scope[("codex_bengalfox", "primary")]["quota_period"] == "five_hour"
+    assert (
+        by_limit_scope[("codex_bengalfox", "secondary")]["quota_period"]
+        == "seven_day"
+    )
+
+
+def test_build_rate_limit_observations_drops_only_malformed_codex_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-codex-only-placeholder-rate"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-only-placeholder-rate",
+            "passthrough_route_family": "codex_responses",
+            "codex_response_headers": {
+                "source": "codex_response_headers",
+                "x-codex-primary-reset-after-seconds": "0",
+                "x-codex-primary-reset-at": "1778122108",
+                "x-codex-primary-used-percent": "0",
+                "x-codex-primary-window-minutes": "0",
+                "x-codex-secondary-reset-after-seconds": "0",
+                "x-codex-secondary-reset-at": "",
+                "x-codex-secondary-used-percent": "0",
+                "x-codex-secondary-window-minutes": "0",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 7, 2, 48, 28, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert observations == []
 
 
 def test_build_rate_limit_observations_extracts_anthropic_response_headers() -> None:
@@ -3695,6 +4071,7 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     mock_conn.execute.assert_awaited_once()
     executed_args = mock_conn.execute.await_args.args
     assert "INSERT INTO public.session_history" in executed_args[0]
+    assert len(executed_args[1:]) == 65
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
@@ -4487,8 +4864,9 @@ def test_build_session_history_record_from_langfuse_trace_observation_marks_open
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
-    assert record["provider_cache_miss_token_count"] is None
-    assert record["provider_cache_miss_cost_usd"] is None
+    assert record["provider_cache_miss_token_count"] == 42
+    assert record["provider_cache_miss_cost_usd"] is not None
+    assert record["provider_cache_miss_cost_usd"] > 0
 
 
 def test_build_session_history_record_prefers_metadata_usage_object_when_result_usage_is_sparse() -> None:
@@ -4683,6 +5061,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
+    assert len(history_args[1][0]) == 65
     assert history_args[1][0][0] == "call-1"
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]

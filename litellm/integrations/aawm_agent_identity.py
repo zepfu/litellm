@@ -27,8 +27,10 @@ import asyncio
 import atexit
 import base64
 import hashlib
+import ipaddress
 import importlib
 import json
+import math
 import queue
 import re
 import shlex
@@ -217,7 +219,16 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     system_behavior_tokens_estimated INTEGER NOT NULL DEFAULT 0,
     system_safety_tokens_estimated INTEGER NOT NULL DEFAULT 0,
     system_instructional_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    system_unclassified_tokens_estimated INTEGER NOT NULL DEFAULT 0
+    system_unclassified_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    litellm_processing_ms DOUBLE PRECISION,
+    llm_upstream_elapsed_ms DOUBLE PRECISION,
+    total_server_elapsed_ms DOUBLE PRECISION,
+    ttft_ms DOUBLE PRECISION,
+    litellm_pre_send_ms DOUBLE PRECISION,
+    litellm_post_response_ms DOUBLE PRECISION,
+    llm_upstream_time_to_first_byte_ms DOUBLE PRECISION,
+    llm_upstream_stream_ms DOUBLE PRECISION,
+    latency_unclassified_ms DOUBLE PRECISION
 )
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
@@ -252,6 +263,15 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_safety_tokens_estimated INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_instructional_tokens_estimated INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_unclassified_tokens_estimated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_processing_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_elapsed_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS total_server_elapsed_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS ttft_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_pre_send_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_post_response_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_time_to_first_byte_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_stream_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS latency_unclassified_ms DOUBLE PRECISION",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
@@ -667,13 +687,23 @@ INSERT INTO public.session_history (
     system_behavior_tokens_estimated,
     system_safety_tokens_estimated,
     system_instructional_tokens_estimated,
-    system_unclassified_tokens_estimated
+    system_unclassified_tokens_estimated,
+    litellm_processing_ms,
+    llm_upstream_elapsed_ms,
+    total_server_elapsed_ms,
+    ttft_ms,
+    litellm_pre_send_ms,
+    litellm_post_response_ms,
+    llm_upstream_time_to_first_byte_ms,
+    llm_upstream_stream_ms,
+    latency_unclassified_ms
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb,
     $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb, $47,
-    $48, $49, $50, $51, $52, $53, $54, $55, $56
+    $48, $49, $50, $51, $52, $53, $54, $55, $56,
+    $57, $58, $59, $60, $61, $62, $63, $64, $65
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -841,6 +871,39 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_unclassified_tokens_estimated
         ELSE session_history.system_unclassified_tokens_estimated
     END,
+    litellm_processing_ms = COALESCE(
+        EXCLUDED.litellm_processing_ms,
+        session_history.litellm_processing_ms
+    ),
+    llm_upstream_elapsed_ms = COALESCE(
+        EXCLUDED.llm_upstream_elapsed_ms,
+        session_history.llm_upstream_elapsed_ms
+    ),
+    total_server_elapsed_ms = COALESCE(
+        EXCLUDED.total_server_elapsed_ms,
+        session_history.total_server_elapsed_ms
+    ),
+    ttft_ms = COALESCE(EXCLUDED.ttft_ms, session_history.ttft_ms),
+    litellm_pre_send_ms = COALESCE(
+        EXCLUDED.litellm_pre_send_ms,
+        session_history.litellm_pre_send_ms
+    ),
+    litellm_post_response_ms = COALESCE(
+        EXCLUDED.litellm_post_response_ms,
+        session_history.litellm_post_response_ms
+    ),
+    llm_upstream_time_to_first_byte_ms = COALESCE(
+        EXCLUDED.llm_upstream_time_to_first_byte_ms,
+        session_history.llm_upstream_time_to_first_byte_ms
+    ),
+    llm_upstream_stream_ms = COALESCE(
+        EXCLUDED.llm_upstream_stream_ms,
+        session_history.llm_upstream_stream_ms
+    ),
+    latency_unclassified_ms = COALESCE(
+        EXCLUDED.latency_unclassified_ms,
+        session_history.latency_unclassified_ms
+    ),
     metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL = """
@@ -1171,11 +1234,18 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "aawm_stream_logging_endpoint_type",
     "aawm_stream_logging_custom_llm_provider",
     "aawm_stream_logging_is_openai_responses",
+    "aawm_local_route",
+    "aawm_local_route_family",
+    "aawm_local_model_group",
+    "aawm_local_upstream_provider",
+    "aawm_local_upstream_model",
+    "aawm_local_upstream_api_base",
     "usage_input_system_tokens_estimated",
     "usage_input_tool_advertisement_tokens_estimated",
     "usage_input_conversation_tokens_estimated",
     "usage_input_other_tokens_estimated",
     "usage_input_breakdown_residual_tokens",
+    "usage_input_opaque_state_tokens_estimated",
     "usage_system_behavior_tokens_estimated",
     "usage_system_safety_tokens_estimated",
     "usage_system_instructional_tokens_estimated",
@@ -1186,6 +1256,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "prompt_overhead_tokenizer",
     "prompt_overhead_classifier_version",
     "prompt_overhead_component_paths",
+    "prompt_overhead_excluded_component_paths",
 )
 _PROMPT_OVERHEAD_TOKEN_FIELDS = (
     "input_system_tokens_estimated",
@@ -1198,7 +1269,18 @@ _PROMPT_OVERHEAD_TOKEN_FIELDS = (
     "system_instructional_tokens_estimated",
     "system_unclassified_tokens_estimated",
 )
-_PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v1"
+_SESSION_HISTORY_LATENCY_FIELDS = (
+    "litellm_processing_ms",
+    "llm_upstream_elapsed_ms",
+    "total_server_elapsed_ms",
+    "ttft_ms",
+    "litellm_pre_send_ms",
+    "litellm_post_response_ms",
+    "llm_upstream_time_to_first_byte_ms",
+    "llm_upstream_stream_ms",
+    "latency_unclassified_ms",
+)
+_PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v2"
 _AAWM_TENANT_ID_METADATA_KEYS = (
     "tenant_id",
     "aawm_tenant_id",
@@ -2657,6 +2739,130 @@ def _parse_datetime_value(value: Any) -> Optional[datetime]:
     return None
 
 
+def _nonnegative_float_or_none(value: Any) -> Optional[float]:
+    normalized = _safe_float(value)
+    if normalized is None or not math.isfinite(normalized) or normalized < 0:
+        return None
+    return round(normalized, 3)
+
+
+def _sum_nonnegative_floats(*values: Optional[float]) -> Optional[float]:
+    present_values = [value for value in values if value is not None]
+    if not present_values:
+        return None
+    return round(sum(present_values), 3)
+
+
+def _coerce_session_latency_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, str):
+        return _parse_datetime_value(value)
+    return _normalize_datetime(value)
+
+
+def _elapsed_ms_from_times(start_time: Any, end_time: Any) -> Optional[float]:
+    normalized_start = _coerce_session_latency_datetime(start_time)
+    normalized_end = _coerce_session_latency_datetime(end_time)
+    if normalized_start is None or normalized_end is None:
+        return None
+    return _nonnegative_float_or_none(
+        (normalized_end - normalized_start).total_seconds() * 1000.0
+    )
+
+
+def _metadata_nonnegative_float(
+    metadata: Dict[str, Any],
+    key: str,
+) -> Optional[float]:
+    return _nonnegative_float_or_none(metadata.get(key))
+
+
+def _build_session_history_latency_breakdown(
+    *,
+    metadata: Any,
+    start_time: Any,
+    end_time: Any,
+) -> Dict[str, Optional[float]]:
+    if not isinstance(metadata, dict):
+        metadata = _safe_json_load(metadata, {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    litellm_pre_send_ms = _metadata_nonnegative_float(
+        metadata,
+        "aawm_local_prepare_ms",
+    )
+    litellm_post_response_ms = _first_non_none(
+        _metadata_nonnegative_float(metadata, "aawm_local_finalize_ms"),
+        _metadata_nonnegative_float(metadata, "aawm_local_stream_finalize_ms"),
+    )
+    litellm_processing_ms = _sum_nonnegative_floats(
+        litellm_pre_send_ms,
+        litellm_post_response_ms,
+    )
+    if litellm_processing_ms is None:
+        litellm_processing_ms = _metadata_nonnegative_float(
+            metadata,
+            "aawm_total_proxy_overhead_ms",
+        )
+
+    upstream_first_chunk_ms = _metadata_nonnegative_float(
+        metadata,
+        "aawm_upstream_first_chunk_ms",
+    )
+    upstream_stream_complete_ms = _metadata_nonnegative_float(
+        metadata,
+        "aawm_upstream_stream_complete_ms",
+    )
+    upstream_wait_ms = _metadata_nonnegative_float(
+        metadata,
+        "aawm_upstream_wait_ms",
+    )
+    llm_upstream_elapsed_ms = _first_non_none(
+        upstream_stream_complete_ms,
+        upstream_wait_ms,
+    )
+    llm_upstream_time_to_first_byte_ms = upstream_first_chunk_ms
+    llm_upstream_stream_ms = None
+    if upstream_first_chunk_ms is not None and upstream_stream_complete_ms is not None:
+        llm_upstream_stream_ms = _nonnegative_float_or_none(
+            upstream_stream_complete_ms - upstream_first_chunk_ms
+        )
+
+    total_server_elapsed_ms = _first_non_none(
+        _metadata_nonnegative_float(metadata, "aawm_total_proxy_duration_ms"),
+        _elapsed_ms_from_times(start_time, end_time),
+    )
+    ttft_ms = _first_non_none(
+        _metadata_nonnegative_float(metadata, "aawm_time_to_first_token_ms"),
+        _metadata_nonnegative_float(metadata, "aawm_first_emitted_chunk_ms"),
+    )
+
+    latency_unclassified_ms = None
+    if total_server_elapsed_ms is not None and (
+        litellm_processing_ms is not None or llm_upstream_elapsed_ms is not None
+    ):
+        classified_ms = (litellm_processing_ms or 0.0) + (
+            llm_upstream_elapsed_ms or 0.0
+        )
+        latency_unclassified_ms = _nonnegative_float_or_none(
+            total_server_elapsed_ms - classified_ms
+        )
+        if latency_unclassified_ms is None:
+            latency_unclassified_ms = 0.0
+
+    return {
+        "litellm_processing_ms": litellm_processing_ms,
+        "llm_upstream_elapsed_ms": llm_upstream_elapsed_ms,
+        "total_server_elapsed_ms": total_server_elapsed_ms,
+        "ttft_ms": ttft_ms,
+        "litellm_pre_send_ms": litellm_pre_send_ms,
+        "litellm_post_response_ms": litellm_post_response_ms,
+        "llm_upstream_time_to_first_byte_ms": llm_upstream_time_to_first_byte_ms,
+        "llm_upstream_stream_ms": llm_upstream_stream_ms,
+        "latency_unclassified_ms": latency_unclassified_ms,
+    }
+
+
 _AAWM_RATE_LIMIT_METADATA_KEYS = (
     "trace_name",
     "litellm_environment",
@@ -3389,10 +3595,17 @@ def _extract_codex_header_rate_limit_observations(
                 used_percentage = _safe_float(
                     _get_rate_limit_header_value(candidate, used_percent_key)
                 )
+                raw_window_minutes = _get_rate_limit_header_value(
+                    candidate,
+                    window_minutes_key,
+                )
+                parsed_window_minutes = _safe_int(raw_window_minutes)
+                if raw_window_minutes is not None and (
+                    parsed_window_minutes is None or parsed_window_minutes <= 0
+                ):
+                    continue
                 observed_window_minutes = (
-                    _safe_int(
-                        _get_rate_limit_header_value(candidate, window_minutes_key)
-                    )
+                    parsed_window_minutes
                     or window_minutes
                 )
                 over_limit_percent = _safe_float(
@@ -4831,22 +5044,161 @@ def _compute_provider_cache_miss_cost_state(
     usage_obj: Any,
     cache_state: Optional[Dict[str, Any]],
     metadata: Optional[Dict[str, Any]] = None,
+    response_cost_usd: Optional[float] = None,
 ) -> Dict[str, Any]:
+    existing_miss_token_count = (
+        _safe_int(cache_state.get("miss_token_count"))
+        if isinstance(cache_state, dict)
+        else None
+    )
+    existing_miss_cost_usd = (
+        _safe_float(cache_state.get("miss_cost_usd"))
+        if isinstance(cache_state, dict)
+        else None
+    )
+    existing_miss_cost_basis = (
+        str(cache_state.get("miss_cost_basis")).strip()
+        if isinstance(cache_state, dict)
+        and cache_state.get("miss_cost_basis") is not None
+        and str(cache_state.get("miss_cost_basis")).strip()
+        else None
+    )
     result: Dict[str, Any] = {
-        "miss_token_count": None,
-        "miss_cost_usd": None,
-        "miss_cost_basis": None,
+        "miss_token_count": existing_miss_token_count,
+        "miss_cost_usd": existing_miss_cost_usd,
+        "miss_cost_basis": existing_miss_cost_basis,
     }
     if provider_family is None or cache_state is None:
         return result
-    if cache_state.get("status") != "write":
+
+    cost_provider_family = "nvidia_nim" if provider_family == "nvidia" else provider_family
+    cache_status = cache_state.get("status")
+    cache_missed = bool(cache_state.get("miss"))
+    service_tier = _extract_service_tier_hint(usage_obj, metadata)
+
+    def _fallback_miss_cost(
+        miss_token_count: int,
+    ) -> Tuple[Optional[float], Optional[str]]:
+        model_info = _lookup_bundled_model_cost_info(
+            model=model,
+            custom_llm_provider=cost_provider_family,
+        )
+        input_cost_per_token = (
+            _safe_float(model_info.get("input_cost_per_token"))
+            if isinstance(model_info, dict)
+            else None
+        )
+        if input_cost_per_token is not None:
+            return (
+                max(float(input_cost_per_token) * float(miss_token_count), 0.0),
+                "prompt_input_cost_no_cache_read_pricing",
+            )
+
+        response_cost = _safe_float(
+            _first_non_none(
+                response_cost_usd,
+                _maybe_get(usage_obj, "cost"),
+                _maybe_get(usage_obj, "response_cost"),
+                _maybe_get(usage_obj, "responseCost"),
+                (metadata or {}).get("litellm_response_cost"),
+                (metadata or {}).get("response_cost"),
+                (metadata or {}).get("usage_openrouter_cost"),
+            )
+        )
+        if response_cost is None or response_cost < 0:
+            return None, None
+        if response_cost == 0:
+            return 0.0, "response_cost_zero"
+
+        prompt_tokens = _extract_prompt_tokens(usage_obj)
+        completion_tokens = _extract_completion_tokens(usage_obj)
+        total_tokens = _extract_total_tokens(
+            usage_obj,
+            prompt_tokens,
+            completion_tokens,
+        )
+        if total_tokens > 0:
+            token_share = min(float(miss_token_count) / float(total_tokens), 1.0)
+            return (
+                max(float(response_cost) * token_share, 0.0),
+                "response_cost_token_share_estimate",
+            )
+        return float(response_cost), "response_cost_estimate"
+
+    if cache_status == "miss" and cache_missed:
+        miss_token_count = _extract_prompt_tokens(usage_obj)
+        if miss_token_count <= 0:
+            result["miss_token_count"] = 0
+            fallback_cost, fallback_basis = _fallback_miss_cost(0)
+            if fallback_cost is not None:
+                result["miss_cost_usd"] = fallback_cost
+                result["miss_cost_basis"] = fallback_basis
+            return result
+
+        result["miss_token_count"] = miss_token_count
+        if result["miss_cost_usd"] is not None:
+            return result
+
+        try:
+            from litellm.litellm_core_utils.llm_cost_calc.utils import (
+                _get_token_base_cost,
+            )
+            from litellm.types.utils import Usage
+            from litellm.utils import get_model_info
+
+            usage_for_cost = Usage(
+                prompt_tokens=miss_token_count,
+                completion_tokens=0,
+                total_tokens=miss_token_count,
+            )
+            model_info = get_model_info(
+                model=model,
+                custom_llm_provider=cost_provider_family,
+            )
+            if "cache_read_input_token_cost" not in model_info:
+                fallback_cost, fallback_basis = _fallback_miss_cost(miss_token_count)
+                if fallback_cost is not None:
+                    result["miss_cost_usd"] = fallback_cost
+                    result["miss_cost_basis"] = fallback_basis
+                return result
+            (
+                prompt_base_cost,
+                _completion_base_cost,
+                _cache_creation_cost,
+                _cache_creation_cost_above_1hr,
+                cache_read_cost,
+            ) = _get_token_base_cost(
+                model_info=model_info,
+                usage=usage_for_cost,
+                service_tier=service_tier,
+            )
+
+            if prompt_base_cost is None or cache_read_cost is None:
+                return result
+
+            miss_cost = max(
+                (float(prompt_base_cost) - float(cache_read_cost))
+                * float(miss_token_count),
+                0.0,
+            )
+            result["miss_cost_usd"] = miss_cost
+            result["miss_cost_basis"] = "prompt_vs_cache_read_delta"
+            return result
+        except Exception:
+            fallback_cost, fallback_basis = _fallback_miss_cost(miss_token_count)
+            if fallback_cost is not None:
+                result["miss_cost_usd"] = fallback_cost
+                result["miss_cost_basis"] = fallback_basis
+            return result
+
+    if cache_status != "write":
         return result
 
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
     if cache_creation_input_tokens <= 0:
         return result
 
-    service_tier = _extract_service_tier_hint(usage_obj, metadata)
+    result["miss_token_count"] = cache_creation_input_tokens
     prompt_tokens = max(_extract_prompt_tokens(usage_obj), cache_creation_input_tokens)
 
     try:
@@ -4879,7 +5231,7 @@ def _compute_provider_cache_miss_cost_state(
         )
         model_info = get_model_info(
             model=model,
-            custom_llm_provider=provider_family,
+            custom_llm_provider=cost_provider_family,
         )
         (
             _prompt_base_cost,
@@ -4901,7 +5253,6 @@ def _compute_provider_cache_miss_cost_state(
         )
         read_cost = float(cache_creation_input_tokens) * float(cache_read_cost or 0.0)
         miss_cost = max(float(write_cost) - float(read_cost), 0.0)
-        result["miss_token_count"] = cache_creation_input_tokens
         result["miss_cost_usd"] = miss_cost
         result["miss_cost_basis"] = "write_vs_read_delta"
         return result
@@ -5428,6 +5779,202 @@ def _append_prompt_component(
     components[name].append({"path": path, "value": value})
 
 
+_RESPONSES_SYSTEM_ROLES = {"system", "developer"}
+_RESPONSES_CONVERSATION_ROLES = {"user", "assistant"}
+_RESPONSES_TEXT_CONTENT_TYPES = {"input_text", "output_text", "text"}
+_RESPONSES_OPAQUE_CONTENT_TYPES = {
+    "item_reference",
+    "input_audio",
+    "audio",
+    "input_image",
+    "image",
+    "image_url",
+}
+_RESPONSES_OPAQUE_ITEM_TYPES = {
+    "reasoning",
+    "function_call",
+    "mcp_call",
+    "file_search_call",
+    "web_search_call",
+    "computer_call",
+    "item_reference",
+}
+
+
+def _append_prompt_text_components(
+    components: Dict[str, List[Dict[str, Any]]],
+    name: str,
+    *,
+    path: str,
+    values: List[str],
+) -> None:
+    for value in values:
+        _append_prompt_component(components, name, path=path, value=value)
+
+
+def _extract_responses_visible_text_blocks(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    if isinstance(value, list):
+        blocks: List[str] = []
+        for item in value:
+            blocks.extend(_extract_responses_visible_text_blocks(item))
+        return blocks
+    if isinstance(value, dict):
+        content_type = str(value.get("type") or "").lower()
+        if content_type in _RESPONSES_OPAQUE_CONTENT_TYPES:
+            return []
+        if content_type in _RESPONSES_TEXT_CONTENT_TYPES:
+            text = value.get("text")
+            return [text.strip()] if isinstance(text, str) and text.strip() else []
+        if "text" in value and isinstance(value.get("text"), str):
+            text = value["text"].strip()
+            return [text] if text else []
+        if "content" in value:
+            return _extract_responses_visible_text_blocks(value.get("content"))
+    return []
+
+
+def _responses_message_component_path(role: str) -> str:
+    if role in _RESPONSES_SYSTEM_ROLES:
+        return "input[type=message][role=system|developer].content"
+    if role in _RESPONSES_CONVERSATION_ROLES:
+        return f"input[type=message][role={role}].content"
+    return "input[type=message].content"
+
+
+def _record_responses_excluded_fields(
+    components: Dict[str, List[Dict[str, Any]]],
+    value: Any,
+    *,
+    path: str,
+) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _record_responses_excluded_fields(components, item, path=path)
+        return
+    if not isinstance(value, dict):
+        return
+    content_type = str(value.get("type") or "").lower()
+    if content_type == "item_reference":
+        _append_prompt_component(
+            components,
+            "excluded",
+            path=f"{path}[type=item_reference]",
+            value=value,
+        )
+        return
+    for key, field_value in value.items():
+        if key in {"encrypted_content", "reasoning_content"}:
+            _append_prompt_component(
+                components,
+                "excluded",
+                path=f"{path}.{key}",
+                value=field_value,
+            )
+        elif isinstance(field_value, (dict, list)):
+            _record_responses_excluded_fields(
+                components,
+                field_value,
+                path=f"{path}.{key}",
+            )
+
+
+def _append_openai_responses_input_component(
+    components: Dict[str, List[Dict[str, Any]]],
+    item: Any,
+) -> None:
+    if isinstance(item, str):
+        _append_prompt_component(
+            components,
+            "conversation",
+            path="input",
+            value=item,
+        )
+        return
+
+    if not isinstance(item, dict):
+        _append_prompt_component(
+            components,
+            "conversation",
+            path="input",
+            value=item,
+        )
+        return
+
+    item_type = str(item.get("type") or "").lower()
+    role = str(item.get("role") or "").lower()
+    if item_type in _RESPONSES_OPAQUE_ITEM_TYPES:
+        _append_prompt_component(
+            components,
+            "excluded",
+            path=f"input[type={item_type}]",
+            value=item,
+        )
+        return
+
+    if item_type == "function_call_output":
+        _append_prompt_component(
+            components,
+            "conversation",
+            path="input[type=function_call_output].output",
+            value=item.get("output"),
+        )
+        return
+
+    _record_responses_excluded_fields(
+        components,
+        item,
+        path=f"input[type={item_type or 'unknown'}]",
+    )
+
+    if item_type == "message" or role:
+        bucket = "system" if role in _RESPONSES_SYSTEM_ROLES else "conversation"
+        path = _responses_message_component_path(role)
+        text_blocks = _extract_responses_visible_text_blocks(item.get("content"))
+        if not text_blocks and "content" not in item:
+            text_blocks = _extract_responses_visible_text_blocks(item)
+        _append_prompt_text_components(
+            components,
+            bucket,
+            path=path,
+            values=text_blocks,
+        )
+        return
+
+    text_blocks = _extract_responses_visible_text_blocks(item)
+    if text_blocks:
+        _append_prompt_text_components(
+            components,
+            "conversation",
+            path="input[type=visible_text]",
+            values=text_blocks,
+        )
+    else:
+        _append_prompt_component(
+            components,
+            "excluded",
+            path=f"input[type={item_type or 'unknown'}]",
+            value=item,
+        )
+
+
+def _append_openai_responses_input_components(
+    components: Dict[str, List[Dict[str, Any]]],
+    input_value: Any,
+) -> None:
+    if isinstance(input_value, list):
+        for item in input_value:
+            _append_openai_responses_input_component(components, item)
+        return
+    _append_openai_responses_input_component(components, input_value)
+
+
 def _split_chat_prompt_messages(messages: Any) -> Tuple[List[Any], List[Any]]:
     if not isinstance(messages, list):
         return [], []
@@ -5449,6 +5996,7 @@ def _extract_prompt_overhead_components(
         "system": [],
         "tools": [],
         "conversation": [],
+        "excluded": [],
     }
     route_family_lower = (route_family or "").lower()
     request_block = request_body.get("request")
@@ -5515,11 +6063,9 @@ def _extract_prompt_overhead_components(
             path="tools",
             value=request_body.get("tools"),
         )
-        _append_prompt_component(
+        _append_openai_responses_input_components(
             components,
-            "conversation",
-            path="input",
-            value=request_body.get("input"),
+            request_body.get("input"),
         )
         return components, "openai_responses"
 
@@ -5615,6 +6161,11 @@ def _build_prompt_overhead_breakdown(
         _estimate_prompt_overhead_tokens(model, component["value"])
         for component in components["conversation"]
     )
+    excluded_components = components.get("excluded", [])
+    opaque_state_tokens = sum(
+        _estimate_prompt_overhead_tokens(model, component["value"])
+        for component in excluded_components
+    )
     component_total = system_tokens + tool_tokens + conversation_tokens
     residual_tokens = prompt_tokens - component_total
 
@@ -5639,6 +6190,9 @@ def _build_prompt_overhead_breakdown(
             str(component.get("path")) for component in components["conversation"]
         ],
     }
+    excluded_component_paths = [
+        str(component.get("path")) for component in excluded_components
+    ]
     metadata.update(
         {
             "prompt_overhead_breakdown_source": "request_body_estimate",
@@ -5647,6 +6201,8 @@ def _build_prompt_overhead_breakdown(
             "prompt_overhead_tokenizer": "litellm.token_counter_with_char_fallback",
             "prompt_overhead_classifier_version": _PROMPT_OVERHEAD_CLASSIFIER_VERSION,
             "prompt_overhead_component_paths": component_paths,
+            "prompt_overhead_excluded_component_paths": excluded_component_paths,
+            "usage_input_opaque_state_tokens_estimated": opaque_state_tokens,
         }
     )
     for key, value in breakdown.items():
@@ -5897,6 +6453,13 @@ def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
         not isinstance(current_status, str)
         or not current_status.strip()
         or bool(record.get("cache_read_input_tokens") or record.get("cache_creation_input_tokens"))
+        or (
+            bool(record.get("provider_cache_miss"))
+            and (
+                record.get("provider_cache_miss_token_count") is None
+                or record.get("provider_cache_miss_cost_usd") is None
+            )
+        )
     )
     if not should_override:
         return
@@ -5909,6 +6472,7 @@ def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
             usage_obj=_row_usage_object_from_record(record),
             cache_state=cache_state,
             metadata=metadata,
+            response_cost_usd=_safe_float(record.get("response_cost_usd")),
         )
     )
     record["provider_cache_attempted"] = bool(cache_state.get("attempted"))
@@ -6063,6 +6627,19 @@ def _normalize_prompt_overhead_state_on_record(record: Dict[str, Any]) -> None:
         record[field] = value if value is not None else 0
 
 
+def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
+    derived_latency = _build_session_history_latency_breakdown(
+        metadata=record.get("metadata"),
+        start_time=record.get("start_time"),
+        end_time=record.get("end_time"),
+    )
+    for field in _SESSION_HISTORY_LATENCY_FIELDS:
+        explicit_value = _nonnegative_float_or_none(record.get(field))
+        record[field] = (
+            explicit_value if explicit_value is not None else derived_latency.get(field)
+        )
+
+
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
@@ -6070,6 +6647,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_session_runtime_identity_on_record(record)
     _normalize_session_repository_on_record(record)
     _normalize_session_tenant_on_record(record)
+    _normalize_session_latency_state_on_record(record)
     _sync_session_history_record_metadata(record)
     return record
 
@@ -6826,6 +7404,16 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
     )
     usage_obj = _extract_usage_object(kwargs, result)
     request_body = _extract_provider_cache_request_body(kwargs)
+    response_cost_usd = _safe_float(
+        _first_non_none(
+            kwargs.get("response_cost"),
+            (kwargs.get("standard_logging_object") or {}).get("response_cost"),
+            metadata.get("litellm_response_cost"),
+            metadata.get("response_cost"),
+            metadata.get("usage_openrouter_cost"),
+            _maybe_get(usage_obj, "cost"),
+        )
+    )
     provider_family = _normalize_provider_cache_family(
         kwargs.get("custom_llm_provider"),
         resolved_model,
@@ -6846,6 +7434,7 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
         usage_obj=usage_obj,
         cache_state=cache_state,
         metadata=metadata,
+        response_cost_usd=response_cost_usd,
     )
     cache_state.update(cache_miss_cost_state)
 
@@ -7650,6 +8239,16 @@ def _build_session_history_record_from_langfuse_trace_observation(
     if repository:
         metadata["repository"] = repository
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
+    response_cost_usd = _safe_float(
+        _first_non_none(
+            _maybe_get(observation.get("costDetails"), "total"),
+            observation.get("calculatedTotalCost"),
+            metadata.get("litellm_response_cost"),
+            metadata.get("response_cost"),
+            metadata.get("usage_openrouter_cost"),
+            trace.get("totalCost"),
+        )
+    )
     provider_cache_state = _resolve_provider_cache_state(
         provider=provider,
         model=str(observation.get("model") or ""),
@@ -7666,17 +8265,10 @@ def _build_session_history_record_from_langfuse_trace_observation(
                 usage_obj=usage_object,
                 cache_state=provider_cache_state,
                 metadata=metadata,
+                response_cost_usd=response_cost_usd,
             )
         )
 
-    response_cost_usd = _safe_float(
-        _first_non_none(
-            _maybe_get(observation.get("costDetails"), "total"),
-            observation.get("calculatedTotalCost"),
-            metadata.get("litellm_response_cost"),
-            trace.get("totalCost"),
-        )
-    )
     permission_usage_fields = _build_permission_usage_fields(
         metadata=metadata,
         prompt_tokens=prompt_tokens,
@@ -7820,6 +8412,132 @@ def _build_session_history_metadata(
     return history_metadata
 
 
+def _sanitize_session_history_api_base(value: Any) -> Optional[str]:
+    cleaned = _clean_non_empty_string(value)
+    if not cleaned:
+        return None
+
+    try:
+        parsed = urlsplit(cleaned)
+    except ValueError:
+        return None
+
+    if not parsed.scheme or not parsed.netloc:
+        return cleaned.split("?", 1)[0].split("#", 1)[0].rstrip("/") or None
+
+    hostname = parsed.hostname
+    if not hostname:
+        return None
+
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+
+    return (
+        urlunsplit((parsed.scheme, netloc, parsed.path.rstrip("/"), "", ""))
+        or None
+    )
+
+
+def _is_local_session_history_api_base(value: Any) -> bool:
+    sanitized = _sanitize_session_history_api_base(value)
+    if not sanitized:
+        return False
+
+    try:
+        hostname = urlsplit(sanitized).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+
+    hostname_lower = hostname.lower()
+    if hostname_lower in {"localhost", "host.docker.internal"}:
+        return True
+
+    try:
+        parsed_ip = ipaddress.ip_address(hostname_lower)
+    except ValueError:
+        return False
+
+    return (
+        parsed_ip.is_loopback
+        or parsed_ip.is_private
+        or parsed_ip.is_link_local
+        or parsed_ip.is_unspecified
+    )
+
+
+def _extract_session_history_api_base(
+    kwargs: Dict[str, Any],
+    standard_logging_object: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    litellm_params = kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        litellm_params = {}
+
+    for candidate in (
+        standard_logging_object.get("api_base"),
+        _maybe_get_path(standard_logging_object, "hidden_params", "api_base"),
+        litellm_params.get("api_base"),
+        metadata.get("api_base"),
+        _maybe_get(metadata.get("hidden_params"), "api_base"),
+    ):
+        sanitized = _sanitize_session_history_api_base(candidate)
+        if sanitized:
+            return sanitized
+    return None
+
+
+def _get_session_history_model_group(
+    metadata: Dict[str, Any],
+    standard_logging_object: Dict[str, Any],
+) -> Optional[str]:
+    return _first_non_empty_string(
+        metadata.get("model_group"),
+        standard_logging_object.get("model_group"),
+    )
+
+
+def _is_completion_call_type(call_type: Any) -> bool:
+    if not isinstance(call_type, str) or not call_type.strip():
+        return False
+    return "completion" in call_type.strip().lower()
+
+
+def _apply_local_llm_route_metadata(
+    *,
+    metadata: Dict[str, Any],
+    resolved_provider: Optional[str],
+    resolved_model: str,
+    model_group: Optional[str],
+    call_type: Any,
+    api_base: Optional[str],
+) -> Tuple[Optional[str], str]:
+    if (
+        resolved_provider != "openai"
+        or not model_group
+        or not api_base
+        or not _is_completion_call_type(call_type)
+        or not _is_local_session_history_api_base(api_base)
+    ):
+        return resolved_provider, resolved_model
+
+    upstream_model = _clean_non_empty_string(resolved_model)
+    if not upstream_model or upstream_model == model_group:
+        return resolved_provider, resolved_model
+
+    metadata["aawm_local_route"] = True
+    metadata["aawm_local_route_family"] = "local_llm_chat"
+    metadata["aawm_local_model_group"] = model_group
+    metadata["aawm_local_upstream_provider"] = "openai"
+    metadata["aawm_local_upstream_model"] = upstream_model
+    metadata["aawm_local_upstream_api_base"] = api_base
+
+    return "local_llm", model_group
+
+
 def _resolve_session_history_model(
     kwargs: Dict[str, Any],
     standard_logging_object: Dict[str, Any],
@@ -7955,6 +8673,21 @@ def _build_session_history_record(
         kwargs.get("custom_llm_provider"),
         resolved_model,
         metadata,
+    )
+    model_group = _get_session_history_model_group(metadata, standard_logging_object)
+    api_base = _extract_session_history_api_base(
+        kwargs=kwargs,
+        standard_logging_object=standard_logging_object,
+        metadata=metadata,
+    )
+    provider_for_cache = resolved_provider
+    resolved_provider, resolved_model = _apply_local_llm_route_metadata(
+        metadata=metadata,
+        resolved_provider=resolved_provider,
+        resolved_model=resolved_model,
+        model_group=model_group,
+        call_type=kwargs.get("call_type") or standard_logging_object.get("call_type"),
+        api_base=api_base,
     )
 
     message = _extract_first_response_message(result)
@@ -8112,7 +8845,7 @@ def _build_session_history_record(
     )
 
     provider_cache_state = _resolve_provider_cache_state(
-        provider=resolved_provider,
+        provider=provider_for_cache,
         model=resolved_model,
         usage_obj=usage_obj,
         metadata=metadata,
@@ -8131,6 +8864,7 @@ def _build_session_history_record(
                 usage_obj=usage_obj,
                 cache_state=provider_cache_state,
                 metadata=metadata,
+                response_cost_usd=response_cost_usd,
             )
         )
 
@@ -8147,7 +8881,7 @@ def _build_session_history_record(
         "provider_response_id": _maybe_get(result, "id"),
         "provider": resolved_provider,
         "model": resolved_model,
-        "model_group": metadata.get("model_group") or standard_logging_object.get("model_group"),
+        "model_group": model_group,
         "agent_name": agent_name,
         "tenant_id": tenant_id,
         "repository": repository,
@@ -8348,6 +9082,15 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("system_safety_tokens_estimated", 0),
         record.get("system_instructional_tokens_estimated", 0),
         record.get("system_unclassified_tokens_estimated", 0),
+        record.get("litellm_processing_ms"),
+        record.get("llm_upstream_elapsed_ms"),
+        record.get("total_server_elapsed_ms"),
+        record.get("ttft_ms"),
+        record.get("litellm_pre_send_ms"),
+        record.get("litellm_post_response_ms"),
+        record.get("llm_upstream_time_to_first_byte_ms"),
+        record.get("llm_upstream_stream_ms"),
+        record.get("latency_unclassified_ms"),
     )
 
 
