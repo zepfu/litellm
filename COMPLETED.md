@@ -1,5 +1,51 @@
 # Completed
 
+## 2026-05-08
+
+- Prepared the session-history telemetry overlay release for prod without
+  restarting `:4000`.
+  The release scope was callback/harness/backfill only, so no new base fork
+  image was cut; the release runbook and `WHEEL.md` say callback-only behavior
+  should ship through the overlay wheel while production keeps the pinned base
+  image.
+
+  LiteLLM repo evidence:
+  committed and pushed `Prepare AAWM session history telemetry overlays`
+  (`3cdf6fb237`) to `main` and `develop`; the main artifact autobump advanced
+  to `cb-v0.0.18` and `h-v0.0.28` on commit `3fbaa81cb0`, and `develop` was
+  fast-forwarded to match. Because GitHub workflow-created tags did not publish
+  release assets, the missing GitHub Releases were created manually with:
+  `aawm_litellm_callbacks-0.0.18-py3-none-any.whl` and
+  `litellm-local-ci-harness-0.0.28.tar.gz`. `cb-latest` and `h-latest` were
+  moved to their matching versioned tags.
+
+  Validation before publishing:
+  `py_compile` passed for the callback, callback wheel source,
+  provider-cache repair script, latency backfill script, and adapter harness;
+  focused Ruff passed with the existing local ignores `PLR0915,T201`;
+  `git diff --check` passed; callback source and wheel source matched by
+  `cmp -s`.
+
+  Infrastructure evidence:
+  `/home/zepfu/projects/aawm-infrastructure` was left with no file changes
+  because the existing config already floats the latest released callback
+  overlay and pins the intended base image
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.43`. A no-cache prod image rebuild was
+  completed with `docker compose -f docker-compose.litellm.yml build --pull
+  --no-cache litellm`. Build logs showed
+  `aawm-litellm-callbacks==0.0.18`,
+  `aawm-litellm-control-plane==0.0.6`, and
+  `litellm==1.82.3+aawm.43`. Direct image inspection confirmed the same
+  package versions and confirmed the callback contains the nine new
+  `public.session_history` latency fields.
+
+  Current runtime status:
+  the running `aawm-litellm` container on `127.0.0.1:4000` was not restarted
+  or recreated during prep. It remains healthy and still reports
+  `aawm-litellm-callbacks=0.0.17`, so the pause-point action must recreate the
+  container from the already-built local `aawm-litellm:latest` image before
+  running prod backfills.
+
 ## 2026-05-05
 
 - Removed hard-coded "current release" version lines from reusable release

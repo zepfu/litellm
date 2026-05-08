@@ -48,6 +48,21 @@ these docs only as needed:
 
 ## Validated Context
 
+- Prod release prep for the session-history telemetry overlay is complete, but
+  the `:4000` runtime has not been restarted/recreated. GitHub Releases
+  `cb-v0.0.18` and `h-v0.0.28` exist with assets, `cb-latest` and `h-latest`
+  point at those tags, and `/home/zepfu/projects/aawm-infrastructure` has a
+  freshly built local `aawm-litellm:latest` image based on
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.43` with
+  `aawm-litellm-callbacks=0.0.18` and
+  `aawm-litellm-control-plane=0.0.6`. The running `aawm-litellm` container is
+  still healthy on `:4000` with callback `0.0.17`. At the pause point, recreate
+  the prod container from the already-built image, then rerun the pending prod
+  `public.session_history` backfills for D1-075 local LLM attribution, D1-076
+  provider-cache miss token/cost fields, and D1-078 latency breakdown columns.
+  Verify the exact target database and confirm stale old-attribution,
+  cache-miss-null, and derivable latency-null counts after backfill.
+
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
   Gemini through dev `:4001`. GPT-5.5 passed at
   `/tmp/claude_adapter_gpt55_child_sequential_core_tools_unique.json`; Gemini
