@@ -288,7 +288,7 @@
           "client_name": "codex_exec",
           "prompt_overhead_breakdown_source": "request_body_estimate",
           "prompt_overhead_counted_shape": "openai_responses",
-          "prompt_overhead_classifier_version": "deterministic-v1"
+          "prompt_overhead_classifier_version": "deterministic-v2"
         },
         "metadata_required_truthy": [
           "request_tags",
