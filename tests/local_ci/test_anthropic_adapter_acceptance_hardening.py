@@ -823,7 +823,7 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
     ] == "openai_responses"
     assert session_history_validation["metadata_required_equals"][
         "prompt_overhead_classifier_version"
-    ] == "deterministic-v1"
+    ] == "deterministic-v2"
     for metadata_key in (
         "prompt_overhead_component_paths",
         "usage_input_system_tokens_estimated",

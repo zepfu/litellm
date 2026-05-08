@@ -3253,6 +3253,7 @@ def _new_prompt_overhead_group(
         'input_conversation_tokens_estimated': 0,
         'input_other_tokens_estimated': 0,
         'input_breakdown_residual_tokens': 0,
+        'input_opaque_state_tokens_estimated': 0,
         'system_behavior_tokens_estimated': 0,
         'system_safety_tokens_estimated': 0,
         'system_instructional_tokens_estimated': 0,
@@ -3336,6 +3337,9 @@ def _add_prompt_overhead_row(
 
     group['explicit_prompt_overhead_tokens_estimated'] += explicit_overhead_tokens
     group['prompt_overhead_plus_other_tokens_estimated'] += overhead_plus_other_tokens
+    group['input_opaque_state_tokens_estimated'] += _prompt_report_int(
+        metadata.get('usage_input_opaque_state_tokens_estimated')
+    )
     if input_tokens > 0 and has_breakdown:
         group['explicit_prompt_overhead_cost_usd_estimated'] += (
             response_cost_usd * explicit_overhead_tokens / input_tokens
@@ -3363,6 +3367,10 @@ def _finalize_prompt_overhead_group(group: dict[str, Any]) -> dict[str, Any]:
     )
     finalized['prompt_overhead_plus_other_input_share'] = _ratio(
         finalized['prompt_overhead_plus_other_tokens_estimated'],
+        finalized['input_tokens_with_breakdown'],
+    )
+    finalized['opaque_state_to_input_token_ratio'] = _ratio(
+        finalized['input_opaque_state_tokens_estimated'],
         finalized['input_tokens_with_breakdown'],
     )
     for key in (
@@ -3419,7 +3427,9 @@ def _build_prompt_overhead_cost_share_report(
     return {
         'cost_allocation_basis': (
             'estimated from response_cost_usd weighted by each row prompt-overhead '
-            'input-token share; session_history does not yet store exact input cost'
+            'input-token share; session_history does not yet store exact input cost; '
+            'opaque response-state tokens are reported separately and not allocated '
+            'as prompt-overhead cost'
         ),
         'group_by': [
             'case_name',
