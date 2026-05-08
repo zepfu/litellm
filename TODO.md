@@ -48,20 +48,24 @@ these docs only as needed:
 
 ## Validated Context
 
-- Prod release prep for the session-history telemetry overlay is complete, but
-  the `:4000` runtime has not been restarted/recreated. GitHub Releases
-  `cb-v0.0.18` and `h-v0.0.28` exist with assets, `cb-latest` and `h-latest`
-  point at those tags, and `/home/zepfu/projects/aawm-infrastructure` has a
-  freshly built local `aawm-litellm:latest` image based on
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.43` with
-  `aawm-litellm-callbacks=0.0.18` and
-  `aawm-litellm-control-plane=0.0.6`. The running `aawm-litellm` container is
-  still healthy on `:4000` with callback `0.0.17`. At the pause point, recreate
-  the prod container from the already-built image, then rerun the pending prod
-  `public.session_history` backfills for D1-075 local LLM attribution, D1-076
-  provider-cache miss token/cost fields, and D1-078 latency breakdown columns.
-  Verify the exact target database and confirm stale old-attribution,
-  cache-miss-null, and derivable latency-null counts after backfill.
+- Prod release for the session-history telemetry overlay is complete on
+  `:4000`. GitHub Releases `cb-v0.0.18` and `h-v0.0.28` exist with assets,
+  `cb-latest` and `h-latest` point at those tags, and
+  `/home/zepfu/projects/aawm-infrastructure` has a rebuilt local
+  `aawm-litellm:latest` image based on
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.43`. The running `aawm-litellm` container
+  was recreated from that image and is healthy on `127.0.0.1:4000` with
+  `litellm=1.82.3+aawm.43`, `aawm-litellm-callbacks=0.0.18`, and
+  `aawm-litellm-control-plane=0.0.6`. Prod `public.session_history` backfills
+  ran against exact database `aawm_tristore`; final aggregate verification is
+  `stale_local=0`, `cache_miss_null_tokens=0`, `cache_miss_null_cost=4`, and
+  `derivable_latency_null=0`. The four cost-null rows are known NVIDIA
+  `qwen/qwen3-coder-480b-a35b-instruct` rows with token counts present but no
+  response cost or bundled NVIDIA pricing to derive a miss cost from. Prod local
+  LLM smoke session `prod-local-llm-release-20260508` wrote
+  `session_history` row `206279` with `provider=local_llm`,
+  `model=qwen3-heretic-gguf`, `litellm_environment=prod`, and
+  `total_server_elapsed_ms=791.361`.
 
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
   Gemini through dev `:4001`. GPT-5.5 passed at
@@ -140,14 +144,12 @@ these docs only as needed:
   OpenAI/Gemini/NVIDIA/OpenRouter and for a later exact input-cost field if the
   proportional `response_cost_usd` estimate is not enough.
 
-- Prod `:4000` is on `v1.82.3-aawm.42`; detailed cutover, smoke, and harness
-  evidence lives in [COMPLETED.md](COMPLETED.md). The current release-prep
-  candidate is `1.82.3+aawm.43` for provider-originated rate-limit observations
-  and the local `qwen3-heretic-gguf` chat route. Before prod promotion, push the
-  source candidate to `main`, wait for the expected callback overlay autobump
-  and release (`cb-v0.0.17` from current `0.0.16`), then tag/publish the fork
-  image from the post-autobump main head and update `aawm-infrastructure` image
-  pins.
+- Prod `:4000` is on `v1.82.3-aawm.43` with callback overlay `0.0.18`;
+  detailed cutover, smoke, and backfill evidence lives in
+  [COMPLETED.md](COMPLETED.md). No prod restart/backfill is currently pending
+  for D1-075/D1-076/D1-077/D1-078. Next useful release follow-up is optional
+  focused/default prod harness validation and normal monitoring of new prod
+  Codex Responses prompt-overhead rows after the callback cutover.
 
 - OpenRouter `inclusionai/ling-2.6-flash:free` is no longer a viable release
   gate or active target path. The focused dev rerun at
