@@ -2,6 +2,45 @@
 
 ## 2026-05-08
 
+- Promoted the prepared session-history telemetry overlay to prod `:4000`.
+  The running `aawm-litellm` container was recreated from the already-built
+  local `aawm-litellm:latest` image in
+  `/home/zepfu/projects/aawm-infrastructure` with
+  `docker compose -f docker-compose.litellm.yml up -d --no-build --force-recreate --no-deps litellm`.
+
+  Runtime evidence:
+  `/health/readiness` returned `status=healthy`,
+  `litellm_version=1.82.3+aawm.43`, and success callbacks including
+  `AawmAgentIdentity`; `/health/liveliness` returned `"I'm alive!"`. Package
+  inspection inside the running container reported
+  `litellm=1.82.3+aawm.43`, `aawm-litellm-callbacks=0.0.18`, and
+  `aawm-litellm-control-plane=0.0.6`.
+
+  Backfill evidence:
+  targeted provider-cache repair against exact database `aawm_tristore` scanned
+  `8` missing-field cache-miss rows and repaired `4`. Latency backfill against
+  exact database `aawm_tristore` dry-ran with `changed_rows=967`,
+  `derivable_rows=99619`, then applied `updated_rows=967`. Final aggregate
+  verification returned `aawm_tristore|0|0|4|0` for
+  `current_database|stale_local|cache_miss_null_tokens|cache_miss_null_cost|derivable_latency_null`.
+  The four remaining cost-null rows are known NVIDIA
+  `qwen/qwen3-coder-480b-a35b-instruct` rows with cache-miss token counts
+  present but no response cost or bundled NVIDIA pricing available to derive a
+  miss cost.
+
+  Smoke evidence:
+  prod local LLM smoke session `prod-local-llm-release-20260508` returned `OK`
+  and wrote `public.session_history` row `206279` with `provider=local_llm`,
+  `model=qwen3-heretic-gguf`, `model_group=qwen3-heretic-gguf`,
+  `litellm_environment=prod`, `litellm_version=1.82.3+aawm.43`,
+  `client_name=curl`, `tenant_id=tenant-local-prod-validation`,
+  `total_server_elapsed_ms=791.361`,
+  `metadata.aawm_local_route_family=local_llm_chat`,
+  `metadata.aawm_local_upstream_model=qwen3-4b-heretic-q8`, and
+  `metadata.aawm_local_upstream_api_base=http://host.docker.internal:8093/v1`.
+  Detailed upstream split fields are expectedly null on this non-pass-through
+  local route.
+
 - Prepared the session-history telemetry overlay release for prod without
   restarting `:4000`.
   The release scope was callback/harness/backfill only, so no new base fork
@@ -39,12 +78,11 @@
   package versions and confirmed the callback contains the nine new
   `public.session_history` latency fields.
 
-  Current runtime status:
+  Prep-time runtime status:
   the running `aawm-litellm` container on `127.0.0.1:4000` was not restarted
-  or recreated during prep. It remains healthy and still reports
-  `aawm-litellm-callbacks=0.0.17`, so the pause-point action must recreate the
-  container from the already-built local `aawm-litellm:latest` image before
-  running prod backfills.
+  or recreated during prep. It remained healthy and still reported
+  `aawm-litellm-callbacks=0.0.17`. The later 2026-05-08 cutover entry above
+  records the completed recreate and prod backfills.
 
 ## 2026-05-05
 
