@@ -3500,6 +3500,20 @@ def _normalize_codex_openai_chat_kwargs_for_google_code_assist(
     }
 
 
+def _normalize_codex_google_code_assist_reasoning_effort(
+    mappable_params: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    reasoning_effort = mappable_params.get("reasoning_effort")
+    if reasoning_effort != "xhigh":
+        return mappable_params, {}
+    updated_params = dict(mappable_params)
+    updated_params["reasoning_effort"] = "high"
+    return updated_params, {
+        "google_adapter_codex_reasoning_effort_normalized_from": "xhigh",
+        "google_adapter_codex_reasoning_effort_normalized_to": "high",
+    }
+
+
 def _remember_codex_google_code_assist_tool_call_name(
     tool_call_id: Any,
     function_name: Any,
@@ -3839,6 +3853,10 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         }
         and value is not None
     }
+    (
+        mappable_params,
+        reasoning_effort_policy_changes,
+    ) = _normalize_codex_google_code_assist_reasoning_effort(mappable_params)
     gemini_optional_params = litellm.GoogleAIStudioGeminiConfig().map_openai_params(
         non_default_params=mappable_params,
         optional_params={},
@@ -3902,6 +3920,7 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         **completion_message_window_changes,
         **openai_chat_shape_changes,
         **codex_tool_pair_changes,
+        **reasoning_effort_policy_changes,
         **native_tool_alias_changes,
         **duplicate_tool_response_changes,
         **system_prompt_policy_changes,

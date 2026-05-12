@@ -58,6 +58,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
     _handle_anthropic_nvidia_completion_adapter_route,
     _handle_codex_google_code_assist_adapter_route,
+    _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
     _perform_openrouter_adapter_pass_through_request,
     _perform_openrouter_completion_adapter_operation,
@@ -4230,6 +4231,18 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert completion_kwargs["messages"][1]["role"] == "user"
         assert completion_kwargs["tools"][0]["function"]["name"] == "exec_command"
         assert "input" not in completion_kwargs
+
+    def test_codex_google_code_assist_normalizes_xhigh_reasoning_effort(self):
+        updated_params, changes = _normalize_codex_google_code_assist_reasoning_effort(
+            {"reasoning_effort": "xhigh", "max_tokens": 64}
+        )
+
+        assert updated_params["reasoning_effort"] == "high"
+        assert updated_params["max_tokens"] == 64
+        assert changes == {
+            "google_adapter_codex_reasoning_effort_normalized_from": "xhigh",
+            "google_adapter_codex_reasoning_effort_normalized_to": "high",
+        }
 
     @pytest.mark.asyncio
     async def test_codex_google_code_assist_builder_accepts_openai_chat_tool_choice(
