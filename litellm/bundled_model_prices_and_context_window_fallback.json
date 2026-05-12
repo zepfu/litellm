@@ -16384,6 +16384,9 @@
         "supports_parallel_function_calling": true,
         "supports_reasoning_summary": false,
         "supports_response_schema": true,
+        "unsupported_hosted_tools": [
+            "image_generation"
+        ],
         "supports_vision": true
     },
     "chatgpt/gpt-5.3-instant": {
@@ -37749,6 +37752,9 @@
         "supports_parallel_function_calling": true,
         "supports_reasoning_summary": false,
         "supports_response_schema": true,
+        "unsupported_hosted_tools": [
+            "image_generation"
+        ],
         "supports_vision": true
     },
     "inclusionai/ling-2.6-flash:free": {

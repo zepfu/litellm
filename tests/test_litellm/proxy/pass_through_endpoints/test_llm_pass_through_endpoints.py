@@ -24,6 +24,7 @@ import litellm
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     RouteChecks,
+    _drop_unsupported_codex_hosted_tools_from_request_body,
     _apply_codex_tool_description_patches_to_request_body,
     _apply_google_adapter_completion_message_window,
     _apply_google_adapter_request_shape_policy,
@@ -7449,6 +7450,81 @@ class TestClaudePersistedOutputExpansion:
         )
 
     @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_preserves_claude_code_agent_tool_description(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        agent_description = (
+            "Launch a new agent to handle complex, multi-step tasks. "
+            "Each agent type has specific capabilities and tools available to it. "
+            "Available agent types and the tools they have access to: "
+            + "analyst: Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch. "
+            * 20
+            + "END-OF-AGENT-DESCRIPTION"
+        )
+        long_schema_description = "Optional model override. " + ("Details. " * 40)
+        request_body = {
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.113.50e; cc_entrypoint=cli; cch=42aab;",
+                }
+            ],
+            "tools": [
+                {
+                    "name": "Agent",
+                    "description": agent_description,
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "description": "A short description of the task",
+                                "type": "string",
+                            },
+                            "prompt": {
+                                "description": "The task for the agent to perform",
+                                "type": "string",
+                            },
+                            "model": {
+                                "description": long_schema_description,
+                                "type": "string",
+                                "enum": ["sonnet", "opus", "haiku"],
+                            },
+                        },
+                        "required": ["description", "prompt"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+            mock_request, request_body
+        )
+
+        agent_tool = updated_body["tools"][0]
+        assert len(agent_tool["description"]) > 360
+        assert agent_tool["description"] == agent_description
+        assert "$schema" not in agent_tool["input_schema"]
+        compacted_model_description = agent_tool["input_schema"]["properties"][
+            "model"
+        ]["description"]
+        assert len(compacted_model_description) < len(long_schema_description)
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert "claude-tool-advertisement-compaction" in litellm_metadata["tags"]
+        assert litellm_metadata[
+            "claude_tool_advertisement_compaction_tool_names"
+        ] == ["Agent"]
+        event = litellm_metadata["claude_tool_advertisement_compaction_events"][0]
+        assert event["top_level_description_compacted"] is False
+        assert event["schema_dropped_key_count"] == 1
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_skips_tool_compaction_without_cc_version(
         self,
     ):
@@ -9480,6 +9556,70 @@ def test_codex_spawn_agent_tool_description_patch_ignores_other_tools():
     assert "litellm_metadata" not in updated_body
 
 
+def test_codex_spark_unsupported_image_generation_tool_is_removed():
+    request_body = {
+        "model": "gpt-5.3-codex-spark",
+        "tools": [
+            {"type": "image_generation", "partial_images": 2},
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a local file.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "tool_choice": {"type": "image_generation"},
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+
+    updated_body, removed_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
+    )
+
+    assert removed_tools == [{"type": "image_generation", "index": 0}]
+    assert updated_body["tools"] == [request_body["tools"][1]]
+    assert "tool_choice" not in updated_body
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert "existing-tag" in litellm_metadata["tags"]
+    assert "codex-unsupported-hosted-tool-removed" in litellm_metadata["tags"]
+    assert (
+        "codex-unsupported-hosted-tool:image_generation"
+        in litellm_metadata["tags"]
+    )
+    assert (
+        "codex-unsupported-hosted-tool-choice-removed"
+        in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["codex_unsupported_hosted_tool_removed_count"] == 1
+    assert litellm_metadata["codex_unsupported_hosted_tool_types_removed"] == [
+        "image_generation"
+    ]
+    assert litellm_metadata["codex_unsupported_hosted_tools_removed"] == [
+        {"type": "image_generation", "index": 0}
+    ]
+    assert litellm_metadata["codex_unsupported_hosted_tool_choice_removed"] == {
+        "type": "image_generation"
+    }
+    assert litellm_metadata["langfuse_spans"][0]["name"] == (
+        "codex.unsupported_hosted_tool_removed"
+    )
+
+
+def test_codex_non_spark_keeps_image_generation_tool():
+    request_body = {
+        "model": "gpt-5.3-codex",
+        "tools": [{"type": "image_generation"}],
+    }
+
+    updated_body, removed_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
+    )
+
+    assert updated_body is request_body
+    assert removed_tools == []
+    assert updated_body["tools"] == [{"type": "image_generation"}]
+
+
 @pytest.mark.asyncio
 async def test_openai_passthrough_route_sets_repository_trace_environment_and_session(
     monkeypatch,
@@ -9535,6 +9675,77 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     assert litellm_metadata["repository"] == "zepfu/litellm"
     assert litellm_metadata["passthrough_route_family"] == "codex_responses"
     assert "route:codex_responses" in litellm_metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_codex_spark_drops_image_generation_tool(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = {
+        "session_id": "codex-session-123",
+        "user-agent": "codex-cli/1.0",
+    }
+    mock_request.query_params = {}
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(
+            return_value={
+                "model": "gpt-5.3-codex-spark",
+                "input": "hello",
+                "tools": [
+                    {"type": "image_generation"},
+                    {
+                        "type": "function",
+                        "name": "read_file",
+                        "description": "Read a local file.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                ],
+            }
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=AsyncMock(return_value={"ok": True}),
+    ):
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://api.openai.com",
+            api_key="test_api_key",
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        )
+
+    assert result == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    prepared_body = mock_set_parsed_body.call_args.args[1]
+    assert prepared_body["tools"] == [
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a local file.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    litellm_metadata = prepared_body["litellm_metadata"]
+    assert litellm_metadata["passthrough_route_family"] == "codex_responses"
+    assert litellm_metadata["codex_unsupported_hosted_tool_removed_count"] == 1
+    assert litellm_metadata["codex_unsupported_hosted_tool_types_removed"] == [
+        "image_generation"
+    ]
+    assert "codex-unsupported-hosted-tool:image_generation" in litellm_metadata[
+        "tags"
+    ]
 
 
 @pytest.mark.asyncio
@@ -9787,7 +9998,8 @@ async def test_openai_passthrough_generic_responses_does_not_patch_spawn_agent_t
                         "name": "spawn_agent",
                         "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
                         "parameters": {"type": "object", "properties": {}},
-                    }
+                    },
+                    {"type": "image_generation"},
                 ],
             }
         ),
@@ -9821,6 +10033,7 @@ async def test_openai_passthrough_generic_responses_does_not_patch_spawn_agent_t
         "Only use `spawn_agent` if and only if"
         in prepared_body["tools"][0]["description"]
     )
+    assert prepared_body["tools"][1] == {"type": "image_generation"}
 
 
 class TestVertexAIPassThroughHandler:

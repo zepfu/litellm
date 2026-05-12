@@ -54,6 +54,7 @@ _CLAUDE_COMMONMARK_PROMPT_IDENTIFIER_TEMPLATE = (
 _CLAUDE_TOOL_DESCRIPTION_MAX_CHARS = 360
 _CLAUDE_TOOL_SCHEMA_DESCRIPTION_MAX_CHARS = 160
 _CLAUDE_TOOL_SCHEMA_DROP_KEYS = {"$schema"}
+_CLAUDE_TOOL_DESCRIPTION_PRESERVE_NAMES = {"Agent"}
 _CLAUDE_KNOWN_TOOL_DESCRIPTIONS = {
     "Bash": (
         "Run a shell command. Prefer dedicated tools for search/read/edit/write. "
@@ -791,7 +792,10 @@ def _compact_claude_tool_advertisement(
     schema_dropped_key_count = 0
 
     description = tool.get("description")
-    if isinstance(description, str):
+    if (
+        isinstance(description, str)
+        and tool_name not in _CLAUDE_TOOL_DESCRIPTION_PRESERVE_NAMES
+    ):
         known_description = _CLAUDE_KNOWN_TOOL_DESCRIPTIONS.get(tool_name)
         compacted_description = (
             known_description

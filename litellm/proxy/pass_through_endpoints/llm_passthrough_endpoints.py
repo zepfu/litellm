@@ -19,6 +19,8 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from functools import lru_cache
+from importlib.resources import files
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional, Tuple, Union, cast
 from urllib.parse import quote, urlencode, urlparse
@@ -510,6 +512,7 @@ _openrouter_adapter_rate_limit_until_monotonic_by_key: dict[str, float] = {}
 _openrouter_adapter_failure_circuit_until_monotonic_by_key: dict[str, float] = {}
 _CODEX_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID = "spawn-agent-fanout-policy"
+_CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD = "unsupported_hosted_tools"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
     "on the critical path. Do not duplicate the same task across agents.\n\n"
@@ -8546,6 +8549,215 @@ def _get_openai_tool_name(tool: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _get_openai_tool_type(tool: dict[str, Any]) -> Optional[str]:
+    tool_type = tool.get("type")
+    if isinstance(tool_type, str) and tool_type.strip():
+        return tool_type.strip()
+    return None
+
+
+@lru_cache(maxsize=1)
+def _load_bundled_model_cost_map_for_codex_tool_policy() -> dict[str, Any]:
+    try:
+        content = files("litellm").joinpath(
+            "bundled_model_prices_and_context_window_fallback.json"
+        ).read_text(encoding="utf-8")
+        loaded = json.loads(content)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:
+        return {}
+    return {}
+
+
+def _get_codex_tool_policy_model_cost_candidates(model: Any) -> list[str]:
+    if not isinstance(model, str) or not model.strip():
+        return []
+
+    model_name = model.strip()
+    split_model_name = model_name.split("/", 1)[1] if "/" in model_name else model_name
+    candidates = [
+        model_name,
+        model_name.lower(),
+        split_model_name,
+        split_model_name.lower(),
+        f"chatgpt/{split_model_name}",
+        f"chatgpt/{split_model_name.lower()}",
+        f"openai/{split_model_name}",
+        f"openai/{split_model_name.lower()}",
+    ]
+
+    unique_candidates: list[str] = []
+    for candidate in candidates:
+        if candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _get_unsupported_hosted_tool_types_for_model(model: Any) -> set[str]:
+    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
+    if not candidate_model_cost_keys:
+        return set()
+
+    model_cost_sources = [
+        litellm.model_cost,
+        _load_bundled_model_cost_map_for_codex_tool_policy(),
+    ]
+    for model_cost in model_cost_sources:
+        for key in candidate_model_cost_keys:
+            model_info = model_cost.get(key)
+            if not isinstance(model_info, dict):
+                continue
+
+            unsupported_tools = model_info.get(
+                _CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD
+            )
+            if not isinstance(unsupported_tools, list):
+                continue
+
+            return {
+                normalized
+                for value in unsupported_tools
+                if (normalized := _normalize_low_cardinality_tag_value(value))
+            }
+
+    return set()
+
+
+def _openai_tool_choice_references_tool_type(
+    tool_choice: Any,
+    tool_types: set[str],
+) -> bool:
+    if not tool_types:
+        return False
+
+    candidates: list[Any] = []
+    if isinstance(tool_choice, str):
+        candidates.append(tool_choice)
+    elif isinstance(tool_choice, dict):
+        candidates.extend([tool_choice.get("type"), tool_choice.get("name")])
+        function = tool_choice.get("function")
+        if isinstance(function, dict):
+            candidates.append(function.get("name"))
+
+    for candidate in candidates:
+        normalized = _normalize_low_cardinality_tag_value(candidate)
+        if normalized in tool_types:
+            return True
+    return False
+
+
+def _add_codex_unsupported_hosted_tool_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    removed_tools: list[dict[str, Any]],
+    removed_tool_choice: Optional[Any],
+) -> dict[str, Any]:
+    removed_tool_types = _dedupe_sorted_str_list(
+        [
+            tool["type"]
+            for tool in removed_tools
+            if isinstance(tool.get("type"), str) and tool["type"]
+        ]
+    )
+    span_metadata: dict[str, Any] = {
+        "removed_count": len(removed_tools),
+        "removed_tool_types": removed_tool_types,
+    }
+    if removed_tool_choice is not None:
+        span_metadata["removed_tool_choice"] = removed_tool_choice
+
+    tags_to_add = ["codex-unsupported-hosted-tool-removed"]
+    tags_to_add.extend(
+        f"codex-unsupported-hosted-tool:{tool_type}"
+        for tool_type in removed_tool_types
+    )
+    if removed_tool_choice is not None:
+        tags_to_add.append("codex-unsupported-hosted-tool-choice-removed")
+
+    extra_fields: dict[str, Any] = {
+        "codex_unsupported_hosted_tool_removed_count": len(removed_tools),
+        "codex_unsupported_hosted_tool_types_removed": removed_tool_types,
+        "codex_unsupported_hosted_tools_removed": removed_tools,
+        "langfuse_spans": [
+            _build_langfuse_span_descriptor(
+                name="codex.unsupported_hosted_tool_removed",
+                metadata=span_metadata,
+            )
+        ],
+    }
+    if removed_tool_choice is not None:
+        extra_fields["codex_unsupported_hosted_tool_choice_removed"] = (
+            removed_tool_choice
+        )
+
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
+
+
+def _drop_unsupported_codex_hosted_tools_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    unsupported_tool_types = _get_unsupported_hosted_tool_types_for_model(
+        request_body.get("model")
+    )
+    if not unsupported_tool_types:
+        return request_body, []
+
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return request_body, []
+
+    updated_tools: list[Any] = []
+    removed_tools: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            updated_tools.append(tool)
+            continue
+
+        tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
+        if tool_type in unsupported_tool_types:
+            removed_tool: dict[str, Any] = {
+                "type": tool_type,
+                "index": index,
+            }
+            tool_name = _get_openai_tool_name(tool)
+            if tool_name:
+                removed_tool["name"] = tool_name
+            removed_tools.append(removed_tool)
+            continue
+
+        updated_tools.append(tool)
+
+    if not removed_tools:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["tools"] = updated_tools
+
+    removed_tool_types = {
+        tool["type"]
+        for tool in removed_tools
+        if isinstance(tool.get("type"), str) and tool["type"]
+    }
+    removed_tool_choice = None
+    if _openai_tool_choice_references_tool_type(
+        updated_body.get("tool_choice"),
+        removed_tool_types,
+    ):
+        removed_tool_choice = updated_body.pop("tool_choice", None)
+
+    updated_body = _add_codex_unsupported_hosted_tool_logging_metadata(
+        updated_body,
+        removed_tools=removed_tools,
+        removed_tool_choice=removed_tool_choice,
+    )
+    return updated_body, removed_tools
+
+
 def _patch_codex_spawn_agent_tool_description(
     tool: dict[str, Any],
     *,
@@ -12240,6 +12452,11 @@ class BaseOpenAIPassThroughHandler:
                 )
                 prepared_request_body, _codex_tool_description_patch_events = (
                     _apply_codex_tool_description_patches_to_request_body(
+                        prepared_request_body
+                    )
+                )
+                prepared_request_body, _codex_unsupported_hosted_tools = (
+                    _drop_unsupported_codex_hosted_tools_from_request_body(
                         prepared_request_body
                     )
                 )

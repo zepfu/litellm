@@ -91,6 +91,13 @@ async def responses_api(
     )
 
     data = await _read_request_body(request=request)
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _drop_unsupported_codex_hosted_tools_from_request_body,
+    )
+
+    data, _codex_unsupported_hosted_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(data)
+    )
 
     # Check if polling via cache should be used for this request
     from litellm.proxy.response_polling.polling_handler import (
