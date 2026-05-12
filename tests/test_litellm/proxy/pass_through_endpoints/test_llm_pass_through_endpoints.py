@@ -33,11 +33,15 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_openai_adapter_parallel_instruction_policy,
     _apply_openrouter_adapter_parallel_instruction_policy,
     _build_anthropic_responses_adapter_request_body,
+    _build_codex_google_code_assist_completion_kwargs,
+    _build_codex_streaming_response_from_google_code_assist_stream,
     _build_completion_adapter_metadata,
     _build_google_code_assist_request_from_completion_kwargs,
     _collect_responses_response_from_stream,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
+    _codex_google_code_assist_tool_call_arguments_cache,
+    _codex_google_code_assist_tool_call_name_cache,
     _get_google_adapter_rate_limit_key,
     _get_or_load_google_code_assist_project,
     _get_google_code_assist_prime_cache_key,
@@ -53,13 +57,16 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_openrouter_adapter_hidden_retry_budget_seconds,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
     _handle_anthropic_nvidia_completion_adapter_route,
+    _handle_codex_google_code_assist_adapter_route,
     _perform_google_adapter_pass_through_request,
     _perform_openrouter_adapter_pass_through_request,
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
     _resolve_google_adapter_session_id,
+    _resolve_codex_google_code_assist_adapter_model,
     _sanitize_google_code_assist_quota_for_logging,
     _set_google_adapter_cooldown,
+    _remember_codex_google_code_assist_tool_call_name,
     _wait_for_google_adapter_cooldown_if_needed,
     _expand_claude_persisted_output_in_anthropic_request_body,
     _extract_google_adapter_error_reason,
@@ -1613,6 +1620,86 @@ class TestGoogleAdapterRequestShapePolicy:
             )
             second_request, _, _, _, _, _ = await _build_google_code_assist_request_from_completion_kwargs(
                 completion_kwargs={"max_tokens": 32, "messages": [{"role": "user", "content": "hi again"}]},
+                adapter_model="gemini-3-flash-preview",
+                project="test-project",
+                request=mock_request,
+            )
+
+        assert first_request["request"]["session_id"] == second_request["request"]["session_id"]
+        assert first_request["user_prompt_id"] != second_request["user_prompt_id"]
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_builder_derives_followup_user_prompt_id_from_tool_result(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "header-session-abc"}
+
+        with patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs",
+            side_effect=[
+                ({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 32}, {}),
+                ({
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Bash",
+                                        "arguments": '{"command": "date -u"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "Mon Apr 20 00:00:00 UTC 2026",
+                        },
+                    ],
+                    "max_tokens": 32,
+                }, {}),
+            ],
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.GoogleAIStudioGeminiConfig.map_openai_params",
+            return_value={},
+        ), patch(
+            "litellm.llms.vertex_ai.gemini.transformation._transform_request_body",
+            return_value={},
+        ):
+            first_request, _, _, _, _, _ = await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={"max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]},
+                adapter_model="gemini-3-flash-preview",
+                project="test-project",
+                request=mock_request,
+            )
+            second_request, _, _, _, _, _ = await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={
+                    "max_tokens": 32,
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Bash",
+                                        "arguments": '{"command": "date -u"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "Mon Apr 20 00:00:00 UTC 2026",
+                        },
+                    ],
+                },
                 adapter_model="gemini-3-flash-preview",
                 project="test-project",
                 request=mock_request,
@@ -4054,6 +4141,468 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "remainingRequests": 1499,
             "totalRequests": 1500,
             "source": "google_retrieve_user_quota",
+        }
+
+    def test_resolve_codex_google_code_assist_adapter_model(self):
+        assert (
+            _resolve_codex_google_code_assist_adapter_model(
+                {"model": "gemini-3.1-pro-preview"},
+                endpoint="/v1/responses",
+            )
+            == "gemini-3.1-pro-preview"
+        )
+        assert (
+            _resolve_codex_google_code_assist_adapter_model(
+                {"model": "google/gemini-3.1"},
+                endpoint="/responses",
+            )
+            == "gemini-3.1-pro-preview"
+        )
+        assert (
+            _resolve_codex_google_code_assist_adapter_model(
+                {"model": "codex-gemini-3.1-flash-lite"},
+                endpoint="/v1/responses",
+            )
+            == "gemini-3.1-flash-lite-preview"
+        )
+        assert (
+            _resolve_codex_google_code_assist_adapter_model(
+                {"model": "openrouter/google/gemini-3.1-pro-preview"},
+                endpoint="/v1/responses",
+            )
+            is None
+        )
+        assert (
+            _resolve_codex_google_code_assist_adapter_model(
+                {"model": "gemini-3.1-pro-preview"},
+                endpoint="/v1/chat/completions",
+            )
+            is None
+        )
+
+    def test_codex_google_code_assist_completion_kwargs_stay_chat_shaped(self):
+        completion_kwargs, request_input, responses_request = (
+            _build_codex_google_code_assist_completion_kwargs(
+                {
+                    "model": "gemini-3.1-pro-preview",
+                    "instructions": "You are Codex.",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "write a tiny patch",
+                                }
+                            ],
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "exec_command",
+                            "description": "run a command",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"cmd": {"type": "string"}},
+                            },
+                        }
+                    ],
+                    "max_output_tokens": 123,
+                    "stream": True,
+                    "previous_response_id": "resp_previous",
+                    "litellm_metadata": {
+                        "passthrough_route_family": "codex_responses"
+                    },
+                },
+                adapter_model="gemini-3.1-pro-preview",
+            )
+        )
+
+        assert request_input[0]["type"] == "message"
+        assert responses_request["previous_response_id"] == "resp_previous"
+        assert completion_kwargs["model"] == "gemini-3.1-pro-preview"
+        assert completion_kwargs["custom_llm_provider"] == "gemini"
+        assert completion_kwargs["max_tokens"] == 123
+        assert completion_kwargs["stream"] is True
+        assert completion_kwargs["messages"][0]["role"] == "system"
+        assert completion_kwargs["messages"][1]["role"] == "user"
+        assert completion_kwargs["tools"][0]["function"]["name"] == "exec_command"
+        assert "input" not in completion_kwargs
+
+    @pytest.mark.asyncio
+    async def test_codex_google_code_assist_builder_accepts_openai_chat_tool_choice(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-openai-chat-session"}
+
+        wrapped_request, tool_name_mapping, completion_messages, _, _, changes = (
+            await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={
+                    "model": "gemini-3.1-pro-preview",
+                    "messages": [
+                        {
+                            "role": "developer",
+                            "content": [
+                                {"type": "text", "text": "You are Codex."}
+                            ],
+                        },
+                        {"role": "user", "content": "run a command"},
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "description": "run a command",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"cmd": {"type": "string"}},
+                                    "required": ["cmd"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "auto",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "metadata": {
+                        "passthrough_route_family": (
+                            "codex_google_code_assist_adapter"
+                        )
+                    },
+                },
+                adapter_model="gemini-3.1-pro-preview",
+                project="project_123",
+                request=mock_request,
+                completion_kwargs_are_openai_chat=True,
+            )
+        )
+
+        request_payload = wrapped_request["request"]
+        declarations = request_payload["tools"][0]["functionDeclarations"]
+        assert wrapped_request["model"] == "gemini-3.1-pro-preview"
+        assert wrapped_request["project"] == "project_123"
+        assert declarations[0]["name"] == "exec_command"
+        assert "systemInstruction" in request_payload
+        assert request_payload["contents"][0]["role"] == "user"
+        assert completion_messages[0]["role"] == "user"
+        assert tool_name_mapping == {}
+        assert (
+            changes["google_adapter_codex_developer_messages_as_system_count"]
+            == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_codex_google_code_assist_builder_repairs_cached_tool_result_pair(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-tool-followup-session"}
+        _codex_google_code_assist_tool_call_name_cache.clear()
+        _codex_google_code_assist_tool_call_arguments_cache.clear()
+        _remember_codex_google_code_assist_tool_call_name(
+            "call_exec",
+            "exec_command",
+            '{"cmd":',
+        )
+        _remember_codex_google_code_assist_tool_call_name(
+            "call_exec",
+            None,
+            '"printf codex-gemini-tool-smoke"}',
+        )
+
+        try:
+            wrapped_request, _, completion_messages, _, _, changes = (
+                await _build_google_code_assist_request_from_completion_kwargs(
+                    completion_kwargs={
+                        "model": "gemini-3.1-pro-preview",
+                        "messages": [
+                            {"role": "user", "content": "run a shell command"},
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": ""}],
+                            },
+                            {
+                                "role": "tool",
+                                "tool_call_id": "call_exec__thought__sig",
+                                "content": "codex-gemini-tool-smoke",
+                            },
+                        ],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "exec_command",
+                                    "description": "run a command",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "cmd": {"type": "string"}
+                                        },
+                                        "required": ["cmd"],
+                                    },
+                                },
+                            },
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "description": "read a file",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "path": {"type": "string"}
+                                        },
+                                        "required": ["path"],
+                                    },
+                                },
+                            },
+                        ],
+                        "tool_choice": "auto",
+                        "max_tokens": 64,
+                        "stream": True,
+                        "metadata": {
+                            "passthrough_route_family": (
+                                "codex_google_code_assist_adapter"
+                            )
+                        },
+                    },
+                    adapter_model="gemini-3.1-pro-preview",
+                    project="project_123",
+                    request=mock_request,
+                    completion_kwargs_are_openai_chat=True,
+                )
+            )
+        finally:
+            _codex_google_code_assist_tool_call_name_cache.clear()
+            _codex_google_code_assist_tool_call_arguments_cache.clear()
+
+        request_parts = [
+            part
+            for content in wrapped_request["request"]["contents"]
+            for part in content.get("parts", [])
+            if isinstance(part, dict)
+        ]
+        function_calls = [
+            part["functionCall"] for part in request_parts if "functionCall" in part
+        ]
+        function_responses = [
+            part["functionResponse"]
+            for part in request_parts
+            if "functionResponse" in part
+        ]
+
+        assert completion_messages[1]["tool_calls"] == [
+            {
+                "id": "call_exec__thought__sig",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"printf codex-gemini-tool-smoke"}',
+                },
+            }
+        ]
+        assert "content" not in completion_messages[1]
+        assert function_calls[0]["name"] == "exec_command"
+        assert function_calls[0]["args"] == {
+            "cmd": "printf codex-gemini-tool-smoke"
+        }
+        assert function_responses[0]["name"] == "exec_command"
+        assert all("text" not in part for part in request_parts[1:])
+        assert (
+            changes["google_adapter_codex_repaired_missing_tool_call_count"]
+            == 1
+        )
+        assert (
+            changes[
+                "google_adapter_codex_repaired_blank_tool_call_text_suppressed_count"
+            ]
+            == 1
+        )
+        assert changes["google_adapter_codex_repaired_missing_tool_call_names"] == [
+            "exec_command"
+        ]
+
+    def test_codex_google_code_assist_streaming_remembers_unmapped_tool_names(
+        self,
+    ):
+        async def body_iterator():
+            yield b"data: [DONE]\n\n"
+
+        adapter_request = SimpleNamespace(
+            google_model="gemini-3.1-pro-preview",
+            completion_messages=[],
+            gemini_optional_params={},
+            google_adapter_rate_limit_key="google-key",
+            tool_name_mapping={},
+            codex_request_input="run a tool",
+            responses_api_request={"stream": True},
+            litellm_metadata={
+                "passthrough_route_family": "codex_google_code_assist_adapter"
+            },
+        )
+
+        def fake_restore(completion_stream, tool_name_mapping):
+            return {
+                "completion_stream": completion_stream,
+                "tool_name_mapping": tool_name_mapping,
+            }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._restore_google_adapter_tool_call_names_stream",
+            side_effect=fake_restore,
+        ) as mock_restore, patch(
+            "litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini.ModelResponseIterator",
+            return_value="model-stream",
+        ), patch(
+            "litellm.litellm_core_utils.streaming_handler.CustomStreamWrapper",
+            side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
+        ) as mock_stream_wrapper, patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            return_value=iter(()),
+        ):
+            response = _build_codex_streaming_response_from_google_code_assist_stream(
+                response=StreamingResponse(
+                    body_iterator(),
+                    media_type="text/event-stream",
+                ),
+                adapter_request=adapter_request,
+            )
+
+        assert response.media_type == "text/event-stream"
+        mock_restore.assert_called_once_with("model-stream", {})
+        assert mock_stream_wrapper.call_args.kwargs["completion_stream"] == {
+            "completion_stream": "model-stream",
+            "tool_name_mapping": {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_codex_google_code_assist_route_uses_google_oauth_and_native_envelope(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+
+        prepared_body = {
+            "model": "gemini-3.1-pro-preview",
+            "input": "just a test msg",
+            "stream": False,
+            "litellm_metadata": {
+                "passthrough_route_family": "codex_responses",
+                "tags": ["route:codex_responses"],
+            },
+        }
+        wrapped_body = {
+            "model": "gemini-3.1-pro-preview",
+            "project": "project_123",
+            "user_prompt_id": "prompt-123",
+            "request": {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": "just a test msg"}],
+                    }
+                ],
+                "session_id": "session-123",
+            },
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
+            new=AsyncMock(return_value="ya29.test-google-token"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+            new=AsyncMock(return_value="project_123"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
+            new=AsyncMock(
+                return_value={
+                    "remainingRequests": 1499,
+                    "totalRequests": 1500,
+                    "source": "google_retrieve_user_quota",
+                }
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
+            new=AsyncMock(
+                return_value=(
+                    dict(wrapped_body),
+                    {},
+                    [{"role": "user", "content": "just a test msg"}],
+                    {},
+                    {},
+                    {},
+                )
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(
+                return_value=StreamingResponse(
+                    iter([b"data: [DONE]\n\n"]),
+                    media_type="text/event-stream",
+                )
+            ),
+        ) as mock_pass_through_request, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_model_response_from_stream",
+            new=AsyncMock(return_value=MagicMock()),
+        ), patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response",
+            return_value={"id": "resp_codex_google", "model": "gemini-3.1-pro-preview"},
+        ):
+            response = await _handle_codex_google_code_assist_adapter_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="gemini-3.1-pro-preview",
+            )
+
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["custom_headers"]["Authorization"] == (
+            "Bearer ya29.test-google-token"
+        )
+        assert call_kwargs["target"] == (
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+        )
+        assert call_kwargs["query_params"] == {"alt": "sse"}
+        assert call_kwargs["custom_llm_provider"] == "gemini"
+        assert call_kwargs["custom_body"]["model"] == "gemini-3.1-pro-preview"
+        assert call_kwargs["custom_body"]["project"] == "project_123"
+        assert call_kwargs["custom_body"]["request"] == wrapped_body["request"]
+        assert "input" not in call_kwargs["custom_body"]
+        assert "previous_response_id" not in call_kwargs["custom_body"]
+        assert "tools" not in call_kwargs["custom_body"]
+        from litellm.types.utils import all_litellm_params
+
+        assert "litellm_metadata" in all_litellm_params
+        litellm_metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "codex_google_code_assist_adapter"
+        )
+        assert "route:codex_google_code_assist_adapter" in litellm_metadata["tags"]
+        assert "codex-google-code-assist-adapter" in litellm_metadata["tags"]
+        assert json.loads(response.body.decode("utf-8")) == {
+            "id": "resp_codex_google",
+            "model": "gemini-3.1-pro-preview",
         }
 
     @pytest.mark.asyncio

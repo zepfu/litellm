@@ -310,6 +310,14 @@ _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES = (
     "gemini-3.1",
     "gemini-3-flash-preview",
 )
+_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES = (
+    "gemini-3.1",
+    "gemini-3-flash-preview",
+)
+_CODEX_GOOGLE_CODE_ASSIST_DEFAULT_MAX_TOKENS = 8192
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE = 2048
+_codex_google_code_assist_tool_call_name_cache: dict[str, str] = {}
+_codex_google_code_assist_tool_call_arguments_cache: dict[str, str] = {}
 _ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST = (
     "authorization",
     "api-key",
@@ -754,6 +762,51 @@ def _normalize_anthropic_google_completion_adapter_model_name(
     return None
 
 
+def _normalize_codex_google_code_assist_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
+    if not candidate:
+        return None
+    lowered = candidate.lower()
+    if lowered.startswith("openrouter/"):
+        return None
+    for prefix in ("google-code-assist/", "code-assist/"):
+        if lowered.startswith(prefix):
+            candidate = candidate.split("/", 1)[1]
+            lowered = candidate.lower()
+            break
+    if lowered.startswith("codex-gemini-"):
+        candidate = candidate[len("codex-") :]
+
+    explicit_provider, split_candidate = _split_anthropic_adapter_provider_prefix(
+        candidate
+    )
+    if explicit_provider not in (None, "google") or split_candidate is None:
+        return None
+    normalized_candidate = _normalize_google_completion_adapter_model_name(
+        split_candidate
+    )
+    if normalized_candidate.startswith(
+        _CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES
+    ):
+        return normalized_candidate
+    return None
+
+
+def _resolve_codex_google_code_assist_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    return _normalize_codex_google_code_assist_adapter_model_name(
+        request_body.get("model")
+    )
+
+
 def _resolve_anthropic_openai_responses_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
@@ -1144,6 +1197,24 @@ def _extract_google_adapter_latest_user_prompt_text(
     return None
 
 
+def _extract_google_adapter_latest_tool_result_fingerprint(
+    completion_messages: list[dict[str, Any]],
+) -> Optional[str]:
+    for message in reversed(completion_messages):
+        if not isinstance(message, dict) or message.get("role") not in {
+            "tool",
+            "function",
+        }:
+            continue
+        tool_call_id = message.get("tool_call_id") or message.get("name") or ""
+        text = _extract_completion_message_text(message).strip()
+        if not tool_call_id and not text:
+            continue
+        result_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+        return f"{tool_call_id}:{result_hash}"
+    return None
+
+
 def _resolve_google_adapter_session_id(
     request: Request,
     completion_messages: list[dict[str, Any]],
@@ -1203,6 +1274,16 @@ def _resolve_google_adapter_user_prompt_id(
     )
     if isinstance(trace_id, str) and trace_id:
         seed = f"user_prompt_trace_id:{trace_id}|model:{google_model}"
+        return str(uuid5(NAMESPACE_URL, seed))
+
+    latest_tool_result = _extract_google_adapter_latest_tool_result_fingerprint(
+        completion_messages
+    )
+    if isinstance(latest_tool_result, str) and latest_tool_result:
+        seed = (
+            f"user_prompt_tool_result:{latest_tool_result}|"
+            f"session_id:{session_id}|model:{google_model}"
+        )
         return str(uuid5(NAMESPACE_URL, seed))
 
     latest_user_prompt = _extract_google_adapter_latest_user_prompt_text(
@@ -3389,49 +3470,333 @@ def _apply_google_adapter_system_prompt_policy(
     return updated_kwargs, policy_metadata
 
 
+def _normalize_codex_openai_chat_kwargs_for_google_code_assist(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return completion_kwargs, {}
+
+    developer_message_count = 0
+    normalized_messages: list[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "developer":
+            updated_message = dict(message)
+            updated_message["role"] = "system"
+            normalized_messages.append(updated_message)
+            developer_message_count += 1
+        else:
+            normalized_messages.append(message)
+
+    if developer_message_count == 0:
+        return completion_kwargs, {}
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["messages"] = normalized_messages
+    return updated_kwargs, {
+        "google_adapter_codex_developer_messages_as_system_count": (
+            developer_message_count
+        )
+    }
+
+
+def _remember_codex_google_code_assist_tool_call_name(
+    tool_call_id: Any,
+    function_name: Any,
+    function_arguments: Any = None,
+) -> None:
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return
+    if not isinstance(function_name, str) or not function_name:
+        function_name = (
+            _codex_google_code_assist_tool_call_name_cache.get(tool_call_id)
+            or (
+                _codex_google_code_assist_tool_call_name_cache.get(
+                    tool_call_id.split("__thought__", 1)[0]
+                )
+                if "__thought__" in tool_call_id
+                else None
+            )
+        )
+        if not isinstance(function_name, str) or not function_name:
+            return
+    if (
+        len(_codex_google_code_assist_tool_call_name_cache)
+        >= _CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE
+    ):
+        try:
+            oldest_key = next(iter(_codex_google_code_assist_tool_call_name_cache))
+            _codex_google_code_assist_tool_call_name_cache.pop(oldest_key, None)
+            _codex_google_code_assist_tool_call_arguments_cache.pop(oldest_key, None)
+        except StopIteration:
+            pass
+    _codex_google_code_assist_tool_call_name_cache[tool_call_id] = function_name
+    normalized_arguments = _normalize_codex_google_code_assist_tool_call_arguments(
+        function_arguments
+    )
+    if normalized_arguments is None:
+        return
+    existing_arguments = _codex_google_code_assist_tool_call_arguments_cache.get(
+        tool_call_id, ""
+    )
+    if not existing_arguments:
+        _codex_google_code_assist_tool_call_arguments_cache[
+            tool_call_id
+        ] = normalized_arguments
+    elif normalized_arguments.startswith(existing_arguments):
+        _codex_google_code_assist_tool_call_arguments_cache[
+            tool_call_id
+        ] = normalized_arguments
+    elif not existing_arguments.endswith(normalized_arguments):
+        _codex_google_code_assist_tool_call_arguments_cache[
+            tool_call_id
+        ] = f"{existing_arguments}{normalized_arguments}"
+
+
+def _normalize_codex_google_code_assist_tool_call_arguments(
+    function_arguments: Any,
+) -> Optional[str]:
+    if function_arguments is None:
+        return None
+    if isinstance(function_arguments, str):
+        return function_arguments
+    if isinstance(function_arguments, (dict, list)):
+        try:
+            return json.dumps(function_arguments, separators=(",", ":"))
+        except Exception:
+            return None
+    return None
+
+
+def _lookup_codex_google_code_assist_tool_call_name(tool_call_id: Any) -> Optional[str]:
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    cached_name = _codex_google_code_assist_tool_call_name_cache.get(tool_call_id)
+    if cached_name:
+        return cached_name
+    if "__thought__" in tool_call_id:
+        return _codex_google_code_assist_tool_call_name_cache.get(
+            tool_call_id.split("__thought__", 1)[0]
+        )
+    return None
+
+
+def _lookup_codex_google_code_assist_tool_call_arguments(
+    tool_call_id: Any,
+) -> Optional[str]:
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    cached_arguments = _codex_google_code_assist_tool_call_arguments_cache.get(
+        tool_call_id
+    )
+    if cached_arguments is not None:
+        return cached_arguments
+    if "__thought__" in tool_call_id:
+        return _codex_google_code_assist_tool_call_arguments_cache.get(
+            tool_call_id.split("__thought__", 1)[0]
+        )
+    return None
+
+
+def _infer_single_codex_google_code_assist_function_tool_name(
+    tools: Any,
+) -> Optional[str]:
+    if not isinstance(tools, list):
+        return None
+    function_names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+        else:
+            name = tool.get("name")
+        if isinstance(name, str) and name:
+            function_names.append(name)
+    if len(function_names) == 1:
+        return function_names[0]
+    return None
+
+
+def _is_codex_google_code_assist_empty_text_content(content: Any) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ""
+    if not isinstance(content, list):
+        return False
+    if not content:
+        return True
+    for part in content:
+        if isinstance(part, str):
+            if part.strip():
+                return False
+            continue
+        if not isinstance(part, dict):
+            return False
+        part_type = part.get("type")
+        if part_type not in (None, "text", "output_text"):
+            return False
+        text = part.get("text")
+        if not isinstance(text, str) or text.strip():
+            return False
+    return True
+
+
+def _ensure_codex_google_code_assist_tool_results_have_calls(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return completion_kwargs, {}
+
+    updated_messages = list(messages)
+    repaired_count = 0
+    blank_text_suppressed_count = 0
+    repaired_names: set[str] = set()
+    fallback_tool_name = _infer_single_codex_google_code_assist_function_tool_name(
+        completion_kwargs.get("tools")
+    )
+
+    for index, message in enumerate(updated_messages):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        tool_call_id = message.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            continue
+        previous_assistant_index: Optional[int] = None
+        for candidate_index in range(index - 1, -1, -1):
+            candidate = updated_messages[candidate_index]
+            if isinstance(candidate, dict) and candidate.get("role") == "assistant":
+                previous_assistant_index = candidate_index
+                break
+        if previous_assistant_index is None:
+            continue
+
+        previous_assistant = updated_messages[previous_assistant_index]
+        if not isinstance(previous_assistant, dict):
+            continue
+        existing_tool_call_ids = _completion_message_tool_call_ids(previous_assistant)
+        if tool_call_id in existing_tool_call_ids:
+            continue
+
+        function_name = (
+            _lookup_codex_google_code_assist_tool_call_name(tool_call_id)
+            or fallback_tool_name
+        )
+        if not function_name:
+            continue
+        function_arguments = (
+            _lookup_codex_google_code_assist_tool_call_arguments(tool_call_id)
+            or "{}"
+        )
+
+        updated_assistant = dict(previous_assistant)
+        tool_calls = updated_assistant.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+        if _is_codex_google_code_assist_empty_text_content(
+            updated_assistant.get("content")
+        ):
+            updated_assistant.pop("content", None)
+            blank_text_suppressed_count += 1
+        updated_assistant["tool_calls"] = [
+            *tool_calls,
+            {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": function_arguments,
+                },
+            },
+        ]
+        updated_messages[previous_assistant_index] = updated_assistant
+        repaired_count += 1
+        repaired_names.add(function_name)
+
+    if repaired_count == 0:
+        return completion_kwargs, {}
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["messages"] = updated_messages
+    changes: dict[str, Any] = {
+        "google_adapter_codex_repaired_missing_tool_call_count": repaired_count,
+        "google_adapter_codex_repaired_missing_tool_call_names": sorted(
+            repaired_names
+        ),
+    }
+    if blank_text_suppressed_count:
+        changes[
+            "google_adapter_codex_repaired_blank_tool_call_text_suppressed_count"
+        ] = blank_text_suppressed_count
+    return updated_kwargs, changes
+
+
 async def _build_google_code_assist_request_from_completion_kwargs(
     *,
     completion_kwargs: dict[str, Any],
     adapter_model: str,
     project: str,
     request: Request,
+    completion_kwargs_are_openai_chat: bool = False,
 ) -> tuple[dict[str, Any], dict[str, str], list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
-        LiteLLMMessagesToCompletionTransformationHandler,
-    )
     from litellm.llms.vertex_ai.gemini.transformation import _transform_request_body
 
     google_model = _normalize_google_completion_adapter_model_name(adapter_model)
-    completion_kwargs, tool_name_mapping = (
-        LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
-            max_tokens=completion_kwargs["max_tokens"],
-            messages=completion_kwargs.get("messages") or [],
-            model=google_model,
-            metadata=completion_kwargs.get("metadata"),
-            stop_sequences=completion_kwargs.get("stop_sequences"),
-            stream=completion_kwargs.get("stream"),
-            system=completion_kwargs.get("system"),
-            temperature=completion_kwargs.get("temperature"),
-            thinking=completion_kwargs.get("thinking"),
-            tool_choice=completion_kwargs.get("tool_choice"),
-            tools=completion_kwargs.get("tools"),
-            top_k=completion_kwargs.get("top_k"),
-            top_p=completion_kwargs.get("top_p"),
-            output_format=completion_kwargs.get("output_format"),
-            output_config=completion_kwargs.get("output_config"),
-            extra_kwargs={
-                "custom_llm_provider": litellm.LlmProviders.GEMINI.value,
-                "metadata": completion_kwargs.get("metadata"),
-                "parallel_tool_calls": completion_kwargs.get("parallel_tool_calls"),
-                "response_format": completion_kwargs.get("response_format"),
-                "reasoning_effort": completion_kwargs.get("reasoning_effort"),
-                "frequency_penalty": completion_kwargs.get("frequency_penalty"),
-                "presence_penalty": completion_kwargs.get("presence_penalty"),
-                "seed": completion_kwargs.get("seed"),
-                "n": completion_kwargs.get("n"),
-            },
+    if completion_kwargs_are_openai_chat:
+        completion_kwargs = dict(completion_kwargs)
+        (
+            completion_kwargs,
+            openai_chat_shape_changes,
+        ) = _normalize_codex_openai_chat_kwargs_for_google_code_assist(
+            completion_kwargs
         )
-    )
+        (
+            completion_kwargs,
+            codex_tool_pair_changes,
+        ) = _ensure_codex_google_code_assist_tool_results_have_calls(
+            completion_kwargs
+        )
+        tool_name_mapping: dict[str, str] = {}
+    else:
+        from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+            LiteLLMMessagesToCompletionTransformationHandler,
+        )
+
+        completion_kwargs, tool_name_mapping = (
+            LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+                max_tokens=completion_kwargs["max_tokens"],
+                messages=completion_kwargs.get("messages") or [],
+                model=google_model,
+                metadata=completion_kwargs.get("metadata"),
+                stop_sequences=completion_kwargs.get("stop_sequences"),
+                stream=completion_kwargs.get("stream"),
+                system=completion_kwargs.get("system"),
+                temperature=completion_kwargs.get("temperature"),
+                thinking=completion_kwargs.get("thinking"),
+                tool_choice=completion_kwargs.get("tool_choice"),
+                tools=completion_kwargs.get("tools"),
+                top_k=completion_kwargs.get("top_k"),
+                top_p=completion_kwargs.get("top_p"),
+                output_format=completion_kwargs.get("output_format"),
+                output_config=completion_kwargs.get("output_config"),
+                extra_kwargs={
+                    "custom_llm_provider": litellm.LlmProviders.GEMINI.value,
+                    "metadata": completion_kwargs.get("metadata"),
+                    "parallel_tool_calls": completion_kwargs.get("parallel_tool_calls"),
+                    "response_format": completion_kwargs.get("response_format"),
+                    "reasoning_effort": completion_kwargs.get("reasoning_effort"),
+                    "frequency_penalty": completion_kwargs.get("frequency_penalty"),
+                    "presence_penalty": completion_kwargs.get("presence_penalty"),
+                    "seed": completion_kwargs.get("seed"),
+                    "n": completion_kwargs.get("n"),
+                },
+            )
+        )
+        openai_chat_shape_changes = {}
+        codex_tool_pair_changes = {}
     completion_kwargs, system_prompt_policy_changes = _apply_google_adapter_system_prompt_policy(
         completion_kwargs
     )
@@ -3535,6 +3900,8 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         }
     completion_message_window_changes = {
         **completion_message_window_changes,
+        **openai_chat_shape_changes,
+        **codex_tool_pair_changes,
         **native_tool_alias_changes,
         **duplicate_tool_response_changes,
         **system_prompt_policy_changes,
@@ -3542,6 +3909,226 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         'google_adapter_session_id_hash': hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8],
     }
     return wrapped_request, tool_name_mapping, completion_messages, gemini_optional_params, litellm_params, completion_message_window_changes
+
+
+def _drop_codex_google_code_assist_non_function_tools(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return request_body, []
+
+    kept_tools: list[Any] = []
+    dropped_tool_types: list[str] = []
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "function":
+            kept_tools.append(tool)
+            continue
+        if isinstance(tool, dict):
+            dropped_tool_types.append(str(tool.get("type") or "unknown"))
+        else:
+            dropped_tool_types.append(type(tool).__name__)
+
+    if not dropped_tool_types:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["tools"] = kept_tools
+    tool_choice = updated_body.get("tool_choice")
+    if isinstance(tool_choice, dict) and tool_choice.get("type") != "function":
+        updated_body.pop("tool_choice", None)
+    elif isinstance(tool_choice, str) and tool_choice not in {
+        "auto",
+        "none",
+        "required",
+    }:
+        updated_body.pop("tool_choice", None)
+
+    return _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=["codex-google-code-assist-tools-sanitized"],
+        extra_fields={
+            "codex_google_code_assist_dropped_response_tool_types": _dedupe_sorted_str_list(
+                dropped_tool_types
+            ),
+        },
+    ), dropped_tool_types
+
+
+def _build_codex_google_code_assist_completion_kwargs(
+    prepared_request_body: dict[str, Any],
+    *,
+    adapter_model: str,
+) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    request_input = prepared_request_body.get("input") or ""
+    responses_api_request = {
+        key: value
+        for key, value in prepared_request_body.items()
+        if key not in {"input", "model", "litellm_metadata"}
+    }
+    litellm_metadata = dict(prepared_request_body.get("litellm_metadata") or {})
+    completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model=adapter_model,
+        input=request_input,
+        responses_api_request=responses_api_request,
+        custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+        stream=bool(prepared_request_body.get("stream")),
+        metadata=litellm_metadata,
+    )
+    completion_kwargs["metadata"] = litellm_metadata
+    if not completion_kwargs.get("max_tokens"):
+        completion_kwargs["max_tokens"] = _CODEX_GOOGLE_CODE_ASSIST_DEFAULT_MAX_TOKENS
+    return completion_kwargs, request_input, responses_api_request
+
+
+async def _prepare_codex_google_code_assist_adapter_request(
+    *,
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> SimpleNamespace:
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    google_access_token = await _load_valid_local_google_oauth_access_token()
+    google_project = await _get_or_load_google_code_assist_project(google_access_token)
+    google_quota_observation = await _prime_google_code_assist_session(
+        google_access_token,
+        google_project,
+    )
+
+    route_family = "codex_google_code_assist_adapter"
+    requested_model = prepared_request_body.get("model")
+    google_target_base = _get_anthropic_adapter_google_target_base()
+    google_model = _normalize_google_completion_adapter_model_name(adapter_model)
+    google_adapter_rate_limit_key = _get_google_adapter_rate_limit_key(
+        google_model,
+        access_token=google_access_token,
+        companion_project=google_project,
+    )
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    target_endpoint_label = "/v1internal:streamGenerateContent"
+    target_query_params = {"alt": "sse"}
+    target_url = f"{google_target_base.rstrip('/')}{target_endpoint_label}"
+    annotated_target_url = httpx.URL(target_url).copy_with(params=target_query_params)
+
+    prepared_request_body, _dropped_tool_types = (
+        _drop_codex_google_code_assist_non_function_tools(prepared_request_body)
+    )
+    prepared_request_body = _merge_litellm_metadata(
+        _add_route_family_logging_metadata(prepared_request_body, route_family),
+        tags_to_add=[
+            "codex-google-code-assist-adapter",
+            f"codex-adapter-model:{google_model}",
+            f"codex-adapter-target:google:{target_endpoint_label}",
+        ],
+        extra_fields={
+            "codex_adapter_model": google_model,
+            "codex_adapter_original_model": requested_model,
+            "codex_adapter_target_endpoint": f"google:{target_endpoint_label}",
+            "codex_adapter_input_shape": "openai_responses",
+            "codex_adapter_output_shape": "openai_responses",
+            **(
+                {"google_retrieve_user_quota": google_quota_observation}
+                if google_quota_observation
+                else {}
+            ),
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.google_code_assist_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": google_model,
+                        "stream": client_requested_stream,
+                        "upstream_stream": True,
+                    },
+                )
+            ],
+        },
+    )
+    (
+        completion_kwargs,
+        codex_request_input,
+        responses_api_request,
+    ) = _build_codex_google_code_assist_completion_kwargs(
+        prepared_request_body,
+        adapter_model=google_model,
+    )
+    previous_response_id = responses_api_request.get("previous_response_id")
+    if previous_response_id:
+        completion_kwargs = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+            previous_response_id=str(previous_response_id),
+            litellm_completion_request=completion_kwargs,
+        )
+
+    wrapped_request_body, tool_name_mapping, completion_messages, gemini_optional_params, litellm_params, completion_message_window_changes = await _build_google_code_assist_request_from_completion_kwargs(
+        completion_kwargs=completion_kwargs,
+        adapter_model=google_model,
+        project=google_project,
+        request=request,
+        completion_kwargs_are_openai_chat=True,
+    )
+    if isinstance(prepared_request_body.get("litellm_metadata"), dict):
+        # pass_through_request strips LiteLLM params before the HTTP send; keep
+        # adapter metadata here so logging survives without reaching Code Assist.
+        wrapped_request_body["litellm_metadata"] = {
+            **dict(wrapped_request_body.get("litellm_metadata") or {}),
+            **dict(prepared_request_body["litellm_metadata"]),
+        }
+
+    generation_policy_changes = _apply_google_adapter_request_shape_policy(
+        wrapped_request_body
+    )
+    adapter_headers = _build_google_adapter_native_headers(
+        access_token=google_access_token,
+        model=google_model,
+        accept="*/*",
+    )
+    if isinstance(wrapped_request_body.get("litellm_metadata"), dict):
+        if completion_message_window_changes:
+            wrapped_request_body["litellm_metadata"][
+                "google_adapter_completion_message_window"
+            ] = completion_message_window_changes
+        if generation_policy_changes:
+            wrapped_request_body["litellm_metadata"][
+                "google_adapter_request_shape_policy"
+            ] = generation_policy_changes
+
+    sanitized_schema_fix_count = _sanitize_google_code_assist_request_schemas(
+        wrapped_request_body
+    )
+    _log_google_completion_adapter_debug(
+        prepared_request_body=prepared_request_body,
+        wrapped_request_body=wrapped_request_body,
+        google_model=google_model,
+        adapter_headers=adapter_headers,
+        sanitized_schema_fix_count=sanitized_schema_fix_count,
+        generation_policy_changes=generation_policy_changes,
+    )
+
+    return SimpleNamespace(
+        adapter_headers=adapter_headers,
+        annotated_target_url=annotated_target_url,
+        client_requested_stream=client_requested_stream,
+        codex_request_input=codex_request_input,
+        completion_messages=completion_messages,
+        gemini_optional_params=gemini_optional_params,
+        google_adapter_rate_limit_key=google_adapter_rate_limit_key,
+        google_model=google_model,
+        is_stream=True,
+        litellm_metadata=dict(wrapped_request_body.get("litellm_metadata") or {}),
+        litellm_params=litellm_params,
+        responses_api_request=responses_api_request,
+        target_query_params=target_query_params,
+        target_url=target_url,
+        tool_name_mapping=tool_name_mapping,
+        wrapped_request_body=wrapped_request_body,
+    )
 
 
 def _get_google_code_assist_native_tool_aliases() -> dict[str, str]:
@@ -4534,16 +5121,74 @@ def _build_anthropic_streaming_response_from_google_code_assist_stream(
     )
 
 
-async def _collect_google_code_assist_response_from_stream(
+def _restore_google_adapter_tool_call_names(
+    response_obj: Any,
+    tool_name_mapping: dict[str, str],
+) -> Any:
+    choices = getattr(response_obj, "choices", None)
+    if not isinstance(choices, list):
+        return response_obj
+    for choice in choices:
+        for message_attr in ("message", "delta"):
+            message = getattr(choice, message_attr, None)
+            if message is None:
+                continue
+            tool_calls = getattr(message, "tool_calls", None)
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                function = (
+                    tool_call.get("function")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "function", None)
+                )
+                if function is None:
+                    continue
+                current_name = (
+                    function.get("name")
+                    if isinstance(function, dict)
+                    else getattr(function, "name", None)
+                )
+                function_arguments = (
+                    function.get("arguments")
+                    if isinstance(function, dict)
+                    else getattr(function, "arguments", None)
+                )
+                original_name = tool_name_mapping.get(str(current_name or ""))
+                final_name = original_name or current_name
+                tool_call_id = (
+                    tool_call.get("id")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "id", None)
+                )
+                _remember_codex_google_code_assist_tool_call_name(
+                    tool_call_id,
+                    final_name,
+                    function_arguments,
+                )
+                if not original_name:
+                    continue
+                if isinstance(function, dict):
+                    function["name"] = original_name
+                else:
+                    setattr(function, "name", original_name)
+    return response_obj
+
+
+async def _restore_google_adapter_tool_call_names_stream(
+    completion_stream: Any,
+    tool_name_mapping: dict[str, str],
+) -> Any:
+    async for chunk in completion_stream:
+        yield _restore_google_adapter_tool_call_names(chunk, tool_name_mapping)
+
+
+async def _collect_google_code_assist_model_response_from_stream(
     *,
     response: StreamingResponse,
     adapter_model: str,
-    tool_name_mapping: dict[str, str],
     logging_obj: Any,
-) -> Response:
-    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
-        AnthropicAdapter,
-    )
+) -> Any:
     from litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrough_logging_handler import (
         GeminiPassthroughLoggingHandler,
     )
@@ -4572,6 +5217,25 @@ async def _collect_google_code_assist_response_from_stream(
             status_code=502,
             detail="Google Code Assist streaming adapter could not build a complete response.",
         )
+    return model_response
+
+
+async def _collect_google_code_assist_response_from_stream(
+    *,
+    response: StreamingResponse,
+    adapter_model: str,
+    tool_name_mapping: dict[str, str],
+    logging_obj: Any,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        AnthropicAdapter,
+    )
+
+    model_response = await _collect_google_code_assist_model_response_from_stream(
+        response=response,
+        adapter_model=adapter_model,
+        logging_obj=logging_obj,
+    )
 
     anthropic_response = AnthropicAdapter().translate_completion_output_params(
         model_response,
@@ -4579,6 +5243,89 @@ async def _collect_google_code_assist_response_from_stream(
     )
     return _build_anthropic_response_from_completion_adapter_response(
         anthropic_response
+    )
+
+
+def _serialize_responses_adapter_response(response_obj: Any) -> str:
+    if hasattr(response_obj, "model_dump_json"):
+        return response_obj.model_dump_json(exclude_none=True)
+    if hasattr(response_obj, "json"):
+        return response_obj.json(exclude_none=True)
+    return json.dumps(response_obj)
+
+
+def _build_responses_response_from_adapter_response(response_obj: Any) -> Response:
+    return Response(
+        content=_serialize_responses_adapter_response(response_obj),
+        media_type="application/json",
+    )
+
+
+async def _responses_sse_from_iterator(responses_iterator: Any) -> Any:
+    async for event in responses_iterator:
+        event_type = getattr(event, "type", None)
+        serialized = _serialize_responses_adapter_response(event)
+        if isinstance(event_type, str) and event_type:
+            yield f"event: {event_type}\ndata: {serialized}\n\n"
+        else:
+            yield f"data: {serialized}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _build_codex_streaming_response_from_google_code_assist_stream(
+    *,
+    response: StreamingResponse,
+    adapter_request: SimpleNamespace,
+) -> StreamingResponse:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        ModelResponseIterator,
+    )
+    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+        LiteLLMCompletionStreamingIterator,
+    )
+
+    logging_obj = Logging(
+        model=adapter_request.google_model,
+        messages=adapter_request.completion_messages,
+        stream=True,
+        call_type="completion",
+        start_time=datetime.now(),
+        litellm_call_id=str(uuid4()),
+        function_id="codex_google_code_assist_adapter",
+    )
+    logging_obj.optional_params = adapter_request.gemini_optional_params
+    completion_stream = ModelResponseIterator(
+        streaming_response=_iterate_google_code_assist_unwrapped_stream(
+            response.body_iterator,
+            adapter_model=adapter_request.google_model,
+            rate_limit_key=adapter_request.google_adapter_rate_limit_key,
+        ),
+        sync_stream=False,
+        logging_obj=logging_obj,
+    )
+    completion_stream = _restore_google_adapter_tool_call_names_stream(
+        completion_stream,
+        adapter_request.tool_name_mapping,
+    )
+    streamwrapper = CustomStreamWrapper(
+        completion_stream=completion_stream,
+        model=adapter_request.google_model,
+        custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+        logging_obj=logging_obj,
+    )
+    responses_iterator = LiteLLMCompletionStreamingIterator(
+        model=adapter_request.google_model,
+        litellm_custom_stream_wrapper=streamwrapper,
+        request_input=adapter_request.codex_request_input,
+        responses_api_request=adapter_request.responses_api_request,
+        custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+        litellm_metadata=adapter_request.litellm_metadata,
+    )
+    return StreamingResponse(
+        _responses_sse_from_iterator(responses_iterator),
+        media_type="text/event-stream",
     )
 
 
@@ -6525,6 +7272,126 @@ async def _handle_anthropic_google_completion_adapter_route(
         adapter_model=adapter_model,
     )
     return await _perform_anthropic_google_completion_adapter_request(
+        request=request,
+        user_api_key_dict=user_api_key_dict,
+        adapter_request=adapter_request,
+    )
+
+
+async def _perform_codex_google_code_assist_adapter_request(
+    *,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth,
+    adapter_request: SimpleNamespace,
+) -> Response:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=str(adapter_request.annotated_target_url),
+        headers=adapter_request.adapter_headers,
+        credential_family="google",
+        expected_target_family="google",
+    )
+    _annotate_request_scope_for_adapted_access_log(
+        request,
+        adapter_request.annotated_target_url,
+    )
+
+    google_adapter_semaphore = _get_google_adapter_semaphore(
+        rate_limit_key=adapter_request.google_adapter_rate_limit_key
+    )
+    await google_adapter_semaphore.acquire()
+    release_state = {"released": False}
+    stream_release_attached = False
+    try:
+        upstream_response = await _perform_google_adapter_pass_through_request(
+            request=request,
+            target=adapter_request.target_url,
+            custom_headers=adapter_request.adapter_headers,
+            user_api_key_dict=user_api_key_dict,
+            custom_body=adapter_request.wrapped_request_body,
+            forward_headers=False,
+            query_params=adapter_request.target_query_params,
+            stream=adapter_request.is_stream,
+            custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+            egress_credential_family="google",
+            expected_target_family="google",
+            google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
+        )
+
+        if not isinstance(upstream_response, StreamingResponse):
+            raise HTTPException(
+                status_code=502,
+                detail="Google Code Assist adapter expected a streaming response.",
+            )
+
+        if adapter_request.client_requested_stream:
+            streaming_response = _build_codex_streaming_response_from_google_code_assist_stream(
+                response=upstream_response,
+                adapter_request=adapter_request,
+            )
+            stream_release_attached = True
+            return _wrap_streaming_response_with_release_callback(
+                streaming_response,
+                lambda: _release_google_adapter_semaphore_once(
+                    google_adapter_semaphore,
+                    release_state,
+                    google_model=adapter_request.google_model,
+                ),
+            )
+
+        logging_obj = Logging(
+            model=adapter_request.google_model,
+            messages=adapter_request.completion_messages,
+            stream=False,
+            call_type="completion",
+            start_time=datetime.now(),
+            litellm_call_id=str(uuid4()),
+            function_id="codex_google_code_assist_adapter",
+        )
+        logging_obj.optional_params = adapter_request.gemini_optional_params
+        model_response = await _collect_google_code_assist_model_response_from_stream(
+            response=upstream_response,
+            adapter_model=adapter_request.google_model,
+            logging_obj=logging_obj,
+        )
+        model_response = _restore_google_adapter_tool_call_names(
+            model_response,
+            adapter_request.tool_name_mapping,
+        )
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            chat_completion_response=model_response,
+            request_input=adapter_request.codex_request_input,
+            responses_api_request=adapter_request.responses_api_request,
+        )
+        return _build_responses_response_from_adapter_response(responses_api_response)
+    finally:
+        if not adapter_request.is_stream or not stream_release_attached:
+            _release_google_adapter_semaphore_once(
+                google_adapter_semaphore,
+                release_state,
+                google_model=adapter_request.google_model,
+            )
+
+
+async def _handle_codex_google_code_assist_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    adapter_request = await _prepare_codex_google_code_assist_adapter_request(
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+    )
+    return await _perform_codex_google_code_assist_adapter_request(
         request=request,
         user_api_key_dict=user_api_key_dict,
         adapter_request=adapter_request,
@@ -12463,6 +13330,25 @@ class BaseOpenAIPassThroughHandler:
                 prepared_request_body = _add_codex_request_breakout_logging_metadata(
                     prepared_request_body
                 )
+                google_adapter_model = _resolve_codex_google_code_assist_adapter_model(
+                    prepared_request_body,
+                    endpoint=endpoint,
+                )
+                if google_adapter_model is not None:
+                    prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                        request=request,
+                        request_body=prepared_request_body,
+                    )
+                    if prepared_request_body is not request_body:
+                        _safe_set_request_parsed_body(request, prepared_request_body)
+                    return await _handle_codex_google_code_assist_adapter_route(
+                        endpoint=endpoint,
+                        request=request,
+                        fastapi_response=fastapi_response,
+                        user_api_key_dict=user_api_key_dict,
+                        prepared_request_body=prepared_request_body,
+                        adapter_model=google_adapter_model,
+                    )
             else:
                 prepared_request_body = _add_route_family_logging_metadata(
                     prepared_request_body,

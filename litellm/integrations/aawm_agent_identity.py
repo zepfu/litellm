@@ -1275,6 +1275,13 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_unsupported_hosted_tool_types_removed",
     "codex_unsupported_hosted_tools_removed",
     "codex_unsupported_hosted_tool_choice_removed",
+    "codex_adapter_model",
+    "codex_adapter_original_model",
+    "codex_adapter_target_endpoint",
+    "codex_adapter_input_shape",
+    "codex_adapter_output_shape",
+    "codex_google_code_assist_dropped_response_tool_types",
+    "google_retrieve_user_quota",
     "usage_tool_call_count",
     "usage_tool_names",
     "google_adapter_system_prompt_policy_name",
@@ -3343,14 +3350,14 @@ def _infer_rate_limit_client_family(
         )
         if value is not None
     ).lower()
-    if "codex" in source_lower or "codex" in route_family or "codex" in model_lower:
-        return "codex"
     if (
         "google_code_assist" in source_lower
         or "google_retrieve_user_quota" in source_lower
         or "code_assist" in route_family
     ):
         return "google_code_assist"
+    if "codex" in source_lower or "codex" in route_family or "codex" in model_lower:
+        return "codex"
     if "gemini" in source_lower or "gemini" in route_family or "gemini" in model_lower:
         return "gemini"
     if (
@@ -3420,6 +3427,7 @@ def _build_rate_limit_context(
         model,
         metadata.get("model"),
         metadata.get("anthropic_adapter_model"),
+        metadata.get("codex_adapter_model"),
     )
     runtime_identity = _build_session_runtime_identity(
         metadata=metadata,
@@ -8750,6 +8758,7 @@ def _resolve_session_history_model(
         _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
         _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body", "model"),
         metadata.get("anthropic_adapter_model"),
+        metadata.get("codex_adapter_model"),
         metadata.get("model"),
         _maybe_get(result, "model"),
         _maybe_get(_maybe_get(result_completed_payload, "response"), "model"),
