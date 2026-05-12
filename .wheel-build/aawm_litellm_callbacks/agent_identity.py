@@ -228,7 +228,8 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     litellm_post_response_ms DOUBLE PRECISION,
     llm_upstream_time_to_first_byte_ms DOUBLE PRECISION,
     llm_upstream_stream_ms DOUBLE PRECISION,
-    latency_unclassified_ms DOUBLE PRECISION
+    latency_unclassified_ms DOUBLE PRECISION,
+    previous_response_to_current_request_ms DOUBLE PRECISION
 )
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
@@ -272,10 +273,12 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_time_to_first_byte_ms DOUBLE PRECISION",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_stream_ms DOUBLE PRECISION",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS latency_unclassified_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS previous_response_to_current_request_ms DOUBLE PRECISION",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON public.session_history (session_id, model, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_session_start_idx ON public.session_history (session_id, (COALESCE(start_time, created_at)), id)",
     "CREATE INDEX IF NOT EXISTS session_history_litellm_environment_created_idx ON public.session_history (litellm_environment, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_client_created_idx ON public.session_history (client_name, client_version, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_repository_created_idx ON public.session_history (repository, created_at DESC)",
@@ -696,14 +699,15 @@ INSERT INTO public.session_history (
     litellm_post_response_ms,
     llm_upstream_time_to_first_byte_ms,
     llm_upstream_stream_ms,
-    latency_unclassified_ms
+    latency_unclassified_ms,
+    previous_response_to_current_request_ms
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb,
     $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb, $47,
     $48, $49, $50, $51, $52, $53, $54, $55, $56,
-    $57, $58, $59, $60, $61, $62, $63, $64, $65
+    $57, $58, $59, $60, $61, $62, $63, $64, $65, $66
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -904,7 +908,72 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         EXCLUDED.latency_unclassified_ms,
         session_history.latency_unclassified_ms
     ),
+    previous_response_to_current_request_ms = COALESCE(
+        EXCLUDED.previous_response_to_current_request_ms,
+        session_history.previous_response_to_current_request_ms
+    ),
     metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+"""
+_SESSION_HISTORY_PREVIOUS_GAP_FIELD = "previous_response_to_current_request_ms"
+_AAWM_SESSION_HISTORY_PREVIOUS_GAP_UPDATE_SQL = f"""
+WITH inserted AS (
+    SELECT
+        id,
+        session_id,
+        COALESCE(start_time, created_at) AS current_started_at
+    FROM public.session_history
+    WHERE litellm_call_id = ANY($1::text[])
+),
+affected AS (
+    SELECT id
+    FROM inserted
+    UNION
+    SELECT next_sh.id
+    FROM inserted
+    JOIN LATERAL (
+        SELECT sh.id
+        FROM public.session_history sh
+        WHERE sh.session_id = inserted.session_id
+          AND (COALESCE(sh.start_time, sh.created_at), sh.id)
+              > (inserted.current_started_at, inserted.id)
+        ORDER BY COALESCE(sh.start_time, sh.created_at) ASC, sh.id ASC
+        LIMIT 1
+    ) next_sh ON TRUE
+),
+target AS (
+    SELECT
+        sh.id,
+        sh.session_id,
+        COALESCE(sh.start_time, sh.created_at) AS current_started_at
+    FROM public.session_history sh
+    JOIN affected ON affected.id = sh.id
+),
+derived AS (
+    SELECT
+        target.id,
+        CASE
+            WHEN previous.end_time IS NULL THEN NULL
+            WHEN target.current_started_at >= previous.end_time THEN
+                EXTRACT(EPOCH FROM (target.current_started_at - previous.end_time)) * 1000.0
+            ELSE NULL
+        END AS {_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
+    FROM target
+    LEFT JOIN LATERAL (
+        SELECT sh.end_time
+        FROM public.session_history sh
+        WHERE sh.session_id = target.session_id
+          AND (COALESCE(sh.start_time, sh.created_at), sh.id)
+              < (target.current_started_at, target.id)
+        ORDER BY COALESCE(sh.start_time, sh.created_at) DESC, sh.id DESC
+        LIMIT 1
+    ) previous ON TRUE
+)
+UPDATE public.session_history AS sh
+SET {_SESSION_HISTORY_PREVIOUS_GAP_FIELD} = derived.{_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
+FROM derived
+WHERE sh.id = derived.id
+  AND sh.{_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
+      IS DISTINCT FROM derived.{_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
 """
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL = """
 INSERT INTO public.session_history_tool_activity (
@@ -9206,6 +9275,7 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("llm_upstream_time_to_first_byte_ms"),
         record.get("llm_upstream_stream_ms"),
         record.get("latency_unclassified_ms"),
+        record.get(_SESSION_HISTORY_PREVIOUS_GAP_FIELD),
     )
 
 
@@ -9240,6 +9310,30 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
             )
         )
     return payloads
+
+
+def _extract_session_history_call_ids_from_payloads(
+    payloads: List[Tuple[Any, ...]],
+) -> List[str]:
+    call_ids: List[str] = []
+    seen_call_ids: set[str] = set()
+    for payload in payloads:
+        call_id = _clean_non_empty_string(payload[0] if payload else None)
+        if call_id is None or call_id in seen_call_ids:
+            continue
+        call_ids.append(call_id)
+        seen_call_ids.add(call_id)
+    return call_ids
+
+
+async def _update_session_history_previous_gap_ms(
+    conn: Any,
+    payloads: List[Tuple[Any, ...]],
+) -> None:
+    call_ids = _extract_session_history_call_ids_from_payloads(payloads)
+    if not call_ids:
+        return
+    await conn.execute(_AAWM_SESSION_HISTORY_PREVIOUS_GAP_UPDATE_SQL, call_ids)
 
 
 def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
@@ -9554,6 +9648,7 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
             tool_activity_payloads = _build_tool_activity_db_payloads(record)
 
             await conn.execute(_AAWM_SESSION_HISTORY_INSERT_SQL, *history_payload)
+            await _update_session_history_previous_gap_ms(conn, [history_payload])
             if tool_activity_payloads:
                 await conn.executemany(
                     _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL,
@@ -9617,6 +9712,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
 
         if payloads:
             await conn.executemany(_AAWM_SESSION_HISTORY_INSERT_SQL, payloads)
+            await _update_session_history_previous_gap_ms(conn, payloads)
         if tool_activity_payloads:
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
