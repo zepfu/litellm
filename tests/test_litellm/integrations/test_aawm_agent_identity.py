@@ -3281,6 +3281,64 @@ def test_build_session_history_record_marks_gemini_cache_miss_from_intent_metada
     assert record["provider_cache_miss_token_count"] == 1536
 
 
+def test_build_session_history_record_uses_codex_google_code_assist_metadata() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "unknown"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-google-code-assist"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-google-code-assist",
+            "passthrough_route_family": "codex_google_code_assist_adapter",
+            "codex_adapter_model": "gemini-3.1-pro-preview",
+            "codex_adapter_input_shape": "openai_responses",
+            "codex_adapter_output_shape": "openai_responses",
+            "google_retrieve_user_quota": {
+                "source": "google_retrieve_user_quota",
+                "buckets": {"items": []},
+            },
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "project": "dev-project",
+        "request": {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        },
+    }
+
+    result = {
+        "id": "provider-response-codex-google-code-assist",
+        "usage": {
+            "prompt_tokens": 42,
+            "completion_tokens": 8,
+            "total_tokens": 50,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "gemini routed"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["model"] == "gemini-3.1-pro-preview"
+    assert record["metadata"]["passthrough_route_family"] == (
+        "codex_google_code_assist_adapter"
+    )
+    assert record["metadata"]["codex_adapter_model"] == "gemini-3.1-pro-preview"
+    assert record["metadata"]["codex_adapter_input_shape"] == "openai_responses"
+    assert record["metadata"]["codex_adapter_output_shape"] == "openai_responses"
+    assert record["metadata"]["google_retrieve_user_quota"] == {
+        "source": "google_retrieve_user_quota",
+        "buckets": {"items": []},
+    }
+
+
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="codex")
@@ -3916,6 +3974,47 @@ def test_build_rate_limit_observations_extracts_google_quota_buckets() -> None:
     assert by_model["gemini-2.5-flash"]["used_percentage"] == pytest.approx(9.3)
     assert by_model["gemini-2.5-flash"]["quota_period"] == "daily"
     assert by_model["gemini-2.5-flash-lite"]["used_percentage"] == pytest.approx(2.25)
+
+
+def test_build_rate_limit_observations_treats_codex_adapter_quota_as_code_assist() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gemini-3.1-pro-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["litellm_call_id"] = "call-codex-google-quota-buckets"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-google-quota-buckets",
+            "passthrough_route_family": "codex_google_code_assist_adapter",
+            "codex_adapter_model": "gemini-3.1-pro-preview",
+            "google_retrieve_user_quota": {
+                "source": "google_retrieve_user_quota",
+                "buckets": {
+                    "items": [
+                        {
+                            "modelId": "gemini-3.1-pro-preview",
+                            "tokenType": "REQUESTS",
+                            "remainingFraction": 0.75,
+                            "resetTime": "2026-05-06T00:25:54Z",
+                        }
+                    ]
+                },
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["provider"] == "gemini"
+    assert observations[0]["client_family"] == "google_code_assist"
+    assert observations[0]["model"] == "gemini-3.1-pro-preview"
+    assert observations[0]["used_percentage"] == pytest.approx(25.0)
 
 
 def test_build_rate_limit_observations_keeps_google_capacity_distinct_from_quota() -> None:
