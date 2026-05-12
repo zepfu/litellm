@@ -43,8 +43,9 @@ adapter harness and focused regression tests pass against the intended target.
 
 **Version metadata note:** `pyproject.toml` should stay aligned to the last
 carried patch set. `litellm/_version.py` now reflects the installed
-distribution version directly. The current promotion target is
-`1.82.3+aawm.43`.
+distribution version directly. Treat `pyproject.toml` as the source for the
+active fork-local version during release prep; do not duplicate a current
+promotion target here because it goes stale after each promotion turn.
 
 **Current rebased checkpoint:** branch `rebase/upstream-1.82.3-stable.patch.4`
 passed the local acceptance suite with artifact
@@ -1559,6 +1560,62 @@ verified Codex response-header `used-percent` values populate
 `remaining_pct`; older saved shape captures only retained the used-percent
 header names, not the values, so existing null OpenAI/Codex rows cannot be
 accurately backfilled from those artifacts.
+
+---
+
+### aawm.44 — Codex Spark hosted-tool sanitizer and session response-gap telemetry
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `TODO.md`
+- `WHEEL.md`
+- `PROD_RELEASE.md`
+- `docker-compose.dev.yml`
+- `model_prices_and_context_window.json`
+- `litellm/bundled_model_prices_and_context_window_fallback.json`
+- `litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/proxy/response_api_endpoints/endpoints.py`
+- `litellm/types/utils.py`
+- `litellm/utils.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `scripts/backfill_session_history_latency.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/proxy/response_api_endpoints/test_endpoints.py`
+
+**Upstream issue:** Native Codex traffic for `gpt-5.3-codex-spark` can advertise
+the OpenAI hosted `image_generation` tool even though the Codex Spark upstream
+rejects that tool. AAWM also needs a `public.session_history` metric that
+captures the delay between a previous response finishing and the next request
+entering processing for the same session.
+
+**Fix:** Mark Codex Spark as not supporting `image_generation` hosted tools,
+sanitize that hosted tool out of native Codex Responses requests on both the
+generic passthrough and first-class Responses paths, preserve normal function
+tools, and retain auditable metadata for removed hosted tools. Add
+`previous_response_to_current_request_ms` to `public.session_history`, derive it
+from the immediately previous same-session row when writes are persisted, and
+extend the latency backfill script with a separate gap-metric pass for existing
+rows.
+
+**Why not upstream:** The Codex hosted-tool filter is tied to AAWM's native
+Codex passthrough deployment shape and current model catalog policy. The
+session-history response-gap field is AAWM tristore telemetry.
+
+**Validation status:** Focused unit coverage verifies the hosted-tool sanitizer
+for passthrough and first-class Responses routes, non-Spark behavior, preserved
+function tools, and session-history metadata retention. Dev `:4001` live smoke
+for `codex exec --profile litellm-dev -m gpt-5.3-codex-spark "just a test msg"`
+completed without the upstream image-generation 400. Focused session-history
+tests verify the widened payload and post-insert gap update; static checks
+covered the callback sources and the latency backfill script. The current
+release candidate should be treated as a new base fork candidate because the
+Codex sanitizer touches core passthrough/Responses code and model metadata;
+main-branch artifact automation is expected to advance the callback,
+control-plane, and model-config overlay lines before the infrastructure rebuild.
 
 ---
 
