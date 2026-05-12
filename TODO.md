@@ -48,24 +48,26 @@ these docs only as needed:
 
 ## Validated Context
 
-- Prod release for the session-history telemetry overlay is complete on
-  `:4000`. GitHub Releases `cb-v0.0.18` and `h-v0.0.28` exist with assets,
-  `cb-latest` and `h-latest` point at those tags, and
-  `/home/zepfu/projects/aawm-infrastructure` has a rebuilt local
-  `aawm-litellm:latest` image based on
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.43`. The running `aawm-litellm` container
-  was recreated from that image and is healthy on `127.0.0.1:4000` with
-  `litellm=1.82.3+aawm.43`, `aawm-litellm-callbacks=0.0.18`, and
-  `aawm-litellm-control-plane=0.0.6`. Prod `public.session_history` backfills
-  ran against exact database `aawm_tristore`; final aggregate verification is
-  `stale_local=0`, `cache_miss_null_tokens=0`, `cache_miss_null_cost=4`, and
-  `derivable_latency_null=0`. The four cost-null rows are known NVIDIA
-  `qwen/qwen3-coder-480b-a35b-instruct` rows with token counts present but no
-  response cost or bundled NVIDIA pricing to derive a miss cost from. Prod local
-  LLM smoke session `prod-local-llm-release-20260508` wrote
-  `session_history` row `206279` with `provider=local_llm`,
-  `model=qwen3-heretic-gguf`, `litellm_environment=prod`, and
-  `total_server_elapsed_ms=791.361`.
+- Prod release `aawm.44` is complete on `:4000`. GitHub Releases exist for
+  `v1.82.3-aawm.44`, `cb-v0.0.19`, `cp-v0.0.7`, and `cfg-v0.0.10`, and
+  `/home/zepfu/projects/aawm-infrastructure` pins
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.44` for the standalone LiteLLM image. The
+  running `aawm-litellm` container is healthy on `127.0.0.1:4000` with
+  `litellm=1.82.3+aawm.44`, `aawm-litellm-callbacks=0.0.19`, and
+  `aawm-litellm-control-plane=0.0.7`. Runtime source checks confirmed the
+  D1-081 Spark hosted-tool sanitizer on pass-through and first-class Responses
+  paths, Spark unsupported hosted-tool metadata in the bundled model config,
+  and the D1-082 callback gap metric. Native prod-profile smoke
+  `codex exec --profile litellm -m gpt-5.3-codex-spark "just a test msg"`
+  completed successfully with session
+  `019e1c01-5d30-76e3-8fe6-55eb39e474b8`, writing
+  `session_history` row `301249` with `provider=openai`,
+  `model=gpt-5.3-codex-spark`, and route family `codex_responses`. The
+  latency/gap backfill ran against exact database `aawm_tristore` with
+  `gap_updated_rows=30`; post-backfill verification showed `143040` non-null
+  `previous_response_to_current_request_ms` values out of `251287`
+  `session_history` rows. D1-079 memory-writer verification showed
+  `memory_rows=60` and `0` unrepaired workload/tag rows.
 
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
   Gemini through dev `:4001`. GPT-5.5 passed at
@@ -125,16 +127,6 @@ these docs only as needed:
   `/tmp/claude_adapter_nvidia_parallel_read_tools_trace_fix.json`.
 
 ## Next
-
-- `aawm.44` release artifacts are prepared for the pending D1-081/D1-082 prod
-  cutover. GitHub Releases/assets exist for `v1.82.3-aawm.44`, `cb-v0.0.19`,
-  `cp-v0.0.7`, and `cfg-v0.0.10`; `h-v0.0.28` is unchanged. No prod
-  infrastructure update or `:4000` restart has been done for this release yet.
-  Next action after explicit goahead is in `/home/zepfu/projects/aawm-infrastructure`:
-  update/rebuild the prod image from `ghcr.io/zepfu/litellm:1.82.3-aawm.44`,
-  verify installed package versions, run the Codex Spark native smoke, and run
-  the `session_history` latency/gap backfill against exact database
-  `aawm_tristore`.
 
 - Full monolithic `make test` is still not a clean local release gate. The
   2026-05-01 rerun collected `18172 items / 83 errors` after fixing the three
