@@ -255,6 +255,7 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     rpm: Optional[int]
     provider_specific_entry: Optional[Dict[str, float]]
     uses_embed_content: Optional[bool]
+    unsupported_hosted_tools: Optional[List[str]]
 
 
 class ModelInfo(ModelInfoBase, total=False):

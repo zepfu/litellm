@@ -1,16 +1,75 @@
 """
 Test for response_api_endpoints/endpoints.py
 """
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import Request, Response
 from fastapi.testclient import TestClient
 
 from litellm.proxy.proxy_server import app
 
 
 class TestResponsesAPIEndpoints(unittest.TestCase):
+    @pytest.mark.asyncio
+    async def test_responses_api_drops_codex_spark_image_generation_tool(self):
+        from litellm.proxy.response_api_endpoints.endpoints import responses_api
+
+        body = json.dumps(
+            {
+                "model": "gpt-5.3-codex-spark",
+                "input": "hello",
+                "tools": [
+                    {"type": "image_generation"},
+                    {"type": "function", "name": "read_file"},
+                ],
+            }
+        ).encode("utf-8")
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(scope=scope, receive=receive)
+        seen_data = []
+
+        class FakeProcessor:
+            def __init__(self, data):
+                self.data = data
+                seen_data.append(data)
+
+            async def base_process_llm_request(self, **kwargs):
+                return {"ok": True}
+
+        with patch(
+            "litellm.proxy.response_polling.polling_handler.should_use_polling_for_request",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.response_api_endpoints.endpoints.ProxyBaseLLMRequestProcessing",
+            FakeProcessor,
+        ):
+            response = await responses_api(
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=MagicMock(),
+            )
+
+        assert response == {"ok": True}
+        assert seen_data[0]["tools"] == [{"type": "function", "name": "read_file"}]
+        metadata = seen_data[0]["litellm_metadata"]
+        assert metadata["codex_unsupported_hosted_tool_removed_count"] == 1
+        assert metadata["codex_unsupported_hosted_tool_types_removed"] == [
+            "image_generation"
+        ]
+
     @pytest.mark.asyncio
     @patch("litellm.proxy.proxy_server.llm_router")
     @patch("litellm.proxy.proxy_server.user_api_key_auth")
@@ -193,4 +252,3 @@ class TestResponsesAPIEndpoints(unittest.TestCase):
         assert "x-litellm-response-cost" in response.headers
         response_cost_value = float(response.headers["x-litellm-response-cost"])
         assert response_cost_value == pytest.approx(0.0005, abs=1e-10)
-
