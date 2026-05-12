@@ -1,3 +1,5 @@
+import asyncio
+import datetime
 import os
 from unittest.mock import MagicMock, patch
 
@@ -62,3 +64,30 @@ class TestLangfusePromptManagement:
                 mock_run_async.call_args[0][0]
                 == langfuse_prompt_management.async_log_failure_event
             )
+
+    def test_async_log_success_event_defaults_missing_dynamic_params(self):
+        langfuse_prompt_management = LangfusePromptManagement()
+        mock_logger = MagicMock()
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse_prompt_management.LangFuseHandler"
+        ) as mock_handler:
+            mock_handler.get_langfuse_logger_for_request.return_value = mock_logger
+
+            asyncio.run(
+                langfuse_prompt_management.async_log_success_event(
+                    kwargs={"user": "test-user"},
+                    response_obj={"ok": True},
+                    start_time=datetime.datetime.now(datetime.UTC),
+                    end_time=datetime.datetime.now(datetime.UTC),
+                )
+            )
+
+        mock_handler.get_langfuse_logger_for_request.assert_called_once()
+        assert (
+            mock_handler.get_langfuse_logger_for_request.call_args.kwargs[
+                "standard_callback_dynamic_params"
+            ]
+            == {}
+        )
+        mock_logger.log_event_on_langfuse.assert_called_once()
