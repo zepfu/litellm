@@ -2,6 +2,63 @@
 
 ## 2026-05-12
 
+- Promoted the Codex-native Gemini release to prod `:4000` and closed the
+  final `aawm.47` hotfix.
+
+  Release chain:
+  `aawm.45` packaged the Codex Gemini Code Assist adapter; initial prod smoke
+  exposed Codex sending `reasoning_effort=xhigh` to the Gemini adapter, so
+  `aawm.46` normalized `xhigh` to `high` for Google Code Assist. The successful
+  `aawm.46` smoke then exposed a non-fatal Langfuse callback error on missing
+  `standard_callback_dynamic_params`; `aawm.47` now defaults that value to `{}`
+  on Langfuse success/failure logging.
+
+  Published artifacts:
+  `aawm.46` commit `0a10837148` was tagged as `v1.82.3-aawm.46`, and GitHub
+  Actions run `25756766335` succeeded. `aawm.47` commit `bdf2a2be6e` was pushed
+  to `main` and `develop`, tagged as `v1.82.3-aawm.47`, and GitHub Actions run
+  `25757854966` succeeded, publishing the fork image and GitHub Release.
+  Overlay artifacts remain `cb-v0.0.20`, `cp-v0.0.7`, `cfg-v0.0.10`, and
+  `h-v0.0.28`.
+
+  Runtime evidence:
+  `/home/zepfu/projects/aawm-infrastructure` now pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.47`. The local prod image build produced
+  `aawm-litellm:latest` image id `ae399237b0b2`; package inspection reported
+  `litellm=1.82.3+aawm.47`, `aawm-litellm-callbacks=0.0.20`,
+  `aawm-litellm-control-plane=0.0.7`, and
+  `langfuse_none_guard=True`. Prod was recreated as container
+  `14ce5872fab4`, healthy on `127.0.0.1:4000`; `/health/readiness` returned
+  `status=healthy`, `litellm_version=1.82.3+aawm.47`, and success callbacks
+  including `LangfusePromptManagement` and `AawmAgentIdentity`.
+
+  Smoke and DB evidence:
+  native prod-profile smoke
+  `codex exec --profile litellm -m gemini-3.1-flash-lite-preview "Reply exactly: prod-gemini-aawm47-smoke"`
+  completed successfully with session
+  `019e1dbe-fea3-73f3-8a71-44ade814aa78`, despite Codex reporting
+  `reasoning effort: xhigh`. Exact database
+  `aawm_tristore.public.session_history` row `308938` recorded
+  `provider=gemini`, `model=gemini-3.1-flash-lite-preview`,
+  `client_name=codex_exec`, `litellm_environment=prod`,
+  `litellm_version=1.82.3+aawm.47`,
+  `metadata.passthrough_route_family=codex_google_code_assist_adapter`, and
+  `metadata.codex_adapter_model=gemini-3.1-flash-lite-preview`. The same
+  session wrote `public.rate_limit_observations` rows with
+  `provider=google`, `client=google_code_assist`,
+  `source=google_retrieve_user_quota`, and Gemini request-quota rows including
+  `gemini-3.1-flash-lite-preview` with `remaining_pct=99.125`.
+
+  Validation:
+  `py_compile` passed for the Langfuse prompt-management module and test; the
+  focused Langfuse regression suite passed with `3 passed`; the focused Codex
+  Google Code Assist pass-through suite passed with `7 passed, 289 deselected`;
+  `git diff --check` passed. A post-smoke prod log scan found no `Langfuse
+  Layer Error`, `NoneType`, invalid-reasoning-effort, or model-not-found errors.
+  Remaining visible warnings are the known master-key warning, Langfuse trace
+  header overwrite warnings, and the Google adapter upstream-attempt warning.
+
 - Prepared the `aawm.45` LiteLLM release candidate and local prod image for
   cutover without restarting prod `:4000`.
 

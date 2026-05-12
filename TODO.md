@@ -48,37 +48,27 @@ these docs only as needed:
 
 ## Validated Context
 
-- Prod is still running the completed `aawm.44` release on `:4000`. GitHub Releases exist for
-  `v1.82.3-aawm.44`, `cb-v0.0.19`, `cp-v0.0.7`, and `cfg-v0.0.10`, and
-  `/home/zepfu/projects/aawm-infrastructure` pins
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.45` for the next standalone LiteLLM image. The
-  running `aawm-litellm` container is healthy on `127.0.0.1:4000` with
-  `litellm=1.82.3+aawm.44`, `aawm-litellm-callbacks=0.0.19`, and
-  `aawm-litellm-control-plane=0.0.7`. Runtime source checks confirmed the
-  D1-081 Spark hosted-tool sanitizer on pass-through and first-class Responses
-  paths, Spark unsupported hosted-tool metadata in the bundled model config,
-  and the D1-082 callback gap metric. Native prod-profile smoke
-  `codex exec --profile litellm -m gpt-5.3-codex-spark "just a test msg"`
-  completed successfully with session
-  `019e1c01-5d30-76e3-8fe6-55eb39e474b8`, writing
-  `session_history` row `301249` with `provider=openai`,
-  `model=gpt-5.3-codex-spark`, and route family `codex_responses`. The
-  latency/gap backfill ran against exact database `aawm_tristore` with
-  `gap_updated_rows=30`; post-backfill verification showed `143040` non-null
-  `previous_response_to_current_request_ms` values out of `251287`
-  `session_history` rows. D1-079 memory-writer verification showed
-  `memory_rows=60` and `0` unrepaired workload/tag rows.
-
-- The next `aawm.45` release is prepared but not cut over. LiteLLM `main` and
-  `develop` have the Codex Gemini Code Assist adapter candidate, GitHub
-  Releases exist for `v1.82.3-aawm.45` and `cb-v0.0.20`, and existing overlay
-  artifacts remain `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`. The prepared
-  local prod image `aawm-litellm:latest` has image id `09c88f2ea9f0` and
-  reports `litellm=1.82.3+aawm.45`,
+- Prod is running the completed `aawm.47` release on `:4000`. GitHub Releases
+  exist for `v1.82.3-aawm.47`, `cb-v0.0.20`, `cp-v0.0.7`, and
+  `cfg-v0.0.10`, and `/home/zepfu/projects/aawm-infrastructure` pins
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.47` for the standalone LiteLLM image.
+  The running `aawm-litellm` container is healthy on `127.0.0.1:4000`,
+  container id `14ce5872fab4`, with `litellm=1.82.3+aawm.47`,
   `aawm-litellm-callbacks=0.0.20`, and
-  `aawm-litellm-control-plane=0.0.7`. When the user says release, recreate
-  `aawm-litellm` from the already-built image, then run readiness, package
-  inspection, native Codex Gemini smoke, and session-history/quota checks.
+  `aawm-litellm-control-plane=0.0.7`. Runtime inspection confirmed the
+  Langfuse missing-dynamic-params guard, and native prod-profile smoke
+  `codex exec --profile litellm -m gemini-3.1-flash-lite-preview "Reply exactly: prod-gemini-aawm47-smoke"`
+  completed successfully with session
+  `019e1dbe-fea3-73f3-8a71-44ade814aa78`, writing `session_history` row
+  `308938` with `provider=gemini`, `model=gemini-3.1-flash-lite-preview`,
+  `litellm_version=1.82.3+aawm.47`, and route family
+  `codex_google_code_assist_adapter`. The same session wrote
+  `google/google_code_assist/google_retrieve_user_quota`
+  `rate_limit_observations` rows for Gemini Code Assist request quotas.
+  Recent prod log scan after the smoke found no `Langfuse Layer Error`,
+  `NoneType`, invalid-reasoning-effort, or model-not-found errors; remaining
+  visible lines were expected header-overwrite warnings and the configured
+  master-key warning.
 
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
   Gemini through dev `:4001`. GPT-5.5 passed at
