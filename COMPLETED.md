@@ -1,5 +1,42 @@
 # Completed
 
+## 2026-05-12
+
+- Prepared the `aawm.44` LiteLLM release candidate for prod cutover without
+  touching `/home/zepfu/projects/aawm-infrastructure` or restarting prod
+  `:4000`.
+
+  Release scope:
+  D1-081 adds the Codex Spark native hosted-tool sanitizer on the core
+  passthrough and first-class Responses paths; D1-082 adds
+  `public.session_history.previous_response_to_current_request_ms` plus the
+  latency/gap backfill path. Because D1-081 touches core proxy code and model
+  metadata, this is a new base fork release, not callback-only.
+
+  Published artifacts:
+  `main` was fast-forwarded through `develop`, the artifact autobump advanced
+  `main` to `289d33f0d7`, and `v1.82.3-aawm.44` was tagged from that post-bump
+  commit. GitHub Releases now exist for `v1.82.3-aawm.44`, `cb-v0.0.19`,
+  `cp-v0.0.7`, and `cfg-v0.0.10`; their assets are present, and
+  `cb-latest`, `cp-latest`, and `cfg-latest` point at the artifact-bump commit.
+  `h-v0.0.28` / `h-latest` remain unchanged because this release did not touch
+  the local harness archive.
+
+  Validation before publishing:
+  focused Codex Spark passthrough sanitizer tests passed (`6 passed`),
+  first-class Responses sanitizer test passed (`1 passed`), session-history
+  metadata/gap tests passed (`4 passed`), `git diff --check` passed, targeted
+  Ruff checks passed, callback/backfill `py_compile` passed, and the artifact
+  dry run predicted `cb-v0.0.19`, `cp-v0.0.7`, and `cfg-v0.0.10`.
+
+  Remaining cutover work:
+  after explicit infrastructure approval, update/rebuild the prod LiteLLM image
+  from `ghcr.io/zepfu/litellm:1.82.3-aawm.44`, verify installed packages report
+  `litellm=1.82.3+aawm.44`, `aawm-litellm-callbacks=0.0.19`,
+  `aawm-litellm-control-plane=0.0.7`, smoke Codex Spark native traffic, and run
+  `scripts/backfill_session_history_latency.py --apply --expected-database
+  aawm_tristore` for the new latency/gap field.
+
 ## 2026-05-08
 
 - Promoted the prepared session-history telemetry overlay to prod `:4000`.
