@@ -2,6 +2,42 @@
 
 ## 2026-05-12
 
+- Promoted the prepared `aawm.44` LiteLLM release to prod `:4000`.
+
+  Infrastructure evidence:
+  `/home/zepfu/projects/aawm-infrastructure` now pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.44`. The running `aawm-litellm`
+  container is healthy on `127.0.0.1:4000`, container id `1cf65e1ab153`, from
+  local image `aawm-litellm:latest` image id `27f4ac92e620`.
+
+  Runtime evidence:
+  `/health/readiness` returned `status=healthy`,
+  `litellm_version=1.82.3+aawm.44`, and `AawmAgentIdentity` in success
+  callbacks; `/health/liveliness` returned `"I'm alive!"`. Package/source
+  inspection inside the container reported `litellm=1.82.3+aawm.44`,
+  `aawm-litellm-callbacks=0.0.19`,
+  `aawm-litellm-control-plane=0.0.7`, pass-through sanitizer present,
+  first-class Responses sanitizer hook present, Spark unsupported hosted-tool
+  metadata present in the bundled fallback config, and the callback gap metric
+  present.
+
+  Smoke/backfill evidence:
+  native prod-profile smoke
+  `codex exec --profile litellm -m gpt-5.3-codex-spark "just a test msg"`
+  completed successfully with session
+  `019e1c01-5d30-76e3-8fe6-55eb39e474b8`; `public.session_history` row
+  `301249` in exact database `aawm_tristore` recorded
+  `provider=openai`, `model=gpt-5.3-codex-spark`, and
+  `metadata.passthrough_route_family=codex_responses`. The
+  `previous_response_to_current_request_ms` backfill ran against
+  `aawm_tristore` with `applied=true`, `scanned_rows=149826`,
+  `gap_scanned_rows=108054`, and `gap_updated_rows=30`; post-backfill
+  verification showed `143040` non-null gap values out of `251287`
+  `session_history` rows. D1-079 memory-writer verification returned
+  `memory_rows=60`, `unrepaired_workload_rows=0`, and
+  `unrepaired_tagged_rows=0`.
+
 - Prepared the `aawm.44` LiteLLM release candidate for prod cutover without
   touching `/home/zepfu/projects/aawm-infrastructure` or restarting prod
   `:4000`.
@@ -29,13 +65,12 @@
   Ruff checks passed, callback/backfill `py_compile` passed, and the artifact
   dry run predicted `cb-v0.0.19`, `cp-v0.0.7`, and `cfg-v0.0.10`.
 
-  Remaining cutover work:
-  after explicit infrastructure approval, update/rebuild the prod LiteLLM image
-  from `ghcr.io/zepfu/litellm:1.82.3-aawm.44`, verify installed packages report
-  `litellm=1.82.3+aawm.44`, `aawm-litellm-callbacks=0.0.19`,
-  `aawm-litellm-control-plane=0.0.7`, smoke Codex Spark native traffic, and run
+  Cutover status:
+  completed by the prod promotion entry above. The prod LiteLLM image was
+  updated from `ghcr.io/zepfu/litellm:1.82.3-aawm.44`, package/source checks
+  passed, Codex Spark native traffic was smoked, and
   `scripts/backfill_session_history_latency.py --apply --expected-database
-  aawm_tristore` for the new latency/gap field.
+  aawm_tristore` ran for the new latency/gap field.
 
 ## 2026-05-08
 
