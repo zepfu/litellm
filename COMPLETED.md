@@ -2,6 +2,47 @@
 
 ## 2026-05-12
 
+- Prepared the `aawm.45` LiteLLM release candidate and local prod image for
+  cutover without restarting prod `:4000`.
+
+  Release scope:
+  native Codex `/responses` traffic can now route Gemini preview models through
+  the Google Code Assist OAuth/project/quota path while preserving Codex-facing
+  OpenAI Responses request/response shape. Session-history and rate-limit
+  attribution now retain the Codex Google adapter metadata so rows resolve as
+  `provider=gemini`, Gemini model, and Google Code Assist quota observations.
+
+  Published artifacts:
+  candidate commit `45eade7328` was pushed to `develop` and fast-forwarded to
+  `main`; the artifact autobump advanced `main` to `183c3ff397` and tagged
+  `cb-v0.0.20`. The missing callback GitHub Release asset was built locally
+  and published as
+  `aawm_litellm_callbacks-0.0.20-py3-none-any.whl`; `cb-latest` now points at
+  `183c3ff397`. The base fork image tag/release `v1.82.3-aawm.45` was
+  published by GitHub Actions run `25755115747`. Control-plane, config, and
+  harness overlays remain `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`.
+
+  Validation before publishing:
+  `py_compile` passed for the changed pass-through, callback, overlay, and test
+  files; focused pass-through tests passed with `28 passed, 267 deselected`;
+  focused session-history/quota tests passed with `3 passed, 121 deselected`;
+  `git diff --check` passed. A broad Ruff check on the touched large files was
+  not a clean gate because of pre-existing callback/test-module lint debt
+  (`PLR0915`, unused imports, print statements, and unused locals).
+
+  Prod-image prep:
+  `/home/zepfu/projects/aawm-infrastructure` commit `7c66290` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.45`. A no-cache local build completed and
+  produced `aawm-litellm:latest` image id `09c88f2ea9f0`; image inspection
+  reported `litellm=1.82.3+aawm.45`,
+  `aawm-litellm-callbacks=0.0.20`,
+  `aawm-litellm-control-plane=0.0.7`,
+  `has_codex_google_adapter=True`, and
+  `callback_has_codex_adapter_model=True`. The running prod container was left
+  untouched: `aawm-litellm` remains container id `1cf65e1ab153`, image
+  `27f4ac92e620`, healthy on `127.0.0.1:4000`.
+
 - Promoted the prepared `aawm.44` LiteLLM release to prod `:4000`.
 
   Infrastructure evidence:

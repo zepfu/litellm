@@ -48,10 +48,10 @@ these docs only as needed:
 
 ## Validated Context
 
-- Prod release `aawm.44` is complete on `:4000`. GitHub Releases exist for
+- Prod is still running the completed `aawm.44` release on `:4000`. GitHub Releases exist for
   `v1.82.3-aawm.44`, `cb-v0.0.19`, `cp-v0.0.7`, and `cfg-v0.0.10`, and
   `/home/zepfu/projects/aawm-infrastructure` pins
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.44` for the standalone LiteLLM image. The
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.45` for the next standalone LiteLLM image. The
   running `aawm-litellm` container is healthy on `127.0.0.1:4000` with
   `litellm=1.82.3+aawm.44`, `aawm-litellm-callbacks=0.0.19`, and
   `aawm-litellm-control-plane=0.0.7`. Runtime source checks confirmed the
@@ -68,6 +68,17 @@ these docs only as needed:
   `previous_response_to_current_request_ms` values out of `251287`
   `session_history` rows. D1-079 memory-writer verification showed
   `memory_rows=60` and `0` unrepaired workload/tag rows.
+
+- The next `aawm.45` release is prepared but not cut over. LiteLLM `main` and
+  `develop` have the Codex Gemini Code Assist adapter candidate, GitHub
+  Releases exist for `v1.82.3-aawm.45` and `cb-v0.0.20`, and existing overlay
+  artifacts remain `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`. The prepared
+  local prod image `aawm-litellm:latest` has image id `09c88f2ea9f0` and
+  reports `litellm=1.82.3+aawm.45`,
+  `aawm-litellm-callbacks=0.0.20`, and
+  `aawm-litellm-control-plane=0.0.7`. When the user says release, recreate
+  `aawm-litellm` from the already-built image, then run readiness, package
+  inspection, native Codex Gemini smoke, and session-history/quota checks.
 
 - Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
   Gemini through dev `:4001`. GPT-5.5 passed at
