@@ -1419,13 +1419,14 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 65
+    assert len(payload) == 66
     assert payload[56] == pytest.approx(25.0)
     assert payload[57] == pytest.approx(100.0)
     assert payload[58] == pytest.approx(130.0)
     assert payload[59] == pytest.approx(50.0)
     assert payload[60] == pytest.approx(10.0)
     assert payload[61] == pytest.approx(15.0)
+    assert payload[65] is None
     assert payload[62] == pytest.approx(40.0)
     assert payload[63] == pytest.approx(60.0)
     assert payload[64] == pytest.approx(5.0)
@@ -4233,13 +4234,16 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
 
     await _persist_session_history_record(record)
 
-    mock_conn.execute.assert_awaited_once()
-    executed_args = mock_conn.execute.await_args.args
+    assert mock_conn.execute.await_count == 2
+    executed_args = mock_conn.execute.await_args_list[0].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 65
+    assert len(executed_args[1:]) == 66
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
+    gap_args = mock_conn.execute.await_args_list[1].args
+    assert "previous_response_to_current_request_ms" in gap_args[0]
+    assert gap_args[1] == ["call-123"]
     mock_conn.executemany.assert_awaited_once()
     tool_args = mock_conn.executemany.await_args.args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
@@ -5223,10 +5227,14 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 
     await _persist_session_history_records(records)
 
+    assert mock_conn.execute.await_count == 1
+    gap_args = mock_conn.execute.await_args.args
+    assert "previous_response_to_current_request_ms" in gap_args[0]
+    assert gap_args[1] == ["call-1"]
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
-    assert len(history_args[1][0]) == 65
+    assert len(history_args[1][0]) == 66
     assert history_args[1][0][0] == "call-1"
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
