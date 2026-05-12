@@ -436,6 +436,23 @@ cost map as the container. The repair script defaults
 `LITELLM_LOCAL_MODEL_COST_MAP=True`; only override that when intentionally
 testing against a different cost-map source.
 
+If a release changes `public.session_history` schema or derived telemetry
+columns, run the matching backfill after the prod restart against the exact
+target database and record the database name in evidence. For latency and
+response-gap fields:
+
+```bash
+./.venv/bin/python scripts/backfill_session_history_latency.py \
+  --apply \
+  --expected-database aawm_tristore
+```
+
+For response-gap validation, query recent multi-row sessions and confirm
+non-overlapping rows store
+`current COALESCE(start_time, created_at) - previous end_time` in milliseconds;
+first rows, missing previous `end_time`, and overlapping/concurrent rows should
+remain `NULL`.
+
 ## Optional Provider Lanes
 
 These cases remain available but are not part of the default promotion suite

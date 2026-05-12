@@ -126,6 +126,17 @@ these docs only as needed:
 
 ## Next
 
+- Pending prod release scope after the 2026-05-12 `develop` work is D1-081 plus
+  D1-082. This is not callback-only: D1-081 changes core Codex passthrough /
+  first-class Responses behavior and model metadata, while D1-082 changes the
+  callback overlay and latency backfill script. Prepare this as base fork
+  candidate `1.82.3+aawm.44`; the main-branch artifact autobump dry run from
+  `origin/main..origin/develop` expects `cb-v0.0.19`, `cp-v0.0.7`, and
+  `cfg-v0.0.10`, with no harness bump. Before the infrastructure cutover,
+  verify the GitHub Releases/assets exist; after the prod restart, run the
+  Codex Spark native smoke and the `session_history` latency/gap backfill
+  against exact database `aawm_tristore`.
+
 - Full monolithic `make test` is still not a clean local release gate. The
   2026-05-01 rerun collected `18172 items / 83 errors` after fixing the three
   documentation collection regressions from the earlier `86`-error run. Keep

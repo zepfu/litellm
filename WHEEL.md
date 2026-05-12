@@ -51,6 +51,9 @@ Current responsibilities:
   traces while preserving unrelated explicit caller trace names
 - Claude/Gemini reasoning and signature enrichment
 - `public.session_history` persistence into the AAWM tristore
+- `public.session_history` latency and response-gap telemetry, including
+  `previous_response_to_current_request_ms` for same-session delay between a
+  completed response and the next request start
 - `public.session_history_tool_activity` classification for delegated agents and
   provider-native tool names
 - repository and tenant fallback attribution for native CLI passthrough rows
