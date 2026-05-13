@@ -48,6 +48,19 @@ these docs only as needed:
 
 ## Validated Context
 
+- `aawm.48` is prod-ready up to, but not including, the prod restart/cutover.
+  GitHub Releases exist for `v1.82.3-aawm.48`, `cb-v0.0.21`,
+  `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`; the callback release includes
+  asset `aawm_litellm_callbacks-0.0.21-py3-none-any.whl`.
+  `/home/zepfu/projects/aawm-infrastructure` commit `2ba93fd` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.48`. The local no-cache image build
+  produced `aawm-litellm:latest` image id `c584b3c8eee5`; direct inspection
+  reported `litellm=1.82.3+aawm.48`,
+  `aawm-litellm-callbacks=0.0.21`, and
+  `aawm-litellm-control-plane=0.0.7`. The next explicit release step is the
+  prod restart/recreate command; it has not been run.
+
 - Prod is running the completed `aawm.47` release on `:4000`. GitHub Releases
   exist for `v1.82.3-aawm.47`, `cb-v0.0.20`, `cp-v0.0.7`, and
   `cfg-v0.0.10`, and `/home/zepfu/projects/aawm-infrastructure` pins
