@@ -2685,7 +2685,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 65
+    assert len(payload) == 66
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -2693,7 +2693,18 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
     assert payload[23] == "hit"
     assert payload[35] == "dev"
     assert payload[36] == "1.82.3+aawm.25"
-    assert payload[56:] == (None, None, None, None, None, None, None, None, None)
+    assert payload[56:] == (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
     assert payload[37] == "aawm.25"
     assert "aawm-litellm-callbacks" in payload[38]
     assert payload[39] == "codex-tui"
@@ -3294,6 +3305,15 @@ def test_build_session_history_record_uses_codex_google_code_assist_metadata() -
             "codex_adapter_model": "gemini-3.1-pro-preview",
             "codex_adapter_input_shape": "openai_responses",
             "codex_adapter_output_shape": "openai_responses",
+            "codex_google_code_assist_tool_contract_policy_name": (
+                "codex_google_code_assist_tool_contract_policy"
+            ),
+            "codex_google_code_assist_tool_contract_policy": "append",
+            "codex_google_code_assist_tool_contract_policy_version": (
+                "2026-05-12.v1"
+            ),
+            "codex_google_code_assist_tool_contract_policy_applied": True,
+            "codex_google_code_assist_tool_contract_prompt_chars": 713,
             "google_retrieve_user_quota": {
                 "source": "google_retrieve_user_quota",
                 "buckets": {"items": []},
@@ -3333,6 +3353,27 @@ def test_build_session_history_record_uses_codex_google_code_assist_metadata() -
     assert record["metadata"]["codex_adapter_model"] == "gemini-3.1-pro-preview"
     assert record["metadata"]["codex_adapter_input_shape"] == "openai_responses"
     assert record["metadata"]["codex_adapter_output_shape"] == "openai_responses"
+    assert record["metadata"][
+        "codex_google_code_assist_tool_contract_policy_name"
+    ] == "codex_google_code_assist_tool_contract_policy"
+    assert (
+        record["metadata"]["codex_google_code_assist_tool_contract_policy"]
+        == "append"
+    )
+    assert (
+        record["metadata"]["codex_google_code_assist_tool_contract_policy_version"]
+        == "2026-05-12.v1"
+    )
+    assert (
+        record["metadata"][
+            "codex_google_code_assist_tool_contract_policy_applied"
+        ]
+        is True
+    )
+    assert (
+        record["metadata"]["codex_google_code_assist_tool_contract_prompt_chars"]
+        == 713
+    )
     assert record["metadata"]["google_retrieve_user_quota"] == {
         "source": "google_retrieve_user_quota",
         "buckets": {"items": []},
