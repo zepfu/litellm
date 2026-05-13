@@ -2,6 +2,60 @@
 
 ## 2026-05-12
 
+- Promoted the prepared `aawm.48` LiteLLM release to prod `:4000`.
+
+  Runtime evidence:
+  `/home/zepfu/projects/aawm-infrastructure` remained pinned at commit
+  `2ba93fd` with `Dockerfile.litellm` and `docker-compose.litellm.yml`
+  pointing at `ghcr.io/zepfu/litellm:1.82.3-aawm.48`. Prod was recreated with
+  `docker compose -f docker-compose.litellm.yml up -d --no-build --force-recreate --no-deps litellm`.
+  The running `aawm-litellm` container is now `61c1c73e5e81`, healthy on
+  `127.0.0.1:4000`, from local image `aawm-litellm:latest` image id
+  `c584b3c8eee5`. Package inspection inside the running container reported
+  `litellm=1.82.3+aawm.48`,
+  `aawm-litellm-callbacks=0.0.21`, and
+  `aawm-litellm-control-plane=0.0.7`. `/health/readiness` returned
+  `status=healthy`, `litellm_version=1.82.3+aawm.48`, and success callbacks
+  including `LangfusePromptManagement` and `AawmAgentIdentity`;
+  `/health/liveliness` returned `"I'm alive!"`.
+
+  Smoke and DB evidence:
+  native prod-profile smoke
+  `codex exec --profile litellm -m gemini-3.1-flash-lite-preview "Reply exactly: prod-gemini-aawm48-smoke"`
+  completed with session `019e1ed2-4107-76c2-923a-bda26eb50887` and returned
+  exactly `prod-gemini-aawm48-smoke`. Exact database
+  `aawm_tristore.public.session_history` row `311133` recorded
+  `provider=gemini`, `model=gemini-3.1-flash-lite-preview`,
+  `client_name=codex_exec`, `litellm_environment=prod`,
+  `litellm_version=1.82.3+aawm.48`,
+  `metadata.passthrough_route_family=codex_google_code_assist_adapter`,
+  `metadata.codex_google_code_assist_tool_contract_policy=append`,
+  `metadata.codex_google_code_assist_tool_contract_policy_applied=true`, and
+  policy version `2026-05-12.v1`. The same session wrote
+  `google/google_code_assist/google_retrieve_user_quota` rows for Gemini Code
+  Assist request quotas.
+
+  Tool-use evidence:
+  a second native prod-profile Gemini smoke completed with session
+  `019e1ed3-6cc4-75f3-b80c-a106cb3b50dc`. It ran the requested
+  `printf 'D1-089 prod smoke after cutover'` command and returned the exact
+  command/output. Exact database `aawm_tristore.public.session_history` rows
+  `311143` through `311146` recorded the same Gemini/provider/policy metadata.
+  `public.session_history_tool_activity` stored structured `exec_command`
+  rows for `ls -F .analysis/todo.md`, `cat .analysis/todo.md`, and
+  `printf 'D1-089 prod smoke after cutover'`; the malformed transcript-command
+  detector returned `0`. Matching `rate_limit_observations` rows were written
+  for `gemini-2.5-flash-lite` and `gemini-3.1-flash-lite-preview`.
+
+  Log evidence:
+  overlapping prod logs showed startup, successful `/openai_passthrough/responses`
+  traffic, and the known master-key / Langfuse trace-header warnings. During
+  the tool-use smoke, two transient Google adapter `429` warnings were retried
+  with the configured cooldown and the request completed successfully. No
+  release-blocking `model_not_found`, invalid reasoning effort, Langfuse layer
+  error, `NoneType`, traceback, or pass-through 400 appeared in the inspected
+  logs.
+
 - Prepared the `aawm.48` LiteLLM release and local prod image for cutover
   without restarting prod `:4000`.
 
