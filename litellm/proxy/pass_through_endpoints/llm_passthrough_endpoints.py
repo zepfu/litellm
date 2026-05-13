@@ -181,6 +181,20 @@ Tool usage:
 
 Follow the preserved project, workspace, safety, and operator instructions
 below."""
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME = (
+    "codex_google_code_assist_tool_contract_policy"
+)
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION = "2026-05-12.v1"
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV = (
+    "AAWM_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY"
+)
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT = "append"
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = """Codex tool contract:
+- Tool results are observations only. Never copy a previous tool result, terminal transcript, "Chunk ID", "Wall time", "Process exited", or "Output:" text into the arguments for a later tool call.
+- For every function call, construct arguments from the declared tool schema. If the tool requires `cmd`, the arguments must contain a non-empty `cmd` string. Do not use `output`, `content`, or raw terminal transcript text as a substitute.
+- After a tool result, continue the assigned task. Use the latest user task and requested output shape as authoritative.
+- If a previous tool call failed because required arguments were missing, either retry once with schema-valid arguments or stop and explain the blocker in the final answer.
+- Final answers must address the assigned task directly. Do not return generic descriptions of files unless the user asked for a file overview."""
 _GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = (
     "# Preserved Project And Safety Instructions"
 )
@@ -3271,6 +3285,20 @@ def _get_google_adapter_system_prompt_policy() -> str:
     return _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
 
 
+def _get_codex_google_code_assist_tool_contract_policy() -> str:
+    raw_value = _clean_codex_auth_value(
+        os.getenv(_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV)
+    )
+    if raw_value is None:
+        return _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT
+    normalized_value = raw_value.strip().lower()
+    if normalized_value in {"0", "false", "disabled", "none", "off"}:
+        return "off"
+    if normalized_value in {"1", "true", "enabled", "on", "append"}:
+        return "append"
+    return _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT
+
+
 def _extract_google_adapter_system_text_from_content(content: Any) -> Optional[str]:
     if isinstance(content, str):
         return content
@@ -3324,6 +3352,100 @@ def _replace_google_adapter_system_message_text(
             return updated_message
     updated_message["content"] = rewritten_text
     return updated_message
+
+
+def _append_codex_google_code_assist_tool_contract_to_system_text(
+    system_text: str,
+) -> str:
+    stripped_system_text = system_text.strip()
+    if _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT in stripped_system_text:
+        return stripped_system_text
+    if not stripped_system_text:
+        return _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT
+    return (
+        f"{stripped_system_text}\n\n"
+        f"{_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT}"
+    )
+
+
+def _apply_codex_google_code_assist_tool_contract_policy(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    policy_mode = _get_codex_google_code_assist_tool_contract_policy()
+    metadata = dict(completion_kwargs.get("metadata") or {})
+    policy_metadata: dict[str, Any] = {
+        "codex_google_code_assist_tool_contract_policy_name": (
+            _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME
+        ),
+        "codex_google_code_assist_tool_contract_policy": policy_mode,
+        "codex_google_code_assist_tool_contract_policy_version": (
+            _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION
+        ),
+        "codex_google_code_assist_tool_contract_policy_applied": (
+            policy_mode != "off"
+        ),
+    }
+    if policy_mode != "off":
+        policy_metadata[
+            "codex_google_code_assist_tool_contract_prompt_chars"
+        ] = len(_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT)
+
+    metadata.update(policy_metadata)
+    tags = metadata.get("tags")
+    if not isinstance(tags, list):
+        tags = []
+    metadata["tags"] = list(
+        dict.fromkeys(
+            [
+                *tags,
+                "codex-google-code-assist-tool-contract-policy",
+                f"codex-google-code-assist-tool-contract-policy:{policy_mode}",
+            ]
+        )
+    )
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["metadata"] = metadata
+    if policy_mode == "off":
+        return updated_kwargs, policy_metadata
+
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return updated_kwargs, policy_metadata
+
+    updated_messages = list(messages)
+    system_message_index: Optional[int] = None
+    system_text: Optional[str] = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        candidate_text = _extract_google_adapter_system_text_from_content(
+            message.get("content")
+        )
+        if isinstance(candidate_text, str):
+            system_message_index = index
+            system_text = candidate_text
+            break
+
+    if system_message_index is None or system_text is None:
+        updated_messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT,
+            },
+        )
+    else:
+        updated_messages[system_message_index] = (
+            _replace_google_adapter_system_message_text(
+                cast(dict[str, Any], updated_messages[system_message_index]),
+                _append_codex_google_code_assist_tool_contract_to_system_text(
+                    system_text
+                ),
+            )
+        )
+    updated_kwargs["messages"] = updated_messages
+    return updated_kwargs, policy_metadata
 
 
 def _is_google_adapter_claude_overhead_block(block: str) -> bool:
@@ -3814,6 +3936,14 @@ async def _build_google_code_assist_request_from_completion_kwargs(
     completion_kwargs, system_prompt_policy_changes = _apply_google_adapter_system_prompt_policy(
         completion_kwargs
     )
+    codex_tool_contract_policy_changes: dict[str, Any] = {}
+    if completion_kwargs_are_openai_chat:
+        (
+            completion_kwargs,
+            codex_tool_contract_policy_changes,
+        ) = _apply_codex_google_code_assist_tool_contract_policy(
+            completion_kwargs
+        )
     completion_messages = list(completion_kwargs.get("messages") or [])
     (
         completion_messages,
@@ -3924,6 +4054,7 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         **native_tool_alias_changes,
         **duplicate_tool_response_changes,
         **system_prompt_policy_changes,
+        **codex_tool_contract_policy_changes,
         'google_adapter_session_id_source': session_id_source,
         'google_adapter_session_id_hash': hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8],
     }

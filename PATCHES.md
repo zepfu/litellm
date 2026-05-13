@@ -1619,6 +1619,57 @@ control-plane, and model-config overlay lines before the infrastructure rebuild.
 
 ---
 
+### aawm.45-aawm.48 — Codex-native Gemini Code Assist adapter and child-agent hardening
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `TODO.md`
+- `COMPLETED.md`
+- `PROD_RELEASE.md`
+- `docker-compose.dev.yml`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `litellm/integrations/langfuse/langfuse_prompt_management.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_litellm/integrations/langfuse/test_langfuse_prompt_management.py`
+
+**Upstream issue:** AAWM needs normal Codex sessions to dispatch Gemini child
+agents through the existing LiteLLM proxy using Google Code Assist OAuth,
+quota observation, and session-history attribution. The initial prod release
+also exposed two hardening gaps: Codex can request `reasoning_effort=xhigh`,
+which Google Code Assist does not accept, and Gemini child agents can confuse
+terminal tool results for the next tool-call arguments after a tool-result
+turn.
+
+**Fix:** Add a Codex-native Google Code Assist adapter path that translates
+OpenAI Responses/chat-shaped Codex requests into native
+`streamGenerateContent` requests while preserving the Gemini Code Assist OAuth
+token path and quota preflight. Normalize Codex `xhigh` effort to Google
+`high`, keep Langfuse prompt-management logging tolerant of missing dynamic
+callback parameters, and append a Codex-specific tool contract for native
+Gemini Code Assist requests. The tool contract instructs Gemini to treat tool
+results as observations, construct later function-call arguments from the
+declared schema, and never copy prior terminal transcript text such as
+`Chunk ID`, `Wall time`, or `Output:` into executable tool arguments.
+
+**Why not upstream:** This is AAWM-specific Codex/Gemini account routing,
+Google Code Assist OAuth reuse, and child-agent operational hardening for the
+AAWM proxy deployment.
+
+**Validation status:** `aawm.47` is live on prod with the Codex-native Gemini
+adapter, `xhigh` normalization, and Langfuse missing-dynamic-params guard.
+`aawm.48` adds the tool-contract hardening and callback metadata parity. Dev
+`:4001` validation proved `codex exec --profile litellm-dev -m
+gemini-3.1-flash-lite-preview` can run a real shell tool through Gemini, writes
+`provider=gemini` / `model=gemini-3.1-flash-lite-preview` rows with
+`codex_google_code_assist_tool_contract_policy=append`, and records no
+terminal-transcript-shaped malformed Gemini command rows after the smoke.
+
+---
+
 
 ## Dropped Patches
 

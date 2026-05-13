@@ -14,6 +14,8 @@ services:
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
       - ./litellm/integrations/aawm_passthrough_shape_capture.py:/app/litellm/integrations/aawm_passthrough_shape_capture.py
       - ./litellm/integrations/langfuse/langfuse.py:/app/litellm/integrations/langfuse/langfuse.py
+      - ./litellm/integrations/langfuse/langfuse_handler.py:/app/litellm/integrations/langfuse/langfuse_handler.py
+      - ./litellm/integrations/langfuse/langfuse_prompt_management.py:/app/litellm/integrations/langfuse/langfuse_prompt_management.py
       - ./litellm/__init__.py:/app/litellm/__init__.py
       - ./litellm/_lazy_imports_registry.py:/app/litellm/_lazy_imports_registry.py
       - ./litellm/main.py:/app/litellm/main.py

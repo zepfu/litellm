@@ -30,6 +30,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_adapter_request_shape_policy,
     _apply_google_adapter_system_prompt_policy,
     _apply_google_code_assist_native_tool_aliases,
+    _apply_codex_google_code_assist_tool_contract_policy,
     _apply_openai_adapter_parallel_instruction_policy,
     _apply_openrouter_adapter_parallel_instruction_policy,
     _build_anthropic_responses_adapter_request_body,
@@ -769,6 +770,81 @@ class TestGoogleNativeToolAliases:
         assert original_system_text in system_text
         assert changes["google_adapter_system_prompt_policy"] == "append"
         assert changes["google_adapter_system_prompt_removed_claude_overhead_chars"] == 0
+
+    def test_codex_google_tool_contract_policy_appends_to_system_prompt(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "AAWM_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY", "append"
+        )
+        completion_kwargs = {
+            "messages": [
+                {"role": "system", "content": "You are Codex."},
+                {"role": "user", "content": "Read the queue."},
+            ],
+            "metadata": {"tags": ["existing-tag"]},
+        }
+
+        updated_kwargs, changes = (
+            _apply_codex_google_code_assist_tool_contract_policy(
+                completion_kwargs
+            )
+        )
+
+        system_text = updated_kwargs["messages"][0]["content"]
+        metadata = updated_kwargs["metadata"]
+        assert "You are Codex." in system_text
+        assert "Codex tool contract:" in system_text
+        assert "Tool results are observations only." in system_text
+        assert "Never copy a previous tool result" in system_text
+        assert "arguments must contain a non-empty `cmd` string" in system_text
+        assert (
+            changes["codex_google_code_assist_tool_contract_policy"]
+            == "append"
+        )
+        assert (
+            changes["codex_google_code_assist_tool_contract_policy_version"]
+            == "2026-05-12.v1"
+        )
+        assert (
+            metadata["codex_google_code_assist_tool_contract_policy_applied"]
+            is True
+        )
+        assert (
+            "codex-google-code-assist-tool-contract-policy:append"
+            in metadata["tags"]
+        )
+        assert "existing-tag" in metadata["tags"]
+
+    def test_codex_google_tool_contract_policy_off_does_not_rewrite_prompt(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "AAWM_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY", "off"
+        )
+        completion_kwargs = {
+            "messages": [
+                {"role": "system", "content": "You are Codex."},
+                {"role": "user", "content": "Read the queue."},
+            ],
+        }
+
+        updated_kwargs, changes = (
+            _apply_codex_google_code_assist_tool_contract_policy(
+                completion_kwargs
+            )
+        )
+
+        assert updated_kwargs["messages"] == completion_kwargs["messages"]
+        assert (
+            changes["codex_google_code_assist_tool_contract_policy"] == "off"
+        )
+        assert (
+            updated_kwargs["metadata"][
+                "codex_google_code_assist_tool_contract_policy_applied"
+            ]
+            is False
+        )
 
     def test_apply_google_code_assist_native_tool_aliases(self):
         expected_aliases = {
@@ -4296,16 +4372,24 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
 
         request_payload = wrapped_request["request"]
         declarations = request_payload["tools"][0]["functionDeclarations"]
+        system_text = request_payload["systemInstruction"]["parts"][0]["text"]
         assert wrapped_request["model"] == "gemini-3.1-pro-preview"
         assert wrapped_request["project"] == "project_123"
         assert declarations[0]["name"] == "exec_command"
         assert "systemInstruction" in request_payload
+        assert "Codex tool contract:" in system_text
+        assert "Tool results are observations only." in system_text
+        assert "non-empty `cmd` string" in system_text
         assert request_payload["contents"][0]["role"] == "user"
         assert completion_messages[0]["role"] == "user"
         assert tool_name_mapping == {}
         assert (
             changes["google_adapter_codex_developer_messages_as_system_count"]
             == 1
+        )
+        assert (
+            changes["codex_google_code_assist_tool_contract_policy"]
+            == "append"
         )
 
     @pytest.mark.asyncio
@@ -4341,7 +4425,13 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                             {
                                 "role": "tool",
                                 "tool_call_id": "call_exec__thought__sig",
-                                "content": "codex-gemini-tool-smoke",
+                                "content": (
+                                    "Chunk ID: b8716b\n"
+                                    "Wall time: 0.0000 seconds\n"
+                                    "Process exited with code 0\n"
+                                    "Output:\n"
+                                    "codex-gemini-tool-smoke"
+                                ),
                             },
                         ],
                         "tools": [
@@ -4399,6 +4489,9 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             for part in content.get("parts", [])
             if isinstance(part, dict)
         ]
+        system_text = wrapped_request["request"]["systemInstruction"]["parts"][0][
+            "text"
+        ]
         function_calls = [
             part["functionCall"] for part in request_parts if "functionCall" in part
         ]
@@ -4424,6 +4517,9 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "cmd": "printf codex-gemini-tool-smoke"
         }
         assert function_responses[0]["name"] == "exec_command"
+        assert "Codex tool contract:" in system_text
+        assert "Tool results are observations only." in system_text
+        assert "Never copy a previous tool result" in system_text
         assert all("text" not in part for part in request_parts[1:])
         assert (
             changes["google_adapter_codex_repaired_missing_tool_call_count"]
