@@ -2,6 +2,47 @@
 
 ## 2026-05-12
 
+- Prepared the `aawm.48` LiteLLM release and local prod image for cutover
+  without restarting prod `:4000`.
+
+  Release scope:
+  Codex-native Gemini child-agent requests now receive the Google Code Assist
+  tool-result/schema contract prompt overlay on the Codex-native route only.
+  The release records the prompt-policy metadata into `session_history` so
+  follow-up analysis can distinguish the hardened Codex Google Code Assist
+  path.
+
+  Published artifacts:
+  release candidate commit `30c6983849` was pushed to `main`; the artifact
+  autobump run `25770463131` succeeded and advanced `main` to `ea34b28ff4`,
+  tagging `cb-v0.0.21`. `develop`, `main`, `origin/develop`, and
+  `origin/main` were converged at `ea34b28ff4` before the fork tag was cut.
+  GitHub Actions run `25770532050` succeeded for `v1.82.3-aawm.48`,
+  publishing `ghcr.io/zepfu/litellm:1.82.3-aawm.48` and the GitHub Release.
+  The missing callback release asset was built locally and published as
+  `cb-v0.0.21` with asset
+  `aawm_litellm_callbacks-0.0.21-py3-none-any.whl`. Existing overlay releases
+  remain `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`.
+
+  Prod-image prep:
+  `/home/zepfu/projects/aawm-infrastructure` commit `2ba93fd` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.48`. A no-cache local build completed
+  without recreating prod and produced `aawm-litellm:latest` image id
+  `c584b3c8eee5`; direct image inspection reported
+  `litellm=1.82.3+aawm.48`,
+  `aawm-litellm-callbacks=0.0.21`, and
+  `aawm-litellm-control-plane=0.0.7`. Running prod was not restarted:
+  `docker ps --filter name=aawm-litellm` still showed container
+  `14ce5872fab4`, image `ae399237b0b2`, healthy on `127.0.0.1:4000`.
+
+  Validation:
+  focused release validation passed before publishing:
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py tests/test_litellm/integrations/test_aawm_agent_identity.py -q`
+  (`422 passed`), `py_compile` passed for the callback/pass-through files,
+  targeted Ruff passed on the touched files, and `git diff --check` passed in
+  both repos.
+
 - Promoted the Codex-native Gemini release to prod `:4000` and closed the
   final `aawm.47` hotfix.
 
