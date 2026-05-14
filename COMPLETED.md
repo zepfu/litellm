@@ -42,6 +42,35 @@
   `public.rate_limit_observations` and `public.rate_limit_intervals` was
   refreshed/analyzed in exact database `aawm_tristore`.
 
+  Release:
+  fix commit `f16df28f9f` was pushed to `main` and `develop`; fork image
+  workflow run `25867223817` published `v1.82.3-aawm.50` and
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.50`. Artifact autobump run
+  `25867210855` advanced `main` to `a2eb4c6e58` and tagged `cb-v0.0.26`.
+  Because the tag did not publish a GitHub Release asset, the callback wheel
+  was built locally and published manually as release `cb-v0.0.26` with asset
+  `aawm_litellm_callbacks-0.0.26-py3-none-any.whl`.
+
+  Prod cutover:
+  `/home/zepfu/projects/aawm-infrastructure` commit `4dcefb1` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.50`. The rebuilt local image is
+  `aawm-litellm:latest` image id `5d05f2dd5e0e`; running container
+  `dc96d643dff4` is healthy on `127.0.0.1:4000`. Runtime package inspection
+  reports `litellm=1.82.3+aawm.50`, `aawm-litellm-callbacks=0.0.26`, and
+  `aawm-litellm-control-plane=0.0.7`.
+
+  Live post-cutover proof:
+  exact database `aawm_tristore.public.rate_limit_observations` had `23`
+  Anthropic rows at or after `2026-05-14 15:10:00+00`, with latest observed at
+  `2026-05-14 15:16:41.718051+00`; grouped rows included
+  `anthropic_unified_5h:5h` and `anthropic_unified_7d:7d`, both sourced from
+  `anthropic_response_headers`. `public.rate_limit_intervals` was refreshed and
+  analyzed after the cutover and reported `2548` rows with Anthropic interval
+  `max(fromdate)=2026-05-14 15:13:01.394973+00`. A filtered prod log scan since
+  the cutover found no release-blocking error patterns; one upstream
+  ChatGPT/Codex `503` occurred and the following passthrough retry succeeded.
+
 - Repaired malformed `public.session_history` repository identity values in
   exact database `aawm_tristore`.
 
