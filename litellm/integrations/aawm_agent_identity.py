@@ -1501,6 +1501,9 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
     ),
 )
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
+_AAWM_REPOSITORY_ID_PATTERN = re.compile(
+    r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$"
+)
 _CODEX_MEMORY_WORKFLOW_REQUIRED_MARKER = "memory writing agent"
 _CODEX_MEMORY_WORKFLOW_CONTEXT_MARKERS = (
     "raw rollouts",
@@ -1956,7 +1959,16 @@ def _extract_tenant_identity_from_langfuse_trace_observation(
     )
 
 
+def _is_valid_repository_identity(value: str) -> bool:
+    if value.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
+        value = value[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
+    return bool(_AAWM_REPOSITORY_ID_PATTERN.fullmatch(value))
+
+
 def _normalize_repository_identity(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+
     cleaned = _clean_non_empty_string(value)
     if not cleaned:
         return None
@@ -1982,7 +1994,10 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
 
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
-    return cleaned.strip().strip("/") or None
+    cleaned = cleaned.strip().strip("/")
+    if not cleaned or not _is_valid_repository_identity(cleaned):
+        return None
+    return cleaned
 
 
 def _extract_repository_identity_from_text(value: str) -> Optional[str]:
@@ -6874,6 +6889,8 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     repository = _normalize_repository_identity(record.get("repository"))
     if repository is not None:
         metadata["repository"] = repository
+    else:
+        metadata.pop("repository", None)
 
     tenant_id = _clean_non_empty_string(record.get("tenant_id"))
     if tenant_id is not None:
