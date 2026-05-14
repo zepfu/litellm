@@ -23,14 +23,27 @@
   focused session-history tests passed
   `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py -q`
   (`140 passed`, `1 warning`). The repair script applied to `3,877` rows, then
-  a follow-up pass repaired `2` prod rows that landed during verification.
-  Final exact DB checks returned `0` malformed `repository`, `tenant_id`, and
-  `metadata.repository` rows.
+  follow-up passes repaired `2` and then `147` prod rows that landed before the
+  fixed callback was serving. Final exact DB checks returned `0` malformed
+  `repository`, `tenant_id`, and `metadata.repository` rows.
 
-  Caveat:
-  prod `:4000` was still running callback `0.0.23` when those two new rows
-  landed, so the parser hotfix must be promoted in a callback release before
-  future prod traffic is protected.
+  Release:
+  hotfix commit `3878c1a783` was pushed to `main`; artifact autobump run
+  `25839627206` advanced `main` to `7bd79f127f` and tagged `cb-v0.0.24`.
+  Because the tag did not publish a GitHub Release asset, the callback wheel was
+  built locally and published manually as release `cb-v0.0.24` with asset
+  `aawm_litellm_callbacks-0.0.24-py3-none-any.whl`. `develop` was fast-forwarded
+  to the same commit.
+
+  Prod cutover:
+  rebuilt the existing prod image on base `ghcr.io/zepfu/litellm:1.82.3-aawm.49`
+  and recreated only `aawm-litellm`. The rebuilt local image is
+  `aawm-litellm:latest` image id `a07aceecfb05`; running container
+  `d1a51fdc2b4a` is healthy on `127.0.0.1:4000`. Runtime package inspection
+  reports `litellm=1.82.3+aawm.49`, `aawm-litellm-callbacks=0.0.24`, and
+  `aawm-litellm-control-plane=0.0.7`. A running-container normalizer smoke
+  returned `zepfu/litellm` for a GitHub URL and `None` for rollout descriptor
+  and dict/schema inputs.
 
 ## 2026-05-13
 
