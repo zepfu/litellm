@@ -48,6 +48,25 @@ these docs only as needed:
 
 ## Validated Context
 
+- The `aawm.49` release is prepared and published, but prod `:4000` has not
+  been restarted for it. Release candidate commit `a38d79fc25` was pushed to
+  `main`; artifact autobump run `25833914450` succeeded and advanced
+  `main`/`develop` to `6dfff5e366`, tagging `cb-v0.0.22`. GitHub Actions run
+  `25833977035` succeeded for `v1.82.3-aawm.49`, publishing
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.49` and creating the GitHub Release. The
+  callback release `cb-v0.0.22` exists with asset
+  `aawm_litellm_callbacks-0.0.22-py3-none-any.whl`; existing overlay releases
+  remain `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`. Focused validation
+  passed with `434` pytest cases, py_compile, callback mirror diff, PyYAML
+  dev-config parse, targeted Ruff, `git diff --check`, dev `:4001` readiness,
+  clean filtered `litellm-dev` log scan, and exact database
+  `aawm_tristore.public.rate_limit_intervals` verification
+  (`1687` rows, latest interval `2026-05-13 23:59:52.907187+00`, pg_cron jobs
+  `24` and `25` scheduled). Next release step is infrastructure prep/cutover:
+  update/build `/home/zepfu/projects/aawm-infrastructure` from
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.49` and recreate prod only after explicit
+  go-ahead.
+
 - Prod is now running the completed `aawm.48` release on `:4000`.
   GitHub Releases exist for `v1.82.3-aawm.48`, `cb-v0.0.21`,
   `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`; the callback release includes
