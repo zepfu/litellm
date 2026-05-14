@@ -276,6 +276,7 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS previous_response_to_current_request_ms DOUBLE PRECISION",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS session_history_created_at_idx ON public.session_history (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON public.session_history (session_id, model, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_session_start_idx ON public.session_history (session_id, (COALESCE(start_time, created_at)), id)",
@@ -585,11 +586,66 @@ WHERE doomed.id = ranked.id
 _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_identity_latest_idx ON public.rate_limit_observations (provider, client, account_hash, quota_key, source, model, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_quota_observed_idx ON public.rate_limit_observations (quota_key, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_quota_observed_idx ON public.rate_limit_observations (provider, quota_key, observed_at DESC) INCLUDE (expected_reset_at, remaining_pct, quota_type, model) WHERE remaining_pct >= 0",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_model_observed_idx ON public.rate_limit_observations (provider, model, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_type_model_observed_idx ON public.rate_limit_observations (provider, quota_type, model, observed_at DESC) INCLUDE (expected_reset_at, remaining_pct, quota_key) WHERE remaining_pct >= 0",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_client_observed_idx ON public.rate_limit_observations (client, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_reset_idx ON public.rate_limit_observations (expected_reset_at)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_session_idx ON public.rate_limit_observations (session_id, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_trace_call_idx ON public.rate_limit_observations (trace_id, litellm_call_id)",
+)
+_AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL = """
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.rate_limit_intervals AS
+WITH rate_limits AS (
+    SELECT
+        provider,
+        CASE WHEN provider = 'google'
+             THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i')
+             ELSE ''
+        END AS model,
+        quota_key,
+        quota_type,
+        expected_reset_at,
+        remaining_pct,
+        MIN(observed_at) AS fromDate,
+        LEAD(MIN(observed_at)) OVER (
+            PARTITION BY provider,
+                         CASE WHEN provider='google' THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i') ELSE '' END,
+                         quota_key, quota_type
+            ORDER BY MIN(observed_at) ASC
+        ) AS next_fromDate
+    FROM public.rate_limit_observations
+    WHERE provider IN ('openai', 'anthropic', 'google')
+      AND remaining_pct >= 0
+      AND (
+            quota_key IN ('codex:secondary','codex:primary',
+                          'anthropic_unified_7d:7d','anthropic_unified_7d_sonnet:7d_sonnet','anthropic_unified_5h:5h')
+         OR quota_type = 'requests'
+      )
+    GROUP BY provider,
+             CASE WHEN provider='google' THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i') ELSE '' END,
+             quota_key, quota_type, expected_reset_at, remaining_pct
+)
+SELECT
+    provider,
+    model,
+    quota_key,
+    expected_reset_at,
+    remaining_pct,
+    fromDate,
+    COALESCE(next_fromDate, '9999-12-31'::timestamptz) AS toDate,
+    CASE
+        WHEN quota_key IN ('anthropic_unified_7d:7d', 'codex:secondary') THEN 'weekly'
+        WHEN quota_key IN ('anthropic_unified_5h:5h', 'codex:primary') THEN 'short'
+        WHEN quota_key = 'anthropic_unified_7d_sonnet:7d_sonnet' THEN 'weekly_special'
+        ELSE quota_type
+    END AS quota_type
+FROM rate_limits
+"""
+_AAWM_RATE_LIMIT_INTERVALS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS rate_limit_intervals_type_provider_from_idx ON public.rate_limit_intervals (quota_type, provider, fromDate DESC)",
+    "CREATE INDEX IF NOT EXISTS rate_limit_intervals_requests_idx ON public.rate_limit_intervals (quota_type, provider, model, fromDate DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS rate_limit_intervals_unique_idx ON public.rate_limit_intervals (provider, model, quota_key, quota_type, fromDate, expected_reset_at, remaining_pct)",
 )
 _AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.rate_limit_transitions (
@@ -1280,6 +1336,16 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_adapter_target_endpoint",
     "codex_adapter_input_shape",
     "codex_adapter_output_shape",
+    "requested_model_alias",
+    "codex_auto_agent_alias",
+    "codex_auto_agent_selected_provider",
+    "codex_auto_agent_selected_model",
+    "codex_auto_agent_selected_route_family",
+    "codex_auto_agent_selected_last_resort",
+    "codex_auto_agent_selection_reason",
+    "codex_auto_agent_lane_key",
+    "codex_auto_agent_attempts",
+    "codex_auto_agent_skipped_candidates",
     "codex_google_code_assist_dropped_response_tool_types",
     "google_retrieve_user_quota",
     "usage_tool_call_count",
@@ -1325,9 +1391,12 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "aawm_local_route",
     "aawm_local_route_family",
     "aawm_local_model_group",
+    "aawm_local_service",
+    "aawm_local_endpoint",
     "aawm_local_upstream_provider",
     "aawm_local_upstream_model",
     "aawm_local_upstream_api_base",
+    "aawm_local_upstream_url",
     "usage_input_system_tokens_estimated",
     "usage_input_tool_advertisement_tokens_estimated",
     "usage_input_conversation_tokens_estimated",
@@ -1419,8 +1488,12 @@ _AAWM_REPOSITORY_HEADER_NAMES = (
     "x-git-repository",
 )
 _AAWM_REPOSITORY_TEXT_PATTERNS = (
-    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
+    re.compile(
+        r"<environment_context>[\s\S]{0,2000}<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>",
+        re.IGNORECASE,
+    ),
     re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
+    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
     re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)"),
     re.compile(
         r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
@@ -1914,12 +1987,11 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
 
 def _extract_repository_identity_from_text(value: str) -> Optional[str]:
     for pattern in _AAWM_REPOSITORY_TEXT_PATTERNS:
-        match = pattern.search(value)
-        if not match:
-            continue
-        repository = _normalize_repository_identity(match.group("path"))
-        if repository:
-            return repository
+        matches = list(pattern.finditer(value))
+        for match in reversed(matches):
+            repository = _normalize_repository_identity(match.group("path"))
+            if repository:
+                return repository
     return None
 
 
@@ -1936,7 +2008,7 @@ def _extract_repository_identity_from_value(value: Any) -> Optional[str]:
             if repository:
                 return repository
     if isinstance(value, list):
-        for child in value:
+        for child in reversed(value):
             repository = _extract_repository_identity_from_value(child)
             if repository:
                 return repository
@@ -8669,6 +8741,8 @@ def _extract_session_history_api_base(
         litellm_params.get("api_base"),
         metadata.get("api_base"),
         _maybe_get(metadata.get("hidden_params"), "api_base"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "url"),
+        _maybe_get_path(kwargs.get("standard_pass_through_logging_payload"), "url"),
     ):
         sanitized = _sanitize_session_history_api_base(candidate)
         if sanitized:
@@ -8722,6 +8796,73 @@ def _apply_local_llm_route_metadata(
     metadata["aawm_local_upstream_api_base"] = api_base
 
     return "local_llm", model_group
+
+
+_LOCAL_BIOMED_SESSION_HISTORY_ROUTES = {
+    (8094, "/extract"): {
+        "model": "scispacy",
+        "service": "scispacy",
+        "endpoint": "extract",
+    },
+    (8095, "/annotate"): {
+        "model": "tinybern2",
+        "service": "tinybern2",
+        "endpoint": "annotate",
+    },
+}
+
+
+def _resolve_local_biomed_session_history_route(
+    api_base: Optional[str],
+) -> Optional[Dict[str, str]]:
+    sanitized = _sanitize_session_history_api_base(api_base)
+    if not sanitized:
+        return None
+
+    try:
+        parsed = urlsplit(sanitized)
+    except ValueError:
+        return None
+
+    route_info = _LOCAL_BIOMED_SESSION_HISTORY_ROUTES.get(
+        (parsed.port or 0, parsed.path.rstrip("/"))
+    )
+    if route_info is None:
+        return None
+    return dict(route_info)
+
+
+def _apply_local_biomed_route_metadata(
+    *,
+    metadata: Dict[str, Any],
+    resolved_provider: Optional[str],
+    resolved_model: str,
+    model_group: Optional[str],
+    call_type: Any,
+    api_base: Optional[str],
+) -> Tuple[Optional[str], str, Optional[str]]:
+    if str(call_type or "").strip().lower() != "pass_through_endpoint":
+        return resolved_provider, resolved_model, model_group
+
+    route_info = _resolve_local_biomed_session_history_route(api_base)
+    if route_info is None:
+        return resolved_provider, resolved_model, model_group
+
+    route_model = route_info["model"]
+    sanitized_api_base = _sanitize_session_history_api_base(api_base)
+    metadata["aawm_local_route"] = True
+    metadata["aawm_local_route_family"] = "local_biomed_rest"
+    metadata["aawm_local_model_group"] = route_model
+    metadata["aawm_local_service"] = route_info["service"]
+    metadata["aawm_local_endpoint"] = route_info["endpoint"]
+    metadata["aawm_local_upstream_provider"] = "local_rest"
+    metadata["aawm_local_upstream_model"] = route_model
+    if sanitized_api_base:
+        metadata["aawm_local_upstream_api_base"] = sanitized_api_base
+        metadata["aawm_local_upstream_url"] = sanitized_api_base
+    metadata.setdefault("passthrough_route_family", "local_biomed")
+
+    return "local_biomed", route_model, model_group or route_model
 
 
 def _resolve_session_history_model(
@@ -8869,6 +9010,14 @@ def _build_session_history_record(
     )
     provider_for_cache = resolved_provider
     resolved_provider, resolved_model = _apply_local_llm_route_metadata(
+        metadata=metadata,
+        resolved_provider=resolved_provider,
+        resolved_model=resolved_model,
+        model_group=model_group,
+        call_type=kwargs.get("call_type") or standard_logging_object.get("call_type"),
+        api_base=api_base,
+    )
+    resolved_provider, resolved_model, model_group = _apply_local_biomed_route_metadata(
         metadata=metadata,
         resolved_provider=resolved_provider,
         resolved_model=resolved_model,
@@ -9211,6 +9360,9 @@ async def _ensure_session_history_schema(conn: Any) -> None:
         for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS:
             await conn.execute(statement)
         for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS:
+            await conn.execute(statement)
+        await conn.execute(_AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL)
+        for statement in _AAWM_RATE_LIMIT_INTERVALS_INDEX_STATEMENTS:
             await conn.execute(statement)
         await conn.execute(_AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL)
         for statement in _AAWM_RATE_LIMIT_TRANSITIONS_ALTER_STATEMENTS:

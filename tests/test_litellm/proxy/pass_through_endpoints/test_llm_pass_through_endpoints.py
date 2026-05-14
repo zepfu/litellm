@@ -43,6 +43,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _codex_google_code_assist_tool_call_arguments_cache,
     _codex_google_code_assist_tool_call_name_cache,
+    _codex_auto_agent_cooldown_until_monotonic_by_key,
+    _codex_auto_agent_session_affinity_by_key,
     _get_google_adapter_rate_limit_key,
     _get_or_load_google_code_assist_project,
     _get_google_code_assist_prime_cache_key,
@@ -58,9 +60,13 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_openrouter_adapter_hidden_retry_budget_seconds,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
     _handle_anthropic_nvidia_completion_adapter_route,
+    _handle_codex_auto_agent_alias_route,
     _handle_codex_google_code_assist_adapter_route,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
+    _resolve_codex_auto_agent_alias_model,
+    _select_codex_auto_agent_candidate,
+    _set_codex_auto_agent_cooldown,
     _perform_openrouter_adapter_pass_through_request,
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
@@ -2951,6 +2957,9 @@ class TestGoogleAdapterRequestShapePolicy:
                 target="https://example.com",
                 google_access_token="token-123",
                 google_adapter_rate_limit_key="lane-123",
+                google_adapter_max_retries=0,
+                google_adapter_model_capacity_max_retries=0,
+                google_adapter_hidden_retry_budget_seconds=0,
             )
 
         assert result is successful_response
@@ -2959,6 +2968,46 @@ class TestGoogleAdapterRequestShapePolicy:
         assert forwarded_kwargs["target"] == "https://example.com"
         assert "google_access_token" not in forwarded_kwargs
         assert "google_adapter_rate_limit_key" not in forwarded_kwargs
+        assert "google_adapter_max_retries" not in forwarded_kwargs
+        assert "google_adapter_model_capacity_max_retries" not in forwarded_kwargs
+        assert "google_adapter_hidden_retry_budget_seconds" not in forwarded_kwargs
+
+    @pytest.mark.asyncio
+    async def test_google_adapter_request_honors_inline_retry_overrides(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES", "8")
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES", "8")
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "60")
+
+        class Generic429Error(Exception):
+            def __init__(self):
+                self.status_code = 429
+                self.detail = b'{"error":{"message":"quota reset after 4s"}}'
+                super().__init__("generic 429")
+
+        set_cooldown = AsyncMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(side_effect=Generic429Error()),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_google_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._set_google_adapter_cooldown",
+            new=set_cooldown,
+        ):
+            with pytest.raises(Generic429Error):
+                await _perform_google_adapter_pass_through_request(
+                    request=MagicMock(),
+                    google_adapter_max_retries=0,
+                    google_adapter_model_capacity_max_retries=0,
+                    google_adapter_hidden_retry_budget_seconds=0,
+                )
+
+        assert mock_pass_through.await_count == 1
+        set_cooldown.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_google_adapter_request_stops_after_retry_budget(self, monkeypatch):
@@ -9483,6 +9532,44 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["trace_environment"] == "dev"
         assert litellm_metadata["repository"] == "aawm"
 
+    def test_prepare_request_body_for_passthrough_observability_prefers_current_codex_cwd(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-session-aegis"}
+        request_body = {
+            "model": "gemini-3.1-flash-lite-preview",
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "# AGENTS.md instructions for /home/zepfu/projects/aawm-tap\n\n"
+                        "Earlier session context."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "# AGENTS.md instructions for /home/zepfu/projects/aegis-dashboard\n\n"
+                        "<environment_context>\n"
+                        "  <cwd>/home/zepfu/projects/aegis-dashboard</cwd>\n"
+                        "</environment_context>"
+                    ),
+                },
+            ],
+        }
+
+        updated_body = _prepare_request_body_for_passthrough_observability(
+            mock_request,
+            request_body,
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "codex-session-aegis"
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert litellm_metadata["repository"] == "aegis-dashboard"
+
     def test_prepare_request_body_for_passthrough_observability_infers_gemini_workspace_repository(
         self, monkeypatch
     ):
@@ -10278,6 +10365,257 @@ def test_codex_non_spark_keeps_image_generation_tool():
     assert updated_body["tools"] == [{"type": "image_generation"}]
 
 
+def _build_codex_auto_agent_request(session_id: str = "codex-session"):
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = {
+        "session_id": session_id,
+        "user-agent": "codex-cli/1.0",
+        "originator": "codex_cli_rs",
+    }
+    mock_request.query_params = {}
+    mock_request.url = httpx.URL(
+        "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+    )
+    mock_request.scope = {
+        "path": "/openai_passthrough/v1/responses",
+        "query_string": b"",
+    }
+    return mock_request
+
+
+@pytest.fixture(autouse=True)
+def clear_codex_auto_agent_alias_state():
+    _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    _codex_auto_agent_session_affinity_by_key.clear()
+    yield
+    _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    _codex_auto_agent_session_affinity_by_key.clear()
+
+
+def test_resolve_codex_auto_agent_alias_model_only_for_responses():
+    assert (
+        _resolve_codex_auto_agent_alias_model(
+            {"model": "aawm-codex-agent-auto"},
+            endpoint="/v1/responses",
+        )
+        == "aawm-codex-agent-auto"
+    )
+    assert (
+        _resolve_codex_auto_agent_alias_model(
+            {"model": "aawm-codex-agent-auto"},
+            endpoint="/v1/chat/completions",
+        )
+        is None
+    )
+    assert (
+        _resolve_codex_auto_agent_alias_model(
+            {"model": "gemini-3.1-flash-lite-preview"},
+            endpoint="/v1/responses",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_selects_spark_first(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "first_available"
+    assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_skips_cooled_down_candidates(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:session:codex-session",
+        60.0,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "google_code_assist"
+    assert selection["candidate"]["model"] == "gemini-3.1-flash-lite-preview"
+    assert selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_uses_gpt54_mini_only_as_last_resort(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:session:codex-session",
+        60.0,
+    )
+    for model in (
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-pro-preview",
+    ):
+        await _set_codex_auto_agent_cooldown(
+            f"google_code_assist:{model}:google-lane",
+            60.0,
+        )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.4-mini"
+    assert selection["candidate"]["last_resort"] is True
+    assert selection["selection_reason"] == "last_resort"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_native_success_sets_session_affinity(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+        await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    assert mock_pass_through.await_count == 2
+    first_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
+    second_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
+    assert first_body["model"] == "gpt-5.3-codex-spark"
+    assert second_body["model"] == "gpt-5.3-codex-spark"
+    assert first_body["litellm_metadata"]["requested_model_alias"] == (
+        "aawm-codex-agent-auto"
+    )
+    assert second_body["litellm_metadata"]["codex_auto_agent_selection_reason"] == (
+        "session_affinity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_falls_back_to_gemini_after_native_429(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    native_error = ProxyException(
+        message="usage limit",
+        type="invalid_request_error",
+        param="model",
+        code=429,
+    )
+    native_error.detail = {
+        "error": {
+            "message": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        }
+    }
+    gemini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=native_error),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(return_value=gemini_success),
+    ) as mock_gemini:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is gemini_success
+    assert mock_pass_through.await_count == 1
+    mock_gemini.assert_awaited_once()
+    assert mock_gemini.await_args.kwargs["adapter_model"] == (
+        "gemini-3.1-flash-lite-preview"
+    )
+    assert mock_gemini.await_args.kwargs["use_alias_candidate_probe"] is True
+    gemini_body = mock_gemini.await_args.kwargs["prepared_request_body"]
+    assert gemini_body["model"] == "gemini-3.1-flash-lite-preview"
+    assert gemini_body["litellm_metadata"]["requested_model_alias"] == (
+        "aawm-codex-agent-auto"
+    )
+    assert gemini_body["litellm_metadata"]["codex_auto_agent_attempts"][0][
+        "status"
+    ] == "cooldown_set"
+
+
 @pytest.mark.asyncio
 async def test_openai_passthrough_route_sets_repository_trace_environment_and_session(
     monkeypatch,
@@ -10333,6 +10671,55 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     assert litellm_metadata["repository"] == "zepfu/litellm"
     assert litellm_metadata["passthrough_route_family"] == "codex_responses"
     assert "route:codex_responses" in litellm_metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_codex_auto_agent_alias_uses_alias_router(
+    monkeypatch,
+):
+    mock_request = _build_codex_auto_agent_request("codex-session-123")
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(
+            return_value={
+                "model": "aawm-codex-agent-auto",
+                "input": "hello",
+            }
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_auto_agent_alias_route",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_alias_handler, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+    ) as mock_create_pass_through_route:
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://chatgpt.com/backend-api/codex",
+            api_key=None,
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            forward_headers=True,
+        )
+
+    assert result == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    mock_alias_handler.assert_awaited_once()
+    mock_create_pass_through_route.assert_not_called()
+    prepared_body = mock_alias_handler.await_args.kwargs["prepared_request_body"]
+    assert prepared_body["model"] == "aawm-codex-agent-auto"
+    assert prepared_body["litellm_metadata"]["passthrough_route_family"] == (
+        "codex_responses"
+    )
+    assert mock_alias_handler.await_args.kwargs["target_url"] == (
+        "https://chatgpt.com/backend-api/codex/responses"
+    )
 
 
 @pytest.mark.asyncio
