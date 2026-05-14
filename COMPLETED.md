@@ -2,6 +2,69 @@
 
 ## 2026-05-13
 
+- Promoted the `aawm.49` LiteLLM release to prod `:4000` with callback
+  hotfix overlay `0.0.23`.
+
+  Runtime evidence:
+  `/home/zepfu/projects/aawm-infrastructure` now pins the prod LiteLLM base
+  image to `ghcr.io/zepfu/litellm:1.82.3-aawm.49` in
+  `Dockerfile.litellm` and `docker-compose.litellm.yml`. The rebuilt local
+  image is `aawm-litellm:latest` image id `5d0fb153886a`; prod was recreated
+  with `docker compose -f docker-compose.litellm.yml up -d --no-build
+  --force-recreate --no-deps litellm`. The running container is
+  `1563b4463f3d`, healthy on `127.0.0.1:4000`. Runtime package inspection
+  reports `litellm=1.82.3+aawm.49`, `aawm-litellm-callbacks=0.0.23`, and
+  `aawm-litellm-control-plane=0.0.7`; `/health/readiness` returns
+  `status=healthy` with `AawmAgentIdentity` in success callbacks.
+
+  Hotfix scope:
+  native Codex pass-through now treats explicit repository headers such as
+  `x-aawm-repository` as authoritative over free-text cwd inference from the
+  request payload, preventing historical tool output from overriding harness or
+  caller-supplied repository attribution. The callback also normalizes the new
+  Gemini CLI user-agent shape `GeminiCLI-tui/<version>/...` to
+  `client_name=gemini-cli`. The in-repo callback source and callback wheel
+  source remain byte-for-byte identical.
+
+  Published artifacts:
+  hotfix commit `1801e2e6d1` was pushed to `main`; artifact autobump run
+  `25835631268` succeeded and advanced `main` to `94601b242e`, tagging
+  `cb-v0.0.23` and `h-v0.0.29`. Because autobump-created tags did not publish
+  GitHub Release assets, the callback wheel and harness archive were built
+  locally and published manually. Verified releases now include
+  `cb-v0.0.23` with asset
+  `aawm_litellm_callbacks-0.0.23-py3-none-any.whl`, `h-v0.0.29` with asset
+  `litellm-local-ci-harness-0.0.29.tar.gz`, and existing overlays
+  `cp-v0.0.7` and `cfg-v0.0.10`.
+
+  Validation:
+  focused tests passed:
+  `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py -q`
+  (`129 passed`, `1 warning`) and
+  `./.venv/bin/python -m pytest tests/local_ci/test_anthropic_adapter_acceptance_hardening.py -q`
+  (`56 passed`, `1 warning`), with `git diff --check` clean. The release-doc
+  native passthrough shard passed at
+  `/tmp/litellm-prod-native-aawm49-cb23.json` with zero failures and warnings;
+  exact artifact evidence shows Codex session history stored
+  `repository=zepfu/litellm`, `client_name=codex_exec`, and callback
+  `0.0.23`, while Gemini stored `provider=gemini`,
+  `client_name=gemini-cli`, `client_version=0.42.0`, and the original
+  `GeminiCLI-tui/0.42.0/...` user-agent. The focused non-Codex rerun
+  `claude_adapter_gpt54_mini` passed at
+  `/tmp/litellm-prod-gpt54-mini-aawm49-cb23-rerun.json`.
+
+  Default harness caveat:
+  the default prod harness artifact
+  `/tmp/litellm-prod-harness-aawm49-cb23.json` is not fully green because
+  `gpt-5.3-codex-spark` is under upstream Codex account pressure. The failed
+  Spark-dependent cases reported `usage_limit_reached` with reset
+  `2026-05-18 15:08:41 UTC`. The only non-Codex default failure was
+  `claude_adapter_gpt54_mini`, caused by an overlapping transient Codex
+  upstream `503` log line; the focused rerun passed cleanly. A final filtered
+  prod log scan found no release-blocking `ERROR`, traceback, pass-through
+  exception, model-not-found, invalid request, `KeyError`, content-length/h11,
+  ASGI, or `NoneType` patterns.
+
 - Prepared the `aawm.49` LiteLLM release for prod cutover without restarting
   prod `:4000`.
 

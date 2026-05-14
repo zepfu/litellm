@@ -48,24 +48,23 @@ these docs only as needed:
 
 ## Validated Context
 
-- The `aawm.49` release is prepared and published, but prod `:4000` has not
-  been restarted for it. Release candidate commit `a38d79fc25` was pushed to
-  `main`; artifact autobump run `25833914450` succeeded and advanced
-  `main`/`develop` to `6dfff5e366`, tagging `cb-v0.0.22`. GitHub Actions run
-  `25833977035` succeeded for `v1.82.3-aawm.49`, publishing
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.49` and creating the GitHub Release. The
-  callback release `cb-v0.0.22` exists with asset
-  `aawm_litellm_callbacks-0.0.22-py3-none-any.whl`; existing overlay releases
-  remain `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`. Focused validation
-  passed with `434` pytest cases, py_compile, callback mirror diff, PyYAML
-  dev-config parse, targeted Ruff, `git diff --check`, dev `:4001` readiness,
-  clean filtered `litellm-dev` log scan, and exact database
-  `aawm_tristore.public.rate_limit_intervals` verification
-  (`1687` rows, latest interval `2026-05-13 23:59:52.907187+00`, pg_cron jobs
-  `24` and `25` scheduled). Next release step is infrastructure prep/cutover:
-  update/build `/home/zepfu/projects/aawm-infrastructure` from
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.49` and recreate prod only after explicit
-  go-ahead.
+- Prod `:4000` is running the `aawm.49` base image with callback hotfix
+  overlay `0.0.23`. LiteLLM `main` is at `94601b242e` after hotfix commit
+  `1801e2e6d1` and artifact autobump run `25835631268`, with releases
+  `v1.82.3-aawm.49`, `cb-v0.0.23`, `cp-v0.0.7`, `cfg-v0.0.10`, and
+  `h-v0.0.29`. Prod container `1563b4463f3d` is healthy on
+  `127.0.0.1:4000` from local image `aawm-litellm:latest` image id
+  `5d0fb153886a`; package inspection reports `litellm=1.82.3+aawm.49`,
+  `aawm-litellm-callbacks=0.0.23`, and `aawm-litellm-control-plane=0.0.7`.
+  The native prod passthrough shard passed at
+  `/tmp/litellm-prod-native-aawm49-cb23.json`, proving Codex repository
+  attribution (`repository=zepfu/litellm`) and Gemini CLI normalization
+  (`client_name=gemini-cli` for `GeminiCLI-tui/0.42.0/...`). The default prod
+  harness artifact `/tmp/litellm-prod-harness-aawm49-cb23.json` is not fully
+  green only because Spark/Codex cases hit `usage_limit_reached` with reset
+  `2026-05-18 15:08:41 UTC`; the only non-Codex failure was rerun cleanly at
+  `/tmp/litellm-prod-gpt54-mini-aawm49-cb23-rerun.json`. Final filtered prod
+  log scan found no release-blocking patterns.
 
 - Prod is now running the completed `aawm.48` release on `:4000`.
   GitHub Releases exist for `v1.82.3-aawm.48`, `cb-v0.0.21`,
@@ -163,6 +162,14 @@ these docs only as needed:
   `/tmp/claude_adapter_nvidia_parallel_read_tools_trace_fix.json`.
 
 ## Next
+
+- Rerun the Spark/Codex-dependent prod harness cases after the upstream Codex
+  quota reset at `2026-05-18 15:08:41 UTC`: at minimum
+  `claude_adapter_codex_tool_activity`, `claude_adapter_peeromega_fanout`, and
+  `claude_adapter_spark`. The 2026-05-13 prod artifact
+  `/tmp/litellm-prod-harness-aawm49-cb23.json` shows the exact
+  `usage_limit_reached` reset payloads, while non-Codex lanes passed or were
+  rerun cleanly.
 
 - Full monolithic `make test` is still not a clean local release gate. The
   2026-05-01 rerun collected `18172 items / 83 errors` after fixing the three
