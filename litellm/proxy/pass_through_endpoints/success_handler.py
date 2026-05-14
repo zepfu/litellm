@@ -37,6 +37,14 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
     VertexPassthroughLoggingHandler,
 )
 
+_ANTHROPIC_RATE_LIMIT_HEADER_PREFIXES = (
+    "anthropic-ratelimit-",
+    "x-ratelimit-",
+)
+_ANTHROPIC_RATE_LIMIT_HEADER_NAMES = {
+    "retry-after",
+}
+
 
 class PassThroughEndpointLogging:
     def __init__(self):
@@ -80,6 +88,57 @@ class PassThroughEndpointLogging:
 
         # Vertex AI Live API WebSocket
         self.TRACKED_VERTEX_AI_LIVE_ROUTES = ["/vertex_ai/live"]
+
+    @staticmethod
+    def _ensure_metadata(kwargs: dict) -> dict:
+        litellm_params = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+            kwargs["litellm_params"] = litellm_params
+
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            litellm_params["metadata"] = metadata
+        return metadata
+
+    @staticmethod
+    def _sanitize_anthropic_rate_limit_headers(
+        response_headers: httpx.Headers,
+    ) -> dict[str, str]:
+        sanitized: dict[str, str] = {}
+        for header_name, header_value in response_headers.items():
+            normalized_name = str(header_name).lower()
+            if not (
+                normalized_name.startswith(_ANTHROPIC_RATE_LIMIT_HEADER_PREFIXES)
+                or normalized_name in _ANTHROPIC_RATE_LIMIT_HEADER_NAMES
+            ):
+                continue
+            sanitized[normalized_name] = str(header_value)
+        if sanitized:
+            sanitized["source"] = "anthropic_response_headers"
+        return sanitized
+
+    def _record_upstream_rate_limit_headers_metadata(
+        self,
+        kwargs: dict,
+        *,
+        httpx_response: httpx.Response,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+    ) -> None:
+        if not (
+            custom_llm_provider == "anthropic"
+            or self.is_anthropic_route(url_route)
+        ):
+            return
+        sanitized_headers = self._sanitize_anthropic_rate_limit_headers(
+            httpx_response.headers
+        )
+        if not sanitized_headers:
+            return
+        metadata = self._ensure_metadata(kwargs)
+        metadata["anthropic_response_headers"] = sanitized_headers
 
     async def _handle_logging(
         self,
@@ -386,6 +445,12 @@ class PassThroughEndpointLogging:
             metadata["google_retrieve_user_quota"] = sanitized_quota
             metadata["aawm_rate_limit_observation_only"] = True
         else:
+            self._record_upstream_rate_limit_headers_metadata(
+                kwargs,
+                httpx_response=httpx_response,
+                url_route=url_route,
+                custom_llm_provider=custom_llm_provider,
+            )
             normalized_llm_passthrough_logging_payload = (
                 self.normalize_llm_passthrough_logging_payload(
                     httpx_response=httpx_response,

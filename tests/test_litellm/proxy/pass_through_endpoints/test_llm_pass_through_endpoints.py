@@ -2829,6 +2829,31 @@ class TestGoogleAdapterRequestShapePolicy:
         assert headers["anthropic-ratelimit-tokens-remaining"] == "159500"
         assert "authorization" not in headers
 
+    def test_success_handler_records_nonstream_anthropic_rate_limit_headers(self):
+        kwargs = {"litellm_params": {"metadata": {"client_name": "claude-cli"}}}
+        response = httpx.Response(
+            status_code=200,
+            headers={
+                "anthropic-ratelimit-unified-5h-reset": "1778034000",
+                "anthropic-ratelimit-unified-5h-status": "allowed",
+                "anthropic-ratelimit-unified-5h-utilization": "0.42",
+                "authorization": "Bearer should-not-be-logged",
+            },
+        )
+
+        PassThroughEndpointLogging()._record_upstream_rate_limit_headers_metadata(
+            kwargs,
+            httpx_response=response,
+            url_route="https://api.anthropic.com/v1/messages",
+            custom_llm_provider="anthropic",
+        )
+
+        headers = kwargs["litellm_params"]["metadata"]["anthropic_response_headers"]
+        assert headers["source"] == "anthropic_response_headers"
+        assert headers["anthropic-ratelimit-unified-5h-reset"] == "1778034000"
+        assert headers["anthropic-ratelimit-unified-5h-utilization"] == "0.42"
+        assert "authorization" not in headers
+
     def test_streaming_handler_records_codex_rate_limit_headers(self):
         kwargs = {"litellm_params": {"metadata": {"client_name": "codex_exec"}}}
         response = httpx.Response(

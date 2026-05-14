@@ -36,6 +36,7 @@ import re
 import shlex
 import threading
 import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
@@ -3250,6 +3251,14 @@ def _json_safe_rate_limit_value(value: Any) -> Any:
 def _coerce_rate_limit_payload(value: Any) -> Any:
     if isinstance(value, (dict, list)):
         return value
+    if hasattr(value, "items"):
+        try:
+            return {
+                str(key): nested_value
+                for key, nested_value in list(value.items())
+            }
+        except Exception:
+            return None
     if isinstance(value, bytes):
         try:
             return _coerce_rate_limit_payload(value.decode("utf-8", errors="replace"))
@@ -3264,7 +3273,9 @@ def _coerce_rate_limit_payload(value: Any) -> Any:
     if parsed is not None:
         return parsed
     try:
-        literal_value = ast.literal_eval(stripped)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            literal_value = ast.literal_eval(stripped)
     except Exception:
         return None
     if isinstance(literal_value, bytes):
@@ -3718,6 +3729,30 @@ def _rate_limit_candidate_roots(kwargs: Dict[str, Any], result: Any) -> List[Any
         kwargs.get("standard_pass_through_logging_payload"),
         litellm_params.get("metadata") if isinstance(litellm_params, dict) else None,
     ]
+    for candidate in (
+        result,
+        standard_logging_object.get("response")
+        if isinstance(standard_logging_object, dict)
+        else None,
+        standard_logging_object.get("output")
+        if isinstance(standard_logging_object, dict)
+        else None,
+    ):
+        for attr_name in (
+            "_hidden_params",
+            "hidden_params",
+            "additional_headers",
+            "_response_headers",
+            "response_headers",
+            "headers",
+            "upstream_headers",
+        ):
+            attr_value = _maybe_get(candidate, attr_name)
+            if attr_value is not None:
+                roots.append(attr_value)
+                additional_headers = _maybe_get(attr_value, "additional_headers")
+                if additional_headers is not None:
+                    roots.append(additional_headers)
     for key in (
         "rate_limits",
         "codex_rate_limits",
@@ -3966,7 +4001,18 @@ def _extract_codex_header_rate_limit_observations(
 
 def _extract_error_payload_dicts(value: Any) -> List[Dict[str, Any]]:
     roots: List[Any] = [value, str(value)]
-    for attr in ("detail", "body", "response", "message"):
+    for attr in (
+        "detail",
+        "body",
+        "response",
+        "message",
+        "_hidden_params",
+        "hidden_params",
+        "additional_headers",
+        "headers",
+        "response_headers",
+        "upstream_headers",
+    ):
         try:
             attr_value = getattr(value, attr)
         except Exception:
@@ -4076,9 +4122,14 @@ def _get_rate_limit_header_value(
         if isinstance(key, str)
     }
     for header_name in header_names:
-        value = lower_headers.get(header_name.lower())
-        if value is not None:
-            return value
+        normalized_header_name = header_name.lower()
+        for candidate_name in (
+            normalized_header_name,
+            f"llm_provider-{normalized_header_name}",
+        ):
+            value = lower_headers.get(candidate_name)
+            if value is not None:
+                return value
     return None
 
 
@@ -4120,7 +4171,11 @@ def _extract_anthropic_header_rate_limit_observations(
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         source = str(candidate.get("source") or "").lower()
         has_anthropic_header = any(
-            isinstance(key, str) and key.lower().startswith("anthropic-ratelimit-")
+            isinstance(key, str)
+            and (
+                key.lower().startswith("anthropic-ratelimit-")
+                or key.lower().startswith("llm_provider-anthropic-ratelimit-")
+            )
             for key in list(candidate.keys())
         )
         if not has_anthropic_header and source != "anthropic_response_headers":
