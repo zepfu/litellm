@@ -465,7 +465,7 @@
         "expected_provider": "gemini",
         "expected_model": "gemini-2.5-flash",
         "expected_client_name": "gemini-cli",
-        "client_user_agent_contains": "GeminiCLI/",
+        "client_user_agent_contains": "GeminiCLI",
         "metadata_required_equals": {
           "trace_environment": "dev",
           "litellm_environment": "dev",
@@ -534,7 +534,7 @@
         "expected_provider": "gemini",
         "expected_model": "gemini-2.5-flash",
         "expected_client_name": "gemini-cli",
-        "client_user_agent_contains": "GeminiCLI/",
+        "client_user_agent_contains": "GeminiCLI",
         "metadata_required_equals": {
           "trace_environment": "dev",
           "litellm_environment": "dev",

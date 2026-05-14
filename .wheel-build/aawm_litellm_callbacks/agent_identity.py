@@ -2061,6 +2061,14 @@ def _extract_repository_identity_from_kwargs(
     proxy_body = _coerce_mapping(proxy_request.get("body"))
     passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
 
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    for header_name in _AAWM_REPOSITORY_HEADER_NAMES:
+        repository = _normalize_repository_identity(
+            _get_header_value(headers, header_name)
+        )
+        if repository:
+            return repository
+
     repository = _extract_repository_identity_from_metadata_sources(
         ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
         ("litellm_params.litellm_metadata", litellm_params.get("litellm_metadata")),
@@ -2078,14 +2086,6 @@ def _extract_repository_identity_from_kwargs(
     )
     if repository:
         return repository
-
-    headers = _extract_request_headers_from_kwargs(kwargs)
-    for header_name in _AAWM_REPOSITORY_HEADER_NAMES:
-        repository = _normalize_repository_identity(
-            _get_header_value(headers, header_name)
-        )
-        if repository:
-            return repository
 
     return None
 
@@ -2248,7 +2248,10 @@ def _parse_client_identity_from_user_agent(
     known_patterns = (
         (re.compile(r"\bclaude-code/(?P<version>[A-Za-z0-9.+_-]+)"), "claude-code"),
         (re.compile(r"\bcodex-tui/(?P<version>[A-Za-z0-9.+_-]+)"), "codex-tui"),
-        (re.compile(r"\bGeminiCLI/(?P<version>[A-Za-z0-9.+_-]+)"), "gemini-cli"),
+        (
+            re.compile(r"\bGeminiCLI(?:-tui)?/(?P<version>[A-Za-z0-9.+_-]+)"),
+            "gemini-cli",
+        ),
         (re.compile(r"\bOpenAI/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "openai-python"),
         (re.compile(r"\bAnthropic/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "anthropic-python"),
     )

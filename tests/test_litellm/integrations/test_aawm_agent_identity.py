@@ -620,6 +620,46 @@ def test_build_session_history_record_uses_repository_header_and_metadata() -> N
     assert payload[46] == "zepfu/litellm"
 
 
+def test_build_session_history_record_prefers_repository_header_over_request_context() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-repository-header-wins"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-repository-header-wins"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "x-aawm-repository": "https://github.com/zepfu/litellm.git",
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"]["input"] = [
+        {
+            "role": "user",
+            "content": (
+                "<environment_context><cwd>/home/zepfu/projects/"
+                "aegis-dashboard</cwd></environment_context>"
+            ),
+        }
+    ]
+
+    result = {
+        "id": "resp-repository-header-wins",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "zepfu/litellm"
+    assert record["metadata"]["repository"] == "zepfu/litellm"
+
+
 def test_build_session_history_record_uses_repository_as_tenant_fallback() -> None:
     kwargs = _base_kwargs()
     kwargs["passthrough_logging_payload"]["request_body"]["messages"] = []
@@ -1079,6 +1119,11 @@ def test_build_session_history_record_tracks_runtime_and_client_identity() -> No
     ("user_agent", "expected_name", "expected_version"),
     [
         ("GeminiCLI/0.9.1 darwin arm64", "gemini-cli", "0.9.1"),
+        (
+            "GeminiCLI-tui/0.42.0/gemini-2.5-flash (linux; x64; terminal)",
+            "gemini-cli",
+            "0.42.0",
+        ),
         ("OpenAI/Python 1.99.0", "openai-python", "1.99.0"),
         ("Anthropic/Python 0.67.0", "anthropic-python", "0.67.0"),
         ("example-client/2.3.4 extra", "example-client", "2.3.4"),
