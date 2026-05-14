@@ -54,19 +54,20 @@ these docs only as needed:
   verification showed `0` malformed `repository`, `tenant_id`, and
   `metadata.repository` rows. The source and callback-wheel copies of
   `aawm_agent_identity.py` now reject non-string and non-repo-shaped repository
-  values, with focused tests passing. This hotfix is not yet promoted to the
-  running prod callback; prod `:4000` on callback `0.0.23` produced new bad
-  rows during verification, so promote the repository identity normalizer before
-  considering the issue closed for future traffic.
+  values, with focused tests passing. The callback hotfix is promoted to prod
+  as `cb-v0.0.24`; prod `:4000` was rebuilt on the existing `aawm.49` base and
+  is healthy with callback `0.0.24`. Post-deploy DB checks stayed at `0`
+  malformed identity rows while new prod `/openai_passthrough/responses` traffic
+  was arriving.
 
 - Prod `:4000` is running the `aawm.49` base image with callback hotfix
-  overlay `0.0.23`. LiteLLM `main` is at `94601b242e` after hotfix commit
-  `1801e2e6d1` and artifact autobump run `25835631268`, with releases
-  `v1.82.3-aawm.49`, `cb-v0.0.23`, `cp-v0.0.7`, `cfg-v0.0.10`, and
-  `h-v0.0.29`. Prod container `1563b4463f3d` is healthy on
+  overlay `0.0.24`. LiteLLM `main` is at `7bd79f127f` after repository
+  identity hotfix commit `3878c1a783` and artifact autobump run `25839627206`,
+  with releases `v1.82.3-aawm.49`, `cb-v0.0.24`, `cp-v0.0.7`,
+  `cfg-v0.0.10`, and `h-v0.0.29`. Prod container `d1a51fdc2b4a` is healthy on
   `127.0.0.1:4000` from local image `aawm-litellm:latest` image id
-  `5d0fb153886a`; package inspection reports `litellm=1.82.3+aawm.49`,
-  `aawm-litellm-callbacks=0.0.23`, and `aawm-litellm-control-plane=0.0.7`.
+  `a07aceecfb05`; package inspection reports `litellm=1.82.3+aawm.49`,
+  `aawm-litellm-callbacks=0.0.24`, and `aawm-litellm-control-plane=0.0.7`.
   The native prod passthrough shard passed at
   `/tmp/litellm-prod-native-aawm49-cb23.json`, proving Codex repository
   attribution (`repository=zepfu/litellm`) and Gemini CLI normalization
