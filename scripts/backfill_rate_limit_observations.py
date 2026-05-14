@@ -60,6 +60,7 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
     _build_rate_limit_observations,
     _ensure_session_history_schema,
     _persist_session_history_records,
+    _rate_limit_storage_provider,
     _rate_limit_storage_quota_key,
     _rate_limit_storage_remaining_pct,
 )
@@ -589,12 +590,22 @@ def build_record_from_langfuse_event(
 def _observation_signature(observation: Dict[str, Any]) -> Tuple[Any, ...]:
     return (
         observation.get("source"),
+        _rate_limit_storage_provider(observation),
+        observation.get("model"),
         _rate_limit_storage_quota_key(observation),
-        str(observation.get("observed_at")),
-        str(observation.get("provider_resets_at")),
+        _signature_datetime_millis(observation.get("observed_at")),
+        _signature_datetime_millis(observation.get("provider_resets_at")),
         _rate_limit_storage_remaining_pct(observation),
-        observation.get("litellm_call_id"),
+        observation.get("trace_id"),
     )
+
+
+def _signature_datetime_millis(value: Any) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat(timespec="milliseconds")
+    return str(value)
 
 
 async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -606,7 +617,15 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
             if observation.get("litellm_call_id")
         }
     )
-    if not call_ids:
+    trace_ids = sorted(
+        {
+            str(observation.get("trace_id"))
+            for record in records
+            for observation in record.get("rate_limit_observations", [])
+            if observation.get("trace_id")
+        }
+    )
+    if not call_ids and not trace_ids:
         return records
     target_dsn = _build_aawm_dsn()
     if not target_dsn:
@@ -616,13 +635,15 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
         await _ensure_session_history_schema(conn)
         rows = await conn.fetch(
             """
-            SELECT source, quota_key, observed_at,
+            SELECT source, provider, model, quota_key, observed_at,
                    expected_reset_at AS provider_resets_at,
-                   remaining_pct, litellm_call_id
+                   remaining_pct, trace_id
             FROM public.rate_limit_observations
             WHERE litellm_call_id = ANY($1::text[])
+               OR trace_id = ANY($2::text[])
             """,
             call_ids,
+            trace_ids,
         )
     finally:
         await conn.close()
@@ -632,11 +653,13 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
         existing.add(
             (
                 row_dict.get("source"),
+                row_dict.get("provider"),
+                row_dict.get("model"),
                 row_dict.get("quota_key"),
-                str(row_dict.get("observed_at")),
-                str(row_dict.get("provider_resets_at")),
+                _signature_datetime_millis(row_dict.get("observed_at")),
+                _signature_datetime_millis(row_dict.get("provider_resets_at")),
                 row_dict.get("remaining_pct"),
-                row_dict.get("litellm_call_id"),
+                row_dict.get("trace_id"),
             )
         )
     filtered: List[Dict[str, Any]] = []
