@@ -2,6 +2,54 @@
 
 ## 2026-05-14
 
+- Hardened the Anthropic/OpenAI/Gemini rate-limit observation repair path after
+  prod validation showed the first fix was not enough.
+
+  Root cause:
+  historical ClickHouse backfill rows could pass string timestamps into the
+  callback extractor and fall back to wall-clock `observed_at`; stale absolute
+  reset timestamps were also accepted when no relative reset hint was present.
+  The recent backfill dedupe key still allowed live/backfill duplicate pairs
+  when call ids differed or timestamps only differed below millisecond
+  precision.
+
+  Fix and repair:
+  `AawmAgentIdentity` now parses string `start_time` / `end_time` values for
+  rate-limit observations, rejects stale provider reset timestamps after a
+  15-minute tolerance, and only uses stale Codex `reset-at` when a
+  `reset-after-seconds` hint is present. The backfill script dedupes by
+  provider/model/quota/trace/timestamp/value instead of synthetic call id and
+  truncates timestamps to millisecond precision.
+
+  Prod proof:
+  prod `aawm-litellm` is running `litellm=1.82.3+aawm.50`,
+  `aawm-litellm-callbacks=0.0.27`, and
+  `aawm-litellm-control-plane=0.0.7`; readiness is healthy. Exact database
+  `aawm_tristore` was repaired by deleting `219` bad-time historical rows,
+  replaying retained rows through `2026-05-14T16:35:00Z`, deleting `26`
+  duplicate tail rows, and then applying a focused `16:40`-`17:00 UTC` repair
+  after user-reported live drift. That focused repair found retained provider
+  headers for recent Anthropic traffic and a follow-up cleanup deleted `9`
+  live/backfill duplicate tail rows.
+
+  Final data checks:
+  duplicate signature groups are `0|0`, stale reset rows are `0`, and bad
+  `time-*` rows are `0`. After `REFRESH MATERIALIZED VIEW CONCURRENTLY
+  public.rate_limit_intervals` and `ANALYZE`, current Anthropic intervals are
+  visible as short `68` from `2026-05-14 17:00:16.700282+00`, weekly `99` from
+  `2026-05-14 17:00:33.518196+00`, and weekly_special `99` from the same time.
+  Raw retained Anthropic headers for recent trace
+  `d72dadfa-21da-4a1f-8f79-012ad0650f5b` showed
+  `5h-utilization=0.31` and `7d-utilization=0.0`; later live traffic produced
+  the `<100` weekly rows that the current materialized view can display.
+
+  Validation:
+  `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py -q -k "rate_limit_observations or rate_limit_meaningful or repeated_rate_limit or codex_response_headers or anthropic_unified or google_quota"`
+  passed (`16 passed`, `129 deselected`, `1 warning`), and
+  `./.venv/bin/python -m pytest tests/test_scripts/test_backfill_rate_limit_observations.py -q`
+  passed (`7 passed`, `1 warning`). `py_compile`, callback source/wheel parity,
+  and `git diff --check` passed.
+
 - Fixed Anthropic rate-limit observation capture and backfilled retained
   missing observations.
 

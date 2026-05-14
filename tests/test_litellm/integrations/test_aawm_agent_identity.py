@@ -4031,6 +4031,47 @@ def test_build_rate_limit_observations_extracts_codex_response_headers() -> None
     )
 
 
+def test_build_rate_limit_observations_uses_codex_reset_after_when_reset_at_stale() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-codex-stale-reset-at"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-stale-reset-at",
+            "passthrough_route_family": "codex_responses",
+            "codex_response_headers": {
+                "source": "codex_response_headers",
+                "x-codex-primary-reset-after-seconds": "3600",
+                "x-codex-primary-reset-at": "2026-05-14T01:22:21Z",
+                "x-codex-primary-used-percent": "35",
+                "x-codex-primary-window-minutes": "300",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 14, 14, 49, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["provider_resets_at"] == datetime(
+        2026,
+        5,
+        14,
+        15,
+        49,
+        tzinfo=timezone.utc,
+    )
+    assert aawm_agent_identity._build_rate_limit_observation_db_payload(
+        observations[0]
+    )[10] == pytest.approx(65.0)
+
+
 def test_build_rate_limit_observations_skips_malformed_codex_placeholder_headers() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.5"
@@ -4201,6 +4242,35 @@ def test_build_rate_limit_observations_extracts_anthropic_unified_headers() -> N
     assert by_scope["7d_sonnet"]["client_family"] == "claude"
 
 
+def test_build_rate_limit_observations_skips_anthropic_stale_reset_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-stale-reset"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-stale-reset",
+            "client_name": "claude-cli",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-unified-5h-reset": "2026-05-14T02:40:00Z",
+                "anthropic-ratelimit-unified-5h-status": "allowed",
+                "anthropic-ratelimit-unified-5h-utilization": "0.42",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 14, 14, 49, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert observations == []
+
+
 def test_build_rate_limit_observations_extracts_anthropic_hidden_headers() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -4319,6 +4389,35 @@ def test_build_rate_limit_observations_extracts_google_quota_buckets() -> None:
     assert by_model["gemini-2.5-flash"]["used_percentage"] == pytest.approx(9.3)
     assert by_model["gemini-2.5-flash"]["quota_period"] == "daily"
     assert by_model["gemini-2.5-flash-lite"]["used_percentage"] == pytest.approx(2.25)
+
+
+def test_build_rate_limit_observations_skips_google_stale_reset_time() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gemini/gemini-2.5-flash"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["litellm_call_id"] = "call-google-stale-reset-time"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-google-stale-reset-time",
+            "passthrough_route_family": "google_code_assist_generate_content",
+            "google_retrieve_user_quota": {
+                "source": "google_retrieve_user_quota",
+                "modelId": "gemini-2.5-flash",
+                "remainingFraction": 0.5,
+                "resetTime": "2026-05-14T12:50:53Z",
+            },
+        }
+    )
+    end_time = datetime(2026, 5, 14, 14, 49, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert observations == []
 
 
 def test_build_rate_limit_observations_treats_codex_adapter_quota_as_code_assist() -> None:

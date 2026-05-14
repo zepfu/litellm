@@ -63,6 +63,66 @@ def test_should_extract_codex_rate_limits_from_structured_clickhouse_output() ->
         for observation in observations
     )
     assert observations[0]["evidence"]["backfill_source"] == "langfuse_clickhouse"
+    assert observations[0]["observed_at"] == datetime(
+        2026,
+        5,
+        5,
+        15,
+        0,
+        1,
+        tzinfo=timezone.utc,
+    )
+
+
+def test_should_dedupe_backfill_observations_independent_of_call_id() -> None:
+    base = {
+        "source": "codex_response_headers",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "limit_id": "codex",
+        "limit_scope": "primary",
+        "observed_at": datetime(2026, 5, 5, 15, 0, 1, tzinfo=timezone.utc),
+        "provider_resets_at": datetime(2026, 5, 5, 20, 0, tzinfo=timezone.utc),
+        "used_percentage": 42.0,
+        "trace_id": "trace-codex",
+    }
+
+    live_observation = dict(base, litellm_call_id="live-call")
+    backfill_observation = dict(base, litellm_call_id="time-15-00-00_backfill-call")
+
+    assert quota_backfill._observation_signature(live_observation) == (
+        quota_backfill._observation_signature(backfill_observation)
+    )
+
+
+def test_should_dedupe_backfill_observations_at_millisecond_precision() -> None:
+    base = {
+        "source": "codex_response_headers",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "limit_id": "codex",
+        "limit_scope": "primary",
+        "provider_resets_at": datetime(
+            2026, 5, 5, 20, 0, 0, 123456, tzinfo=timezone.utc
+        ),
+        "used_percentage": 42.0,
+        "trace_id": "trace-codex",
+    }
+
+    live_observation = dict(
+        base,
+        observed_at=datetime(2026, 5, 5, 15, 0, 1, 641123, tzinfo=timezone.utc),
+        litellm_call_id="live-call",
+    )
+    backfill_observation = dict(
+        base,
+        observed_at=datetime(2026, 5, 5, 15, 0, 1, 641999, tzinfo=timezone.utc),
+        litellm_call_id="time-15-00-00_backfill-call",
+    )
+
+    assert quota_backfill._observation_signature(live_observation) == (
+        quota_backfill._observation_signature(backfill_observation)
+    )
 
 
 def test_should_ignore_assistant_prose_keyword_matches() -> None:
