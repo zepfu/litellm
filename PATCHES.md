@@ -1670,6 +1670,62 @@ terminal-transcript-shaped malformed Gemini command rows after the smoke.
 
 ---
 
+### aawm.49 — Session-history attribution/performance, local biomedical attribution, and Codex auto-agent fallback
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `WHEEL.md`
+- `litellm-dev-config.yaml`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+
+**Upstream issue:** AAWM needs native Codex/proxy sessions to preserve the
+current workspace repository in `session_history`, keep the recurring
+session-history/rate-limit usage report fast enough for pgAdmin use, record
+local biomedical REST pass-through calls as local biomedical usage, and give
+normal Codex child-agent sessions a single model alias that can move across the
+Spark/Gemini preview lanes before falling back to `gpt-5.4-mini`.
+
+**Fix:** Prioritize current `<environment_context><cwd>...</cwd>` values and
+scan list-shaped request payloads newest-first when deriving repository
+identity. Add a `session_history.created_at` index, rate-limit observation
+indexes, and a durable `public.rate_limit_intervals` materialized view for the
+no-temp usage report path. Add dev pass-through routes for local scispaCy and
+TinyBERN2 REST services and classify those route writes in `session_history` as
+`provider=local_biomed`. Add the `aawm-codex-agent-auto` OpenAI Responses alias
+for Codex agent traffic; it selects Spark first, then the three Gemini preview
+models through the Codex Google Code Assist adapter, and uses `gpt-5.4-mini` as
+the final fallback only after the preferred lanes are exhausted. The alias
+records selected-target/attempt metadata and applies bounded cooldowns for
+`429`, `usage_limit_reached`, `RESOURCE_EXHAUSTED`, and
+`MODEL_CAPACITY_EXHAUSTED` responses.
+
+**Why not upstream:** These are AAWM deployment contracts: repository
+attribution from Codex/Gemini workspace context, AAWM tristore reporting
+objects, local biomedical sidecar routing, Google Code Assist OAuth reuse, and
+the AAWM-specific Codex agent model policy.
+
+**Validation status:** Dev validation on `:4001` proved the repository
+attribution fix with an `aegis-dashboard` Codex session and a historical repair
+of `2,726` semantically misattributed rows in exact database `aawm_tristore`.
+The reusable `public.rate_limit_intervals` view and indexes reduced the
+representative no-temp report from minute-scale interval joins to about four
+seconds under `EXPLAIN ANALYZE`, and pg_cron jobs now refresh/analyze it every
+30 minutes in the live database. Local scispaCy pass-through smoke wrote a
+`provider=local_biomed`, `model=scispacy` row; TinyBERN2 health passes through
+LiteLLM, but live annotation remains blocked by missing sidecar model-id
+configuration outside LiteLLM. The Codex auto-agent alias dev smoke wrote
+`provider=gemini`, `model=gemini-3-flash-preview` after Spark and flash-lite
+reported quota exhaustion. Focused pass-through and session-history unit tests
+cover the new selection, metadata, repository, local biomedical, and materialized
+view behavior.
+
+---
+
 
 ## Dropped Patches
 
