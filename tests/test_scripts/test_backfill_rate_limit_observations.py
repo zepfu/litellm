@@ -122,3 +122,36 @@ def test_should_extract_google_quota_from_structured_metadata() -> None:
     assert observation["used_requests"] == 10
     assert observation["total_requests"] == 1500
     assert observation["used_percentage"] == 10 / 1500 * 100
+
+
+def test_should_extract_anthropic_quota_from_structured_metadata() -> None:
+    row = {
+        "observation_id": "obs-anthropic",
+        "observation_trace_id": "trace-anthropic",
+        "observation_start_time": "2026-05-05T15:00:00Z",
+        "observation_end_time": "2026-05-05T15:00:01Z",
+        "observation_name": "litellm-pass_through_endpoint",
+        "observation_metadata": {
+            "client_name": "claude-cli",
+            "passthrough_route_family": "anthropic_messages",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-unified-5h-reset": "1778034000",
+                "anthropic-ratelimit-unified-5h-status": "allowed",
+                "anthropic-ratelimit-unified-5h-utilization": "0.42",
+            },
+        },
+        "observation_input": None,
+        "observation_output": None,
+        "observation_model": "claude-sonnet-4-6",
+        "observation_environment": "dev",
+    }
+
+    record = quota_backfill.build_record_from_clickhouse_row(row)
+
+    assert record is not None
+    [observation] = record["rate_limit_observations"]
+    assert observation["provider"] == "anthropic"
+    assert observation["client_family"] == "claude"
+    assert observation["limit_scope"] == "5h"
+    assert observation["used_percentage"] == 42.0

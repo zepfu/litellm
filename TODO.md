@@ -48,6 +48,15 @@ these docs only as needed:
 
 ## Validated Context
 
+- Anthropic rate-limit observation capture/backfill is implemented and queued
+  for prod promotion. Root cause was missing non-stream Anthropic response
+  header capture plus extractor blind spots for hidden
+  `llm_provider-anthropic-ratelimit-*` headers. Focused tests, compile,
+  callback source parity, `git diff --check`, ClickHouse backfill, and
+  `rate_limit_intervals` refresh/analyze have passed against exact database
+  `aawm_tristore`. Promote `1.82.3+aawm.50` plus callback `0.0.25` to prod
+  `:4000` and record final runtime evidence before calling D1-100 closed.
+
 - `public.session_history` malformed repository identity rows were repaired in
   exact database `aawm_tristore`: historical free-text rollout descriptors,
   JSON-schema fragments, and CLI option strings were cleared or normalized, and

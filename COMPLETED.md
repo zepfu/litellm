@@ -2,6 +2,46 @@
 
 ## 2026-05-14
 
+- Fixed Anthropic rate-limit observation capture and backfilled retained
+  missing observations.
+
+  Root cause:
+  streaming Anthropic passthrough responses preserved sanitized
+  `anthropic-ratelimit-*` headers, but non-stream Anthropic passthrough
+  responses did not copy upstream response rate-limit headers into callback
+  metadata. Separately, retained callback payloads could carry Anthropic
+  headers under hidden response fields as
+  `llm_provider-anthropic-ratelimit-*`, which the observer did not parse.
+
+  Fix and repair:
+  `litellm/proxy/pass_through_endpoints/success_handler.py` now records
+  sanitized Anthropic non-stream response rate-limit headers before
+  passthrough response normalization. `litellm/integrations/aawm_agent_identity.py`
+  and the mirrored callback wheel source now inspect hidden response/header
+  containers and accept both raw and `llm_provider-`-prefixed Anthropic
+  rate-limit headers. `scripts/backfill_rate_limit_observations.py` scans the
+  new retained metadata markers.
+
+  Validation:
+  focused tests passed:
+  `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py tests/test_scripts/test_backfill_rate_limit_observations.py -q -k 'rate_limit or backfill_rate_limit or anthropic_quota'`
+  (`21 passed`, `1 warning`) and
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py -q -k 'anthropic_rate_limit_headers'`
+  (`2 passed`, warnings only). `py_compile`, source/wheel callback parity, and
+  `git diff --check` also passed.
+
+  Backfill:
+  applied `scripts/backfill_rate_limit_observations.py --source-mode clickhouse`
+  against exact database `aawm_tristore` for
+  `2026-05-05T00:00:00Z` through `2026-05-14T14:35:00Z`. The dry run saw
+  `candidate_records=7207` and `extracted_observations=27955`; the apply run
+  reported `inserted_observations=27955`, `source_errors=0`,
+  `applied=true`. Because the target insert suppresses unchanged snapshots,
+  that insert count is attempted observations, not net table growth. Post-run
+  verification showed `2251` Anthropic rows in
+  `public.rate_limit_observations` and `public.rate_limit_intervals` was
+  refreshed/analyzed in exact database `aawm_tristore`.
+
 - Repaired malformed `public.session_history` repository identity values in
   exact database `aawm_tristore`.
 
