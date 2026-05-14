@@ -821,6 +821,57 @@ def test_build_session_history_record_infers_repository_from_codex_workspace_tex
     assert record["metadata"]["tenant_id"] == "aawm"
 
 
+def test_build_session_history_record_prefers_current_codex_cwd_over_stale_context() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gemini-3.1-flash-lite-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-current-workspace-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-codex-current-workspace-repository"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gemini-3.1-flash-lite-preview",
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "# AGENTS.md instructions for /home/zepfu/projects/aawm-tap\n\n"
+                    "Earlier session context."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "# AGENTS.md instructions for /home/zepfu/projects/aegis-dashboard\n\n"
+                    "<environment_context>\n"
+                    "  <cwd>/home/zepfu/projects/aegis-dashboard</cwd>\n"
+                    "</environment_context>"
+                ),
+            },
+        ],
+    }
+
+    result = {
+        "id": "resp-codex-current-workspace-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-29T10:00:00Z",
+        end_time="2026-04-29T10:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "aegis-dashboard"
+    assert record["tenant_id"] == "aegis-dashboard"
+    assert record["metadata"]["repository"] == "aegis-dashboard"
+    assert record["metadata"]["tenant_id"] == "aegis-dashboard"
+
+
 def test_build_session_history_record_infers_repository_from_gemini_workspace_directories() -> None:
     kwargs = _base_kwargs(trace_name="gemini")
     kwargs["model"] = "gemini-3-flash-preview"
@@ -2338,6 +2389,70 @@ def test_build_session_history_record_marks_local_openai_chat_route() -> None:
         record["metadata"]["aawm_local_upstream_api_base"]
         == "http://172.20.0.1:8093/v1"
     )
+
+
+@pytest.mark.parametrize(
+    ("api_base", "expected_model", "expected_endpoint"),
+    [
+        (
+            "http://user:secret@172.20.0.1:8094/extract?key=should-not-log",
+            "scispacy",
+            "extract",
+        ),
+        (
+            "http://172.20.0.1:8095/annotate",
+            "tinybern2",
+            "annotate",
+        ),
+    ],
+)
+def test_build_session_history_record_marks_local_biomed_passthrough_route(
+    api_base: str,
+    expected_model: str,
+    expected_endpoint: str,
+) -> None:
+    kwargs = _base_kwargs(trace_name="local-biomed")
+    kwargs["model"] = "unknown"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = f"call-local-biomed-{expected_model}"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        f"session-local-biomed-{expected_model}"
+    )
+    kwargs["passthrough_logging_payload"]["url"] = api_base
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "text": "BRCA1 is associated with breast cancer.",
+    }
+    kwargs["standard_logging_object"] = {
+        "metadata": {},
+        "request_tags": [],
+        "model": "unknown",
+        "call_type": "pass_through_endpoint",
+    }
+
+    result = {"id": f"{expected_model}-response-1", "entities": []}
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "local_biomed"
+    assert record["model"] == expected_model
+    assert record["model_group"] == expected_model
+    assert record["metadata"]["passthrough_route_family"] == "local_biomed"
+    assert record["metadata"]["aawm_local_route"] is True
+    assert record["metadata"]["aawm_local_route_family"] == "local_biomed_rest"
+    assert record["metadata"]["aawm_local_model_group"] == expected_model
+    assert record["metadata"]["aawm_local_service"] == expected_model
+    assert record["metadata"]["aawm_local_endpoint"] == expected_endpoint
+    assert record["metadata"]["aawm_local_upstream_provider"] == "local_rest"
+    assert record["metadata"]["aawm_local_upstream_model"] == expected_model
+    assert "secret" not in record["metadata"]["aawm_local_upstream_api_base"]
+    assert "should-not-log" not in record["metadata"]["aawm_local_upstream_api_base"]
 
 
 def test_build_session_history_record_calculates_local_rerank_estimated_cost() -> None:

@@ -10,6 +10,7 @@ import ast
 import asyncio
 import base64
 import codecs
+import copy
 import glob
 import importlib
 import hashlib
@@ -195,6 +196,48 @@ _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = """Codex tool contract:
 - After a tool result, continue the assigned task. Use the latest user task and requested output shape as authoritative.
 - If a previous tool call failed because required arguments were missing, either retry once with schema-valid arguments or stop and explain the blocker in the final answer.
 - Final answers must address the assigned task directly. Do not return generic descriptions of files unless the user asked for a file overview."""
+_CODEX_AUTO_AGENT_MODEL_ALIAS = "aawm-codex-agent-auto"
+_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS = 6 * 60 * 60
+_CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = 45.0
+_CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300.0
+_CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = 30 * 60.0
+_CODEX_AUTO_AGENT_NATIVE_PROVIDER = "openai"
+_CODEX_AUTO_AGENT_GOOGLE_PROVIDER = "google_code_assist"
+_CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "codex_responses",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
+        "model": "gemini-3.1-flash-lite-preview",
+        "route_family": "codex_google_code_assist_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
+        "model": "gemini-3-flash-preview",
+        "route_family": "codex_google_code_assist_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
+        "model": "gemini-3.1-pro-preview",
+        "route_family": "codex_google_code_assist_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.4-mini",
+        "route_family": "codex_responses",
+        "last_resort": True,
+    },
+)
+_codex_auto_agent_cooldown_until_monotonic_by_key: dict[str, float] = {}
+_codex_auto_agent_session_affinity_by_key: dict[str, dict[str, Any]] = {}
+_codex_auto_agent_lock = asyncio.Lock()
 _GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = (
     "# Preserved Project And Safety Instructions"
 )
@@ -272,8 +315,12 @@ _PASSTHROUGH_REPOSITORY_BODY_KEYS = frozenset(
     }
 )
 _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = (
-    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
+    re.compile(
+        r"<environment_context>[\s\S]{0,2000}<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>",
+        re.IGNORECASE,
+    ),
     re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
+    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
     re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)"),
     re.compile(
         r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
@@ -818,6 +865,496 @@ def _resolve_codex_google_code_assist_adapter_model(
         return None
     return _normalize_codex_google_code_assist_adapter_model_name(
         request_body.get("model")
+    )
+
+
+def _is_codex_auto_agent_alias_model(model: Any) -> bool:
+    return (
+        isinstance(model, str)
+        and model.strip().lower() == _CODEX_AUTO_AGENT_MODEL_ALIAS
+    )
+
+
+def _resolve_codex_auto_agent_alias_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    if _is_codex_auto_agent_alias_model(request_body.get("model")):
+        return _CODEX_AUTO_AGENT_MODEL_ALIAS
+    return None
+
+
+def _get_codex_auto_agent_header(
+    headers: dict[str, Any], header_name: str
+) -> Optional[str]:
+    for key, value in headers.items():
+        if not isinstance(key, str) or key.lower() != header_name.lower():
+            continue
+        cleaned = _clean_codex_auth_value(value)
+        if cleaned is not None:
+            return cleaned
+    return None
+
+
+def _hash_codex_auto_agent_lane_value(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _resolve_codex_auto_agent_openai_lane_key(request: Request) -> str:
+    headers = _safe_get_request_headers(request)
+    account_id = _get_codex_auto_agent_header(headers, "chatgpt-account-id")
+    if account_id is not None:
+        return f"chatgpt-account:{account_id}"
+    authorization = _get_codex_auto_agent_header(headers, "authorization")
+    if authorization is not None:
+        return f"auth:{_hash_codex_auto_agent_lane_value(authorization)}"
+    session_header = (
+        _get_codex_auto_agent_header(headers, "session_id")
+        or _get_codex_auto_agent_header(headers, "session-id")
+    )
+    if session_header is not None:
+        return f"session:{session_header}"
+    return "__default__"
+
+
+async def _resolve_codex_auto_agent_google_lane_key() -> str:
+    try:
+        google_access_token = await _load_valid_local_google_oauth_access_token()
+        google_project = await _get_or_load_google_code_assist_project(
+            google_access_token
+        )
+        return _get_google_adapter_rate_limit_key(
+            None,
+            access_token=google_access_token,
+            companion_project=google_project,
+        )
+    except Exception:
+        verbose_proxy_logger.warning(
+            "Codex auto-agent alias could not resolve Google Code Assist lane; using default lane",
+            exc_info=True,
+        )
+        return "__default__"
+
+
+def _resolve_codex_auto_agent_session_key(
+    request: Request,
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    metadata = request_body.get("litellm_metadata")
+    metadata_session_id = (
+        metadata.get("session_id") if isinstance(metadata, dict) else None
+    )
+    session_id = _clean_codex_auth_value(metadata_session_id)
+    headers = _safe_get_request_headers(request)
+    if session_id is None:
+        session_id = (
+            _get_codex_auto_agent_header(headers, "session_id")
+            or _get_codex_auto_agent_header(headers, "session-id")
+        )
+    if session_id is None:
+        return None
+    return f"{session_id}:{_resolve_codex_auto_agent_openai_lane_key(request)}"
+
+
+def _codex_auto_agent_candidate_key(
+    candidate: dict[str, Any],
+    lane_key: str,
+) -> str:
+    return "{}:{}:{}".format(
+        candidate["provider"],
+        candidate["model"],
+        lane_key or "__default__",
+    )
+
+
+def _codex_auto_agent_candidate_public_shape(
+    candidate: dict[str, Any],
+    *,
+    lane_key: Optional[str] = None,
+    cooldown_seconds: Optional[float] = None,
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    shaped = {
+        "provider": candidate["provider"],
+        "model": candidate["model"],
+        "route_family": candidate["route_family"],
+        "last_resort": bool(candidate.get("last_resort")),
+    }
+    if lane_key is not None:
+        shaped["lane_key"] = lane_key
+    if cooldown_seconds is not None:
+        shaped["cooldown_seconds"] = round(float(cooldown_seconds), 3)
+    if reason is not None:
+        shaped["reason"] = reason
+    return shaped
+
+
+async def _get_codex_auto_agent_active_cooldown_seconds(
+    cooldown_key: str,
+) -> float:
+    async with _codex_auto_agent_lock:
+        now = time.monotonic()
+        until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(
+            cooldown_key, 0.0
+        )
+        if until <= now:
+            _codex_auto_agent_cooldown_until_monotonic_by_key.pop(
+                cooldown_key, None
+            )
+            return 0.0
+        return max(0.0, until - now)
+
+
+async def _set_codex_auto_agent_cooldown(
+    cooldown_key: str,
+    cooldown_seconds: float,
+) -> None:
+    async with _codex_auto_agent_lock:
+        until = time.monotonic() + max(0.0, cooldown_seconds)
+        current_until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(
+            cooldown_key, 0.0
+        )
+        if until > current_until:
+            _codex_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
+
+
+async def _get_codex_auto_agent_session_affinity(
+    session_key: Optional[str],
+) -> Optional[dict[str, Any]]:
+    if session_key is None:
+        return None
+    async with _codex_auto_agent_lock:
+        affinity = _codex_auto_agent_session_affinity_by_key.get(session_key)
+        if not isinstance(affinity, dict):
+            return None
+        expires_at = affinity.get("expires_at_monotonic", 0.0)
+        if not isinstance(expires_at, (int, float)) or expires_at <= time.monotonic():
+            _codex_auto_agent_session_affinity_by_key.pop(session_key, None)
+            return None
+        return dict(affinity)
+
+
+async def _set_codex_auto_agent_session_affinity(
+    session_key: Optional[str],
+    candidate: dict[str, Any],
+) -> None:
+    if session_key is None:
+        return
+    async with _codex_auto_agent_lock:
+        _codex_auto_agent_session_affinity_by_key[session_key] = {
+            "provider": candidate["provider"],
+            "model": candidate["model"],
+            "route_family": candidate["route_family"],
+            "last_resort": bool(candidate.get("last_resort")),
+            "expires_at_monotonic": (
+                time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
+            ),
+        }
+
+
+def _find_codex_auto_agent_candidate(
+    provider: Any,
+    model: Any,
+) -> Optional[dict[str, Any]]:
+    for candidate in _CODEX_AUTO_AGENT_CANDIDATES:
+        if candidate["provider"] == provider and candidate["model"] == model:
+            return dict(candidate)
+    return None
+
+
+async def _build_codex_auto_agent_candidate_states(
+    request: Request,
+) -> list[dict[str, Any]]:
+    openai_lane_key = _resolve_codex_auto_agent_openai_lane_key(request)
+    google_lane_key: Optional[str] = None
+    states: list[dict[str, Any]] = []
+    for candidate_template in _CODEX_AUTO_AGENT_CANDIDATES:
+        candidate = dict(candidate_template)
+        if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+            if google_lane_key is None:
+                google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
+            lane_key = google_lane_key
+        else:
+            lane_key = openai_lane_key
+        cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
+        cooldown_seconds = await _get_codex_auto_agent_active_cooldown_seconds(
+            cooldown_key
+        )
+        states.append(
+            {
+                "candidate": candidate,
+                "lane_key": lane_key,
+                "cooldown_key": cooldown_key,
+                "cooldown_seconds": cooldown_seconds,
+            }
+        )
+    return states
+
+
+async def _select_codex_auto_agent_candidate(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    session_key = _resolve_codex_auto_agent_session_key(request, request_body)
+    states = await _build_codex_auto_agent_candidate_states(request)
+    skipped = [
+        _codex_auto_agent_candidate_public_shape(
+            state["candidate"],
+            lane_key=state["lane_key"],
+            cooldown_seconds=state["cooldown_seconds"],
+            reason="cooldown",
+        )
+        for state in states
+        if state["cooldown_seconds"] > 0
+    ]
+
+    affinity = await _get_codex_auto_agent_session_affinity(session_key)
+    if affinity is not None:
+        affinity_candidate = _find_codex_auto_agent_candidate(
+            affinity.get("provider"),
+            affinity.get("model"),
+        )
+        if affinity_candidate is not None:
+            affinity_state = next(
+                (
+                    state
+                    for state in states
+                    if state["candidate"]["provider"] == affinity_candidate["provider"]
+                    and state["candidate"]["model"] == affinity_candidate["model"]
+                ),
+                None,
+            )
+            preferred_available = any(
+                not state["candidate"].get("last_resort")
+                and state["cooldown_seconds"] <= 0
+                for state in states
+            )
+            if (
+                affinity_state is not None
+                and affinity_state["cooldown_seconds"] <= 0
+                and (
+                    not affinity_candidate.get("last_resort")
+                    or not preferred_available
+                )
+            ):
+                return {
+                    **affinity_state,
+                    "session_key": session_key,
+                    "selection_reason": "session_affinity",
+                    "skipped": skipped,
+                }
+
+    for state in states:
+        if state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
+            continue
+        return {
+            **state,
+            "session_key": session_key,
+            "selection_reason": "first_available",
+            "skipped": skipped,
+        }
+
+    for state in states:
+        if not state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
+            continue
+        return {
+            **state,
+            "session_key": session_key,
+            "selection_reason": "last_resort",
+            "skipped": skipped,
+        }
+
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": (
+                    "All Codex auto-agent alias candidates are currently cooled down."
+                ),
+                "type": "rate_limit_error",
+                "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
+            },
+            "candidates": skipped,
+        },
+    )
+
+
+def _codex_auto_agent_error_text(exc: Any) -> str:
+    detail = _extract_google_adapter_exception_detail(exc)
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    else:
+        detail_text = str(detail)
+    return " ".join(
+        str(part)
+        for part in (
+            getattr(exc, "message", None),
+            getattr(exc, "code", None),
+            detail_text,
+            str(exc),
+        )
+        if part is not None
+    )
+
+
+def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
+    tokens: set[str] = set()
+    for parsed in _extract_google_adapter_error_payloads(exc):
+        error_blocks: list[dict[str, Any]] = []
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                error_blocks.append(error)
+        elif isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and isinstance(item.get("error"), dict):
+                    error_blocks.append(item["error"])
+        for error in error_blocks:
+            for key in ("code", "status", "type"):
+                value = error.get(key)
+                if isinstance(value, str) and value:
+                    tokens.add(value)
+                elif isinstance(value, int):
+                    tokens.add(str(value))
+            details = error.get("details")
+            if isinstance(details, list):
+                for detail in details:
+                    if not isinstance(detail, dict):
+                        continue
+                    reason = detail.get("reason")
+                    if isinstance(reason, str) and reason:
+                        tokens.add(reason)
+            message = error.get("message")
+            if isinstance(message, str) and message:
+                lowered = message.lower()
+                if "usage_limit_reached" in lowered:
+                    tokens.add("usage_limit_reached")
+                if "resource_exhausted" in lowered:
+                    tokens.add("RESOURCE_EXHAUSTED")
+                if "model_capacity_exhausted" in lowered:
+                    tokens.add("MODEL_CAPACITY_EXHAUSTED")
+    text_lower = _codex_auto_agent_error_text(exc).lower()
+    if "usage_limit_reached" in text_lower:
+        tokens.add("usage_limit_reached")
+    if "resource_exhausted" in text_lower or "resource exhausted" in text_lower:
+        tokens.add("RESOURCE_EXHAUSTED")
+    if (
+        "model_capacity_exhausted" in text_lower
+        or "model capacity exhausted" in text_lower
+    ):
+        tokens.add("MODEL_CAPACITY_EXHAUSTED")
+    if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
+        tokens.add("RATE_LIMIT_EXCEEDED")
+    return tokens
+
+
+def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    if status_code == 429:
+        return True
+    tokens = _extract_codex_auto_agent_error_tokens(exc)
+    return bool(
+        tokens
+        & {
+            "429",
+            "usage_limit_reached",
+            "RESOURCE_EXHAUSTED",
+            "MODEL_CAPACITY_EXHAUSTED",
+            "RATE_LIMIT_EXCEEDED",
+            "rate_limit_exceeded",
+        }
+    )
+
+
+def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
+    headers = _extract_adapter_upstream_headers(exc)
+    retry_after = _parse_retry_after_seconds_from_headers(headers)
+    if retry_after is not None:
+        return max(1.0, retry_after)
+
+    wait_candidates: list[float] = []
+    for header_name in (
+        "X-RateLimit-Reset",
+        "x-ratelimit-reset",
+        "x-codex-primary-reset-at",
+        "x-codex-secondary-reset-at",
+        "x-codex-bengalfox-primary-reset-at",
+        "x-codex-bengalfox-secondary-reset-at",
+    ):
+        reset_value = _get_adapter_header_value(headers, header_name)
+        if reset_value is None:
+            continue
+        try:
+            reset_number = float(reset_value)
+        except Exception:
+            continue
+        if reset_number > 1_000_000_000_000:
+            reset_epoch_seconds = reset_number / 1000.0
+        else:
+            reset_epoch_seconds = reset_number
+        wait_candidates.append(max(1.0, reset_epoch_seconds - time.time()))
+    if not wait_candidates:
+        return None
+    return min(wait_candidates)
+
+
+def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
+    header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
+    if header_wait is not None:
+        return header_wait
+
+    tokens = _extract_codex_auto_agent_error_tokens(exc)
+    if "MODEL_CAPACITY_EXHAUSTED" in tokens:
+        return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
+    if "usage_limit_reached" in tokens:
+        return _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
+    if "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:
+        return _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    if _extract_google_adapter_exception_status_code(exc) == 429:
+        return _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
+
+
+def _add_codex_auto_agent_alias_metadata(
+    request_body: dict[str, Any],
+    *,
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidate = selection["candidate"]
+    target_model = candidate["model"]
+    updated_body = copy.deepcopy(request_body)
+    updated_body["model"] = target_model
+    skipped = selection.get("skipped") or []
+    return _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            "codex-auto-agent-alias",
+            f"codex-auto-agent-selected:{target_model}",
+            f"codex-auto-agent-route:{candidate['route_family']}",
+            *(
+                ["codex-auto-agent-last-resort"]
+                if candidate.get("last_resort")
+                else []
+            ),
+        ],
+        extra_fields={
+            "requested_model_alias": _CODEX_AUTO_AGENT_MODEL_ALIAS,
+            "codex_auto_agent_alias": _CODEX_AUTO_AGENT_MODEL_ALIAS,
+            "codex_auto_agent_selected_provider": candidate["provider"],
+            "codex_auto_agent_selected_model": target_model,
+            "codex_auto_agent_selected_route_family": candidate["route_family"],
+            "codex_auto_agent_selected_last_resort": bool(
+                candidate.get("last_resort")
+            ),
+            "codex_auto_agent_selection_reason": selection.get("selection_reason"),
+            "codex_auto_agent_lane_key": selection.get("lane_key"),
+            "codex_auto_agent_attempts": attempts,
+            "codex_auto_agent_skipped_candidates": skipped,
+        },
     )
 
 
@@ -1506,6 +2043,26 @@ def _get_google_adapter_max_retries() -> int:
     except Exception:
         return 1
     return max(0, parsed)
+
+
+def _coerce_non_negative_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return max(0, parsed)
+
+
+def _coerce_non_negative_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except Exception:
+        return default
+    return max(0.0, parsed)
 
 
 def _get_google_adapter_post_tool_cooldown_seconds() -> float:
@@ -2426,10 +2983,22 @@ async def _set_google_adapter_cooldown(rate_limit_key: str, wait_seconds: float)
 
 async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Response:
     passthrough_kwargs = dict(kwargs)
-    max_retries = _get_google_adapter_max_retries()
+    max_retries = _coerce_non_negative_int(
+        passthrough_kwargs.pop("google_adapter_max_retries", None),
+        _get_google_adapter_max_retries(),
+    )
     total_attempts = max_retries + 1
-    capacity_total_attempts = _get_google_adapter_model_capacity_max_retries() + 1
-    hidden_retry_budget_seconds = _get_google_adapter_hidden_retry_budget_seconds()
+    capacity_total_attempts = (
+        _coerce_non_negative_int(
+            passthrough_kwargs.pop("google_adapter_model_capacity_max_retries", None),
+            _get_google_adapter_model_capacity_max_retries(),
+        )
+        + 1
+    )
+    hidden_retry_budget_seconds = _coerce_non_negative_float(
+        passthrough_kwargs.pop("google_adapter_hidden_retry_budget_seconds", None),
+        _get_google_adapter_hidden_retry_budget_seconds(),
+    )
     accumulated_hidden_wait_seconds = 0.0
     rate_limit_key = _get_google_adapter_rate_limit_key_from_kwargs(kwargs)
     passthrough_kwargs.pop("google_access_token", None)
@@ -7433,6 +8002,7 @@ async def _perform_codex_google_code_assist_adapter_request(
     request: Request,
     user_api_key_dict: UserAPIKeyAuth,
     adapter_request: SimpleNamespace,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.responses.litellm_completion_transformation.transformation import (
@@ -7470,6 +8040,13 @@ async def _perform_codex_google_code_assist_adapter_request(
             egress_credential_family="google",
             expected_target_family="google",
             google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
+            google_adapter_max_retries=0 if use_alias_candidate_probe else None,
+            google_adapter_model_capacity_max_retries=(
+                0 if use_alias_candidate_probe else None
+            ),
+            google_adapter_hidden_retry_budget_seconds=(
+                0 if use_alias_candidate_probe else None
+            ),
         )
 
         if not isinstance(upstream_response, StreamingResponse):
@@ -7535,6 +8112,7 @@ async def _handle_codex_google_code_assist_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     adapter_request = await _prepare_codex_google_code_assist_adapter_request(
         request=request,
@@ -7545,6 +8123,7 @@ async def _handle_codex_google_code_assist_adapter_route(
         request=request,
         user_api_key_dict=user_api_key_dict,
         adapter_request=adapter_request,
+        use_alias_candidate_probe=use_alias_candidate_probe,
     )
 
 
@@ -9136,12 +9715,11 @@ def _normalize_passthrough_repository(value: str) -> Optional[str]:
 
 def _extract_passthrough_repository_from_text(value: str) -> Optional[str]:
     for pattern in _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS:
-        match = pattern.search(value)
-        if not match:
-            continue
-        repository = _normalize_passthrough_repository(match.group("path"))
-        if repository:
-            return repository
+        matches = list(pattern.finditer(value))
+        for match in reversed(matches):
+            repository = _normalize_passthrough_repository(match.group("path"))
+            if repository:
+                return repository
     return None
 
 
@@ -9158,7 +9736,7 @@ def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
             if repository:
                 return repository
     if isinstance(value, list):
-        for child in value:
+        for child in reversed(value):
             repository = _extract_passthrough_repository_from_body_text(child)
             if repository:
                 return repository
@@ -13431,6 +14009,127 @@ async def openai_proxy_route(
     )
 
 
+async def _perform_codex_auto_agent_native_openai_request(
+    *,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    target_url: str,
+    api_key: Optional[str],
+    forward_headers: bool,
+    request_body: dict[str, Any],
+) -> Response:
+    is_streaming_request = "stream" in str(target_url)
+    return await pass_through_request(
+        request=request,
+        target=target_url,
+        custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+            api_key=api_key,
+            request=request,
+        ),
+        user_api_key_dict=user_api_key_dict,
+        forward_headers=forward_headers,
+        stream=is_streaming_request,
+        custom_body=request_body,
+        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        egress_credential_family="openai" if forward_headers else None,
+        expected_target_family="openai",
+        retryable_upstream_status_codes=[429],
+    )
+
+
+async def _handle_codex_auto_agent_alias_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    target_url: str,
+    api_key: Optional[str],
+    forward_headers: bool,
+) -> Response:
+    attempts: list[dict[str, Any]] = []
+    last_retryable_exc: Optional[Exception] = None
+
+    for _attempt_number in range(len(_CODEX_AUTO_AGENT_CANDIDATES)):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=prepared_request_body,
+        )
+        candidate = selection["candidate"]
+        attempt_record = _codex_auto_agent_candidate_public_shape(
+            candidate,
+            lane_key=selection.get("lane_key"),
+            reason=selection.get("selection_reason"),
+        )
+        attempts.append(attempt_record)
+        candidate_body = _add_codex_auto_agent_alias_metadata(
+            prepared_request_body,
+            selection=selection,
+            attempts=attempts,
+        )
+
+        try:
+            if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+                response = await _handle_codex_google_code_assist_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
+                )
+            else:
+                response = await _perform_codex_auto_agent_native_openai_request(
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    target_url=target_url,
+                    api_key=api_key,
+                    forward_headers=forward_headers,
+                    request_body=candidate_body,
+                )
+            await _set_codex_auto_agent_session_affinity(
+                selection.get("session_key"),
+                candidate,
+            )
+            return response
+        except Exception as exc:
+            if not _is_codex_auto_agent_retryable_exhaustion(exc):
+                raise
+            last_retryable_exc = exc
+            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+            await _set_codex_auto_agent_cooldown(
+                selection["cooldown_key"],
+                cooldown_seconds,
+            )
+            attempt_record.update(
+                {
+                    "status": "cooldown_set",
+                    "cooldown_seconds": round(float(cooldown_seconds), 3),
+                    "error_tokens": sorted(
+                        _extract_codex_auto_agent_error_tokens(exc)
+                    ),
+                }
+            )
+            verbose_proxy_logger.warning(
+                "Codex auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",
+                candidate["provider"],
+                candidate["model"],
+                cooldown_seconds,
+            )
+            continue
+
+    if last_retryable_exc is not None:
+        raise last_retryable_exc
+    raise HTTPException(
+        status_code=429,
+        detail="No Codex auto-agent alias candidates were available.",
+    )
+
+
 class BaseOpenAIPassThroughHandler:
     @staticmethod
     async def _base_openai_pass_through_handler(
@@ -13480,6 +14179,27 @@ class BaseOpenAIPassThroughHandler:
                 prepared_request_body = _add_codex_request_breakout_logging_metadata(
                     prepared_request_body
                 )
+                codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
+                    prepared_request_body,
+                    endpoint=endpoint,
+                )
+                if codex_auto_agent_alias is not None:
+                    prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                        request=request,
+                        request_body=prepared_request_body,
+                    )
+                    if prepared_request_body is not request_body:
+                        _safe_set_request_parsed_body(request, prepared_request_body)
+                    return await _handle_codex_auto_agent_alias_route(
+                        endpoint=endpoint,
+                        request=request,
+                        fastapi_response=fastapi_response,
+                        user_api_key_dict=user_api_key_dict,
+                        prepared_request_body=prepared_request_body,
+                        target_url=str(updated_url),
+                        api_key=api_key,
+                        forward_headers=forward_headers,
+                    )
                 google_adapter_model = _resolve_codex_google_code_assist_adapter_model(
                     prepared_request_body,
                     endpoint=endpoint,

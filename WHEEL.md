@@ -59,6 +59,10 @@ Current responsibilities:
 - repository and tenant fallback attribution for native CLI passthrough rows
   from explicit metadata, `x-aawm-repository`, prepared `litellm_metadata`, and
   Codex/Gemini workspace context text
+- Codex auto-agent alias selected-target, attempt, cooldown, and fallback
+  metadata persistence for `session_history`
+- local biomedical REST pass-through attribution for scispaCy and TinyBERN2
+  route families
 - background batching for `session_history` writes with configurable batch/flush tuning
 - Gemini/Codex usage breakout normalization for cache, reasoning, and tool-call fields
 - prompt-overhead token breakdown estimates in `public.session_history`,
@@ -67,6 +71,8 @@ Current responsibilities:
 - provider-originated `public.rate_limit_observations` capture for Codex/OpenAI
   response headers, Anthropic response headers, Google Code Assist quota
   payloads, and provider quota/capacity errors
+- reusable `public.rate_limit_intervals` materialized-view/index bootstrap for
+  repeated session-history usage reporting
 
 ### Claude control-plane wheel
 
