@@ -48,6 +48,17 @@ these docs only as needed:
 
 ## Validated Context
 
+- `public.session_history` malformed repository identity rows were repaired in
+  exact database `aawm_tristore`: historical free-text rollout descriptors,
+  JSON-schema fragments, and CLI option strings were cleared or normalized, and
+  verification showed `0` malformed `repository`, `tenant_id`, and
+  `metadata.repository` rows. The source and callback-wheel copies of
+  `aawm_agent_identity.py` now reject non-string and non-repo-shaped repository
+  values, with focused tests passing. This hotfix is not yet promoted to the
+  running prod callback; prod `:4000` on callback `0.0.23` produced new bad
+  rows during verification, so promote the repository identity normalizer before
+  considering the issue closed for future traffic.
+
 - Prod `:4000` is running the `aawm.49` base image with callback hotfix
   overlay `0.0.23`. LiteLLM `main` is at `94601b242e` after hotfix commit
   `1801e2e6d1` and artifact autobump run `25835631268`, with releases

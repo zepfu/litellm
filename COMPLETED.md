@@ -1,5 +1,37 @@
 # Completed
 
+## 2026-05-14
+
+- Repaired malformed `public.session_history` repository identity values in
+  exact database `aawm_tristore`.
+
+  Root cause:
+  the repository normalizer accepted any non-empty string after URL/path cleanup,
+  so metadata values like JSON-schema fragments and memory rollout descriptors
+  were stored as `repository` and sometimes copied into repository-derived
+  `tenant_id`.
+
+  Fix and repair:
+  `litellm/integrations/aawm_agent_identity.py` and the mirrored callback wheel
+  source now only accept repo slugs, `owner/repo`, or those values with the
+  existing ` (memory)` suffix. Added
+  `scripts/repair_session_history_repository_identity.py` to repair historical
+  rows, preserve valid tenant IDs, recover obvious known local repo prefixes,
+  and remove invalid `metadata.repository` values.
+
+  Validation:
+  focused session-history tests passed
+  `./.venv/bin/python -m pytest tests/test_litellm/integrations/test_aawm_agent_identity.py -q`
+  (`140 passed`, `1 warning`). The repair script applied to `3,877` rows, then
+  a follow-up pass repaired `2` prod rows that landed during verification.
+  Final exact DB checks returned `0` malformed `repository`, `tenant_id`, and
+  `metadata.repository` rows.
+
+  Caveat:
+  prod `:4000` was still running callback `0.0.23` when those two new rows
+  landed, so the parser hotfix must be promoted in a callback release before
+  future prod traffic is protected.
+
 ## 2026-05-13
 
 - Promoted the `aawm.49` LiteLLM release to prod `:4000` with callback

@@ -586,6 +586,44 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
     assert record["session_id"] == "session-from-header"
 
 
+@pytest.mark.parametrize(
+    ("raw_repository", "expected_repository"),
+    [
+        ("https://github.com/zepfu/litellm.git", "zepfu/litellm"),
+        ("git@github.com:zepfu/aawm.git", "zepfu/aawm"),
+        ("/home/zepfu/projects/aegis-dashboard", "aegis-dashboard"),
+        ("aegis-dashboard (memory)", "aegis-dashboard (memory)"),
+    ],
+)
+def test_normalize_repository_identity_accepts_repo_shapes(
+    raw_repository: str, expected_repository: str
+) -> None:
+    assert (
+        aawm_agent_identity._normalize_repository_identity(raw_repository)
+        == expected_repository
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_repository",
+    [
+        {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+        "{'anyOf': [{'type': 'string'}, {'type': 'null'}], 'default': None}",
+        (
+            "rollout-2026-05-10T11-14-00-019e1273.jsonl, "
+            "updated_at=2026-05-10T15:30:57+00:00, thread_id=019e1273"
+        ),
+        "aegis commits=3a131aa skip_tests=true",
+        "aawm-tap-dashboard all=true",
+        "aawm-tap\\n\\n\\ (memory)",
+    ],
+)
+def test_normalize_repository_identity_rejects_metadata_noise(
+    raw_repository: object,
+) -> None:
+    assert aawm_agent_identity._normalize_repository_identity(raw_repository) is None
+
+
 def test_build_session_history_record_uses_repository_header_and_metadata() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"
@@ -658,6 +696,41 @@ def test_build_session_history_record_prefers_repository_header_over_request_con
     assert record is not None
     assert record["repository"] == "zepfu/litellm"
     assert record["metadata"]["repository"] == "zepfu/litellm"
+
+
+def test_build_session_history_record_rejects_invalid_repository_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-invalid-repository-metadata"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-invalid-repository-metadata",
+            "tenant_id": "aegis",
+            "repository": "{'anyOf': [{'type': 'string'}], 'default': None}",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    result = {
+        "id": "resp-invalid-repository-metadata",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] == "aegis"
+    assert "repository" not in record["metadata"]
+    assert record["metadata"]["tenant_id"] == "aegis"
 
 
 def test_build_session_history_record_uses_repository_as_tenant_fallback() -> None:
