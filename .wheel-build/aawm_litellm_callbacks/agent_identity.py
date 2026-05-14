@@ -3149,6 +3149,7 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
 )
 _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP = 1.0
 _AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT = timedelta(minutes=15)
+_AAWM_RATE_LIMIT_STALE_RESET_TOLERANCE = timedelta(minutes=15)
 _AAWM_RATE_LIMIT_SNAPSHOT_FIELDS = (
     "provider_resets_at",
     "used_percentage",
@@ -3221,6 +3222,31 @@ def _parse_reset_hint_seconds(*values: Any) -> Optional[int]:
         if parsed is not None and parsed >= 0:
             return parsed
     return None
+
+
+def _resolve_rate_limit_reset_at(
+    reset_value: Any,
+    observed_at: Any,
+    reset_hint_seconds: Optional[int] = None,
+) -> Tuple[Optional[datetime], bool]:
+    provider_resets_at = _parse_provider_timestamp(reset_value)
+    observed_dt = _normalize_datetime(observed_at)
+    if (
+        provider_resets_at is not None
+        and observed_dt is not None
+        and provider_resets_at
+        < observed_dt - _AAWM_RATE_LIMIT_STALE_RESET_TOLERANCE
+    ):
+        if reset_hint_seconds is not None:
+            return observed_dt + timedelta(seconds=reset_hint_seconds), False
+        return None, True
+    if (
+        provider_resets_at is None
+        and reset_hint_seconds is not None
+        and observed_dt is not None
+    ):
+        return observed_dt + timedelta(seconds=reset_hint_seconds), False
+    return provider_resets_at, False
 
 
 def _json_safe_rate_limit_value(value: Any) -> Any:
@@ -3929,11 +3955,13 @@ def _extract_codex_header_rate_limit_observations(
                     and over_limit_percent is None
                 ):
                     continue
-                provider_resets_at = _parse_provider_timestamp(reset_value)
-                if provider_resets_at is None and reset_hint_seconds is not None:
-                    provider_resets_at = context["observed_at"] + timedelta(
-                        seconds=reset_hint_seconds
-                    )
+                provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
+                    reset_value,
+                    context["observed_at"],
+                    reset_hint_seconds,
+                )
+                if stale_reset:
+                    continue
                 observations.append(
                     _finalize_rate_limit_observation(
                         {
@@ -4205,6 +4233,12 @@ def _extract_anthropic_header_rate_limit_observations(
             )
             if reset_value is None and status_value is None and utilization is None:
                 continue
+            provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
+                reset_value,
+                context["observed_at"],
+            )
+            if stale_reset:
+                continue
             used_percentage = (
                 utilization * 100
                 if utilization is not None and utilization <= 1
@@ -4221,7 +4255,7 @@ def _extract_anthropic_header_rate_limit_observations(
                         "limit_name": display_name,
                         "limit_scope": limit_scope,
                         "window_minutes": window_minutes,
-                        "provider_resets_at": _parse_provider_timestamp(reset_value),
+                        "provider_resets_at": provider_resets_at,
                         "used_percentage": used_percentage,
                         "status": status_value,
                         "exhausted": status_value in {"rejected", "exhausted"},
@@ -4280,6 +4314,12 @@ def _extract_anthropic_header_rate_limit_observations(
             reset_value = _get_rate_limit_header_value(candidate, reset_key)
             if total is None and remaining is None and reset_value is None:
                 continue
+            provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
+                reset_value,
+                context["observed_at"],
+            )
+            if stale_reset:
+                continue
             used = total - remaining if total is not None and remaining is not None else None
             used_percentage = (
                 (used / total) * 100
@@ -4296,7 +4336,7 @@ def _extract_anthropic_header_rate_limit_observations(
                         "limit_id": f"anthropic_{limit_scope}",
                         "limit_name": f"Anthropic {limit_scope} rate limit",
                         "limit_scope": limit_scope,
-                        "provider_resets_at": _parse_provider_timestamp(reset_value),
+                        "provider_resets_at": provider_resets_at,
                         "used_percentage": used_percentage,
                         "remaining_requests": remaining,
                         "used_requests": used,
@@ -4433,6 +4473,12 @@ def _extract_google_quota_observations(
             candidate.get("resetAt"),
             candidate.get("resetTime"),
         )
+        provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
+            reset_source_value,
+            context["observed_at"],
+        )
+        if stale_reset:
+            continue
         if (
             remaining_requests is None
             and used_requests is None
@@ -4483,9 +4529,7 @@ def _extract_google_quota_observations(
                     "limit_scope": limit_scope,
                     "window_minutes": window_minutes,
                     "quota_period": quota_period,
-                    "provider_resets_at": _parse_provider_timestamp(
-                        reset_source_value
-                    ),
+                    "provider_resets_at": provider_resets_at,
                     "used_percentage": used_percentage,
                     "remaining_requests": remaining_requests,
                     "used_requests": used_requests,
@@ -4653,7 +4697,11 @@ def _build_rate_limit_observations(
     start_time: Any,
     end_time: Any,
 ) -> List[Dict[str, Any]]:
-    observed_at = _normalize_datetime(end_time) or _normalize_datetime(start_time) or datetime.now(timezone.utc)
+    observed_at = (
+        _parse_datetime_value(end_time)
+        or _parse_datetime_value(start_time)
+        or datetime.now(timezone.utc)
+    )
     observations: List[Dict[str, Any]] = []
     observations.extend(_extract_codex_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_codex_header_rate_limit_observations(kwargs, result, observed_at))
