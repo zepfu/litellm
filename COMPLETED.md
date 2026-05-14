@@ -1,5 +1,54 @@
 # Completed
 
+## 2026-05-13
+
+- Prepared the `aawm.49` LiteLLM release for prod cutover without restarting
+  prod `:4000`.
+
+  Release scope:
+  `aawm.49` promotes the Codex current-workspace repository attribution fix,
+  `session_history` / `rate_limit_observations` report-performance indexes and
+  `public.rate_limit_intervals` materialized view bootstrap, dev local-biomed
+  pass-through attribution for scispaCy/TinyBERN2, and the
+  `aawm-codex-agent-auto` Codex model alias with Spark/Gemini/GPT fallback
+  metadata.
+
+  Published artifacts:
+  release candidate commit `a38d79fc25` was pushed to `main`. The artifact
+  autobump run `25833914450` succeeded, advanced `main` to `6dfff5e366`, and
+  tagged `cb-v0.0.22`. `develop`, `main`, `origin/develop`, and `origin/main`
+  were converged at `6dfff5e366` before the fork tag was cut. GitHub Actions
+  run `25833977035` succeeded for `v1.82.3-aawm.49`, publishing
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.49`, updating `latest`, and creating the
+  GitHub Release. The missing callback release asset was built locally and
+  published as `cb-v0.0.22` with asset
+  `aawm_litellm_callbacks-0.0.22-py3-none-any.whl`. Existing overlay releases
+  remain `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`.
+
+  Validation:
+  focused release validation passed before publishing:
+  `./.venv/bin/python -m pytest tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py tests/test_litellm/integrations/test_aawm_agent_identity.py -q`
+  (`434 passed`, `74 warnings`), `py_compile` passed for the callback,
+  pass-through, and test files, `diff -q` verified the callback wheel source
+  mirrors `litellm/integrations/aawm_agent_identity.py`, `litellm-dev-config.yaml`
+  parsed with PyYAML, targeted Ruff passed on the touched implementation files,
+  and `git diff --check` passed. Dev `:4001` readiness returned
+  `status=healthy` with `AawmAgentIdentity`, and a filtered `litellm-dev` log
+  scan found no release-blocking `ERROR`, `Traceback`, pass-through exception,
+  model-not-found, invalid request, `KeyError`, h11/content-length, ASGI, or
+  `NoneType` patterns. Exact database `aawm_tristore` verification showed
+  `public.rate_limit_intervals` at `1687` rows, latest interval
+  `2026-05-13 23:59:52.907187+00`, size `680 kB`, with pg_cron jobs `24`
+  (`aawm_rate_limit_intervals_refresh`) and `25`
+  (`aawm_rate_limit_intervals_analyze`) still scheduled.
+
+  Prod status:
+  prod `:4000` was not rebuilt or restarted in this step. The next cutover step
+  is to update/build the production image in
+  `/home/zepfu/projects/aawm-infrastructure` from
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.49`, then recreate prod only after the
+  explicit release go-ahead.
+
 ## 2026-05-12
 
 - Promoted the prepared `aawm.48` LiteLLM release to prod `:4000`.
