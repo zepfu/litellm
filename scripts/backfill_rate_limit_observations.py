@@ -209,6 +209,11 @@ class ClickHouseClient:
             "retrieveUserQuota",
             "MODEL_CAPACITY_EXHAUSTED",
             "RATE_LIMIT_EXCEEDED",
+            "anthropic_response_headers",
+            "anthropic-ratelimit",
+            "llm_provider-anthropic-ratelimit",
+            "codex_response_headers",
+            "x-codex-",
         )
         marker_predicates = [
             f"positionUTF8(toString(o.metadata), {_quote_clickhouse_string(marker)}) > 0"

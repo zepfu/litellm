@@ -1726,6 +1726,47 @@ view behavior.
 
 ---
 
+### aawm.50 — Anthropic rate-limit observation capture and backfill
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `litellm/proxy/pass_through_endpoints/success_handler.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `scripts/backfill_rate_limit_observations.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_scripts/test_backfill_rate_limit_observations.py`
+
+**Upstream issue:** AAWM relies on `public.rate_limit_observations` for provider
+quota reporting. Anthropic streaming passthrough responses already preserved
+sanitized `anthropic-ratelimit-*` headers, but non-stream Anthropic passthrough
+successes did not copy upstream rate-limit headers into callback metadata. Some
+LiteLLM callback payloads also carried Anthropic headers under hidden response
+fields as `llm_provider-anthropic-ratelimit-*`, which the AAWM extractor did
+not recognize.
+
+**Fix:** Record sanitized Anthropic non-stream response rate-limit headers in
+callback metadata before passthrough response normalization. Expand the AAWM
+rate-limit extractor to inspect hidden response/header containers, handle
+mapping-like header objects, and accept both raw `anthropic-ratelimit-*` and
+LiteLLM-prefixed `llm_provider-anthropic-ratelimit-*` names. Expand the
+ClickHouse backfill marker scan so retained Anthropic header metadata can be
+replayed into `public.rate_limit_observations`.
+
+**Why not upstream:** This is AAWM-specific quota telemetry and historical
+repair logic for the local `aawm_tristore` reporting schema.
+
+**Validation status:** Focused unit coverage proves non-stream Anthropic
+passthrough header capture, hidden/prefixed Anthropic header extraction, error
+header extraction, and the expanded backfill markers. The live backfill was run
+against exact database `aawm_tristore` for retained ClickHouse observations
+from `2026-05-05T00:00:00Z` through `2026-05-14T14:35:00Z`, then
+`public.rate_limit_intervals` was refreshed and analyzed.
+
+---
+
 
 ## Dropped Patches
 

@@ -4201,6 +4201,77 @@ def test_build_rate_limit_observations_extracts_anthropic_unified_headers() -> N
     assert by_scope["7d_sonnet"]["client_family"] == "claude"
 
 
+def test_build_rate_limit_observations_extracts_anthropic_hidden_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-hidden-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-hidden-rate-headers",
+            "client_name": "claude-cli",
+        }
+    )
+    result = SimpleNamespace(
+        _hidden_params={
+            "additional_headers": {
+                "llm_provider-anthropic-ratelimit-unified-5h-reset": "1778034000",
+                "llm_provider-anthropic-ratelimit-unified-5h-status": "allowed",
+                "llm_provider-anthropic-ratelimit-unified-5h-utilization": "0.42",
+            }
+        }
+    )
+    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=result,
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["source"] == "anthropic_response_headers"
+    assert observations[0]["limit_id"] == "anthropic_unified_5h"
+    assert observations[0]["limit_scope"] == "5h"
+    assert observations[0]["used_percentage"] == 42.0
+    assert observations[0]["client_family"] == "claude"
+
+
+def test_build_rate_limit_observations_extracts_anthropic_exception_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-error-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-error-rate-headers",
+            "client_name": "claude-cli",
+        }
+    )
+    result = RuntimeError("anthropic upstream failed")
+    result.headers = {
+        "llm_provider-anthropic-ratelimit-requests-limit": "2000",
+        "llm_provider-anthropic-ratelimit-requests-remaining": "1500",
+        "llm_provider-anthropic-ratelimit-requests-reset": "2026-05-05T17:00:00Z",
+    }
+    end_time = datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=result,
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["source"] == "anthropic_response_headers"
+    assert observations[0]["limit_scope"] == "requests"
+    assert observations[0]["remaining_requests"] == 1500
+    assert observations[0]["used_requests"] == 500
+    assert observations[0]["used_percentage"] == 25.0
+
+
 def test_build_rate_limit_observations_extracts_google_quota_buckets() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gemini/gemini-2.5-flash"
