@@ -56,6 +56,7 @@ services:
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py
       - ./litellm/proxy/response_api_endpoints/endpoints.py:/app/litellm/proxy/response_api_endpoints/endpoints.py
+      - ./litellm/litellm_core_utils/get_llm_provider_logic.py:/app/litellm/litellm_core_utils/get_llm_provider_logic.py
       - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
       - ./context-replacement:/app/context-replacement
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
@@ -122,7 +123,7 @@ services:
       - NVIDIA_NIM_RERANK_API_BASE=${NVIDIA_NIM_RERANK_API_BASE:-https://ai.api.nvidia.com}
       - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api}
+      - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}

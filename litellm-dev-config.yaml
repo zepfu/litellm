@@ -12,6 +12,16 @@ model_list:
       base_model: "qwen3-4b-heretic-q8"
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
+  - model_name: "ministral3-3b-adjudicator-q4-k-m"
+    litellm_params:
+      model: "openai/ministral3-3b-adjudicator-q4-k-m"
+      api_base: "http://172.20.0.1:8096/v1"
+      api_key: "fake-api-key"
+    model_info:
+      mode: chat
+      base_model: "mistralai/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
   - model_name: "tei-medcpt-article"
     litellm_params:
       model: "local_embed/ncbi/MedCPT-Article-Encoder"
@@ -83,6 +93,26 @@ model_list:
       input_cost_per_query: 0.0
       input_cost_per_token: 2.5e-08
       output_cost_per_token: 0.0
+  - model_name: "openrouter/qwen/qwen3.5-flash-02-23"
+    litellm_params:
+      model: "openrouter/qwen/qwen3.5-flash-02-23"
+      api_base: "https://openrouter.ai/api/v1"
+    model_info:
+      mode: chat
+  - model_name: "openrouter/qwen/qwen3.6-flash"
+    litellm_params:
+      model: "openrouter/qwen/qwen3.6-flash"
+      api_base: "https://openrouter.ai/api/v1"
+    model_info:
+      mode: chat
+  - model_name: "openrouter/*"
+    litellm_params:
+      model: "openrouter/*"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: "os.environ/AAWM_OPENROUTER_API_KEY"
+    model_info:
+      mode: chat
+      health_check_model: "openrouter/owl-alpha"
   - model_name: "openrouter/baai/bge-base-en-v1.5"
     litellm_params:
       model: "openrouter/baai/bge-base-en-v1.5"
@@ -256,6 +286,7 @@ model_list:
 litellm_settings:
   drop_params: true
   success_callback: ["litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance", "langfuse", "litellm.integrations.aawm_payload_capture.aawm_payload_capture_instance"]
+  failure_callback: ["litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance"]
   model_group_settings:
     forward_client_headers_to_llm_api:
       - "claude-sonnet-4-6"

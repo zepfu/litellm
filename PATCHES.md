@@ -1810,6 +1810,56 @@ before the prod restart.
 
 ---
 
+### aawm.52 — OpenRouter direct routing and in-flight Codex auto-agent cooldowns
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
+- `litellm/litellm_core_utils/get_llm_provider_logic.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `litellm-dev-config.yaml`
+- `docker-compose.dev.yml`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_llm_pass_through_endpoints.py`
+- `tests/test_litellm/llms/openrouter/test_openrouter_provider_routing.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+
+**Upstream issue:** AAWM needs OpenRouter-prefixed model IDs to pass through
+without a second provider-prefix rewrite, and Codex auto-agent retries must not
+switch providers once an agent attempt is already carrying stateful
+continuation data. Mid-session provider switching can strand tool calls,
+reasoning items, or `previous_response_id` continuations on a different
+provider than the one that created the state.
+
+**Fix:** Preserve regular OpenRouter model IDs when the caller already selected
+`custom_llm_provider="openrouter"`, add direct/wildcard OpenRouter routes for
+the Qwen flash models, and allow the Anthropic-to-OpenRouter Responses adapter
+to target `qwen/qwen3.5-flash-02-23` and `qwen/qwen3.6-flash`. For
+`aawm-codex-agent-auto`, detect stateful continuation markers and session
+affinity before retry selection; if the selected provider hits quota/capacity
+while an agent is in flight, set the usual cooldown and surface that provider
+error instead of selecting a different provider. If a subsequent continuation
+arrives while the affinity target is already cooling down, return HTTP `429`
+with code `aawm_codex_auto_agent_in_flight_provider_cooling_down` so the
+orchestrator can redispatch a fresh agent attempt.
+
+OpenRouter session-history cost extraction now prefers provider-reported
+`usage.cost` / `usage_openrouter_cost` before generic LiteLLM zero/catalog
+costs for OpenRouter rows.
+
+**Why not upstream:** These are AAWM-specific routing, callback, and Codex
+agent orchestration contracts layered on top of LiteLLM's generic provider
+routing and retry behavior.
+
+**Validation status:** Focused unit coverage passes for OpenRouter model
+preservation, the Anthropic OpenRouter adapter allowlist, OpenRouter reported
+cost precedence, and Codex auto-agent in-flight terminal cooldown behavior.
+Live dev validation on `litellm-dev` `:4001` proved the new Qwen OpenRouter
+routes and callback writes before prod promotion.
+
+---
+
 
 ## Dropped Patches
 
