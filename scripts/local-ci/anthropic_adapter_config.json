@@ -31,6 +31,8 @@
     "claude_adapter_gpt55_child_analysis_write_probe",
     "claude_adapter_gpt55_child_sequential_core_tools",
     "claude_adapter_gpt55_child_parallel_read_tools",
+    "claude_adapter_gemini_fanout",
+    "claude_adapter_peeromega_fanout",
     "claude_adapter_openrouter_nemotron_child_parallel_read_tools",
     "claude_adapter_nvidia_deepseek_child_parallel_read_tools",
     "claude_adapter_gemini_output_config_effort",
@@ -88,7 +90,10 @@
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": ["/anthropic/v1/messages"],
       "required_trace_tags": ["route:anthropic_messages"],
-      "required_generation_metadata_truthy": ["passthrough_route_family"],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "anthropic_response_headers"
+      ],
       "command_json_checks": {
         "required_equals": {"is_error": false}
       },
@@ -113,6 +118,45 @@
           "output_tokens": 1,
           "total_tokens": 1
         }
+      },
+      "rate_limit_observations_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "allow_latest_snapshot_fallback": true,
+        "latest_snapshot_max_age_seconds": 21600,
+        "expected_rows": [
+          {
+            "provider": "anthropic",
+            "source": "anthropic_response_headers",
+            "quota_key": "anthropic_unified_5h:5h",
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
+          },
+          {
+            "provider": "anthropic",
+            "source": "anthropic_response_headers",
+            "quota_key": "anthropic_unified_7d:7d",
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
+          }
+        ]
       },
       "timeout_seconds": 120,
       "langfuse_poll_timeout_seconds": 60
@@ -257,6 +301,7 @@
       ],
       "required_generation_metadata_truthy": [
         "passthrough_route_family",
+        "codex_response_headers",
         "codex_tool_description_patch_count"
       ],
       "request_text_checks": {
@@ -310,6 +355,55 @@
           "total_tokens": 1
         }
       },
+      "rate_limit_observations_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "allow_latest_snapshot_fallback": true,
+        "latest_snapshot_max_age_seconds": 21600,
+        "expected_rows": [
+          {
+            "provider": "openai",
+            "client": "codex",
+            "source": "codex_response_headers",
+            "quota_key": "codex:primary",
+            "quota_type": "tokens",
+            "required_equals": {
+              "quota_period": "five_hour"
+            },
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
+          },
+          {
+            "provider": "openai",
+            "client": "codex",
+            "source": "codex_response_headers",
+            "quota_key": "codex:secondary",
+            "quota_type": "tokens",
+            "required_equals": {
+              "quota_period": "seven_day"
+            },
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
+          }
+        ]
+      },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60
     },
@@ -344,6 +438,7 @@
       "required_trace_tags": ["route:codex_responses"],
       "required_generation_metadata_truthy": [
         "passthrough_route_family",
+        "codex_response_headers",
         "responses_stream_event_types",
         "responses_stream_tool_state"
       ],
@@ -409,6 +504,55 @@
             "tool_kind": "command",
             "minimum_count": 1,
             "command_text_contains": "pwd"
+          }
+        ]
+      },
+      "rate_limit_observations_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "allow_latest_snapshot_fallback": true,
+        "latest_snapshot_max_age_seconds": 21600,
+        "expected_rows": [
+          {
+            "provider": "openai",
+            "client": "codex",
+            "source": "codex_response_headers",
+            "quota_key": "codex:primary",
+            "quota_type": "tokens",
+            "required_equals": {
+              "quota_period": "five_hour"
+            },
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
+          },
+          {
+            "provider": "openai",
+            "client": "codex",
+            "source": "codex_response_headers",
+            "quota_key": "codex:secondary",
+            "quota_type": "tokens",
+            "required_equals": {
+              "quota_period": "seven_day"
+            },
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
           }
         ]
       },
@@ -481,6 +625,38 @@
           "total_tokens": 1
         }
       },
+      "rate_limit_observations_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "allow_latest_snapshot_fallback": true,
+        "latest_snapshot_max_age_seconds": 21600,
+        "expected_rows": [
+          {
+            "provider": "google",
+            "client": "google_code_assist",
+            "model": "gemini-2.5-flash",
+            "source": "google_retrieve_user_quota",
+            "quota_key": "google_code_assist_requests_gemini-2.5-flash:model_requests",
+            "quota_type": "requests",
+            "required_equals": {
+              "quota_period": "daily"
+            },
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
+          }
+        ]
+      },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 90
     },
@@ -549,6 +725,38 @@
           "output_tokens": 1,
           "total_tokens": 1
         }
+      },
+      "rate_limit_observations_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "allow_latest_snapshot_fallback": true,
+        "latest_snapshot_max_age_seconds": 21600,
+        "expected_rows": [
+          {
+            "provider": "google",
+            "client": "google_code_assist",
+            "model": "gemini-2.5-flash",
+            "source": "google_retrieve_user_quota",
+            "quota_key": "google_code_assist_requests_gemini-2.5-flash:model_requests",
+            "quota_type": "requests",
+            "required_equals": {
+              "quota_period": "daily"
+            },
+            "minimums": {
+              "remaining_pct": 0
+            },
+            "maximums": {
+              "remaining_pct": 100
+            },
+            "required_future_timestamps": ["expected_reset_at"],
+            "required_timestamp_after_observed": ["expected_reset_at"]
+          }
+        ]
       },
       "streaming_checked": true,
       "timeout_seconds": 180,

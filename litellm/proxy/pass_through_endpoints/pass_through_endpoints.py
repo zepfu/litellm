@@ -609,6 +609,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             or hostname.endswith(".openrouter.ai")
         ):
             return "openrouter"
+        if (
+            hostname == "api.x.ai"
+            or hostname.endswith(".x.ai")
+            or hostname == "cli-chat-proxy.grok.com"
+            or hostname.endswith(".grok.com")
+        ):
+            return "xai"
         if hostname in {"integrate.api.nvidia.com", "ai.api.nvidia.com"}:
             return "nvidia"
         if (
@@ -660,6 +667,11 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             or "goog-api-client" in normalized_headers
         ):
             marker_families.add("google")
+
+        if "x-xai-token-auth" in normalized_headers or any(
+            header_name.startswith("x-grok-") for header_name in normalized_headers
+        ):
+            marker_families.add("xai")
 
         if url is not None:
             parsed_url = urlparse(str(url))
@@ -859,6 +871,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             or parsed_url.hostname == "chatgpt.com"
             or parsed_url.hostname == "openrouter.ai"
             or (parsed_url.hostname and parsed_url.hostname.endswith(".openrouter.ai"))
+            or parsed_url.hostname == "api.x.ai"
+            or parsed_url.hostname == "cli-chat-proxy.grok.com"
             or (parsed_url.hostname and "openai.com" in parsed_url.hostname)
         ):
             return EndpointType.OPENAI
@@ -903,6 +917,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         headers: dict,
         requested_query_params: Optional[dict] = None,
         _parsed_body: Optional[dict] = None,
+        raw_body: Optional[bytes] = None,
     ) -> httpx.Response:
         """
         Handle non-streaming HTTP requests
@@ -915,6 +930,14 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 url=url,
                 headers=headers,
                 params=requested_query_params,
+            )
+        elif raw_body is not None:
+            response = await async_client.request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                params=requested_query_params,
+                content=raw_body,
             )
         elif (
             HttpPassThroughEndpointHelpers.is_multipart(request) is True
@@ -1152,6 +1175,7 @@ async def pass_through_request(  # noqa: PLR0915
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
+    raw_body_passthrough: bool = False,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -1174,6 +1198,9 @@ async def pass_through_request(  # noqa: PLR0915
         expected_target_family: Optional provider family expected for the final egress target
         retryable_upstream_status_codes: Optional upstream status codes that will be retried by the
             caller, so generic passthrough failure logging should be deferred to the adapter layer
+        raw_body_passthrough: Forward the original request body as bytes while
+            using a small synthetic body for logging. This is intended for
+            native binary/protobuf side-channel endpoints.
     """
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.pass_through_endpoints.passthrough_guardrails import (
@@ -1191,6 +1218,7 @@ async def pass_through_request(  # noqa: PLR0915
     _parsed_body: Optional[dict] = None
     # kwargs for pass through endpoint, contains metadata, litellm_params, call_type, litellm_call_id, passthrough_logging_payload
     kwargs: Optional[dict] = None
+    raw_body: Optional[bytes] = None
     retryable_status_codes = {
         status_code
         for status_code in (retryable_upstream_status_codes or [])
@@ -1248,6 +1276,13 @@ async def pass_through_request(  # noqa: PLR0915
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request
             _parsed_body = {}
+        elif raw_body_passthrough:
+            raw_body = await request.body()
+            _parsed_body = {
+                "raw_body_passthrough": True,
+                "raw_body_content_type": request.headers.get("content-type"),
+                "raw_body_bytes": len(raw_body),
+            }
         else:
             _parsed_body = await _read_request_body(request)
         normalized_tool_schema_count = _normalize_openai_function_tool_schemas_in_body(
@@ -1492,6 +1527,7 @@ async def pass_through_request(  # noqa: PLR0915
                 headers=headers,
                 requested_query_params=requested_query_params,
                 _parsed_body=_parsed_body,
+                raw_body=raw_body,
             )
         )
         upstream_wait_completed_at = datetime.now()

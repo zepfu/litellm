@@ -1833,6 +1833,277 @@ def _match_session_history_expected_rows(
     return matched_records, failures
 
 
+def _normalize_db_record(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: (value.isoformat() if hasattr(value, 'isoformat') else value)
+        for key, value in row.items()
+    }
+
+
+def _rate_limit_observation_record_matches_expected(
+    row: dict[str, Any],
+    expected_row: dict[str, Any],
+) -> bool:
+    for key in ('provider', 'model', 'source', 'quota_key', 'quota_type', 'client'):
+        expected = expected_row.get(key)
+        if expected is not None and row.get(key) != expected:
+            return False
+    for key, expected in (expected_row.get('required_equals') or {}).items():
+        if row.get(key) != expected:
+            return False
+    for key, allowed_values in (expected_row.get('required_one_of') or {}).items():
+        if row.get(key) not in set(allowed_values or []):
+            return False
+    for key in expected_row.get('required_truthy') or []:
+        if not row.get(key):
+            return False
+    for key, minimum in (expected_row.get('minimums') or {}).items():
+        actual = row.get(key)
+        if not isinstance(actual, (int, float)) or actual < minimum:
+            return False
+    for key, maximum in (expected_row.get('maximums') or {}).items():
+        actual = row.get(key)
+        if not isinstance(actual, (int, float)) or actual > maximum:
+            return False
+    for key in expected_row.get('required_future_timestamps') or []:
+        actual = row.get(key)
+        if not hasattr(actual, 'timestamp') or actual <= RA._utcnow():
+            return False
+    for key in expected_row.get('required_timestamp_after_observed') or []:
+        actual = row.get(key)
+        observed_at = row.get('observed_at')
+        if (
+            not hasattr(actual, 'timestamp')
+            or not hasattr(observed_at, 'timestamp')
+            or actual <= observed_at
+        ):
+            return False
+    return True
+
+
+def _rate_limit_observation_candidate_summary(
+    row: dict[str, Any],
+    expected_row: dict[str, Any],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        'observed_at': row.get('observed_at'),
+        'provider': row.get('provider'),
+        'model': row.get('model'),
+        'quota_key': row.get('quota_key'),
+        'quota_type': row.get('quota_type'),
+        'remaining_pct': row.get('remaining_pct'),
+        'expected_reset_at': row.get('expected_reset_at'),
+        'source': row.get('source'),
+        'session_id': row.get('session_id'),
+    }
+    mismatches: dict[str, Any] = {}
+    for key in ('provider', 'model', 'source', 'quota_key', 'quota_type', 'client'):
+        expected = expected_row.get(key)
+        actual = row.get(key)
+        if expected is not None and actual != expected:
+            mismatches[key] = {'expected': expected, 'actual': actual}
+    for key, expected in (expected_row.get('required_equals') or {}).items():
+        actual = row.get(key)
+        if actual != expected:
+            mismatches[key] = {'expected': expected, 'actual': actual}
+    for key, allowed_values in (expected_row.get('required_one_of') or {}).items():
+        actual = row.get(key)
+        if actual not in set(allowed_values or []):
+            mismatches[key] = {'expected_one_of': allowed_values, 'actual': actual}
+    for key in expected_row.get('required_truthy') or []:
+        actual = row.get(key)
+        if not actual:
+            mismatches[key] = {'expected': 'truthy', 'actual': actual}
+    for key, minimum in (expected_row.get('minimums') or {}).items():
+        actual = row.get(key)
+        if not isinstance(actual, (int, float)) or actual < minimum:
+            mismatches[key] = {'minimum': minimum, 'actual': actual}
+    for key, maximum in (expected_row.get('maximums') or {}).items():
+        actual = row.get(key)
+        if not isinstance(actual, (int, float)) or actual > maximum:
+            mismatches[key] = {'maximum': maximum, 'actual': actual}
+    for key in expected_row.get('required_future_timestamps') or []:
+        actual = row.get(key)
+        if not hasattr(actual, 'timestamp') or actual <= RA._utcnow():
+            mismatches[key] = {'expected': 'future timestamp', 'actual': actual}
+    for key in expected_row.get('required_timestamp_after_observed') or []:
+        actual = row.get(key)
+        observed_at = row.get('observed_at')
+        if (
+            not hasattr(actual, 'timestamp')
+            or not hasattr(observed_at, 'timestamp')
+            or actual <= observed_at
+        ):
+            mismatches[key] = {
+                'expected': 'timestamp after observed_at',
+                'actual': actual,
+                'observed_at': observed_at,
+            }
+    if mismatches:
+        summary['mismatches'] = mismatches
+    return summary
+
+
+def _match_rate_limit_observation_expected_rows(
+    *,
+    family: str,
+    records: list[dict[str, Any]],
+    expected_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    failures: list[str] = []
+    matched_records: list[dict[str, Any]] = []
+    used_record_indexes: set[int] = set()
+    for expected_row in expected_rows:
+        row_provider = expected_row.get('provider')
+        row_quota_key = expected_row.get('quota_key')
+        row_source = expected_row.get('source')
+        try:
+            minimum_count = max(1, int(expected_row.get('minimum_count') or 1))
+        except (TypeError, ValueError):
+            minimum_count = 1
+        matches: list[tuple[int, dict[str, Any]]] = [
+            (index, row)
+            for index, row in enumerate(records)
+            if index not in used_record_indexes
+            and _rate_limit_observation_record_matches_expected(row, expected_row)
+        ]
+        if len(matches) < minimum_count:
+            candidate_rows = [
+                row
+                for row in records
+                if (row_provider is None or row.get('provider') == row_provider)
+                and (row_quota_key is None or row.get('quota_key') == row_quota_key)
+                and (row_source is None or row.get('source') == row_source)
+            ]
+            candidate_summary = [
+                _rate_limit_observation_candidate_summary(row, expected_row)
+                for row in candidate_rows[:5]
+            ]
+            detail = ''
+            if candidate_summary:
+                detail = (
+                    '; candidate rows: '
+                    + json.dumps(candidate_summary, sort_keys=True, default=str)
+                )
+            failures.append(
+                f'{family} missing rate_limit_observations rows for provider={row_provider!r} quota_key={row_quota_key!r} source={row_source!r}; expected >= {minimum_count}, got {len(matches)}{detail}'
+            )
+            continue
+        selected_matches = matches[:minimum_count]
+        used_record_indexes.update(index for index, _ in selected_matches)
+        matched_records.extend(_normalize_db_record(row) for _, row in selected_matches)
+
+    return matched_records, failures
+
+
+def _validate_rate_limit_observations(
+    *,
+    family: str,
+    session_id: str | None,
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    if not checks:
+        return {'records': [], 'matched_records': []}, [], []
+
+    db_settings, db_failures = _validation_db_settings(
+        family=family,
+        checks=checks,
+        validation_name='rate_limit_observations',
+    )
+    if db_settings is None:
+        return {'records': [], 'matched_records': []}, db_failures, []
+
+    expected_rows = checks.get('expected_rows') or []
+    if not isinstance(expected_rows, list) or not expected_rows:
+        return {'records': [], 'matched_records': []}, [], []
+
+    conn = _validation_db_connection(db_settings)
+    poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
+    poll_interval_seconds = max(0.1, float(checks.get('poll_interval_seconds') or 1))
+    allow_latest_snapshot_fallback = bool(checks.get('allow_latest_snapshot_fallback'))
+    max_snapshot_age_seconds = max(
+        1.0,
+        float(checks.get('latest_snapshot_max_age_seconds') or 21600),
+    )
+    latest_cutoff = RA._utcnow() - RA.dt.timedelta(seconds=max_snapshot_age_seconds)
+    session_query = '''
+        select observed_at, created_at, client, client_version, account_hash,
+               provider, model, quota_key, quota_period, quota_type,
+               expected_reset_at, remaining_pct, source, session_id,
+               trace_id, litellm_call_id
+        from public.rate_limit_observations
+        where session_id = %s
+        order by observed_at desc, id desc
+    '''
+    latest_query = '''
+        select observed_at, created_at, client, client_version, account_hash,
+               provider, model, quota_key, quota_period, quota_type,
+               expected_reset_at, remaining_pct, source, session_id,
+               trace_id, litellm_call_id
+        from public.rate_limit_observations
+        where observed_at >= %s
+        order by observed_at desc, id desc
+        limit 500
+    '''
+
+    session_records: list[dict[str, Any]] = []
+    latest_records: list[dict[str, Any]] = []
+    records_for_matching: list[dict[str, Any]] = []
+    matched_records: list[dict[str, Any]] = []
+    match_failures: list[str] = []
+    match_source = 'session'
+    poll_deadline = time.monotonic() + poll_timeout_seconds
+    while True:
+        session_records = []
+        if session_id:
+            with conn.cursor() as cur:
+                cur.execute(session_query, (session_id,))
+                session_records = cur.fetchall()
+
+        records_for_matching = session_records
+        matched_records, match_failures = _match_rate_limit_observation_expected_rows(
+            family=family,
+            records=records_for_matching,
+            expected_rows=expected_rows,
+        )
+        match_source = 'session'
+
+        if match_failures and allow_latest_snapshot_fallback:
+            with conn.cursor() as cur:
+                cur.execute(latest_query, (latest_cutoff,))
+                latest_records = cur.fetchall()
+            matched_records, match_failures = (
+                _match_rate_limit_observation_expected_rows(
+                    family=family,
+                    records=latest_records,
+                    expected_rows=expected_rows,
+                )
+            )
+            records_for_matching = latest_records
+            match_source = 'latest_snapshot'
+
+        if not match_failures:
+            break
+        if time.monotonic() >= poll_deadline:
+            break
+        time.sleep(poll_interval_seconds)
+
+    warnings: list[str] = []
+    if not match_failures and match_source == 'latest_snapshot':
+        warnings.append(
+            f'{family} rate_limit_observations matched latest current snapshots instead of session rows; unchanged duplicate snapshots may have been suppressed'
+        )
+
+    return {
+        'match_source': match_source,
+        'records': [_normalize_db_record(row) for row in records_for_matching],
+        'session_records': [_normalize_db_record(row) for row in session_records],
+        'latest_snapshot_records': [_normalize_db_record(row) for row in latest_records],
+        'matched_records': matched_records,
+        'latest_snapshot_cutoff': latest_cutoff.isoformat(),
+    }, match_failures, warnings
+
+
 def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if not session_id:
         return {'record': None, 'records': []}, [f'{family} missing command session_id for tool_activity validation']
@@ -3045,6 +3316,17 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('session_history_validation') or {},
     )
     failures.extend(session_history_failures)
+    (
+        rate_limit_observations_summary,
+        rate_limit_observations_failures,
+        rate_limit_observations_warnings,
+    ) = _validate_rate_limit_observations(
+        family=name,
+        session_id=command_session_id,
+        checks=config.get('rate_limit_observations_validation') or {},
+    )
+    failures.extend(rate_limit_observations_failures)
+    warnings.extend(rate_limit_observations_warnings)
     tool_activity_summary, tool_activity_failures = _validate_tool_activity(
         family=name,
         session_id=command_session_id,
@@ -3136,6 +3418,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         'command_json': command_json_summary,
         'empty_success': empty_success_summary,
         'session_history': session_history_summary,
+        'rate_limit_observations': rate_limit_observations_summary,
         'tool_activity': tool_activity_summary,
         'transcript_tool_use': transcript_tool_use_summary,
         'runtime_postconditions': runtime_summary,

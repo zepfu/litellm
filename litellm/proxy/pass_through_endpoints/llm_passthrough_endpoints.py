@@ -118,6 +118,41 @@ _GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST = frozenset(
     }
 )
 
+_GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com"
+
+_GROK_CLI_FORWARD_HEADER_ALLOWLIST = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "content-type",
+        "grok-shell-timestamp",
+        "user-agent",
+        "x-email",
+        "x-grok-agent-id",
+        "x-grok-client-identifier",
+        "x-grok-client-version",
+        "x-grok-conv-id",
+        "x-grok-model-override",
+        "x-grok-req-id",
+        "x-grok-session-id",
+        "x-grok-turn-idx",
+        "x-grok-user-id",
+        "x-request-id",
+        "x-teamid",
+        "x-userid",
+        "x-xai-token-auth",
+    }
+)
+
+_GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE = frozenset(
+    {
+        "content-length",
+        "host",
+        "x-litellm-api-key",
+    }
+)
+
 _CLAUDE_PERSISTED_OUTPUT_PATTERN = re.compile(
     r"\A<system-reminder>\n"
     r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
@@ -12003,6 +12038,136 @@ def _get_gemini_passthrough_target_base(
     return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
 
 
+def _get_grok_passthrough_target_base() -> str:
+    return (
+        os.getenv("GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL")
+        or os.getenv("XAI_CLI_CHAT_PROXY_BASE_URL")
+        or _GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL
+    )
+
+
+def _normalize_grok_endpoint_for_target(endpoint: str, base_target_url: str) -> str:
+    normalized_endpoint = httpx.URL(endpoint).path
+    if not normalized_endpoint.startswith("/"):
+        normalized_endpoint = "/" + normalized_endpoint
+
+    base_url = httpx.URL(base_target_url)
+    if base_url.path.rstrip("/") == "/v1" and normalized_endpoint.startswith("/v1/"):
+        normalized_endpoint = normalized_endpoint[len("/v1") :]
+    return normalized_endpoint
+
+
+def _join_grok_passthrough_url(base_target_url: str, endpoint: str) -> str:
+    return BaseOpenAIPassThroughHandler._join_url_paths(
+        base_url=httpx.URL(base_target_url),
+        path=_normalize_grok_endpoint_for_target(
+            endpoint=endpoint,
+            base_target_url=base_target_url,
+        ),
+        custom_llm_provider=litellm.LlmProviders.XAI,
+    )
+
+
+def _get_case_insensitive_header(headers: dict[str, Any], header_name: str) -> Optional[str]:
+    wanted = header_name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == wanted and value is not None:
+            value_str = str(value).strip()
+            if value_str:
+                return value_str
+    return None
+
+
+def _format_litellm_passthrough_api_key(api_key: Optional[str]) -> str:
+    if not isinstance(api_key, str) or not api_key.strip():
+        return ""
+    cleaned = api_key.strip()
+    if cleaned.lower().startswith("bearer "):
+        return cleaned
+    return f"Bearer {cleaned}"
+
+
+def _get_grok_litellm_auth_header(request: Request) -> str:
+    header_key = request.headers.get("x-litellm-api-key")
+    if header_key:
+        return _format_litellm_passthrough_api_key(header_key)
+
+    query_key = request.query_params.get("key")
+    if query_key:
+        return _format_litellm_passthrough_api_key(query_key)
+
+    return request.headers.get("Authorization", "")
+
+
+def _prepare_grok_request_body_for_passthrough(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    headers = _safe_get_request_headers(request)
+    model_override = _get_case_insensitive_header(headers, "x-grok-model-override")
+    session_id = _get_case_insensitive_header(headers, "x-grok-session-id")
+
+    extra_fields: dict[str, Any] = {
+        "client_name": "grok-build",
+        "grok_cli_chat_proxy": True,
+        "passthrough_route_family": "grok_cli_chat_proxy",
+        "xai_cli_chat_proxy": True,
+    }
+    tags_to_add = ["grok-build", "route:grok_cli_chat_proxy"]
+    if model_override:
+        extra_fields["grok_model_override"] = model_override
+        extra_fields["model_group"] = model_override
+        tags_to_add.append(f"grok-model:{model_override}")
+    if session_id:
+        extra_fields["session_id"] = session_id
+
+    updated_body = copy.deepcopy(request_body)
+    return _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
+
+
+def _is_grok_json_request(request: Request) -> bool:
+    content_type = request.headers.get("content-type", "").lower()
+    return (
+        not content_type
+        or "application/json" in content_type
+        or content_type.endswith("+json")
+    )
+
+
+def _log_grok_forward_header_compare(
+    *,
+    endpoint: str,
+    request: Request,
+) -> None:
+    incoming_headers = {
+        str(header_name).lower()
+        for header_name in _safe_get_request_headers(request).keys()
+    }
+    allowed_headers = {header.lower() for header in _GROK_CLI_FORWARD_HEADER_ALLOWLIST}
+    forwarded_headers = sorted(incoming_headers & allowed_headers)
+    stripped_headers = sorted(
+        header
+        for header in incoming_headers - allowed_headers
+        if header not in _GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE
+        and not header.startswith("x-pass-")
+    )
+
+    if not stripped_headers and os.getenv("AAWM_GROK_ROUTE_DEBUG") != "1":
+        return
+
+    verbose_proxy_logger.warning(
+        "Grok passthrough header compare: endpoint=%s forwarded=%s stripped=%s",
+        endpoint,
+        forwarded_headers,
+        stripped_headers,
+    )
+
+
 def create_request_copy(request: Request):
     return {
         "method": request.method,
@@ -12251,6 +12416,77 @@ async def gemini_proxy_route(
     )
 
     return received_value
+
+
+@router.api_route(
+    "/grok/{endpoint:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    tags=["Grok Build Pass-through", "pass-through"],
+)
+async def grok_proxy_route(
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+):
+    """
+    Native Grok Build pass-through for the xAI CLI chat proxy.
+
+    Grok Build keeps its own OIDC Authorization header and xAI routing headers.
+    LiteLLM auth should be supplied separately with `x-litellm-api-key` or a
+    `key` query parameter so the upstream Authorization header can remain intact.
+    """
+    raw_body_passthrough = (
+        request.method in {"POST", "PUT", "PATCH"} and not _is_grok_json_request(request)
+    )
+    if raw_body_passthrough:
+        _safe_set_request_parsed_body(request, {})
+
+    user_api_key_dict = await user_api_key_auth(
+        request=request,
+        api_key=_get_grok_litellm_auth_header(request),
+    )
+
+    base_target_url = _get_grok_passthrough_target_base()
+    target_url = _join_grok_passthrough_url(
+        base_target_url=base_target_url,
+        endpoint=endpoint,
+    )
+
+    _log_grok_forward_header_compare(endpoint=endpoint, request=request)
+
+    custom_body: Optional[dict[str, Any]] = None
+    if request.method in {"POST", "PUT", "PATCH"}:
+        if not raw_body_passthrough:
+            request_body = await get_request_body(request)
+            if isinstance(request_body, dict):
+                custom_body = _prepare_grok_request_body_for_passthrough(
+                    request=request,
+                    request_body=request_body,
+                )
+                if custom_body is not request_body:
+                    _safe_set_request_parsed_body(request, custom_body)
+
+    query_params = {
+        key: value
+        for key, value in dict(request.query_params).items()
+        if str(key).lower() != "key"
+    }
+
+    return await pass_through_request(
+        request=request,
+        target=target_url,
+        custom_headers={},
+        user_api_key_dict=user_api_key_dict,
+        custom_body=custom_body,
+        forward_headers=True,
+        query_params=query_params,
+        stream="stream" in str(target_url),
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        egress_credential_family="xai",
+        expected_target_family="xai",
+        allowed_forward_headers=list(_GROK_CLI_FORWARD_HEADER_ALLOWLIST),
+        raw_body_passthrough=raw_body_passthrough,
+    )
 
 
 @router.api_route(

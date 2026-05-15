@@ -586,6 +586,55 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
     assert record["session_id"] == "session-from-header"
 
 
+def test_build_session_history_record_uses_grok_header_model_override() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "request-body-placeholder"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-header-model"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "session_id": "grok-session-123",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "x-grok-model-override": "grok-build",
+            "x-grok-session-id": "grok-session-123",
+        },
+        "body": {"model": "request-body-placeholder", "input": "hello"},
+    }
+    kwargs["passthrough_logging_payload"]["request_headers"] = {
+        "x-grok-model-override": "grok-build",
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "request-body-placeholder",
+        "input": "hello",
+    }
+
+    result = {
+        "id": "resp-grok",
+        "model": "request-body-placeholder",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "ack"}]}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-05-15T21:00:00Z",
+        end_time="2026-05-15T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["session_id"] == "grok-session-123"
+    assert record["provider"] == "xai"
+    assert record["model"] == "grok-build"
+    assert record["input_tokens"] == 10
+    assert record["output_tokens"] == 4
+
+
 @pytest.mark.parametrize(
     ("raw_repository", "expected_repository"),
     [
