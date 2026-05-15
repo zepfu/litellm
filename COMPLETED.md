@@ -2,6 +2,38 @@
 
 ## 2026-05-15
 
+- Promoted D1-104/D1-105 to prod `aawm-litellm`.
+
+  Release:
+  implementation commit `26a196e155` landed on `main`; autobump commit
+  `6351b80d73` bumped the callback source to `0.0.30`; callback release
+  `cb-v0.0.30` contains
+  `aawm_litellm_callbacks-0.0.30-py3-none-any.whl`; fork release
+  `v1.82.3-aawm.52` is published.
+
+  Prod cutover:
+  `/home/zepfu/projects/aawm-infrastructure` commit `4e6ad61` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.52`. Running container
+  `8997f267a4db` is healthy on `127.0.0.1:4000` from image
+  `sha256:79df84d194ed08fa09fb9388e0b0ceb86faae3f9eebaa545a4157c1c318103b1`.
+  Runtime inspection reports `litellm=1.82.3+aawm.52`,
+  `aawm-litellm-callbacks=0.0.30`, and
+  `aawm-litellm-control-plane=0.0.7`; rendered config includes the two new
+  OpenRouter Qwen routes, `openrouter/*`, and `failure_callback`.
+
+  Live proof:
+  prod OpenRouter smokes wrote exact database
+  `aawm_tristore.public.session_history` rows `368578` and `368579` for
+  `openrouter/qwen/qwen3.6-flash` and
+  `openrouter/qwen/qwen3.5-flash-02-23`, with tokens, reasoning-token counts,
+  and `response_cost_usd` matching `metadata.usage_openrouter_cost`.
+  Controlled Anthropic invalid-key smoke wrote
+  `provider_error_observations` row `id=88`. Active provider probes continued
+  writing DNS/TCP/TLS/ICMP rows, and manual refresh of
+  `public.provider_latency_health_5m` materialized the post-cutover
+  OpenRouter rows and Anthropic failure rows.
+
 - Promoted provider health passive-error capture to prod `aawm-litellm`.
 
   Release:
