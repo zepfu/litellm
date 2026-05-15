@@ -1860,6 +1860,28 @@ routes and callback writes before prod promotion.
 
 ---
 
+### aawm.53 — Codex auto-agent continuation scanner crash guard
+
+**Status:** AAWM local hotfix.
+
+**What changed:** Harden `_codex_auto_agent_request_has_continuation_state()` so
+it treats continuation `type` markers only when they are strings and skips
+already-seen dict/list objects while walking request payloads.
+
+**Why:** Prod showed `aawm-codex-agent-auto` could crash before candidate
+fallback when a request contained a nested dict-valued `type` field, raising
+`TypeError: unhashable type: 'dict'`. That prevented the alias from reaching
+its normal first-call provider fallback behavior.
+
+**Why not upstream:** This scanner is part of AAWM's local Codex auto-agent
+alias and in-flight provider-stickiness policy.
+
+**Validation status:** Live dev `litellm-dev` on `:4001` returned a normal
+provider-shaped `400 invalid_type` for the formerly crashing payload shape, and
+focused `codex_auto_agent` tests passed.
+
+---
+
 
 ## Dropped Patches
 
