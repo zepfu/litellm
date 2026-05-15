@@ -2357,6 +2357,49 @@ def test_build_session_history_record_uses_openrouter_hidden_response_cost() -> 
     assert record["response_cost_usd"] == pytest.approx(0.0066)
 
 
+@pytest.mark.parametrize("generic_response_cost", [0, 0.0001366875])
+def test_build_session_history_record_prefers_openrouter_reported_cost(
+    generic_response_cost: float,
+) -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "qwen/qwen3.6-flash"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-openrouter-qwen-reported-cost"
+    kwargs["standard_logging_object"]["response_cost"] = generic_response_cost
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-openrouter-qwen-reported-cost"
+    )
+
+    result = SimpleNamespace(
+        id="or-qwen-response-reported-cost",
+        usage={
+            "input_tokens": 15,
+            "output_tokens": 68,
+            "total_tokens": 83,
+            "cost": 0.0000793125,
+        },
+        _hidden_params={"response_cost": generic_response_cost},
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "qwen/qwen3.6-flash"
+    assert record["input_tokens"] == 15
+    assert record["output_tokens"] == 68
+    assert record["total_tokens"] == 83
+    assert record["metadata"]["usage_openrouter_cost"] == pytest.approx(0.0000793125)
+    assert record["response_cost_usd"] == pytest.approx(0.0000793125)
+
+
 def test_build_session_history_record_calculates_openrouter_embedding_cost() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "qwen/qwen3-embedding-8b"

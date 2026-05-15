@@ -77,6 +77,23 @@ class TestOpenRouterNativeModelRouting:
         assert model_second == expected_model  # preserved, not stripped further
 
     @pytest.mark.parametrize(
+        "input_model",
+        [
+            "anthropic/claude-3-haiku",
+            "qwen/qwen3.5-flash-02-23",
+            "qwen/qwen3.6-flash",
+        ],
+    )
+    def test_custom_provider_regular_model_preserves_openrouter_model_id(self, input_model):
+        """Bridge calls should not add a second OpenRouter prefix to regular IDs."""
+        result_model, provider, _, _ = litellm.get_llm_provider(
+            model=input_model,
+            custom_llm_provider="openrouter",
+        )
+        assert provider == "openrouter"
+        assert result_model == input_model
+
+    @pytest.mark.parametrize(
         "input_model,expected_model",
         [
             ("openrouter/anthropic/claude-3-haiku", "anthropic/claude-3-haiku"),

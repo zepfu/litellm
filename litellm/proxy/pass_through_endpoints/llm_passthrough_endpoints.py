@@ -359,6 +359,8 @@ _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
         "openai/gpt-oss-120b:free",
         "gpt-oss-20b:free",
         "gpt-oss-120b:free",
+        "qwen/qwen3.5-flash-02-23",
+        "qwen/qwen3.6-flash",
         "qwen/qwen3-coder:free",
     }
 )
@@ -991,6 +993,72 @@ def _codex_auto_agent_candidate_public_shape(
     return shaped
 
 
+def _codex_auto_agent_request_has_continuation_state(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key in (
+            "previous_response_id",
+            "call_id",
+            "tool_call_id",
+            "item_id",
+        ):
+            if value.get(key):
+                return True
+        item_type = value.get("type")
+        if item_type in {
+            "function_call",
+            "function_call_output",
+            "mcp_call",
+            "mcp_approval_request",
+            "mcp_approval_response",
+            "reasoning",
+        }:
+            return True
+        if value.get("role") == "tool":
+            return True
+        if value.get("tool_calls"):
+            return True
+        return any(
+            _codex_auto_agent_request_has_continuation_state(child)
+            for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _codex_auto_agent_request_has_continuation_state(item) for item in value
+        )
+    return False
+
+
+def _raise_codex_auto_agent_in_flight_cooldown(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+) -> None:
+    shaped_candidate = _codex_auto_agent_candidate_public_shape(
+        candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        reason="in_flight_session_affinity_cooldown",
+    )
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": (
+                    "Codex auto-agent alias target is cooling down for an in-flight "
+                    "session; provider switching is disabled for stateful agent "
+                    "continuations. Redispatch a fresh agent attempt to re-run the "
+                    "auto selector."
+                ),
+                "type": "rate_limit_error",
+                "code": "aawm_codex_auto_agent_in_flight_provider_cooling_down",
+            },
+            "candidate": shaped_candidate,
+        },
+        headers={"Retry-After": str(int(max(1.0, cooldown_seconds)))},
+    )
+
+
 async def _get_codex_auto_agent_active_cooldown_seconds(
     cooldown_key: str,
 ) -> float:
@@ -1099,6 +1167,9 @@ async def _select_codex_auto_agent_candidate(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
     session_key = _resolve_codex_auto_agent_session_key(request, request_body)
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
+        request_body
+    )
     states = await _build_codex_auto_agent_candidate_states(request)
     skipped = [
         _codex_auto_agent_candidate_public_shape(
@@ -1127,6 +1198,20 @@ async def _select_codex_auto_agent_candidate(
                 ),
                 None,
             )
+            if affinity_state is not None:
+                if affinity_state["cooldown_seconds"] > 0:
+                    _raise_codex_auto_agent_in_flight_cooldown(
+                        candidate=affinity_candidate,
+                        lane_key=affinity_state.get("lane_key"),
+                        cooldown_seconds=affinity_state["cooldown_seconds"],
+                    )
+                return {
+                    **affinity_state,
+                    "session_key": session_key,
+                    "selection_reason": "session_affinity",
+                    "skipped": skipped,
+                    "in_flight_session": has_continuation_state,
+                }
             preferred_available = any(
                 not state["candidate"].get("last_resort")
                 and state["cooldown_seconds"] <= 0
@@ -14051,6 +14136,9 @@ async def _handle_codex_auto_agent_alias_route(
 ) -> Response:
     attempts: list[dict[str, Any]] = []
     last_retryable_exc: Optional[Exception] = None
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
+        prepared_request_body
+    )
 
     for _attempt_number in range(len(_CODEX_AUTO_AGENT_CANDIDATES)):
         selection = await _select_codex_auto_agent_candidate(
@@ -14120,6 +14208,18 @@ async def _handle_codex_auto_agent_alias_route(
                 candidate["model"],
                 cooldown_seconds,
             )
+            if (
+                has_continuation_state
+                or selection.get("selection_reason") == "session_affinity"
+            ):
+                attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                verbose_proxy_logger.warning(
+                    "Codex auto-agent alias target %s/%s hit retryable exhaustion "
+                    "for an in-flight session; not switching providers",
+                    candidate["provider"],
+                    candidate["model"],
+                )
+                raise
             continue
 
     if last_retryable_exc is not None:

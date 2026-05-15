@@ -6283,10 +6283,14 @@ class TestClaudePersistedOutputExpansion:
             ("meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.3-70b-instruct:free"),
             ("meta-llama/llama-3.3-70b-instructfree", "meta-llama/llama-3.3-70b-instruct:free"),
             ("minimax/minimax-m2.5:free", "minimax/minimax-m2.5:free"),
+            ("qwen/qwen3.5-flash-02-23", "qwen/qwen3.5-flash-02-23"),
+            ("openrouter/qwen/qwen3.5-flash-02-23", "qwen/qwen3.5-flash-02-23"),
+            ("qwen/qwen3.6-flash", "qwen/qwen3.6-flash"),
+            ("openrouter/qwen/qwen3.6-flash", "qwen/qwen3.6-flash"),
             ("qwen/qwen3-coder:free", "qwen/qwen3-coder:free"),
         ],
     )
-    async def test_anthropic_proxy_route_adapts_selected_openrouter_free_models_to_responses(
+    async def test_anthropic_proxy_route_adapts_selected_openrouter_models_to_responses(
         self,
         requested_model: str,
         expected_model: str,
@@ -10639,6 +10643,137 @@ async def test_codex_auto_agent_alias_falls_back_to_gemini_after_native_429(monk
     assert gemini_body["litellm_metadata"]["codex_auto_agent_attempts"][0][
         "status"
     ] == "cooldown_set"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "codex-session:session:codex-session"
+    ] = {
+        "provider": "google_code_assist",
+        "model": "gemini-3.1-flash-lite-preview",
+        "route_family": "codex_google_code_assist_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    gemini_error = ProxyException(
+        message="quota exhausted",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    gemini_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=gemini_error),
+    ) as mock_gemini, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(),
+    ) as mock_pass_through:
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value is gemini_error
+    mock_gemini.assert_awaited_once()
+    mock_pass_through.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_in_flight_affinity_cooldown_does_not_switch(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "codex-session:session:codex-session"
+    ] = {
+        "provider": "google_code_assist",
+        "model": "gemini-3.1-flash-lite-preview",
+        "route_family": "codex_google_code_assist_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    await _set_codex_auto_agent_cooldown(
+        "google_code_assist:gemini-3.1-flash-lite-preview:google-lane",
+        60.0,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(),
+    ) as mock_gemini, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(),
+    ) as mock_pass_through:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_in_flight_provider_cooling_down"
+    )
+    assert exc_info.value.detail["candidate"]["model"] == (
+        "gemini-3.1-flash-lite-preview"
+    )
+    mock_gemini.assert_not_called()
+    mock_pass_through.assert_not_called()
 
 
 @pytest.mark.asyncio
