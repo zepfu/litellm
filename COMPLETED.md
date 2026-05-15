@@ -1,5 +1,41 @@
 # Completed
 
+## 2026-05-15
+
+- Promoted provider health passive-error capture to prod `aawm-litellm`.
+
+  Release:
+  fork release `v1.82.3-aawm.51` is published, and callback release
+  `cb-v0.0.29` contains `aawm_litellm_callbacks-0.0.29-py3-none-any.whl`.
+  The prod infrastructure image was rebuilt from
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.51`; local image
+  `aawm-litellm:latest` has image id `b62d8f201861`.
+
+  Prod cutover:
+  `/home/zepfu/projects/aawm-infrastructure` commit `3b04481` now pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.51` and renders
+  `failure_callback:
+  ["aawm_litellm_callbacks.agent_identity.aawm_agent_identity_instance"]`.
+  Running container `60d5d574e2e6` is healthy on `127.0.0.1:4000` from image
+  `sha256:b62d8f201861550a55345eb46008d8a56e329ed40ff0d89cfd851295a282ca8a`.
+  Runtime inspection reports `litellm=1.82.3+aawm.51`,
+  `aawm-litellm-callbacks=0.0.29`, and
+  `aawm-litellm-control-plane=0.0.7`; `/health/readiness` returned healthy.
+
+  Live proof:
+  a controlled Anthropic pass-through failure on prod wrote exact database
+  `aawm_tristore.public.provider_error_observations` row `id=72`:
+  `environment=prod`, `provider=anthropic`, `model=claude-opus-4-7`,
+  `route_family=anthropic_messages`, `status_code=401`, and
+  `error_class=auth_failed`. After refreshing
+  `public.provider_latency_health_5m`, bucket
+  `2026-05-15 01:25:00+00` includes that smoke as
+  `environment=all`, `auth_failed_events=1`, `provider_error_events=1`, plus
+  provider/control ping metrics. The retained pre-restart prod Docker-log
+  errors remain preserved as `61` `metadata.source='docker_log_backfill'`
+  rows in `provider_error_observations`.
+
 ## 2026-05-14
 
 - Hardened the Anthropic/OpenAI/Gemini rate-limit observation repair path after
