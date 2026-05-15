@@ -5692,6 +5692,7 @@ _PROVIDER_CACHE_TARGET_FAMILIES = {
     "openrouter",
     "gemini",
     "nvidia",
+    "xai",
 }
 
 
@@ -5708,6 +5709,8 @@ def _normalize_provider_cache_family(
     route_family = (metadata or {}).get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
         route_family_lower = route_family.lower()
+        if "grok" in route_family_lower or "xai" in route_family_lower:
+            return "xai"
         if "nvidia" in route_family_lower:
             return "nvidia"
         if "openrouter" in route_family_lower:
@@ -5731,6 +5734,8 @@ def _normalize_provider_cache_family(
     model_lower = str(model or "").strip().lower()
     if model_lower.startswith("nvidia_nim/") or model_lower.startswith("nvidia/"):
         return "nvidia"
+    if model_lower.startswith("xai/") or model_lower.startswith("grok"):
+        return "xai"
     if model_lower.startswith("openrouter/"):
         return "openrouter"
     if "gemini" in model_lower:
@@ -5775,6 +5780,8 @@ def _normalize_session_history_provider(
     route_family = metadata.get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
         route_lower = route_family.lower()
+        if "grok" in route_lower or "xai" in route_lower:
+            return "xai"
         if "nvidia" in route_lower:
             return "nvidia_nim"
         if "openrouter" in route_lower:
@@ -5799,6 +5806,8 @@ def _normalize_session_history_provider(
     api_base = metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base")
     if isinstance(api_base, str) and api_base.strip():
         api_base_lower = api_base.lower()
+        if "api.x.ai" in api_base_lower or "cli-chat-proxy.grok.com" in api_base_lower:
+            return "xai"
         if "integrate.api.nvidia.com" in api_base_lower:
             return "nvidia_nim"
         if "openrouter.ai" in api_base_lower:
@@ -5815,6 +5824,8 @@ def _normalize_session_history_provider(
         return None
     if model_lower.startswith("nvidia/"):
         return "nvidia_nim"
+    if model_lower.startswith("xai/") or model_lower.startswith("grok"):
+        return "xai"
     if model_lower.startswith("openrouter/"):
         return "openrouter"
     if "gemini" in model_lower or model_lower.startswith("google/"):
@@ -8133,8 +8144,12 @@ def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
     proxy_header_candidates = (
         _maybe_get_path(litellm_params, "proxy_server_request", "headers", "x-claude-code-session-id"),
         _maybe_get_path(litellm_params, "proxy_server_request", "headers", "X-Claude-Code-Session-Id"),
+        _maybe_get_path(litellm_params, "proxy_server_request", "headers", "x-grok-session-id"),
+        _maybe_get_path(litellm_params, "proxy_server_request", "headers", "X-Grok-Session-Id"),
         _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers", "x-claude-code-session-id"),
         _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers", "X-Claude-Code-Session-Id"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers", "x-grok-session-id"),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_headers", "X-Grok-Session-Id"),
     )
 
     for candidate in (
@@ -9520,6 +9535,10 @@ def _resolve_session_history_model(
     metadata: Dict[str, Any],
     result: Any,
 ) -> str:
+    grok_model_override = _resolve_xai_grok_model_override(kwargs, metadata)
+    if grok_model_override:
+        return grok_model_override
+
     if str(kwargs.get("custom_llm_provider") or "").lower() == "openrouter":
         for candidate in (
             _maybe_get_path(
@@ -9566,6 +9585,28 @@ def _resolve_session_history_model(
         if normalized and normalized.lower() != "unknown":
             return normalized
     return "unknown"
+
+
+def _resolve_xai_grok_model_override(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    provider = str(kwargs.get("custom_llm_provider") or "").strip().lower()
+    route_family = str(metadata.get("passthrough_route_family") or "").strip().lower()
+    if provider not in {"xai", "grok"} and "grok" not in route_family:
+        return None
+
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    for candidate in (
+        _get_header_value(headers, "x-grok-model-override"),
+        metadata.get("grok_model_override"),
+        metadata.get("model_group"),
+        metadata.get("model"),
+    ):
+        normalized = _clean_non_empty_string(candidate)
+        if normalized and normalized.lower() != "unknown":
+            return normalized
+    return None
 
 
 

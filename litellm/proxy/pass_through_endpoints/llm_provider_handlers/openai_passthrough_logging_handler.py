@@ -67,6 +67,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             or hostname == "ai.api.nvidia.com"
             or hostname == "openrouter.ai"
             or hostname.endswith(".openrouter.ai")
+            or hostname == "api.x.ai"
+            or hostname == "cli-chat-proxy.grok.com"
         )
 
     def get_provider_config(self, model: str) -> OpenAIConfigType:

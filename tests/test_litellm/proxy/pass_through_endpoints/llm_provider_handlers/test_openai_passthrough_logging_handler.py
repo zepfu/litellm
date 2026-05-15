@@ -102,6 +102,7 @@ class TestOpenAIPassthroughLoggingHandler:
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openai.azure.com/v1/chat/completions") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openrouter.ai/api/v1/chat/completions") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://integrate.api.nvidia.com/v1/chat/completions") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://cli-chat-proxy.grok.com/v1/chat/completions") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/models") == False
@@ -141,6 +142,7 @@ class TestOpenAIPassthroughLoggingHandler:
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openrouter.ai/api/v1/responses") == True
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://integrate.api.nvidia.com/v1/responses") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.x.ai/v1/responses") == True
         
         # Negative cases
         assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/chat/completions") == False
@@ -1269,6 +1271,7 @@ class TestOpenAIPassthroughIntegration:
         assert self.handler.is_openai_route("https://openai.azure.com/v1/chat/completions") == True
         assert self.handler.is_openai_route("https://api.openai.com/v1/models") == True
         assert self.handler.is_openai_route("https://openrouter.ai/api/v1/responses") == True
+        assert self.handler.is_openai_route("https://api.x.ai/v1/responses") == True
         
         # Negative cases
         assert self.handler.is_openai_route("http://localhost:4000/openai/v1/chat/completions") == False

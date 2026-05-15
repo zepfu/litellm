@@ -332,6 +332,8 @@ class PassThroughEndpointLogging:
                 anthropic_passthrough_logging_handler_result["result"]
             )
             kwargs = anthropic_passthrough_logging_handler_result["kwargs"]
+        elif custom_llm_provider == "xai" and self.is_openai_route(url_route):
+            return return_dict
         elif self.is_cohere_route(url_route):
             cohere_passthrough_logging_handler_result = (
                 CoherePassthroughLoggingHandler.cohere_passthrough_handler(
@@ -569,6 +571,8 @@ class PassThroughEndpointLogging:
                 or parsed_url.hostname == "ai.api.nvidia.com"
                 or parsed_url.hostname == "openrouter.ai"
                 or parsed_url.hostname.endswith(".openrouter.ai")
+                or parsed_url.hostname == "api.x.ai"
+                or parsed_url.hostname == "cli-chat-proxy.grok.com"
             )
         )
 
@@ -587,7 +591,7 @@ class PassThroughEndpointLogging:
         response_body: Optional[dict],
         custom_llm_provider: Optional[str],
     ) -> Optional[str]:
-        if custom_llm_provider not in {"openai", "openrouter", "nvidia_nim"}:
+        if custom_llm_provider not in {"openai", "openrouter", "nvidia_nim", "xai"}:
             return None
         if not isinstance(response_body, dict):
             return None
@@ -603,6 +607,8 @@ class PassThroughEndpointLogging:
             base_url = "https://openrouter.ai/api"
         elif custom_llm_provider == "nvidia_nim":
             base_url = "https://integrate.api.nvidia.com"
+        elif custom_llm_provider == "xai":
+            base_url = "https://api.x.ai"
         else:
             base_url = "https://api.openai.com"
 

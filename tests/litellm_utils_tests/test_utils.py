@@ -1040,6 +1040,11 @@ def test_convert_model_response_object():
     [
         (None, None, None),
         (
+            "Some preamble text <think>I am thinking here</think>The sky is a canvas of blue",
+            "I am thinking here",
+            "Some preamble text The sky is a canvas of blue",
+        ),
+        (
             "<think>I am thinking here</think>The sky is a canvas of blue",
             "I am thinking here",
             "The sky is a canvas of blue",

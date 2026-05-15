@@ -95,6 +95,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     create_pass_through_route,
     cursor_proxy_route,
     gemini_proxy_route,
+    grok_proxy_route,
     llm_passthrough_factory_proxy_route,
     milvus_proxy_route,
     openai_proxy_route,
@@ -13881,6 +13882,166 @@ class TestOpenAIPassthroughRoute:
             
             # Verify result
             assert result == {"id": "asst_123", "object": "assistant"}
+
+
+class TestGrokProxyRoute:
+    """Tests for the native Grok Build pass-through route."""
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_forwards_native_auth_headers_to_cli_chat_proxy(self):
+        """should route Grok Build traffic to the xAI cli-chat-proxy with native headers preserved"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/chat/completions"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-agent-id": "agent_123",
+            "x-grok-client-version": "0.1.210",
+            "x-grok-conv-id": "conv_123",
+            "x-grok-model-override": "grok-build",
+            "x-grok-req-id": "req_123",
+            "x-grok-turn-idx": "1",
+            "x-grok-user-id": "user_123",
+            "x-email": "user@example.com",
+            "x-teamid": "team_123",
+            "x-userid": "user_123",
+            "user-agent": "grok/0.1",
+            "content-type": "application/json",
+        }
+        mock_request.query_params = {"key": "query-litellm-key", "debug": "1"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        request_body = {
+            "model": "grok-build",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ) as mock_auth, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/chat/completions",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-test-key"
+
+        call_kwargs = mock_pass_through.await_args.kwargs
+        assert call_kwargs["target"] == (
+            "https://cli-chat-proxy.grok.com/v1/chat/completions"
+        )
+        assert call_kwargs["forward_headers"] is True
+        assert call_kwargs["custom_headers"] == {}
+        assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+        assert call_kwargs["egress_credential_family"] == "xai"
+        assert call_kwargs["expected_target_family"] == "xai"
+        assert call_kwargs["query_params"] == {"debug": "1"}
+        assert "authorization" in call_kwargs["allowed_forward_headers"]
+        assert "x-xai-token-auth" in call_kwargs["allowed_forward_headers"]
+        assert "x-grok-agent-id" in call_kwargs["allowed_forward_headers"]
+        assert "x-grok-client-version" in call_kwargs["allowed_forward_headers"]
+        assert "x-grok-conv-id" in call_kwargs["allowed_forward_headers"]
+        assert "x-grok-model-override" in call_kwargs["allowed_forward_headers"]
+        assert "x-grok-req-id" in call_kwargs["allowed_forward_headers"]
+        assert "x-grok-turn-idx" in call_kwargs["allowed_forward_headers"]
+        assert "x-grok-user-id" in call_kwargs["allowed_forward_headers"]
+        assert "x-email" in call_kwargs["allowed_forward_headers"]
+        assert "x-teamid" in call_kwargs["allowed_forward_headers"]
+        assert "x-userid" in call_kwargs["allowed_forward_headers"]
+        assert "x-litellm-api-key" not in call_kwargs["allowed_forward_headers"]
+
+        metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        assert metadata["client_name"] == "grok-build"
+        assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+        assert metadata["grok_model_override"] == "grok-build"
+        assert metadata["model_group"] == "grok-build"
+        assert "route:grok_cli_chat_proxy" in metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_avoids_double_v1_for_custom_upstream_base(self):
+        """should not duplicate /v1 when the configured upstream base already includes it"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.url = "http://localhost:4000/grok/v1/responses/resp_123"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+        }
+        mock_request.query_params = {"key": "litellm-query-key"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {"GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL": "https://proxy.example.com/v1"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ) as mock_auth, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"id": "resp_123"}),
+        ) as mock_pass_through:
+            await grok_proxy_route(
+                endpoint="v1/responses/resp_123",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-query-key"
+        call_kwargs = mock_pass_through.await_args.kwargs
+        assert call_kwargs["target"] == "https://proxy.example.com/v1/responses/resp_123"
+        assert call_kwargs["query_params"] == {}
+        assert call_kwargs["custom_body"] is None
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_passes_binary_trace_body_without_json_parse(self):
+        """should pass Grok protobuf side-channel requests without JSON parsing"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/traces"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": "0.1.210",
+            "content-type": "application/x-protobuf",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value={"unexpected": True}),
+        ) as mock_get_request_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/traces",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        mock_get_request_body.assert_not_awaited()
+        call_kwargs = mock_pass_through.await_args.kwargs
+        assert call_kwargs["target"] == "https://cli-chat-proxy.grok.com/v1/traces"
+        assert call_kwargs["custom_body"] is None
+        assert call_kwargs["raw_body_passthrough"] is True
+        assert "x-grok-client-version" in call_kwargs["allowed_forward_headers"]
 
 
 class TestCursorProxyRoute:

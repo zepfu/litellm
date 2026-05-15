@@ -275,6 +275,47 @@ def test_validate_outgoing_egress_blocks_nvidia_credentials_to_openai():
     reset_egress_guard_alert_state()
 
 
+def test_validate_outgoing_egress_allows_matching_xai_grok_headers():
+    headers = {
+        "Authorization": "Bearer oidc-token",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-model-override": "grok-build",
+    }
+
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url="https://cli-chat-proxy.grok.com/v1/responses",
+        headers=headers,
+        credential_family="xai",
+        expected_target_family="xai",
+    )
+
+
+def test_validate_outgoing_egress_blocks_xai_grok_headers_to_openai():
+    reset_egress_guard_alert_state()
+    headers = {
+        "Authorization": "Bearer oidc-token",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-model-override": "grok-build",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+            url="https://api.openai.com/v1/responses",
+            headers=headers,
+            credential_family="xai",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "credential family xai cannot be sent to openai" in str(
+        exc_info.value.detail
+    )
+    alert_state = get_egress_guard_alert_state()
+    assert alert_state["trigger_count"] == 1
+    assert alert_state["last_credential_family"] == "xai"
+    assert alert_state["last_target_family"] == "openai"
+    reset_egress_guard_alert_state()
+
+
 def test_validate_outgoing_egress_blocks_anthropic_markers_to_openai():
     headers = {
         "x-api-key": "anthropic-secret",
@@ -1016,6 +1057,67 @@ def test_normalize_llm_passthrough_logging_payload_uses_openai_handler_for_adapt
     assert result["kwargs"] == {"marker": "openai"}
     assert mock_openai_handler.call_args.kwargs["url_route"] == "https://openrouter.ai/api/v1/chat/completions"
     mock_anthropic_handler.assert_not_called()
+
+
+def test_normalize_llm_passthrough_logging_payload_uses_openai_handler_for_adapted_xai_responses():
+    handler = PassThroughEndpointLogging()
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_logging_obj = MagicMock()
+    response_body = {
+        "id": "resp-test",
+        "object": "response",
+        "model": "grok-build",
+        "output": [],
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler.OpenAIPassthroughLoggingHandler.openai_passthrough_handler",
+        return_value={"result": "openai-ok", "kwargs": {"marker": "xai"}},
+    ) as mock_openai_handler:
+        result = handler.normalize_llm_passthrough_logging_payload(
+            httpx_response=mock_response,
+            response_body=response_body,
+            request_body={"model": "grok-build"},
+            logging_obj=mock_logging_obj,
+            url_route="https://cli-chat-proxy.grok.com/v1/responses",
+            result="",
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            cache_hit=False,
+            custom_llm_provider="xai",
+        )
+
+    assert result["standard_logging_response_object"] == "openai-ok"
+    assert result["kwargs"] == {"marker": "xai"}
+    assert mock_openai_handler.call_args.kwargs["url_route"] == (
+        "https://api.x.ai/v1/responses"
+    )
+    assert mock_openai_handler.call_args.kwargs["custom_llm_provider"] == "xai"
+
+
+def test_normalize_llm_passthrough_logging_payload_skips_xai_embeddings_not_cohere():
+    handler = PassThroughEndpointLogging()
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_logging_obj = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers.cohere_passthrough_logging_handler.CoherePassthroughLoggingHandler.cohere_passthrough_handler"
+    ) as mock_cohere_handler:
+        result = handler.normalize_llm_passthrough_logging_payload(
+            httpx_response=mock_response,
+            response_body={"data": []},
+            request_body={"model": "grok-build"},
+            logging_obj=mock_logging_obj,
+            url_route="https://cli-chat-proxy.grok.com/v1/embeddings",
+            result="",
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            cache_hit=False,
+            custom_llm_provider="xai",
+        )
+
+    assert result["standard_logging_response_object"] is None
+    assert mock_cohere_handler.call_count == 0
 
 
 def test_set_cost_per_request_none():
@@ -2054,6 +2156,57 @@ async def test_pass_through_request_does_not_mutate_custom_body_on_failure():
     logged_body = request_data["passthrough_logging_payload"]["request_body"]
     assert request_data is not logged_body
     assert "passthrough_logging_payload" not in logged_body
+
+
+@pytest.mark.asyncio
+async def test_pass_through_request_forwards_raw_body_without_json_parse():
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = Headers({"Content-Type": "application/x-protobuf"})
+    mock_request.query_params = QueryParams("")
+    mock_request.body = AsyncMock(return_value=b"\x08\x01native")
+
+    mock_user_api_key_dict = MagicMock()
+    request_for_response = httpx.Request("POST", "https://example.com/v1/traces")
+    mock_response = httpx.Response(
+        status_code=204,
+        request=request_for_response,
+        content=b"",
+        headers={"content-type": "application/json"},
+    )
+
+    mock_async_client = MagicMock()
+    mock_async_client_obj = MagicMock(client=mock_async_client)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=mock_async_client_obj,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=mock_response),
+    ) as mock_http_handler, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
+        new=AsyncMock(side_effect=lambda **kwargs: kwargs["data"]),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ):
+        response = await pass_through_request(
+            request=mock_request,
+            target="https://example.com/v1/traces",
+            custom_headers={},
+            user_api_key_dict=mock_user_api_key_dict,
+            stream=False,
+            raw_body_passthrough=True,
+        )
+
+    assert response.status_code == 204
+    mock_request.body.assert_awaited_once()
+    call_kwargs = mock_http_handler.await_args.kwargs
+    assert call_kwargs["raw_body"] == b"\x08\x01native"
+    assert call_kwargs["_parsed_body"]["raw_body_passthrough"] is True
+    assert call_kwargs["_parsed_body"]["raw_body_content_type"] == "application/x-protobuf"
+    assert call_kwargs["_parsed_body"]["raw_body_bytes"] == len(b"\x08\x01native")
 
 
 @pytest.mark.asyncio
