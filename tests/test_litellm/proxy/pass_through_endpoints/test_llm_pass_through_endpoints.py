@@ -41,6 +41,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _collect_responses_response_from_stream,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
+    _codex_auto_agent_request_has_continuation_state,
     _codex_google_code_assist_tool_call_arguments_cache,
     _codex_google_code_assist_tool_call_name_cache,
     _codex_auto_agent_cooldown_until_monotonic_by_key,
@@ -10644,6 +10645,37 @@ async def test_codex_auto_agent_alias_falls_back_to_gemini_after_native_429(monk
     assert gemini_body["litellm_metadata"]["codex_auto_agent_attempts"][0][
         "status"
     ] == "cooldown_set"
+
+
+def test_codex_auto_agent_continuation_detector_ignores_non_string_type() -> None:
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": {"nested": "not-hashable"},
+                        "text": "hello",
+                    }
+                ],
+            }
+        ],
+    }
+
+    assert _codex_auto_agent_request_has_continuation_state(body) is False
+
+
+def test_codex_auto_agent_continuation_detector_handles_cycles() -> None:
+    body: dict[str, Any] = {
+        "model": "aawm-codex-agent-auto",
+        "input": [{"type": {"nested": "not-hashable"}}],
+    }
+    body["self"] = body
+
+    assert _codex_auto_agent_request_has_continuation_state(body) is False
+    body["previous_response_id"] = "resp_existing"
+    assert _codex_auto_agent_request_has_continuation_state(body) is True
 
 
 @pytest.mark.asyncio
