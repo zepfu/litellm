@@ -1767,6 +1767,49 @@ from `2026-05-05T00:00:00Z` through `2026-05-14T14:35:00Z`, then
 
 ---
 
+### aawm.51 — Provider-health failure observations and active probe schema
+
+**Files:**
+- `litellm/integrations/aawm_agent_identity.py`
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `scripts/record_provider_status_observations.py`
+- `scripts/backfill_provider_error_observations_from_docker_logs.py`
+- `scripts/aawm-provider-status-observations.service`
+- `scripts/aawm-provider-status-observations.timer`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_pass_through_endpoints.py`
+- `tests/test_scripts/test_record_provider_status_observations.py`
+
+**Upstream issue:** AAWM needs provider-health telemetry that separates passive
+traffic failures from active network probe degradation. LiteLLM pass-through
+failures were visible in process logs, but the AAWM callback only persisted
+quota-oriented failure signals and prod Anthropic overloads such as `529`
+could disappear on restart. The pass-through failure path could also hand
+callbacks a recursive request payload, blocking failure observation writes.
+
+**Fix:** Add `public.provider_error_observations` and
+`public.provider_status_observations` bootstrap/persistence to the AAWM
+callback. Failure callbacks now persist normalized provider, model, route,
+status, error type/code/class, reset hint, session, trace, and call metadata.
+The pass-through failure payload copies the parsed body before merging callback
+kwargs so `passthrough_logging_payload.request_body` cannot point back to the
+same request-data object. Add an active status collector for DNS, TCP, TLS,
+ICMP, and control-baseline probes, plus a Docker-log preservation backfill for
+restart windows where the running prod callback did not yet persist provider
+errors.
+
+**Why not upstream:** This is AAWM-specific observability and historical
+preservation for the local `aawm_tristore` reporting schema.
+
+**Validation status:** Focused unit coverage proves provider-error
+classification, recursive pass-through failure handling, provider-error insert
+payloads, and active probe row construction. Local/dev runtime smokes wrote
+real `provider_error_observations` and `provider_status_observations` rows in
+exact database `aawm_tristore`; retained prod Docker-log errors were preserved
+before the prod restart.
+
+---
+
 
 ## Dropped Patches
 

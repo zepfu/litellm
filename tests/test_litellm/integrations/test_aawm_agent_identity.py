@@ -4505,6 +4505,171 @@ def test_build_rate_limit_observations_keeps_google_capacity_distinct_from_quota
     assert observation["evidence"]["corroboration_required"] is True
 
 
+def test_provider_status_observations_schema_includes_icmp_fields() -> None:
+    sql = aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL
+
+    assert "CREATE TABLE IF NOT EXISTS public.provider_status_observations" in sql
+    assert "packet_loss_pct DOUBLE PRECISION" in sql
+    assert "icmp_rtt_avg_ms DOUBLE PRECISION" in sql
+    assert "endpoint_key TEXT NOT NULL" in sql
+    assert "probe_type TEXT NOT NULL" in sql
+    assert any(
+        "provider_status_observations_probe_time_idx" in statement
+        for statement in aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS
+    )
+
+
+def test_build_provider_error_observation_classifies_openrouter_5xx() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/meta-llama/llama-3.3-70b-instruct"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["litellm_call_id"] = "call-provider-error"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-provider-error",
+            "trace_id": "trace-provider-error",
+            "passthrough_route_family": "openrouter_chat_completions",
+        }
+    )
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result={"error": {"code": 503, "message": "upstream service unavailable"}},
+        start_time="2026-05-14T12:00:00Z",
+        end_time="2026-05-14T12:00:01Z",
+    )
+
+    assert observation is not None
+    assert observation["provider"] == "openrouter"
+    assert observation["model"] == "openrouter/meta-llama/llama-3.3-70b-instruct"
+    assert observation["route_family"] == "openrouter_chat_completions"
+    assert observation["status_code"] == 503
+    assert observation["error_class"] == "provider_5xx"
+    assert observation["session_id"] == "session-provider-error"
+    assert observation["trace_id"] == "trace-provider-error"
+
+
+def test_build_provider_error_observation_classifies_google_capacity() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gemini/gemini-3.1-pro-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["litellm_call_id"] = "call-provider-capacity"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-provider-capacity",
+            "passthrough_route_family": "google_code_assist_generate_content",
+        }
+    )
+    error = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "The model is overloaded. quota will reset after 120s",
+            "details": [
+                {
+                    "reason": "MODEL_CAPACITY_EXHAUSTED",
+                    "domain": "cloudcode-pa.googleapis.com",
+                    "metadata": {"model": "gemini-3.1-pro-preview"},
+                }
+            ],
+        }
+    }
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result=error,
+        start_time="2026-05-14T12:00:00Z",
+        end_time="2026-05-14T12:00:00Z",
+    )
+
+    assert observation is not None
+    assert observation["provider"] == "gemini"
+    assert observation["status_code"] == 429
+    assert observation["error_code"] == "RESOURCE_EXHAUSTED"
+    assert observation["error_class"] == "capacity_exhausted"
+    assert observation["retry_after_seconds"] == 120.0
+    assert observation["expected_reset_at"].isoformat() == "2026-05-14T12:02:00+00:00"
+
+
+def test_log_failure_event_enqueues_provider_error_without_quota(monkeypatch) -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/meta-llama/llama-3.3-70b-instruct"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["litellm_call_id"] = "call-provider-error-enqueue"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-provider-error-enqueue"
+    enqueue_mock = MagicMock()
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        enqueue_mock,
+    )
+
+    logger.log_failure_event(
+        kwargs=kwargs,
+        response_obj={"error": {"code": 503, "message": "upstream service unavailable"}},
+        start_time="2026-05-14T12:00:00Z",
+        end_time="2026-05-14T12:00:01Z",
+    )
+
+    enqueue_mock.assert_called_once()
+    queued_record = enqueue_mock.call_args.args[0]
+    assert queued_record["_skip_session_history"] is True
+    assert "rate_limit_observations" not in queued_record
+    assert queued_record["provider_error_observations"][0]["error_class"] == "provider_5xx"
+
+
+def test_log_failure_event_handles_recursive_passthrough_payload(monkeypatch) -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    kwargs["model"] = "claude-opus-4-7[1m]"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-recursive-provider-error"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-recursive-provider-error",
+            "trace_id": "trace-recursive-provider-error",
+            "litellm_environment": "dev",
+            "passthrough_route_family": "anthropic_messages",
+        }
+    )
+    request_body = kwargs["passthrough_logging_payload"]["request_body"]
+    request_body["model"] = "claude-opus-4-7[1m]"
+    kwargs["litellm_params"]["proxy_server_request"] = {"body": request_body}
+    request_body.update(kwargs)
+    kwargs["exception"] = SimpleNamespace(
+        status_code=529,
+        detail=json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Overloaded",
+                },
+            }
+        ),
+    )
+    enqueue_mock = MagicMock()
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        enqueue_mock,
+    )
+
+    logger.log_failure_event(
+        kwargs=kwargs,
+        response_obj=None,
+        start_time="2026-05-15T00:23:39Z",
+        end_time="2026-05-15T00:23:40Z",
+    )
+
+    enqueue_mock.assert_called_once()
+    observation = enqueue_mock.call_args.args[0]["provider_error_observations"][0]
+    assert observation["provider"] == "anthropic"
+    assert observation["model"] == "claude-opus-4-7[1m]"
+    assert observation["route_family"] == "anthropic_messages"
+    assert observation["status_code"] == 529
+    assert observation["error_class"] == "capacity_exhausted"
+
+
 def test_classify_rate_limit_transition_uses_resets_percent_and_counters() -> None:
     previous = {
         "limit_key": "openai:codex:test:codex:primary:300",
@@ -5925,6 +6090,56 @@ async def test_persist_session_history_records_skips_repeated_rate_limit_snapsho
 
     mock_conn.fetchrow.assert_awaited_once()
     mock_conn.executemany.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_session_history_records_writes_provider_error_observation(
+    monkeypatch,
+) -> None:
+    provider_error = {
+        "observed_at": datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc),
+        "environment": "dev",
+        "provider": "openrouter",
+        "model": "openrouter/meta-llama/llama-3.3-70b-instruct",
+        "model_group": "llama-3.3-70b",
+        "route_family": "openrouter_chat_completions",
+        "status_code": 503,
+        "error_type": "ProviderError",
+        "error_code": "503",
+        "error_class": "provider_5xx",
+        "retry_after_seconds": None,
+        "expected_reset_at": None,
+        "session_id": "session-provider-error",
+        "trace_id": "trace-provider-error",
+        "litellm_call_id": "call-provider-error",
+        "metadata": {"observed_signal": "normal_traffic_failure"},
+    }
+    mock_conn = AsyncMock()
+    fake_pool = _FakePool(mock_conn)
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+
+    await _persist_session_history_records(
+        [
+            {
+                "_skip_session_history": True,
+                "provider_error_observations": [provider_error],
+            }
+        ]
+    )
+
+    mock_conn.executemany.assert_awaited_once()
+    insert_args = mock_conn.executemany.await_args.args
+    assert "INSERT INTO public.provider_error_observations" in insert_args[0]
+    assert insert_args[1][0][2] == "openrouter"
+    assert insert_args[1][0][9] == "provider_5xx"
+    assert insert_args[1][0][14] == "call-provider-error"
 
 
 def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() -> None:
