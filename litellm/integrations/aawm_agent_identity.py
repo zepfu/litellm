@@ -3105,6 +3105,21 @@ def _first_non_none(*values: Any) -> Any:
     return None
 
 
+def _first_reported_openrouter_cost(
+    metadata: Dict[str, Any],
+    usage_dict: Dict[str, Any],
+) -> Optional[float]:
+    response_cost = _safe_float(
+        _first_non_none(
+            metadata.get("usage_openrouter_cost"),
+            usage_dict.get("cost"),
+        )
+    )
+    if response_cost is None or response_cost < 0:
+        return None
+    return response_cost
+
+
 def _safe_json_load(value: Any, default: Any) -> Any:
     if value is None or value == "":
         return default
@@ -9739,22 +9754,26 @@ def _build_session_history_record(
             if isinstance(tag, str) and tag and tag not in request_tags:
                 request_tags.append(tag)
 
-    response_cost_usd = _safe_float(
-        _first_non_none(
-            kwargs.get("response_cost"),
-            standard_logging_object.get("response_cost"),
-            hidden_params.get("response_cost"),
-            _maybe_get_path(
-                hidden_params,
-                "additional_headers",
-                "llm_provider-x-litellm-response-cost",
-            ),
-            metadata.get("litellm_response_cost"),
-            metadata.get("response_cost"),
-            metadata.get("usage_openrouter_cost"),
-            usage_dict.get("cost"),
+    response_cost_usd = None
+    if resolved_provider == "openrouter":
+        response_cost_usd = _first_reported_openrouter_cost(metadata, usage_dict)
+    if response_cost_usd is None:
+        response_cost_usd = _safe_float(
+            _first_non_none(
+                kwargs.get("response_cost"),
+                standard_logging_object.get("response_cost"),
+                hidden_params.get("response_cost"),
+                _maybe_get_path(
+                    hidden_params,
+                    "additional_headers",
+                    "llm_provider-x-litellm-response-cost",
+                ),
+                metadata.get("litellm_response_cost"),
+                metadata.get("response_cost"),
+                metadata.get("usage_openrouter_cost"),
+                usage_dict.get("cost"),
+            )
         )
-    )
     if (
         (response_cost_usd is None or response_cost_usd == 0)
         and prompt_tokens > 0
