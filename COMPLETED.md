@@ -2,6 +2,38 @@
 
 ## 2026-05-15
 
+- Promoted D1-105 Codex auto-agent continuation scanner hotfix to prod.
+
+  Release:
+  fix commit `1e0c1901d0` hardened
+  `_codex_auto_agent_request_has_continuation_state`; release commit
+  `3a79ee9858` bumped the fork to `1.82.3+aawm.53`; annotated tag
+  `v1.82.3-aawm.53` was pushed; GitHub Actions run `25944984955`
+  succeeded and published `ghcr.io/zepfu/litellm:1.82.3-aawm.53`.
+
+  Prod cutover:
+  `/home/zepfu/projects/aawm-infrastructure` commit `033b377` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.53` and records the already-prod-live
+  OpenRouter Qwen/wildcard config entries. Running container
+  `3233a8908770` is healthy on `127.0.0.1:4000` from image
+  `sha256:03d696966c95b36568e1f05c63e7e957b13ad9594bf29e358b392eb12678fe91`.
+  Runtime inspection reports `litellm=1.82.3+aawm.53`,
+  `aawm-litellm-callbacks=0.0.30`, and
+  `aawm-litellm-control-plane=0.0.7`.
+
+  Live proof:
+  runtime source inspection confirms the string-type guard is installed and
+  the detector returns `False` for a dict-valued nested `type`. Synthetic prod
+  `/openai_passthrough/responses` smokes for both `gpt-5.4-mini` and
+  `aawm-codex-agent-auto` now return upstream-shaped OpenAI `400 invalid_type`
+  responses instead of the prior local `TypeError: unhashable type: 'dict'`.
+  Exact database `aawm_tristore.public.provider_error_observations` has row
+  `96` for `provider=openai`, `model=aawm-codex-agent-auto`,
+  `status_code=400`, `error_class=adapter_error`, and
+  `route_family=openai_responses`. A post-smoke Docker log scan found no
+  `unhashable type`, `TypeError`, or `Exception in ASGI application`.
+
 - Promoted D1-104/D1-105 to prod `aawm-litellm`.
 
   Release:
