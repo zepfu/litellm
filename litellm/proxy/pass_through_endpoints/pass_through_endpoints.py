@@ -1675,7 +1675,7 @@ async def pass_through_request(  # noqa: PLR0915
         # Monitoring: Trigger post_call_failure_hook
         # for pass through endpoint failure
         #########################################################
-        request_payload: dict = _parsed_body or {}
+        request_payload: dict = dict(_parsed_body or {})
         # add user_api_key_dict, litellm_call_id, passthrough_logging_payloa for logging
         if kwargs:
             for key, value in kwargs.items():
