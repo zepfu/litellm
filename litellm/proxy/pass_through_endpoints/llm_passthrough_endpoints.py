@@ -1028,7 +1028,18 @@ def _codex_auto_agent_candidate_public_shape(
     return shaped
 
 
-def _codex_auto_agent_request_has_continuation_state(value: Any) -> bool:
+def _codex_auto_agent_request_has_continuation_state(
+    value: Any,
+    _seen: Optional[set[int]] = None,
+) -> bool:
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return False
+        _seen.add(value_id)
+
     if isinstance(value, dict):
         for key in (
             "previous_response_id",
@@ -1039,7 +1050,7 @@ def _codex_auto_agent_request_has_continuation_state(value: Any) -> bool:
             if value.get(key):
                 return True
         item_type = value.get("type")
-        if item_type in {
+        if isinstance(item_type, str) and item_type in {
             "function_call",
             "function_call_output",
             "mcp_call",
@@ -1053,12 +1064,13 @@ def _codex_auto_agent_request_has_continuation_state(value: Any) -> bool:
         if value.get("tool_calls"):
             return True
         return any(
-            _codex_auto_agent_request_has_continuation_state(child)
+            _codex_auto_agent_request_has_continuation_state(child, _seen)
             for child in value.values()
         )
     if isinstance(value, list):
         return any(
-            _codex_auto_agent_request_has_continuation_state(item) for item in value
+            _codex_auto_agent_request_has_continuation_state(item, _seen)
+            for item in value
         )
     return False
 
