@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AAWM provider status observations collector every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=60s
+Unit=aawm-provider-status-observations.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=AAWM provider status observations collector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zepfu/projects/litellm
+EnvironmentFile=-/etc/aawm/provider-status-observations.env
+Environment=AAWM_LITELLM_ENVIRONMENT=dev
+ExecStart=/home/zepfu/projects/litellm/.venv/bin/python /home/zepfu/projects/litellm/scripts/record_provider_status_observations.py --apply --environment ${AAWM_LITELLM_ENVIRONMENT} --ping-count 1 --ping-timeout 2 --timeout 2
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=true

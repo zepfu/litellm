@@ -2021,6 +2021,7 @@ async def test_pass_through_request_does_not_mutate_custom_body_on_failure():
     mock_async_client = MagicMock()
     mock_async_client_obj = MagicMock(client=mock_async_client)
 
+    post_failure_mock = AsyncMock()
     with patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
         return_value=mock_async_client_obj,
@@ -2032,7 +2033,7 @@ async def test_pass_through_request_does_not_mutate_custom_body_on_failure():
         new=AsyncMock(side_effect=lambda **kwargs: kwargs["data"]),
     ), patch(
         "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
-        new=AsyncMock(),
+        new=post_failure_mock,
     ), patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
         return_value={},
@@ -2049,6 +2050,10 @@ async def test_pass_through_request_does_not_mutate_custom_body_on_failure():
 
     assert custom_body == {"foo": "bar"}
     assert "litellm_logging_obj" not in custom_body
+    request_data = post_failure_mock.await_args.kwargs["request_data"]
+    logged_body = request_data["passthrough_logging_payload"]["request_body"]
+    assert request_data is not logged_body
+    assert "passthrough_logging_payload" not in logged_body
 
 
 @pytest.mark.asyncio

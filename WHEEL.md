@@ -73,6 +73,9 @@ Current responsibilities:
   payloads, and provider quota/capacity errors
 - reusable `public.rate_limit_intervals` materialized-view/index bootstrap for
   repeated session-history usage reporting
+- passive `public.provider_error_observations` capture from failed provider
+  traffic and active `public.provider_status_observations` schema/bootstrap for
+  DNS, TCP, TLS, ICMP, and control-baseline probe rows
 
 ### Claude control-plane wheel
 

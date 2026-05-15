@@ -690,6 +690,87 @@ _AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS rate_limit_transitions_provider_client_idx ON public.rate_limit_transitions (provider, client_family, new_observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_transitions_type_idx ON public.rate_limit_transitions (transition_type, new_observed_at DESC)",
 )
+_AAWM_PROVIDER_ERROR_OBSERVATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.provider_error_observations (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    environment TEXT,
+    provider TEXT NOT NULL,
+    model TEXT,
+    model_group TEXT,
+    route_family TEXT,
+    status_code INTEGER,
+    error_type TEXT,
+    error_code TEXT,
+    error_class TEXT NOT NULL,
+    retry_after_seconds DOUBLE PRECISION,
+    expected_reset_at TIMESTAMPTZ,
+    session_id TEXT,
+    trace_id TEXT,
+    litellm_call_id TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+_AAWM_PROVIDER_ERROR_OBSERVATIONS_ALTER_STATEMENTS = (
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS environment TEXT",
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS model_group TEXT",
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS route_family TEXT",
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS retry_after_seconds DOUBLE PRECISION",
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS expected_reset_at TIMESTAMPTZ",
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS trace_id TEXT",
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS litellm_call_id TEXT",
+    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+)
+_AAWM_PROVIDER_ERROR_OBSERVATIONS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS provider_error_observations_provider_time_idx ON public.provider_error_observations (provider, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_error_observations_model_time_idx ON public.provider_error_observations (provider, model, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_error_observations_class_time_idx ON public.provider_error_observations (error_class, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_error_observations_trace_call_idx ON public.provider_error_observations (trace_id, litellm_call_id)",
+)
+_AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.provider_status_observations (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    environment TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    endpoint_key TEXT NOT NULL,
+    probe_type TEXT NOT NULL,
+    success BOOLEAN NOT NULL,
+    status_code INTEGER,
+    address_family TEXT,
+    resolved_ip TEXT,
+    packet_loss_pct DOUBLE PRECISION,
+    icmp_rtt_min_ms DOUBLE PRECISION,
+    icmp_rtt_avg_ms DOUBLE PRECISION,
+    icmp_rtt_max_ms DOUBLE PRECISION,
+    icmp_rtt_mdev_ms DOUBLE PRECISION,
+    dns_ms DOUBLE PRECISION,
+    tcp_ms DOUBLE PRECISION,
+    tls_ms DOUBLE PRECISION,
+    ttfb_ms DOUBLE PRECISION,
+    total_ms DOUBLE PRECISION,
+    status_summary TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+_AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS = (
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS address_family TEXT",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS resolved_ip TEXT",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS packet_loss_pct DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_min_ms DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_avg_ms DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_max_ms DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_mdev_ms DOUBLE PRECISION",
+)
+_AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS provider_status_observations_provider_time_idx ON public.provider_status_observations (provider, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_status_observations_endpoint_time_idx ON public.provider_status_observations (provider, endpoint_key, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_status_observations_probe_time_idx ON public.provider_status_observations (probe_type, observed_at DESC)",
+)
 _AAWM_SESSION_HISTORY_INSERT_SQL = """
 INSERT INTO public.session_history (
     litellm_call_id,
@@ -1272,6 +1353,29 @@ INSERT INTO public.rate_limit_transitions (
     $21, $22, $23, $24, $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb
 )
 ON CONFLICT (transition_key) DO NOTHING
+"""
+_AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL = """
+INSERT INTO public.provider_error_observations (
+    observed_at,
+    environment,
+    provider,
+    model,
+    model_group,
+    route_family,
+    status_code,
+    error_type,
+    error_code,
+    error_class,
+    retry_after_seconds,
+    expected_reset_at,
+    session_id,
+    trace_id,
+    litellm_call_id,
+    metadata
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11, $12, $13, $14, $15, $16::jsonb
+)
 """
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "tenant_id_source",
@@ -2011,7 +2115,21 @@ def _extract_repository_identity_from_text(value: str) -> Optional[str]:
     return None
 
 
-def _extract_repository_identity_from_value(value: Any) -> Optional[str]:
+def _extract_repository_identity_from_value(
+    value: Any,
+    *,
+    _seen: Optional[set[int]] = None,
+    _depth: int = 0,
+) -> Optional[str]:
+    if _depth > 12:
+        return None
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return None
+        _seen.add(value_id)
     if isinstance(value, str):
         return _extract_repository_identity_from_text(value)
     if isinstance(value, dict):
@@ -2020,12 +2138,20 @@ def _extract_repository_identity_from_value(value: Any) -> Optional[str]:
                 repository = _normalize_repository_identity(child)
                 if repository:
                     return repository
-            repository = _extract_repository_identity_from_value(child)
+            repository = _extract_repository_identity_from_value(
+                child,
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
             if repository:
                 return repository
     if isinstance(value, list):
         for child in reversed(value):
-            repository = _extract_repository_identity_from_value(child)
+            repository = _extract_repository_identity_from_value(
+                child,
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
             if repository:
                 return repository
     return None
@@ -4710,6 +4836,391 @@ def _build_rate_limit_observations(
     observations.extend(_extract_google_quota_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_error_observations(kwargs, result, observed_at))
     return _dedupe_rate_limit_observations(observations)
+
+
+def _extract_provider_error_dicts(value: Any) -> List[Dict[str, Any]]:
+    dicts: List[Dict[str, Any]] = []
+    if isinstance(value, dict):
+        dicts.append(value)
+    dicts.extend(_extract_error_payload_dicts(value))
+
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for candidate in dicts:
+        try:
+            key = json.dumps(
+                _json_safe_rate_limit_value(candidate),
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            key = str(id(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _extract_provider_error_headers(value: Any) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    candidates = [
+        value,
+        getattr(value, "response", None),
+        getattr(value, "headers", None),
+        getattr(value, "response_headers", None),
+        getattr(value, "upstream_headers", None),
+    ]
+    response = getattr(value, "response", None)
+    if response is not None:
+        candidates.extend(
+            [
+                getattr(response, "headers", None),
+                getattr(response, "response_headers", None),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if not isinstance(candidate, dict) and hasattr(candidate, "items"):
+            try:
+                candidate = dict(candidate.items())
+            except Exception:
+                continue
+        if not isinstance(candidate, dict):
+            continue
+        for key, nested_value in list(candidate.items()):
+            key_text = _clean_non_empty_string(key)
+            value_text = _clean_non_empty_string(nested_value)
+            if key_text and value_text:
+                headers[key_text.lower()] = value_text
+    return headers
+
+
+def _extract_provider_error_status_code(result: Any, dicts: List[Dict[str, Any]]) -> Optional[int]:
+    for candidate in (
+        getattr(result, "status_code", None),
+        getattr(getattr(result, "response", None), "status_code", None),
+        getattr(result, "code", None),
+    ):
+        status_code = _safe_int(candidate)
+        if status_code is not None:
+            return status_code
+
+    for candidate in dicts:
+        error = candidate.get("error") if isinstance(candidate.get("error"), dict) else candidate
+        for key in ("status_code", "statusCode", "http_status", "code"):
+            status_code = _safe_int(error.get(key)) if isinstance(error, dict) else None
+            if status_code is not None:
+                return status_code
+    return None
+
+
+def _extract_provider_error_text(result: Any, dicts: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for candidate in (
+        getattr(result, "message", None),
+        getattr(result, "detail", None),
+        str(result) if result is not None else None,
+    ):
+        cleaned = _clean_non_empty_string(candidate)
+        if cleaned:
+            parts.append(cleaned)
+
+    for candidate in dicts:
+        error = candidate.get("error") if isinstance(candidate.get("error"), dict) else candidate
+        if not isinstance(error, dict):
+            continue
+        for key in ("message", "detail", "status", "type", "code", "reason"):
+            cleaned = _clean_non_empty_string(error.get(key))
+            if cleaned:
+                parts.append(cleaned)
+        details = error.get("details") if isinstance(error.get("details"), list) else []
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            for key in ("reason", "domain"):
+                cleaned = _clean_non_empty_string(detail.get(key))
+                if cleaned:
+                    parts.append(cleaned)
+            metadata = detail.get("metadata")
+            if isinstance(metadata, dict):
+                for key in ("reason", "model"):
+                    cleaned = _clean_non_empty_string(metadata.get(key))
+                    if cleaned:
+                        parts.append(cleaned)
+    return " ".join(parts)
+
+
+def _extract_provider_error_code_and_type(
+    result: Any,
+    dicts: List[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str]]:
+    error_code = _first_non_empty_string(
+        getattr(result, "code", None),
+        getattr(result, "error_code", None),
+    )
+    error_type = _first_non_empty_string(
+        getattr(result, "type", None),
+        getattr(result, "error_type", None),
+        type(result).__name__ if result is not None else None,
+    )
+    for candidate in dicts:
+        error = candidate.get("error") if isinstance(candidate.get("error"), dict) else candidate
+        if not isinstance(error, dict):
+            continue
+        error_code = error_code or _first_non_empty_string(
+            error.get("code"),
+            error.get("status"),
+            error.get("reason"),
+        )
+        error_type = error_type or _first_non_empty_string(
+            error.get("type"),
+            error.get("error_type"),
+            error.get("status"),
+        )
+    return error_code, error_type
+
+
+def _extract_provider_error_retry_after_seconds(
+    *,
+    kwargs: Dict[str, Any],
+    result: Any,
+    dicts: List[Dict[str, Any]],
+    error_text: str,
+) -> Optional[float]:
+    headers = _extract_headers_from_kwargs(kwargs)
+    headers.update(_extract_provider_error_headers(result))
+    retry_after = _first_non_empty_string(
+        headers.get("retry-after"),
+        headers.get("x-ratelimit-reset-after"),
+        headers.get("x-codex-primary-reset-after-seconds"),
+        headers.get("x-codex-secondary-reset-after-seconds"),
+    )
+    retry_after_seconds = _safe_float(retry_after)
+    if retry_after_seconds is not None and retry_after_seconds >= 0:
+        return retry_after_seconds
+
+    for candidate in dicts:
+        error = candidate.get("error") if isinstance(candidate.get("error"), dict) else candidate
+        if not isinstance(error, dict):
+            continue
+        for key in ("retry_after_seconds", "retryAfterSeconds", "resetAfterSeconds"):
+            parsed = _safe_float(error.get(key))
+            if parsed is not None and parsed >= 0:
+                return parsed
+    reset_hint = _parse_reset_hint_seconds(error_text)
+    return float(reset_hint) if reset_hint is not None else None
+
+
+def _classify_provider_error(
+    *,
+    status_code: Optional[int],
+    error_code: Optional[str],
+    error_type: Optional[str],
+    error_text: str,
+) -> str:
+    normalized = " ".join(
+        part
+        for part in (
+            str(status_code or ""),
+            error_code or "",
+            error_type or "",
+            error_text,
+        )
+        if part
+    ).lower()
+    if "usage_limit_reached" in normalized:
+        return "usage_limit_reached"
+    if (
+        "model_capacity_exhausted" in normalized
+        or "capacity_exhausted" in normalized
+        or "model is overloaded" in normalized
+        or "overloaded" in normalized
+    ):
+        return "capacity_exhausted"
+    if (
+        status_code == 429
+        or "resource_exhausted" in normalized
+        or "rate_limit" in normalized
+        or "rate limit" in normalized
+        or "too many requests" in normalized
+    ):
+        return "rate_limited"
+    if status_code in {401, 403} or any(
+        marker in normalized
+        for marker in (
+            "x-api-key",
+            "api key",
+            "authentication",
+            "unauthorized",
+            "permission denied",
+            "forbidden",
+        )
+    ):
+        return "auth_failed"
+    if status_code is not None and status_code >= 500:
+        return "provider_5xx"
+    if any(marker in normalized for marker in ("timeout", "timed out", "deadline")):
+        return "provider_timeout"
+    if any(
+        marker in normalized
+        for marker in (
+            "connection error",
+            "connection refused",
+            "connection reset",
+            "dns",
+            "tls",
+            "ssl",
+            "network",
+        )
+    ):
+        return "network_error"
+    return "adapter_error"
+
+
+def _build_provider_error_observation(
+    kwargs: Dict[str, Any],
+    result: Any,
+    start_time: Any,
+    end_time: Any,
+) -> Optional[Dict[str, Any]]:
+    observed_at = (
+        _parse_datetime_value(end_time)
+        or _parse_datetime_value(start_time)
+        or datetime.now(timezone.utc)
+    )
+    metadata = _merged_rate_limit_metadata(kwargs)
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    if not isinstance(standard_logging_object, dict):
+        standard_logging_object = {}
+    model = _resolve_rate_limit_model(kwargs, result, metadata)
+    provider = (
+        _normalize_session_history_provider(
+            kwargs.get("custom_llm_provider"),
+            model,
+            metadata,
+        )
+        or "unknown"
+    )
+    dicts = _extract_provider_error_dicts(result)
+    status_code = _extract_provider_error_status_code(result, dicts)
+    error_text = _extract_provider_error_text(result, dicts)
+    error_code, error_type = _extract_provider_error_code_and_type(result, dicts)
+    error_class = _classify_provider_error(
+        status_code=status_code,
+        error_code=error_code,
+        error_type=error_type,
+        error_text=error_text,
+    )
+    retry_after_seconds = _extract_provider_error_retry_after_seconds(
+        kwargs=kwargs,
+        result=result,
+        dicts=dicts,
+        error_text=error_text,
+    )
+    expected_reset_at = (
+        observed_at + timedelta(seconds=retry_after_seconds)
+        if retry_after_seconds is not None
+        else None
+    )
+    runtime_identity = _build_session_runtime_identity(
+        metadata=metadata,
+        kwargs=kwargs,
+        allow_runtime=True,
+    )
+    return {
+        "observed_at": observed_at,
+        "environment": runtime_identity.get("litellm_environment"),
+        "provider": provider,
+        "model": model if model != "unknown" else None,
+        "model_group": _get_session_history_model_group(
+            metadata,
+            standard_logging_object,
+        ),
+        "route_family": _clean_non_empty_string(
+            metadata.get("passthrough_route_family")
+            or metadata.get("codex_auto_agent_selected_route_family")
+            or metadata.get("aawm_local_route_family")
+        ),
+        "status_code": status_code,
+        "error_type": error_type,
+        "error_code": error_code,
+        "error_class": error_class,
+        "retry_after_seconds": retry_after_seconds,
+        "expected_reset_at": expected_reset_at,
+        "session_id": _extract_session_id(kwargs),
+        "trace_id": _first_non_empty_string(
+            metadata.get("trace_id"),
+            metadata.get("langfuse_trace_id"),
+            standard_logging_object.get("trace_id"),
+            kwargs.get("trace_id"),
+        ),
+        "litellm_call_id": kwargs.get("litellm_call_id"),
+        "metadata": {
+            "client_name": runtime_identity.get("client_name"),
+            "client_version": runtime_identity.get("client_version"),
+            "client_user_agent": runtime_identity.get("client_user_agent"),
+            "normalized_error_text": error_text[:500] if error_text else None,
+            "observed_signal": "normal_traffic_failure",
+        },
+    }
+
+
+def _build_provider_error_observation_only_record(
+    kwargs: Dict[str, Any],
+    observation: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    model = _resolve_rate_limit_model(kwargs, None, metadata)
+    return {
+        "_skip_session_history": True,
+        "litellm_call_id": kwargs.get("litellm_call_id"),
+        "session_id": _extract_session_id(kwargs),
+        "model": model,
+        "provider_error_observations": [observation],
+    }
+
+
+def _build_failure_observation_only_record(
+    kwargs: Dict[str, Any],
+    result: Any,
+    start_time: Any,
+    end_time: Any,
+) -> Optional[Dict[str, Any]]:
+    failure_result = result
+    if failure_result is None:
+        failure_result = kwargs.get("exception") or kwargs.get("original_exception")
+    rate_limit_observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=failure_result,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    provider_error_observation = _build_provider_error_observation(
+        kwargs=kwargs,
+        result=failure_result,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if not rate_limit_observations and provider_error_observation is None:
+        return None
+
+    if rate_limit_observations:
+        record = _build_rate_limit_observation_only_record(
+            kwargs,
+            rate_limit_observations,
+        )
+    else:
+        assert provider_error_observation is not None
+        record = _build_provider_error_observation_only_record(
+            kwargs,
+            provider_error_observation,
+        )
+    if provider_error_observation is not None:
+        record["provider_error_observations"] = [provider_error_observation]
+    return record
 
 
 def _classify_rate_limit_transition(
@@ -9492,6 +10003,16 @@ async def _ensure_session_history_schema(conn: Any) -> None:
             await conn.execute(statement)
         for statement in _AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS:
             await conn.execute(statement)
+        await conn.execute(_AAWM_PROVIDER_ERROR_OBSERVATIONS_TABLE_SQL)
+        for statement in _AAWM_PROVIDER_ERROR_OBSERVATIONS_ALTER_STATEMENTS:
+            await conn.execute(statement)
+        for statement in _AAWM_PROVIDER_ERROR_OBSERVATIONS_INDEX_STATEMENTS:
+            await conn.execute(statement)
+        await conn.execute(_AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL)
+        for statement in _AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS:
+            await conn.execute(statement)
+        for statement in _AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS:
+            await conn.execute(statement)
 
         _aawm_session_history_schema_ready = True
 
@@ -9764,6 +10285,27 @@ def _build_rate_limit_transition_db_payload(record: Dict[str, Any]) -> Tuple[Any
     )
 
 
+def _build_provider_error_observation_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        record["observed_at"],
+        record.get("environment"),
+        record["provider"],
+        record.get("model"),
+        record.get("model_group"),
+        record.get("route_family"),
+        record.get("status_code"),
+        record.get("error_type"),
+        record.get("error_code"),
+        record["error_class"],
+        record.get("retry_after_seconds"),
+        record.get("expected_reset_at"),
+        record.get("session_id"),
+        record.get("trace_id"),
+        record.get("litellm_call_id"),
+        json.dumps(_json_safe_rate_limit_value(record.get("metadata") or {})),
+    )
+
+
 async def _fetch_previous_rate_limit_observation(
     conn: Any,
     observation: Dict[str, Any],
@@ -9979,6 +10521,20 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
                         for transition in transitions
                     ],
                 )
+        provider_error_observations = record.get("provider_error_observations")
+        provider_error_observations = [
+            observation
+            for observation in provider_error_observations
+            if isinstance(observation, dict)
+        ] if isinstance(provider_error_observations, list) else []
+        if provider_error_observations:
+            await conn.executemany(
+                _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
+                [
+                    _build_provider_error_observation_db_payload(observation)
+                    for observation in provider_error_observations
+                ],
+            )
 
 
 async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
@@ -10044,6 +10600,23 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
                         for transition in transitions
                     ],
                 )
+        provider_error_observations: List[Dict[str, Any]] = []
+        for record in records:
+            observations = record.get("provider_error_observations")
+            if isinstance(observations, list):
+                provider_error_observations.extend(
+                    observation
+                    for observation in observations
+                    if isinstance(observation, dict)
+                )
+        if provider_error_observations:
+            await conn.executemany(
+                _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
+                [
+                    _build_provider_error_observation_db_payload(observation)
+                    for observation in provider_error_observations
+                ],
+            )
 
 
 def _get_reasoning_state_tags(
@@ -10557,22 +11130,17 @@ class AawmAgentIdentity(CustomLogger):
             )
 
     def log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        """Queue rate-limit observations from failed provider calls."""
+        """Queue passive health observations from failed provider calls."""
         try:
-            rate_limit_observations = _build_rate_limit_observations(
-                kwargs=kwargs,
-                result=response_obj,
-                start_time=start_time,
-                end_time=end_time,
+            record = _build_failure_observation_only_record(
+                kwargs,
+                response_obj,
+                start_time,
+                end_time,
             )
-            if not rate_limit_observations:
+            if record is None:
                 return
-            _enqueue_session_history_record(
-                _build_rate_limit_observation_only_record(
-                    kwargs,
-                    rate_limit_observations,
-                )
-            )
+            _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.log_failure_event failed: %s", exc
@@ -10582,20 +11150,15 @@ class AawmAgentIdentity(CustomLogger):
         self, kwargs, response_obj, start_time, end_time
     ) -> None:
         try:
-            rate_limit_observations = _build_rate_limit_observations(
-                kwargs=kwargs,
-                result=response_obj,
-                start_time=start_time,
-                end_time=end_time,
+            record = _build_failure_observation_only_record(
+                kwargs,
+                response_obj,
+                start_time,
+                end_time,
             )
-            if not rate_limit_observations:
+            if record is None:
                 return
-            _enqueue_session_history_record(
-                _build_rate_limit_observation_only_record(
-                    kwargs,
-                    rate_limit_observations,
-                )
-            )
+            _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.async_log_failure_event failed: %s", exc
@@ -10612,20 +11175,15 @@ class AawmAgentIdentity(CustomLogger):
             kwargs = dict(request_data or {})
             kwargs.setdefault("user_api_key_dict", user_api_key_dict)
             now = datetime.now(timezone.utc)
-            rate_limit_observations = _build_rate_limit_observations(
-                kwargs=kwargs,
-                result=original_exception,
-                start_time=now,
-                end_time=now,
+            record = _build_failure_observation_only_record(
+                kwargs,
+                original_exception,
+                now,
+                now,
             )
-            if not rate_limit_observations:
+            if record is None:
                 return None
-            _enqueue_session_history_record(
-                _build_rate_limit_observation_only_record(
-                    kwargs,
-                    rate_limit_observations,
-                )
-            )
+            _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.async_post_call_failure_hook failed: %s",

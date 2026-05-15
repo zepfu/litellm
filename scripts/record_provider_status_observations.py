@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""Collect non-inference provider status observations.
+
+The script intentionally avoids chat/completion/messages/generate endpoints. It
+records network/front-door signals only: ICMP ping, DNS, TCP connect, and TLS
+handshake. By default it prints JSON rows; pass --apply to insert into
+public.provider_status_observations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote, urlencode
+
+import psycopg
+
+from litellm.integrations import aawm_agent_identity
+
+
+PING_STATS_RE = re.compile(
+    r"(?P<sent>\d+)\s+packets transmitted,\s+"
+    r"(?P<received>\d+)\s+(?:packets )?received,\s+"
+    r"(?P<loss>[0-9.]+)% packet loss"
+)
+PING_RTT_RE = re.compile(
+    r"rtt min/avg/max/(?:mdev|stddev) = "
+    r"(?P<min>[0-9.]+)/(?P<avg>[0-9.]+)/(?P<max>[0-9.]+)/(?P<mdev>[0-9.]+) ms"
+)
+PING_IP_RE = re.compile(r"PING\s+[^\s]+\s+\((?P<ip>[^)]+)\)")
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    provider: str
+    endpoint_key: str
+    host: str
+    port: int = 443
+
+
+DEFAULT_ENDPOINTS: tuple[Endpoint, ...] = (
+    Endpoint("anthropic", "api.anthropic.com:443", "api.anthropic.com"),
+    Endpoint("openai", "api.openai.com:443", "api.openai.com"),
+    Endpoint("openrouter", "openrouter.ai:443", "openrouter.ai"),
+    Endpoint("nvidia_nim", "integrate.api.nvidia.com:443", "integrate.api.nvidia.com"),
+    Endpoint("gemini", "generativelanguage.googleapis.com:443", "generativelanguage.googleapis.com"),
+    Endpoint("gemini", "cloudcode-pa.googleapis.com:443", "cloudcode-pa.googleapis.com"),
+    Endpoint("control", "control:google.com", "google.com"),
+)
+
+
+PROVIDER_STATUS_INSERT_SQL = """
+INSERT INTO public.provider_status_observations (
+    observed_at,
+    environment,
+    provider,
+    endpoint_key,
+    probe_type,
+    success,
+    status_code,
+    address_family,
+    resolved_ip,
+    packet_loss_pct,
+    icmp_rtt_min_ms,
+    icmp_rtt_avg_ms,
+    icmp_rtt_max_ms,
+    icmp_rtt_mdev_ms,
+    dns_ms,
+    tcp_ms,
+    tls_ms,
+    ttfb_ms,
+    total_ms,
+    status_summary,
+    error_class,
+    error_message,
+    metadata
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s::jsonb
+)
+"""
+
+
+def _build_dsn(args: argparse.Namespace) -> Optional[str]:
+    if args.dsn:
+        return args.dsn
+
+    host = args.pg_host or os.getenv("AAWM_DB_HOST") or os.getenv("PGHOST")
+    database = args.pg_database or os.getenv("AAWM_DB_NAME") or os.getenv("PGDATABASE")
+    user = args.pg_user or os.getenv("AAWM_DB_USER") or os.getenv("PGUSER")
+    password = args.pg_password or os.getenv("AAWM_DB_PASSWORD") or os.getenv("PGPASSWORD")
+    configured_port = args.pg_port or os.getenv("AAWM_DB_PORT") or os.getenv("PGPORT")
+    port = configured_port or "5432"
+    sslmode = args.pg_sslmode or os.getenv("AAWM_DB_SSLMODE") or os.getenv("PGSSLMODE")
+    has_component_config = any((host, database, user, password, configured_port, sslmode))
+    if has_component_config:
+        if not (host and database and user):
+            return None
+
+        dsn = (
+            f"postgresql://{quote(user, safe='')}"
+            f"{':' + quote(password, safe='') if password else ''}"
+            f"@{host}:{port}/{quote(database, safe='')}"
+        )
+        if sslmode:
+            dsn += f"?{urlencode({'sslmode': sslmode})}"
+        return dsn
+
+    for key in ("AAWM_DB_URL", "AAWM_DATABASE_URL", "AAWM_POSTGRES_URL"):
+        value = os.getenv(key)
+        if value:
+            return value
+    return None
+
+
+def _empty_observation(
+    *,
+    endpoint: Endpoint,
+    environment: str,
+    observed_at: datetime,
+    probe_type: str,
+) -> Dict[str, Any]:
+    return {
+        "observed_at": observed_at,
+        "environment": environment,
+        "provider": endpoint.provider,
+        "endpoint_key": endpoint.endpoint_key,
+        "probe_type": probe_type,
+        "success": False,
+        "status_code": None,
+        "address_family": None,
+        "resolved_ip": None,
+        "packet_loss_pct": None,
+        "icmp_rtt_min_ms": None,
+        "icmp_rtt_avg_ms": None,
+        "icmp_rtt_max_ms": None,
+        "icmp_rtt_mdev_ms": None,
+        "dns_ms": None,
+        "tcp_ms": None,
+        "tls_ms": None,
+        "ttfb_ms": None,
+        "total_ms": None,
+        "status_summary": None,
+        "error_class": None,
+        "error_message": None,
+        "metadata": {},
+    }
+
+
+def _family_name(family: int) -> str:
+    if family == socket.AF_INET:
+        return "ipv4"
+    if family == socket.AF_INET6:
+        return "ipv6"
+    return str(family)
+
+
+def _resolve_host(
+    endpoint: Endpoint,
+    *,
+    environment: str,
+    observed_at: datetime,
+    timeout: float,
+) -> tuple[Dict[str, Any], Optional[str], Optional[int]]:
+    observation = _empty_observation(
+        endpoint=endpoint,
+        environment=environment,
+        observed_at=observed_at,
+        probe_type="dns",
+    )
+    started = time.perf_counter()
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        results = socket.getaddrinfo(endpoint.host, endpoint.port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        observation["error_class"] = "dns_error"
+        observation["error_message"] = str(exc)[:300]
+        observation["total_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        observation["dns_ms"] = observation["total_ms"]
+        return observation, None, None
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    if not results:
+        observation["error_class"] = "dns_empty"
+        observation["dns_ms"] = elapsed_ms
+        observation["total_ms"] = elapsed_ms
+        return observation, None, None
+
+    family, _socktype, _proto, _canonname, sockaddr = results[0]
+    resolved_ip = sockaddr[0]
+    observation.update(
+        {
+            "success": True,
+            "address_family": _family_name(family),
+            "resolved_ip": resolved_ip,
+            "dns_ms": elapsed_ms,
+            "total_ms": elapsed_ms,
+            "metadata": {"address_count": len(results)},
+        }
+    )
+    return observation, resolved_ip, family
+
+
+def _tcp_probe(
+    endpoint: Endpoint,
+    *,
+    environment: str,
+    observed_at: datetime,
+    resolved_ip: Optional[str],
+    family: Optional[int],
+    timeout: float,
+) -> Dict[str, Any]:
+    observation = _empty_observation(
+        endpoint=endpoint,
+        environment=environment,
+        observed_at=observed_at,
+        probe_type="tcp_connect",
+    )
+    observation["resolved_ip"] = resolved_ip
+    observation["address_family"] = _family_name(family) if family is not None else None
+    if resolved_ip is None:
+        observation["error_class"] = "dns_error"
+        return observation
+
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((resolved_ip, endpoint.port), timeout=timeout):
+            pass
+    except OSError as exc:
+        observation["error_class"] = "tcp_error"
+        observation["error_message"] = str(exc)[:300]
+    else:
+        observation["success"] = True
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    observation["tcp_ms"] = elapsed_ms
+    observation["total_ms"] = elapsed_ms
+    return observation
+
+
+def _tls_probe(
+    endpoint: Endpoint,
+    *,
+    environment: str,
+    observed_at: datetime,
+    resolved_ip: Optional[str],
+    family: Optional[int],
+    timeout: float,
+) -> Dict[str, Any]:
+    observation = _empty_observation(
+        endpoint=endpoint,
+        environment=environment,
+        observed_at=observed_at,
+        probe_type="tls_handshake",
+    )
+    observation["resolved_ip"] = resolved_ip
+    observation["address_family"] = _family_name(family) if family is not None else None
+    if resolved_ip is None:
+        observation["error_class"] = "dns_error"
+        return observation
+
+    context = ssl.create_default_context()
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((resolved_ip, endpoint.port), timeout=timeout) as raw_sock:
+            connect_ms = round((time.perf_counter() - started) * 1000, 3)
+            tls_started = time.perf_counter()
+            with context.wrap_socket(raw_sock, server_hostname=endpoint.host) as tls_sock:
+                cert = tls_sock.getpeercert() or {}
+                tls_ms = round((time.perf_counter() - tls_started) * 1000, 3)
+                observation.update(
+                    {
+                        "success": True,
+                        "tcp_ms": connect_ms,
+                        "tls_ms": tls_ms,
+                        "metadata": {
+                            "tls_version": tls_sock.version(),
+                            "cert_subject": cert.get("subject"),
+                        },
+                    }
+                )
+    except OSError as exc:
+        observation["error_class"] = "tls_error"
+        observation["error_message"] = str(exc)[:300]
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    observation["total_ms"] = elapsed_ms
+    return observation
+
+
+def parse_ping_output(output: str) -> Dict[str, Any]:
+    stats_match = PING_STATS_RE.search(output)
+    rtt_match = PING_RTT_RE.search(output)
+    ip_match = PING_IP_RE.search(output)
+    parsed: Dict[str, Any] = {}
+    if ip_match:
+        parsed["resolved_ip"] = ip_match.group("ip")
+    if stats_match:
+        parsed["sent"] = int(stats_match.group("sent"))
+        parsed["received"] = int(stats_match.group("received"))
+        parsed["packet_loss_pct"] = float(stats_match.group("loss"))
+    if rtt_match:
+        parsed["icmp_rtt_min_ms"] = float(rtt_match.group("min"))
+        parsed["icmp_rtt_avg_ms"] = float(rtt_match.group("avg"))
+        parsed["icmp_rtt_max_ms"] = float(rtt_match.group("max"))
+        parsed["icmp_rtt_mdev_ms"] = float(rtt_match.group("mdev"))
+    return parsed
+
+
+def _icmp_probe(
+    endpoint: Endpoint,
+    *,
+    environment: str,
+    observed_at: datetime,
+    count: int,
+    timeout: int,
+) -> Dict[str, Any]:
+    observation = _empty_observation(
+        endpoint=endpoint,
+        environment=environment,
+        observed_at=observed_at,
+        probe_type="icmp_ping",
+    )
+    started = time.perf_counter()
+    command = ["ping", "-c", str(count), "-W", str(timeout), endpoint.host]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=max(timeout * count + 2, timeout + 2),
+    )
+    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+    parsed = parse_ping_output(output)
+    observation.update(
+        {
+            "success": completed.returncode == 0 and parsed.get("packet_loss_pct") != 100.0,
+            "resolved_ip": parsed.get("resolved_ip"),
+            "packet_loss_pct": parsed.get("packet_loss_pct"),
+            "icmp_rtt_min_ms": parsed.get("icmp_rtt_min_ms"),
+            "icmp_rtt_avg_ms": parsed.get("icmp_rtt_avg_ms"),
+            "icmp_rtt_max_ms": parsed.get("icmp_rtt_max_ms"),
+            "icmp_rtt_mdev_ms": parsed.get("icmp_rtt_mdev_ms"),
+            "total_ms": round((time.perf_counter() - started) * 1000, 3),
+            "metadata": {
+                "packets_sent": parsed.get("sent"),
+                "packets_received": parsed.get("received"),
+            },
+        }
+    )
+    if not observation["success"]:
+        observation["error_class"] = "icmp_unavailable"
+        observation["error_message"] = output[-300:] if output else "ping failed"
+    return observation
+
+
+def collect_observations(
+    endpoints: Iterable[Endpoint],
+    *,
+    environment: str,
+    timeout: float,
+    ping_count: int,
+    ping_timeout: int,
+    skip_icmp: bool,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for endpoint in endpoints:
+        observed_at = datetime.now(timezone.utc)
+        if not skip_icmp:
+            rows.append(
+                _icmp_probe(
+                    endpoint,
+                    environment=environment,
+                    observed_at=observed_at,
+                    count=ping_count,
+                    timeout=ping_timeout,
+                )
+            )
+        dns_row, resolved_ip, family = _resolve_host(
+            endpoint,
+            environment=environment,
+            observed_at=observed_at,
+            timeout=timeout,
+        )
+        rows.append(dns_row)
+        rows.append(
+            _tcp_probe(
+                endpoint,
+                environment=environment,
+                observed_at=observed_at,
+                resolved_ip=resolved_ip,
+                family=family,
+                timeout=timeout,
+            )
+        )
+        rows.append(
+            _tls_probe(
+                endpoint,
+                environment=environment,
+                observed_at=observed_at,
+                resolved_ip=resolved_ip,
+                family=family,
+                timeout=timeout,
+            )
+        )
+    return rows
+
+
+def _db_payload(row: Dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row["observed_at"],
+        row["environment"],
+        row["provider"],
+        row["endpoint_key"],
+        row["probe_type"],
+        row["success"],
+        row.get("status_code"),
+        row.get("address_family"),
+        row.get("resolved_ip"),
+        row.get("packet_loss_pct"),
+        row.get("icmp_rtt_min_ms"),
+        row.get("icmp_rtt_avg_ms"),
+        row.get("icmp_rtt_max_ms"),
+        row.get("icmp_rtt_mdev_ms"),
+        row.get("dns_ms"),
+        row.get("tcp_ms"),
+        row.get("tls_ms"),
+        row.get("ttfb_ms"),
+        row.get("total_ms"),
+        row.get("status_summary"),
+        row.get("error_class"),
+        row.get("error_message"),
+        json.dumps(row.get("metadata") or {}),
+    )
+
+
+def insert_observations(dsn: str, rows: List[Dict[str, Any]]) -> None:
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL)
+            for statement in aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS:
+                cur.execute(statement)
+            for statement in aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS:
+                cur.execute(statement)
+            cur.executemany(PROVIDER_STATUS_INSERT_SQL, [_db_payload(row) for row in rows])
+        conn.commit()
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="Insert rows into Postgres.")
+    parser.add_argument("--dsn", help="PostgreSQL DSN. Defaults to AAWM_DB_* env vars.")
+    parser.add_argument("--environment", default=os.getenv("AAWM_LITELLM_ENVIRONMENT", "unknown"))
+    parser.add_argument("--timeout", type=float, default=3.0, help="DNS/TCP/TLS timeout seconds.")
+    parser.add_argument("--ping-count", type=int, default=3)
+    parser.add_argument("--ping-timeout", type=int, default=2)
+    parser.add_argument("--skip-icmp", action="store_true")
+    parser.add_argument("--pg-host")
+    parser.add_argument("--pg-port")
+    parser.add_argument("--pg-database")
+    parser.add_argument("--pg-user")
+    parser.add_argument("--pg-password")
+    parser.add_argument("--pg-sslmode")
+    args = parser.parse_args()
+
+    rows = collect_observations(
+        DEFAULT_ENDPOINTS,
+        environment=args.environment,
+        timeout=args.timeout,
+        ping_count=args.ping_count,
+        ping_timeout=args.ping_timeout,
+        skip_icmp=args.skip_icmp,
+    )
+    if args.apply:
+        dsn = _build_dsn(args)
+        if not dsn:
+            raise SystemExit("No database DSN found. Set AAWM_DB_* or pass --dsn.")
+        insert_observations(dsn, rows)
+
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True, default=_json_default))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
