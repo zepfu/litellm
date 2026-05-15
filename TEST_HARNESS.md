@@ -19,11 +19,16 @@ For the production promotion process, see `PROD_RELEASE.md`.
 - `:4001`
   - `litellm-dev`
   - primary development runtime for Anthropic-route adapter work
-  - native Anthropic egress is enabled again, but the adapter suite still targets explicit adapted models and mixed fanout rather than plain top-level Claude traffic
+  - native Anthropic egress is enabled again; the focused
+    `native_anthropic_passthrough_claude` case validates native Anthropic
+    telemetry and rate-limit observations
+  - focused native Codex and native Gemini cases validate `session_history`
+    persistence plus provider quota rows in `rate_limit_observations`
 
 Because the adapter suite is validating the Anthropic-route adapter specifically,
-top-level Claude runs without an adapted `--model` are not meaningful
-acceptance targets there.
+top-level Claude runs without an adapted `--model` are not broad acceptance
+targets there. The exception is `native_anthropic_passthrough_claude`, which is
+a narrow opt-in native Anthropic telemetry and rate-limit-observation gate.
 
 ## Baseline local acceptance suite
 
@@ -90,6 +95,7 @@ This suite shells out to the real Claude CLI and then validates:
 - adapted route tags / metadata in Langfuse
 - Anthropic-compatible response shape seen by Claude Code
 - backend `session_history` attribution and cost
+- provider-originated `rate_limit_observations` for the native Anthropic smoke
 - provider-family egress separation
 - adapted access-log labeling
 
@@ -150,13 +156,30 @@ These default adapter cases are expected to pass on the real Claude CLI path:
 - `claude_adapter_ctx_marker`
 - `claude_adapter_ctx_marker_escaped`
 - `claude_adapter_codex_tool_activity`
-- `claude_adapter_gemini_fanout`
-- `claude_adapter_peeromega_fanout`
 - `claude_adapter_spark`
 
-The full adapter suite intentionally runs `claude_adapter_gemini_fanout`
-before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not
-contaminated by the mixed fanout's short-window upstream pressure.
+Claude subagent fanout cases are no longer default gates. Run
+`claude_adapter_gemini_fanout` or `claude_adapter_peeromega_fanout` explicitly
+with `--cases` when validating fanout behavior.
+
+The native Anthropic rate-limit gate is also explicit while the live native
+auth path is being stabilized:
+
+```bash
+python3 scripts/local-ci/run_anthropic_adapter_acceptance.py \
+  --target dev \
+  --cases native_anthropic_passthrough_claude \
+  --write-artifact /tmp/native-anthropic-rate-limit.json
+```
+
+Native Codex and native Gemini rate-limit gates are also explicit canaries:
+
+```bash
+python3 scripts/local-ci/run_anthropic_adapter_acceptance.py \
+  --target dev \
+  --cases native_openai_passthrough_responses_codex native_gemini_passthrough_generate_content \
+  --write-artifact /tmp/native-codex-gemini-rate-limits.json
+```
 
 ### Warning-only canaries
 
@@ -325,7 +348,7 @@ Telemetry expectation:
   `litellm_wheel_versions`, `client_name`, `client_version`, and
   `client_user_agent`; dev/prod harness target profiles inject the expected
   environment into session-history validation
-- the default Anthropic adapter suite includes a provider-cache canary in
+- the opt-in Anthropic adapter fanout suite includes a provider-cache canary in
   `claude_adapter_peeromega_fanout`: at least one Anthropic child row must have
   `provider_cache_attempted=true` and `provider_cache_status` equal to `hit` or
   `write`
@@ -395,7 +418,7 @@ Telemetry expectation:
   - cost tracking should not remain permanently zero or unmapped; if NVIDIA
     lacks usable non-free pricing, use the closest equivalent OpenRouter
     pricing as the fallback basis
-- for Gemini fanout acceptance, do not assume every Gemini child model emits
+- for opt-in Gemini fanout acceptance, do not assume every Gemini child model emits
   its own command row; the stable invariant is:
   - session-wide delegated `Agent` rows are present on the parent session
   - `claude_adapter_gemini_fanout` should persist at least three parent-session

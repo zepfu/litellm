@@ -735,6 +735,75 @@ def test_target_profile_adds_native_cli_repository_headers(monkeypatch):
     assert "x-aawm-repository: zepfu/litellm" in gemini_headers
 
 
+def _assert_session_history_validation_loads_provider_record(
+    case_config,
+    *,
+    expected_provider,
+    expected_model,
+    expected_client_name,
+):
+    session_history_validation = case_config["session_history_validation"]
+    assert session_history_validation["expected_provider"] == expected_provider
+    assert session_history_validation["expected_model"] == expected_model
+    assert session_history_validation["expected_client_name"] == expected_client_name
+    assert session_history_validation["metadata_required_equals"][
+        "client_name"
+    ] == expected_client_name
+    assert "request_tags" in session_history_validation["metadata_required_truthy"]
+    assert "client_version" in session_history_validation["metadata_required_truthy"]
+    assert session_history_validation["required_contains"]["repository"] == "litellm"
+    assert session_history_validation["minimums"]["input_tokens"] == 1
+    assert session_history_validation["minimums"]["output_tokens"] == 1
+    assert session_history_validation["minimums"]["total_tokens"] == 1
+
+
+def _assert_codex_rate_limit_validation(case_config):
+    assert "codex_response_headers" in case_config[
+        "required_generation_metadata_truthy"
+    ]
+    rate_limit_checks = case_config["rate_limit_observations_validation"]
+    assert rate_limit_checks["allow_latest_snapshot_fallback"] is True
+    expected_rows = rate_limit_checks["expected_rows"]
+    assert {
+        (row["quota_key"], row["required_equals"]["quota_period"])
+        for row in expected_rows
+    } == {
+        ("codex:primary", "five_hour"),
+        ("codex:secondary", "seven_day"),
+    }
+    for row in expected_rows:
+        assert row["provider"] == "openai"
+        assert row["client"] == "codex"
+        assert row["source"] == "codex_response_headers"
+        assert row["quota_type"] == "tokens"
+        assert row["minimums"]["remaining_pct"] == 0
+        assert row["maximums"]["remaining_pct"] == 100
+        assert "expected_reset_at" in row["required_future_timestamps"]
+        assert "expected_reset_at" in row["required_timestamp_after_observed"]
+
+
+def _assert_gemini_rate_limit_validation(case_config):
+    rate_limit_checks = case_config["rate_limit_observations_validation"]
+    assert rate_limit_checks["allow_latest_snapshot_fallback"] is True
+    [expected_row] = rate_limit_checks["expected_rows"]
+    assert expected_row["provider"] == "google"
+    assert expected_row["client"] == "google_code_assist"
+    assert expected_row["model"] == "gemini-2.5-flash"
+    assert expected_row["source"] == "google_retrieve_user_quota"
+    assert (
+        expected_row["quota_key"]
+        == "google_code_assist_requests_gemini-2.5-flash:model_requests"
+    )
+    assert expected_row["quota_type"] == "requests"
+    assert expected_row["required_equals"]["quota_period"] == "daily"
+    assert expected_row["minimums"]["remaining_pct"] == 0
+    assert expected_row["maximums"]["remaining_pct"] == 100
+    assert "expected_reset_at" in expected_row["required_future_timestamps"]
+    assert "expected_reset_at" in expected_row[
+        "required_timestamp_after_observed"
+    ]
+
+
 def test_codex_tool_activity_parity_cases_have_stream_state_gates():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
 
@@ -764,6 +833,13 @@ def test_codex_tool_activity_parity_cases_have_stream_state_gates():
     assert native_case["tool_activity_validation"]["expected_rows"][0][
         "command_text_contains"
     ] == "pwd"
+    _assert_session_history_validation_loads_provider_record(
+        native_case,
+        expected_provider="openai",
+        expected_model="gpt-5.4-mini",
+        expected_client_name="codex_exec",
+    )
+    _assert_codex_rate_limit_validation(native_case)
 
     claude_stream_gate = claude_case["stream_tool_call_state_validation"]
     assert "anthropic-openai-codex-native-tools" in claude_case[
@@ -790,6 +866,13 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
     case_config = config["cases"]["native_openai_passthrough_responses_codex"]
 
+    _assert_session_history_validation_loads_provider_record(
+        case_config,
+        expected_provider="openai",
+        expected_model="gpt-5.4-mini",
+        expected_client_name="codex_exec",
+    )
+    _assert_codex_rate_limit_validation(case_config)
     assert "codex-tool-description-patch" in case_config["required_trace_tags"]
     assert (
         "codex-tool-description-patch:spawn-agent-fanout-policy"
@@ -839,6 +922,28 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
         assert session_history_validation["minimums"][column_name] == 1
 
 
+def test_default_suite_keeps_claude_fanout_and_native_anthropic_rate_limit_gate_opt_in():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    assert "claude_adapter_gemini_fanout" in config["default_excluded_cases"]
+    assert "claude_adapter_peeromega_fanout" in config["default_excluded_cases"]
+    assert "native_anthropic_passthrough_claude" in config[
+        "default_excluded_cases"
+    ]
+
+    native_case = config["cases"]["native_anthropic_passthrough_claude"]
+    assert "anthropic_response_headers" in native_case[
+        "required_generation_metadata_truthy"
+    ]
+    rate_limit_checks = native_case["rate_limit_observations_validation"]
+    assert rate_limit_checks["allow_latest_snapshot_fallback"] is True
+    quota_keys = {
+        row["quota_key"] for row in rate_limit_checks["expected_rows"]
+    }
+    assert "anthropic_unified_5h:5h" in quota_keys
+    assert "anthropic_unified_7d:7d" in quota_keys
+
+
 def test_native_gemini_cases_have_code_assist_request_payload_gates():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
 
@@ -847,6 +952,13 @@ def test_native_gemini_cases_have_code_assist_request_payload_gates():
         "native_gemini_passthrough_stream_generate_content",
     ):
         case_config = config["cases"][case_name]
+        _assert_session_history_validation_loads_provider_record(
+            case_config,
+            expected_provider="gemini",
+            expected_model="gemini-2.5-flash",
+            expected_client_name="gemini-cli",
+        )
+        _assert_gemini_rate_limit_validation(case_config)
         assert case_config["cli_passthrough"] == "gemini"
         assert case_config["allowed_generation_routes"] == [
             "/gemini/v1internal:streamGenerateContent"
@@ -2746,6 +2858,290 @@ def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeyp
     assert '"expected": "adapter-harness-tenant"' in failures[0]
     assert '"input_system_tokens_estimated"' in failures[0]
     assert '"metadata.prompt_overhead_counted_shape"' in failures[0]
+
+    harness._close_validation_db_connections()
+
+
+def test_rate_limit_observations_validation_matches_session_rows(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+    now = dt.datetime(2026, 5, 14, 18, 0, tzinfo=dt.timezone.utc)
+    attempts = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            attempts.append((query, params))
+
+        def fetchall(self):
+            return [
+                {
+                    "observed_at": now,
+                    "created_at": now,
+                    "client": "claude",
+                    "client_version": "1.2.3",
+                    "account_hash": "acct",
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-6",
+                    "quota_key": "anthropic_unified_5h:5h",
+                    "quota_period": "5h",
+                    "quota_type": "tokens",
+                    "expected_reset_at": now + dt.timedelta(hours=1),
+                    "remaining_pct": 66.0,
+                    "source": "anthropic_response_headers",
+                    "session_id": "session-1",
+                    "trace_id": "trace-1",
+                    "litellm_call_id": "call-1",
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+    monkeypatch.setattr(harness.RA, "_utcnow", lambda: now)
+
+    summary, failures, warnings = harness._validate_rate_limit_observations(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "anthropic",
+                    "source": "anthropic_response_headers",
+                    "quota_key": "anthropic_unified_5h:5h",
+                    "minimums": {"remaining_pct": 0},
+                    "maximums": {"remaining_pct": 100},
+                    "required_future_timestamps": ["expected_reset_at"],
+                    "required_timestamp_after_observed": ["expected_reset_at"],
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    assert warnings == []
+    assert summary["match_source"] == "session"
+    assert summary["matched_records"][0]["quota_key"] == "anthropic_unified_5h:5h"
+    assert "from public.rate_limit_observations" in attempts[0][0]
+    assert attempts[0][1] == ("session-1",)
+
+    harness._close_validation_db_connections()
+
+
+def test_rate_limit_observations_validation_matches_codex_and_google_rows(
+    monkeypatch,
+):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+    now = dt.datetime(2026, 5, 14, 18, 0, tzinfo=dt.timezone.utc)
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            self.query = query
+            self.params = params
+
+        def fetchall(self):
+            return [
+                {
+                    "observed_at": now,
+                    "created_at": now,
+                    "client": "codex",
+                    "client_version": "0.130.0",
+                    "account_hash": "acct-openai",
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
+                    "quota_key": "codex:primary",
+                    "quota_period": "five_hour",
+                    "quota_type": "tokens",
+                    "expected_reset_at": now + dt.timedelta(hours=2),
+                    "remaining_pct": 57.0,
+                    "source": "codex_response_headers",
+                    "session_id": "session-native",
+                    "trace_id": "trace-codex",
+                    "litellm_call_id": "call-codex",
+                },
+                {
+                    "observed_at": now,
+                    "created_at": now,
+                    "client": "google_code_assist",
+                    "client_version": "0.9.0",
+                    "account_hash": "acct-google",
+                    "provider": "google",
+                    "model": "gemini-2.5-flash",
+                    "quota_key": "google_code_assist_requests_gemini-2.5-flash:model_requests",
+                    "quota_period": "daily",
+                    "quota_type": "requests",
+                    "expected_reset_at": now + dt.timedelta(hours=6),
+                    "remaining_pct": 91.5,
+                    "source": "google_retrieve_user_quota",
+                    "session_id": "session-native",
+                    "trace_id": "trace-google",
+                    "litellm_call_id": "call-google",
+                },
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+    monkeypatch.setattr(harness.RA, "_utcnow", lambda: now)
+
+    summary, failures, warnings = harness._validate_rate_limit_observations(
+        family="native-provider-cases",
+        session_id="session-native",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "openai",
+                    "client": "codex",
+                    "source": "codex_response_headers",
+                    "quota_key": "codex:primary",
+                    "quota_type": "tokens",
+                    "required_equals": {"quota_period": "five_hour"},
+                    "minimums": {"remaining_pct": 0},
+                    "maximums": {"remaining_pct": 100},
+                    "required_future_timestamps": ["expected_reset_at"],
+                    "required_timestamp_after_observed": ["expected_reset_at"],
+                },
+                {
+                    "provider": "google",
+                    "client": "google_code_assist",
+                    "model": "gemini-2.5-flash",
+                    "source": "google_retrieve_user_quota",
+                    "quota_key": (
+                        "google_code_assist_requests_gemini-2.5-flash:"
+                        "model_requests"
+                    ),
+                    "quota_type": "requests",
+                    "required_equals": {"quota_period": "daily"},
+                    "minimums": {"remaining_pct": 0},
+                    "maximums": {"remaining_pct": 100},
+                    "required_future_timestamps": ["expected_reset_at"],
+                    "required_timestamp_after_observed": ["expected_reset_at"],
+                },
+            ],
+        },
+    )
+
+    assert failures == []
+    assert warnings == []
+    assert summary["match_source"] == "session"
+    assert {
+        row["quota_key"] for row in summary["matched_records"]
+    } == {
+        "codex:primary",
+        "google_code_assist_requests_gemini-2.5-flash:model_requests",
+    }
+
+    harness._close_validation_db_connections()
+
+
+def test_rate_limit_observations_validation_can_fall_back_to_latest_snapshot(monkeypatch):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+    now = dt.datetime(2026, 5, 14, 18, 0, tzinfo=dt.timezone.utc)
+    attempts = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            attempts.append((query, params))
+
+        def fetchall(self):
+            query = attempts[-1][0]
+            if "where session_id = %s" in query:
+                return []
+            return [
+                {
+                    "observed_at": now - dt.timedelta(minutes=3),
+                    "created_at": now - dt.timedelta(minutes=3),
+                    "client": "claude",
+                    "client_version": "1.2.3",
+                    "account_hash": "acct",
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-6",
+                    "quota_key": "anthropic_unified_7d:7d",
+                    "quota_period": "7d",
+                    "quota_type": "tokens",
+                    "expected_reset_at": now + dt.timedelta(days=1),
+                    "remaining_pct": 99.0,
+                    "source": "anthropic_response_headers",
+                    "session_id": "older-session",
+                    "trace_id": "trace-old",
+                    "litellm_call_id": "call-old",
+                }
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+    monkeypatch.setattr(harness.RA, "_utcnow", lambda: now)
+
+    summary, failures, warnings = harness._validate_rate_limit_observations(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "allow_latest_snapshot_fallback": True,
+            "latest_snapshot_max_age_seconds": 21600,
+            "expected_rows": [
+                {
+                    "provider": "anthropic",
+                    "source": "anthropic_response_headers",
+                    "quota_key": "anthropic_unified_7d:7d",
+                    "minimums": {"remaining_pct": 0},
+                    "maximums": {"remaining_pct": 100},
+                    "required_future_timestamps": ["expected_reset_at"],
+                    "required_timestamp_after_observed": ["expected_reset_at"],
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    assert summary["match_source"] == "latest_snapshot"
+    assert summary["matched_records"][0]["session_id"] == "older-session"
+    assert warnings == [
+        "case rate_limit_observations matched latest current snapshots instead of session rows; unchanged duplicate snapshots may have been suppressed"
+    ]
 
     harness._close_validation_db_connections()
 
