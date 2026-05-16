@@ -82,3 +82,17 @@ def test_db_payload_preserves_icmp_fields() -> None:
     assert payload[9] == 0.0
     assert payload[11] == 34.297
     assert '"packets_received": 3' in payload[22]
+
+
+def test_default_endpoints_include_xai_front_doors() -> None:
+    endpoints = {
+        (endpoint.provider, endpoint.endpoint_key, endpoint.host)
+        for endpoint in probes.DEFAULT_ENDPOINTS
+    }
+
+    assert (
+        "xai",
+        "cli-chat-proxy.grok.com:443",
+        "cli-chat-proxy.grok.com",
+    ) in endpoints
+    assert ("xai", "api.x.ai:443", "api.x.ai") in endpoints

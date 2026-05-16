@@ -1882,6 +1882,46 @@ focused `codex_auto_agent` tests passed.
 
 ---
 
+### aawm.54 — xAI/Grok provider-health capture
+
+**Files:**
+- `pyproject.toml`
+- `PATCHES.md`
+- `litellm/proxy/pass_through_endpoints/pass_through_endpoints.py`
+- `litellm/integrations/aawm_agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `scripts/record_provider_status_observations.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_pass_through_endpoints.py`
+- `tests/test_litellm/integrations/test_aawm_agent_identity.py`
+- `tests/test_scripts/test_record_provider_status_observations.py`
+
+**Upstream issue:** AAWM's native Grok Build `/grok` passthrough route could
+record successful `session_history` rows, but xAI/Grok upstream failures were
+not guaranteed to reach `public.provider_error_observations`. The active
+provider-status collector also did not probe xAI front doors, leaving the
+provider-health overlay blind to xAI DNS/TCP/TLS/ICMP behavior.
+
+**Fix:** Add `cli-chat-proxy.grok.com:443` and `api.x.ai:443` to the active
+provider-status collector. Enrich xAI/Grok passthrough failure payloads with
+provider, route-family, API base, and `x-grok-model-override` metadata, then
+directly call the AAWM failure callback for xAI passthrough failures in
+addition to the normal LiteLLM failure hook. Make provider-error persistence
+idempotent for duplicate callbacks by deduping rows with the same
+`litellm_call_id`, provider, route family, and status code.
+
+**Why not upstream:** This is AAWM-specific native Grok Build routing and
+provider-health telemetry for the local `aawm_tristore` reporting schema.
+
+**Validation status:** Focused unit coverage proves xAI default active-probe
+endpoints, Grok failure classification, direct xAI passthrough failure capture,
+and idempotent provider-error SQL. Live dev validation on `litellm-dev` `:4001`
+inserted an exact `aawm_tristore.public.provider_error_observations` row for a
+controlled `/grok/v1/responses` upstream `401` with `provider=xai`,
+`model=grok-build`, `error_class=auth_failed`, and
+`route_family=grok_cli_chat_proxy`, with one row for the call id after dedupe.
+
+---
+
 
 ## Dropped Patches
 
