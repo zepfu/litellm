@@ -4,6 +4,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -25,6 +26,7 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    _direct_capture_xai_passthrough_failure,
     pass_through_request,
 )
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
@@ -2234,6 +2236,46 @@ async def test_pass_through_request_adds_xai_context_on_failure_logging():
     assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
     assert metadata["grok_model_override"] == "grok-build"
     assert metadata["xai_cli_chat_proxy"] is True
+
+
+@pytest.mark.asyncio
+async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallback():
+    direct_capture_mock = AsyncMock()
+
+    def fake_import_module(module_name):
+        if module_name == "litellm.integrations.aawm_agent_identity":
+            raise ModuleNotFoundError(module_name)
+        if module_name == "aawm_litellm_callbacks.agent_identity":
+            return SimpleNamespace(
+                aawm_agent_identity_instance=SimpleNamespace(
+                    async_post_call_failure_hook=direct_capture_mock,
+                )
+            )
+        raise AssertionError(f"unexpected module import {module_name}")
+
+    request_payload = {"model": "grok-build", "custom_llm_provider": "xai"}
+    user_api_key_dict = MagicMock()
+    original_exception = HTTPException(status_code=401, detail="xai auth failed")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.importlib.import_module",
+        side_effect=fake_import_module,
+    ):
+        await _direct_capture_xai_passthrough_failure(
+            request_payload=request_payload,
+            original_exception=original_exception,
+            user_api_key_dict=user_api_key_dict,
+            traceback_str="traceback",
+            url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses"),
+            custom_llm_provider="xai",
+        )
+
+    direct_capture_mock.assert_awaited_once_with(
+        user_api_key_dict=user_api_key_dict,
+        original_exception=original_exception,
+        request_data=request_payload,
+        traceback_str="traceback",
+    )
 
 
 @pytest.mark.asyncio
