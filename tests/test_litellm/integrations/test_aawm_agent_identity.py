@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 import litellm
 from litellm.integrations import aawm_agent_identity
@@ -4683,6 +4684,48 @@ def test_build_provider_error_observation_classifies_google_capacity() -> None:
     assert observation["expected_reset_at"].isoformat() == "2026-05-14T12:02:00+00:00"
 
 
+def test_build_provider_error_observation_classifies_grok_auth_failure() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_call_id"] = "call-grok-provider-error"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-grok-provider-error",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "grok_model_override": "grok-build",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "x-grok-model-override": "grok-build",
+            "x-grok-session-id": "session-grok-provider-error",
+        },
+        "body": {"model": "grok-build", "input": "hello"},
+    }
+    error = HTTPException(
+        status_code=401,
+        detail=(
+            '{"error":"Invalid or expired credentials '
+            '(auth_kind=bearer, x_xai_token_auth=unknown)"}'
+        ),
+    )
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result=error,
+        start_time="2026-05-15T23:44:00Z",
+        end_time="2026-05-15T23:44:01Z",
+    )
+
+    assert observation is not None
+    assert observation["provider"] == "xai"
+    assert observation["model"] == "grok-build"
+    assert observation["route_family"] == "grok_cli_chat_proxy"
+    assert observation["status_code"] == 401
+    assert observation["error_class"] == "auth_failed"
+
+
 def test_log_failure_event_enqueues_provider_error_without_quota(monkeypatch) -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
@@ -6232,6 +6275,17 @@ async def test_persist_session_history_records_writes_provider_error_observation
     assert insert_args[1][0][2] == "openrouter"
     assert insert_args[1][0][9] == "provider_5xx"
     assert insert_args[1][0][14] == "call-provider-error"
+
+
+def test_provider_error_observation_insert_sql_dedupes_litellm_call_id() -> None:
+    sql = aawm_agent_identity._AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL
+
+    assert "WHERE NULLIF($15::text, '') IS NULL" in sql
+    assert "NOT EXISTS" in sql
+    assert "existing.litellm_call_id = NULLIF($15::text, '')" in sql
+    assert "existing.provider IS NOT DISTINCT FROM $3::text" in sql
+    assert "existing.route_family IS NOT DISTINCT FROM $6::text" in sql
+    assert "existing.status_code IS NOT DISTINCT FROM $7::integer" in sql
 
 
 def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() -> None:

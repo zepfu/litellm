@@ -257,6 +257,121 @@ def _extract_exception_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
+def _get_case_insensitive_mapping_value(
+    values: Optional[dict],
+    key_name: str,
+) -> Optional[str]:
+    if not isinstance(values, dict):
+        return None
+    wanted = key_name.lower()
+    for key, value in values.items():
+        if str(key).lower() != wanted or value is None:
+            continue
+        value_text = str(value).strip()
+        if value_text:
+            return value_text
+    return None
+
+
+def _is_xai_passthrough_target(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+) -> bool:
+    provider = str(custom_llm_provider or "").strip().lower()
+    hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
+    return (
+        provider == "xai"
+        or hostname in {
+            "api.x.ai",
+            "cli-chat-proxy.grok.com",
+        }
+        or hostname.endswith(".x.ai")
+        or hostname.endswith(".grok.com")
+    )
+
+
+def _enrich_passthrough_failure_request_payload(
+    *,
+    request_payload: dict,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+) -> None:
+    if custom_llm_provider:
+        request_payload["custom_llm_provider"] = custom_llm_provider
+        litellm_params = request_payload.setdefault("litellm_params", {})
+        if isinstance(litellm_params, dict):
+            metadata = litellm_params.setdefault("metadata", {})
+            if isinstance(metadata, dict):
+                metadata.setdefault("custom_llm_provider", custom_llm_provider)
+                if url is not None:
+                    metadata.setdefault("api_base", str(url))
+
+    if not _is_xai_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return
+
+    litellm_params = request_payload.setdefault("litellm_params", {})
+    if not isinstance(litellm_params, dict):
+        return
+    metadata = litellm_params.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        return
+
+    metadata.setdefault("custom_llm_provider", "xai")
+    metadata.setdefault("passthrough_route_family", "grok_cli_chat_proxy")
+    metadata.setdefault("xai_cli_chat_proxy", True)
+    if url is not None:
+        metadata.setdefault("api_base", str(url))
+
+    headers = _safe_get_request_headers(request)
+    model_override = _get_case_insensitive_mapping_value(
+        headers,
+        "x-grok-model-override",
+    )
+    if model_override:
+        metadata.setdefault("grok_model_override", model_override)
+        metadata.setdefault("model_group", model_override)
+        if not str(request_payload.get("model") or "").strip():
+            request_payload["model"] = model_override
+
+
+async def _direct_capture_xai_passthrough_failure(
+    *,
+    request_payload: dict,
+    original_exception: Exception,
+    user_api_key_dict: Any,
+    traceback_str: Optional[str],
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+) -> None:
+    if not _is_xai_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return
+
+    try:
+        from litellm.integrations.aawm_agent_identity import (
+            aawm_agent_identity_instance,
+        )
+
+        await aawm_agent_identity_instance.async_post_call_failure_hook(
+            user_api_key_dict=user_api_key_dict,
+            original_exception=original_exception,
+            request_data=request_payload,
+            traceback_str=traceback_str,
+        )
+    except Exception as exc:
+        verbose_proxy_logger.warning(
+            "Failed to directly capture xAI passthrough failure for provider health: %s",
+            exc,
+        )
+
+
 def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
     if not isinstance(kwargs, dict):
         return {}
@@ -1725,16 +1840,33 @@ async def pass_through_request(  # noqa: PLR0915
             request_payload["model"] = _parsed_body.get("model", "")
         if "custom_llm_provider" not in request_payload and custom_llm_provider:
             request_payload["custom_llm_provider"] = custom_llm_provider
+        _enrich_passthrough_failure_request_payload(
+            request_payload=request_payload,
+            request=request,
+            url=url,
+            custom_llm_provider=custom_llm_provider,
+        )
 
+        traceback_str = traceback.format_exc(
+            limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
+        )
         if not suppress_retryable_failure_logging:
-            await proxy_logging_obj.post_call_failure_hook(
-                user_api_key_dict=user_api_key_dict,
-                original_exception=e,
-                request_data=request_payload,
-                traceback_str=traceback.format_exc(
-                    limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
-                ),
-            )
+            try:
+                await proxy_logging_obj.post_call_failure_hook(
+                    user_api_key_dict=user_api_key_dict,
+                    original_exception=e,
+                    request_data=request_payload,
+                    traceback_str=traceback_str,
+                )
+            finally:
+                await _direct_capture_xai_passthrough_failure(
+                    user_api_key_dict=user_api_key_dict,
+                    original_exception=e,
+                    request_payload=request_payload,
+                    traceback_str=traceback_str,
+                    url=url,
+                    custom_llm_provider=custom_llm_provider,
+                )
 
         #########################################################
 

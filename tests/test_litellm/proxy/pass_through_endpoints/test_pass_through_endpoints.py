@@ -2159,6 +2159,84 @@ async def test_pass_through_request_does_not_mutate_custom_body_on_failure():
 
 
 @pytest.mark.asyncio
+async def test_pass_through_request_adds_xai_context_on_failure_logging():
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4000/grok/v1/responses"
+    mock_request.headers = Headers(
+        {
+            "content-type": "application/json",
+            "authorization": "Bearer oidc-token",
+            "x-grok-model-override": "grok-build",
+        }
+    )
+    mock_request.query_params = QueryParams({})
+    mock_user_api_key_dict = MagicMock()
+    custom_body = {
+        "model": "grok-build",
+        "input": "hello",
+        "litellm_metadata": {
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        },
+    }
+    upstream_request = httpx.Request(
+        "POST",
+        "https://cli-chat-proxy.grok.com/v1/responses",
+    )
+    upstream_response = httpx.Response(
+        401,
+        json={"error": "Invalid or expired credentials"},
+        request=upstream_request,
+    )
+    post_failure_mock = AsyncMock()
+    direct_capture_mock = AsyncMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=MagicMock(client=MagicMock()),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
+        new=AsyncMock(side_effect=lambda **kwargs: kwargs["data"]),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+        new=post_failure_mock,
+    ), patch(
+        "litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance.async_post_call_failure_hook",
+        new=direct_capture_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ):
+        with pytest.raises(ProxyException):
+            await pass_through_request(
+                request=mock_request,
+                target="https://cli-chat-proxy.grok.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=mock_user_api_key_dict,
+                custom_body=custom_body,
+                custom_llm_provider="xai",
+                egress_credential_family="xai",
+                expected_target_family="xai",
+            )
+
+    post_failure_mock.assert_awaited_once()
+    direct_capture_mock.assert_awaited_once()
+    request_data = post_failure_mock.await_args.kwargs["request_data"]
+    direct_request_data = direct_capture_mock.await_args.kwargs["request_data"]
+    assert direct_request_data is request_data
+    metadata = request_data["litellm_params"]["metadata"]
+    assert request_data["custom_llm_provider"] == "xai"
+    assert request_data["model"] == "grok-build"
+    assert metadata["custom_llm_provider"] == "xai"
+    assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+    assert metadata["grok_model_override"] == "grok-build"
+    assert metadata["xai_cli_chat_proxy"] is True
+
+
+@pytest.mark.asyncio
 async def test_pass_through_request_forwards_raw_body_without_json_parse():
     mock_request = MagicMock(spec=Request)
     mock_request.method = "POST"

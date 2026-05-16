@@ -1372,9 +1372,31 @@ INSERT INTO public.provider_error_observations (
     trace_id,
     litellm_call_id,
     metadata
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11, $12, $13, $14, $15, $16::jsonb
+) SELECT
+    $1::timestamptz,
+    $2::text,
+    $3::text,
+    $4::text,
+    $5::text,
+    $6::text,
+    $7::integer,
+    $8::text,
+    $9::text,
+    $10::text,
+    $11::double precision,
+    $12::timestamptz,
+    $13::text,
+    $14::text,
+    $15::text,
+    $16::jsonb
+WHERE NULLIF($15::text, '') IS NULL
+OR NOT EXISTS (
+    SELECT 1
+    FROM public.provider_error_observations existing
+    WHERE existing.litellm_call_id = NULLIF($15::text, '')
+      AND existing.provider IS NOT DISTINCT FROM $3::text
+      AND existing.route_family IS NOT DISTINCT FROM $6::text
+      AND existing.status_code IS NOT DISTINCT FROM $7::integer
 )
 """
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
