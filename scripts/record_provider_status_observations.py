@@ -52,6 +52,8 @@ DEFAULT_ENDPOINTS: tuple[Endpoint, ...] = (
     Endpoint("anthropic", "api.anthropic.com:443", "api.anthropic.com"),
     Endpoint("openai", "api.openai.com:443", "api.openai.com"),
     Endpoint("openrouter", "openrouter.ai:443", "openrouter.ai"),
+    Endpoint("xai", "cli-chat-proxy.grok.com:443", "cli-chat-proxy.grok.com"),
+    Endpoint("xai", "api.x.ai:443", "api.x.ai"),
     Endpoint("nvidia_nim", "integrate.api.nvidia.com:443", "integrate.api.nvidia.com"),
     Endpoint("gemini", "generativelanguage.googleapis.com:443", "generativelanguage.googleapis.com"),
     Endpoint("gemini", "cloudcode-pa.googleapis.com:443", "cloudcode-pa.googleapis.com"),
