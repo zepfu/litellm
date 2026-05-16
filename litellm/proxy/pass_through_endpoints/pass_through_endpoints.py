@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import copy
+import importlib
 import json
 import traceback
 from base64 import b64encode
@@ -355,9 +356,26 @@ async def _direct_capture_xai_passthrough_failure(
         return
 
     try:
-        from litellm.integrations.aawm_agent_identity import (
-            aawm_agent_identity_instance,
-        )
+        aawm_agent_identity_instance = None
+        for module_name in (
+            "litellm.integrations.aawm_agent_identity",
+            "aawm_litellm_callbacks.agent_identity",
+        ):
+            try:
+                module = importlib.import_module(module_name)
+            except ModuleNotFoundError:
+                continue
+            aawm_agent_identity_instance = getattr(
+                module,
+                "aawm_agent_identity_instance",
+                None,
+            )
+            if aawm_agent_identity_instance is not None:
+                break
+        if aawm_agent_identity_instance is None:
+            raise ModuleNotFoundError(
+                "No AAWM agent identity callback module is importable"
+            )
 
         await aawm_agent_identity_instance.async_post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
