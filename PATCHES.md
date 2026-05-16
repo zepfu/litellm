@@ -1922,6 +1922,32 @@ controlled `/grok/v1/responses` upstream `401` with `provider=xai`,
 
 ---
 
+### aawm.55 — xAI/Grok provider-health prod overlay import fallback
+
+**Status:** AAWM local hotfix.
+
+**What changed:** The xAI/Grok direct failure-capture path now resolves the
+AAWM agent-identity callback from either the source-tree module
+`litellm.integrations.aawm_agent_identity` or the production overlay module
+`aawm_litellm_callbacks.agent_identity`.
+
+**Why:** The `v1.82.3-aawm.54` fork image correctly included the direct xAI
+capture path, but production packaging excludes the source-tree integration
+module and installs the callback wheel as an overlay. Prod therefore logged
+`No module named 'litellm.integrations.aawm_agent_identity'` when the direct
+capture fallback ran for `/grok` failures. The normal callback registration
+still uses the overlay wheel, so the direct path must use the same package when
+the source-tree module is not present.
+
+**Why not upstream:** This is specific to the AAWM split between fork image
+core code and overlay callback wheel packaging.
+
+**Validation status:** Focused unit coverage proves the direct xAI passthrough
+failure path falls back to `aawm_litellm_callbacks.agent_identity` when the
+source integration module is missing.
+
+---
+
 
 ## Dropped Patches
 
