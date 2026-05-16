@@ -370,6 +370,13 @@ def _infer_provider_and_route_family(
     context_text = "\n".join(entry.clean_content for entry in context_lines)
     if status_code >= 500 and _looks_proxy_internal(f"{detail}\n{context_text}"):
         return "proxy_internal", "proxy_internal", "proxy_internal"
+    if (
+        (path and path.startswith("/grok"))
+        or "cli-chat-proxy.grok.com" in normalized
+        or "x_xai_token_auth" in normalized
+        or "x-grok-" in normalized
+    ):
+        return "xai", "grok_cli_chat_proxy", "provider_exception"
     if "cloudcode-pa.googleapis.com" in normalized or "google code assist" in normalized:
         return "gemini", "google_code_assist_generate_content", "provider_exception"
     if path and path.startswith("/anthropic"):
@@ -383,6 +390,21 @@ def _infer_provider_and_route_family(
     if path and path.startswith("/v1/embeddings"):
         return "unknown", "embeddings", "provider_exception"
     return "unknown", None, "provider_exception"
+
+
+def _infer_model_from_route(
+    *,
+    provider: str,
+    path: Optional[str],
+    detail: str,
+    payload: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    model = _extract_model(detail, payload)
+    if model:
+        return model
+    if provider == "xai" and path and path.startswith("/grok/v1/responses"):
+        return "grok-build"
+    return None
 
 
 def _looks_proxy_internal(value: str) -> bool:
@@ -506,7 +528,12 @@ def _build_observations(
                 "observed_at": exception_log.entry.observed_at,
                 "environment": environment,
                 "provider": provider,
-                "model": _extract_model(exception_log.detail, payload),
+                "model": _infer_model_from_route(
+                    provider=provider,
+                    path=path,
+                    detail=exception_log.detail,
+                    payload=payload,
+                ),
                 "model_group": None,
                 "route_family": route_family,
                 "status_code": exception_log.status_code,
@@ -562,7 +589,12 @@ def _build_observations(
                 "observed_at": access_log.entry.observed_at,
                 "environment": environment,
                 "provider": provider,
-                "model": _extract_model(detail, None),
+                "model": _infer_model_from_route(
+                    provider=provider,
+                    path=access_log.path,
+                    detail=detail,
+                    payload=None,
+                ),
                 "model_group": None,
                 "route_family": route_family,
                 "status_code": access_log.status_code,
