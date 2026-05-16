@@ -2,6 +2,44 @@
 
 ## 2026-05-15
 
+- Promoted xAI/Grok provider health probes and passive error capture to prod.
+
+  Release:
+  implementation commits `1cd806a5ee`, `444b0c2477`, and `3de47db732`
+  landed on `main`; fork tags `v1.82.3-aawm.54` and
+  `v1.82.3-aawm.55` were pushed; GitHub Actions runs `25947258471` and
+  `25947731095` succeeded and published the fork images. Callback release
+  `cb-v0.0.32` contains
+  `aawm_litellm_callbacks-0.0.32-py3-none-any.whl`.
+
+  Prod cutover:
+  running prod `aawm-litellm` is healthy on `127.0.0.1:4000` from
+  `1.82.3+aawm.55`. Runtime inspection reports
+  `litellm=1.82.3+aawm.55`, `aawm-litellm-callbacks=0.0.32`, and
+  `aawm-litellm-control-plane=0.0.7`.
+
+  Live proof:
+  active provider probes now include `provider=xai` endpoint keys
+  `api.x.ai:443` and `cli-chat-proxy.grok.com:443`; the latest exact
+  database rows in `aawm_tristore.public.provider_status_observations` show
+  successful DNS, ICMP ping, TCP connect, and TLS handshake probes for both
+  endpoints. The latest observed RTTs at `2026-05-16 00:35 UTC` included
+  ICMP `47.967 ms` for `api.x.ai:443` and `30.105 ms` for
+  `cli-chat-proxy.grok.com:443`.
+
+  Passive error proof:
+  before the prod restart, retained Grok errors were preserved into
+  `aawm_tristore.public.provider_error_observations` as docker-log backfill
+  rows `104` and `106` with `provider=xai`, `status_code=401`,
+  `error_class=auth_failed`, and `route_family=grok_cli_chat_proxy`. After
+  the cutover, a controlled prod `/grok/v1/responses` failure wrote live row
+  `112` with `environment=prod`, `provider=xai`, `model=grok-build`,
+  `status_code=401`, `error_class=auth_failed`,
+  `route_family=grok_cli_chat_proxy`, and
+  `litellm_call_id=f1478601-0e00-4090-a0b7-5f86e44c665d`; the blank
+  `metadata.source` confirms this came from live callback/direct capture, not
+  the docker-log backfill path.
+
 - Promoted D1-105 Codex auto-agent continuation scanner hotfix to prod.
 
   Release:
