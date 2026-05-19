@@ -1983,6 +1983,35 @@ completed on `gemini-3.1-flash-lite-preview` with
 
 ---
 
+### aawm.58 — Claude auto-review telemetry attribution
+
+**Status:** AAWM local hotfix.
+
+**What changed:** Claude permission-check traffic is now persisted as the
+logical model `claude-auto-review` with `agent_name=auto-reviewer`, while
+preserving the provider source model for cost/reference metadata. Langfuse tag
+collection now also reads metadata-level request/trace tags so permission-check
+tags survive callback ordering, and the bundled model-cost map includes the
+`claude-auto-review` alias for offline reporting. A bounded backfill script can
+repair historical permission-check rows without recalculating already stored
+cost.
+
+**Why:** Claude Code auto-review/permission checks were being mixed into normal
+Claude session history, often with ephemeral agent-style repository values.
+That made session-level attribution and downstream review of real work harder,
+especially when permission checks appeared inside active development sessions.
+
+**Why not upstream:** This is AAWM-specific telemetry classification for the
+local `session_history`, Langfuse tagging, and Claude Code auto-review reporting
+model.
+
+**Validation status:** Focused callback/backfill coverage passed locally
+(`181 passed`) with the callback wheel source synced to the in-repo callback.
+Langfuse tag unit coverage passed, model cost maps are synced, JSON checks
+passed, and the dev runtime/backfill evidence is recorded in `COMPLETED.md`.
+
+---
+
 
 ## Dropped Patches
 
