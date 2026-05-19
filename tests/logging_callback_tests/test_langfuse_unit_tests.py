@@ -290,6 +290,25 @@ def test_get_langfuse_tags():
     result = global_langfuse_logger._get_langfuse_tags(mock_payload)
     assert result == []
 
+    result = global_langfuse_logger._get_langfuse_tags(
+        mock_payload,
+        metadata={
+            "request_tags": ["metadata-tag", "tag2"],
+            "tags": ["trace-tag", "metadata-tag"],
+        },
+    )
+    assert result == ["metadata-tag", "tag2", "trace-tag"]
+
+    mock_payload["request_tags"] = ["standard-tag", "metadata-tag"]
+    result = global_langfuse_logger._get_langfuse_tags(
+        mock_payload,
+        metadata={
+            "request_tags": ["metadata-tag", "request-only"],
+            "tags": ["trace-tag"],
+        },
+    )
+    assert result == ["standard-tag", "metadata-tag", "request-only", "trace-tag"]
+
 
 @patch.dict(os.environ, {}, clear=True)  # Start with empty environment
 def test_get_langfuse_flush_interval():

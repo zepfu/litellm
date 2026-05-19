@@ -593,7 +593,10 @@ class LangFuseLogger:
                 kwargs.get("standard_logging_object", None),
             )
             tags = (
-                self._get_langfuse_tags(standard_logging_object=standard_logging_object)
+                self._get_langfuse_tags(
+                    standard_logging_object=standard_logging_object,
+                    metadata=metadata,
+                )
                 if self._supports_tags()
                 else []
             )
@@ -1039,10 +1042,27 @@ class LangFuseLogger:
     @staticmethod
     def _get_langfuse_tags(
         standard_logging_object: Optional[StandardLoggingPayload],
+        metadata: Optional[dict] = None,
     ) -> List[str]:
-        if standard_logging_object is None:
-            return []
-        return standard_logging_object.get("request_tags", []) or []
+        tags: List[str] = []
+
+        if standard_logging_object is not None:
+            request_tags = standard_logging_object.get("request_tags", []) or []
+            if isinstance(request_tags, list):
+                for tag in request_tags:
+                    if isinstance(tag, str) and tag and tag not in tags:
+                        tags.append(tag)
+
+        if isinstance(metadata, dict):
+            for key in ("request_tags", "tags"):
+                metadata_tags = metadata.get(key) or []
+                if not isinstance(metadata_tags, list):
+                    continue
+                for tag in metadata_tags:
+                    if isinstance(tag, str) and tag and tag not in tags:
+                        tags.append(tag)
+
+        return tags
 
     def add_default_langfuse_tags(self, tags, kwargs, metadata):
         """

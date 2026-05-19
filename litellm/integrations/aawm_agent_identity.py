@@ -1091,6 +1091,31 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     ),
     metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
+_AAWM_CLAUDE_AUTO_REVIEW_PARENT_IDENTITY_SQL = """
+SELECT
+    id,
+    repository,
+    tenant_id,
+    agent_name,
+    metadata,
+    COALESCE(start_time, created_at) AS row_time
+FROM public.session_history
+WHERE session_id = $1
+  AND COALESCE(start_time, created_at)
+      BETWEEN COALESCE($2::timestamptz, NOW()) - INTERVAL '30 minutes'
+          AND COALESCE($2::timestamptz, NOW()) + INTERVAL '5 minutes'
+  AND provider IS NOT DISTINCT FROM 'anthropic'
+  AND model IS DISTINCT FROM 'claude-auto-review'
+  AND COALESCE(LOWER(metadata->>'claude_permission_check'), '') NOT IN ('1', 'true', 'yes', 'y')
+  AND metadata::text NOT ILIKE '%claude-permission-check%'
+ORDER BY
+    CASE WHEN metadata::text ILIKE '%claude-project:%' THEN 0 ELSE 1 END,
+    CASE WHEN repository IS NOT NULL THEN 0 ELSE 1 END,
+    CASE WHEN COALESCE(metadata->>'trace_name', '') = 'claude-code.orchestrator' THEN 0 ELSE 1 END,
+    COALESCE(start_time, created_at) DESC,
+    id DESC
+LIMIT 10
+"""
 _SESSION_HISTORY_PREVIOUS_GAP_FIELD = "previous_response_to_current_request_ms"
 _AAWM_SESSION_HISTORY_PREVIOUS_GAP_UPDATE_SQL = f"""
 WITH inserted AS (
@@ -1444,7 +1469,10 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "workload_subtype",
     "source_repository",
     "trace_name",
+    "trace_user_id",
     "trace_environment",
+    "source_model",
+    "logical_model",
     "aawm_claude_agent_name",
     "aawm_claude_project",
     "aawm_tenant_id",
@@ -1698,6 +1726,9 @@ _AAWM_REPOSITORY_WAVE_AGENT_RE = re.compile(
     r"^wave\d+-(?:analyst|engineer|infra|ops|principal|qa|researcher|reviewer|salvage|tester)$",
     re.IGNORECASE,
 )
+_CLAUDE_AUTO_REVIEW_LOGICAL_MODEL = "claude-auto-review"
+_CLAUDE_AUTO_REVIEW_TRACE_NAME = "claude-code.auto-reviewer"
+_CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
 _AAWM_REPOSITORY_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$"
@@ -2107,6 +2138,42 @@ def _extract_tenant_identity_from_metadata_sources(
     return None, None
 
 
+def _extract_claude_trace_agent_name(value: Any) -> Optional[str]:
+    trace_name = _clean_non_empty_string(value)
+    if not trace_name or not trace_name.startswith("claude-code."):
+        return None
+    agent_name = _clean_non_empty_string(trace_name.split(".", 1)[1])
+    return agent_name
+
+
+def _extract_claude_trace_user_identity_from_metadata_sources(
+    *sources: Tuple[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    for source_name, raw_source in sources:
+        source = _coerce_mapping(raw_source)
+        if not source:
+            continue
+
+        trace_user_id = _normalize_repository_identity(source.get("trace_user_id"))
+        if trace_user_id and _clean_non_empty_string(
+            source.get("trace_name")
+        ) and str(source.get("trace_name")).startswith("claude-code"):
+            return trace_user_id, f"{source_name}.trace_user_id"
+
+        nested_source = _coerce_mapping(source.get("metadata"))
+        if not nested_source:
+            continue
+        trace_user_id = _normalize_repository_identity(
+            nested_source.get("trace_user_id")
+        )
+        if trace_user_id and _clean_non_empty_string(
+            nested_source.get("trace_name")
+        ) and str(nested_source.get("trace_name")).startswith("claude-code"):
+            return trace_user_id, f"{source_name}.metadata.trace_user_id"
+
+    return None, None
+
+
 def _extract_tenant_identity_from_kwargs(
     kwargs: Dict[str, Any],
     *,
@@ -2139,6 +2206,21 @@ def _extract_tenant_identity_from_kwargs(
     tenant_id = _get_header_value(headers, *_AAWM_TENANT_ID_HEADER_NAMES)
     if tenant_id:
         return tenant_id, "request_headers"
+
+    tenant_id, source = _extract_claude_trace_user_identity_from_metadata_sources(
+        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
+        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
+        ("kwargs.metadata", kwargs.get("metadata")),
+        ("litellm_params.proxy_server_request.body", proxy_body),
+        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
+        ("passthrough_logging_payload", passthrough_payload),
+        ("passthrough_logging_payload.request_body", passthrough_body),
+        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
+        ("standard_logging_object", standard_logging_object),
+        ("kwargs", kwargs),
+    )
+    if tenant_id:
+        return tenant_id, source
 
     return None, None
 
@@ -2324,6 +2406,23 @@ def _extract_repository_identity_from_kwargs(
     repository = _extract_repository_identity_from_metadata_sources(
         ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
         ("litellm_params.litellm_metadata", litellm_params.get("litellm_metadata")),
+        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
+        ("kwargs.metadata", kwargs.get("metadata")),
+        ("litellm_params.proxy_server_request.body", proxy_body),
+        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
+        ("litellm_params.proxy_server_request.body.litellm_metadata", proxy_body.get("litellm_metadata")),
+        ("passthrough_logging_payload", passthrough_payload),
+        ("passthrough_logging_payload.request_body", passthrough_body),
+        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
+        ("passthrough_logging_payload.request_body.litellm_metadata", passthrough_body.get("litellm_metadata")),
+        ("standard_logging_object", standard_logging_object),
+        ("kwargs", kwargs),
+    )
+    if repository:
+        return repository
+
+    repository, _source = _extract_claude_trace_user_identity_from_metadata_sources(
+        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
         ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
         ("kwargs.metadata", kwargs.get("metadata")),
         ("litellm_params.proxy_server_request.body", proxy_body),
@@ -2656,6 +2755,9 @@ def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optio
         )
         if agent_name:
             return agent_name, explicit_tenant_id or tenant_id
+        trace_agent_name = _extract_claude_trace_agent_name(source.get("trace_name"))
+        if trace_agent_name:
+            return trace_agent_name, explicit_tenant_id or tenant_id
 
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
@@ -2928,12 +3030,15 @@ def _sync_standard_logging_object(kwargs: Dict[str, Any], metadata: Dict[str, An
     tags = metadata.get("tags") or []
     if not isinstance(tags, list):
         tags = []
+    metadata_request_tags = metadata.get("request_tags") or []
+    if not isinstance(metadata_request_tags, list):
+        metadata_request_tags = []
     existing_request_tags = standard_logging_object.get("request_tags") or []
     if not isinstance(existing_request_tags, list):
         existing_request_tags = []
 
     merged_request_tags = list(existing_request_tags)
-    for tag in tags:
+    for tag in [*tags, *metadata_request_tags]:
         if isinstance(tag, str) and tag and tag not in merged_request_tags:
             merged_request_tags.append(tag)
     standard_logging_object["request_tags"] = merged_request_tags
@@ -3258,6 +3363,217 @@ def _metadata_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y"}
     return bool(value)
+
+
+def _metadata_request_tags(metadata: Dict[str, Any]) -> List[str]:
+    request_tags = metadata.get("request_tags")
+    tags = metadata.get("tags")
+    merged: List[str] = []
+    for source in (request_tags, tags):
+        if not isinstance(source, list):
+            continue
+        for tag in source:
+            if isinstance(tag, str) and tag.strip() and tag not in merged:
+                merged.append(tag)
+    return merged
+
+
+def _is_claude_permission_check_metadata(metadata: Any) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    if _metadata_bool(metadata.get("claude_permission_check")):
+        return True
+    for tag in _metadata_request_tags(metadata):
+        if tag == "claude-permission-check" or tag.startswith(
+            "claude-permission-check:"
+        ):
+            return True
+    return False
+
+
+def _extract_claude_project_from_metadata_tags(
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    for tag in _metadata_request_tags(metadata):
+        if not tag.startswith("claude-project:"):
+            continue
+        repository = _normalize_repository_identity(tag.split(":", 1)[1])
+        if repository:
+            return repository
+    return None
+
+
+def _extract_claude_auto_review_source_model(
+    metadata: Dict[str, Any],
+    fallback_model: Optional[str] = None,
+) -> Optional[str]:
+    return _first_non_empty_string(
+        metadata.get("source_model"),
+        metadata.get("claude_permission_check_response_model"),
+        metadata.get("claude_permission_check_request_model"),
+        fallback_model,
+    )
+
+
+def _apply_claude_auto_review_metadata(
+    metadata: Dict[str, Any],
+    *,
+    repository: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    source_model: Optional[str] = None,
+) -> None:
+    metadata["trace_name"] = _CLAUDE_AUTO_REVIEW_TRACE_NAME
+    metadata["agent_name"] = _CLAUDE_AUTO_REVIEW_AGENT_NAME
+    metadata["aawm_claude_agent_name"] = _CLAUDE_AUTO_REVIEW_AGENT_NAME
+    metadata["logical_model"] = _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
+
+    resolved_source_model = _extract_claude_auto_review_source_model(
+        metadata,
+        source_model,
+    )
+    if (
+        resolved_source_model
+        and resolved_source_model != _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
+    ):
+        metadata["source_model"] = resolved_source_model
+
+    normalized_repository = _normalize_repository_identity(repository)
+    normalized_tenant = _normalize_repository_identity(tenant_id)
+    inherited_identity = normalized_repository or normalized_tenant
+    if inherited_identity:
+        metadata["repository"] = inherited_identity
+        metadata["tenant_id"] = inherited_identity
+        metadata["aawm_tenant_id"] = inherited_identity
+        metadata["aawm_claude_project"] = inherited_identity
+        metadata["trace_user_id"] = inherited_identity
+
+    tags_to_add = [
+        "claude-internal-check",
+        "claude-permission-check",
+        f"claude-agent:{_CLAUDE_AUTO_REVIEW_AGENT_NAME}",
+    ]
+    if inherited_identity:
+        tags_to_add.append(f"claude-project:{inherited_identity}")
+    _merge_tags(metadata, tags_to_add)
+    existing_request_tags = metadata.get("request_tags") or []
+    if not isinstance(existing_request_tags, list):
+        existing_request_tags = []
+    merged_request_tags = list(existing_request_tags)
+    for tag in tags_to_add:
+        if tag and tag not in merged_request_tags:
+            merged_request_tags.append(tag)
+    metadata["request_tags"] = merged_request_tags
+
+
+def _apply_claude_auto_review_identity_to_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    if not _is_claude_permission_check_metadata(metadata):
+        return
+
+    source_model = _extract_claude_auto_review_source_model(
+        metadata,
+        _clean_non_empty_string(record.get("model")),
+    )
+    repository = _normalize_repository_identity(record.get("repository"))
+    tenant_id = _normalize_repository_identity(record.get("tenant_id"))
+    if repository is None:
+        repository = _extract_claude_project_from_metadata_tags(metadata)
+    if tenant_id is None:
+        tenant_id = repository
+
+    _apply_claude_auto_review_metadata(
+        metadata,
+        repository=repository,
+        tenant_id=tenant_id,
+        source_model=source_model,
+    )
+    record["metadata"] = metadata
+    record["model"] = _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
+    record["agent_name"] = _CLAUDE_AUTO_REVIEW_AGENT_NAME
+    record["repository"] = repository
+    record["tenant_id"] = tenant_id or repository
+
+
+def _extract_claude_auto_review_identity_from_row(
+    row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    repository = (
+        _normalize_repository_identity(row.get("repository"))
+        or _extract_claude_project_from_metadata_tags(metadata)
+        or _normalize_repository_identity(metadata.get("aawm_claude_project"))
+        or _normalize_repository_identity(metadata.get("repository"))
+        or _normalize_repository_identity(row.get("tenant_id"))
+        or _normalize_repository_identity(metadata.get("tenant_id"))
+    )
+    if not repository:
+        return None
+
+    return {
+        "repository": repository,
+        "tenant_id": repository,
+        "source_row_id": row.get("id"),
+        "source": "same_session.session_history",
+    }
+
+
+def _apply_claude_auto_review_parent_identity(
+    payload: Dict[str, Any],
+    identity: Dict[str, Any],
+) -> None:
+    repository = _normalize_repository_identity(identity.get("repository"))
+    if not repository:
+        return
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+
+    payload["repository"] = repository
+    payload["tenant_id"] = repository
+    _apply_claude_auto_review_metadata(
+        metadata,
+        repository=repository,
+        tenant_id=repository,
+        source_model=_extract_claude_auto_review_source_model(
+            metadata,
+            _clean_non_empty_string(payload.get("model")),
+        ),
+    )
+    metadata["claude_auto_review_parent_identity_source"] = identity.get("source")
+    if identity.get("source_row_id") is not None:
+        metadata["claude_auto_review_parent_identity_source_row_id"] = identity[
+            "source_row_id"
+        ]
+    payload["metadata"] = metadata
+
+
+def _build_session_identity_cache(
+    records: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    identity_by_session: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if record.get("_skip_session_history"):
+            continue
+        session_id = _clean_non_empty_string(record.get("session_id"))
+        if not session_id:
+            continue
+        metadata = record.get("metadata")
+        if _is_claude_permission_check_metadata(metadata):
+            continue
+        identity = _extract_claude_auto_review_identity_from_row(record)
+        if identity:
+            identity_by_session[session_id] = identity
+    return identity_by_session
 
 
 def _build_permission_usage_fields(
@@ -5465,6 +5781,25 @@ def _build_provider_error_observation(
     if not isinstance(standard_logging_object, dict):
         standard_logging_object = {}
     model = _resolve_rate_limit_model(kwargs, result, metadata)
+    source_model = model if model != "unknown" else None
+    if _is_claude_permission_check_metadata(metadata):
+        repository = _extract_repository_identity_from_kwargs(
+            kwargs,
+            metadata=metadata,
+            standard_logging_object=standard_logging_object,
+        )
+        tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(
+            kwargs,
+            metadata=metadata,
+            standard_logging_object=standard_logging_object,
+        )
+        _apply_claude_auto_review_metadata(
+            metadata,
+            repository=repository,
+            tenant_id=tenant_id,
+            source_model=source_model,
+        )
+        model = _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
     provider = (
         _normalize_session_history_provider(
             kwargs.get("custom_llm_provider"),
@@ -5499,6 +5834,32 @@ def _build_provider_error_observation(
         kwargs=kwargs,
         allow_runtime=True,
     )
+    observation_metadata = {
+        "client_name": runtime_identity.get("client_name"),
+        "client_version": runtime_identity.get("client_version"),
+        "client_user_agent": runtime_identity.get("client_user_agent"),
+        "normalized_error_text": error_text[:500] if error_text else None,
+        "observed_signal": "normal_traffic_failure",
+    }
+    if _is_claude_permission_check_metadata(metadata):
+        for key in (
+            "source_model",
+            "logical_model",
+            "trace_name",
+            "trace_user_id",
+            "repository",
+            "tenant_id",
+            "request_tags",
+            "tags",
+            "claude_permission_check",
+            "claude_permission_check_decision",
+            "claude_permission_check_blocked",
+            "claude_permission_check_request_model",
+            "claude_permission_check_response_model",
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                observation_metadata[key] = value
     return {
         "observed_at": observed_at,
         "environment": runtime_identity.get("litellm_environment"),
@@ -5527,13 +5888,7 @@ def _build_provider_error_observation(
             kwargs.get("trace_id"),
         ),
         "litellm_call_id": kwargs.get("litellm_call_id"),
-        "metadata": {
-            "client_name": runtime_identity.get("client_name"),
-            "client_version": runtime_identity.get("client_version"),
-            "client_user_agent": runtime_identity.get("client_user_agent"),
-            "normalized_error_text": error_text[:500] if error_text else None,
-            "observed_signal": "normal_traffic_failure",
-        },
+        "metadata": observation_metadata,
     }
 
 
@@ -8051,6 +8406,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_invalid_tool_call_state_on_record(record)
     _normalize_prompt_overhead_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
+    _apply_claude_auto_review_identity_to_record(record)
     _normalize_session_repository_on_record(record)
     _normalize_session_tenant_on_record(record)
     _normalize_session_latency_state_on_record(record)
@@ -10413,7 +10769,7 @@ def _build_session_history_record(
         allow_runtime=allow_runtime_identity,
     )
 
-    return _normalize_session_history_record({
+    record = {
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "session_id": session_id,
         "trace_id": _extract_trace_id(kwargs),
@@ -10478,7 +10834,9 @@ def _build_session_history_record(
             request_tags=[tag for tag in request_tags if isinstance(tag, str)],
             tenant_id=tenant_id,
         ),
-    })
+    }
+    _apply_claude_auto_review_identity_to_record(record)
+    return _normalize_session_history_record(record)
 
 
 async def _open_aawm_session_history_connection() -> Any:
@@ -10680,6 +11038,60 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
             )
         )
     return payloads
+
+
+async def _lookup_claude_auto_review_parent_identity(
+    conn: Any,
+    payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    session_id = _clean_non_empty_string(payload.get("session_id"))
+    if not session_id:
+        return None
+    reference_time = (
+        _parse_datetime_value(payload.get("start_time"))
+        or _parse_datetime_value(payload.get("observed_at"))
+        or _parse_datetime_value(payload.get("end_time"))
+    )
+    rows = await conn.fetch(
+        _AAWM_CLAUDE_AUTO_REVIEW_PARENT_IDENTITY_SQL,
+        session_id,
+        reference_time,
+    )
+    for row in rows:
+        try:
+            candidate = dict(row)
+        except Exception:
+            candidate = {
+                "id": _maybe_get(row, "id"),
+                "repository": _maybe_get(row, "repository"),
+                "tenant_id": _maybe_get(row, "tenant_id"),
+                "agent_name": _maybe_get(row, "agent_name"),
+                "metadata": _maybe_get(row, "metadata"),
+            }
+        identity = _extract_claude_auto_review_identity_from_row(candidate)
+        if identity:
+            return identity
+    return None
+
+
+async def _apply_claude_auto_review_parent_identity_from_store(
+    conn: Any,
+    payload: Dict[str, Any],
+    identity_by_session: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
+    metadata = payload.get("metadata")
+    if not _is_claude_permission_check_metadata(metadata):
+        return
+
+    session_id = _clean_non_empty_string(payload.get("session_id"))
+    identity = (identity_by_session or {}).get(session_id or "")
+    if identity is None:
+        identity = await _lookup_claude_auto_review_parent_identity(conn, payload)
+    if identity is not None:
+        _apply_claude_auto_review_parent_identity(payload, identity)
+        return
+
+    _apply_claude_auto_review_identity_to_record(payload)
 
 
 def _extract_session_history_call_ids_from_payloads(
@@ -11041,6 +11453,7 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
         await _ensure_session_history_schema(conn)
 
         if not record.get("_skip_session_history"):
+            await _apply_claude_auto_review_parent_identity_from_store(conn, record)
             history_payload = _build_session_history_db_payload(record)
             tool_activity_payloads = _build_tool_activity_db_payloads(record)
 
@@ -11094,6 +11507,11 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
             if isinstance(observation, dict)
         ] if isinstance(provider_error_observations, list) else []
         if provider_error_observations:
+            for observation in provider_error_observations:
+                await _apply_claude_auto_review_parent_identity_from_store(
+                    conn,
+                    observation,
+                )
             await conn.executemany(
                 _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
                 [
@@ -11114,6 +11532,13 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
         history_records = [
             record for record in records if not record.get("_skip_session_history")
         ]
+        identity_by_session = _build_session_identity_cache(history_records)
+        for record in history_records:
+            await _apply_claude_auto_review_parent_identity_from_store(
+                conn,
+                record,
+                identity_by_session,
+            )
         payloads = [
             _build_session_history_db_payload(record) for record in history_records
         ]
@@ -11176,6 +11601,12 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
                     if isinstance(observation, dict)
                 )
         if provider_error_observations:
+            for observation in provider_error_observations:
+                await _apply_claude_auto_review_parent_identity_from_store(
+                    conn,
+                    observation,
+                    identity_by_session,
+                )
             await conn.executemany(
                 _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
                 [
@@ -11518,6 +11949,27 @@ def _enrich_trace_name_and_provider_metadata(
     metadata = _ensure_mutable_metadata(kwargs)
     session_id = _extract_session_id(kwargs)
     is_grok_context = _is_native_grok_passthrough_context(metadata, headers)
+    _enrich_claude_permission_check_metadata(kwargs, metadata, result)
+    if _is_claude_permission_check_metadata(metadata):
+        direct_repository = _extract_repository_identity_from_kwargs(
+            kwargs,
+            metadata=metadata,
+            standard_logging_object=kwargs.get("standard_logging_object") or {},
+        )
+        direct_tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(
+            kwargs,
+            metadata=metadata,
+            standard_logging_object=kwargs.get("standard_logging_object") or {},
+        )
+        _apply_claude_auto_review_metadata(
+            metadata,
+            repository=direct_repository,
+            tenant_id=direct_tenant_id,
+            source_model=_extract_claude_auto_review_source_model(
+                metadata,
+                _clean_non_empty_string(kwargs.get("model")),
+            ),
+        )
 
     current_trace_name = metadata.get("trace_name")
     if current_trace_name == "claude-code":
@@ -11585,7 +12037,6 @@ def _enrich_trace_name_and_provider_metadata(
     if message is not None:
         _enrich_claude_thinking_metadata(metadata, message)
         _enrich_gemini_thought_signature_metadata(metadata, message)
-    _enrich_claude_permission_check_metadata(kwargs, metadata, result)
     _enrich_usage_breakout_metadata(kwargs, result)
     _enrich_provider_cache_metadata(kwargs, result)
 
