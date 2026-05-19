@@ -38,10 +38,12 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 )
 from litellm.types.utils import (
     Choices,
+    EmbeddingResponse,
     ImageResponse,
     LlmProviders,
     Message,
     PassthroughCallTypes,
+    Usage,
 )
 from litellm.utils import ModelResponse, TextCompletionResponse
 
@@ -86,6 +88,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 candidates.append(f"openrouter/{model}")
             else:
                 candidates.append(model.removeprefix("openrouter/"))
+        elif custom_llm_provider == "xai":
+            if not model.startswith("xai/"):
+                candidates.append(f"xai/{model}")
+            else:
+                candidates.append(model.removeprefix("xai/"))
         return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
     @staticmethod
@@ -221,6 +228,144 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             )
             and ("/v1/responses" in parsed_url.path or "/responses" in parsed_url.path)
         )
+
+    @staticmethod
+    def is_openai_embeddings_route(url_route: str) -> bool:
+        """Check if the URL route is an OpenAI embeddings endpoint."""
+        if not url_route:
+            return False
+        parsed_url = urlparse(url_route)
+        return bool(
+            OpenAIPassthroughLoggingHandler._is_openai_compatible_hostname(
+                parsed_url.hostname
+            )
+            and ("/v1/embeddings" in parsed_url.path or "/embeddings" in parsed_url.path)
+        )
+
+    @staticmethod
+    def _extract_passthrough_model_fallback(kwargs: dict) -> Optional[str]:
+        litellm_params = kwargs.get("litellm_params")
+        metadata = (
+            litellm_params.get("metadata")
+            if isinstance(litellm_params, dict)
+            and isinstance(litellm_params.get("metadata"), dict)
+            else {}
+        )
+        for candidate in (
+            metadata.get("grok_model_override"),
+            metadata.get("model_group"),
+            metadata.get("model"),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        header_sources = (
+            kwargs.get("passthrough_logging_payload", {}).get("request_headers")
+            if isinstance(kwargs.get("passthrough_logging_payload"), dict)
+            else None,
+            litellm_params.get("proxy_server_request", {}).get("headers")
+            if isinstance(litellm_params, dict)
+            and isinstance(litellm_params.get("proxy_server_request"), dict)
+            else None,
+        )
+        for headers in header_sources:
+            if not isinstance(headers, dict):
+                continue
+            for header_name, header_value in headers.items():
+                if (
+                    isinstance(header_name, str)
+                    and header_name.lower() == "x-grok-model-override"
+                    and isinstance(header_value, str)
+                    and header_value.strip()
+                ):
+                    return header_value.strip()
+        return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _build_embedding_usage(response_body: dict) -> Usage:
+        usage = response_body.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        prompt_tokens = (
+            OpenAIPassthroughLoggingHandler._safe_int(usage.get("prompt_tokens"))
+            or OpenAIPassthroughLoggingHandler._safe_int(usage.get("input_tokens"))
+            or OpenAIPassthroughLoggingHandler._safe_int(usage.get("total_tokens"))
+            or 0
+        )
+        completion_tokens = (
+            OpenAIPassthroughLoggingHandler._safe_int(usage.get("completion_tokens"))
+            or OpenAIPassthroughLoggingHandler._safe_int(usage.get("output_tokens"))
+            or 0
+        )
+        total_tokens = (
+            OpenAIPassthroughLoggingHandler._safe_int(usage.get("total_tokens"))
+            or prompt_tokens + completion_tokens
+        )
+        return Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            prompt_tokens_details=usage.get("prompt_tokens_details")
+            or usage.get("input_tokens_details"),
+        )
+
+    @staticmethod
+    def _calculate_embedding_cost(
+        *,
+        embedding_response: EmbeddingResponse,
+        model: str,
+        custom_llm_provider: Optional[str],
+    ) -> float:
+        try:
+            return litellm.completion_cost(
+                completion_response=embedding_response,
+                model=model,
+                custom_llm_provider=custom_llm_provider,
+                call_type="embedding",
+            )
+        except Exception as exc:
+            model_info = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+                model,
+                custom_llm_provider,
+            )
+            usage = getattr(embedding_response, "usage", None)
+            if not isinstance(model_info, dict) or usage is None:
+                raise
+            input_cost_per_token = model_info.get("input_cost_per_token")
+            if not isinstance(input_cost_per_token, (int, float)):
+                raise
+
+            prompt_tokens = getattr(usage, "prompt_tokens", None) or 0
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            cached_tokens = 0
+            if isinstance(prompt_details, dict):
+                cached_tokens = int(prompt_details.get("cached_tokens") or 0)
+            else:
+                cached_tokens = int(getattr(prompt_details, "cached_tokens", 0) or 0)
+            cache_read_cost = model_info.get("cache_read_input_token_cost")
+            if not isinstance(cache_read_cost, (int, float)):
+                cache_read_cost = input_cost_per_token
+            uncached_tokens = max(int(prompt_tokens) - cached_tokens, 0)
+            fallback_cost = (
+                uncached_tokens * float(input_cost_per_token)
+                + cached_tokens * float(cache_read_cost)
+            )
+            verbose_proxy_logger.warning(
+                "OpenAI passthrough embedding cost fallback used for model=%s provider=%s after completion_cost error: %s",
+                model,
+                custom_llm_provider,
+                str(exc),
+            )
+            return fallback_cost
 
     def _get_user_from_metadata(
         self,
@@ -1077,12 +1222,16 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         is_responses = OpenAIPassthroughLoggingHandler.is_openai_responses_route(
             url_route
         )
+        is_embeddings = OpenAIPassthroughLoggingHandler.is_openai_embeddings_route(
+            url_route
+        )
 
         if not (
             is_chat_completions
             or is_image_generation
             or is_image_editing
             or is_responses
+            or is_embeddings
         ):
             # For unsupported endpoints, return None to let the system fall back to generic behavior
             return {
@@ -1091,7 +1240,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             }
 
         # Extract model from request or response
-        model = request_body.get("model", response_body.get("model", ""))
+        model = (
+            request_body.get("model")
+            or response_body.get("model")
+            or OpenAIPassthroughLoggingHandler._extract_passthrough_model_fallback(
+                kwargs
+            )
+            or ""
+        )
         if not model:
             verbose_proxy_logger.warning(
                 "No model found in request or response for OpenAI passthrough cost tracking"
@@ -1236,6 +1392,29 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     custom_llm_provider=custom_llm_provider,
                     call_type="responses",
                 )
+            elif is_embeddings:
+                try:
+                    logging_obj.call_type = "embedding"
+                except Exception:
+                    pass
+                kwargs["call_type"] = "embedding"
+                usage = OpenAIPassthroughLoggingHandler._build_embedding_usage(
+                    response_body
+                )
+                litellm_model_response = EmbeddingResponse(
+                    data=response_body.get("data", []),
+                    model=response_body.get("model") or model,
+                    usage=usage,
+                    _response_headers=dict(httpx_response.headers),
+                )
+                response_id = response_body.get("id")
+                if isinstance(response_id, str) and response_id:
+                    litellm_model_response.id = response_id
+                response_cost = OpenAIPassthroughLoggingHandler._calculate_embedding_cost(
+                    embedding_response=litellm_model_response,
+                    model=model,
+                    custom_llm_provider=custom_llm_provider,
+                )
 
             apply_passthrough_logging_contract(
                 litellm_response=litellm_model_response,
@@ -1282,6 +1461,10 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 else "image_generation"
                 if is_image_generation
                 else "image_editing"
+                if is_image_editing
+                else "responses"
+                if is_responses
+                else "embeddings"
             )
             verbose_proxy_logger.debug(
                 f"OpenAI passthrough cost tracking - Endpoint: {endpoint_type}, Model: {model}, Cost: ${response_cost:.6f}"
