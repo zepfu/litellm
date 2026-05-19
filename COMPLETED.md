@@ -2,6 +2,45 @@
 
 ## 2026-05-19
 
+- Promoted the prod `aawm-litellm` container to the `aawm.58` release line.
+
+  Runtime:
+  prod was recreated from local image `aawm-litellm:latest` image id
+  `ce6e947066e4`, built from
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.58`. The running container
+  `ad7bfc97158c` is healthy on `:4000`; readiness reports
+  `litellm_version=1.82.3+aawm.58` with `AawmAgentIdentity` loaded.
+  Package inspection inside the running container reports
+  `litellm=1.82.3+aawm.58`, `aawm-litellm-callbacks=0.0.34`, and
+  `aawm-litellm-control-plane=0.0.7`.
+
+  Validation:
+  the first default prod harness artifact
+  `/tmp/litellm-prod-harness-aawm58.json` exposed two validation issues:
+  OpenRouter-backed cases failed because the infrastructure `.env` still held
+  the expired OpenRouter key, and `claude_adapter_codex_tool_activity` returned
+  `/home/zepvu/projects/litellm` instead of the expected
+  `/home/zepfu/projects/litellm` in Claude CLI final JSON. The OpenRouter key
+  in `/home/zepfu/projects/aawm-infrastructure/.env` was refreshed from the
+  repo `.env`, prod was force-recreated, and a direct
+  `openrouter/owl-alpha` smoke through `:4000` returned HTTP `200` with
+  content `OK.`.
+
+  Focused recheck:
+  `/tmp/litellm-prod-focused-aawm58-recheck.json` reran the initially failed
+  provider cases after the key refresh. `claude_adapter_spark`,
+  `claude_adapter_openrouter_free`, and `claude_adapter_nemotron_super` passed.
+  The only remaining failure was the Claude CLI -> Codex-agent command result
+  typo above; the corresponding `session_history_tool_activity` row still
+  recorded the expected `exec_command` tool call with `cmd=pwd`, so this was
+  treated as non-blocking per operator direction to disregard Claude Code CLI
+  execution of Codex agents for this deployment.
+
+  Infrastructure:
+  `/home/zepfu/projects/aawm-infrastructure` commit `62bddf0` is pushed to both
+  `origin/main` and `origin/develop`, keeping the prod image pin at
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.58`.
+
 - Prepared the D1-115 Claude auto-review telemetry attribution release line for
   prod, without restarting the prod container.
 
