@@ -2,6 +2,54 @@
 
 ## 2026-05-19
 
+- Prepared the D1-115 Claude auto-review telemetry attribution release line for
+  prod, without restarting the prod container.
+
+  Code and branch state:
+  implementation commit `d7301ba7ff` landed the Claude auto-review
+  session-history/Langfuse attribution behavior, autobump commit `c12e5e38b7`
+  advanced the callback and model-config artifact versions, and release commit
+  `3ca2c670f0` bumped the fork to `1.82.3+aawm.58`. `origin/main` and
+  `origin/develop` now both point at `3ca2c670f0`.
+
+  Published artifacts:
+  tag `v1.82.3-aawm.58` points at `3ca2c670f0`; GitHub Actions run
+  `26117919762` completed successfully and published
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.58`; GitHub Release
+  `v1.82.3-aawm.58` is public at
+  `https://github.com/zepfu/litellm/releases/tag/v1.82.3-aawm.58`.
+  Callback release `cb-v0.0.34` contains
+  `aawm_litellm_callbacks-0.0.34-py3-none-any.whl`; model-config release
+  `cfg-v0.0.12` contains `litellm-model-config-0.0.12.tar.gz`. Existing
+  overlay releases `cp-v0.0.7` and `h-v0.0.30` remain the current
+  control-plane and harness artifacts.
+
+  Infrastructure prep:
+  `/home/zepfu/projects/aawm-infrastructure` commit `62bddf0` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.58` on `origin/develop`. A no-cache
+  `docker compose -f docker-compose.litellm.yml build --pull --no-cache
+  litellm` completed and produced local `aawm-litellm:latest` image id
+  `ce6e947066e4`.
+
+  Verification:
+  local release verification passed for model-cost sync, JSON parsing, targeted
+  `py_compile`, targeted `ruff`, `git diff --check`, the AAWM identity and
+  Claude auto-review backfill pytest suites (`181 passed, 1 warning`), and the
+  focused Langfuse tag unit test. Built-image inspection reported
+  `litellm=1.82.3+aawm.58`, `aawm-litellm-callbacks=0.0.34`, and
+  `aawm-litellm-control-plane=0.0.7`; callback import inspection returned
+  `_CLAUDE_AUTO_REVIEW_LOGICAL_MODEL=claude-auto-review` and
+  `_CLAUDE_AUTO_REVIEW_AGENT_NAME=auto-reviewer`, and the bundled model-config
+  backup contains the `claude-auto-review` metadata.
+
+  Cutover status:
+  no prod compose restart or `docker compose up -d litellm` was run. The
+  running `aawm-litellm` container remains the existing prod runtime and
+  reports `litellm=1.82.3+aawm.55`,
+  `aawm-litellm-callbacks=0.0.32`, and
+  `aawm-litellm-control-plane=0.0.7` until explicit cutover approval.
+
 - Prepared the D1-114 `aawm-codex-agent-auto` fresh-dispatch affinity fallback for prod release, without recreating the prod container.
 
   Release prep:
