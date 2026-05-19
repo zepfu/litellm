@@ -111,6 +111,29 @@ def test_aawm_agent_identity_enriches_trace_name() -> None:
     )
 
 
+def test_aawm_agent_identity_syncs_metadata_request_tags() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="claude-code.reviewer")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "tags": ["metadata-tags-only"],
+            "request_tags": ["metadata-request-tags-only", "metadata-tags-only"],
+        }
+    )
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    request_tags = updated_kwargs["standard_logging_object"]["request_tags"]
+    assert "metadata-tags-only" in request_tags
+    assert "metadata-request-tags-only" in request_tags
+    assert request_tags.count("metadata-tags-only") == 1
+
+
 def test_aawm_agent_identity_keeps_child_dispatch_trace_metadata() -> None:
     logger = AawmAgentIdentity()
     kwargs = _child_dispatch_metadata_kwargs()
@@ -488,6 +511,11 @@ def test_aawm_agent_identity_adds_claude_permission_check_span() -> None:
 
     metadata = updated_kwargs["litellm_params"]["metadata"]
     tags = metadata["tags"]
+    assert metadata["trace_name"] == "claude-code.auto-reviewer"
+    assert metadata["agent_name"] == "auto-reviewer"
+    assert metadata["aawm_claude_agent_name"] == "auto-reviewer"
+    assert metadata["logical_model"] == "claude-auto-review"
+    assert metadata["source_model"] == "claude-opus-4-6"
     assert metadata["claude_internal_check"] is True
     assert metadata["claude_internal_check_type"] == "permission_check"
     assert metadata["claude_permission_check"] is True
@@ -498,6 +526,7 @@ def test_aawm_agent_identity_adds_claude_permission_check_span() -> None:
     assert "claude-permission-check" in tags
     assert "claude-permission-check:no" in tags
     assert "claude-permission-check:allow" in tags
+    assert "claude-agent:auto-reviewer" in tags
     assert "claude-permission-check" in updated_kwargs["standard_logging_object"][
         "request_tags"
     ]
@@ -519,6 +548,47 @@ def test_aawm_agent_identity_adds_claude_permission_check_span() -> None:
     assert permission_span["metadata"]["response_model"] == "claude-opus-4-6"
     assert permission_span["input"] == {"check_type": "permission_check"}
     assert permission_span["output"] == {"decision": "no", "blocked": False}
+
+
+def test_aawm_agent_identity_rewrites_permission_check_langfuse_headers() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-7[1m]"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = (
+        "claude-opus-4-7[1m]"
+    )
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "tenant_id": "dashboard-shell",
+            "repository": "dashboard-shell",
+            "trace_user_id": "dashboard-shell",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "claude-code.orchestrator",
+            "langfuse_trace_user_id": "dashboard-shell",
+        }
+    }
+    result = {
+        "model": "claude-opus-4-7",
+        "choices": [{"message": {"role": "assistant", "content": "<block>no"}}],
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result=result,
+        call_type="pass_through_endpoint",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert metadata["trace_name"] == "claude-code.auto-reviewer"
+    assert metadata["trace_user_id"] == "dashboard-shell"
+    assert headers["langfuse_trace_name"] == "claude-code.auto-reviewer"
+    assert headers["langfuse_trace_user_id"] == "dashboard-shell"
+    assert "claude-project:dashboard-shell" in metadata["tags"]
 
 
 def test_aawm_agent_identity_adds_gemini_thought_signature_tags() -> None:
@@ -641,6 +711,74 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
 
     assert record is not None
     assert record["session_id"] == "session-from-header"
+
+
+def test_build_session_history_record_aliases_permission_check_after_cost() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-auto-review"
+    kwargs["response_cost"] = 0.1234
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-auto-review",
+            "repository": "agent-a3ee0f55d7cda22ec",
+            "tenant_id": "agent-a3ee0f55d7cda22ec",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = (
+        "claude-opus-4-7[1m]"
+    )
+    result = {
+        "id": "resp-auto-review",
+        "model": "claude-opus-4-7",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "<block>no"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-05-19T13:00:00Z",
+        end_time="2026-05-19T13:00:01Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "anthropic"
+    assert record["model"] == "claude-auto-review"
+    assert record["agent_name"] == "auto-reviewer"
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert record["response_cost_usd"] == pytest.approx(0.1234)
+    assert record["permission_usd_cost"] == pytest.approx(0.1234)
+    assert record["metadata"]["trace_name"] == "claude-code.auto-reviewer"
+    assert record["metadata"]["source_model"] == "claude-opus-4-7"
+    assert record["metadata"]["logical_model"] == "claude-auto-review"
+    assert "claude-agent:auto-reviewer" in record["metadata"]["request_tags"]
+    assert "claude-permission-check" in record["metadata"]["request_tags"]
+
+
+def test_claude_auto_review_offline_pricing_matches_opus_47() -> None:
+    auto_info = aawm_agent_identity._lookup_bundled_model_cost_info(
+        model="claude-auto-review",
+        custom_llm_provider="anthropic",
+    )
+    opus_info = aawm_agent_identity._lookup_bundled_model_cost_info(
+        model="claude-opus-4-7",
+        custom_llm_provider="anthropic",
+    )
+
+    assert auto_info is not None
+    assert opus_info is not None
+    for key in (
+        "input_cost_per_token",
+        "output_cost_per_token",
+        "cache_creation_input_token_cost",
+        "cache_read_input_token_cost",
+        "litellm_provider",
+    ):
+        assert auto_info[key] == opus_info[key]
 
 
 def test_build_session_history_record_uses_grok_header_model_override() -> None:
@@ -884,6 +1022,44 @@ def test_build_session_history_record_uses_claude_project_over_agent_repository_
     assert record["metadata"]["repository"] == "dashboard-shell"
     assert record["metadata"]["aawm_claude_project"] == "dashboard-shell"
     assert record["metadata"]["aawm_claude_agent_name"] == "orchestrator"
+
+
+def test_build_session_history_record_uses_claude_trace_user_identity_fallback() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-trace-user-fallback"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-trace-user-fallback",
+            "trace_user_id": "dashboard-shell",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    result = {
+        "id": "resp-claude-trace-user-fallback",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["agent_name"] == "orchestrator"
+    assert record["tenant_id"] == "dashboard-shell"
+    assert record["repository"] == "dashboard-shell"
+    assert record["metadata"]["repository"] == "dashboard-shell"
+    assert (
+        record["metadata"]["tenant_id_source"]
+        == "litellm_params.metadata.trace_user_id"
+    )
 
 
 def test_build_session_history_record_rejects_agent_id_repository_without_tenant_fallback() -> None:
@@ -1307,7 +1483,8 @@ def test_build_session_history_record_marks_claude_permission_check() -> None:
 
     assert record is not None
     assert record["session_id"] == "session-claude-permission-check"
-    assert record["model"] == "claude-opus-4-6"
+    assert record["model"] == "claude-auto-review"
+    assert record["agent_name"] == "auto-reviewer"
     assert record["output_tokens"] == 7
     assert record["token_permission_input"] == 12000
     assert record["token_permission_output"] == 7
@@ -1320,6 +1497,9 @@ def test_build_session_history_record_marks_claude_permission_check() -> None:
     assert metadata["claude_permission_check_blocked"] is False
     assert metadata["claude_permission_check_request_model"] == "claude-opus-4-6"
     assert metadata["claude_permission_check_response_model"] == "claude-opus-4-6"
+    assert metadata["source_model"] == "claude-opus-4-6"
+    assert metadata["logical_model"] == "claude-auto-review"
+    assert metadata["trace_name"] == "claude-code.auto-reviewer"
     assert "claude-permission-check" in metadata["request_tags"]
     assert "claude-permission-check:no" in metadata["request_tags"]
 
@@ -5084,6 +5264,50 @@ def test_build_provider_error_observation_classifies_grok_auth_failure() -> None
     assert observation["error_class"] == "auth_failed"
 
 
+def test_build_provider_error_observation_uses_auto_review_logical_model() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-7[1m]"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-auto-review-provider-error"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-auto-review-provider-error",
+            "passthrough_route_family": "anthropic_messages",
+            "claude_permission_check": True,
+            "claude_permission_check_request_model": "claude-opus-4-7[1m]",
+            "claude_permission_check_response_model": "claude-opus-4-7",
+            "tags": ["claude-permission-check"],
+        }
+    )
+    error = HTTPException(
+        status_code=529,
+        detail=json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Overloaded",
+                },
+            }
+        ),
+    )
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result=error,
+        start_time="2026-05-19T13:05:00Z",
+        end_time="2026-05-19T13:05:01Z",
+    )
+
+    assert observation is not None
+    assert observation["provider"] == "anthropic"
+    assert observation["model"] == "claude-auto-review"
+    assert observation["error_class"] == "capacity_exhausted"
+    assert observation["metadata"]["source_model"] == "claude-opus-4-7"
+    assert observation["metadata"]["logical_model"] == "claude-auto-review"
+    assert observation["metadata"]["trace_name"] == "claude-code.auto-reviewer"
+
+
 def test_log_failure_event_enqueues_provider_error_without_quota(monkeypatch) -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
@@ -6496,6 +6720,97 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert fake_pool.acquire_contexts[0].enter_count == 1
     assert fake_pool.acquire_contexts[0].exit_count == 1
     mock_conn.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_session_history_records_inherits_auto_review_parent_identity(
+    monkeypatch,
+) -> None:
+    parent_kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    parent_kwargs["model"] = "claude-opus-4-7"
+    parent_kwargs["custom_llm_provider"] = "anthropic"
+    parent_kwargs["call_type"] = "pass_through_endpoint"
+    parent_kwargs["litellm_call_id"] = "call-parent"
+    parent_kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-auto-review-parent",
+            "repository": "dashboard-shell",
+            "tenant_id": "dashboard-shell",
+            "tags": ["claude-project:dashboard-shell"],
+        }
+    )
+    parent_record = _build_session_history_record(
+        kwargs=parent_kwargs,
+        result={
+            "id": "resp-parent",
+            "model": "claude-opus-4-7",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        },
+        start_time="2026-05-19T13:00:00Z",
+        end_time="2026-05-19T13:00:01Z",
+    )
+
+    permission_kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    permission_kwargs["model"] = "claude-opus-4-7"
+    permission_kwargs["custom_llm_provider"] = "anthropic"
+    permission_kwargs["call_type"] = "pass_through_endpoint"
+    permission_kwargs["litellm_call_id"] = "call-auto-review-child"
+    permission_kwargs["response_cost"] = 0.01
+    permission_kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-auto-review-parent",
+            "repository": "agent-a3ee0f55d7cda22ec",
+            "tenant_id": "agent-a3ee0f55d7cda22ec",
+        }
+    )
+    permission_record = _build_session_history_record(
+        kwargs=permission_kwargs,
+        result={
+            "id": "resp-auto-review-child",
+            "model": "claude-opus-4-7",
+            "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
+            "choices": [{"message": {"role": "assistant", "content": "<block>no"}}],
+        },
+        start_time="2026-05-19T13:01:00Z",
+        end_time="2026-05-19T13:01:01Z",
+    )
+    assert parent_record is not None
+    assert permission_record is not None
+
+    mock_conn = AsyncMock()
+    mock_conn.fetch = AsyncMock(return_value=[])
+    fake_pool = _FakePool(mock_conn)
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+
+    await _persist_session_history_records([parent_record, permission_record])
+
+    history_args = mock_conn.executemany.await_args_list[0].args
+    payloads = history_args[1]
+    permission_payload = next(
+        payload for payload in payloads if payload[0] == "call-auto-review-child"
+    )
+    metadata = json.loads(permission_payload[46])
+    assert permission_payload[5] == "claude-auto-review"
+    assert permission_payload[7] == "auto-reviewer"
+    assert permission_payload[8] == "dashboard-shell"
+    assert permission_payload[47] == "dashboard-shell"
+    assert metadata["repository"] == "dashboard-shell"
+    assert metadata["tenant_id"] == "dashboard-shell"
+    assert metadata["trace_user_id"] == "dashboard-shell"
+    assert "claude-project:dashboard-shell" in metadata["request_tags"]
+    assert (
+        metadata["claude_auto_review_parent_identity_source"]
+        == "same_session.session_history"
+    )
+    mock_conn.fetch.assert_not_awaited()
 
 
 @pytest.mark.asyncio
