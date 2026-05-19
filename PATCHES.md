@@ -1948,7 +1948,7 @@ source integration module is missing.
 
 ---
 
-### aawm.56 — Codex auto-agent fresh-dispatch affinity fallback
+### aawm.57 — Codex auto-agent fresh-dispatch affinity fallback
 
 **Status:** AAWM local hotfix.
 
