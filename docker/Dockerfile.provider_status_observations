@@ -1,0 +1,27 @@
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    AAWM_LITELLM_ENVIRONMENT=dev \
+    AAWM_PROVIDER_STATUS_APPLY=1 \
+    AAWM_PROVIDER_STATUS_INTERVAL_SECONDS=300 \
+    AAWM_PROVIDER_STATUS_TIMEOUT=2 \
+    AAWM_PROVIDER_STATUS_PING_COUNT=1 \
+    AAWM_PROVIDER_STATUS_PING_TIMEOUT=2 \
+    AAWM_PROVIDER_STATUS_SKIP_ICMP=0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir "psycopg[binary]==3.3.4"
+
+COPY scripts/record_provider_status_observations.py /app/scripts/record_provider_status_observations.py
+COPY scripts/run_provider_status_observations_loop.py /app/scripts/run_provider_status_observations_loop.py
+RUN touch /app/scripts/__init__.py
+
+ENTRYPOINT ["python", "/app/scripts/run_provider_status_observations_loop.py"]

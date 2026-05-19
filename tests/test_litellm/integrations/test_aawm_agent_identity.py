@@ -203,6 +203,62 @@ def test_aawm_agent_identity_promotes_codex_repository_over_generic_user_header(
     assert langfuse_metadata["trace_user_id"] == "pytest-classifier"
 
 
+def test_aawm_agent_identity_promotes_grok_repository_without_custom_headers() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="grok-build")
+    request_text = (
+        "You are 'builder' and you are working on the 'infra' project.\n"
+        "# AGENTS.md instructions for /home/zepfu/projects/litellm\n"
+    )
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "session_id": "grok-session-identity",
+            "trace_user_id": "grok-build",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "grok-build",
+            "langfuse_trace_user_id": "grok-build",
+            "x-grok-model-override": "grok-build",
+            "user-agent": "grok/0.1.210",
+        },
+        "body": {
+            "model": "grok-build",
+            "messages": [{"role": "user", "content": request_text}],
+        },
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "grok-build",
+        "messages": [{"role": "user", "content": request_text}],
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"output": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"output": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert metadata["trace_name"] == "grok-build.builder"
+    assert metadata["trace_user_id"] == "litellm"
+    assert metadata["repository"] == "litellm"
+    assert metadata["tenant_id"] == "infra"
+    assert headers["langfuse_trace_name"] == "grok-build.builder"
+    assert headers["langfuse_trace_user_id"] == "litellm"
+
+    langfuse_metadata = LangFuseLogger.add_metadata_from_header(
+        updated_kwargs["litellm_params"],
+        dict(metadata),
+    )
+    assert langfuse_metadata["trace_name"] == "grok-build.builder"
+    assert langfuse_metadata["trace_user_id"] == "litellm"
+
+
 def test_aawm_agent_identity_promotes_codex_memory_repository_trace_user_id() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="codex")
@@ -666,6 +722,12 @@ def test_normalize_repository_identity_accepts_repo_shapes(
         "aegis commits=3a131aa skip_tests=true",
         "aawm-tap-dashboard all=true",
         "aawm-tap\\n\\n\\ (memory)",
+        "agent-ac357ffbc895e51d4",
+        "agent-abc",
+        "orchestrator",
+        "wave8-engineer",
+        "path",
+        "project",
     ],
 )
 def test_normalize_repository_identity_rejects_metadata_noise(
@@ -705,7 +767,7 @@ def test_build_session_history_record_uses_repository_header_and_metadata() -> N
     assert record["metadata"]["repository"] == "zepfu/litellm"
 
     payload = _build_session_history_db_payload(record)
-    assert payload[46] == "zepfu/litellm"
+    assert payload[47] == "zepfu/litellm"
 
 
 def test_build_session_history_record_prefers_repository_header_over_request_context() -> None:
@@ -781,6 +843,81 @@ def test_build_session_history_record_rejects_invalid_repository_metadata() -> N
     assert record["tenant_id"] == "aegis"
     assert "repository" not in record["metadata"]
     assert record["metadata"]["tenant_id"] == "aegis"
+
+
+def test_build_session_history_record_uses_claude_project_over_agent_repository_noise() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-project-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-project-repository",
+            "agent_name": "orchestrator",
+            "aawm_claude_agent_name": "orchestrator",
+            "tenant_id": "dashboard-shell",
+            "aawm_tenant_id": "dashboard-shell",
+            "aawm_claude_project": "dashboard-shell",
+            "repository": "agent-ac357ffbc895e51d4",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    result = {
+        "id": "resp-claude-project-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["agent_name"] == "orchestrator"
+    assert record["tenant_id"] == "dashboard-shell"
+    assert record["repository"] == "dashboard-shell"
+    assert record["metadata"]["repository"] == "dashboard-shell"
+    assert record["metadata"]["aawm_claude_project"] == "dashboard-shell"
+    assert record["metadata"]["aawm_claude_agent_name"] == "orchestrator"
+
+
+def test_build_session_history_record_rejects_agent_id_repository_without_tenant_fallback() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-agent-id-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-agent-id-repository",
+            "repository": "agent-ac357ffbc895e51d4",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    result = {
+        "id": "resp-agent-id-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
+    assert "tenant_id" not in record["metadata"]
 
 
 def test_build_session_history_record_uses_repository_as_tenant_fallback() -> None:
@@ -1465,6 +1602,58 @@ def test_build_session_history_record_uses_hidden_responses_output_for_tool_acti
     assert record["tool_activity"][0]["command_text"] == "pwd"
 
 
+def test_build_session_history_record_counts_invalid_tool_call_results() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-invalid-tool-result"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-invalid-tool-result"
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "is_error": True,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "<tool_use_error>InputValidationError: Read failed "
+                                    "due to the following issue: An unexpected "
+                                    "parameter `line` was provided</tool_use_error>"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    result = {
+        "id": "resp-invalid-tool-result",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "Recovered."}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["invalid_tool_call_count"] == 1
+    assert record["metadata"]["usage_invalid_tool_call_count"] == 1
+
+    payload = _build_session_history_db_payload(record)
+    assert payload[29] == 1
+
+
 def test_build_session_history_record_omits_empty_read_pages_from_tool_activity() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.5"
@@ -1638,17 +1827,17 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 66
-    assert payload[56] == pytest.approx(25.0)
-    assert payload[57] == pytest.approx(100.0)
-    assert payload[58] == pytest.approx(130.0)
-    assert payload[59] == pytest.approx(50.0)
-    assert payload[60] == pytest.approx(10.0)
-    assert payload[61] == pytest.approx(15.0)
-    assert payload[65] is None
-    assert payload[62] == pytest.approx(40.0)
-    assert payload[63] == pytest.approx(60.0)
-    assert payload[64] == pytest.approx(5.0)
+    assert len(payload) == 67
+    assert payload[57] == pytest.approx(25.0)
+    assert payload[58] == pytest.approx(100.0)
+    assert payload[59] == pytest.approx(130.0)
+    assert payload[60] == pytest.approx(50.0)
+    assert payload[61] == pytest.approx(10.0)
+    assert payload[62] == pytest.approx(15.0)
+    assert payload[66] is None
+    assert payload[63] == pytest.approx(40.0)
+    assert payload[64] == pytest.approx(60.0)
+    assert payload[65] == pytest.approx(5.0)
 
 
 def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None:
@@ -2495,6 +2684,62 @@ def test_build_session_history_record_calculates_openrouter_embedding_cost() -> 
     assert record["response_cost_usd"] == pytest.approx(0.00002)
 
 
+def test_build_session_history_record_calculates_grok_embedding_cost() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "embedding"
+    kwargs["litellm_call_id"] = "call-grok-build-embedding-cost"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "session_id": "session-grok-build-embedding-cost",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-grok-model-override": "grok-build"},
+        "body": {
+            "model": "grok-build",
+            "input": "Embed this Grok Build text.",
+        },
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "grok-build",
+        "input": "Embed this Grok Build text.",
+    }
+
+    result = {
+        "id": "grok-embedding-response-1",
+        "model": "grok-build",
+        "object": "list",
+        "usage": {
+            "prompt_tokens": 2000,
+            "completion_tokens": 0,
+            "total_tokens": 2000,
+        },
+        "data": [{"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "xai"
+    assert record["model"] == "grok-build"
+    assert record["call_type"] == "embedding"
+    assert record["input_tokens"] == 2000
+    assert record["output_tokens"] == 0
+    assert record["total_tokens"] == 2000
+    assert record["response_cost_usd"] == pytest.approx(0.0025)
+
+
 def test_build_session_history_record_calculates_local_embedding_estimated_cost() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "ncbi/MedCPT-Article-Encoder"
@@ -3011,15 +3256,16 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 66
+    assert len(payload) == 67
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
     assert payload[22] is True
     assert payload[23] == "hit"
-    assert payload[35] == "dev"
-    assert payload[36] == "1.82.3+aawm.25"
-    assert payload[56:] == (
+    assert payload[29] == 0
+    assert payload[36] == "dev"
+    assert payload[37] == "1.82.3+aawm.25"
+    assert payload[57:] == (
         None,
         None,
         None,
@@ -3031,17 +3277,18 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
         None,
         None,
     )
-    assert payload[37] == "aawm.25"
-    assert "aawm-litellm-callbacks" in payload[38]
-    assert payload[39] == "codex-tui"
-    assert payload[40] == "0.124.0"
-    assert payload[41] == "codex-tui/0.124.0"
-    assert payload[42] == 100
-    assert payload[43] == 7
-    assert payload[44] == pytest.approx(0.016138)
-    payload_metadata = json.loads(payload[45])
+    assert payload[38] == "aawm.25"
+    assert "aawm-litellm-callbacks" in payload[39]
+    assert payload[40] == "codex-tui"
+    assert payload[41] == "0.124.0"
+    assert payload[42] == "codex-tui/0.124.0"
+    assert payload[43] == 100
+    assert payload[44] == 7
+    assert payload[45] == pytest.approx(0.016138)
+    payload_metadata = json.loads(payload[46])
     assert payload_metadata["litellm_environment"] == "dev"
     assert payload_metadata["client_name"] == "codex-tui"
+    assert payload_metadata["usage_invalid_tool_call_count"] == 0
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
@@ -4598,6 +4845,117 @@ def test_build_rate_limit_observations_keeps_google_capacity_distinct_from_quota
     assert observation["evidence"]["corroboration_required"] is True
 
 
+def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-billing"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing",
+        "request_headers": {
+            "x-grok-model-override": "grok-build",
+            "x-grok-user-id": "user_123",
+        },
+        "response_body": {
+            "config": {
+                "monthlyLimit": {"val": 60000},
+                "used": {"val": 324},
+                "onDemandCap": {"val": 0},
+                "billingPeriodStart": "2026-05-01T00:00:00+00:00",
+                "billingPeriodEnd": "2026-06-01T00:00:00+00:00",
+            }
+        },
+    }
+    end_time = datetime(2026, 5, 16, 0, 35, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={
+            "config": kwargs["standard_pass_through_logging_payload"]["response_body"][
+                "config"
+            ]
+        },
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["source"] == "grok_billing"
+    assert observation["provider"] == "xai"
+    assert observation["client_family"] == "grok-build"
+    assert observation["model"] == "grok-build"
+    assert observation["quota_type"] == "requests"
+    assert observation["quota_period"] == "monthly"
+    assert observation["limit_scope"] == "requests"
+    assert observation["raw_provider_fields"]["quota_unit"] == "grok_billing_used"
+    assert observation["raw_provider_fields"]["quota_unit_interpretation"] == "requests"
+    assert observation["remaining_pct"] == 99.0
+    assert observation["used_percentage"] == 1.0
+    assert observation["provider_resets_at"] == datetime(
+        2026,
+        6,
+        1,
+        tzinfo=timezone.utc,
+    )
+
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+        observation
+    )
+    assert payload[4] == "xai"
+    assert payload[6] == "xai_grok_build_monthly_requests:requests"
+    assert payload[8] == "requests"
+    assert payload[10] == 99.0
+
+
+def test_build_rate_limit_observations_skips_invalid_grok_billing_limit() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_params"]["metadata"].update(
+        {"passthrough_route_family": "grok_cli_chat_proxy"}
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing",
+        "response_body": {
+            "config": {
+                "monthlyLimit": {"val": 0},
+                "used": {"val": 324},
+                "billingPeriodEnd": "2026-06-01T00:00:00+00:00",
+            }
+        },
+    }
+    end_time = datetime(2026, 5, 16, 0, 35, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert observations == []
+
+
+def test_rate_limit_intervals_materialized_view_includes_xai_requests() -> None:
+    sql = aawm_agent_identity._AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL
+
+    assert "provider IN ('openai', 'anthropic', 'google', 'xai')" in sql
+    assert "WHEN provider = 'xai'" in sql
+    assert "COALESCE(NULLIF(model, ''), 'grok-build')" in sql
+    assert "AND remaining_pct < 100" in sql
+    assert "LAG(remaining_pct) OVER rate_limit_window" in sql
+    assert "previous_remaining_pct IS DISTINCT FROM remaining_pct" in sql
+    assert "MIN(observed_at) AS fromDate" not in sql
+
+
 def test_provider_status_observations_schema_includes_icmp_fields() -> None:
     sql = aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL
 
@@ -5080,7 +5438,7 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert mock_conn.execute.await_count == 2
     executed_args = mock_conn.execute.await_args_list[0].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 66
+    assert len(executed_args[1:]) == 67
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
@@ -5448,6 +5806,59 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["metadata"]["session_id_source"] == "trace.sessionId"
     assert record["metadata"]["trace_id_source"] == "trace.id"
     assert "route:anthropic_messages" in record["metadata"]["request_tags"]
+
+
+def test_build_session_history_record_from_langfuse_observation_counts_invalid_tool_results() -> None:
+    request_body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "is_error": True,
+                        "content": (
+                            "<tool_use_error>InputValidationError: Read failed due "
+                            "to the following issue: An unexpected parameter `line` "
+                            "was provided</tool_use_error>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+    trace = {
+        "id": "trace-invalid-tool",
+        "name": "claude-code.engineer",
+        "sessionId": "session-invalid-tool",
+        "input": {"messages": []},
+    }
+    observation = {
+        "id": "call-invalid-tool",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "claude-opus-4-7",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "input": {
+            "messages": [
+                {"role": "user", "content": json.dumps(request_body)}
+            ]
+        },
+        "output": {"id": "provider-response-invalid-tool", "content": "Recovered."},
+        "metadata": {"trace_name": "claude-code.engineer"},
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-invalid-tool",
+    )
+
+    assert record is not None
+    assert record["invalid_tool_call_count"] == 1
+    assert record["metadata"]["usage_invalid_tool_call_count"] == 1
 
 
 def test_build_session_history_record_from_langfuse_trace_observation_marks_permission_cost() -> None:
@@ -6077,7 +6488,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
-    assert len(history_args[1][0]) == 66
+    assert len(history_args[1][0]) == 67
     assert history_args[1][0][0] == "call-1"
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]

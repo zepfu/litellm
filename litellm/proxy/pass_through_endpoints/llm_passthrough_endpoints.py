@@ -362,6 +362,36 @@ _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES = {
+    "path",
+    "project",
+    "repo",
+    "repository",
+    "unknown",
+}
+_PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES = {
+    "agent",
+    "analyst",
+    "architect",
+    "engineer",
+    "infra",
+    "ops",
+    "orchestrator",
+    "principal",
+    "qa",
+    "researcher",
+    "reviewer",
+    "salvage",
+    "tester",
+}
+_PASSTHROUGH_REPOSITORY_AGENT_ID_RE = re.compile(
+    r"^agent-[a-f0-9]{3,}$",
+    re.IGNORECASE,
+)
+_PASSTHROUGH_REPOSITORY_WAVE_AGENT_RE = re.compile(
+    r"^wave\d+-(?:analyst|engineer|infra|ops|principal|qa|researcher|reviewer|salvage|tester)$",
+    re.IGNORECASE,
+)
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
     {"/messages", "/v1/messages"}
 )
@@ -1247,18 +1277,28 @@ async def _select_codex_auto_agent_candidate(
             )
             if affinity_state is not None:
                 if affinity_state["cooldown_seconds"] > 0:
-                    _raise_codex_auto_agent_in_flight_cooldown(
-                        candidate=affinity_candidate,
-                        lane_key=affinity_state.get("lane_key"),
-                        cooldown_seconds=affinity_state["cooldown_seconds"],
+                    if has_continuation_state:
+                        _raise_codex_auto_agent_in_flight_cooldown(
+                            candidate=affinity_candidate,
+                            lane_key=affinity_state.get("lane_key"),
+                            cooldown_seconds=affinity_state["cooldown_seconds"],
+                        )
+                    skipped.append(
+                        _codex_auto_agent_candidate_public_shape(
+                            affinity_candidate,
+                            lane_key=affinity_state.get("lane_key"),
+                            cooldown_seconds=affinity_state["cooldown_seconds"],
+                            reason="session_affinity_cooldown",
+                        )
                     )
-                return {
-                    **affinity_state,
-                    "session_key": session_key,
-                    "selection_reason": "session_affinity",
-                    "skipped": skipped,
-                    "in_flight_session": has_continuation_state,
-                }
+                else:
+                    return {
+                        **affinity_state,
+                        "session_key": session_key,
+                        "selection_reason": "session_affinity",
+                        "skipped": skipped,
+                        "in_flight_session": has_continuation_state,
+                    }
             preferred_available = any(
                 not state["candidate"].get("last_resort")
                 and state["cooldown_seconds"] <= 0
@@ -9842,7 +9882,20 @@ def _normalize_passthrough_repository(value: str) -> Optional[str]:
         cleaned = cleaned.rstrip("/").rsplit("/", 1)[-1]
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
-    return cleaned.strip("/") or None
+    cleaned = cleaned.strip("/")
+    if not cleaned:
+        return None
+
+    normalized = cleaned.lower()
+    if (
+        normalized in _PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES
+        or normalized in _PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES
+        or _PASSTHROUGH_REPOSITORY_AGENT_ID_RE.fullmatch(normalized)
+        or _PASSTHROUGH_REPOSITORY_WAVE_AGENT_RE.fullmatch(normalized)
+    ):
+        return None
+
+    return cleaned
 
 
 def _extract_passthrough_repository_from_text(value: str) -> Optional[str]:
@@ -12135,10 +12188,14 @@ def _prepare_grok_request_body_for_passthrough(
         extra_fields["session_id"] = session_id
 
     updated_body = copy.deepcopy(request_body)
-    return _merge_litellm_metadata(
+    updated_body = _merge_litellm_metadata(
         updated_body,
         tags_to_add=tags_to_add,
         extra_fields=extra_fields,
+    )
+    return _prepare_request_body_for_passthrough_observability(
+        request=request,
+        request_body=updated_body,
     )
 
 
@@ -14450,24 +14507,21 @@ async def _handle_codex_auto_agent_alias_route(
                     ),
                 }
             )
+            if has_continuation_state:
+                attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                verbose_proxy_logger.warning(
+                    "Codex auto-agent alias target %s/%s hit retryable exhaustion "
+                    "for an in-flight session; signaling redispatch",
+                    candidate["provider"],
+                    candidate["model"],
+                )
+                raise
             verbose_proxy_logger.warning(
                 "Codex auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",
                 candidate["provider"],
                 candidate["model"],
                 cooldown_seconds,
             )
-            if (
-                has_continuation_state
-                or selection.get("selection_reason") == "session_affinity"
-            ):
-                attempt_record["status"] = "terminal_in_flight_cooldown_set"
-                verbose_proxy_logger.warning(
-                    "Codex auto-agent alias target %s/%s hit retryable exhaustion "
-                    "for an in-flight session; not switching providers",
-                    candidate["provider"],
-                    candidate["model"],
-                )
-                raise
             continue
 
     if last_retryable_exc is not None:

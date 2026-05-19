@@ -2,13 +2,14 @@
 """Repair malformed repository identity values in public.session_history."""
 
 import argparse
+from collections import Counter
 import json
 import os
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import psycopg
 import psycopg.rows
@@ -44,13 +45,75 @@ def _load_repo_dotenv() -> None:
 _load_repo_dotenv()
 
 from litellm.integrations.aawm_agent_identity import (  # noqa: E402
+    _AAWM_REPOSITORY_AGENT_ID_RE,
+    _AAWM_REPOSITORY_AGENT_ROLE_VALUES,
+    _AAWM_REPOSITORY_PLACEHOLDER_VALUES,
+    _AAWM_REPOSITORY_WAVE_AGENT_RE,
     _CODEX_MEMORY_REPOSITORY_SUFFIX,
     _build_aawm_dsn,
+    _extract_repository_identity_from_metadata_sources,
     _normalize_repository_identity,
 )
 
 
 _VALID_IDENTITY_SQL = r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?( \(memory\))?$"
+_AGENT_IDENTITY_SQL = _AAWM_REPOSITORY_AGENT_ID_RE.pattern
+_WAVE_AGENT_IDENTITY_SQL = _AAWM_REPOSITORY_WAVE_AGENT_RE.pattern
+_DISALLOWED_IDENTITY_VALUES = tuple(
+    sorted(_AAWM_REPOSITORY_PLACEHOLDER_VALUES | _AAWM_REPOSITORY_AGENT_ROLE_VALUES)
+)
+_METADATA_IDENTITY_KEYS = (
+    "repository",
+    "source_repository",
+    "aawm_repository",
+    "repo",
+    "repo_name",
+    "repository_name",
+    "git_repository",
+    "vcs_repository",
+    "workspace_root",
+    "workspaceRoot",
+    "project_root",
+    "projectRoot",
+    "root_path",
+    "rootPath",
+    "working_directory",
+    "workingDirectory",
+    "cwd_path",
+    "cwdPath",
+    "cwd_uri",
+    "cwdUri",
+    "aawm_claude_project",
+    "tenant_id",
+    "aawm_tenant_id",
+)
+_ROW_METADATA_REPOSITORY_PRIORITY = (
+    "aawm_claude_project",
+    "aawm_repository",
+    "repository",
+    "source_repository",
+    "repo",
+    "repo_name",
+    "repository_name",
+    "git_repository",
+    "vcs_repository",
+    "workspace_root",
+    "workspaceRoot",
+    "project_root",
+    "projectRoot",
+    "root_path",
+    "rootPath",
+    "working_directory",
+    "workingDirectory",
+    "cwd_path",
+    "cwdPath",
+    "cwd_uri",
+    "cwdUri",
+)
+_ROW_METADATA_TENANT_PRIORITY = (
+    "aawm_tenant_id",
+    "tenant_id",
+)
 _NOISY_REPO_PREFIX_PATTERNS = (
     re.compile(r"^(?P<repo>[A-Za-z0-9_.-]+)\s+(?:all|commits|files)="),
     re.compile(r"^(?P<repo>[A-Za-z0-9_.-]+)(?:\\\\n|\\n|\n)+"),
@@ -118,31 +181,126 @@ def _repair_noisy_identity(
     return None
 
 
-def _build_repaired_row(
+def _known_repository_candidate(
+    value: Any,
+    known_repositories: set[str],
+) -> Optional[str]:
+    repaired = _repair_noisy_identity(value, known_repositories)
+    if repaired and _is_known_repository(repaired, known_repositories):
+        return repaired
+    return None
+
+
+def _best_row_repository_candidate(
     row: Dict[str, Any],
     known_repositories: set[str],
-) -> Optional[Dict[str, Any]]:
+) -> Optional[Tuple[str, str, int]]:
     metadata = _safe_json_metadata(row.get("metadata"))
+
+    for priority, key in enumerate(_ROW_METADATA_REPOSITORY_PRIORITY):
+        repository = _known_repository_candidate(metadata.get(key), known_repositories)
+        if repository:
+            return repository, f"session_metadata.{key}", priority
+
+    repository = _extract_repository_identity_from_metadata_sources(
+        ("session_history.metadata", metadata)
+    )
+    if _is_known_repository(repository, known_repositories):
+        return repository, "session_metadata.recursive_repository", 40
+
+    repository = _known_repository_candidate(row.get("repository"), known_repositories)
+    if repository:
+        return repository, "session_history.repository", 50
+
+    for offset, key in enumerate(_ROW_METADATA_TENANT_PRIORITY):
+        repository = _known_repository_candidate(metadata.get(key), known_repositories)
+        if repository:
+            return repository, f"session_metadata.{key}", 60 + offset
+
+    repository = _known_repository_candidate(row.get("tenant_id"), known_repositories)
+    if repository:
+        return repository, "session_history.tenant_id", 70
+
+    return None
+
+
+def _is_grok_row(row: Dict[str, Any]) -> bool:
+    provider = str(row.get("provider") or "").lower()
+    model = str(row.get("model") or "").lower()
+    return provider == "xai" or "grok" in model
+
+
+def _build_session_repository_map(
+    rows: list[Dict[str, Any]],
+    known_repositories: set[str],
+) -> Dict[str, Dict[str, Any]]:
+    best_by_session: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        session_id = row.get("session_id")
+        if not session_id:
+            continue
+        candidate = _best_row_repository_candidate(row, known_repositories)
+        if candidate is None:
+            continue
+        repository, source, priority = candidate
+        existing = best_by_session.get(session_id)
+        if existing is not None and int(existing["priority"]) <= priority:
+            continue
+        best_by_session[session_id] = {
+            "repository": repository,
+            "source": source,
+            "priority": priority,
+            "source_row_id": row.get("id"),
+        }
+    return best_by_session
+
+
+def _build_repaired_row(  # noqa: PLR0915
+    row: Dict[str, Any],
+    known_repositories: set[str],
+    session_repositories: Optional[Dict[str, Dict[str, Any]]] = None,
+    grok_repository: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    session_repositories = session_repositories or {}
+    metadata = _safe_json_metadata(row.get("metadata"))
+    original_metadata = _safe_json_metadata(row.get("metadata"))
     original_repository = row.get("repository")
     original_tenant_id = row.get("tenant_id")
 
-    repository = _normalize_repository_identity(original_repository)
-    metadata_repository = _normalize_repository_identity(metadata.get("repository"))
-    source_repository = _normalize_repository_identity(metadata.get("source_repository"))
+    repository = _repair_noisy_identity(original_repository, known_repositories)
+    metadata_repository = _repair_noisy_identity(
+        metadata.get("repository"), known_repositories
+    )
+    source_repository = _repair_noisy_identity(
+        metadata.get("source_repository"), known_repositories
+    )
     tenant_id = _normalize_repository_identity(original_tenant_id)
     repaired_tenant_id = _repair_noisy_identity(
         original_tenant_id, known_repositories
     )
+    repair_source = "row_identity_normalization"
 
-    if repository is None:
+    if grok_repository and _is_grok_row(row):
+        repository = grok_repository
+        repair_source = "grok_repository_override"
+    elif repository is None:
         if metadata_repository is not None:
             repository = metadata_repository
+            repair_source = "row_metadata.repository"
         elif source_repository is not None:
             repository = source_repository
+            repair_source = "row_metadata.source_repository"
+        elif (
+            session_identity := session_repositories.get(str(row.get("session_id")))
+        ) is not None:
+            repository = str(session_identity["repository"])
+            repair_source = f"same_session.{session_identity['source']}"
         elif _is_known_repository(tenant_id, known_repositories):
             repository = tenant_id
+            repair_source = "row_tenant_id"
         elif _is_known_repository(repaired_tenant_id, known_repositories):
             repository = repaired_tenant_id
+            repair_source = "row_tenant_id_noisy"
 
     if tenant_id is None:
         tenant_id = repaired_tenant_id or repository
@@ -161,15 +319,17 @@ def _build_repaired_row(
     changed = (
         repository != original_repository
         or tenant_id != original_tenant_id
-        or metadata != _safe_json_metadata(row.get("metadata"))
+        or metadata != original_metadata
     )
     if not changed:
         return None
 
     metadata["repository_identity_repaired_at"] = datetime.now(timezone.utc).isoformat()
-    metadata["repository_identity_repair_source"] = (
-        "repair_session_history_repository_identity.py"
-    )
+    metadata["repository_identity_repair_source"] = repair_source
+    if repository != original_repository:
+        metadata["repository_identity_previous_repository"] = original_repository
+    if tenant_id != original_tenant_id:
+        metadata["repository_identity_previous_tenant_id"] = original_tenant_id
     if tenant_id == repository and tenant_id is not None:
         metadata["tenant_id_source"] = "repository_repair"
 
@@ -180,6 +340,7 @@ def _build_repaired_row(
         "metadata": metadata,
         "previous_repository": original_repository,
         "previous_tenant_id": original_tenant_id,
+        "repair_source": repair_source,
     }
 
 
@@ -188,30 +349,107 @@ def _fetch_candidate_rows(
     *,
     cursor_id: int,
     batch_size: int,
+    include_all_grok: bool = False,
 ) -> list[Dict[str, Any]]:
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(
             """
-            SELECT id, repository, tenant_id, metadata
+            SELECT id, session_id, provider, model, repository, tenant_id, metadata, created_at
             FROM public.session_history
             WHERE id > %s
               AND (
-                    (repository IS NOT NULL AND repository !~ %s)
-                 OR (tenant_id IS NOT NULL AND tenant_id !~ %s)
-                 OR (
-                        metadata ? 'repository'
-                    AND (metadata->>'repository') !~ %s
+                    (
+                        %s
+                    AND (provider = 'xai' OR model ILIKE %s)
                     )
+                 OR (
+                        repository IS NOT NULL
+                    AND (
+                            repository !~ %s
+                         OR lower(repository) = ANY(%s::text[])
+                         OR repository ~* %s
+                         OR repository ~* %s
+                        )
+                    )
+                 OR (
+                        tenant_id IS NOT NULL
+                    AND (
+                            tenant_id !~ %s
+                         OR lower(tenant_id) = ANY(%s::text[])
+                         OR tenant_id ~* %s
+                         OR tenant_id ~* %s
+                        )
+                    )
+                 OR (
+                        jsonb_typeof(metadata) = 'object'
+                    AND EXISTS (
+                            SELECT 1
+                            FROM jsonb_each_text(metadata) AS metadata_entry(key, value)
+                            WHERE metadata_entry.key = ANY(%s::text[])
+                              AND metadata_entry.value IS NOT NULL
+                              AND (
+                                    metadata_entry.value !~ %s
+                                 OR lower(metadata_entry.value) = ANY(%s::text[])
+                                 OR metadata_entry.value ~* %s
+                                 OR metadata_entry.value ~* %s
+                              )
+                        )
+                    )
+                 OR (repository IS NULL AND metadata ? 'aawm_claude_project')
+                 OR (repository IS NULL AND (provider = 'xai' OR model ILIKE %s))
               )
             ORDER BY id ASC
             LIMIT %s
             """,
             (
                 cursor_id,
+                include_all_grok,
+                "%grok%",
                 _VALID_IDENTITY_SQL,
+                list(_DISALLOWED_IDENTITY_VALUES),
+                _AGENT_IDENTITY_SQL,
+                _WAVE_AGENT_IDENTITY_SQL,
                 _VALID_IDENTITY_SQL,
+                list(_DISALLOWED_IDENTITY_VALUES),
+                _AGENT_IDENTITY_SQL,
+                _WAVE_AGENT_IDENTITY_SQL,
+                list(_METADATA_IDENTITY_KEYS),
                 _VALID_IDENTITY_SQL,
+                list(_DISALLOWED_IDENTITY_VALUES),
+                _AGENT_IDENTITY_SQL,
+                _WAVE_AGENT_IDENTITY_SQL,
+                "%grok%",
                 batch_size,
+            ),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def _fetch_session_identity_rows(
+    conn: psycopg.Connection,
+    session_ids: set[str],
+) -> list[Dict[str, Any]]:
+    if not session_ids:
+        return []
+
+    with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, session_id, repository, tenant_id, metadata
+            FROM public.session_history
+            WHERE session_id = ANY(%s::text[])
+              AND (
+                    repository IS NOT NULL
+                 OR tenant_id IS NOT NULL
+                 OR (
+                        jsonb_typeof(metadata) = 'object'
+                    AND metadata ?| %s::text[]
+                    )
+              )
+            """,
+            (
+                list(session_ids),
+                list(_METADATA_IDENTITY_KEYS),
             ),
         )
         return [dict(row) for row in cur.fetchall()]
@@ -242,14 +480,23 @@ def _apply_repairs(
         )
 
 
-def repair_repository_identities(args: argparse.Namespace) -> int:
+def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0915
     dsn = args.dsn or _build_aawm_dsn()
     if not dsn:
         raise SystemExit("No database DSN found. Set AAWM_DB_* or pass --dsn.")
 
     known_repositories = _load_known_repositories(Path(args.projects_dir))
+    grok_repository = None
+    if args.grok_repository:
+        grok_repository = _normalize_repository_identity(args.grok_repository)
+        if not _is_known_repository(grok_repository, known_repositories):
+            raise SystemExit(
+                f"--grok-repository must resolve to a known repository: {args.grok_repository!r}"
+            )
+
     total_seen = 0
     total_repaired = 0
+    repair_sources: Counter[str] = Counter()
     preview: list[Dict[str, Any]] = []
     cursor_id = args.cursor_id
 
@@ -263,11 +510,21 @@ def repair_repository_identities(args: argparse.Namespace) -> int:
                 conn,
                 cursor_id=cursor_id,
                 batch_size=args.batch_size,
+                include_all_grok=grok_repository is not None,
             )
             if not rows:
                 break
             total_seen += len(rows)
             cursor_id = max(int(row["id"]) for row in rows)
+            session_ids = {
+                str(row["session_id"])
+                for row in rows
+                if row.get("session_id")
+            }
+            session_repositories = _build_session_repository_map(
+                _fetch_session_identity_rows(conn, session_ids),
+                known_repositories,
+            )
             repairs = [
                 repair
                 for row in rows
@@ -275,12 +532,15 @@ def repair_repository_identities(args: argparse.Namespace) -> int:
                     repair := _build_repaired_row(
                         row,
                         known_repositories,
+                        session_repositories,
+                        grok_repository,
                     )
                 )
                 is not None
             ]
             if repairs:
                 total_repaired += len(repairs)
+                repair_sources.update(str(repair["repair_source"]) for repair in repairs)
                 preview.extend(repairs[: max(0, args.preview_limit - len(preview))])
                 if args.apply:
                     _apply_repairs(conn, repairs)
@@ -291,12 +551,14 @@ def repair_repository_identities(args: argparse.Namespace) -> int:
         if not args.apply:
             conn.rollback()
 
-    print(f"database={database_name}")
-    print(f"candidate_rows={total_seen}")
-    print(f"repairable_rows={total_repaired}")
-    print(f"applied={str(bool(args.apply)).lower()}")
+    print(f"database={database_name}")  # noqa: T201
+    print(f"candidate_rows={total_seen}")  # noqa: T201
+    print(f"repairable_rows={total_repaired}")  # noqa: T201
+    print(f"applied={str(bool(args.apply)).lower()}")  # noqa: T201
+    for source, count in sorted(repair_sources.items()):
+        print(f"repair_source {source}={count}")  # noqa: T201
     for repair in preview:
-        print(
+        print(  # noqa: T201
             "preview "
             f"id={repair['id']} "
             f"repository={repair['previous_repository']!r}->{repair['repository']!r} "
@@ -315,6 +577,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cursor-id", type=int, default=0)
     parser.add_argument("--preview-limit", type=int, default=20)
     parser.add_argument("--projects-dir", default="/home/zepfu/projects")
+    parser.add_argument(
+        "--grok-repository",
+        help=(
+            "Explicit repository to stamp onto Grok/xAI rows. "
+            "Use only when the Grok dataset is known to belong to one repository."
+        ),
+    )
     return parser.parse_args()
 
 

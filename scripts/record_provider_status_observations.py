@@ -25,8 +25,6 @@ from urllib.parse import quote, urlencode
 
 import psycopg
 
-from litellm.integrations import aawm_agent_identity
-
 
 PING_STATS_RE = re.compile(
     r"(?P<sent>\d+)\s+packets transmitted,\s+"
@@ -92,6 +90,49 @@ INSERT INTO public.provider_status_observations (
     %s, %s, %s::jsonb
 )
 """
+PROVIDER_STATUS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.provider_status_observations (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    environment TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    endpoint_key TEXT NOT NULL,
+    probe_type TEXT NOT NULL,
+    success BOOLEAN NOT NULL,
+    status_code INTEGER,
+    address_family TEXT,
+    resolved_ip TEXT,
+    packet_loss_pct DOUBLE PRECISION,
+    icmp_rtt_min_ms DOUBLE PRECISION,
+    icmp_rtt_avg_ms DOUBLE PRECISION,
+    icmp_rtt_max_ms DOUBLE PRECISION,
+    icmp_rtt_mdev_ms DOUBLE PRECISION,
+    dns_ms DOUBLE PRECISION,
+    tcp_ms DOUBLE PRECISION,
+    tls_ms DOUBLE PRECISION,
+    ttfb_ms DOUBLE PRECISION,
+    total_ms DOUBLE PRECISION,
+    status_summary TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+PROVIDER_STATUS_ALTER_STATEMENTS = (
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS address_family TEXT",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS resolved_ip TEXT",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS packet_loss_pct DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_min_ms DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_avg_ms DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_max_ms DOUBLE PRECISION",
+    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_mdev_ms DOUBLE PRECISION",
+)
+PROVIDER_STATUS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS provider_status_observations_provider_time_idx ON public.provider_status_observations (provider, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_status_observations_endpoint_time_idx ON public.provider_status_observations (provider, endpoint_key, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_status_observations_probe_time_idx ON public.provider_status_observations (probe_type, observed_at DESC)",
+)
 
 
 def _build_dsn(args: argparse.Namespace) -> Optional[str]:
@@ -337,13 +378,32 @@ def _icmp_probe(
     )
     started = time.perf_counter()
     command = ["ping", "-c", str(count), "-W", str(timeout), endpoint.host]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=max(timeout * count + 2, timeout + 2),
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=max(timeout * count + 2, timeout + 2),
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = "\n".join(
+            part
+            for part in (
+                exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout,
+                exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr,
+            )
+            if part
+        )
+        observation.update(
+            {
+                "total_ms": round((time.perf_counter() - started) * 1000, 3),
+                "error_class": "icmp_timeout",
+                "error_message": output[-300:] if output else str(exc),
+            }
+        )
+        return observation
+
     output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
     parsed = parse_ping_output(output)
     observation.update(
@@ -451,10 +511,10 @@ def _db_payload(row: Dict[str, Any]) -> tuple[Any, ...]:
 def insert_observations(dsn: str, rows: List[Dict[str, Any]]) -> None:
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute(aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL)
-            for statement in aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS:
+            cur.execute(PROVIDER_STATUS_TABLE_SQL)
+            for statement in PROVIDER_STATUS_ALTER_STATEMENTS:
                 cur.execute(statement)
-            for statement in aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS:
+            for statement in PROVIDER_STATUS_INDEX_STATEMENTS:
                 cur.execute(statement)
             cur.executemany(PROVIDER_STATUS_INSERT_SQL, [_db_payload(row) for row in rows])
         conn.commit()
