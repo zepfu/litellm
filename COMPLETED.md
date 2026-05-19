@@ -1,5 +1,44 @@
 # Completed
 
+## 2026-05-19
+
+- Prepared the D1-114 `aawm-codex-agent-auto` fresh-dispatch affinity fallback for prod release, without recreating the prod container.
+
+  Release prep:
+  implementation commit `50e54657fb` landed the Codex auto-agent fallback
+  behavior and related accumulated AAWM observability work. Fresh dispatches no
+  longer treat stale `session_affinity` 429/quota exhaustion as terminal, while
+  continuation/in-flight requests still surface 429/quota/capacity as terminal
+  redispatch signals. The initial stale `v1.82.3-aawm.56` tag was preserved
+  after the guarded publish path rejected it, and replacement commit
+  `82f079a3d3` bumped the fork to `1.82.3+aawm.57`.
+
+  Published artifacts:
+  tag `v1.82.3-aawm.57` points at `82f079a3d3`; GitHub Actions run
+  `26105701307` completed successfully and published
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.57`; GitHub Release
+  `v1.82.3-aawm.57` is public at
+  `https://github.com/zepfu/litellm/releases/tag/v1.82.3-aawm.57`.
+
+  Infrastructure prep:
+  `/home/zepfu/projects/aawm-infrastructure` commit `a199dbf` pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.57` on `origin/develop`. No prod compose
+  rebuild or `docker compose up -d litellm` was run; current prod
+  `aawm-litellm` remains untouched until explicit go-ahead.
+
+  Verification:
+  focused pytest coverage passed for Codex auto-agent routing, AAWM identity,
+  provider-status observations, repository repair, and trace-quality scoring
+  (`79 passed, 441 deselected`); full script coverage passed for provider
+  status, repository repair, and trace-quality scoring (`26 passed`). Targeted
+  `py_compile`, `git diff --check`, the dev live smoke session
+  `019e40ab-1fc4-7410-9803-afad0bcd2ac6`, `gh release view
+  v1.82.3-aawm.57`, and `gh run view 26105701307` all passed. Final local
+  status before this ledger entry showed `/home/zepfu/projects/litellm` clean
+  at `main...origin/main` and `/home/zepfu/projects/aawm-infrastructure` clean
+  at `develop...origin/develop`.
+
 ## 2026-05-15
 
 - Promoted xAI/Grok provider health probes and passive error capture to prod.
