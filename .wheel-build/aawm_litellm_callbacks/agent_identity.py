@@ -40,7 +40,7 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     provider_cache_miss_token_count INTEGER,
     provider_cache_miss_cost_usd DOUBLE PRECISION,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
+    invalid_tool_call_count INTEGER NOT NULL DEFAULT 0,
     tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
     file_read_count INTEGER NOT NULL DEFAULT 0,
     file_modified_count INTEGER NOT NULL DEFAULT 0,
@@ -245,6 +246,7 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_reason TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_token_count INTEGER",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_cost_usd DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS invalid_tool_call_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_environment TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_version TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_fork_version TEXT",
@@ -597,35 +599,67 @@ _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
 )
 _AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL = """
 CREATE MATERIALIZED VIEW IF NOT EXISTS public.rate_limit_intervals AS
-WITH rate_limits AS (
+WITH rate_limit_points AS (
     SELECT
+        id,
         provider,
-        CASE WHEN provider = 'google'
-             THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i')
-             ELSE ''
+        CASE
+            WHEN provider = 'google'
+                THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i')
+            WHEN provider = 'xai'
+                THEN COALESCE(NULLIF(model, ''), 'grok-build')
+            ELSE ''
         END AS model,
         quota_key,
         quota_type,
         expected_reset_at,
         remaining_pct,
-        MIN(observed_at) AS fromDate,
-        LEAD(MIN(observed_at)) OVER (
-            PARTITION BY provider,
-                         CASE WHEN provider='google' THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i') ELSE '' END,
-                         quota_key, quota_type
-            ORDER BY MIN(observed_at) ASC
-        ) AS next_fromDate
+        observed_at
     FROM public.rate_limit_observations
-    WHERE provider IN ('openai', 'anthropic', 'google')
+    WHERE provider IN ('openai', 'anthropic', 'google', 'xai')
       AND remaining_pct >= 0
+      AND remaining_pct < 100
       AND (
             quota_key IN ('codex:secondary','codex:primary',
                           'anthropic_unified_7d:7d','anthropic_unified_7d_sonnet:7d_sonnet','anthropic_unified_5h:5h')
          OR quota_type = 'requests'
       )
-    GROUP BY provider,
-             CASE WHEN provider='google' THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i') ELSE '' END,
-             quota_key, quota_type, expected_reset_at, remaining_pct
+),
+rate_limit_changes AS (
+    SELECT
+        *,
+        LAG(expected_reset_at) OVER rate_limit_window AS previous_expected_reset_at,
+        LAG(remaining_pct) OVER rate_limit_window AS previous_remaining_pct
+    FROM rate_limit_points
+    WINDOW rate_limit_window AS (
+        PARTITION BY provider, model, quota_key, quota_type
+        ORDER BY observed_at ASC, id ASC
+    )
+),
+rate_limit_intervals AS (
+    SELECT
+        provider,
+        model,
+        quota_key,
+        quota_type,
+        expected_reset_at,
+        remaining_pct,
+        observed_at AS fromDate,
+        LEAD(observed_at) OVER (
+            PARTITION BY provider, model, quota_key, quota_type
+            ORDER BY observed_at ASC, id ASC
+        ) AS next_fromDate
+    FROM rate_limit_changes
+    WHERE previous_remaining_pct IS NULL
+       OR previous_remaining_pct IS DISTINCT FROM remaining_pct
+       OR NOT (
+            previous_expected_reset_at IS NOT DISTINCT FROM expected_reset_at
+            OR (
+                previous_expected_reset_at IS NOT NULL
+                AND expected_reset_at IS NOT NULL
+                AND ABS(EXTRACT(EPOCH FROM (expected_reset_at - previous_expected_reset_at))) < 900
+            )
+       )
 )
 SELECT
     provider,
@@ -641,7 +675,7 @@ SELECT
         WHEN quota_key = 'anthropic_unified_7d_sonnet:7d_sonnet' THEN 'weekly_special'
         ELSE quota_type
     END AS quota_type
-FROM rate_limits
+FROM rate_limit_intervals
 """
 _AAWM_RATE_LIMIT_INTERVALS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS rate_limit_intervals_type_provider_from_idx ON public.rate_limit_intervals (quota_type, provider, fromDate DESC)",
@@ -802,6 +836,7 @@ INSERT INTO public.session_history (
     provider_cache_miss_token_count,
     provider_cache_miss_cost_usd,
     tool_call_count,
+    invalid_tool_call_count,
     tool_names,
     file_read_count,
     file_modified_count,
@@ -842,10 +877,10 @@ INSERT INTO public.session_history (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb,
-    $31, $32, $33, $34, $35, $36, $37, $38, $39::jsonb, $40, $41, $42, $43, $44, $45, $46::jsonb, $47,
-    $48, $49, $50, $51, $52, $53, $54, $55, $56,
-    $57, $58, $59, $60, $61, $62, $63, $64, $65, $66
+    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
+    $32, $33, $34, $35, $36, $37, $38, $39, $40::jsonb, $41, $42, $43, $44, $45, $46, $47::jsonb, $48,
+    $49, $50, $51, $52, $53, $54, $55, $56, $57,
+    $58, $59, $60, $61, $62, $63, $64, $65, $66, $67
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -916,6 +951,10 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         EXCLUDED.provider_cache_miss_cost_usd
     ),
     tool_call_count = GREATEST(session_history.tool_call_count, EXCLUDED.tool_call_count),
+    invalid_tool_call_count = GREATEST(
+        session_history.invalid_tool_call_count,
+        EXCLUDED.invalid_tool_call_count
+    ),
     tool_names = CASE
         WHEN jsonb_array_length(EXCLUDED.tool_names) > jsonb_array_length(session_history.tool_names)
             THEN EXCLUDED.tool_names
@@ -1406,6 +1445,9 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "source_repository",
     "trace_name",
     "trace_environment",
+    "aawm_claude_agent_name",
+    "aawm_claude_project",
+    "aawm_tenant_id",
     "cc_version",
     "cc_entrypoint",
     "litellm_environment",
@@ -1476,6 +1518,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_google_code_assist_dropped_response_tool_types",
     "google_retrieve_user_quota",
     "usage_tool_call_count",
+    "usage_invalid_tool_call_count",
     "usage_tool_names",
     "google_adapter_system_prompt_policy_name",
     "google_adapter_system_prompt_policy",
@@ -1607,6 +1650,7 @@ _AAWM_REPOSITORY_METADATA_KEYS = (
     "cwdPath",
     "cwd_uri",
     "cwdUri",
+    "aawm_claude_project",
 )
 _AAWM_REPOSITORY_HEADER_NAMES = (
     "x-aawm-repository",
@@ -1626,6 +1670,33 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
         r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
         re.IGNORECASE,
     ),
+)
+_AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
+    "path",
+    "project",
+    "repo",
+    "repository",
+    "unknown",
+}
+_AAWM_REPOSITORY_AGENT_ROLE_VALUES = {
+    "agent",
+    "analyst",
+    "architect",
+    "engineer",
+    "infra",
+    "ops",
+    "orchestrator",
+    "principal",
+    "qa",
+    "researcher",
+    "reviewer",
+    "salvage",
+    "tester",
+}
+_AAWM_REPOSITORY_AGENT_ID_RE = re.compile(r"^agent-[a-f0-9]{3,}$", re.IGNORECASE)
+_AAWM_REPOSITORY_WAVE_AGENT_RE = re.compile(
+    r"^wave\d+-(?:analyst|engineer|infra|ops|principal|qa|researcher|reviewer|salvage|tester)$",
+    re.IGNORECASE,
 )
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
 _AAWM_REPOSITORY_ID_PATTERN = re.compile(
@@ -2092,6 +2163,19 @@ def _is_valid_repository_identity(value: str) -> bool:
     return bool(_AAWM_REPOSITORY_ID_PATTERN.fullmatch(value))
 
 
+def _is_disallowed_repository_identity(value: str) -> bool:
+    normalized = value.strip().strip("/").lower()
+    if not normalized:
+        return True
+    if normalized in _AAWM_REPOSITORY_PLACEHOLDER_VALUES:
+        return True
+    if normalized in _AAWM_REPOSITORY_AGENT_ROLE_VALUES:
+        return True
+    if _AAWM_REPOSITORY_AGENT_ID_RE.fullmatch(normalized):
+        return True
+    return bool(_AAWM_REPOSITORY_WAVE_AGENT_RE.fullmatch(normalized))
+
+
 def _normalize_repository_identity(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -2122,7 +2206,11 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
     cleaned = cleaned.strip().strip("/")
-    if not cleaned or not _is_valid_repository_identity(cleaned):
+    if (
+        not cleaned
+        or not _is_valid_repository_identity(cleaned)
+        or _is_disallowed_repository_identity(cleaned)
+    ):
         return None
     return cleaned
 
@@ -2673,6 +2761,97 @@ def _is_native_codex_passthrough_context(
         and user_agent
         and "codex" in user_agent.lower()
     )
+
+
+def _is_generic_grok_trace_user_id(value: Any) -> bool:
+    normalized = _clean_non_empty_string(value)
+    return normalized is not None and normalized.lower() in {
+        "grok",
+        "grok-build",
+        "grok-cli",
+        "xai",
+        "xai-grok",
+    }
+
+
+def _is_generic_grok_trace_name(value: Any) -> bool:
+    normalized = _clean_non_empty_string(value)
+    if normalized is None:
+        return True
+    normalized_lower = normalized.lower()
+    return normalized_lower in {"grok", "grok-build", "xai"} or normalized_lower.startswith(
+        "grok-build."
+    )
+
+
+def _is_native_grok_passthrough_context(
+    metadata: Dict[str, Any], headers: Dict[str, Any]
+) -> bool:
+    route_family = str(metadata.get("passthrough_route_family") or "").lower()
+    if "grok" in route_family or "xai" in route_family:
+        return True
+
+    client_name = str(metadata.get("client_name") or "").lower()
+    if client_name == "grok-build":
+        return True
+
+    trace_name = _first_non_empty_string(
+        metadata.get("trace_name"),
+        _get_header_value(headers, "langfuse_trace_name"),
+    )
+    if trace_name and str(trace_name).lower().startswith("grok-build"):
+        return True
+
+    return any(
+        str(header_name).lower().startswith("x-grok-")
+        or str(header_name).lower() == "x-xai-token-auth"
+        for header_name in headers
+    )
+
+
+def _promote_grok_repository_trace_identity(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+    headers: Dict[str, Any],
+) -> None:
+    if not _is_native_grok_passthrough_context(metadata, headers):
+        return
+
+    repository = _extract_repository_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+    )
+    if repository:
+        metadata["repository"] = repository
+
+    tenant_id, tenant_source = _extract_tenant_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+    )
+    if not tenant_id:
+        _agent_name, agent_context_tenant_id = _extract_agent_context(kwargs)
+        if agent_context_tenant_id:
+            tenant_id = agent_context_tenant_id
+            tenant_source = "agent_context_text"
+    if tenant_id and not metadata.get("tenant_id"):
+        metadata["tenant_id"] = tenant_id
+    if tenant_id and tenant_source and not metadata.get("tenant_id_source"):
+        metadata["tenant_id_source"] = tenant_source
+
+    metadata_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
+    header_trace_user_id = _get_header_value(headers, "langfuse_trace_user_id")
+    desired_trace_user_id = repository or tenant_id
+    if not desired_trace_user_id:
+        return
+
+    if metadata_trace_user_id is None or _is_generic_grok_trace_user_id(
+        metadata_trace_user_id
+    ):
+        metadata["trace_user_id"] = desired_trace_user_id
+    if header_trace_user_id is None or _is_generic_grok_trace_user_id(
+        header_trace_user_id
+    ):
+        headers["langfuse_trace_user_id"] = desired_trace_user_id
 
 
 def _promote_codex_repository_trace_user_id(
@@ -3557,6 +3736,11 @@ def _extract_rate_limit_account_hash(
         headers.get("x-goog-user-project"),
         headers.get("anthropic-organization-id"),
         headers.get("openai-organization"),
+        headers.get("x-grok-user-id"),
+        headers.get("x-userid"),
+        headers.get("x-teamid"),
+        headers.get("x-email"),
+        headers.get("x-xai-token-auth"),
         headers.get("authorization"),
     ]
     for candidate in candidates:
@@ -3655,6 +3839,14 @@ def _infer_rate_limit_client_family(
         return "codex"
     if "gemini" in source_lower or "gemini" in route_family or "gemini" in model_lower:
         return "gemini"
+    if (
+        "grok" in source_lower
+        or "grok" in route_family
+        or "xai" in route_family
+        or "grok" in model_lower
+        or "grok-build" in client_text
+    ):
+        return "grok-build"
     if (
         "claude" in source_lower
         or "claude" in route_family
@@ -4543,6 +4735,145 @@ def _first_quota_float(candidate: Dict[str, Any], *keys: str) -> Optional[float]
     return None
 
 
+def _grok_billing_quota_value(value: Any) -> Optional[float]:
+    if isinstance(value, dict):
+        value = value.get("val")
+    return _safe_float(value)
+
+
+def _is_grok_billing_context(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> bool:
+    route_text = " ".join(
+        str(value)
+        for value in (
+            metadata.get("passthrough_route_family"),
+            metadata.get("user_api_key_request_route"),
+            metadata.get("api_base"),
+            _maybe_get_path(kwargs.get("standard_pass_through_logging_payload"), "url"),
+            _maybe_get_path(kwargs.get("passthrough_logging_payload"), "url"),
+        )
+        if value is not None
+    ).lower()
+    if "/billing" in route_text and (
+        "grok" in route_text or "xai" in route_text or "x.ai" in route_text
+    ):
+        return True
+    if (
+        metadata.get("grok_cli_chat_proxy") is True
+        or metadata.get("xai_cli_chat_proxy") is True
+    ):
+        return True
+    headers = _extract_headers_from_kwargs(kwargs)
+    return any(
+        header_name.startswith("x-grok-") or header_name == "x-xai-token-auth"
+        for header_name in headers
+    )
+
+
+def _extract_grok_billing_config(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    config = (
+        candidate.get("config") if isinstance(candidate.get("config"), dict) else candidate
+    )
+    if not isinstance(config, dict):
+        return None
+    if not isinstance(config.get("monthlyLimit"), dict) or not isinstance(
+        config.get("used"),
+        dict,
+    ):
+        return None
+    return config
+
+
+def _extract_grok_billing_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    if not _is_grok_billing_context(kwargs, metadata):
+        return []
+
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        "grok_billing",
+    )
+    observations: List[Dict[str, Any]] = []
+    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        config = _extract_grok_billing_config(candidate)
+        if config is None:
+            continue
+
+        monthly_limit = _grok_billing_quota_value(config.get("monthlyLimit"))
+        used = _grok_billing_quota_value(config.get("used"))
+        if monthly_limit is None or monthly_limit <= 0 or used is None or used < 0:
+            continue
+
+        used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
+        remaining_pct = int(
+            math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
+        )
+        provider_resets_at = _parse_provider_timestamp(config.get("billingPeriodEnd"))
+        model = (
+            _clean_non_empty_string(context.get("model"))
+            if context.get("model") != "unknown"
+            else None
+        ) or _clean_non_empty_string(
+            metadata.get("grok_model_override")
+        ) or "grok-build"
+        observations.append(
+            _finalize_rate_limit_observation(
+                {
+                    "observed_at": context["observed_at"],
+                    "source": "grok_billing",
+                    "provider": "xai",
+                    "client_family": "grok-build",
+                    "limit_id": "xai_grok_build_monthly_requests",
+                    "limit_name": "Grok Build monthly requests",
+                    "limit_scope": "requests",
+                    "quota_period": "monthly",
+                    "quota_type": "requests",
+                    "provider_resets_at": provider_resets_at,
+                    "remaining_pct": float(remaining_pct),
+                    "used_percentage": float(100 - remaining_pct),
+                    "model": model,
+                    "model_family": "grok",
+                    "raw_provider_fields": {
+                        "monthlyLimit": _json_safe_rate_limit_value(
+                            config.get("monthlyLimit")
+                        ),
+                        "used": _json_safe_rate_limit_value(config.get("used")),
+                        "onDemandCap": _json_safe_rate_limit_value(
+                            config.get("onDemandCap")
+                        ),
+                        "billingPeriodStart": config.get("billingPeriodStart"),
+                        "billingPeriodEnd": config.get("billingPeriodEnd"),
+                        "quota_unit": "grok_billing_used",
+                        "quota_unit_interpretation": "requests",
+                    },
+                    "evidence": {
+                        "signals": ["grok_billing_payload"],
+                        "provider_fields": [
+                            "config.monthlyLimit.val",
+                            "config.used.val",
+                            "config.billingPeriodEnd",
+                        ],
+                        "rounding": "whole_remaining_percentage",
+                        "unit_note": (
+                            "Grok billing does not label used.val; observed tool "
+                            "traffic behaves request-like."
+                        ),
+                    },
+                },
+                context,
+            )
+        )
+    return _dedupe_rate_limit_observations(observations)
+
+
 def _looks_like_google_quota_candidate(candidate: Dict[str, Any]) -> bool:
     request_quota_keys = {
         "buckets",
@@ -4870,6 +5201,7 @@ def _build_rate_limit_observations(
     observations.extend(_extract_codex_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_codex_usage_limit_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_anthropic_header_rate_limit_observations(kwargs, result, observed_at))
+    observations.extend(_extract_grok_billing_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_quota_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_error_observations(kwargs, result, observed_at))
     return _dedupe_rate_limit_observations(observations)
@@ -5898,6 +6230,130 @@ def _extract_provider_cache_request_body(kwargs: Dict[str, Any]) -> Optional[Dic
     for candidate in candidates:
         if isinstance(candidate, dict):
             return candidate
+    return None
+
+
+_INVALID_TOOL_CALL_ERROR_RE = re.compile(
+    r"("
+    r"\bInputValidationError\b"
+    r"|<tool_use_error>"
+    r"|tool_use_error"
+    r"|unexpected (?:parameter|key)"
+    r"|unrecognized (?:parameter|key)"
+    r"|unknown (?:parameter|key)"
+    r"|invalid tool(?: call| use)?"
+    r"|tool call validation"
+    r"|unable to parse tool parameter json"
+    r"|failed due to the following issue"
+    r")",
+    re.IGNORECASE,
+)
+_TOOL_RESULT_ERROR_BLOCK_TYPES = {
+    "tool_result",
+    "tool_use_result",
+    "function_call_output",
+}
+
+
+def _invalid_tool_call_error_text_seen(value: Any) -> bool:
+    parsed = _safe_json_load(value, value)
+    if isinstance(parsed, str):
+        return bool(_INVALID_TOOL_CALL_ERROR_RE.search(parsed))
+    if isinstance(parsed, dict):
+        for key in (
+            "content",
+            "text",
+            "output",
+            "error",
+            "message",
+            "status",
+            "name",
+            "type",
+        ):
+            if key in parsed and _invalid_tool_call_error_text_seen(parsed[key]):
+                return True
+        return False
+    if isinstance(parsed, list):
+        return any(_invalid_tool_call_error_text_seen(item) for item in parsed)
+    return False
+
+
+def _iter_tool_result_error_candidates(message: Any) -> Iterator[Any]:
+    parsed_message = _safe_json_load(message, message)
+    if not isinstance(parsed_message, dict):
+        return
+
+    message_type = _clean_non_empty_string(parsed_message.get("type"))
+    message_role = _clean_non_empty_string(parsed_message.get("role"))
+    if (
+        message_type in _TOOL_RESULT_ERROR_BLOCK_TYPES
+        or (message_role or "").lower() == "tool"
+    ):
+        yield parsed_message
+
+    content = _safe_json_load(parsed_message.get("content"), parsed_message.get("content"))
+    if isinstance(content, dict):
+        content_blocks = [content]
+    elif isinstance(content, list):
+        content_blocks = content
+    else:
+        content_blocks = []
+
+    for block in content_blocks:
+        parsed_block = _safe_json_load(block, block)
+        if not isinstance(parsed_block, dict):
+            continue
+        block_type = _clean_non_empty_string(parsed_block.get("type"))
+        if block_type in _TOOL_RESULT_ERROR_BLOCK_TYPES:
+            yield parsed_block
+
+
+def _iter_request_message_payloads(request_body: Dict[str, Any]) -> Iterator[Any]:
+    for key in ("messages", "input"):
+        value = request_body.get(key)
+        parsed = _safe_json_load(value, value)
+        if isinstance(parsed, list):
+            yield from parsed
+        elif isinstance(parsed, dict):
+            yield parsed
+
+    nested_request = _safe_json_load(request_body.get("request"), request_body.get("request"))
+    if isinstance(nested_request, dict) and nested_request is not request_body:
+        yield from _iter_request_message_payloads(nested_request)
+
+
+def _extract_invalid_tool_call_count_from_request_body(
+    request_body: Optional[Dict[str, Any]],
+) -> int:
+    if not isinstance(request_body, dict):
+        return 0
+
+    invalid_count = 0
+    for message in _iter_request_message_payloads(request_body):
+        for candidate in _iter_tool_result_error_candidates(message):
+            if _invalid_tool_call_error_text_seen(candidate):
+                invalid_count += 1
+    return invalid_count
+
+
+def _extract_request_body_from_langfuse_input(value: Any) -> Optional[Dict[str, Any]]:
+    parsed = _safe_json_load(value, value)
+    if not isinstance(parsed, dict):
+        return None
+
+    messages = parsed.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            nested = _safe_json_load(message.get("content"), None)
+            if isinstance(nested, dict) and isinstance(nested.get("messages"), list):
+                return nested
+        return parsed
+
+    body = parsed.get("body")
+    if isinstance(body, dict):
+        return _extract_request_body_from_langfuse_input(body)
     return None
 
 
@@ -7507,6 +7963,10 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     for field in _PROMPT_OVERHEAD_TOKEN_FIELDS:
         metadata[f"usage_{field}"] = int(record.get(field) or 0)
 
+    metadata["usage_invalid_tool_call_count"] = int(
+        record.get("invalid_tool_call_count") or 0
+    )
+
     provider_family = _normalize_provider_cache_family(
         record.get("provider"),
         str(record.get("model") or ""),
@@ -7567,6 +8027,11 @@ def _normalize_prompt_overhead_state_on_record(record: Dict[str, Any]) -> None:
         record[field] = value if value is not None else 0
 
 
+def _normalize_invalid_tool_call_state_on_record(record: Dict[str, Any]) -> None:
+    value = _safe_int(record.get("invalid_tool_call_count"))
+    record["invalid_tool_call_count"] = value if value is not None and value > 0 else 0
+
+
 def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
     derived_latency = _build_session_history_latency_breakdown(
         metadata=record.get("metadata"),
@@ -7583,6 +8048,7 @@ def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
+    _normalize_invalid_tool_call_state_on_record(record)
     _normalize_prompt_overhead_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
     _normalize_session_repository_on_record(record)
@@ -9159,6 +9625,11 @@ def _build_session_history_record_from_langfuse_trace_observation(
             if normalized_tool_names:
                 tool_call_count = len(normalized_tool_names)
                 tool_names = normalized_tool_names
+    request_body = _extract_request_body_from_langfuse_input(observation.get("input"))
+    invalid_tool_call_count = max(
+        _extract_invalid_tool_call_count_from_request_body(request_body),
+        _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
+    )
     tool_activity_summary = _summarize_tool_activity(tool_activity)
     agent_name, tenant_id = _extract_agent_context_from_langfuse_trace_observation(
         trace,
@@ -9198,7 +9669,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         model=str(observation.get("model") or ""),
         usage_obj=usage_object,
         metadata=metadata,
-        request_body=None,
+        request_body=request_body,
     )
     provider_cache_state = dict(provider_cache_state or {})
     if provider_cache_state:
@@ -9289,6 +9760,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
             provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
         ),
         "tool_call_count": tool_call_count,
+        "invalid_tool_call_count": invalid_tool_call_count,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
@@ -9786,6 +10258,10 @@ def _build_session_history_record(
         )
     tool_activity_summary = _summarize_tool_activity(tool_activity)
     request_body = _extract_provider_cache_request_body(kwargs)
+    invalid_tool_call_count = max(
+        _extract_invalid_tool_call_count_from_request_body(request_body),
+        _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
+    )
     agent_name, tenant_id = _extract_agent_context(kwargs)
     explicit_tenant_id, tenant_source = _extract_tenant_identity_from_kwargs(
         kwargs,
@@ -9980,6 +10456,7 @@ def _build_session_history_record(
             provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
         ),
         "tool_call_count": tool_call_count,
+        "invalid_tool_call_count": invalid_tool_call_count,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
@@ -10131,6 +10608,7 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("provider_cache_miss_token_count"),
         record.get("provider_cache_miss_cost_usd"),
         record["tool_call_count"],
+        record["invalid_tool_call_count"],
         json.dumps(record["tool_names"]),
         record.get("file_read_count", 0),
         record.get("file_modified_count", 0),
@@ -10271,6 +10749,10 @@ def _rate_limit_storage_quota_key(record: Dict[str, Any]) -> str:
 
 
 def _rate_limit_storage_quota_type(record: Dict[str, Any]) -> str:
+    explicit_quota_type = _clean_non_empty_string(record.get("quota_type"))
+    if explicit_quota_type:
+        return explicit_quota_type
+
     limit_scope = str(record.get("limit_scope") or "").lower()
     raw_provider_fields = record.get("raw_provider_fields")
     token_type = (
@@ -10283,6 +10765,8 @@ def _rate_limit_storage_quota_type(record: Dict[str, Any]) -> str:
 
     if "request" in limit_scope or limit_scope == "requests" or token_type == "requests":
         return "requests"
+    if "message" in limit_scope or token_type == "messages":
+        return "messages"
     if "token" in limit_scope or limit_scope == "tokens" or token_type == "tokens":
         return "tokens"
     if limit_scope == "model_capacity" or "capacity" in source:
@@ -11033,10 +11517,19 @@ def _enrich_trace_name_and_provider_metadata(
     headers = _ensure_mutable_headers(kwargs)
     metadata = _ensure_mutable_metadata(kwargs)
     session_id = _extract_session_id(kwargs)
+    is_grok_context = _is_native_grok_passthrough_context(metadata, headers)
 
     current_trace_name = metadata.get("trace_name")
     if current_trace_name == "claude-code":
         metadata["trace_name"] = f"claude-code.{agent_name}"
+    elif is_grok_context and (
+        not current_trace_name or _is_generic_grok_trace_name(current_trace_name)
+    ):
+        metadata["trace_name"] = (
+            f"grok-build.{agent_name}"
+            if agent_name and agent_name != _DEFAULT_AGENT
+            else "grok-build"
+        )
     elif not current_trace_name:
         metadata["trace_name"] = agent_name
     child_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
@@ -11053,6 +11546,19 @@ def _enrich_trace_name_and_provider_metadata(
             headers["langfuse_trace_name"] = child_trace_name
             verbose_logger.debug(
                 "AawmAgentIdentity: enriched header trace_name to %s",
+                child_trace_name,
+            )
+    if headers and is_grok_context and child_trace_name:
+        current_trace_name_header = _clean_non_empty_string(
+            headers.get("langfuse_trace_name")
+        )
+        if (
+            current_trace_name_header is None
+            or _is_generic_grok_trace_name(current_trace_name_header)
+        ) and current_trace_name_header != child_trace_name:
+            headers["langfuse_trace_name"] = child_trace_name
+            verbose_logger.debug(
+                "AawmAgentIdentity: enriched Grok header trace_name to %s",
                 child_trace_name,
             )
     if (
@@ -11072,6 +11578,7 @@ def _enrich_trace_name_and_provider_metadata(
         metadata["session_id"] = session_id
 
     _promote_codex_repository_trace_user_id(kwargs, metadata, headers)
+    _promote_grok_repository_trace_identity(kwargs, metadata, headers)
     _enrich_session_runtime_identity_metadata(kwargs)
 
     message = _extract_first_response_message(result)

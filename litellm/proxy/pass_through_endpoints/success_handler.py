@@ -246,6 +246,7 @@ class PassThroughEndpointLogging:
         adapted_openai_url_route = self._get_adapted_openai_logging_route(
             response_body=response_body,
             custom_llm_provider=custom_llm_provider,
+            url_route=url_route,
         )
 
         if self.is_gemini_route(url_route, custom_llm_provider):
@@ -590,6 +591,7 @@ class PassThroughEndpointLogging:
         self,
         response_body: Optional[dict],
         custom_llm_provider: Optional[str],
+        url_route: Optional[str] = None,
     ) -> Optional[str]:
         if custom_llm_provider not in {"openai", "openrouter", "nvidia_nim", "xai"}:
             return None
@@ -600,7 +602,14 @@ class PassThroughEndpointLogging:
         is_responses_payload = response_body.get("object") == "response" or isinstance(
             response_body.get("output"), list
         )
-        if not (is_chat_completions_payload or is_responses_payload):
+        is_embeddings_payload = self._is_openai_compatible_embedding_payload(
+            response_body
+        )
+        if not (
+            is_chat_completions_payload
+            or is_responses_payload
+            or is_embeddings_payload
+        ):
             return None
 
         if custom_llm_provider == "openrouter":
@@ -614,7 +623,24 @@ class PassThroughEndpointLogging:
 
         if is_responses_payload:
             return f"{base_url}/v1/responses"
+        if is_embeddings_payload:
+            parsed_url = urlparse(url_route or "")
+            if parsed_url.path and "/embeddings" not in parsed_url.path:
+                return None
+            return f"{base_url}/v1/embeddings"
         return f"{base_url}/v1/chat/completions"
+
+    @staticmethod
+    def _is_openai_compatible_embedding_payload(response_body: dict) -> bool:
+        data = response_body.get("data")
+        if response_body.get("object") != "list" or not isinstance(data, list):
+            return False
+        if not data:
+            return "/embeddings" in str(response_body.get("url", "")).lower()
+        first_item = data[0]
+        return isinstance(first_item, dict) and (
+            first_item.get("object") == "embedding" or "embedding" in first_item
+        )
 
     def _is_supported_openai_endpoint(self, url_route: str) -> bool:
         """Check if the OpenAI endpoint is supported by the passthrough logging handler."""
@@ -629,6 +655,7 @@ class PassThroughEndpointLogging:
             )
             or OpenAIPassthroughLoggingHandler.is_openai_image_editing_route(url_route)
             or OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+            or OpenAIPassthroughLoggingHandler.is_openai_embeddings_route(url_route)
         )
 
     def _set_cost_per_request(

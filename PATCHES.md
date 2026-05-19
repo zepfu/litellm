@@ -1948,6 +1948,41 @@ source integration module is missing.
 
 ---
 
+### aawm.56 — Codex auto-agent fresh-dispatch affinity fallback
+
+**Status:** AAWM local hotfix.
+
+**What changed:** `aawm-codex-agent-auto` no longer treats every
+`session_affinity` retryable exhaustion as terminal. If a request has
+Responses continuation state, provider `429`/quota/capacity exhaustion still
+sets cooldown and surfaces the provider error so the orchestrator can
+redispatch. If the request is a fresh dispatch, the alias can skip a cooled
+session-affinity target and continue through the preferred candidates before
+using the `gpt-5.4-mini` last-resort fallback.
+
+**Why:** Recent child-agent dispatches were pinned to
+`gpt-5.3-codex-spark` via session affinity. When Spark later returned
+`usage_limit_reached`, the alias raised immediately because the selection
+reason was `session_affinity`, even for fresh agent dispatches that could have
+fallen through to Gemini or the final `gpt-5.4-mini` fallback. In-flight
+sessions should still fail fast on provider exhaustion because their tool calls,
+reasoning items, and `previous_response_id` state belong to the selected
+provider family.
+
+**Why not upstream:** This is an AAWM-specific Codex agent orchestration policy
+layered on top of native Codex and Google Code Assist pass-through routing.
+
+**Validation status:** Focused unit coverage proves a fresh dispatch with
+stale Spark affinity reaches `gpt-5.4-mini` after Spark and all Gemini
+candidates return retryable exhaustion, while existing in-flight affinity tests
+still prove continuation failures are terminal redispatch signals. Live dev
+validation on `litellm-dev` `:4001` showed Spark return
+`usage_limit_reached`, the alias set Spark cooldown, and the same fresh request
+completed on `gemini-3.1-flash-lite-preview` with
+`requested_model_alias=aawm-codex-agent-auto` in `session_history`.
+
+---
+
 
 ## Dropped Patches
 

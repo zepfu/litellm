@@ -8,6 +8,9 @@ tests
 *.tgz
 log.txt
 docker/Dockerfile.*
+.analysis/
+.wheel-build/
+captures/
 
 # Claude Flow generated files (must be excluded from Docker build)
 .claude/

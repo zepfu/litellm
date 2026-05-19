@@ -136,6 +136,48 @@ services:
       - default
       - aawm_default
 
+  provider-status-observations:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.provider_status_observations
+    image: aawm-provider-status-observations:dev
+    container_name: aawm-provider-status-observations
+    restart: unless-stopped
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-postgres18}
+      - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-5432}
+      - AAWM_DB_NAME=${LITELLM_AAWM_DB_NAME:-aawm_tristore}
+      - AAWM_DB_USER=${LITELLM_AAWM_DB_USER:-aawm}
+      - AAWM_DB_PASSWORD=${LITELLM_AAWM_DB_PASSWORD:-aawm_dev}
+      - AAWM_DB_PWD=${LITELLM_AAWM_DB_PWD:-}
+      - AAWM_DB_SSLMODE=${LITELLM_AAWM_DB_SSLMODE:-disable}
+      - AAWM_DB_SSL=${LITELLM_AAWM_DB_SSL:-}
+      - AAWM_DB_URL=${LITELLM_AAWM_DB_URL:-}
+      - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
+      - AAWM_POSTGRES_SERVER=${LITELLM_AAWM_POSTGRES_SERVER:-}
+      - AAWM_POSTGRES_PORT=${LITELLM_AAWM_POSTGRES_PORT:-}
+      - AAWM_POSTGRES_DATABASE=${LITELLM_AAWM_POSTGRES_DATABASE:-}
+      - AAWM_POSTGRES_USER=${LITELLM_AAWM_POSTGRES_USER:-}
+      - AAWM_POSTGRES_PASSWORD=${LITELLM_AAWM_POSTGRES_PASSWORD:-}
+      - AAWM_POSTGRES_PWD=${LITELLM_AAWM_POSTGRES_PWD:-}
+      - AAWM_POSTGRES_SSLMODE=${LITELLM_AAWM_POSTGRES_SSLMODE:-}
+      - AAWM_POSTGRES_SSL=${LITELLM_AAWM_POSTGRES_SSL:-}
+      - AAWM_POSTGRES_URL=${LITELLM_AAWM_POSTGRES_URL:-}
+      - AAWM_LITELLM_ENVIRONMENT=${AAWM_LITELLM_ENVIRONMENT:-dev}
+      - AAWM_PROVIDER_STATUS_APPLY=${AAWM_PROVIDER_STATUS_APPLY:-1}
+      - AAWM_PROVIDER_STATUS_INTERVAL_SECONDS=${AAWM_PROVIDER_STATUS_INTERVAL_SECONDS:-300}
+      - AAWM_PROVIDER_STATUS_TIMEOUT=${AAWM_PROVIDER_STATUS_TIMEOUT:-2}
+      - AAWM_PROVIDER_STATUS_PING_COUNT=${AAWM_PROVIDER_STATUS_PING_COUNT:-1}
+      - AAWM_PROVIDER_STATUS_PING_TIMEOUT=${AAWM_PROVIDER_STATUS_PING_TIMEOUT:-2}
+      - AAWM_PROVIDER_STATUS_SKIP_ICMP=${AAWM_PROVIDER_STATUS_SKIP_ICMP:-0}
+    networks:
+      - default
+      - aawm_default
+
 networks:
   aawm_default:
     external: true

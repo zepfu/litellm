@@ -82,6 +82,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_google_code_assist_function_names,
     _expand_claude_persisted_output_text,
     _prepare_anthropic_request_body_for_passthrough,
+    _prepare_grok_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
     _handle_anthropic_google_completion_adapter_route,
     _iterate_responses_sse_events,
@@ -2855,6 +2856,80 @@ class TestGoogleAdapterRequestShapePolicy:
         assert headers["anthropic-ratelimit-unified-5h-reset"] == "1778034000"
         assert headers["anthropic-ratelimit-unified-5h-utilization"] == "0.42"
         assert "authorization" not in headers
+
+    def test_success_handler_normalizes_xai_embedding_passthrough_payload(self):
+        from datetime import datetime
+
+        handler = PassThroughEndpointLogging()
+        response_body = {
+            "id": "grok-embed-1",
+            "object": "list",
+            "data": [
+                {"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0}
+            ],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 0,
+                "total_tokens": 12,
+            },
+        }
+        request_body = {"input": "embed me"}
+        httpx_response = httpx.Response(
+            200,
+            json=response_body,
+            request=httpx.Request(
+                "POST",
+                "https://cli-chat-proxy.grok.com/v1/embeddings",
+            ),
+        )
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {}
+        logging_obj.litellm_call_id = "call-grok-embed-1"
+        logging_obj.call_type = "pass_through_endpoint"
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "client_name": "grok-build",
+                    "grok_model_override": "grok-build",
+                    "passthrough_route_family": "grok_cli_chat_proxy",
+                    "session_id": "grok-embed-session",
+                }
+            },
+            "passthrough_logging_payload": {
+                "request_body": request_body,
+                "request_headers": {"x-grok-model-override": "grok-build"},
+            },
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler.get_standard_logging_object_payload",
+            return_value={"metadata": {}, "call_type": "embedding"},
+        ):
+            normalized = handler.normalize_llm_passthrough_logging_payload(
+                httpx_response=httpx_response,
+                response_body=response_body,
+                request_body=request_body,
+                logging_obj=logging_obj,
+                url_route="https://cli-chat-proxy.grok.com/v1/embeddings",
+                result=json.dumps(response_body),
+                start_time=datetime.now(),
+                end_time=datetime.now(),
+                cache_hit=False,
+                custom_llm_provider="xai",
+                **kwargs,
+            )
+
+        result = normalized["standard_logging_response_object"]
+        updated_kwargs = normalized["kwargs"]
+        assert result is not None
+        assert result.object == "list"
+        assert result.model == "grok-build"
+        assert result.usage.prompt_tokens == 12
+        assert logging_obj.call_type == "embedding"
+        assert updated_kwargs["call_type"] == "embedding"
+        assert updated_kwargs["custom_llm_provider"] == "xai"
+        assert updated_kwargs["model"] == "grok-build"
+        assert updated_kwargs["response_cost"] == pytest.approx(0.000015)
 
     def test_streaming_handler_records_codex_rate_limit_headers(self):
         kwargs = {"litellm_params": {"metadata": {"client_name": "codex_exec"}}}
@@ -9639,6 +9714,65 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["trace_environment"] == "dev"
         assert litellm_metadata["repository"] == "mcp-pg"
 
+    def test_prepare_request_body_for_passthrough_observability_rejects_agent_id_repository(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "agent-id-session"}
+        request_body = {
+            "model": "claude-opus-4-7",
+            "repository": "agent-ac357ffbc895e51d4",
+            "input": "hello",
+        }
+
+        updated_body = _prepare_request_body_for_passthrough_observability(
+            mock_request,
+            request_body,
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "agent-id-session"
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert "repository" not in litellm_metadata
+
+    def test_prepare_grok_request_body_for_passthrough_infers_workspace_repository(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {
+            "x-grok-model-override": "grok-build",
+            "x-grok-session-id": "grok-session-abc",
+        }
+        request_body = {
+            "model": "grok-build",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "# AGENTS.md instructions for /home/zepfu/projects/litellm\n\n"
+                        "<environment_context>\n"
+                        "  <cwd>/home/zepfu/projects/litellm</cwd>\n"
+                        "</environment_context>"
+                    ),
+                }
+            ],
+        }
+
+        updated_body = _prepare_grok_request_body_for_passthrough(
+            request=mock_request,
+            request_body=request_body,
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["session_id"] == "grok-session-abc"
+        assert litellm_metadata["client_name"] == "grok-build"
+        assert litellm_metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+        assert litellm_metadata["grok_model_override"] == "grok-build"
+        assert litellm_metadata["trace_environment"] == "dev"
+        assert litellm_metadata["repository"] == "litellm"
+
     @pytest.mark.parametrize(
         ("endpoint", "expected_route_family"),
         [
@@ -10645,6 +10779,91 @@ async def test_codex_auto_agent_alias_falls_back_to_gemini_after_native_429(monk
     assert gemini_body["litellm_metadata"]["codex_auto_agent_attempts"][0][
         "status"
     ] == "cooldown_set"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_resort(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "codex-session:session:codex-session"
+    ] = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    native_error = ProxyException(
+        message="usage limit",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    native_error.detail = {
+        "error": {
+            "message": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        }
+    }
+    gemini_error = ProxyException(
+        message="quota exhausted",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    gemini_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+    mini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=[native_error, mini_success]),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=gemini_error),
+    ) as mock_gemini:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is mini_success
+    assert mock_pass_through.await_count == 2
+    assert mock_gemini.await_count == 3
+    first_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
+    last_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
+    assert first_body["model"] == "gpt-5.3-codex-spark"
+    assert first_body["litellm_metadata"]["codex_auto_agent_selection_reason"] == (
+        "session_affinity"
+    )
+    assert last_body["model"] == "gpt-5.4-mini"
+    assert last_body["litellm_metadata"]["codex_auto_agent_selected_last_resort"] is True
+    assert last_body["litellm_metadata"]["codex_auto_agent_selection_reason"] == (
+        "last_resort"
+    )
+    assert len(last_body["litellm_metadata"]["codex_auto_agent_attempts"]) == 5
 
 
 def test_codex_auto_agent_continuation_detector_ignores_non_string_type() -> None:
