@@ -181,6 +181,22 @@ python3 scripts/local-ci/run_anthropic_adapter_acceptance.py \
   --write-artifact /tmp/native-codex-gemini-rate-limits.json
 ```
 
+The OpenRouter free daily request meter has an explicit opt-in gate:
+
+```bash
+python3 scripts/local-ci/run_anthropic_adapter_acceptance.py \
+  --target dev \
+  --cases native_openrouter_free_daily_meter_chat \
+  --write-artifact /tmp/openrouter-free-daily-meter.json
+```
+
+That case sends `openrouter/openai/gpt-oss-20b:free` through dev LiteLLM
+`/chat/completions` and hard-gates `public.rate_limit_observations` for
+`source=openrouter_free_daily_local_meter`,
+`quota_key=openrouter_free_daily_requests:requests`, and
+`quota_period=daily`. It allows latest-snapshot fallback because unchanged
+daily snapshots are intentionally deduped at insert time.
+
 ### Warning-only canaries
 
 These are real validations, but they are allowed to warn instead of failing the
@@ -196,6 +212,8 @@ suite when the upstream provider is noisy:
   - excluded from the default full suite; run explicitly with
     `--cases claude_adapter_gpt_oss_20b` when this edge OpenRouter target needs
     validation
+  - also checks the OpenRouter free daily request row, but failures stay
+    warning-only with the rest of this canary
 - `claude_adapter_gemma_31b`
 - `claude_adapter_gemma_26b_a4b`
 - `claude_adapter_nemotron_super`

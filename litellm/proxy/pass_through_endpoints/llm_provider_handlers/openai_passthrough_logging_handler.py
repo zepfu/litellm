@@ -1665,7 +1665,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     json_mode=False,
                 )
             except ValueError as e:
-                if reasoning_summary_text and "Unknown items in responses API response" in str(e):
+                if "Unknown items in responses API response" in str(e):
                     return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
                         response_body=completed_response_payload,
                         fallback_model=model,

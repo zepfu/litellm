@@ -297,7 +297,15 @@ def _apply_target_profile_to_config(
         )
         runtime_postconditions['docker_container_name'] = profile['docker_container_name']
         updated_case['runtime_postconditions'] = runtime_postconditions
-        updated_case['expected_trace_environment'] = profile['expected_trace_environment']
+        skip_trace_environment_validation = bool(
+            updated_case.get('skip_trace_environment_validation')
+        )
+        if skip_trace_environment_validation:
+            updated_case.pop('expected_trace_environment', None)
+        else:
+            updated_case['expected_trace_environment'] = profile[
+                'expected_trace_environment'
+            ]
         updated_case.setdefault('require_trace_user_id', True)
         updated_case['target_profile'] = target
         updated_case['case_name'] = case_name
@@ -333,9 +341,10 @@ def _apply_target_profile_to_config(
         metadata_required_equals = dict(
             session_history_validation.get('metadata_required_equals') or {}
         )
-        metadata_required_equals['trace_environment'] = profile[
-            'expected_trace_environment'
-        ]
+        if not skip_trace_environment_validation:
+            metadata_required_equals['trace_environment'] = profile[
+                'expected_trace_environment'
+            ]
         metadata_required_equals['litellm_environment'] = profile[
             'expected_trace_environment'
         ]
@@ -3071,6 +3080,12 @@ def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, A
         if isinstance(parsed, dict):
             api_error_status = parsed.get('api_error_status')
             is_error = parsed.get('is_error')
+            if (
+                api_error_status is None
+                and is_error is True
+                and isinstance(parsed.get('status_code'), int)
+            ):
+                api_error_status = parsed.get('status_code')
         attempts.append({
             'attempt': attempt,
             'started_at': RA._isoformat(started),

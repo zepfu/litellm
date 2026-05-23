@@ -102,12 +102,18 @@ Current first-wave adapted coverage:
 - OpenRouter opt-in edge-lane check: `openai/gpt-oss-120b:free`
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - this case remains available by explicit `--cases claude_adapter_gpt_oss_120b`, but is excluded from the default suite because OpenRouter frequently returns provider-unavailable `503 provider=OpenInference raw=no healthy upstream`; it is an opt-in hard gate with only that narrow provider-unavailable soft-fail, not a `warning_only` canary
+- OpenRouter free daily meter gate: `native_openrouter_free_daily_meter_chat`
+  - sends `openrouter/openai/gpt-oss-20b:free` through dev LiteLLM `/chat/completions` on `:4001`
+  - hard-gates `session_history` plus the local OpenRouter free daily request snapshot in `public.rate_limit_observations`
+  - expects `provider=openrouter`, `client=openrouter`, `source=openrouter_free_daily_local_meter`, `quota_key=openrouter_free_daily_requests:requests`, `quota_type=requests`, and `quota_period=daily`
+  - allows latest-snapshot fallback because duplicate unchanged snapshots are intentionally suppressed by the observation insert
 - OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
 - OpenRouter focused replacement parallel proof: `claude_adapter_openrouter_nemotron_child_parallel_read_tools`
   - uses `nvidia/nemotron-3-super-120b-a12b:free`
   - hard-gates OpenRouter Responses routing, `session_history`, persisted tool activity, and the one-message parallel `Read` / `Glob` / `Grep` transcript shape
 - OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
   - `openai/gpt-oss-20b:free` remains available in config but is excluded from the default full suite because it is an edge OpenRouter target with noisy upstream availability
+  - `claude_adapter_gpt_oss_20b` also validates the OpenRouter free daily request row, but failures remain warning-only with the rest of that canary
   - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain available in config but are excluded from the default full suite
   - run them only by explicit selection, for example:
     `--cases claude_adapter_gpt_oss_20b,claude_adapter_gemma_31b,claude_adapter_gemma_26b_a4b,claude_adapter_nemotron_super`

@@ -124,6 +124,7 @@ class SessionCandidate:
     input_tokens: int
     output_tokens: int
     tool_call_count: int
+    invalid_tool_call_count: int
     metadata: Dict[str, Any]
 
 
@@ -451,6 +452,7 @@ SELECT
   coalesce(input_tokens, 0) AS input_tokens,
   coalesce(output_tokens, 0) AS output_tokens,
   coalesce(tool_call_count, 0) AS tool_call_count,
+  coalesce(invalid_tool_call_count, 0) AS invalid_tool_call_count,
   coalesce(metadata, '{{}}'::jsonb) AS metadata
 FROM public.session_history
 WHERE {' AND '.join(predicates)}
@@ -482,6 +484,7 @@ LIMIT %(limit)s
                 input_tokens=_coerce_int(row.get("input_tokens")),
                 output_tokens=_coerce_int(row.get("output_tokens")),
                 tool_call_count=_coerce_int(row.get("tool_call_count")),
+                invalid_tool_call_count=_coerce_int(row.get("invalid_tool_call_count")),
                 metadata=_metadata_dict(row.get("metadata")),
             )
         )
@@ -1084,9 +1087,18 @@ def score_candidate(
         and not assistant_text.strip()
         and no_tool_calls
     )
-    invalid_tool_call_error_markers, invalid_tool_call_error_count = (
+    invalid_tool_call_error_markers, payload_invalid_tool_call_error_count = (
         _collect_invalid_tool_call_errors(messages)
     )
+    invalid_tool_call_error_count = max(
+        payload_invalid_tool_call_error_count,
+        candidate.invalid_tool_call_count,
+    )
+    if (
+        candidate.invalid_tool_call_count > payload_invalid_tool_call_error_count
+        and "session_history_invalid_tool_call_count" not in invalid_tool_call_error_markers
+    ):
+        invalid_tool_call_error_markers.append("session_history_invalid_tool_call_count")
     empty_completion_failure = (
         empty_output
         and final_user_tool_result
