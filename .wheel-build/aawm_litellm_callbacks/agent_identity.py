@@ -195,6 +195,11 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     provider_cache_miss_cost_usd DOUBLE PRECISION,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
     invalid_tool_call_count INTEGER NOT NULL DEFAULT 0,
+    structured_output_attempted BOOLEAN NOT NULL DEFAULT FALSE,
+    structured_output_failed BOOLEAN NOT NULL DEFAULT FALSE,
+    structured_output_mode TEXT,
+    structured_output_schema_hash TEXT,
+    structured_output_failure_reason TEXT,
     tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
     file_read_count INTEGER NOT NULL DEFAULT 0,
     file_modified_count INTEGER NOT NULL DEFAULT 0,
@@ -247,6 +252,11 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_token_count INTEGER",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_cost_usd DOUBLE PRECISION",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS invalid_tool_call_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_attempted BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_failed BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_mode TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_schema_hash TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_failure_reason TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_environment TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_version TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_fork_version TEXT",
@@ -597,91 +607,6 @@ _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_session_idx ON public.rate_limit_observations (session_id, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_trace_call_idx ON public.rate_limit_observations (trace_id, litellm_call_id)",
 )
-_AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL = """
-CREATE MATERIALIZED VIEW IF NOT EXISTS public.rate_limit_intervals AS
-WITH rate_limit_points AS (
-    SELECT
-        id,
-        provider,
-        CASE
-            WHEN provider = 'google'
-                THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i')
-            WHEN provider = 'xai'
-                THEN COALESCE(NULLIF(model, ''), 'grok-build')
-            ELSE ''
-        END AS model,
-        quota_key,
-        quota_type,
-        expected_reset_at,
-        remaining_pct,
-        observed_at
-    FROM public.rate_limit_observations
-    WHERE provider IN ('openai', 'anthropic', 'google', 'xai')
-      AND remaining_pct >= 0
-      AND remaining_pct < 100
-      AND (
-            quota_key IN ('codex:secondary','codex:primary',
-                          'anthropic_unified_7d:7d','anthropic_unified_7d_sonnet:7d_sonnet','anthropic_unified_5h:5h')
-         OR quota_type = 'requests'
-      )
-),
-rate_limit_changes AS (
-    SELECT
-        *,
-        LAG(expected_reset_at) OVER rate_limit_window AS previous_expected_reset_at,
-        LAG(remaining_pct) OVER rate_limit_window AS previous_remaining_pct
-    FROM rate_limit_points
-    WINDOW rate_limit_window AS (
-        PARTITION BY provider, model, quota_key, quota_type
-        ORDER BY observed_at ASC, id ASC
-    )
-),
-rate_limit_intervals AS (
-    SELECT
-        provider,
-        model,
-        quota_key,
-        quota_type,
-        expected_reset_at,
-        remaining_pct,
-        observed_at AS fromDate,
-        LEAD(observed_at) OVER (
-            PARTITION BY provider, model, quota_key, quota_type
-            ORDER BY observed_at ASC, id ASC
-        ) AS next_fromDate
-    FROM rate_limit_changes
-    WHERE previous_remaining_pct IS NULL
-       OR previous_remaining_pct IS DISTINCT FROM remaining_pct
-       OR NOT (
-            previous_expected_reset_at IS NOT DISTINCT FROM expected_reset_at
-            OR (
-                previous_expected_reset_at IS NOT NULL
-                AND expected_reset_at IS NOT NULL
-                AND ABS(EXTRACT(EPOCH FROM (expected_reset_at - previous_expected_reset_at))) < 900
-            )
-       )
-)
-SELECT
-    provider,
-    model,
-    quota_key,
-    expected_reset_at,
-    remaining_pct,
-    fromDate,
-    COALESCE(next_fromDate, '9999-12-31'::timestamptz) AS toDate,
-    CASE
-        WHEN quota_key IN ('anthropic_unified_7d:7d', 'codex:secondary') THEN 'weekly'
-        WHEN quota_key IN ('anthropic_unified_5h:5h', 'codex:primary') THEN 'short'
-        WHEN quota_key = 'anthropic_unified_7d_sonnet:7d_sonnet' THEN 'weekly_special'
-        ELSE quota_type
-    END AS quota_type
-FROM rate_limit_intervals
-"""
-_AAWM_RATE_LIMIT_INTERVALS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS rate_limit_intervals_type_provider_from_idx ON public.rate_limit_intervals (quota_type, provider, fromDate DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_intervals_requests_idx ON public.rate_limit_intervals (quota_type, provider, model, fromDate DESC)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS rate_limit_intervals_unique_idx ON public.rate_limit_intervals (provider, model, quota_key, quota_type, fromDate, expected_reset_at, remaining_pct)",
-)
 _AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.rate_limit_transitions (
     id BIGSERIAL PRIMARY KEY,
@@ -873,14 +798,20 @@ INSERT INTO public.session_history (
     llm_upstream_time_to_first_byte_ms,
     llm_upstream_stream_ms,
     latency_unclassified_ms,
-    previous_response_to_current_request_ms
+    previous_response_to_current_request_ms,
+    structured_output_attempted,
+    structured_output_failed,
+    structured_output_mode,
+    structured_output_schema_hash,
+    structured_output_failure_reason
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
     $32, $33, $34, $35, $36, $37, $38, $39, $40::jsonb, $41, $42, $43, $44, $45, $46, $47::jsonb, $48,
     $49, $50, $51, $52, $53, $54, $55, $56, $57,
-    $58, $59, $60, $61, $62, $63, $64, $65, $66, $67
+    $58, $59, $60, $61, $62, $63, $64, $65, $66, $67,
+    $68, $69, $70, $71, $72
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -955,8 +886,34 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         session_history.invalid_tool_call_count,
         EXCLUDED.invalid_tool_call_count
     ),
+    structured_output_attempted = session_history.structured_output_attempted OR EXCLUDED.structured_output_attempted,
+    structured_output_failed = session_history.structured_output_failed OR EXCLUDED.structured_output_failed,
+    structured_output_mode = COALESCE(
+        NULLIF(EXCLUDED.structured_output_mode, ''),
+        session_history.structured_output_mode
+    ),
+    structured_output_schema_hash = COALESCE(
+        NULLIF(EXCLUDED.structured_output_schema_hash, ''),
+        session_history.structured_output_schema_hash
+    ),
+    structured_output_failure_reason = COALESCE(
+        NULLIF(EXCLUDED.structured_output_failure_reason, ''),
+        session_history.structured_output_failure_reason
+    ),
     tool_names = CASE
-        WHEN jsonb_array_length(EXCLUDED.tool_names) > jsonb_array_length(session_history.tool_names)
+        WHEN jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(EXCLUDED.tool_names) = 'array'
+                    THEN EXCLUDED.tool_names
+                ELSE '[]'::jsonb
+            END
+        ) > jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(session_history.tool_names) = 'array'
+                    THEN session_history.tool_names
+                ELSE '[]'::jsonb
+            END
+        )
             THEN EXCLUDED.tool_names
         ELSE session_history.tool_names
     END,
@@ -1210,12 +1167,36 @@ ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
     tool_name = COALESCE(NULLIF(EXCLUDED.tool_name, ''), session_history_tool_activity.tool_name),
     tool_kind = COALESCE(NULLIF(EXCLUDED.tool_kind, ''), session_history_tool_activity.tool_kind),
     file_paths_read = CASE
-        WHEN jsonb_array_length(EXCLUDED.file_paths_read) > jsonb_array_length(session_history_tool_activity.file_paths_read)
+        WHEN jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(EXCLUDED.file_paths_read) = 'array'
+                    THEN EXCLUDED.file_paths_read
+                ELSE '[]'::jsonb
+            END
+        ) > jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(session_history_tool_activity.file_paths_read) = 'array'
+                    THEN session_history_tool_activity.file_paths_read
+                ELSE '[]'::jsonb
+            END
+        )
             THEN EXCLUDED.file_paths_read
         ELSE session_history_tool_activity.file_paths_read
     END,
     file_paths_modified = CASE
-        WHEN jsonb_array_length(EXCLUDED.file_paths_modified) > jsonb_array_length(session_history_tool_activity.file_paths_modified)
+        WHEN jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(EXCLUDED.file_paths_modified) = 'array'
+                    THEN EXCLUDED.file_paths_modified
+                ELSE '[]'::jsonb
+            END
+        ) > jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(session_history_tool_activity.file_paths_modified) = 'array'
+                    THEN session_history_tool_activity.file_paths_modified
+                ELSE '[]'::jsonb
+            END
+        )
             THEN EXCLUDED.file_paths_modified
         ELSE session_history_tool_activity.file_paths_modified
     END,
@@ -1471,6 +1452,9 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "trace_name",
     "trace_user_id",
     "trace_environment",
+    "session_id_source",
+    "synthetic_session_id",
+    "synthetic_session_id_basis",
     "source_model",
     "logical_model",
     "aawm_claude_agent_name",
@@ -1547,6 +1531,11 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "google_retrieve_user_quota",
     "usage_tool_call_count",
     "usage_invalid_tool_call_count",
+    "usage_structured_output_attempted",
+    "usage_structured_output_failed",
+    "usage_structured_output_mode",
+    "usage_structured_output_schema_hash",
+    "usage_structured_output_failure_reason",
     "usage_tool_names",
     "google_adapter_system_prompt_policy_name",
     "google_adapter_system_prompt_policy",
@@ -5841,6 +5830,31 @@ def _build_provider_error_observation(
         "normalized_error_text": error_text[:500] if error_text else None,
         "observed_signal": "normal_traffic_failure",
     }
+    structured_output_state = _detect_structured_output_request(
+        _extract_provider_cache_request_body(kwargs),
+        metadata,
+    )
+    if structured_output_state.get("structured_output_attempted"):
+        structured_failure_reason = _first_non_empty_string(
+            structured_output_state.get("structured_output_failure_reason"),
+            _classify_structured_output_failure(result),
+        )
+        observation_metadata["structured_output_attempted"] = True
+        observation_metadata["structured_output_failed"] = bool(
+            structured_output_state.get("structured_output_failed")
+            or structured_failure_reason
+        )
+        for key in (
+            "structured_output_mode",
+            "structured_output_schema_hash",
+        ):
+            value = _clean_non_empty_string(structured_output_state.get(key))
+            if value is not None:
+                observation_metadata[key] = value
+        if structured_failure_reason is not None:
+            observation_metadata[
+                "structured_output_failure_reason"
+            ] = structured_failure_reason
     if _is_claude_permission_check_metadata(metadata):
         for key in (
             "source_model",
@@ -5907,6 +5921,41 @@ def _build_provider_error_observation_only_record(
     }
 
 
+
+def _build_structured_output_failure_session_history_record(
+    kwargs: Dict[str, Any],
+    result: Any,
+    start_time: Any,
+    end_time: Any,
+) -> Optional[Dict[str, Any]]:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    request_body = _extract_provider_cache_request_body(kwargs)
+    structured_output_state = _detect_structured_output_request(request_body, metadata)
+    if not structured_output_state.get("structured_output_attempted"):
+        return None
+
+    failure_reason = _first_non_empty_string(
+        structured_output_state.get("structured_output_failure_reason"),
+        _classify_structured_output_failure(result),
+    )
+    structured_output_state["structured_output_failed"] = bool(
+        structured_output_state.get("structured_output_failed") or failure_reason
+    )
+    structured_output_state["structured_output_failure_reason"] = failure_reason
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={},
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if record is None:
+        return None
+
+    record.update(structured_output_state)
+    return _normalize_session_history_record(record)
+
+
 def _build_failure_observation_only_record(
     kwargs: Dict[str, Any],
     result: Any,
@@ -5928,10 +5977,24 @@ def _build_failure_observation_only_record(
         start_time=start_time,
         end_time=end_time,
     )
-    if not rate_limit_observations and provider_error_observation is None:
+    structured_output_record = _build_structured_output_failure_session_history_record(
+        kwargs=kwargs,
+        result=failure_result,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if (
+        not rate_limit_observations
+        and provider_error_observation is None
+        and structured_output_record is None
+    ):
         return None
 
-    if rate_limit_observations:
+    if structured_output_record is not None:
+        record = structured_output_record
+        if rate_limit_observations:
+            record["rate_limit_observations"] = rate_limit_observations
+    elif rate_limit_observations:
         record = _build_rate_limit_observation_only_record(
             kwargs,
             rate_limit_observations,
@@ -6690,6 +6753,372 @@ def _extract_invalid_tool_call_count_from_request_body(
                 invalid_count += 1
     return invalid_count
 
+
+_STRUCTURED_OUTPUT_JSON_MODE_VALUES = {
+    "json",
+    "json_object",
+    "json_schema",
+    "schema",
+    "response_schema",
+}
+_STRUCTURED_OUTPUT_NESTED_REQUEST_KEYS = (
+    "body",
+    "data",
+    "json",
+    "payload",
+    "request",
+    "request_body",
+)
+_STRUCTURED_OUTPUT_FAILURE_PATTERNS = (
+    (
+        "schema_validation_error",
+        re.compile(
+            r"("
+            r"structured[-_ ]?output"
+            r"|json[-_ ]?schema"
+            r"|schema validation"
+            r"|validation schema"
+            r"|invalid schema"
+            r"|schema .*valid"
+            r"|does not match (?:the )?schema"
+            r"|pydantic"
+            r"|jsonschema"
+            r")",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "json_validation_error",
+        re.compile(
+            r"("
+            r"invalid[-_ ]?json"
+            r"|malformed json"
+            r"|json parse"
+            r"|parse json"
+            r"|json decode"
+            r"|json validation"
+            r"|validate json"
+            r"|json .*valid"
+            r")",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "response_format_error",
+        re.compile(r"(response[-_ ]?format|invalid_response_format)", re.IGNORECASE),
+    ),
+)
+
+
+def _empty_structured_output_state() -> Dict[str, Any]:
+    return {
+        "structured_output_attempted": False,
+        "structured_output_failed": False,
+        "structured_output_mode": None,
+        "structured_output_schema_hash": None,
+        "structured_output_failure_reason": None,
+    }
+
+
+def _merge_structured_output_state(
+    current: Dict[str, Any],
+    candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not isinstance(candidate, dict) or not candidate.get("structured_output_attempted"):
+        return current
+
+    current["structured_output_attempted"] = True
+    current["structured_output_failed"] = bool(
+        current.get("structured_output_failed")
+        or candidate.get("structured_output_failed")
+    )
+    for key in (
+        "structured_output_mode",
+        "structured_output_schema_hash",
+        "structured_output_failure_reason",
+    ):
+        value = _clean_non_empty_string(candidate.get(key))
+        if value and not _clean_non_empty_string(current.get(key)):
+            current[key] = value
+    return current
+
+
+def _structured_output_schema_hash(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(
+            _json_safe_rate_limit_value(value),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        encoded = str(value)
+    if not encoded or encoded in {"null", "{}", "[]"}:
+        return None
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _structured_output_state_from_format(
+    value: Any,
+    *,
+    default_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    parsed = _safe_json_load(value, value)
+    state = _empty_structured_output_state()
+
+    if isinstance(parsed, str):
+        mode = parsed.strip().lower().replace("-", "_")
+        if mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES or "json" in mode:
+            state["structured_output_attempted"] = True
+            state["structured_output_mode"] = mode
+        return state
+
+    if not isinstance(parsed, dict):
+        return state
+
+    raw_mode = _first_non_empty_string(
+        parsed.get("type"),
+        parsed.get("format"),
+        parsed.get("mode"),
+        default_mode,
+    )
+    mode = raw_mode.lower().replace("-", "_") if raw_mode else None
+    schema = _first_non_none(
+        parsed.get("json_schema"),
+        parsed.get("schema"),
+        parsed.get("response_schema"),
+        parsed.get("responseSchema"),
+    )
+    mime_type = _first_non_empty_string(
+        parsed.get("response_mime_type"),
+        parsed.get("responseMimeType"),
+        parsed.get("mime_type"),
+    )
+    has_json_mime = bool(mime_type and "json" in mime_type.lower())
+    has_json_mode = bool(
+        mode
+        and (mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES or "json" in mode or "schema" in mode)
+    )
+    if schema is None and not has_json_mode and not has_json_mime:
+        return state
+
+    state["structured_output_attempted"] = True
+    state["structured_output_mode"] = mode or (
+        "response_schema" if schema is not None else "json_mime_type"
+    )
+    state["structured_output_schema_hash"] = _structured_output_schema_hash(schema)
+    return state
+
+
+def _structured_output_state_from_generation_config(value: Any) -> Dict[str, Any]:
+    parsed = _safe_json_load(value, value)
+    state = _empty_structured_output_state()
+    if not isinstance(parsed, dict):
+        return state
+
+    schema = _first_non_none(
+        parsed.get("responseSchema"),
+        parsed.get("response_schema"),
+    )
+    mime_type = _first_non_empty_string(
+        parsed.get("responseMimeType"),
+        parsed.get("response_mime_type"),
+    )
+    if schema is None and not (mime_type and "json" in mime_type.lower()):
+        return state
+
+    state["structured_output_attempted"] = True
+    state["structured_output_mode"] = (
+        "response_schema" if schema is not None else "json_mime_type"
+    )
+    state["structured_output_schema_hash"] = _structured_output_schema_hash(schema)
+    return state
+
+
+def _detect_structured_output_request(
+    request_body: Optional[Dict[str, Any]],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    state = _empty_structured_output_state()
+
+    if isinstance(metadata, dict):
+        metadata_attempted = any(
+            key in metadata and _metadata_bool(metadata.get(key))
+            for key in (
+                "usage_structured_output_attempted",
+                "structured_output_attempted",
+            )
+        )
+        metadata_failed = any(
+            key in metadata and _metadata_bool(metadata.get(key))
+            for key in (
+                "usage_structured_output_failed",
+                "structured_output_failed",
+            )
+        )
+        metadata_mode = _first_non_empty_string(
+            metadata.get("usage_structured_output_mode"),
+            metadata.get("structured_output_mode"),
+        )
+        metadata_schema_hash = _first_non_empty_string(
+            metadata.get("usage_structured_output_schema_hash"),
+            metadata.get("structured_output_schema_hash"),
+        )
+        metadata_reason = _first_non_empty_string(
+            metadata.get("usage_structured_output_failure_reason"),
+            metadata.get("structured_output_failure_reason"),
+        )
+        if metadata_attempted or metadata_failed or metadata_mode or metadata_schema_hash:
+            state["structured_output_attempted"] = True
+            state["structured_output_failed"] = metadata_failed
+            state["structured_output_mode"] = metadata_mode
+            state["structured_output_schema_hash"] = metadata_schema_hash
+            state["structured_output_failure_reason"] = metadata_reason
+
+    parsed_request = _safe_json_load(request_body, request_body)
+    if not isinstance(parsed_request, dict):
+        return state
+
+    pending: List[Tuple[Any, int]] = [(parsed_request, 0)]
+    seen: set[int] = set()
+    while pending:
+        payload, depth = pending.pop(0)
+        if not isinstance(payload, dict):
+            continue
+        payload_id = id(payload)
+        if payload_id in seen:
+            continue
+        seen.add(payload_id)
+
+        for key in ("response_format", "responseFormat"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_format(payload.get(key)),
+                )
+
+        text_config = _safe_json_load(payload.get("text"), payload.get("text"))
+        if isinstance(text_config, dict) and "format" in text_config:
+            _merge_structured_output_state(
+                state,
+                _structured_output_state_from_format(text_config.get("format")),
+            )
+
+        for key in ("text_format", "textFormat"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_format(payload.get(key)),
+                )
+
+        for key in ("output_format", "outputFormat", "output_config", "outputConfig"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_format(payload.get(key)),
+                )
+
+        for key in ("generationConfig", "generation_config"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_generation_config(payload.get(key)),
+                )
+
+        if "response_schema" in payload or "responseSchema" in payload:
+            schema = _first_non_none(
+                payload.get("response_schema"),
+                payload.get("responseSchema"),
+            )
+            _merge_structured_output_state(
+                state,
+                {
+                    "structured_output_attempted": True,
+                    "structured_output_failed": False,
+                    "structured_output_mode": "response_schema",
+                    "structured_output_schema_hash": _structured_output_schema_hash(schema),
+                    "structured_output_failure_reason": None,
+                },
+            )
+
+        mime_type = _first_non_empty_string(
+            payload.get("response_mime_type"),
+            payload.get("responseMimeType"),
+        )
+        if mime_type and "json" in mime_type.lower():
+            _merge_structured_output_state(
+                state,
+                {
+                    "structured_output_attempted": True,
+                    "structured_output_failed": False,
+                    "structured_output_mode": "json_mime_type",
+                    "structured_output_schema_hash": None,
+                    "structured_output_failure_reason": None,
+                },
+            )
+
+        if depth >= 4:
+            continue
+        for key in _STRUCTURED_OUTPUT_NESTED_REQUEST_KEYS:
+            nested = _safe_json_load(payload.get(key), payload.get(key))
+            if isinstance(nested, dict):
+                pending.append((nested, depth + 1))
+
+    return state
+
+
+def _collect_structured_output_failure_texts(value: Any) -> List[str]:
+    texts: List[str] = []
+    pending: List[Tuple[Any, int]] = [(value, 0)]
+    seen: set[int] = set()
+    while pending and len(texts) < 40:
+        current, depth = pending.pop(0)
+        current = _safe_json_load(current, current)
+        if isinstance(current, str):
+            if current.strip():
+                texts.append(current.strip()[:1000])
+            continue
+        if isinstance(current, dict):
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            for key in (
+                "message",
+                "error",
+                "detail",
+                "details",
+                "code",
+                "type",
+                "statusMessage",
+                "status_message",
+            ):
+                if key in current:
+                    pending.append((current[key], depth + 1))
+            if depth < 3:
+                for nested_value in list(current.values()):
+                    if isinstance(nested_value, (dict, list)):
+                        pending.append((nested_value, depth + 1))
+            continue
+        if isinstance(current, list) and depth < 3:
+            for item in current[:40]:
+                pending.append((item, depth + 1))
+    return texts
+
+
+def _classify_structured_output_failure(value: Any) -> Optional[str]:
+    dicts = _extract_provider_error_dicts(value)
+    error_text = _extract_provider_error_text(value, dicts)
+    texts = [error_text] if error_text else []
+    texts.extend(_collect_structured_output_failure_texts(value))
+    combined = "\n".join(text for text in texts if isinstance(text, str))[:5000]
+    if not combined.strip():
+        return None
+    for reason, pattern in _STRUCTURED_OUTPUT_FAILURE_PATTERNS:
+        if pattern.search(combined):
+            return reason
+    return None
 
 def _extract_request_body_from_langfuse_input(value: Any) -> Optional[Dict[str, Any]]:
     parsed = _safe_json_load(value, value)
@@ -8261,14 +8690,45 @@ def _normalize_session_runtime_identity_on_record(record: Dict[str, Any]) -> Non
     }
 
 
+_REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS = (
+    "harness",
+    "validation",
+)
+
+
+def _normalize_request_header_tenant_repository(value: Any) -> Optional[str]:
+    repository = _normalize_repository_identity(value)
+    if repository is None:
+        return None
+    normalized = repository.lower()
+    if any(
+        fragment in normalized
+        for fragment in _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS
+    ):
+        return "litellm"
+    if normalized.endswith("-dev") or "tenant" in normalized:
+        return None
+    return repository
+
+
 def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
     repository = _normalize_repository_identity(record.get("repository"))
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
     if repository is None:
-        metadata = record.get("metadata")
-        if isinstance(metadata, dict):
-            repository = _extract_repository_identity_from_metadata_sources(
-                ("record.metadata", metadata)
-            )
+        repository = _extract_repository_identity_from_metadata_sources(
+            ("record.metadata", metadata)
+        )
+    if repository is None and metadata.get("tenant_id_source") == "request_headers":
+        repository = (
+            _normalize_request_header_tenant_repository(record.get("tenant_id"))
+            or _normalize_request_header_tenant_repository(metadata.get("tenant_id"))
+        )
+        if repository is not None:
+            metadata = dict(metadata)
+            metadata.setdefault("repository_source", "tenant_id.request_headers")
+            record["metadata"] = metadata
     record["repository"] = repository
 
 
@@ -8321,6 +8781,26 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     metadata["usage_invalid_tool_call_count"] = int(
         record.get("invalid_tool_call_count") or 0
     )
+
+    metadata["usage_structured_output_attempted"] = bool(
+        record.get("structured_output_attempted")
+    )
+    metadata["usage_structured_output_failed"] = bool(
+        record.get("structured_output_failed")
+    )
+    for field, metadata_key in (
+        ("structured_output_mode", "usage_structured_output_mode"),
+        ("structured_output_schema_hash", "usage_structured_output_schema_hash"),
+        (
+            "structured_output_failure_reason",
+            "usage_structured_output_failure_reason",
+        ),
+    ):
+        value = _clean_non_empty_string(record.get(field))
+        if value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = value
 
     provider_family = _normalize_provider_cache_family(
         record.get("provider"),
@@ -8387,6 +8867,47 @@ def _normalize_invalid_tool_call_state_on_record(record: Dict[str, Any]) -> None
     record["invalid_tool_call_count"] = value if value is not None and value > 0 else 0
 
 
+def _normalize_structured_output_state_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    attempted_value = record.get("structured_output_attempted")
+    failed_value = record.get("structured_output_failed")
+    attempted = (
+        _metadata_bool(attempted_value)
+        if attempted_value is not None
+        else _metadata_bool(metadata.get("usage_structured_output_attempted"))
+    )
+    failed = (
+        _metadata_bool(failed_value)
+        if failed_value is not None
+        else _metadata_bool(metadata.get("usage_structured_output_failed"))
+    )
+    if failed:
+        attempted = True
+
+    record["structured_output_attempted"] = attempted
+    record["structured_output_failed"] = failed
+    record["structured_output_mode"] = _first_non_empty_string(
+        record.get("structured_output_mode"),
+        metadata.get("usage_structured_output_mode"),
+        metadata.get("structured_output_mode"),
+    )
+    record["structured_output_schema_hash"] = _first_non_empty_string(
+        record.get("structured_output_schema_hash"),
+        metadata.get("usage_structured_output_schema_hash"),
+        metadata.get("structured_output_schema_hash"),
+    )
+    record["structured_output_failure_reason"] = _first_non_empty_string(
+        record.get("structured_output_failure_reason"),
+        metadata.get("usage_structured_output_failure_reason"),
+        metadata.get("structured_output_failure_reason"),
+    )
+    if not failed:
+        record["structured_output_failure_reason"] = None
+
+
 def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
     derived_latency = _build_session_history_latency_breakdown(
         metadata=record.get("metadata"),
@@ -8404,6 +8925,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
     _normalize_invalid_tool_call_state_on_record(record)
+    _normalize_structured_output_state_on_record(record)
     _normalize_prompt_overhead_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
     _apply_claude_auto_review_identity_to_record(record)
@@ -9008,6 +9530,55 @@ def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
     ):
         if candidate is not None and str(candidate).strip():
             return str(candidate)
+
+    route_family = _first_non_empty_string(
+        metadata.get("passthrough_route_family"),
+        standard_metadata.get("passthrough_route_family"),
+    )
+    call_type = kwargs.get("call_type") or standard_logging_object.get("call_type")
+    should_fallback = (
+        call_type == "pass_through_endpoint"
+        or route_family is not None
+        or metadata.get("aawm_passthrough_endpoint_type") is not None
+        or metadata.get("aawm_stream_logging_endpoint_type") is not None
+    )
+    if not should_fallback:
+        return None
+
+    fallback_candidates = (
+        (
+            "metadata.google_adapter_session_id",
+            metadata.get("google_adapter_session_id"),
+            False,
+        ),
+        (
+            "standard_metadata.google_adapter_session_id",
+            standard_metadata.get("google_adapter_session_id"),
+            False,
+        ),
+        (
+            "litellm_params.litellm_trace_id",
+            litellm_params.get("litellm_trace_id"),
+            True,
+        ),
+        ("kwargs.litellm_trace_id", kwargs.get("litellm_trace_id"), True),
+        ("metadata.trace_id", metadata.get("trace_id"), True),
+        (
+            "standard_logging_object.trace_id",
+            standard_logging_object.get("trace_id"),
+            True,
+        ),
+        ("kwargs.litellm_call_id", kwargs.get("litellm_call_id"), True),
+    )
+    for source, candidate, synthetic in fallback_candidates:
+        if candidate is None or not str(candidate).strip():
+            continue
+        if isinstance(metadata, dict):
+            metadata.setdefault("session_id_source", source)
+            if synthetic:
+                metadata.setdefault("synthetic_session_id", True)
+                metadata.setdefault("synthetic_session_id_basis", source)
+        return str(candidate).strip()
     return None
 
 
@@ -9632,6 +10203,7 @@ def _extract_langfuse_session_id(
         trace.get("sessionId"),
         trace.get("session_id"),
         observation_metadata.get("session_id"),
+        observation_metadata.get("google_adapter_session_id"),
         _coerce_nested_session_id(observation_metadata.get("user_id")),
         _coerce_nested_session_id(observation_metadata.get("user_api_key_end_user_id")),
     ):
@@ -9642,12 +10214,36 @@ def _extract_langfuse_session_id(
                 return str(candidate).strip(), "trace.session_id"
             if candidate == observation_metadata.get("session_id"):
                 return str(candidate).strip(), "observation.metadata.session_id"
+            if candidate == observation_metadata.get("google_adapter_session_id"):
+                return (
+                    str(candidate).strip(),
+                    "observation.metadata.google_adapter_session_id",
+                )
             if candidate == _coerce_nested_session_id(observation_metadata.get("user_id")):
                 return str(candidate).strip(), "observation.metadata.user_id.session_id"
             return (
                 str(candidate).strip(),
                 "observation.metadata.user_api_key_end_user_id.session_id",
             )
+
+    route_family = observation_metadata.get("passthrough_route_family")
+    is_passthrough_trace = (
+        isinstance(route_family, str)
+        and bool(route_family.strip())
+        or observation_metadata.get("aawm_passthrough_endpoint_type") is not None
+        or observation_metadata.get("aawm_stream_logging_endpoint_type") is not None
+    )
+    if is_passthrough_trace:
+        for source, candidate in (
+            ("trace.id", trace.get("id")),
+            ("observation.traceId", observation_metadata.get("traceId")),
+        ):
+            if candidate is None or not str(candidate).strip():
+                continue
+            observation_metadata.setdefault("session_id_source", f"{source}.synthetic")
+            observation_metadata.setdefault("synthetic_session_id", True)
+            observation_metadata.setdefault("synthetic_session_id_basis", source)
+            return str(candidate).strip(), f"{source}.synthetic"
 
     return None, "missing"
 
@@ -9986,6 +10582,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         _extract_invalid_tool_call_count_from_request_body(request_body),
         _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
     )
+    structured_output_state = _detect_structured_output_request(request_body, metadata)
     tool_activity_summary = _summarize_tool_activity(tool_activity)
     agent_name, tenant_id = _extract_agent_context_from_langfuse_trace_observation(
         trace,
@@ -10117,6 +10714,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         ),
         "tool_call_count": tool_call_count,
         "invalid_tool_call_count": invalid_tool_call_count,
+        **structured_output_state,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
@@ -10618,6 +11216,7 @@ def _build_session_history_record(
         _extract_invalid_tool_call_count_from_request_body(request_body),
         _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
     )
+    structured_output_state = _detect_structured_output_request(request_body, metadata)
     agent_name, tenant_id = _extract_agent_context(kwargs)
     explicit_tenant_id, tenant_source = _extract_tenant_identity_from_kwargs(
         kwargs,
@@ -10813,6 +11412,7 @@ def _build_session_history_record(
         ),
         "tool_call_count": tool_call_count,
         "invalid_tool_call_count": invalid_tool_call_count,
+        **structured_output_state,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
@@ -10899,38 +11499,9 @@ async def _ensure_session_history_schema(conn: Any) -> None:
         if _aawm_session_history_schema_ready:
             return
 
-        await conn.execute(_AAWM_SESSION_HISTORY_TABLE_SQL)
-        for statement in _AAWM_SESSION_HISTORY_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_SESSION_HISTORY_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL)
-        for statement in _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_RATE_LIMIT_OBSERVATIONS_TABLE_SQL)
-        for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL)
-        for statement in _AAWM_RATE_LIMIT_INTERVALS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL)
-        for statement in _AAWM_RATE_LIMIT_TRANSITIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_PROVIDER_ERROR_OBSERVATIONS_TABLE_SQL)
-        for statement in _AAWM_PROVIDER_ERROR_OBSERVATIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_PROVIDER_ERROR_OBSERVATIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL)
-        for statement in _AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-
+        # Schema changes are migration-owned. The callback must not mutate,
+        # recreate, or drop database structures at request/write time.
+        _ = conn
         _aawm_session_history_schema_ready = True
 
 
@@ -11004,6 +11575,11 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("llm_upstream_stream_ms"),
         record.get("latency_unclassified_ms"),
         record.get(_SESSION_HISTORY_PREVIOUS_GAP_FIELD),
+        record.get("structured_output_attempted", False),
+        record.get("structured_output_failed", False),
+        record.get("structured_output_mode"),
+        record.get("structured_output_schema_hash"),
+        record.get("structured_output_failure_reason"),
     )
 
 

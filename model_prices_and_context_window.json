@@ -24476,6 +24476,40 @@
         "supports_reasoning": false,
         "supports_tool_choice": true
     },
+    "deepseek/deepseek-v4-flash:free": {
+        "input_cost_per_token": 1.4e-07,
+        "cache_read_input_token_cost": 7e-08,
+        "input_cost_per_token_cache_hit": 7e-08,
+        "litellm_provider": "openrouter",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 1000000,
+        "max_tokens": 1000000,
+        "mode": "chat",
+        "output_cost_per_token": 2.8e-07,
+        "source": "https://openrouter.ai/deepseek/deepseek-v4-flash:free",
+        "supports_assistant_prefill": true,
+        "supports_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": false,
+        "supports_tool_choice": true
+    },
+    "openrouter/deepseek/deepseek-v4-flash:free": {
+        "input_cost_per_token": 1.4e-07,
+        "cache_read_input_token_cost": 7e-08,
+        "input_cost_per_token_cache_hit": 7e-08,
+        "litellm_provider": "openrouter",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 1000000,
+        "max_tokens": 1000000,
+        "mode": "chat",
+        "output_cost_per_token": 2.8e-07,
+        "source": "https://openrouter.ai/deepseek/deepseek-v4-flash:free",
+        "supports_assistant_prefill": true,
+        "supports_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": false,
+        "supports_tool_choice": true
+    },
     "openrouter/deepseek/deepseek-r1": {
         "input_cost_per_token": 5.5e-07,
         "input_cost_per_token_cache_hit": 1.4e-07,
@@ -37805,6 +37839,36 @@
             "image_generation"
         ],
         "supports_vision": true
+    },
+    "inclusionai/ling-2.6-flash": {
+        "max_tokens": 262144,
+        "max_input_tokens": 262144,
+        "input_cost_per_token": 1e-07,
+        "cache_read_input_token_cost": 2e-08,
+        "output_cost_per_token": 3e-07,
+        "litellm_provider": "openrouter",
+        "mode": "chat",
+        "supports_function_calling": true,
+        "supports_tool_choice": true,
+        "supports_response_schema": true,
+        "supports_prompt_caching": true,
+        "source": "https://openrouter.ai/inclusionai/ling-2.6-flash",
+        "pricing_note": "Non-discount OpenRouter pricing basis: $0.10/M input, $0.30/M output, $0.02/M cache read."
+    },
+    "openrouter/inclusionai/ling-2.6-flash": {
+        "max_tokens": 262144,
+        "max_input_tokens": 262144,
+        "input_cost_per_token": 1e-07,
+        "cache_read_input_token_cost": 2e-08,
+        "output_cost_per_token": 3e-07,
+        "litellm_provider": "openrouter",
+        "mode": "chat",
+        "supports_function_calling": true,
+        "supports_tool_choice": true,
+        "supports_response_schema": true,
+        "supports_prompt_caching": true,
+        "source": "https://openrouter.ai/inclusionai/ling-2.6-flash",
+        "pricing_note": "Non-discount OpenRouter pricing basis: $0.10/M input, $0.30/M output, $0.02/M cache read."
     },
     "inclusionai/ling-2.6-flash:free": {
         "max_tokens": 262144,

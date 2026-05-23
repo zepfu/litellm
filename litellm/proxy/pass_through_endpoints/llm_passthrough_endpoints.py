@@ -238,6 +238,8 @@ _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300.0
 _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = 30 * 60.0
 _CODEX_AUTO_AGENT_NATIVE_PROVIDER = "openai"
 _CODEX_AUTO_AGENT_GOOGLE_PROVIDER = "google_code_assist"
+_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = "openrouter"
+_CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
 _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -264,15 +266,65 @@ _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": False,
     },
     {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "deepseek/deepseek-v4-flash:free",
+        "route_family": "codex_openrouter_responses",
+        "last_resort": False,
+    },
+    {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "gpt-5.4-mini",
         "route_family": "codex_responses",
         "last_resort": True,
     },
 )
+_ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = "aawm-anthropic-agent-auto"
+_ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = "anthropic"
+_ANTHROPIC_AUTO_AGENT_HAIKU_MODEL = "claude-haiku-4-5-20251001"
+_ANTHROPIC_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
+        "model": "gemini-3.1-flash-lite-preview",
+        "route_family": "anthropic_google_completion_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
+        "model": "gemini-3-flash-preview",
+        "route_family": "anthropic_google_completion_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
+        "model": "gemini-3.1-pro-preview",
+        "route_family": "anthropic_google_completion_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "deepseek/deepseek-v4-flash:free",
+        "route_family": "anthropic_openrouter_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": _ANTHROPIC_AUTO_AGENT_HAIKU_MODEL,
+        "route_family": "anthropic_messages",
+        "last_resort": True,
+    },
+)
 _codex_auto_agent_cooldown_until_monotonic_by_key: dict[str, float] = {}
 _codex_auto_agent_session_affinity_by_key: dict[str, dict[str, Any]] = {}
 _codex_auto_agent_lock = asyncio.Lock()
+_anthropic_auto_agent_cooldown_until_monotonic_by_key: dict[str, float] = {}
+_anthropic_auto_agent_session_affinity_by_key: dict[str, dict[str, Any]] = {}
+_anthropic_auto_agent_lock = asyncio.Lock()
 _GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = (
     "# Preserved Project And Safety Instructions"
 )
@@ -424,6 +476,7 @@ _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
         "openai/gpt-oss-120b:free",
         "gpt-oss-20b:free",
         "gpt-oss-120b:free",
+        "deepseek/deepseek-v4-flash:free",
         "qwen/qwen3.5-flash-02-23",
         "qwen/qwen3.6-flash",
         "qwen/qwen3-coder:free",
@@ -1087,6 +1140,8 @@ def _codex_auto_agent_request_has_continuation_state(
             "mcp_approval_request",
             "mcp_approval_response",
             "reasoning",
+            "tool_use",
+            "tool_result",
         }:
             return True
         if value.get("role") == "tool":
@@ -1221,6 +1276,8 @@ async def _build_codex_auto_agent_candidate_states(
             if google_lane_key is None:
                 google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
             lane_key = google_lane_key
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+            lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
         else:
             lane_key = openai_lane_key
         cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
@@ -1490,6 +1547,43 @@ def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
     return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
 
 
+def _is_codex_auto_agent_google_lane_exhaustion(exc: Any) -> bool:
+    tokens = _extract_codex_auto_agent_error_tokens(exc)
+    if "MODEL_CAPACITY_EXHAUSTED" in tokens:
+        return False
+    if tokens & {"RATE_LIMIT_EXCEEDED", "QUOTA_EXHAUSTED", "RESOURCE_EXHAUSTED"}:
+        return True
+    return _extract_google_adapter_exception_status_code(exc) == 429
+
+
+async def _set_codex_auto_agent_candidate_cooldowns(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    exc: Any,
+) -> str:
+    if (
+        candidate.get("provider") != _CODEX_AUTO_AGENT_GOOGLE_PROVIDER
+        or not _is_codex_auto_agent_google_lane_exhaustion(exc)
+    ):
+        await _set_codex_auto_agent_cooldown(
+            selected_cooldown_key,
+            cooldown_seconds,
+        )
+        return "candidate"
+
+    for candidate_template in _CODEX_AUTO_AGENT_CANDIDATES:
+        if candidate_template.get("provider") != _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+            continue
+        await _set_codex_auto_agent_cooldown(
+            _codex_auto_agent_candidate_key(candidate_template, lane_key),
+            cooldown_seconds,
+        )
+    return "google_lane"
+
+
 def _add_codex_auto_agent_alias_metadata(
     request_body: dict[str, Any],
     *,
@@ -1526,6 +1620,339 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_lane_key": selection.get("lane_key"),
             "codex_auto_agent_attempts": attempts,
             "codex_auto_agent_skipped_candidates": skipped,
+        },
+    )
+
+def _is_anthropic_auto_agent_alias_model(model: Any) -> bool:
+    return (
+        isinstance(model, str)
+        and model.strip().lower() == _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+    )
+
+
+def _resolve_anthropic_auto_agent_alias_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    if _is_anthropic_auto_agent_alias_model(request_body.get("model")):
+        return _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+    return None
+
+
+def _resolve_anthropic_auto_agent_native_lane_key(request: Request) -> str:
+    headers = _safe_get_request_headers(request)
+    for header_name in ("x-api-key", "authorization"):
+        header_value = _get_codex_auto_agent_header(headers, header_name)
+        if header_value is not None:
+            return f"{header_name}:{_hash_codex_auto_agent_lane_value(header_value)}"
+    session_header = (
+        _get_codex_auto_agent_header(headers, "session_id")
+        or _get_codex_auto_agent_header(headers, "session-id")
+        or _get_codex_auto_agent_header(headers, "x-session-id")
+    )
+    if session_header is not None:
+        return f"session:{session_header}"
+    return "__default__"
+
+
+def _resolve_anthropic_auto_agent_session_key(
+    request: Request,
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    metadata = request_body.get("litellm_metadata")
+    metadata_session_id = (
+        metadata.get("session_id") if isinstance(metadata, dict) else None
+    )
+    session_id = _clean_codex_auth_value(metadata_session_id)
+    headers = _safe_get_request_headers(request)
+    if session_id is None:
+        session_id = (
+            _get_codex_auto_agent_header(headers, "session_id")
+            or _get_codex_auto_agent_header(headers, "session-id")
+            or _get_codex_auto_agent_header(headers, "x-session-id")
+        )
+    if session_id is None:
+        return None
+    return f"{session_id}:{_resolve_anthropic_auto_agent_native_lane_key(request)}"
+
+
+async def _get_anthropic_auto_agent_active_cooldown_seconds(
+    cooldown_key: str,
+) -> float:
+    async with _anthropic_auto_agent_lock:
+        now = time.monotonic()
+        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
+            cooldown_key, 0.0
+        )
+        if until <= now:
+            _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
+                cooldown_key, None
+            )
+            return 0.0
+        return max(0.0, until - now)
+
+
+async def _set_anthropic_auto_agent_cooldown(
+    cooldown_key: str,
+    cooldown_seconds: float,
+) -> None:
+    async with _anthropic_auto_agent_lock:
+        until = time.monotonic() + max(0.0, cooldown_seconds)
+        current_until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
+            cooldown_key, 0.0
+        )
+        if until > current_until:
+            _anthropic_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
+
+
+async def _get_anthropic_auto_agent_session_affinity(
+    session_key: Optional[str],
+) -> Optional[dict[str, Any]]:
+    if session_key is None:
+        return None
+    async with _anthropic_auto_agent_lock:
+        affinity = _anthropic_auto_agent_session_affinity_by_key.get(session_key)
+        if not isinstance(affinity, dict):
+            return None
+        expires_at = affinity.get("expires_at_monotonic", 0.0)
+        if not isinstance(expires_at, (int, float)) or expires_at <= time.monotonic():
+            _anthropic_auto_agent_session_affinity_by_key.pop(session_key, None)
+            return None
+        return dict(affinity)
+
+
+async def _set_anthropic_auto_agent_session_affinity(
+    session_key: Optional[str],
+    candidate: dict[str, Any],
+) -> None:
+    if session_key is None:
+        return
+    async with _anthropic_auto_agent_lock:
+        _anthropic_auto_agent_session_affinity_by_key[session_key] = {
+            "provider": candidate["provider"],
+            "model": candidate["model"],
+            "route_family": candidate["route_family"],
+            "last_resort": bool(candidate.get("last_resort")),
+            "expires_at_monotonic": (
+                time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
+            ),
+        }
+
+
+def _find_anthropic_auto_agent_candidate(
+    provider: Any,
+    model: Any,
+) -> Optional[dict[str, Any]]:
+    for candidate in _ANTHROPIC_AUTO_AGENT_CANDIDATES:
+        if candidate["provider"] == provider and candidate["model"] == model:
+            return dict(candidate)
+    return None
+
+
+async def _build_anthropic_auto_agent_candidate_states(
+    request: Request,
+) -> list[dict[str, Any]]:
+    openai_lane_key = _resolve_codex_auto_agent_openai_lane_key(request)
+    anthropic_lane_key = _resolve_anthropic_auto_agent_native_lane_key(request)
+    google_lane_key: Optional[str] = None
+    states: list[dict[str, Any]] = []
+    for candidate_template in _ANTHROPIC_AUTO_AGENT_CANDIDATES:
+        candidate = dict(candidate_template)
+        if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+            if google_lane_key is None:
+                google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
+            lane_key = google_lane_key
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+            lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+        elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
+            lane_key = anthropic_lane_key
+        else:
+            lane_key = openai_lane_key
+        cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
+        cooldown_seconds = await _get_anthropic_auto_agent_active_cooldown_seconds(
+            cooldown_key
+        )
+        states.append(
+            {
+                "candidate": candidate,
+                "lane_key": lane_key,
+                "cooldown_key": cooldown_key,
+                "cooldown_seconds": cooldown_seconds,
+            }
+        )
+    return states
+
+
+def _raise_anthropic_auto_agent_in_flight_cooldown(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+) -> None:
+    shaped_candidate = _codex_auto_agent_candidate_public_shape(
+        candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        reason="in_flight_session_affinity_cooldown",
+    )
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": (
+                    "Anthropic auto-agent alias target is cooling down for an "
+                    "in-flight session; provider switching is disabled for "
+                    "stateful Claude continuations. Redispatch a fresh agent "
+                    "attempt to re-run the auto selector."
+                ),
+                "type": "rate_limit_error",
+                "code": "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
+            },
+            "candidate": shaped_candidate,
+        },
+        headers={"Retry-After": str(int(max(1.0, cooldown_seconds)))},
+    )
+
+
+async def _select_anthropic_auto_agent_candidate(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    session_key = _resolve_anthropic_auto_agent_session_key(request, request_body)
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
+        request_body
+    )
+    states = await _build_anthropic_auto_agent_candidate_states(request)
+    skipped = [
+        _codex_auto_agent_candidate_public_shape(
+            state["candidate"],
+            lane_key=state["lane_key"],
+            cooldown_seconds=state["cooldown_seconds"],
+            reason="cooldown",
+        )
+        for state in states
+        if state["cooldown_seconds"] > 0
+    ]
+
+    affinity = await _get_anthropic_auto_agent_session_affinity(session_key)
+    if affinity is not None:
+        affinity_candidate = _find_anthropic_auto_agent_candidate(
+            affinity.get("provider"),
+            affinity.get("model"),
+        )
+        if affinity_candidate is not None:
+            affinity_state = next(
+                (
+                    state
+                    for state in states
+                    if state["candidate"]["provider"] == affinity_candidate["provider"]
+                    and state["candidate"]["model"] == affinity_candidate["model"]
+                ),
+                None,
+            )
+            if affinity_state is not None:
+                if affinity_state["cooldown_seconds"] > 0:
+                    if has_continuation_state:
+                        _raise_anthropic_auto_agent_in_flight_cooldown(
+                            candidate=affinity_candidate,
+                            lane_key=affinity_state.get("lane_key"),
+                            cooldown_seconds=affinity_state["cooldown_seconds"],
+                        )
+                    skipped.append(
+                        _codex_auto_agent_candidate_public_shape(
+                            affinity_candidate,
+                            lane_key=affinity_state.get("lane_key"),
+                            cooldown_seconds=affinity_state["cooldown_seconds"],
+                            reason="session_affinity_cooldown",
+                        )
+                    )
+                else:
+                    return {
+                        **affinity_state,
+                        "session_key": session_key,
+                        "selection_reason": "session_affinity",
+                        "skipped": skipped,
+                        "in_flight_session": has_continuation_state,
+                    }
+
+    for state in states:
+        if state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
+            continue
+        return {
+            **state,
+            "session_key": session_key,
+            "selection_reason": "first_available",
+            "skipped": skipped,
+            "in_flight_session": has_continuation_state,
+        }
+
+    for state in states:
+        if not state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
+            continue
+        return {
+            **state,
+            "session_key": session_key,
+            "selection_reason": "last_resort",
+            "skipped": skipped,
+            "in_flight_session": has_continuation_state,
+        }
+
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": (
+                    "All Anthropic auto-agent alias candidates are currently cooled down."
+                ),
+                "type": "rate_limit_error",
+                "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
+            },
+            "candidates": skipped,
+        },
+    )
+
+
+def _add_anthropic_auto_agent_alias_metadata(
+    request_body: dict[str, Any],
+    *,
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidate = selection["candidate"]
+    target_model = candidate["model"]
+    updated_body = copy.deepcopy(request_body)
+    updated_body["model"] = target_model
+    skipped = selection.get("skipped") or []
+    return _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            "anthropic-auto-agent-alias",
+            f"anthropic-auto-agent-selected:{target_model}",
+            f"anthropic-auto-agent-route:{candidate['route_family']}",
+            *(
+                ["anthropic-auto-agent-last-resort"]
+                if candidate.get("last_resort")
+                else []
+            ),
+        ],
+        extra_fields={
+            "requested_model_alias": _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+            "anthropic_auto_agent_alias": _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+            "anthropic_auto_agent_selected_provider": candidate["provider"],
+            "anthropic_auto_agent_selected_model": target_model,
+            "anthropic_auto_agent_selected_route_family": candidate["route_family"],
+            "anthropic_auto_agent_selected_last_resort": bool(
+                candidate.get("last_resort")
+            ),
+            "anthropic_auto_agent_selection_reason": selection.get(
+                "selection_reason"
+            ),
+            "anthropic_auto_agent_lane_key": selection.get("lane_key"),
+            "anthropic_auto_agent_attempts": attempts,
+            "anthropic_auto_agent_skipped_candidates": skipped,
         },
     )
 
@@ -4780,8 +5207,14 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         "user_prompt_id": user_prompt_id,
         "request": google_request_dict,
     }
+    session_id_hash = hashlib.sha1(session_id.encode("utf-8")).hexdigest()[:8]
     if isinstance(metadata, dict) and metadata:
         wrapped_request["litellm_metadata"] = dict(metadata)
+    litellm_metadata = wrapped_request.setdefault("litellm_metadata", {})
+    litellm_metadata.setdefault("session_id", session_id)
+    litellm_metadata["google_adapter_session_id"] = session_id
+    litellm_metadata["google_adapter_session_id_source"] = session_id_source
+    litellm_metadata["google_adapter_session_id_hash"] = session_id_hash
     if fallback_context_changes:
         completion_message_window_changes = {
             **completion_message_window_changes,
@@ -4796,8 +5229,8 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         **duplicate_tool_response_changes,
         **system_prompt_policy_changes,
         **codex_tool_contract_policy_changes,
-        'google_adapter_session_id_source': session_id_source,
-        'google_adapter_session_id_hash': hashlib.sha1(session_id.encode('utf-8')).hexdigest()[:8],
+        "google_adapter_session_id_source": session_id_source,
+        "google_adapter_session_id_hash": session_id_hash,
     }
     return wrapped_request, tool_name_mapping, completion_messages, gemini_optional_params, litellm_params, completion_message_window_changes
 
@@ -6254,8 +6687,12 @@ def _wrap_streaming_response_with_release_callback(
     return response
 
 
-def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
+def _get_openrouter_api_key() -> Optional[str]:
     return _get_first_secret_value(_ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS)
+
+
+def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
+    return _get_openrouter_api_key()
 
 
 def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
@@ -6408,11 +6845,18 @@ async def _perform_nvidia_completion_adapter_operation(
             await asyncio.sleep(wait_seconds)
 
 
-def _get_anthropic_adapter_openrouter_target_base() -> str:
-    cleaned = _clean_secret_string(os.getenv("OPENROUTER_API_BASE")) or "https://openrouter.ai/api"
+def _get_openrouter_target_base() -> str:
+    cleaned = (
+        _clean_secret_string(os.getenv("OPENROUTER_API_BASE"))
+        or "https://openrouter.ai/api"
+    ).rstrip("/")
     if cleaned.endswith("/api/v1"):
         return cleaned[: -len("/v1")]
     return cleaned
+
+
+def _get_anthropic_adapter_openrouter_target_base() -> str:
+    return _get_openrouter_target_base()
 
 
 def _build_openrouter_default_headers() -> dict[str, str]:
@@ -8055,6 +8499,7 @@ async def _perform_anthropic_google_completion_adapter_request(
     request: Request,
     user_api_key_dict: UserAPIKeyAuth,
     adapter_request: SimpleNamespace,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     from litellm.litellm_core_utils.litellm_logging import Logging
 
@@ -8096,6 +8541,13 @@ async def _perform_anthropic_google_completion_adapter_request(
             egress_credential_family="google",
             expected_target_family="google",
             google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
+            google_adapter_max_retries=0 if use_alias_candidate_probe else None,
+            google_adapter_model_capacity_max_retries=(
+                0 if use_alias_candidate_probe else None
+            ),
+            google_adapter_hidden_retry_budget_seconds=(
+                0 if use_alias_candidate_probe else None
+            ),
         )
 
         if not isinstance(upstream_response, StreamingResponse):
@@ -8156,6 +8608,7 @@ async def _handle_anthropic_google_completion_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     adapter_request = await _prepare_anthropic_google_completion_adapter_request(
         request=request,
@@ -8166,6 +8619,7 @@ async def _handle_anthropic_google_completion_adapter_route(
         request=request,
         user_api_key_dict=user_api_key_dict,
         adapter_request=adapter_request,
+        use_alias_candidate_probe=use_alias_candidate_probe,
     )
 
 
@@ -12880,11 +13334,158 @@ async def is_streaming_request_fn(request: Request) -> bool:
     return False
 
 
+async def _handle_anthropic_auto_agent_alias_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    target_url: str,
+    custom_headers: dict[str, Any],
+) -> Response:
+    attempts: list[dict[str, Any]] = []
+    last_retryable_exc: Optional[Exception] = None
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
+        prepared_request_body
+    )
+
+    for _attempt_number in range(len(_ANTHROPIC_AUTO_AGENT_CANDIDATES)):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=prepared_request_body,
+        )
+        candidate = selection["candidate"]
+        attempt_record = _codex_auto_agent_candidate_public_shape(
+            candidate,
+            lane_key=selection.get("lane_key"),
+            reason=selection.get("selection_reason"),
+        )
+        attempts.append(attempt_record)
+        candidate_body = _add_anthropic_auto_agent_alias_metadata(
+            prepared_request_body,
+            selection=selection,
+            attempts=attempts,
+        )
+
+        try:
+            if candidate["provider"] == _CODEX_AUTO_AGENT_NATIVE_PROVIDER:
+                response = await _handle_anthropic_openai_responses_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+                response = await _handle_anthropic_google_completion_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
+                )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+                response = await _handle_anthropic_openrouter_responses_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                )
+            else:
+                _safe_set_request_parsed_body(request, candidate_body)
+                response = await _perform_anthropic_native_passthrough_request(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    target_url=target_url,
+                    custom_headers=custom_headers,
+                )
+            await _set_anthropic_auto_agent_session_affinity(
+                selection.get("session_key"),
+                candidate,
+            )
+            return response
+        except Exception as exc:
+            if not _is_codex_auto_agent_retryable_exhaustion(exc):
+                raise
+            last_retryable_exc = exc
+            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+            await _set_anthropic_auto_agent_cooldown(
+                selection["cooldown_key"],
+                cooldown_seconds,
+            )
+            attempt_record.update(
+                {
+                    "status": "cooldown_set",
+                    "cooldown_seconds": round(float(cooldown_seconds), 3),
+                    "error_tokens": sorted(
+                        _extract_codex_auto_agent_error_tokens(exc)
+                    ),
+                }
+            )
+            if has_continuation_state:
+                attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                verbose_proxy_logger.warning(
+                    "Anthropic auto-agent alias target %s/%s hit retryable exhaustion "
+                    "for an in-flight session; signaling redispatch",
+                    candidate["provider"],
+                    candidate["model"],
+                )
+                raise
+            verbose_proxy_logger.warning(
+                "Anthropic auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",
+                candidate["provider"],
+                candidate["model"],
+                cooldown_seconds,
+            )
+            continue
+
+    if last_retryable_exc is not None:
+        raise last_retryable_exc
+    raise HTTPException(
+        status_code=429,
+        detail="No Anthropic auto-agent alias candidates were available.",
+    )
+
+
+async def _perform_anthropic_native_passthrough_request(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    target_url: str,
+    custom_headers: dict[str, Any],
+) -> Response:
+    is_streaming_request = await is_streaming_request_fn(request)
+    endpoint_func = create_pass_through_route(
+        endpoint=endpoint,
+        target=target_url,
+        custom_headers=custom_headers,
+        _forward_headers=True,
+        is_streaming_request=is_streaming_request,
+    )
+    received_value = await endpoint_func(
+        request,
+        fastapi_response,
+        user_api_key_dict,
+    )
+    return received_value
+
+
 @router.api_route(
     "/anthropic/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     tags=["Anthropic Pass-through", "pass-through"],
 )
+
 async def anthropic_proxy_route(
     endpoint: str,
     request: Request,
@@ -12935,6 +13536,22 @@ async def anthropic_proxy_route(
                 sorted(hooks),
                 sorted(billing_header_fields),
             )
+
+        anthropic_auto_agent_alias = _resolve_anthropic_auto_agent_alias_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if anthropic_auto_agent_alias is not None:
+            return await _handle_anthropic_auto_agent_alias_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                target_url=str(updated_url),
+                custom_headers=custom_headers,
+            )
+
         adapter_model = _resolve_anthropic_openai_responses_adapter_model(
             prepared_request_body,
             endpoint=encoded_endpoint,
@@ -13005,24 +13622,14 @@ async def anthropic_proxy_route(
                 adapter_model=openrouter_adapter_model,
             )
 
-    ## check for streaming
-    is_streaming_request = await is_streaming_request_fn(request)
-
-    ## CREATE PASS-THROUGH
-    endpoint_func = create_pass_through_route(
+    return await _perform_anthropic_native_passthrough_request(
         endpoint=endpoint,
-        target=str(updated_url),
+        request=request,
+        fastapi_response=fastapi_response,
+        user_api_key_dict=user_api_key_dict,
+        target_url=str(updated_url),
         custom_headers=custom_headers,
-        _forward_headers=True,
-        is_streaming_request=is_streaming_request,
-    )  # dynamically construct pass-through endpoint based on incoming path
-    received_value = await endpoint_func(
-        request,
-        fastapi_response,
-        user_api_key_dict,
     )
-
-    return received_value
 
 
 # Bedrock endpoint actions - consolidated list used for model extraction and streaming detection
@@ -14428,6 +15035,67 @@ async def _perform_codex_auto_agent_native_openai_request(
     )
 
 
+async def _perform_codex_auto_agent_openrouter_responses_request(
+    *,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth,
+    endpoint: str,
+    adapter_model: str,
+    request_body: dict[str, Any],
+) -> Response:
+    openrouter_api_key = _get_openrouter_api_key()
+    if openrouter_api_key is None:
+        exc = ProxyException(
+            message=(
+                "OpenRouter Codex auto-agent candidate requires "
+                "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
+            ),
+            type="rate_limit_error",
+            param="model",
+            code=429,
+        )
+        exc.detail = {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        }
+        raise exc
+
+    target_base_url = _get_openrouter_target_base()
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint=endpoint,
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.OPENROUTER.value,
+    )
+    custom_headers: dict[str, Any] = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=openrouter_api_key,
+        request=request,
+    )
+    custom_headers.update(_build_openrouter_default_headers())
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    return await _perform_openrouter_adapter_pass_through_request(
+        adapter_model=adapter_model,
+        request=request,
+        target=str(target_url),
+        custom_headers=custom_headers,
+        user_api_key_dict=user_api_key_dict,
+        custom_body=request_body,
+        forward_headers=False,
+        allowed_forward_headers=[],
+        allowed_pass_through_prefixed_headers=[],
+        stream=bool(request_body.get("stream")),
+        custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
+        egress_credential_family="openrouter",
+        expected_target_family="openrouter",
+    )
+
+
 async def _handle_codex_auto_agent_alias_route(
     *,
     endpoint: str,
@@ -14474,6 +15142,14 @@ async def _handle_codex_auto_agent_alias_route(
                     adapter_model=candidate["model"],
                     use_alias_candidate_probe=True,
                 )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+                response = await _perform_codex_auto_agent_openrouter_responses_request(
+                    endpoint=endpoint,
+                    request=request,
+                    user_api_key_dict=user_api_key_dict,
+                    adapter_model=candidate["model"],
+                    request_body=candidate_body,
+                )
             else:
                 response = await _perform_codex_auto_agent_native_openai_request(
                     request=request,
@@ -14494,14 +15170,18 @@ async def _handle_codex_auto_agent_alias_route(
                 raise
             last_retryable_exc = exc
             cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
-            await _set_codex_auto_agent_cooldown(
-                selection["cooldown_key"],
-                cooldown_seconds,
+            cooldown_scope = await _set_codex_auto_agent_candidate_cooldowns(
+                candidate=candidate,
+                lane_key=selection.get("lane_key"),
+                selected_cooldown_key=selection["cooldown_key"],
+                cooldown_seconds=cooldown_seconds,
+                exc=exc,
             )
             attempt_record.update(
                 {
                     "status": "cooldown_set",
                     "cooldown_seconds": round(float(cooldown_seconds), 3),
+                    "cooldown_scope": cooldown_scope,
                     "error_tokens": sorted(
                         _extract_codex_auto_agent_error_tokens(exc)
                     ),

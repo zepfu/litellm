@@ -576,6 +576,70 @@ def test_target_profile_sets_session_history_runtime_identity_expectations(monke
     assert "harness_run_id" in updated["cases"]["claude_adapter_gpt55"]
 
 
+def test_target_profile_can_skip_trace_environment_validation():
+    harness = _load_harness_module()
+
+    config = {
+        "cases": {
+            "native_openrouter_free_daily_meter_chat": {
+                "skip_trace_environment_validation": True,
+                "http_request": {
+                    "path": "/chat/completions",
+                    "json": {"model": "openrouter/openai/gpt-oss-20b:free"},
+                },
+                "session_history_validation": {"expected_provider": "openrouter"},
+            }
+        }
+    }
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    case_config = updated["cases"]["native_openrouter_free_daily_meter_chat"]
+    validation = case_config["session_history_validation"]
+    assert "expected_trace_environment" not in case_config
+    assert validation["metadata_required_equals"]["litellm_environment"] == "dev"
+    assert "trace_environment" not in validation["metadata_required_equals"]
+
+
+def test_http_request_retry_uses_status_code_for_api_error_status(monkeypatch):
+    harness = _load_harness_module()
+    runs = [
+        {
+            "exit_code": 1,
+            "stdout": json.dumps({"status_code": 429, "is_error": True}),
+        },
+        {
+            "exit_code": 0,
+            "stdout": json.dumps({"status_code": 200, "is_error": False}),
+        },
+    ]
+
+    monkeypatch.setattr(
+        harness,
+        "_run_http_request_with_repeat",
+        lambda _config: runs.pop(0),
+    )
+
+    _started, final_run, attempts = harness._run_command_with_retry(
+        config={
+            "http_request": {"path": "/chat/completions"},
+            "retry_on_api_error_statuses": [429],
+            "retry_max_attempts": 2,
+        }
+    )
+
+    assert final_run["exit_code"] == 0
+    assert [attempt["api_error_status"] for attempt in attempts] == [429, None]
+
+
 def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeypatch):
     monkeypatch.delenv("AAWM_HARNESS_USER_ID", raising=False)
     monkeypatch.delenv("PYTEST_CLASSIFIER_HARNESS_USER_ID", raising=False)
@@ -804,6 +868,27 @@ def _assert_gemini_rate_limit_validation(case_config):
     ]
 
 
+def _assert_openrouter_free_daily_rate_limit_validation(case_config):
+    rate_limit_checks = case_config["rate_limit_observations_validation"]
+    assert rate_limit_checks["allow_latest_snapshot_fallback"] is True
+    [expected_row] = rate_limit_checks["expected_rows"]
+    assert expected_row["provider"] == "openrouter"
+    assert expected_row["client"] == "openrouter"
+    assert expected_row["source"] == "openrouter_free_daily_local_meter"
+    assert (
+        expected_row["quota_key"]
+        == "openrouter_free_daily_requests:requests"
+    )
+    assert expected_row["quota_type"] == "requests"
+    assert expected_row["required_equals"]["quota_period"] == "daily"
+    assert expected_row["minimums"]["remaining_pct"] == 0
+    assert expected_row["maximums"]["remaining_pct"] == 100
+    assert "expected_reset_at" in expected_row["required_future_timestamps"]
+    assert "expected_reset_at" in expected_row[
+        "required_timestamp_after_observed"
+    ]
+
+
 def test_codex_tool_activity_parity_cases_have_stream_state_gates():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
 
@@ -942,6 +1027,22 @@ def test_default_suite_keeps_claude_fanout_and_native_anthropic_rate_limit_gate_
     }
     assert "anthropic_unified_5h:5h" in quota_keys
     assert "anthropic_unified_7d:7d" in quota_keys
+
+
+def test_openrouter_free_cases_validate_daily_rate_limit_observations():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name in (
+        "native_openrouter_free_daily_meter_chat",
+        "claude_adapter_gpt_oss_20b",
+    ):
+        assert case_name in config["default_excluded_cases"]
+        _assert_openrouter_free_daily_rate_limit_validation(
+            config["cases"][case_name]
+        )
+    assert config["cases"]["native_openrouter_free_daily_meter_chat"][
+        "skip_trace_environment_validation"
+    ] is True
 
 
 def test_native_gemini_cases_have_code_assist_request_payload_gates():
