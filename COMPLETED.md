@@ -1,5 +1,60 @@
 # Completed
 
+## 2026-05-23
+
+- Promoted the `aawm.59` session-history and OpenRouter `:free` release line to prod.
+
+  Release:
+  `main` and `origin/develop` point at
+  `d9ca00b2f89c385c50cb563ece9e9e42de5042ab`, tagged
+  `v1.82.3-aawm.59`, and the published fork image is
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.59`. The current overlay releases are
+  `cb-v0.0.35` (`aawm_litellm_callbacks-0.0.35-py3-none-any.whl`),
+  `cfg-v0.0.13` (`litellm-model-config-0.0.13.tar.gz`),
+  `h-v0.0.31` (`litellm-local-ci-harness-0.0.31.tar.gz`), and existing
+  control-plane `cp-v0.0.7`.
+
+  Infrastructure:
+  `/home/zepfu/projects/aawm-infrastructure` commit
+  `abc9195cda5d9ec0a392fe7434f1584613c74990` is pushed to both
+  `origin/main` and `origin/develop`. It pins
+  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.59` and adds prod routes for
+  `deepseek/deepseek-v4-flash:free` and
+  `openrouter/inclusionai/ling-2.6-flash`.
+
+  Runtime:
+  prod `aawm-litellm` was rebuilt and recreated. The running container
+  `ce678c8a9c64` is healthy from local image `aawm-litellm:latest`;
+  readiness on `127.0.0.1:4000` reports
+  `litellm_version=1.82.3+aawm.59` with `AawmAgentIdentity` loaded.
+  Package inspection inside the running container reports
+  `litellm=1.82.3+aawm.59`, `aawm-litellm-callbacks=0.0.35`, and
+  `aawm-litellm-control-plane=0.0.7`.
+
+  Validation:
+  focused prod harness artifact
+  `/tmp/litellm-prod-openrouter-free-meter-aawm59.json` passed
+  `native_openrouter_free_daily_meter_chat` against `:4000` with no failures.
+  The only warning was expected:
+  `rate_limit_observations matched latest current snapshots instead of session rows; unchanged duplicate snapshots may have been suppressed`.
+  Exact database `aawm_tristore.public.session_history` row `718637`
+  records the harness call with
+  `session_id=litellm-harness.prod.native_openrouter_free_daily_meter_chat.1779516320-588833.session`,
+  `provider=openrouter`, `model=openrouter/openai/gpt-oss-20b:free`,
+  `client_name=openrouter-free-meter-harness`,
+  `litellm_environment=prod`, `litellm_version=1.82.3+aawm.59`,
+  `input_tokens=72`, `output_tokens=17`, `total_tokens=89`,
+  `response_cost_usd=2.62e-06`, `repository=litellm`, and
+  `tenant_id=adapter-harness-tenant`.
+
+  Backfill:
+  the final `session_history` repair pass found no additional rows requiring
+  updates. Post-backfill checks against exact database `aawm_tristore` showed
+  `blank_session=0`, `blank_session_with_trace=0`, and
+  `repairable_recent_repo=0` for recent blank-repository rows that still carry
+  deterministic repository clues in metadata.
+
 ## 2026-05-19
 
 - Promoted the prod `aawm-litellm` container to the `aawm.58` release line.
