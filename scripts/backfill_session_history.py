@@ -122,6 +122,20 @@ def _parse_optional_datetime(value: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(normalized)
 
 
+def _as_utc_aware_datetime(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _clickhouse_datetime64_literal_value(value: datetime) -> str:
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.isoformat(sep=" ")
+
+
 def _normalize_langfuse_host(host: Optional[str]) -> str:
     cleaned = _clean_secret(host) or "http://127.0.0.1:3000"
     normalized = cleaned.rstrip("/")
@@ -770,15 +784,16 @@ class LangfuseClickHouseSource:
         from_dt = _parse_optional_datetime(from_start_time)
         to_dt = _parse_optional_datetime(to_start_time)
         if from_dt is not None:
-            predicates.append(f"o.start_time >= toDateTime64({q(from_dt.isoformat(sep=' '))}, 3)")
+            predicates.append(f"o.start_time >= toDateTime64({q(_clickhouse_datetime64_literal_value(from_dt))}, 3)")
         if to_dt is not None:
-            predicates.append(f"o.start_time <= toDateTime64({q(to_dt.isoformat(sep=' '))}, 3)")
+            predicates.append(f"o.start_time <= toDateTime64({q(_clickhouse_datetime64_literal_value(to_dt))}, 3)")
 
         if cursor_start_time is not None and cursor_id is not None:
+            cursor_literal = _clickhouse_datetime64_literal_value(cursor_start_time)
             predicates.append(
                 "("
-                f"o.start_time < toDateTime64({q(cursor_start_time.isoformat(sep=' '))}, 3)"
-                f" OR (o.start_time = toDateTime64({q(cursor_start_time.isoformat(sep=' '))}, 3)"
+                f"o.start_time < toDateTime64({q(cursor_literal)}, 3)"
+                f" OR (o.start_time = toDateTime64({q(cursor_literal)}, 3)"
                 f" AND o.id < {q(cursor_id)}))"
             )
 
@@ -1033,11 +1048,14 @@ def _record_matches_filters(record: Dict[str, Any], args: argparse.Namespace) ->
         return False
 
     start_time = record.get("start_time")
-    from_start = _parse_optional_datetime(args.from_start_time)
-    to_start = _parse_optional_datetime(args.to_start_time)
-    if from_start and isinstance(start_time, datetime) and start_time < from_start:
+    comparable_start_time = (
+        _as_utc_aware_datetime(start_time) if isinstance(start_time, datetime) else None
+    )
+    from_start = _as_utc_aware_datetime(_parse_optional_datetime(args.from_start_time))
+    to_start = _as_utc_aware_datetime(_parse_optional_datetime(args.to_start_time))
+    if from_start and comparable_start_time and comparable_start_time < from_start:
         return False
-    if to_start and isinstance(start_time, datetime) and start_time > to_start:
+    if to_start and comparable_start_time and comparable_start_time > to_start:
         return False
 
     return True

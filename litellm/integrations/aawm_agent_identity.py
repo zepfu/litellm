@@ -195,6 +195,11 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     provider_cache_miss_cost_usd DOUBLE PRECISION,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
     invalid_tool_call_count INTEGER NOT NULL DEFAULT 0,
+    structured_output_attempted BOOLEAN NOT NULL DEFAULT FALSE,
+    structured_output_failed BOOLEAN NOT NULL DEFAULT FALSE,
+    structured_output_mode TEXT,
+    structured_output_schema_hash TEXT,
+    structured_output_failure_reason TEXT,
     tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
     file_read_count INTEGER NOT NULL DEFAULT 0,
     file_modified_count INTEGER NOT NULL DEFAULT 0,
@@ -247,6 +252,11 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_token_count INTEGER",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_cost_usd DOUBLE PRECISION",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS invalid_tool_call_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_attempted BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_failed BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_mode TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_schema_hash TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_failure_reason TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_environment TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_version TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_fork_version TEXT",
@@ -286,6 +296,7 @@ _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_litellm_environment_created_idx ON public.session_history (litellm_environment, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_client_created_idx ON public.session_history (client_name, client_version, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_repository_created_idx ON public.session_history (repository, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_openrouter_free_observed_idx ON public.session_history ((COALESCE(end_time, start_time, created_at)) DESC) WHERE provider = 'openrouter' AND lower(COALESCE(model, '')) LIKE '%:free'",
 )
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
@@ -597,91 +608,14 @@ _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_session_idx ON public.rate_limit_observations (session_id, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_trace_call_idx ON public.rate_limit_observations (trace_id, litellm_call_id)",
 )
-_AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL = """
-CREATE MATERIALIZED VIEW IF NOT EXISTS public.rate_limit_intervals AS
-WITH rate_limit_points AS (
-    SELECT
-        id,
-        provider,
-        CASE
-            WHEN provider = 'google'
-                THEN regexp_replace(quota_key, '^.*(gemini-\\d+(?:\\.\\d+)?-[^-:]+(?:-[^-:]+)*).*', '\\1', 'i')
-            WHEN provider = 'xai'
-                THEN COALESCE(NULLIF(model, ''), 'grok-build')
-            ELSE ''
-        END AS model,
-        quota_key,
-        quota_type,
-        expected_reset_at,
-        remaining_pct,
-        observed_at
-    FROM public.rate_limit_observations
-    WHERE provider IN ('openai', 'anthropic', 'google', 'xai')
-      AND remaining_pct >= 0
-      AND remaining_pct < 100
-      AND (
-            quota_key IN ('codex:secondary','codex:primary',
-                          'anthropic_unified_7d:7d','anthropic_unified_7d_sonnet:7d_sonnet','anthropic_unified_5h:5h')
-         OR quota_type = 'requests'
-      )
-),
-rate_limit_changes AS (
-    SELECT
-        *,
-        LAG(expected_reset_at) OVER rate_limit_window AS previous_expected_reset_at,
-        LAG(remaining_pct) OVER rate_limit_window AS previous_remaining_pct
-    FROM rate_limit_points
-    WINDOW rate_limit_window AS (
-        PARTITION BY provider, model, quota_key, quota_type
-        ORDER BY observed_at ASC, id ASC
-    )
-),
-rate_limit_intervals AS (
-    SELECT
-        provider,
-        model,
-        quota_key,
-        quota_type,
-        expected_reset_at,
-        remaining_pct,
-        observed_at AS fromDate,
-        LEAD(observed_at) OVER (
-            PARTITION BY provider, model, quota_key, quota_type
-            ORDER BY observed_at ASC, id ASC
-        ) AS next_fromDate
-    FROM rate_limit_changes
-    WHERE previous_remaining_pct IS NULL
-       OR previous_remaining_pct IS DISTINCT FROM remaining_pct
-       OR NOT (
-            previous_expected_reset_at IS NOT DISTINCT FROM expected_reset_at
-            OR (
-                previous_expected_reset_at IS NOT NULL
-                AND expected_reset_at IS NOT NULL
-                AND ABS(EXTRACT(EPOCH FROM (expected_reset_at - previous_expected_reset_at))) < 900
-            )
-       )
-)
-SELECT
-    provider,
-    model,
-    quota_key,
-    expected_reset_at,
-    remaining_pct,
-    fromDate,
-    COALESCE(next_fromDate, '9999-12-31'::timestamptz) AS toDate,
-    CASE
-        WHEN quota_key IN ('anthropic_unified_7d:7d', 'codex:secondary') THEN 'weekly'
-        WHEN quota_key IN ('anthropic_unified_5h:5h', 'codex:primary') THEN 'short'
-        WHEN quota_key = 'anthropic_unified_7d_sonnet:7d_sonnet' THEN 'weekly_special'
-        ELSE quota_type
-    END AS quota_type
-FROM rate_limit_intervals
+_AAWM_OPENROUTER_FREE_DAILY_REQUEST_COUNT_SQL = """
+SELECT COUNT(*)::integer
+FROM public.session_history
+WHERE provider = 'openrouter'
+  AND lower(COALESCE(model, '')) LIKE '%:free'
+  AND COALESCE(end_time, start_time, created_at) >= $1::timestamptz
+  AND COALESCE(end_time, start_time, created_at) < $2::timestamptz
 """
-_AAWM_RATE_LIMIT_INTERVALS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS rate_limit_intervals_type_provider_from_idx ON public.rate_limit_intervals (quota_type, provider, fromDate DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_intervals_requests_idx ON public.rate_limit_intervals (quota_type, provider, model, fromDate DESC)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS rate_limit_intervals_unique_idx ON public.rate_limit_intervals (provider, model, quota_key, quota_type, fromDate, expected_reset_at, remaining_pct)",
-)
 _AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.rate_limit_transitions (
     id BIGSERIAL PRIMARY KEY,
@@ -873,14 +807,20 @@ INSERT INTO public.session_history (
     llm_upstream_time_to_first_byte_ms,
     llm_upstream_stream_ms,
     latency_unclassified_ms,
-    previous_response_to_current_request_ms
+    previous_response_to_current_request_ms,
+    structured_output_attempted,
+    structured_output_failed,
+    structured_output_mode,
+    structured_output_schema_hash,
+    structured_output_failure_reason
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
     $32, $33, $34, $35, $36, $37, $38, $39, $40::jsonb, $41, $42, $43, $44, $45, $46, $47::jsonb, $48,
     $49, $50, $51, $52, $53, $54, $55, $56, $57,
-    $58, $59, $60, $61, $62, $63, $64, $65, $66, $67
+    $58, $59, $60, $61, $62, $63, $64, $65, $66, $67,
+    $68, $69, $70, $71, $72
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -955,8 +895,34 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         session_history.invalid_tool_call_count,
         EXCLUDED.invalid_tool_call_count
     ),
+    structured_output_attempted = session_history.structured_output_attempted OR EXCLUDED.structured_output_attempted,
+    structured_output_failed = session_history.structured_output_failed OR EXCLUDED.structured_output_failed,
+    structured_output_mode = COALESCE(
+        NULLIF(EXCLUDED.structured_output_mode, ''),
+        session_history.structured_output_mode
+    ),
+    structured_output_schema_hash = COALESCE(
+        NULLIF(EXCLUDED.structured_output_schema_hash, ''),
+        session_history.structured_output_schema_hash
+    ),
+    structured_output_failure_reason = COALESCE(
+        NULLIF(EXCLUDED.structured_output_failure_reason, ''),
+        session_history.structured_output_failure_reason
+    ),
     tool_names = CASE
-        WHEN jsonb_array_length(EXCLUDED.tool_names) > jsonb_array_length(session_history.tool_names)
+        WHEN jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(EXCLUDED.tool_names) = 'array'
+                    THEN EXCLUDED.tool_names
+                ELSE '[]'::jsonb
+            END
+        ) > jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(session_history.tool_names) = 'array'
+                    THEN session_history.tool_names
+                ELSE '[]'::jsonb
+            END
+        )
             THEN EXCLUDED.tool_names
         ELSE session_history.tool_names
     END,
@@ -1210,12 +1176,36 @@ ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
     tool_name = COALESCE(NULLIF(EXCLUDED.tool_name, ''), session_history_tool_activity.tool_name),
     tool_kind = COALESCE(NULLIF(EXCLUDED.tool_kind, ''), session_history_tool_activity.tool_kind),
     file_paths_read = CASE
-        WHEN jsonb_array_length(EXCLUDED.file_paths_read) > jsonb_array_length(session_history_tool_activity.file_paths_read)
+        WHEN jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(EXCLUDED.file_paths_read) = 'array'
+                    THEN EXCLUDED.file_paths_read
+                ELSE '[]'::jsonb
+            END
+        ) > jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(session_history_tool_activity.file_paths_read) = 'array'
+                    THEN session_history_tool_activity.file_paths_read
+                ELSE '[]'::jsonb
+            END
+        )
             THEN EXCLUDED.file_paths_read
         ELSE session_history_tool_activity.file_paths_read
     END,
     file_paths_modified = CASE
-        WHEN jsonb_array_length(EXCLUDED.file_paths_modified) > jsonb_array_length(session_history_tool_activity.file_paths_modified)
+        WHEN jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(EXCLUDED.file_paths_modified) = 'array'
+                    THEN EXCLUDED.file_paths_modified
+                ELSE '[]'::jsonb
+            END
+        ) > jsonb_array_length(
+            CASE
+                WHEN jsonb_typeof(session_history_tool_activity.file_paths_modified) = 'array'
+                    THEN session_history_tool_activity.file_paths_modified
+                ELSE '[]'::jsonb
+            END
+        )
             THEN EXCLUDED.file_paths_modified
         ELSE session_history_tool_activity.file_paths_modified
     END,
@@ -1471,6 +1461,9 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "trace_name",
     "trace_user_id",
     "trace_environment",
+    "session_id_source",
+    "synthetic_session_id",
+    "synthetic_session_id_basis",
     "source_model",
     "logical_model",
     "aawm_claude_agent_name",
@@ -1547,6 +1540,11 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "google_retrieve_user_quota",
     "usage_tool_call_count",
     "usage_invalid_tool_call_count",
+    "usage_structured_output_attempted",
+    "usage_structured_output_failed",
+    "usage_structured_output_mode",
+    "usage_structured_output_schema_hash",
+    "usage_structured_output_failure_reason",
     "usage_tool_names",
     "google_adapter_system_prompt_policy_name",
     "google_adapter_system_prompt_policy",
@@ -3808,6 +3806,8 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
 _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP = 1.0
 _AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT = timedelta(minutes=15)
 _AAWM_RATE_LIMIT_STALE_RESET_TOLERANCE = timedelta(minutes=15)
+_AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT_DEFAULT = 1000
+_AAWM_OPENROUTER_FREE_DAILY_SOURCE = "openrouter_free_daily_local_meter"
 _AAWM_RATE_LIMIT_SNAPSHOT_FIELDS = (
     "provider_resets_at",
     "used_percentage",
@@ -4171,6 +4171,217 @@ def _infer_rate_limit_client_family(
     ):
         return "claude"
     return provider
+
+
+def _openrouter_free_daily_request_limit() -> int:
+    configured_limit = _safe_int(
+        get_secret_str("AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT")
+    )
+    if configured_limit is not None and configured_limit > 0:
+        return configured_limit
+    return _AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT_DEFAULT
+
+
+def _openrouter_free_shared_account_hash() -> str:
+    return _short_hash(b"openrouter_free_daily_shared_pool")
+
+
+def _is_openrouter_free_model(model: Any) -> bool:
+    return str(model or "").strip().lower().endswith(":free")
+
+
+def _openrouter_free_daily_window(observed_at: Any) -> Tuple[datetime, datetime]:
+    observed_dt = _normalize_datetime(observed_at) or datetime.now(timezone.utc)
+    day_start = observed_dt.astimezone(timezone.utc).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return day_start, day_start + timedelta(days=1)
+
+
+def _openrouter_free_daily_observation_context_from_record(
+    record: Dict[str, Any],
+    observed_at: datetime,
+) -> Dict[str, Any]:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "observed_at": observed_at,
+        "provider": "openrouter",
+        "client_family": "openrouter",
+        "account_hash": _openrouter_free_shared_account_hash(),
+        "environment": record.get("litellm_environment"),
+        "tenant_id": record.get("tenant_id"),
+        "repository": record.get("repository"),
+        "session_id": record.get("session_id"),
+        "trace_id": record.get("trace_id"),
+        "litellm_call_id": record.get("litellm_call_id"),
+        "route_family": metadata.get("passthrough_route_family"),
+        "request_model": record.get("model"),
+        "response_model": None,
+        "model": None,
+        "model_family": "openrouter",
+        "model_tier": "free",
+        "client_name": record.get("client_name"),
+        "client_version": record.get("client_version"),
+        "client_user_agent": record.get("client_user_agent"),
+        "metadata": metadata,
+    }
+
+
+def _build_openrouter_free_daily_observation(
+    *,
+    context: Dict[str, Any],
+    day_start: datetime,
+    day_end: datetime,
+    used_requests: int,
+    total_requests: int,
+    signal: str,
+    status: str = "observed",
+    exhausted: bool = False,
+    reset_hint_seconds: Optional[int] = None,
+    provider_resets_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    bounded_total = max(total_requests, 1)
+    bounded_used = max(0, used_requests)
+    remaining_requests = max(0, bounded_total - bounded_used)
+    used_percentage = round(
+        min(100.0, (bounded_used / bounded_total) * 100.0),
+        3,
+    )
+    remaining_pct = round(max(0.0, 100.0 - used_percentage), 3)
+    return _finalize_rate_limit_observation(
+        {
+            "observed_at": context["observed_at"],
+            "source": _AAWM_OPENROUTER_FREE_DAILY_SOURCE,
+            "provider": "openrouter",
+            "client_family": "openrouter",
+            "account_hash": _openrouter_free_shared_account_hash(),
+            "limit_id": "openrouter_free_daily_requests",
+            "limit_name": "OpenRouter free daily requests",
+            "limit_scope": "requests",
+            "window_minutes": 1440,
+            "quota_period": "daily",
+            "quota_type": "requests",
+            "provider_resets_at": provider_resets_at or day_end,
+            "remaining_pct": remaining_pct,
+            "used_percentage": used_percentage,
+            "remaining_requests": remaining_requests,
+            "used_requests": bounded_used,
+            "total_requests": bounded_total,
+            "status": status,
+            "exhausted": exhausted or remaining_requests <= 0,
+            "exhaustion_kind": "request_quota" if exhausted else None,
+            "reset_hint_seconds": reset_hint_seconds,
+            "model": None,
+            "model_family": "openrouter",
+            "model_tier": "free",
+            "raw_provider_fields": {
+                "dailyLimit": bounded_total,
+                "usedRequests": bounded_used,
+                "remainingRequests": remaining_requests,
+                "windowStart": _json_safe_rate_limit_value(day_start),
+                "windowEnd": _json_safe_rate_limit_value(day_end),
+                "reset_anchor": "utc_midnight",
+                "model_scope": "openrouter_:free_shared_pool",
+                "meter_source": "local_session_history",
+            },
+            "evidence": {
+                "signals": [signal],
+                "provider_fields": [],
+                "scope_note": (
+                    "OpenRouter documents free-model quota as account-level; "
+                    "provider does not expose current free request usage."
+                ),
+            },
+        },
+        context,
+    )
+
+
+def _openrouter_free_record_observed_at(record: Dict[str, Any]) -> datetime:
+    return (
+        _normalize_datetime(record.get("end_time"))
+        or _normalize_datetime(record.get("start_time"))
+        or datetime.now(timezone.utc)
+    )
+
+
+def _is_openrouter_free_session_history_record(record: Dict[str, Any]) -> bool:
+    model = record.get("model")
+    if not _is_openrouter_free_model(model):
+        return False
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    provider = _normalize_session_history_provider(
+        record.get("provider"),
+        str(model or ""),
+        metadata,
+    )
+    return provider == "openrouter"
+
+
+async def _build_openrouter_free_daily_observations_for_records(
+    conn: Any,
+    records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    latest_record_by_window: Dict[
+        Tuple[datetime, datetime],
+        Tuple[datetime, Dict[str, Any]],
+    ] = {}
+    for record in records:
+        if record.get("_skip_session_history"):
+            continue
+        if not _is_openrouter_free_session_history_record(record):
+            continue
+        observed_at = _openrouter_free_record_observed_at(record)
+        window = _openrouter_free_daily_window(observed_at)
+        previous = latest_record_by_window.get(window)
+        if previous is None or observed_at >= previous[0]:
+            latest_record_by_window[window] = (observed_at, record)
+
+    if not latest_record_by_window:
+        return []
+
+    total_requests = _openrouter_free_daily_request_limit()
+    observations: List[Dict[str, Any]] = []
+    for (day_start, day_end), (observed_at, record) in sorted(
+        latest_record_by_window.items(),
+        key=lambda item: item[0][0],
+    ):
+        used_requests = _safe_int(
+            await conn.fetchval(
+                _AAWM_OPENROUTER_FREE_DAILY_REQUEST_COUNT_SQL,
+                day_start,
+                day_end,
+            )
+        )
+        if used_requests is None:
+            continue
+        observations.append(
+            _build_openrouter_free_daily_observation(
+                context=_openrouter_free_daily_observation_context_from_record(
+                    record,
+                    observed_at,
+                ),
+                day_start=day_start,
+                day_end=day_end,
+                used_requests=used_requests,
+                total_requests=total_requests,
+                signal="local_session_history_openrouter_free_count",
+                status=(
+                    "quota_exhausted"
+                    if used_requests >= total_requests
+                    else "observed"
+                ),
+                exhausted=used_requests >= total_requests,
+            )
+        )
+    return observations
 
 
 def _build_rate_limit_key(
@@ -5190,6 +5401,117 @@ def _extract_grok_billing_observations(
     return _dedupe_rate_limit_observations(observations)
 
 
+def _extract_openrouter_free_error_reset_at(
+    kwargs: Dict[str, Any],
+    result: Any,
+    dicts: List[Dict[str, Any]],
+    error_text: str,
+    observed_at: datetime,
+) -> Tuple[datetime, Optional[int]]:
+    headers = _extract_headers_from_kwargs(kwargs)
+    headers.update(_extract_provider_error_headers(result))
+    retry_after_seconds = _extract_provider_error_retry_after_seconds(
+        kwargs=kwargs,
+        result=result,
+        dicts=dicts,
+        error_text=error_text,
+    )
+    reset_hint_seconds = (
+        int(retry_after_seconds)
+        if retry_after_seconds is not None and retry_after_seconds >= 0
+        else None
+    )
+    reset_value = _first_non_empty_string(
+        headers.get("x-ratelimit-reset"),
+        headers.get("x-rate-limit-reset"),
+        headers.get("x-ratelimit-reset-at"),
+        headers.get("x-rate-limit-reset-at"),
+    )
+    provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
+        reset_value,
+        observed_at,
+        reset_hint_seconds,
+    )
+    if provider_resets_at is not None and not stale_reset:
+        return provider_resets_at, reset_hint_seconds
+    _day_start, day_end = _openrouter_free_daily_window(observed_at)
+    return day_end, reset_hint_seconds
+
+
+def _extract_openrouter_free_error_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        _AAWM_OPENROUTER_FREE_DAILY_SOURCE,
+    )
+    if context.get("provider") != "openrouter":
+        return []
+    model_candidates = (
+        context.get("model"),
+        context.get("request_model"),
+        _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"),
+            "request_body",
+            "model",
+        ),
+        _maybe_get_path(
+            kwargs.get("litellm_params"),
+            "proxy_server_request",
+            "body",
+            "model",
+        ),
+    )
+    if not any(_is_openrouter_free_model(model) for model in model_candidates):
+        return []
+
+    dicts = _extract_provider_error_dicts(result)
+    status_code = _extract_provider_error_status_code(result, dicts)
+    error_text = _extract_provider_error_text(result, dicts)
+    error_code, error_type = _extract_provider_error_code_and_type(result, dicts)
+    error_class = _classify_provider_error(
+        status_code=status_code,
+        error_code=error_code,
+        error_type=error_type,
+        error_text=error_text,
+    )
+    if error_class not in {"rate_limited", "usage_limit_reached"}:
+        return []
+
+    observed_dt = context["observed_at"]
+    day_start, day_end = _openrouter_free_daily_window(observed_dt)
+    provider_resets_at, reset_hint_seconds = _extract_openrouter_free_error_reset_at(
+        kwargs,
+        result,
+        dicts,
+        error_text,
+        observed_dt,
+    )
+    context = dict(context)
+    context["account_hash"] = _openrouter_free_shared_account_hash()
+    context["client_family"] = "openrouter"
+    context["model"] = None
+    total_requests = _openrouter_free_daily_request_limit()
+    return [
+        _build_openrouter_free_daily_observation(
+            context=context,
+            day_start=day_start,
+            day_end=day_end,
+            used_requests=total_requests,
+            total_requests=total_requests,
+            signal="openrouter_free_model_rate_limit_error",
+            status="quota_exhausted",
+            exhausted=True,
+            reset_hint_seconds=reset_hint_seconds,
+            provider_resets_at=provider_resets_at,
+        )
+    ]
+
+
 def _looks_like_google_quota_candidate(candidate: Dict[str, Any]) -> bool:
     request_quota_keys = {
         "buckets",
@@ -5518,6 +5840,7 @@ def _build_rate_limit_observations(
     observations.extend(_extract_codex_usage_limit_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_anthropic_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_grok_billing_observations(kwargs, result, observed_at))
+    observations.extend(_extract_openrouter_free_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_quota_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_error_observations(kwargs, result, observed_at))
     return _dedupe_rate_limit_observations(observations)
@@ -5841,6 +6164,31 @@ def _build_provider_error_observation(
         "normalized_error_text": error_text[:500] if error_text else None,
         "observed_signal": "normal_traffic_failure",
     }
+    structured_output_state = _detect_structured_output_request(
+        _extract_provider_cache_request_body(kwargs),
+        metadata,
+    )
+    if structured_output_state.get("structured_output_attempted"):
+        structured_failure_reason = _first_non_empty_string(
+            structured_output_state.get("structured_output_failure_reason"),
+            _classify_structured_output_failure(result),
+        )
+        observation_metadata["structured_output_attempted"] = True
+        observation_metadata["structured_output_failed"] = bool(
+            structured_output_state.get("structured_output_failed")
+            or structured_failure_reason
+        )
+        for key in (
+            "structured_output_mode",
+            "structured_output_schema_hash",
+        ):
+            value = _clean_non_empty_string(structured_output_state.get(key))
+            if value is not None:
+                observation_metadata[key] = value
+        if structured_failure_reason is not None:
+            observation_metadata[
+                "structured_output_failure_reason"
+            ] = structured_failure_reason
     if _is_claude_permission_check_metadata(metadata):
         for key in (
             "source_model",
@@ -5907,6 +6255,40 @@ def _build_provider_error_observation_only_record(
     }
 
 
+
+def _build_structured_output_failure_session_history_record(
+    kwargs: Dict[str, Any],
+    result: Any,
+    start_time: Any,
+    end_time: Any,
+) -> Optional[Dict[str, Any]]:
+    metadata = _merged_rate_limit_metadata(kwargs)
+    request_body = _extract_provider_cache_request_body(kwargs)
+    structured_output_state = _detect_structured_output_request(request_body, metadata)
+    if not structured_output_state.get("structured_output_attempted"):
+        return None
+
+    failure_reason = _first_non_empty_string(
+        structured_output_state.get("structured_output_failure_reason"),
+        _classify_structured_output_failure(result),
+    )
+    structured_output_state["structured_output_failed"] = bool(
+        structured_output_state.get("structured_output_failed") or failure_reason
+    )
+    structured_output_state["structured_output_failure_reason"] = failure_reason
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={},
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if record is None:
+        return None
+
+    record.update(structured_output_state)
+    return _normalize_session_history_record(record)
+
 def _build_failure_observation_only_record(
     kwargs: Dict[str, Any],
     result: Any,
@@ -5928,10 +6310,24 @@ def _build_failure_observation_only_record(
         start_time=start_time,
         end_time=end_time,
     )
-    if not rate_limit_observations and provider_error_observation is None:
+    structured_output_record = _build_structured_output_failure_session_history_record(
+        kwargs=kwargs,
+        result=failure_result,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if (
+        not rate_limit_observations
+        and provider_error_observation is None
+        and structured_output_record is None
+    ):
         return None
 
-    if rate_limit_observations:
+    if structured_output_record is not None:
+        record = structured_output_record
+        if rate_limit_observations:
+            record["rate_limit_observations"] = rate_limit_observations
+    elif rate_limit_observations:
         record = _build_rate_limit_observation_only_record(
             kwargs,
             rate_limit_observations,
@@ -6410,6 +6806,81 @@ def _has_nested_path(obj: Any, *keys: str) -> bool:
     return _maybe_get_path(obj, *keys, default=sentinel) is not sentinel
 
 
+def _session_history_provider_from_model(model: Any) -> Optional[str]:
+    model_lower = str(model or "").strip().lower()
+    if not model_lower or model_lower == "unknown":
+        return None
+    if model_lower.startswith("nvidia/"):
+        return "nvidia_nim"
+    if model_lower.startswith("xai/") or model_lower.startswith("grok"):
+        return "xai"
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if "gemini" in model_lower or model_lower.startswith("google/"):
+        return "gemini"
+    if "claude" in model_lower or model_lower.startswith("anthropic/"):
+        return "anthropic"
+    if (
+        model_lower.startswith("gpt")
+        or model_lower.startswith("o1")
+        or model_lower.startswith("o3")
+        or model_lower.startswith("o4")
+        or model_lower.startswith("openai/")
+        or "codex" in model_lower
+    ):
+        return "openai"
+    return None
+
+
+def _session_history_provider_from_route_family(route_family: Any) -> Optional[str]:
+    if not isinstance(route_family, str) or not route_family.strip():
+        return None
+    route_lower = route_family.lower()
+    if "grok" in route_lower or "xai" in route_lower:
+        return "xai"
+    if "nvidia" in route_lower:
+        return "nvidia_nim"
+    if "openrouter" in route_lower:
+        return "openrouter"
+    if "gemini" in route_lower or "google" in route_lower:
+        return "gemini"
+    if "codex" in route_lower or "openai" in route_lower:
+        return "openai"
+    if "anthropic" in route_lower:
+        return "anthropic"
+    return None
+
+
+def _session_history_adapter_target_provider(
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    for tag in _metadata_request_tags(metadata):
+        tag_lower = tag.strip().lower()
+        if not tag_lower.startswith("anthropic-adapter-target:"):
+            continue
+        target = tag_lower.split(":", 1)[1].strip()
+        if target.startswith(("google", "gemini")):
+            return "gemini"
+        if target.startswith("openrouter"):
+            return "openrouter"
+        if target.startswith("nvidia"):
+            return "nvidia_nim"
+        if target.startswith(("xai", "grok")):
+            return "xai"
+        if target.startswith(("responses", "openai", "codex", "/v1/responses")):
+            return "openai"
+    return None
+
+
+def _session_history_adapter_model(metadata: Dict[str, Any]) -> Optional[str]:
+    prefix = "anthropic-adapter-model:"
+    for tag in _metadata_request_tags(metadata):
+        stripped_tag = tag.strip()
+        if stripped_tag.lower().startswith(prefix):
+            return stripped_tag[len(prefix) :].strip() or None
+    return None
+
+
 def _normalize_provider_cache_family(
     provider: Any,
     model: str,
@@ -6464,6 +6935,17 @@ def _normalize_session_history_provider(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     metadata = metadata or {}
+    adapter_target_provider = _session_history_adapter_target_provider(metadata)
+    if adapter_target_provider is not None:
+        return adapter_target_provider
+
+    route_provider = _session_history_provider_from_route_family(
+        metadata.get("passthrough_route_family")
+    )
+    if route_provider is not None and route_provider != "anthropic":
+        return route_provider
+
+    model_provider = _session_history_provider_from_model(model)
 
     def _normalize_known_provider(candidate: Any) -> Optional[str]:
         if not isinstance(candidate, str) or not candidate.strip():
@@ -6478,39 +6960,38 @@ def _normalize_session_history_provider(
         return candidate_lower
 
     normalized_provider = _normalize_known_provider(provider)
+    if (
+        normalized_provider == "anthropic"
+        and model_provider is not None
+        and model_provider != "anthropic"
+    ):
+        return model_provider
     if normalized_provider is not None:
         return normalized_provider
 
     for key in ("custom_llm_provider", "provider", "litellm_provider"):
         normalized_provider = _normalize_known_provider(metadata.get(key))
+        if (
+            normalized_provider == "anthropic"
+            and model_provider is not None
+            and model_provider != "anthropic"
+        ):
+            return model_provider
         if normalized_provider is not None:
             return normalized_provider
 
-    route_family = metadata.get("passthrough_route_family")
-    if isinstance(route_family, str) and route_family.strip():
-        route_lower = route_family.lower()
-        if "grok" in route_lower or "xai" in route_lower:
-            return "xai"
-        if "nvidia" in route_lower:
-            return "nvidia_nim"
-        if "openrouter" in route_lower:
-            return "openrouter"
-        if "gemini" in route_lower or "google" in route_lower:
-            return "gemini"
-        if "codex" in route_lower or "openai" in route_lower:
-            return "openai"
-        if "anthropic" in route_lower:
-            return "anthropic"
+    if route_provider is not None:
+        return route_provider
 
     request_route = metadata.get("user_api_key_request_route")
     if isinstance(request_route, str) and request_route.strip():
         route_lower = request_route.lower()
-        if route_lower.startswith("/anthropic/"):
-            return "anthropic"
         if "gemini" in route_lower or "google" in route_lower:
             return "gemini"
         if route_lower.startswith("/v1/"):
             return "openai"
+        if route_lower.startswith("/anthropic/"):
+            return "anthropic"
 
     api_base = metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base")
     if isinstance(api_base, str) and api_base.strip():
@@ -6528,29 +7009,7 @@ def _normalize_session_history_provider(
         if "openai.com" in api_base_lower:
             return "openai"
 
-    model_lower = str(model or "").strip().lower()
-    if not model_lower or model_lower == "unknown":
-        return None
-    if model_lower.startswith("nvidia/"):
-        return "nvidia_nim"
-    if model_lower.startswith("xai/") or model_lower.startswith("grok"):
-        return "xai"
-    if model_lower.startswith("openrouter/"):
-        return "openrouter"
-    if "gemini" in model_lower or model_lower.startswith("google/"):
-        return "gemini"
-    if "claude" in model_lower or model_lower.startswith("anthropic/"):
-        return "anthropic"
-    if (
-        model_lower.startswith("gpt")
-        or model_lower.startswith("o1")
-        or model_lower.startswith("o3")
-        or model_lower.startswith("o4")
-        or model_lower.startswith("openai/")
-        or "codex" in model_lower
-    ):
-        return "openai"
-    return None
+    return model_provider
 
 
 def _supports_prompt_caching_safe(
@@ -6691,6 +7150,372 @@ def _extract_invalid_tool_call_count_from_request_body(
     return invalid_count
 
 
+_STRUCTURED_OUTPUT_JSON_MODE_VALUES = {
+    "json",
+    "json_object",
+    "json_schema",
+    "schema",
+    "response_schema",
+}
+_STRUCTURED_OUTPUT_NESTED_REQUEST_KEYS = (
+    "body",
+    "data",
+    "json",
+    "payload",
+    "request",
+    "request_body",
+)
+_STRUCTURED_OUTPUT_FAILURE_PATTERNS = (
+    (
+        "schema_validation_error",
+        re.compile(
+            r"("
+            r"structured[-_ ]?output"
+            r"|json[-_ ]?schema"
+            r"|schema validation"
+            r"|validation schema"
+            r"|invalid schema"
+            r"|schema .*valid"
+            r"|does not match (?:the )?schema"
+            r"|pydantic"
+            r"|jsonschema"
+            r")",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "json_validation_error",
+        re.compile(
+            r"("
+            r"invalid[-_ ]?json"
+            r"|malformed json"
+            r"|json parse"
+            r"|parse json"
+            r"|json decode"
+            r"|json validation"
+            r"|validate json"
+            r"|json .*valid"
+            r")",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "response_format_error",
+        re.compile(r"(response[-_ ]?format|invalid_response_format)", re.IGNORECASE),
+    ),
+)
+
+
+def _empty_structured_output_state() -> Dict[str, Any]:
+    return {
+        "structured_output_attempted": False,
+        "structured_output_failed": False,
+        "structured_output_mode": None,
+        "structured_output_schema_hash": None,
+        "structured_output_failure_reason": None,
+    }
+
+
+def _merge_structured_output_state(
+    current: Dict[str, Any],
+    candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not isinstance(candidate, dict) or not candidate.get("structured_output_attempted"):
+        return current
+
+    current["structured_output_attempted"] = True
+    current["structured_output_failed"] = bool(
+        current.get("structured_output_failed")
+        or candidate.get("structured_output_failed")
+    )
+    for key in (
+        "structured_output_mode",
+        "structured_output_schema_hash",
+        "structured_output_failure_reason",
+    ):
+        value = _clean_non_empty_string(candidate.get(key))
+        if value and not _clean_non_empty_string(current.get(key)):
+            current[key] = value
+    return current
+
+
+def _structured_output_schema_hash(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(
+            _json_safe_rate_limit_value(value),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        encoded = str(value)
+    if not encoded or encoded in {"null", "{}", "[]"}:
+        return None
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _structured_output_state_from_format(
+    value: Any,
+    *,
+    default_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    parsed = _safe_json_load(value, value)
+    state = _empty_structured_output_state()
+
+    if isinstance(parsed, str):
+        mode = parsed.strip().lower().replace("-", "_")
+        if mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES or "json" in mode:
+            state["structured_output_attempted"] = True
+            state["structured_output_mode"] = mode
+        return state
+
+    if not isinstance(parsed, dict):
+        return state
+
+    raw_mode = _first_non_empty_string(
+        parsed.get("type"),
+        parsed.get("format"),
+        parsed.get("mode"),
+        default_mode,
+    )
+    mode = raw_mode.lower().replace("-", "_") if raw_mode else None
+    schema = _first_non_none(
+        parsed.get("json_schema"),
+        parsed.get("schema"),
+        parsed.get("response_schema"),
+        parsed.get("responseSchema"),
+    )
+    mime_type = _first_non_empty_string(
+        parsed.get("response_mime_type"),
+        parsed.get("responseMimeType"),
+        parsed.get("mime_type"),
+    )
+    has_json_mime = bool(mime_type and "json" in mime_type.lower())
+    has_json_mode = bool(
+        mode
+        and (mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES or "json" in mode or "schema" in mode)
+    )
+    if schema is None and not has_json_mode and not has_json_mime:
+        return state
+
+    state["structured_output_attempted"] = True
+    state["structured_output_mode"] = mode or (
+        "response_schema" if schema is not None else "json_mime_type"
+    )
+    state["structured_output_schema_hash"] = _structured_output_schema_hash(schema)
+    return state
+
+
+def _structured_output_state_from_generation_config(value: Any) -> Dict[str, Any]:
+    parsed = _safe_json_load(value, value)
+    state = _empty_structured_output_state()
+    if not isinstance(parsed, dict):
+        return state
+
+    schema = _first_non_none(
+        parsed.get("responseSchema"),
+        parsed.get("response_schema"),
+    )
+    mime_type = _first_non_empty_string(
+        parsed.get("responseMimeType"),
+        parsed.get("response_mime_type"),
+    )
+    if schema is None and not (mime_type and "json" in mime_type.lower()):
+        return state
+
+    state["structured_output_attempted"] = True
+    state["structured_output_mode"] = (
+        "response_schema" if schema is not None else "json_mime_type"
+    )
+    state["structured_output_schema_hash"] = _structured_output_schema_hash(schema)
+    return state
+
+
+def _detect_structured_output_request(
+    request_body: Optional[Dict[str, Any]],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    state = _empty_structured_output_state()
+
+    if isinstance(metadata, dict):
+        metadata_attempted = any(
+            key in metadata and _metadata_bool(metadata.get(key))
+            for key in (
+                "usage_structured_output_attempted",
+                "structured_output_attempted",
+            )
+        )
+        metadata_failed = any(
+            key in metadata and _metadata_bool(metadata.get(key))
+            for key in (
+                "usage_structured_output_failed",
+                "structured_output_failed",
+            )
+        )
+        metadata_mode = _first_non_empty_string(
+            metadata.get("usage_structured_output_mode"),
+            metadata.get("structured_output_mode"),
+        )
+        metadata_schema_hash = _first_non_empty_string(
+            metadata.get("usage_structured_output_schema_hash"),
+            metadata.get("structured_output_schema_hash"),
+        )
+        metadata_reason = _first_non_empty_string(
+            metadata.get("usage_structured_output_failure_reason"),
+            metadata.get("structured_output_failure_reason"),
+        )
+        if metadata_attempted or metadata_failed or metadata_mode or metadata_schema_hash:
+            state["structured_output_attempted"] = True
+            state["structured_output_failed"] = metadata_failed
+            state["structured_output_mode"] = metadata_mode
+            state["structured_output_schema_hash"] = metadata_schema_hash
+            state["structured_output_failure_reason"] = metadata_reason
+
+    parsed_request = _safe_json_load(request_body, request_body)
+    if not isinstance(parsed_request, dict):
+        return state
+
+    pending: List[Tuple[Any, int]] = [(parsed_request, 0)]
+    seen: set[int] = set()
+    while pending:
+        payload, depth = pending.pop(0)
+        if not isinstance(payload, dict):
+            continue
+        payload_id = id(payload)
+        if payload_id in seen:
+            continue
+        seen.add(payload_id)
+
+        for key in ("response_format", "responseFormat"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_format(payload.get(key)),
+                )
+
+        text_config = _safe_json_load(payload.get("text"), payload.get("text"))
+        if isinstance(text_config, dict) and "format" in text_config:
+            _merge_structured_output_state(
+                state,
+                _structured_output_state_from_format(text_config.get("format")),
+            )
+
+        for key in ("text_format", "textFormat"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_format(payload.get(key)),
+                )
+
+        for key in ("output_format", "outputFormat", "output_config", "outputConfig"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_format(payload.get(key)),
+                )
+
+        for key in ("generationConfig", "generation_config"):
+            if key in payload:
+                _merge_structured_output_state(
+                    state,
+                    _structured_output_state_from_generation_config(payload.get(key)),
+                )
+
+        if "response_schema" in payload or "responseSchema" in payload:
+            schema = _first_non_none(
+                payload.get("response_schema"),
+                payload.get("responseSchema"),
+            )
+            _merge_structured_output_state(
+                state,
+                {
+                    "structured_output_attempted": True,
+                    "structured_output_failed": False,
+                    "structured_output_mode": "response_schema",
+                    "structured_output_schema_hash": _structured_output_schema_hash(schema),
+                    "structured_output_failure_reason": None,
+                },
+            )
+
+        mime_type = _first_non_empty_string(
+            payload.get("response_mime_type"),
+            payload.get("responseMimeType"),
+        )
+        if mime_type and "json" in mime_type.lower():
+            _merge_structured_output_state(
+                state,
+                {
+                    "structured_output_attempted": True,
+                    "structured_output_failed": False,
+                    "structured_output_mode": "json_mime_type",
+                    "structured_output_schema_hash": None,
+                    "structured_output_failure_reason": None,
+                },
+            )
+
+        if depth >= 4:
+            continue
+        for key in _STRUCTURED_OUTPUT_NESTED_REQUEST_KEYS:
+            nested = _safe_json_load(payload.get(key), payload.get(key))
+            if isinstance(nested, dict):
+                pending.append((nested, depth + 1))
+
+    return state
+
+
+def _collect_structured_output_failure_texts(value: Any) -> List[str]:
+    texts: List[str] = []
+    pending: List[Tuple[Any, int]] = [(value, 0)]
+    seen: set[int] = set()
+    while pending and len(texts) < 40:
+        current, depth = pending.pop(0)
+        current = _safe_json_load(current, current)
+        if isinstance(current, str):
+            if current.strip():
+                texts.append(current.strip()[:1000])
+            continue
+        if isinstance(current, dict):
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            for key in (
+                "message",
+                "error",
+                "detail",
+                "details",
+                "code",
+                "type",
+                "statusMessage",
+                "status_message",
+            ):
+                if key in current:
+                    pending.append((current[key], depth + 1))
+            if depth < 3:
+                for nested_value in list(current.values()):
+                    if isinstance(nested_value, (dict, list)):
+                        pending.append((nested_value, depth + 1))
+            continue
+        if isinstance(current, list) and depth < 3:
+            for item in current[:40]:
+                pending.append((item, depth + 1))
+    return texts
+
+
+def _classify_structured_output_failure(value: Any) -> Optional[str]:
+    dicts = _extract_provider_error_dicts(value)
+    error_text = _extract_provider_error_text(value, dicts)
+    texts = [error_text] if error_text else []
+    texts.extend(_collect_structured_output_failure_texts(value))
+    combined = "\n".join(text for text in texts if isinstance(text, str))[:5000]
+    if not combined.strip():
+        return None
+    for reason, pattern in _STRUCTURED_OUTPUT_FAILURE_PATTERNS:
+        if pattern.search(combined):
+            return reason
+    return None
+
 def _extract_request_body_from_langfuse_input(value: Any) -> Optional[Dict[str, Any]]:
     parsed = _safe_json_load(value, value)
     if not isinstance(parsed, dict):
@@ -6743,16 +7568,48 @@ def _request_contains_prompt_cache_key(payload: Any) -> bool:
     return isinstance(prompt_cache_key, str) and bool(prompt_cache_key.strip())
 
 
-def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
-    return any(
-        _has_nested_path(usage_obj, *path)
-        for path in (
+def _openai_style_cached_tokens_source(usage_obj: Any) -> Optional[str]:
+    for path, source in (
+        (
+            ("prompt_tokens_details", "cached_tokens"),
+            "usage.prompt_tokens_details.cached_tokens",
+        ),
+        (
+            ("prompt_tokens_details", "cachedTokens"),
+            "usage.prompt_tokens_details.cachedTokens",
+        ),
+        (
             ("input_tokens_details", "cached_tokens"),
+            "usage.input_tokens_details.cached_tokens",
+        ),
+        (
             ("input_tokens_details", "cachedTokens"),
+            "usage.input_tokens_details.cachedTokens",
+        ),
+        (
+            ("promptTokensDetails", "cached_tokens"),
+            "usage.promptTokensDetails.cached_tokens",
+        ),
+        (
+            ("promptTokensDetails", "cachedTokens"),
+            "usage.promptTokensDetails.cachedTokens",
+        ),
+        (
             ("inputTokensDetails", "cached_tokens"),
+            "usage.inputTokensDetails.cached_tokens",
+        ),
+        (
             ("inputTokensDetails", "cachedTokens"),
-        )
-    )
+            "usage.inputTokensDetails.cachedTokens",
+        ),
+    ):
+        if _has_nested_path(usage_obj, *path):
+            return source
+    return None
+
+
+def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
+    return _openai_style_cached_tokens_source(usage_obj) is not None
 
 
 def _usage_has_gemini_style_cached_content_field(usage_obj: Any) -> bool:
@@ -6764,8 +7621,9 @@ def _openai_cache_attempt_source(
 ) -> Optional[Tuple[str, str]]:
     if _request_contains_prompt_cache_key(request_body):
         return "prompt_cache_key_requested_without_hit", "request.prompt_cache_key"
-    if _usage_has_openai_style_cached_tokens_field(usage_obj):
-        return "cached_tokens_reported_zero", "usage.input_tokens_details.cached_tokens"
+    cached_tokens_source = _openai_style_cached_tokens_source(usage_obj)
+    if cached_tokens_source is not None:
+        return "cached_tokens_reported_zero", cached_tokens_source
     return None
 
 
@@ -7090,7 +7948,8 @@ def _resolve_provider_cache_state(
 
     request_has_cache_control = _request_contains_cache_control(request_body)
     request_has_cached_content = _request_contains_cached_content(request_body)
-    usage_has_openai_cached_tokens = _usage_has_openai_style_cached_tokens_field(usage_obj)
+    openai_cached_tokens_source = _openai_style_cached_tokens_source(usage_obj)
+    usage_has_openai_cached_tokens = openai_cached_tokens_source is not None
     usage_has_gemini_cached_content = _usage_has_gemini_style_cached_content_field(usage_obj)
     supports_prompt_caching = _supports_prompt_caching_safe(
         model=model,
@@ -7139,7 +7998,7 @@ def _resolve_provider_cache_state(
         elif usage_has_openai_cached_tokens:
             attempted = True
             miss_reason = miss_reason or "cached_tokens_reported_zero"
-            source = source or "usage.input_tokens_details.cached_tokens"
+            source = source or openai_cached_tokens_source
     elif provider_family == "gemini":
         if request_has_cached_content:
             attempted = True
@@ -8198,6 +9057,12 @@ def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
         return
 
     current_status = record.get("provider_cache_status")
+    if (
+        isinstance(current_status, str)
+        and current_status.strip()
+        and cache_state.get("status") == "not_attempted"
+    ):
+        return
     should_override = (
         not isinstance(current_status, str)
         or not current_status.strip()
@@ -8261,14 +9126,45 @@ def _normalize_session_runtime_identity_on_record(record: Dict[str, Any]) -> Non
     }
 
 
+_REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS = (
+    "harness",
+    "validation",
+)
+
+
+def _normalize_request_header_tenant_repository(value: Any) -> Optional[str]:
+    repository = _normalize_repository_identity(value)
+    if repository is None:
+        return None
+    normalized = repository.lower()
+    if any(
+        fragment in normalized
+        for fragment in _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS
+    ):
+        return "litellm"
+    if normalized.endswith("-dev") or "tenant" in normalized:
+        return None
+    return repository
+
+
 def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
     repository = _normalize_repository_identity(record.get("repository"))
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
     if repository is None:
-        metadata = record.get("metadata")
-        if isinstance(metadata, dict):
-            repository = _extract_repository_identity_from_metadata_sources(
-                ("record.metadata", metadata)
-            )
+        repository = _extract_repository_identity_from_metadata_sources(
+            ("record.metadata", metadata)
+        )
+    if repository is None and metadata.get("tenant_id_source") == "request_headers":
+        repository = (
+            _normalize_request_header_tenant_repository(record.get("tenant_id"))
+            or _normalize_request_header_tenant_repository(metadata.get("tenant_id"))
+        )
+        if repository is not None:
+            metadata = dict(metadata)
+            metadata.setdefault("repository_source", "tenant_id.request_headers")
+            record["metadata"] = metadata
     record["repository"] = repository
 
 
@@ -8321,6 +9217,26 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     metadata["usage_invalid_tool_call_count"] = int(
         record.get("invalid_tool_call_count") or 0
     )
+
+    metadata["usage_structured_output_attempted"] = bool(
+        record.get("structured_output_attempted")
+    )
+    metadata["usage_structured_output_failed"] = bool(
+        record.get("structured_output_failed")
+    )
+    for field, metadata_key in (
+        ("structured_output_mode", "usage_structured_output_mode"),
+        ("structured_output_schema_hash", "usage_structured_output_schema_hash"),
+        (
+            "structured_output_failure_reason",
+            "usage_structured_output_failure_reason",
+        ),
+    ):
+        value = _clean_non_empty_string(record.get(field))
+        if value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = value
 
     provider_family = _normalize_provider_cache_family(
         record.get("provider"),
@@ -8387,6 +9303,47 @@ def _normalize_invalid_tool_call_state_on_record(record: Dict[str, Any]) -> None
     record["invalid_tool_call_count"] = value if value is not None and value > 0 else 0
 
 
+def _normalize_structured_output_state_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    attempted_value = record.get("structured_output_attempted")
+    failed_value = record.get("structured_output_failed")
+    attempted = (
+        _metadata_bool(attempted_value)
+        if attempted_value is not None
+        else _metadata_bool(metadata.get("usage_structured_output_attempted"))
+    )
+    failed = (
+        _metadata_bool(failed_value)
+        if failed_value is not None
+        else _metadata_bool(metadata.get("usage_structured_output_failed"))
+    )
+    if failed:
+        attempted = True
+
+    record["structured_output_attempted"] = attempted
+    record["structured_output_failed"] = failed
+    record["structured_output_mode"] = _first_non_empty_string(
+        record.get("structured_output_mode"),
+        metadata.get("usage_structured_output_mode"),
+        metadata.get("structured_output_mode"),
+    )
+    record["structured_output_schema_hash"] = _first_non_empty_string(
+        record.get("structured_output_schema_hash"),
+        metadata.get("usage_structured_output_schema_hash"),
+        metadata.get("structured_output_schema_hash"),
+    )
+    record["structured_output_failure_reason"] = _first_non_empty_string(
+        record.get("structured_output_failure_reason"),
+        metadata.get("usage_structured_output_failure_reason"),
+        metadata.get("structured_output_failure_reason"),
+    )
+    if not failed:
+        record["structured_output_failure_reason"] = None
+
+
 def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
     derived_latency = _build_session_history_latency_breakdown(
         metadata=record.get("metadata"),
@@ -8404,6 +9361,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
     _normalize_invalid_tool_call_state_on_record(record)
+    _normalize_structured_output_state_on_record(record)
     _normalize_prompt_overhead_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
     _apply_claude_auto_review_identity_to_record(record)
@@ -9008,6 +9966,55 @@ def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
     ):
         if candidate is not None and str(candidate).strip():
             return str(candidate)
+
+    route_family = _first_non_empty_string(
+        metadata.get("passthrough_route_family"),
+        standard_metadata.get("passthrough_route_family"),
+    )
+    call_type = kwargs.get("call_type") or standard_logging_object.get("call_type")
+    should_fallback = (
+        call_type == "pass_through_endpoint"
+        or route_family is not None
+        or metadata.get("aawm_passthrough_endpoint_type") is not None
+        or metadata.get("aawm_stream_logging_endpoint_type") is not None
+    )
+    if not should_fallback:
+        return None
+
+    fallback_candidates = (
+        (
+            "metadata.google_adapter_session_id",
+            metadata.get("google_adapter_session_id"),
+            False,
+        ),
+        (
+            "standard_metadata.google_adapter_session_id",
+            standard_metadata.get("google_adapter_session_id"),
+            False,
+        ),
+        (
+            "litellm_params.litellm_trace_id",
+            litellm_params.get("litellm_trace_id"),
+            True,
+        ),
+        ("kwargs.litellm_trace_id", kwargs.get("litellm_trace_id"), True),
+        ("metadata.trace_id", metadata.get("trace_id"), True),
+        (
+            "standard_logging_object.trace_id",
+            standard_logging_object.get("trace_id"),
+            True,
+        ),
+        ("kwargs.litellm_call_id", kwargs.get("litellm_call_id"), True),
+    )
+    for source, candidate, synthetic in fallback_candidates:
+        if candidate is None or not str(candidate).strip():
+            continue
+        if isinstance(metadata, dict):
+            metadata.setdefault("session_id_source", source)
+            if synthetic:
+                metadata.setdefault("synthetic_session_id", True)
+                metadata.setdefault("synthetic_session_id_basis", source)
+        return str(candidate).strip()
     return None
 
 
@@ -9632,6 +10639,7 @@ def _extract_langfuse_session_id(
         trace.get("sessionId"),
         trace.get("session_id"),
         observation_metadata.get("session_id"),
+        observation_metadata.get("google_adapter_session_id"),
         _coerce_nested_session_id(observation_metadata.get("user_id")),
         _coerce_nested_session_id(observation_metadata.get("user_api_key_end_user_id")),
     ):
@@ -9642,12 +10650,36 @@ def _extract_langfuse_session_id(
                 return str(candidate).strip(), "trace.session_id"
             if candidate == observation_metadata.get("session_id"):
                 return str(candidate).strip(), "observation.metadata.session_id"
+            if candidate == observation_metadata.get("google_adapter_session_id"):
+                return (
+                    str(candidate).strip(),
+                    "observation.metadata.google_adapter_session_id",
+                )
             if candidate == _coerce_nested_session_id(observation_metadata.get("user_id")):
                 return str(candidate).strip(), "observation.metadata.user_id.session_id"
             return (
                 str(candidate).strip(),
                 "observation.metadata.user_api_key_end_user_id.session_id",
             )
+
+    route_family = observation_metadata.get("passthrough_route_family")
+    is_passthrough_trace = (
+        isinstance(route_family, str)
+        and bool(route_family.strip())
+        or observation_metadata.get("aawm_passthrough_endpoint_type") is not None
+        or observation_metadata.get("aawm_stream_logging_endpoint_type") is not None
+    )
+    if is_passthrough_trace:
+        for source, candidate in (
+            ("trace.id", trace.get("id")),
+            ("observation.traceId", observation_metadata.get("traceId")),
+        ):
+            if candidate is None or not str(candidate).strip():
+                continue
+            observation_metadata.setdefault("session_id_source", f"{source}.synthetic")
+            observation_metadata.setdefault("synthetic_session_id", True)
+            observation_metadata.setdefault("synthetic_session_id_basis", source)
+            return str(candidate).strip(), f"{source}.synthetic"
 
     return None, "missing"
 
@@ -9743,27 +10775,15 @@ def _infer_provider_from_langfuse_observation(
     observation: Dict[str, Any],
     metadata: Dict[str, Any],
 ) -> Optional[str]:
-    route_family = metadata.get("passthrough_route_family")
-    if isinstance(route_family, str) and route_family.strip():
-        route_lower = route_family.lower()
-        if "anthropic" in route_lower:
-            return "anthropic"
-        if "gemini" in route_lower:
-            return "gemini"
-        if "codex" in route_lower:
-            return "openai"
-        if "openai" in route_lower:
-            return "openai"
+    adapter_target_provider = _session_history_adapter_target_provider(metadata)
+    if adapter_target_provider is not None:
+        return adapter_target_provider
 
-    request_route = metadata.get("user_api_key_request_route")
-    if isinstance(request_route, str) and request_route.strip():
-        route_lower = request_route.lower()
-        if route_lower.startswith("/anthropic/"):
-            return "anthropic"
-        if "gemini" in route_lower:
-            return "gemini"
-        if route_lower.startswith("/v1/"):
-            return "openai"
+    route_provider = _session_history_provider_from_route_family(
+        metadata.get("passthrough_route_family")
+    )
+    if route_provider is not None:
+        return route_provider
 
     api_base = (
         metadata.get("api_base")
@@ -9779,22 +10799,20 @@ def _infer_provider_from_langfuse_observation(
         if "openai.com" in api_base_lower:
             return "openai"
 
-    model = observation.get("model")
-    if isinstance(model, str) and model.strip():
-        model_lower = model.lower()
-        if "claude" in model_lower:
-            return "anthropic"
-        if "gemini" in model_lower:
+    model = _session_history_adapter_model(metadata) or observation.get("model")
+    model_provider = _session_history_provider_from_model(model)
+    if model_provider is not None:
+        return model_provider
+
+    request_route = metadata.get("user_api_key_request_route")
+    if isinstance(request_route, str) and request_route.strip():
+        route_lower = request_route.lower()
+        if "gemini" in route_lower or "google" in route_lower:
             return "gemini"
-        if (
-            model_lower.startswith("gpt")
-            or model_lower.startswith("o1")
-            or model_lower.startswith("o3")
-            or model_lower.startswith("o4")
-            or "codex" in model_lower
-            or "text-embedding" in model_lower
-        ):
+        if route_lower.startswith("/v1/"):
             return "openai"
+        if route_lower.startswith("/anthropic/"):
+            return "anthropic"
 
     return _normalize_session_history_provider(
         metadata.get("custom_llm_provider"),
@@ -9888,6 +10906,10 @@ def _build_session_history_record_from_langfuse_trace_observation(
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_object)
     provider_reported_reasoning_tokens = reported_reasoning_tokens
     provider = _infer_provider_from_langfuse_observation(observation, metadata)
+    resolved_model = _first_non_empty_string(
+        _session_history_adapter_model(metadata),
+        observation.get("model"),
+    ) or ""
 
     output_payload = observation.get("output")
     permission_decision = _extract_claude_permission_check_decision_from_value(
@@ -9937,7 +10959,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
     estimated_reasoning_tokens = None
     if reported_reasoning_tokens is None and reasoning_present:
         estimated_reasoning_tokens = _estimate_reasoning_tokens(
-            model=str(observation.get("model") or ""),
+            model=resolved_model,
             reasoning_text=reasoning_text,
         )
     reasoning_tokens_source = _determine_reasoning_tokens_source(
@@ -9986,6 +11008,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         _extract_invalid_tool_call_count_from_request_body(request_body),
         _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
     )
+    structured_output_state = _detect_structured_output_request(request_body, metadata)
     tool_activity_summary = _summarize_tool_activity(tool_activity)
     agent_name, tenant_id = _extract_agent_context_from_langfuse_trace_observation(
         trace,
@@ -10022,7 +11045,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
     )
     provider_cache_state = _resolve_provider_cache_state(
         provider=provider,
-        model=str(observation.get("model") or ""),
+        model=resolved_model,
         usage_obj=usage_object,
         metadata=metadata,
         request_body=request_body,
@@ -10032,7 +11055,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         provider_cache_state.update(
             _compute_provider_cache_miss_cost_state(
                 provider_family=provider,
-                model=str(observation.get("model") or ""),
+                model=resolved_model,
                 usage_obj=usage_object,
                 cache_state=provider_cache_state,
                 metadata=metadata,
@@ -10079,7 +11102,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "trace_id": trace_id,
         "provider_response_id": _maybe_get(output_payload, "id"),
         "provider": provider,
-        "model": str(observation.get("model") or ""),
+        "model": resolved_model,
         "model_group": metadata.get("model_group"),
         "agent_name": agent_name,
         "tenant_id": tenant_id,
@@ -10117,6 +11140,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         ),
         "tool_call_count": tool_call_count,
         "invalid_tool_call_count": invalid_tool_call_count,
+        **structured_output_state,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
@@ -10421,6 +11445,7 @@ def _resolve_session_history_model(
         standard_logging_object.get("model"),
         _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
         _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body", "model"),
+        _session_history_adapter_model(metadata),
         metadata.get("anthropic_adapter_model"),
         metadata.get("codex_adapter_model"),
         metadata.get("model"),
@@ -10618,6 +11643,7 @@ def _build_session_history_record(
         _extract_invalid_tool_call_count_from_request_body(request_body),
         _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
     )
+    structured_output_state = _detect_structured_output_request(request_body, metadata)
     agent_name, tenant_id = _extract_agent_context(kwargs)
     explicit_tenant_id, tenant_source = _extract_tenant_identity_from_kwargs(
         kwargs,
@@ -10813,6 +11839,7 @@ def _build_session_history_record(
         ),
         "tool_call_count": tool_call_count,
         "invalid_tool_call_count": invalid_tool_call_count,
+        **structured_output_state,
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
@@ -10899,38 +11926,9 @@ async def _ensure_session_history_schema(conn: Any) -> None:
         if _aawm_session_history_schema_ready:
             return
 
-        await conn.execute(_AAWM_SESSION_HISTORY_TABLE_SQL)
-        for statement in _AAWM_SESSION_HISTORY_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_SESSION_HISTORY_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL)
-        for statement in _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_RATE_LIMIT_OBSERVATIONS_TABLE_SQL)
-        for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL)
-        for statement in _AAWM_RATE_LIMIT_INTERVALS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL)
-        for statement in _AAWM_RATE_LIMIT_TRANSITIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_PROVIDER_ERROR_OBSERVATIONS_TABLE_SQL)
-        for statement in _AAWM_PROVIDER_ERROR_OBSERVATIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_PROVIDER_ERROR_OBSERVATIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-        await conn.execute(_AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL)
-        for statement in _AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS:
-            await conn.execute(statement)
-        for statement in _AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS:
-            await conn.execute(statement)
-
+        # Schema changes are migration-owned. The callback must not mutate,
+        # recreate, or drop database structures at request/write time.
+        _ = conn
         _aawm_session_history_schema_ready = True
 
 
@@ -11004,6 +12002,11 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("llm_upstream_stream_ms"),
         record.get("latency_unclassified_ms"),
         record.get(_SESSION_HISTORY_PREVIOUS_GAP_FIELD),
+        record.get("structured_output_attempted", False),
+        record.get("structured_output_failed", False),
+        record.get("structured_output_mode"),
+        record.get("structured_output_schema_hash"),
+        record.get("structured_output_failure_reason"),
     )
 
 
@@ -11465,12 +12468,16 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
                     tool_activity_payloads,
                 )
 
+        openrouter_free_daily_observations = (
+            await _build_openrouter_free_daily_observations_for_records(conn, [record])
+        )
         observations = record.get("rate_limit_observations")
         rate_limit_observations = [
             observation
             for observation in observations
             if isinstance(observation, dict)
         ] if isinstance(observations, list) else []
+        rate_limit_observations.extend(openrouter_free_daily_observations)
         if rate_limit_observations:
             (
                 rate_limit_observations,
@@ -11553,6 +12560,12 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
             )
+        openrouter_free_daily_observations = (
+            await _build_openrouter_free_daily_observations_for_records(
+                conn,
+                history_records,
+            )
+        )
         rate_limit_observations: List[Dict[str, Any]] = []
         for record in records:
             observations = record.get("rate_limit_observations")
@@ -11562,6 +12575,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
                     for observation in observations
                     if isinstance(observation, dict)
                 )
+        rate_limit_observations.extend(openrouter_free_daily_observations)
         if rate_limit_observations:
             (
                 rate_limit_observations,

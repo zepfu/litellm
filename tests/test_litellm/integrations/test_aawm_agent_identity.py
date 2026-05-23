@@ -1,3 +1,4 @@
+import inspect
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -713,6 +714,39 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
     assert record["session_id"] == "session-from-header"
 
 
+def test_build_session_history_record_uses_synthetic_passthrough_session_id() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-synthetic-session"
+    kwargs["litellm_params"]["metadata"].update(
+        {"passthrough_route_family": "codex_responses"}
+    )
+
+    result = {
+        "id": "resp-synthetic-session",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-05-23T03:00:00Z",
+        end_time="2026-05-23T03:00:01Z",
+    )
+
+    assert record is not None
+    assert record["session_id"] == "call-synthetic-session"
+    assert record["metadata"]["session_id_source"] == "kwargs.litellm_call_id"
+    assert record["metadata"]["synthetic_session_id"] is True
+    assert (
+        record["metadata"]["synthetic_session_id_basis"]
+        == "kwargs.litellm_call_id"
+    )
+
+
 def test_build_session_history_record_aliases_permission_check_after_cost() -> None:
     kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
     kwargs["model"] = "claude-opus-4-7"
@@ -981,6 +1015,76 @@ def test_build_session_history_record_rejects_invalid_repository_metadata() -> N
     assert record["tenant_id"] == "aegis"
     assert "repository" not in record["metadata"]
     assert record["metadata"]["tenant_id"] == "aegis"
+
+
+def test_build_session_history_record_uses_request_header_tenant_as_repository_fallback() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/qwen/qwen3.5-flash-02-23"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-request-tenant-repository"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-request-tenant-repository"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-aawm-tenant-id": "aawm-tap"}
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    result = {
+        "id": "resp-request-tenant-repository",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["tenant_id"] == "aawm-tap"
+    assert record["repository"] == "aawm-tap"
+    assert record["metadata"]["repository"] == "aawm-tap"
+    assert record["metadata"]["repository_source"] == "tenant_id.request_headers"
+
+
+@pytest.mark.parametrize(
+    "tenant_id",
+    ["adapter-harness-tenant", "tenant-openrouter-validation"],
+)
+def test_build_session_history_record_maps_harness_tenant_to_litellm_repository(
+    tenant_id: str,
+) -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/qwen/qwen3.5-flash-02-23"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = f"call-request-{tenant_id}"
+    kwargs["litellm_params"]["metadata"]["session_id"] = f"session-request-{tenant_id}"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-aawm-tenant-id": tenant_id}
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    result = {
+        "id": f"resp-request-{tenant_id}",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["tenant_id"] == tenant_id
+    assert record["repository"] == "litellm"
+    assert record["metadata"]["repository"] == "litellm"
+    assert record["metadata"]["repository_source"] == "tenant_id.request_headers"
 
 
 def test_build_session_history_record_uses_claude_project_over_agent_repository_noise() -> None:
@@ -1834,6 +1938,61 @@ def test_build_session_history_record_counts_invalid_tool_call_results() -> None
     assert payload[29] == 1
 
 
+def test_build_session_history_record_tracks_structured_output_request() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-structured-output"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-structured-output"
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [{"role": "user", "content": "Return JSON."}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "astronomy_ingest_result",
+                "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+    result = {
+        "id": "resp-structured-output",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": '{"ok":true}'}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["structured_output_attempted"] is True
+    assert record["structured_output_failed"] is False
+    assert record["structured_output_mode"] == "json_schema"
+    assert len(record["structured_output_schema_hash"]) == 64
+    assert record["structured_output_failure_reason"] is None
+    assert record["metadata"]["usage_structured_output_attempted"] is True
+    assert record["metadata"]["usage_structured_output_failed"] is False
+    assert record["metadata"]["usage_structured_output_mode"] == "json_schema"
+
+    payload = _build_session_history_db_payload(record)
+    assert len(payload) == 72
+    assert payload[67] is True
+    assert payload[68] is False
+    assert payload[69] == "json_schema"
+    assert payload[70] == record["structured_output_schema_hash"]
+    assert payload[71] is None
+
+
 def test_build_session_history_record_omits_empty_read_pages_from_tool_activity() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.5"
@@ -2007,7 +2166,7 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 67
+    assert len(payload) == 72
     assert payload[57] == pytest.approx(25.0)
     assert payload[58] == pytest.approx(100.0)
     assert payload[59] == pytest.approx(130.0)
@@ -3336,6 +3495,41 @@ def test_build_session_history_record_marks_openai_provider_cache_miss_from_zero
     assert record["provider_cache_miss_cost_usd"] > 0
 
 
+def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_prompt_tokens_details() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/inclusionai/ling-2.6-flash"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-openrouter-cache-miss"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-cache-miss"
+
+    result = {
+        "id": "provider-response-openrouter-cache-miss",
+        "usage": {
+            "prompt_tokens": 2048,
+            "completion_tokens": 8,
+            "total_tokens": 2056,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        },
+        "choices": [{"message": {"role": "assistant", "content": "plain output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "cached_tokens_reported_zero"
+    assert record["provider_cache_miss_token_count"] == 2048
+
+
 def test_build_session_history_record_tracks_git_global_option_commit_and_push() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -3436,7 +3630,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 67
+    assert len(payload) == 72
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -3445,7 +3639,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
     assert payload[29] == 0
     assert payload[36] == "dev"
     assert payload[37] == "1.82.3+aawm.25"
-    assert payload[57:] == (
+    assert payload[57:67] == (
         None,
         None,
         None,
@@ -3457,6 +3651,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
         None,
         None,
     )
+    assert payload[67:] == (False, False, None, None, None)
     assert payload[38] == "aawm.25"
     assert "aawm-litellm-callbacks" in payload[39]
     assert payload[40] == "codex-tui"
@@ -4043,6 +4238,74 @@ def test_build_session_history_record_marks_gemini_cache_miss_from_intent_metada
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "cache_attempted_without_hit"
     assert record["provider_cache_miss_token_count"] == 1536
+
+
+@pytest.mark.parametrize(
+    ("model", "target_tag", "expected_provider"),
+    [
+        (
+            "unknown",
+            "anthropic-adapter-target:google:/v1internal:streamGenerateContent",
+            "gemini",
+        ),
+        (
+            "gpt-oss-20b:free",
+            "anthropic-adapter-target:openrouter:/v1/responses",
+            "openrouter",
+        ),
+        (
+            "gpt-5.4-mini",
+            "anthropic-adapter-target:responses",
+            "openai",
+        ),
+    ],
+)
+def test_build_session_history_record_uses_adapter_target_over_anthropic_ingress(
+    model: str,
+    target_tag: str,
+    expected_provider: str,
+) -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = model
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = (
+        f"call-adapter-target-{expected_provider}-{model.replace('/', '-')}"
+    )
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": f"session-adapter-target-{expected_provider}",
+            "request_tags": [
+                "anthropic-adapter-model:gemini-3-flash-preview"
+                if model == "unknown"
+                else f"anthropic-adapter-model:{model}",
+                target_tag,
+            ],
+            "user_api_key_request_route": "/anthropic/v1/messages",
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": f"provider-response-adapter-target-{expected_provider}",
+            "usage": {
+                "prompt_tokens": 42,
+                "completion_tokens": 8,
+                "total_tokens": 50,
+            },
+            "choices": [
+                {"message": {"role": "assistant", "content": "adapter output"}}
+            ],
+        },
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == expected_provider
+    if model == "unknown":
+        assert record["model"] == "gemini-3-flash-preview"
 
 
 def test_build_session_history_record_uses_codex_google_code_assist_metadata() -> None:
@@ -5124,16 +5387,92 @@ def test_build_rate_limit_observations_skips_invalid_grok_billing_limit() -> Non
     assert observations == []
 
 
-def test_rate_limit_intervals_materialized_view_includes_xai_requests() -> None:
-    sql = aawm_agent_identity._AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL
+def test_build_rate_limit_observations_extracts_openrouter_free_429() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "openrouter/deepseek/deepseek-v4-flash:free"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["litellm_call_id"] = "call-openrouter-free-429"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openrouter-free-429",
+            "passthrough_route_family": "anthropic_openrouter_responses_adapter",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "openrouter/deepseek/deepseek-v4-flash:free",
+        "input": "hello",
+    }
+    error = RuntimeError("OpenRouter free model daily rate limit reached")
+    error.status_code = 429
+    error.headers = {"retry-after": "120"}
+    end_time = datetime(2026, 5, 17, 23, 58, tzinfo=timezone.utc)
 
-    assert "provider IN ('openai', 'anthropic', 'google', 'xai')" in sql
-    assert "WHEN provider = 'xai'" in sql
-    assert "COALESCE(NULLIF(model, ''), 'grok-build')" in sql
-    assert "AND remaining_pct < 100" in sql
-    assert "LAG(remaining_pct) OVER rate_limit_window" in sql
-    assert "previous_remaining_pct IS DISTINCT FROM remaining_pct" in sql
-    assert "MIN(observed_at) AS fromDate" not in sql
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=error,
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["source"] == "openrouter_free_daily_local_meter"
+    assert observation["provider"] == "openrouter"
+    assert observation["client_family"] == "openrouter"
+    assert observation["quota_type"] == "requests"
+    assert observation["quota_period"] == "daily"
+    assert observation["limit_scope"] == "requests"
+    assert observation["status"] == "quota_exhausted"
+    assert observation["exhausted"] is True
+    assert observation["remaining_pct"] == 0.0
+    assert observation["used_percentage"] == 100.0
+    assert observation["provider_resets_at"] == datetime(
+        2026,
+        5,
+        18,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+    assert observation["reset_hint_seconds"] == 120
+
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+        observation
+    )
+    assert payload[4] == "openrouter"
+    assert payload[5] is None
+    assert payload[6] == "openrouter_free_daily_requests:requests"
+    assert payload[8] == "requests"
+    assert payload[10] == 0.0
+
+
+def test_aawm_callback_does_not_embed_rate_limit_intervals_mview_ddl() -> None:
+    source = inspect.getsource(aawm_agent_identity)
+
+    assert not hasattr(
+        aawm_agent_identity,
+        "_AAWM_RATE_LIMIT_INTERVALS_MATERIALIZED_VIEW_SQL",
+    )
+    assert not hasattr(aawm_agent_identity, "_AAWM_RATE_LIMIT_INTERVALS_DROP_STALE_SQL")
+    assert "CREATE MATERIALIZED VIEW IF NOT EXISTS public.rate_limit_intervals" not in source
+    assert "DROP MATERIALIZED VIEW public.rate_limit_intervals" not in source
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_history_schema_does_not_execute_runtime_ddl(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_schema_ready",
+        False,
+    )
+    mock_conn = AsyncMock()
+
+    await aawm_agent_identity._ensure_session_history_schema(mock_conn)
+
+    mock_conn.execute.assert_not_called()
+    assert aawm_agent_identity._aawm_session_history_schema_ready is True
 
 
 def test_provider_status_observations_schema_includes_icmp_fields() -> None:
@@ -5306,6 +5645,89 @@ def test_build_provider_error_observation_uses_auto_review_logical_model() -> No
     assert observation["metadata"]["source_model"] == "claude-opus-4-7"
     assert observation["metadata"]["logical_model"] == "claude-auto-review"
     assert observation["metadata"]["trace_name"] == "claude-code.auto-reviewer"
+
+
+def test_failure_record_persists_structured_output_failure_in_session_history() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-structured-output-failure"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-structured-output-failure"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [{"role": "user", "content": "Return JSON."}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "astronomy_ingest_result",
+                "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                },
+            },
+        },
+    }
+
+    record = aawm_agent_identity._build_failure_observation_only_record(
+        kwargs=kwargs,
+        result={
+            "error": {
+                "code": "schema_validation_failed",
+                "message": "Structured output did not match json_schema.",
+            }
+        },
+        start_time="2026-05-21T12:00:00Z",
+        end_time="2026-05-21T12:00:01Z",
+    )
+
+    assert record is not None
+    assert record.get("_skip_session_history") is not True
+    assert record["structured_output_attempted"] is True
+    assert record["structured_output_failed"] is True
+    assert record["structured_output_failure_reason"] == "schema_validation_error"
+    assert record["metadata"]["usage_structured_output_failed"] is True
+    assert record["provider_error_observations"][0]["metadata"][
+        "structured_output_failed"
+    ] is True
+
+    payload = _build_session_history_db_payload(record)
+    assert payload[67] is True
+    assert payload[68] is True
+    assert payload[71] == "schema_validation_error"
+
+
+def test_failure_record_persists_structured_output_attempt_for_unrelated_error() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-structured-output-rate-limit"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-structured-output-rate-limit"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [{"role": "user", "content": "Return JSON."}],
+        "response_format": {"type": "json_object"},
+    }
+
+    record = aawm_agent_identity._build_failure_observation_only_record(
+        kwargs=kwargs,
+        result={"error": {"code": "rate_limit_exceeded", "message": "Too many requests"}},
+        start_time="2026-05-21T12:00:00Z",
+        end_time="2026-05-21T12:00:01Z",
+    )
+
+    assert record is not None
+    assert record.get("_skip_session_history") is not True
+    assert record["structured_output_attempted"] is True
+    assert record["structured_output_failed"] is False
+    assert record["structured_output_failure_reason"] is None
+    assert record["provider_error_observations"][0]["metadata"][
+        "structured_output_failed"
+    ] is False
 
 
 def test_log_failure_event_enqueues_provider_error_without_quota(monkeypatch) -> None:
@@ -5662,7 +6084,7 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert mock_conn.execute.await_count == 2
     executed_args = mock_conn.execute.await_args_list[0].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 67
+    assert len(executed_args[1:]) == 72
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
@@ -5676,6 +6098,82 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert fake_pool.acquire_contexts[0].enter_count == 1
     assert fake_pool.acquire_contexts[0].exit_count == 1
     mock_conn.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_session_history_record_writes_openrouter_free_daily_meter(
+    monkeypatch,
+) -> None:
+    end_time = datetime(2026, 5, 17, 23, 58, tzinfo=timezone.utc)
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "openrouter/deepseek/deepseek-v4-flash:free"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "responses"
+    kwargs["litellm_call_id"] = "call-openrouter-free-success"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openrouter-free-success",
+            "passthrough_route_family": "anthropic_openrouter_responses_adapter",
+            "client_name": "codex",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "openrouter/deepseek/deepseek-v4-flash:free",
+        "input": "hello",
+    }
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-openrouter-free-success",
+            "model": "openrouter/deepseek/deepseek-v4-flash:free",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+            },
+        },
+        start_time=end_time,
+        end_time=end_time,
+        allow_runtime_identity=False,
+    )
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"].endswith(":free")
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchval.return_value = 251
+    mock_conn.fetchrow.return_value = None
+    fake_pool = _FakePool(mock_conn)
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+
+    await _persist_session_history_record(record)
+
+    mock_conn.fetchval.assert_awaited_once()
+    count_args = mock_conn.fetchval.await_args.args
+    assert "FROM public.session_history" in count_args[0]
+    assert count_args[1] == datetime(2026, 5, 17, tzinfo=timezone.utc)
+    assert count_args[2] == datetime(2026, 5, 18, tzinfo=timezone.utc)
+    mock_conn.fetchrow.assert_awaited_once()
+    observation_args = mock_conn.executemany.await_args.args
+    assert "INSERT INTO public.rate_limit_observations" in observation_args[0]
+    payload = observation_args[1][0]
+    assert payload[4] == "openrouter"
+    assert payload[5] is None
+    assert payload[6] == "openrouter_free_daily_requests:requests"
+    assert payload[7] == "daily"
+    assert payload[8] == "requests"
+    assert payload[9] == datetime(2026, 5, 18, tzinfo=timezone.utc)
+    assert payload[10] == pytest.approx(74.9)
+    assert payload[11] == "openrouter_free_daily_local_meter"
+    assert payload[12] == "session-openrouter-free-success"
+    assert payload[14] == "call-openrouter-free-success"
 
 
 def test_build_session_history_record_from_spend_log_row_recovers_real_session_id() -> None:
@@ -6030,6 +6528,37 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["metadata"]["session_id_source"] == "trace.sessionId"
     assert record["metadata"]["trace_id_source"] == "trace.id"
     assert "route:anthropic_messages" in record["metadata"]["request_tags"]
+
+
+def test_build_session_history_record_from_langfuse_passthrough_uses_synthetic_session_id() -> None:
+    trace = {
+        "id": "trace-no-session",
+        "name": "litellm-pass_through_endpoint",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "call-no-session",
+        "traceId": "trace-no-session",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.5",
+        "startTime": "2026-05-23T03:00:00Z",
+        "endTime": "2026-05-23T03:00:01Z",
+        "usageDetails": {"input": 10, "output": 2, "total": 12},
+        "metadata": {"passthrough_route_family": "codex_responses"},
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-synthetic",
+    )
+
+    assert record is not None
+    assert record["session_id"] == "trace-no-session"
+    assert record["metadata"]["session_id_source"] == "trace.id.synthetic"
+    assert record["metadata"]["synthetic_session_id"] is True
+    assert record["metadata"]["synthetic_session_id_basis"] == "trace.id"
 
 
 def test_build_session_history_record_from_langfuse_observation_counts_invalid_tool_results() -> None:
@@ -6419,6 +6948,56 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_gemin
     assert record["reasoning_present"] is True
 
 
+def test_build_session_history_record_from_langfuse_uses_adapter_target_over_anthropic_route() -> None:
+    trace = {
+        "id": "trace-adapter-gemini",
+        "name": "claude-code.gemini-3-flash-preview",
+        "sessionId": "session-adapter-gemini",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-adapter-gemini",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "unknown",
+        "startTime": "2026-04-17T14:00:00Z",
+        "endTime": "2026-04-17T14:00:02Z",
+        "usage": {
+            "input": 20,
+            "output": 15,
+            "total": 35,
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "gemini flash result",
+                    }
+                }
+            ]
+        },
+        "metadata": {
+            "user_api_key_request_route": "/anthropic/v1/messages",
+            "request_tags": [
+                "anthropic-adapter-model:gemini-3-flash-preview",
+                "anthropic-adapter-target:google:/v1internal:streamGenerateContent",
+            ],
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-adapter-gemini",
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["model"] == "gemini-3-flash-preview"
+    assert record["call_type"] == "/anthropic/v1/messages"
+
+
 def test_build_session_history_record_from_langfuse_trace_observation_sets_not_applicable_reasoning_source_when_absent() -> None:
     trace = {
         "id": "trace-no-reasoning",
@@ -6712,7 +7291,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
-    assert len(history_args[1][0]) == 67
+    assert len(history_args[1][0]) == 72
     assert history_args[1][0][0] == "call-1"
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
@@ -7012,6 +7591,28 @@ def test_provider_error_observation_insert_sql_dedupes_litellm_call_id() -> None
     assert "existing.provider IS NOT DISTINCT FROM $3::text" in sql
     assert "existing.route_family IS NOT DISTINCT FROM $6::text" in sql
     assert "existing.status_code IS NOT DISTINCT FROM $7::integer" in sql
+
+
+def test_session_history_upsert_sql_guards_scalar_tool_names() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
+
+    assert "jsonb_typeof(EXCLUDED.tool_names) = 'array'" in sql
+    assert "jsonb_typeof(session_history.tool_names) = 'array'" in sql
+
+
+def test_tool_activity_upsert_sql_guards_scalar_file_paths() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL
+
+    assert "jsonb_typeof(EXCLUDED.file_paths_read) = 'array'" in sql
+    assert (
+        "jsonb_typeof(session_history_tool_activity.file_paths_read) = 'array'"
+        in sql
+    )
+    assert "jsonb_typeof(EXCLUDED.file_paths_modified) = 'array'" in sql
+    assert (
+        "jsonb_typeof(session_history_tool_activity.file_paths_modified) = 'array'"
+        in sql
+    )
 
 
 def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() -> None:

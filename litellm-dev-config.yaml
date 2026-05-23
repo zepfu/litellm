@@ -105,6 +105,20 @@ model_list:
       api_base: "https://openrouter.ai/api/v1"
     model_info:
       mode: chat
+  - model_name: "deepseek/deepseek-v4-flash:free"
+    litellm_params:
+      model: "openrouter/deepseek/deepseek-v4-flash:free"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: "os.environ/AAWM_OPENROUTER_API_KEY"
+    model_info:
+      mode: chat
+  - model_name: "openrouter/inclusionai/ling-2.6-flash"
+    litellm_params:
+      model: "openrouter/inclusionai/ling-2.6-flash"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: "os.environ/AAWM_OPENROUTER_API_KEY"
+    model_info:
+      mode: chat
   - model_name: "openrouter/*"
     litellm_params:
       model: "openrouter/*"

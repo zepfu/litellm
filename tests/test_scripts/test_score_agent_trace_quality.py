@@ -21,6 +21,7 @@ def _candidate(**overrides: object) -> scorer.SessionCandidate:
         "input_tokens": 53874,
         "output_tokens": 3,
         "tool_call_count": 0,
+        "invalid_tool_call_count": 0,
         "metadata": {},
     }
     values.update(overrides)
@@ -369,6 +370,23 @@ def test_should_detect_openai_tool_role_error_payload_and_preserve_quality() -> 
     ]
     assert evidence.trace_quality_score == 1.0
     assert evidence.reasons == ["invalid_tool_call_error_seen"]
+
+
+def test_should_use_session_history_invalid_tool_count_when_payload_missing() -> None:
+    evidence = scorer.score_candidate(
+        _candidate(invalid_tool_call_count=2),
+        None,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.invalid_tool_call_error_count == 2
+    assert evidence.invalid_tool_call_error_markers == [
+        "session_history_invalid_tool_call_count"
+    ]
+    assert evidence.reasons == ["invalid_tool_call_error_seen"]
+    assert evidence.errors == ["missing_observation_payload", "missing_request_messages"]
 
 
 def test_should_build_stable_langfuse_score_payloads() -> None:
