@@ -5,14 +5,15 @@
 - Promoted the `aawm.59` session-history and OpenRouter `:free` release line to prod.
 
   Release:
-  `main` and `origin/develop` point at
-  `d9ca00b2f89c385c50cb563ece9e9e42de5042ab`, tagged
+  release code commit `d9ca00b2f89c385c50cb563ece9e9e42de5042ab` is tagged
   `v1.82.3-aawm.59`, and the published fork image is
   `ghcr.io/zepfu/litellm:1.82.3-aawm.59`. The current overlay releases are
   `cb-v0.0.35` (`aawm_litellm_callbacks-0.0.35-py3-none-any.whl`),
   `cfg-v0.0.13` (`litellm-model-config-0.0.13.tar.gz`),
   `h-v0.0.31` (`litellm-local-ci-harness-0.0.31.tar.gz`), and existing
-  control-plane `cp-v0.0.7`.
+  control-plane `cp-v0.0.7`. Closeout docs commit
+  `ac8b6a5f5313ac5efd70cedb2afa6d3731c23bd5` is pushed to both
+  `origin/main` and `origin/develop`.
 
   Infrastructure:
   `/home/zepfu/projects/aawm-infrastructure` commit
