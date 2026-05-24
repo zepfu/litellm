@@ -1492,6 +1492,14 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "thinking_signature_present",
     "usage_reasoning_tokens_reported",
     "usage_reasoning_tokens_source",
+    "usage_token_count_response",
+    "aawm_rate_limit_observation_only",
+    "session_history_usage_record",
+    "session_history_zero_token_class",
+    "d1_140_zero_token_class",
+    "d1_140_zero_token_reason",
+    "gemini_control_plane_excluded",
+    "gemini_control_plane_method",
     "reasoning_effort_requested",
     "reasoning_effort_source",
     "reasoning_effort_native_provider",
@@ -6540,8 +6548,9 @@ def _build_usage_object_from_metadata(metadata: Dict[str, Any]) -> Optional[Dict
         return None
 
     usage_object = metadata.get("usage_object")
-    if isinstance(usage_object, dict) and usage_object:
-        return dict(usage_object)
+    reconstructed: Dict[str, Any] = (
+        dict(usage_object) if isinstance(usage_object, dict) and usage_object else {}
+    )
 
     input_tokens = _safe_int(metadata.get("usage_input_tokens"))
     output_tokens = _safe_int(metadata.get("usage_output_tokens"))
@@ -6561,9 +6570,8 @@ def _build_usage_object_from_metadata(metadata: Dict[str, Any]) -> Optional[Dict
             reasoning_tokens_reported,
         )
     ):
-        return None
+        return reconstructed or None
 
-    reconstructed: Dict[str, Any] = {}
     if input_tokens is not None:
         reconstructed["input_tokens"] = input_tokens
         reconstructed["prompt_tokens"] = input_tokens
@@ -6586,6 +6594,162 @@ def _build_usage_object_from_metadata(metadata: Dict[str, Any]) -> Optional[Dict
         reconstructed["output_tokens_details"] = output_tokens_details
 
     return reconstructed or None
+
+
+def _build_usage_object_from_token_count_payload(
+    output_payload: Any,
+) -> Optional[Dict[str, Any]]:
+    if isinstance(output_payload, str):
+        parsed_payload = _maybe_parse_json_text(output_payload)
+        if parsed_payload is None:
+            return None
+        return _build_usage_object_from_token_count_payload(parsed_payload)
+
+    if not isinstance(output_payload, dict):
+        return None
+
+    input_tokens = _safe_int(
+        _first_non_none(
+            output_payload.get("prompt_tokens"),
+            output_payload.get("input_tokens"),
+            output_payload.get("inputTokens"),
+        )
+    )
+    output_tokens = _safe_int(
+        _first_non_none(
+            output_payload.get("completion_tokens"),
+            output_payload.get("output_tokens"),
+            output_payload.get("outputTokens"),
+        )
+    )
+    total_tokens = _safe_int(
+        _first_non_none(
+            output_payload.get("total_tokens"),
+            output_payload.get("totalTokens"),
+            output_payload.get("total"),
+        )
+    )
+
+    if input_tokens is None and output_tokens is None and total_tokens is None:
+        return None
+
+    usage_object: Dict[str, Any] = {}
+    usage_object["token_count_response"] = True
+    if input_tokens is not None:
+        usage_object["prompt_tokens"] = input_tokens
+        usage_object["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        usage_object["completion_tokens"] = output_tokens
+        usage_object["output_tokens"] = output_tokens
+    if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+    if total_tokens is not None:
+        usage_object["total_tokens"] = total_tokens
+
+    return usage_object or None
+
+
+def _extract_responses_completed_response_from_langfuse_output(
+    output_payload: Any,
+) -> Optional[Dict[str, Any]]:
+    raw_text = output_payload
+    if isinstance(output_payload, dict):
+        if isinstance(output_payload.get("response"), dict):
+            return output_payload["response"]
+        if isinstance(output_payload.get("raw_output"), str):
+            raw_text = output_payload["raw_output"]
+
+    completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
+        raw_text
+    )
+    if not isinstance(completed_payload, dict):
+        return None
+    response_payload = completed_payload.get("response")
+    return response_payload if isinstance(response_payload, dict) else None
+
+
+def _build_usage_object_from_langfuse_output(output_payload: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(output_payload, dict):
+        usage = output_payload.get("usage")
+        if isinstance(usage, dict) and usage:
+            return dict(usage)
+
+    token_count_usage = _build_usage_object_from_token_count_payload(output_payload)
+    if token_count_usage is not None:
+        return token_count_usage
+
+    response_payload = _extract_responses_completed_response_from_langfuse_output(
+        output_payload
+    )
+    if not isinstance(response_payload, dict):
+        return None
+    usage = response_payload.get("usage")
+    return dict(usage) if isinstance(usage, dict) and usage else None
+
+
+def _extract_codex_model_from_response_headers(metadata: Dict[str, Any]) -> Optional[str]:
+    headers = metadata.get("codex_response_headers")
+    if not isinstance(headers, dict):
+        return None
+
+    limit_name = _clean_non_empty_string(
+        _get_rate_limit_header_value(headers, "x-codex-bengalfox-limit-name")
+    )
+    if not limit_name:
+        return None
+
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", limit_name.lower()).strip("-")
+    if normalized.startswith("gpt-") and "codex" in normalized:
+        return normalized
+    return None
+
+
+def _session_history_metadata_model(metadata: Dict[str, Any]) -> Optional[str]:
+    hidden_params = metadata.get("hidden_params")
+    return _first_known_model_string(
+        metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("codex_adapter_model"),
+        metadata.get("litellm_model"),
+        metadata.get("model"),
+        _maybe_get(hidden_params, "model"),
+    )
+
+
+def _extract_model_from_langfuse_input(input_payload: Any) -> Optional[str]:
+    request_body = _extract_request_body_from_langfuse_input(input_payload)
+    if not isinstance(request_body, dict):
+        return None
+    body = request_body.get("body")
+    return _first_known_model_string(
+        request_body.get("model"),
+        _maybe_get(body, "model"),
+    )
+
+
+def _extract_model_from_langfuse_output(output_payload: Any) -> Optional[str]:
+    if isinstance(output_payload, dict):
+        model = output_payload.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+
+    response_payload = _extract_responses_completed_response_from_langfuse_output(
+        output_payload
+    )
+    model = _maybe_get(response_payload, "model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return None
+
+
+def _first_known_model_string(*candidates: Any) -> Optional[str]:
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = candidate.strip()
+        if not cleaned or cleaned.lower() in {"unknown", "none", "null"}:
+            continue
+        return cleaned
+    return None
 
 
 def _coerce_usage_object_to_dict(usage_obj: Any) -> Optional[Dict[str, Any]]:
@@ -6665,6 +6829,21 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
     if usage_obj is not None:
         return _merge_usage_object_with_metadata(usage_obj, metadata_usage_object)
 
+    token_count_usage = _build_usage_object_from_token_count_payload(result)
+    if token_count_usage is not None:
+        return _merge_usage_object_with_metadata(
+            token_count_usage,
+            metadata_usage_object,
+        )
+    token_count_usage = _build_usage_object_from_token_count_payload(
+        _maybe_get(result, "response")
+    )
+    if token_count_usage is not None:
+        return _merge_usage_object_with_metadata(
+            token_count_usage,
+            metadata_usage_object,
+        )
+
     meta_obj = _maybe_get(result, "meta")
     billed_units = _maybe_get(meta_obj, "billed_units")
     token_units = _maybe_get(meta_obj, "tokens")
@@ -6704,6 +6883,20 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
                 response["usage"],
                 metadata_usage_object,
             )
+        token_count_usage = _build_usage_object_from_token_count_payload(response)
+        if token_count_usage is not None:
+            return _merge_usage_object_with_metadata(
+                token_count_usage,
+                metadata_usage_object,
+            )
+        token_count_usage = _build_usage_object_from_token_count_payload(
+            standard_logging_object.get("output")
+        )
+        if token_count_usage is not None:
+            return _merge_usage_object_with_metadata(
+                token_count_usage,
+                metadata_usage_object,
+            )
 
     if metadata_usage_object is not None:
         return metadata_usage_object
@@ -6721,6 +6914,49 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
                 )
 
     return None
+
+
+def _enrich_token_count_usage_metadata(kwargs: Dict[str, Any], result: Any) -> None:
+    metadata = _ensure_mutable_metadata(kwargs)
+    standard_logging_object = kwargs.get("standard_logging_object")
+    if not isinstance(standard_logging_object, dict):
+        standard_logging_object = {}
+
+    passthrough_logging_payload = kwargs.get("passthrough_logging_payload")
+    standard_passthrough_logging_payload = kwargs.get(
+        "standard_pass_through_logging_payload"
+    )
+    candidates = (
+        result,
+        _maybe_get(result, "response"),
+        standard_logging_object.get("response"),
+        standard_logging_object.get("output"),
+        _maybe_get_path(passthrough_logging_payload, "response_body"),
+        _maybe_get_path(passthrough_logging_payload, "response"),
+        _maybe_get_path(standard_passthrough_logging_payload, "response_body"),
+        _maybe_get_path(standard_passthrough_logging_payload, "response"),
+    )
+
+    token_count_usage: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        token_count_usage = _build_usage_object_from_token_count_payload(candidate)
+        if token_count_usage is not None:
+            break
+    if token_count_usage is None:
+        return
+
+    prompt_tokens = _extract_prompt_tokens(token_count_usage)
+    completion_tokens = _extract_completion_tokens(token_count_usage)
+    total_tokens = _extract_total_tokens(
+        token_count_usage,
+        prompt_tokens,
+        completion_tokens,
+    )
+    metadata["usage_token_count_response"] = True
+    metadata["usage_input_tokens"] = prompt_tokens
+    metadata["usage_output_tokens"] = completion_tokens
+    metadata["usage_total_tokens"] = total_tokens
+    _merge_tags(metadata, ["token-count-response"])
 
 
 def _extract_prompt_tokens(usage_obj: Any) -> int:
@@ -7527,7 +7763,12 @@ def _extract_request_body_from_langfuse_input(value: Any) -> Optional[Dict[str, 
             if not isinstance(message, dict):
                 continue
             nested = _safe_json_load(message.get("content"), None)
-            if isinstance(nested, dict) and isinstance(nested.get("messages"), list):
+            if isinstance(nested, dict) and (
+                isinstance(nested.get("messages"), list)
+                or isinstance(nested.get("input"), (str, list, dict))
+                or isinstance(nested.get("instructions"), str)
+                or isinstance(nested.get("model"), str)
+            ):
                 return nested
         return parsed
 
@@ -7735,6 +7976,17 @@ def _compute_provider_cache_miss_cost_state(
     if cache_status == "miss" and cache_missed:
         miss_token_count = _extract_prompt_tokens(usage_obj)
         if miss_token_count <= 0:
+            if existing_miss_token_count is not None and existing_miss_token_count > 0:
+                result["miss_token_count"] = existing_miss_token_count
+                if result["miss_cost_usd"] is not None:
+                    return result
+                fallback_cost, fallback_basis = _fallback_miss_cost(
+                    existing_miss_token_count
+                )
+                if fallback_cost is not None:
+                    result["miss_cost_usd"] = fallback_cost
+                    result["miss_cost_basis"] = fallback_basis
+                return result
             result["miss_token_count"] = 0
             fallback_cost, fallback_basis = _fallback_miss_cost(0)
             if fallback_cost is not None:
@@ -9357,6 +9609,119 @@ def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
         )
 
 
+_GEMINI_CONTROL_PLANE_METHOD_LABELS = {
+    "fetchadmincontrols": "google-fetch-admin-controls",
+    "listexperiments": "google-list-experiments",
+    "loadcodeassist": "google-load-code-assist",
+    "retrieveuserquota": "google-retrieve-user-quota",
+}
+_GEMINI_CONTROL_PLANE_METHOD_NAMES = {
+    "fetchadmincontrols": "fetchAdminControls",
+    "listexperiments": "listExperiments",
+    "loadcodeassist": "loadCodeAssist",
+    "retrieveuserquota": "retrieveUserQuota",
+}
+
+
+def _extract_gemini_control_plane_method_from_record(
+    record: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    candidates = (
+        record.get("call_type"),
+        record.get("model"),
+        metadata.get("user_api_key_request_route"),
+        metadata.get("passthrough_route_family"),
+        metadata.get("aawm_local_route"),
+        metadata.get("aawm_local_endpoint"),
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        candidate_lower = candidate.lower()
+        for method_lower in _GEMINI_CONTROL_PLANE_METHOD_LABELS:
+            if method_lower in candidate_lower:
+                return method_lower
+    return None
+
+
+def _session_history_record_usage_token_total(record: Dict[str, Any]) -> int:
+    total = 0
+    for field in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "reasoning_tokens_reported",
+        "reasoning_tokens_estimated",
+    ):
+        value = _safe_int(record.get(field))
+        if value is not None and value > 0:
+            total += value
+    return total
+
+
+def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
+    if _session_history_record_usage_token_total(record) > 0:
+        return
+
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+
+    provider = str(record.get("provider") or "").strip().lower()
+    zero_token_class: Optional[str] = None
+    zero_token_reason: Optional[str] = None
+
+    gemini_control_plane_method = _extract_gemini_control_plane_method_from_record(
+        record,
+        metadata,
+    )
+    has_gemini_quota_payload = isinstance(metadata.get("google_retrieve_user_quota"), dict)
+    if (
+        provider in {"gemini", "google"}
+        and (
+            metadata.get("aawm_rate_limit_observation_only") is True
+            or has_gemini_quota_payload
+            or gemini_control_plane_method is not None
+        )
+    ):
+        zero_token_class = "non_usage_rate_limit_observation"
+        zero_token_reason = "gemini_control_plane_rate_limit_payload"
+        if gemini_control_plane_method is not None:
+            metadata.setdefault(
+                "gemini_control_plane_method",
+                _GEMINI_CONTROL_PLANE_METHOD_NAMES[gemini_control_plane_method],
+            )
+            metadata["gemini_control_plane_excluded"] = True
+            model = _clean_non_empty_string(record.get("model"))
+            if model is None or model.lower() in {"unknown", "null", "none"}:
+                record["model"] = _GEMINI_CONTROL_PLANE_METHOD_LABELS[
+                    gemini_control_plane_method
+                ]
+    elif (
+        provider == "gemini"
+        and metadata.get("codex_adapter_output_shape") == "openai_responses"
+        and _safe_int(metadata.get("aawm_stream_chunk_count")) is not None
+    ):
+        zero_token_class = "empty_provider_response_no_usage"
+        zero_token_reason = "gemini_code_assist_adapter_empty_response"
+    elif metadata.get("source_status") == "failure":
+        zero_token_class = "failed_observation_no_usage"
+        zero_token_reason = "langfuse_observation_failed_without_usage"
+
+    if zero_token_class is not None:
+        metadata.setdefault("session_history_usage_record", False)
+        metadata.setdefault("session_history_zero_token_class", zero_token_class)
+        metadata.setdefault("d1_140_zero_token_class", zero_token_class)
+        if zero_token_reason is not None:
+            metadata.setdefault("d1_140_zero_token_reason", zero_token_reason)
+
+    record["metadata"] = metadata
+
+
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
@@ -9368,6 +9733,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_session_repository_on_record(record)
     _normalize_session_tenant_on_record(record)
     _normalize_session_latency_state_on_record(record)
+    _classify_zero_token_session_history_record(record)
     _sync_session_history_record_metadata(record)
     return record
 
@@ -10690,8 +11056,15 @@ def _build_usage_object_from_langfuse_observation(observation: Dict[str, Any]) -
     usage_details = observation.get("usageDetails")
 
     usage_object: Dict[str, Any] = {}
-    if isinstance(metadata, dict) and isinstance(metadata.get("usage_object"), dict):
-        usage_object.update(metadata["usage_object"])
+    if isinstance(metadata, dict):
+        metadata_usage_object = _build_usage_object_from_metadata(metadata)
+        if isinstance(metadata_usage_object, dict):
+            usage_object.update(metadata_usage_object)
+    output_usage_object = _build_usage_object_from_langfuse_output(
+        observation.get("output")
+    )
+    if isinstance(output_usage_object, dict):
+        usage_object.update(output_usage_object)
     if isinstance(usage, dict):
         usage_object.update(usage)
     if isinstance(usage_details, dict):
@@ -10799,7 +11172,11 @@ def _infer_provider_from_langfuse_observation(
         if "openai.com" in api_base_lower:
             return "openai"
 
-    model = _session_history_adapter_model(metadata) or observation.get("model")
+    model = (
+        _session_history_adapter_model(metadata)
+        or _session_history_metadata_model(metadata)
+        or observation.get("model")
+    )
     model_provider = _session_history_provider_from_model(model)
     if model_provider is not None:
         return model_provider
@@ -10905,13 +11282,32 @@ def _build_session_history_record_from_langfuse_trace_observation(
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_object)
     reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_object)
     provider_reported_reasoning_tokens = reported_reasoning_tokens
+    if usage_object.get("token_count_response"):
+        metadata["usage_token_count_response"] = True
     provider = _infer_provider_from_langfuse_observation(observation, metadata)
-    resolved_model = _first_non_empty_string(
-        _session_history_adapter_model(metadata),
-        observation.get("model"),
-    ) or ""
-
     output_payload = observation.get("output")
+    output_response_payload = _extract_responses_completed_response_from_langfuse_output(
+        output_payload
+    )
+    output_model = _first_non_empty_string(
+        _maybe_get(output_response_payload, "model"),
+        _extract_model_from_langfuse_output(output_payload),
+    )
+    resolved_model = _first_known_model_string(
+        _session_history_adapter_model(metadata),
+        _session_history_metadata_model(metadata),
+        observation.get("model"),
+        output_model,
+        _extract_model_from_langfuse_input(observation.get("input")),
+        _extract_codex_model_from_response_headers(metadata),
+    ) or _first_non_empty_string(
+        _session_history_adapter_model(metadata),
+        _session_history_metadata_model(metadata),
+        observation.get("model"),
+        output_model,
+        _extract_model_from_langfuse_input(observation.get("input")),
+        _extract_codex_model_from_response_headers(metadata),
+    ) or ""
     permission_decision = _extract_claude_permission_check_decision_from_value(
         output_payload
     )
@@ -11100,7 +11496,10 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "litellm_call_id": observation.get("id"),
         "session_id": session_id,
         "trace_id": trace_id,
-        "provider_response_id": _maybe_get(output_payload, "id"),
+        "provider_response_id": _first_non_empty_string(
+            _maybe_get(output_payload, "id"),
+            _maybe_get(output_response_payload, "id"),
+        ),
         "provider": provider,
         "model": resolved_model,
         "model_group": metadata.get("model_group"),
@@ -11533,6 +11932,8 @@ def _build_session_history_record(
         model=resolved_model,
     )
     usage_dict = _coerce_usage_object_to_dict(usage_obj) or {}
+    if usage_dict.get("token_count_response"):
+        metadata["usage_token_count_response"] = True
     search_units = _safe_int(usage_dict.get("search_units"))
     if search_units:
         metadata["usage_search_units"] = search_units
@@ -11699,6 +12100,7 @@ def _build_session_history_record(
         (response_cost_usd is None or response_cost_usd == 0)
         and prompt_tokens > 0
         and resolved_model != "unknown"
+        and not usage_dict.get("token_count_response")
     ):
         try:
             import litellm
@@ -13051,6 +13453,7 @@ def _enrich_trace_name_and_provider_metadata(
     if message is not None:
         _enrich_claude_thinking_metadata(metadata, message)
         _enrich_gemini_thought_signature_metadata(metadata, message)
+    _enrich_token_count_usage_metadata(kwargs, result)
     _enrich_usage_breakout_metadata(kwargs, result)
     _enrich_provider_cache_metadata(kwargs, result)
 

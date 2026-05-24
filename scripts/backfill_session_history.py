@@ -810,6 +810,7 @@ class LangfuseClickHouseSource:
                 o.level AS observation_level,
                 o.status_message AS observation_status_message,
                 o.version AS observation_version,
+                o.input AS observation_input,
                 o.output AS observation_output,
                 o.provided_model_name AS observation_model,
                 o.internal_model_id AS observation_internal_model_id,
@@ -889,7 +890,23 @@ class LangfuseClickHouseSource:
         for observation_row in observation_rows:
             trace_row = trace_by_id.get(str(observation_row.get("observation_trace_id")))
             if trace_row is None:
-                continue
+                trace_row = {
+                    "trace_id": observation_row.get("observation_trace_id"),
+                    "trace_timestamp": observation_row.get("observation_start_time"),
+                    "trace_name": None,
+                    "trace_user_id": None,
+                    "trace_metadata": {},
+                    "trace_release": None,
+                    "trace_version": None,
+                    "trace_project_id": observation_row.get("observation_project_id"),
+                    "trace_environment": observation_row.get("observation_environment"),
+                    "trace_public": None,
+                    "trace_bookmarked": None,
+                    "trace_tags": [],
+                    "trace_session_id": None,
+                    "trace_created_at": observation_row.get("observation_created_at"),
+                    "trace_updated_at": observation_row.get("observation_updated_at"),
+                }
             merged_rows.append({**observation_row, **trace_row})
         return merged_rows
 
@@ -967,7 +984,7 @@ def _build_langfuse_observation_from_clickhouse_row(row: Dict[str, Any]) -> Dict
         "level": row.get("observation_level"),
         "statusMessage": row.get("observation_status_message"),
         "version": row.get("observation_version"),
-        "input": None,
+        "input": _parse_clickhouse_value(row.get("observation_input")),
         "output": output_payload,
         "model": row.get("observation_model"),
         "internalModelId": row.get("observation_internal_model_id"),
