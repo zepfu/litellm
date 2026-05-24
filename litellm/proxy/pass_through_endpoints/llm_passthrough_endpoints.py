@@ -233,9 +233,16 @@ _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = """Codex tool contract:
 - Final answers must address the assigned task directly. Do not return generic descriptions of files unless the user asked for a file overview."""
 _CODEX_AUTO_AGENT_MODEL_ALIAS = "aawm-codex-agent-auto"
 _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS = 6 * 60 * 60
-_CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = 45.0
-_CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300.0
-_CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = 30 * 60.0
+_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3 * 60 * 60.0
+_CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = (
+    _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
+)
+_CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = (
+    _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
+)
+_CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
+    _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
+)
 _CODEX_AUTO_AGENT_NATIVE_PROVIDER = "openai"
 _CODEX_AUTO_AGENT_GOOGLE_PROVIDER = "google_code_assist"
 _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = "openrouter"
@@ -1484,7 +1491,7 @@ def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
 
 def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
     status_code = _extract_google_adapter_exception_status_code(exc)
-    if status_code == 429:
+    if status_code in {429, 529}:
         return True
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     return bool(
@@ -1535,7 +1542,7 @@ def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
 def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
     header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
     if header_wait is not None:
-        return header_wait
+        return max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
 
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if "MODEL_CAPACITY_EXHAUSTED" in tokens:
@@ -1549,15 +1556,6 @@ def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
     return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
 
 
-def _is_codex_auto_agent_google_lane_exhaustion(exc: Any) -> bool:
-    tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if "MODEL_CAPACITY_EXHAUSTED" in tokens:
-        return False
-    if tokens & {"RATE_LIMIT_EXCEEDED", "QUOTA_EXHAUSTED", "RESOURCE_EXHAUSTED"}:
-        return True
-    return _extract_google_adapter_exception_status_code(exc) == 429
-
-
 async def _set_codex_auto_agent_candidate_cooldowns(
     *,
     candidate: dict[str, Any],
@@ -1566,24 +1564,11 @@ async def _set_codex_auto_agent_candidate_cooldowns(
     cooldown_seconds: float,
     exc: Any,
 ) -> str:
-    if (
-        candidate.get("provider") != _CODEX_AUTO_AGENT_GOOGLE_PROVIDER
-        or not _is_codex_auto_agent_google_lane_exhaustion(exc)
-    ):
-        await _set_codex_auto_agent_cooldown(
-            selected_cooldown_key,
-            cooldown_seconds,
-        )
-        return "candidate"
-
-    for candidate_template in _CODEX_AUTO_AGENT_CANDIDATES:
-        if candidate_template.get("provider") != _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-            continue
-        await _set_codex_auto_agent_cooldown(
-            _codex_auto_agent_candidate_key(candidate_template, lane_key),
-            cooldown_seconds,
-        )
-    return "google_lane"
+    await _set_codex_auto_agent_cooldown(
+        selected_cooldown_key,
+        cooldown_seconds,
+    )
+    return "candidate"
 
 
 def _add_codex_auto_agent_alias_metadata(
@@ -7854,6 +7839,62 @@ def _is_empty_success_responses_body(response_body: dict[str, Any]) -> bool:
     if isinstance(output_text, str) and output_text.strip():
         return False
     return True
+
+
+def _is_codex_auto_agent_empty_success_responses_body(
+    response_body: dict[str, Any],
+) -> bool:
+    if not _is_empty_success_responses_body(response_body):
+        return False
+    usage = response_body.get("usage") or {}
+    if not isinstance(usage, dict):
+        return False
+    output_tokens = usage.get("output_tokens")
+    if output_tokens is None:
+        return False
+    try:
+        return int(output_tokens) <= 1
+    except Exception:
+        return False
+
+
+def _raise_codex_auto_agent_empty_success_response(
+    *,
+    response_body: dict[str, Any],
+    adapter_model: str,
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    diagnostic = _build_empty_success_responses_diagnostic(
+        response_body=response_body,
+        diagnostic_context={
+            "adapter": "codex_auto_agent_openrouter_responses",
+            "adapter_model": adapter_model,
+            **(
+                {"stream_events": stream_event_summaries}
+                if stream_event_summaries is not None
+                else {}
+            ),
+        },
+    )
+    exc = ProxyException(
+        message=(
+            "Codex auto-agent OpenRouter candidate returned an empty successful "
+            "Responses payload."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    exc.detail = {
+        "error": {
+            "message": exc.message,
+            "code": "aawm_codex_auto_agent_empty_success",
+            "status": "RATE_LIMIT_EXCEEDED",
+            "type": "rate_limit_error",
+        },
+        "diagnostic": diagnostic,
+    }
+    raise exc
 
 
 def _responses_output_stream_key(
@@ -15081,7 +15122,7 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     custom_headers.update(_build_openrouter_default_headers())
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
-    return await _perform_openrouter_adapter_pass_through_request(
+    response = await _perform_openrouter_adapter_pass_through_request(
         adapter_model=adapter_model,
         request=request,
         target=str(target_url),
@@ -15096,6 +15137,20 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
         egress_credential_family="openrouter",
         expected_target_family="openrouter",
     )
+    if isinstance(response, Response) and not isinstance(response, StreamingResponse):
+        try:
+            response_body = json.loads(response.body.decode("utf-8"))
+        except Exception:
+            return response
+        if (
+            isinstance(response_body, dict)
+            and _is_codex_auto_agent_empty_success_responses_body(response_body)
+        ):
+            _raise_codex_auto_agent_empty_success_response(
+                response_body=response_body,
+                adapter_model=adapter_model,
+            )
+    return response
 
 
 async def _handle_codex_auto_agent_alias_route(
