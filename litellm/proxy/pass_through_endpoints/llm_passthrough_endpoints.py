@@ -1317,6 +1317,8 @@ async def _select_codex_auto_agent_candidate(
     ]
 
     affinity = await _get_codex_auto_agent_session_affinity(session_key)
+    if affinity is not None and not has_continuation_state:
+        affinity = None
     if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_candidate(
             affinity.get("provider"),
