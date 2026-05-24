@@ -6,6 +6,11 @@ services:
     container_name: litellm-dev
     restart: always
     command: ["litellm", "--config", "/app/litellm-dev-config.yaml", "--port", "4001"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     ports:
       - "4001:4001"
     volumes:
