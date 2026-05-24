@@ -283,7 +283,7 @@ class LangFuseLogger:
             if metadata_param_key.startswith("langfuse_"):
                 trace_param_key = metadata_param_key.replace("langfuse_", "", 1)
                 if trace_param_key in metadata:
-                    verbose_logger.warning(
+                    verbose_logger.debug(
                         f"Overwriting Langfuse `{trace_param_key}` from request header"
                     )
                 else:

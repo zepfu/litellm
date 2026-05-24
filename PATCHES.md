@@ -2042,6 +2042,28 @@ to `gpt-5.4-mini`, and legitimate one-token text success behavior.
 
 ---
 
+### aawm.61 — Demote routine LiteLLM operational log noise
+
+**What changed:** Demoted routine success/bookkeeping logs to debug level:
+Langfuse header overwrite notices, per-request shared-session attachment,
+Router `200 OK` success lines, adapter upstream attempt counters, Google
+post-tool cooldown bookkeeping, and Anthropic/Vertex managed-object/model-id
+bookkeeping. Failure, retry/backoff, cooldown-active, telemetry-loss, and
+fallback warnings remain visible at warning level.
+
+**Why:** Dev and prod both run with `LITELLM_LOG=INFO`; normal request flow was
+producing high-volume INFO/WARNING lines that made actionable errors harder to
+see in Docker logs.
+
+**Why not upstream:** The exact noisy paths are tied to AAWM pass-through,
+adapter, and operational observability behavior in this fork.
+
+**Validation status:** `py_compile` passed for all touched modules and
+`litellm-dev` was rebuilt/recreated successfully with `/health` returning HTTP
+200 before prod promotion.
+
+---
+
 
 ## Dropped Patches
 

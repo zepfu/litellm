@@ -3592,7 +3592,7 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
     attempt = 0
     while True:
         attempt += 1
-        verbose_proxy_logger.warning(
+        verbose_proxy_logger.debug(
             "Google adapter upstream attempt %s/%s",
             attempt,
             max(total_attempts, capacity_total_attempts),
@@ -4022,7 +4022,7 @@ async def _perform_openrouter_completion_adapter_operation(
     attempt = 0
     while True:
         attempt += 1
-        verbose_proxy_logger.warning(
+        verbose_proxy_logger.debug(
             "OpenRouter completion adapter upstream attempt %s/%s for model=%s",
             attempt,
             total_attempts,
@@ -4113,7 +4113,7 @@ async def _perform_openrouter_adapter_pass_through_request(
     attempt = 0
     while True:
         attempt += 1
-        verbose_proxy_logger.warning(
+        verbose_proxy_logger.debug(
             "OpenRouter adapter upstream attempt %s/%s for model=%s",
             attempt,
             total_attempts,
@@ -6372,7 +6372,7 @@ async def _iterate_google_code_assist_unwrapped_stream(
                         cooldown_seconds,
                     )
                     post_tool_cooldown_armed = True
-                    verbose_proxy_logger.info(
+                    verbose_proxy_logger.debug(
                         "Google adapter post-tool cooldown armed for %.1fs",
                         cooldown_seconds,
                     )
@@ -6794,7 +6794,7 @@ async def _perform_nvidia_completion_adapter_operation(
     attempt = 0
     while True:
         attempt += 1
-        verbose_proxy_logger.warning(
+        verbose_proxy_logger.debug(
             "NVIDIA completion adapter upstream attempt %s/%s for model=%s",
             attempt,
             total_attempts,
