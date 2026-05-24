@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -11265,7 +11266,9 @@ async def test_codex_auto_agent_alias_uses_gpt54_mini_only_as_last_resort(monkey
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_native_success_sets_session_affinity(monkeypatch):
+async def test_codex_auto_agent_alias_native_success_sets_session_affinity_for_continuation(
+    monkeypatch,
+):
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-codex-agent-auto",
@@ -11292,27 +11295,47 @@ async def test_codex_auto_agent_alias_native_success_sets_session_affinity(monke
             api_key=None,
             forward_headers=True,
         )
+        fresh_body = copy.deepcopy(body)
         await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
+            prepared_request_body=fresh_body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+        continuation_body = {
+            **copy.deepcopy(body),
+            "previous_response_id": "resp_existing",
+        }
+        await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=continuation_body,
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
         )
 
     assert response is success
-    assert mock_pass_through.await_count == 2
+    assert mock_pass_through.await_count == 3
     first_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
     second_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
+    third_body = mock_pass_through.await_args_list[2].kwargs["custom_body"]
     assert first_body["model"] == "gpt-5.3-codex-spark"
     assert second_body["model"] == "gpt-5.3-codex-spark"
+    assert third_body["model"] == "gpt-5.3-codex-spark"
     assert first_body["litellm_metadata"]["requested_model_alias"] == (
         "aawm-codex-agent-auto"
     )
     assert second_body["litellm_metadata"]["codex_auto_agent_selection_reason"] == (
+        "first_available"
+    )
+    assert third_body["litellm_metadata"]["codex_auto_agent_selection_reason"] == (
         "session_affinity"
     )
 
@@ -11473,7 +11496,7 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
     last_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
     assert first_body["model"] == "gpt-5.3-codex-spark"
     assert first_body["litellm_metadata"]["codex_auto_agent_selection_reason"] == (
-        "session_affinity"
+        "first_available"
     )
     assert last_body["model"] == "gpt-5.4-mini"
     assert last_body["litellm_metadata"]["codex_auto_agent_selected_last_resort"] is True

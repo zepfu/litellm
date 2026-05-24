@@ -2271,6 +2271,64 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["metadata"]["cc_version"] == "2.1.112"
 
 
+def test_build_session_history_record_recovers_anthropic_count_tokens_result() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "trace-count-tokens"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "claude-session-1",
+            "passthrough_route_family": "anthropic_messages",
+            "aawm_passthrough_endpoint_type": "anthropic",
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={"input_tokens": 28654},
+        start_time=datetime(2026, 5, 22, 2, 4, 19, tzinfo=timezone.utc),
+        end_time=datetime(2026, 5, 22, 2, 4, 20, tzinfo=timezone.utc),
+    )
+
+    assert record is not None
+    assert record["input_tokens"] == 28654
+    assert record["output_tokens"] == 0
+    assert record["total_tokens"] == 28654
+    assert record["response_cost_usd"] is None
+    assert record["metadata"]["usage_token_count_response"] is True
+
+
+def test_build_session_history_record_recovers_anthropic_count_tokens_response_wrapper() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "trace-count-tokens-wrapper"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "claude-session-1",
+            "passthrough_route_family": "anthropic_messages",
+            "aawm_passthrough_endpoint_type": "anthropic",
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=SimpleNamespace(response='{"input_tokens":13237}'),
+        start_time=datetime(2026, 5, 23, 15, 28, 22, tzinfo=timezone.utc),
+        end_time=datetime(2026, 5, 23, 15, 28, 23, tzinfo=timezone.utc),
+    )
+
+    assert record is not None
+    assert record["input_tokens"] == 13237
+    assert record["output_tokens"] == 0
+    assert record["total_tokens"] == 13237
+    assert record["response_cost_usd"] is None
+    assert record["metadata"]["usage_token_count_response"] is True
+
+
 def _fake_prompt_overhead_token_count(_model: str, value) -> int:
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
     return len([part for part in text.replace("\n", " ").split(" ") if part])
@@ -6559,6 +6617,472 @@ def test_build_session_history_record_from_langfuse_passthrough_uses_synthetic_s
     assert record["metadata"]["session_id_source"] == "trace.id.synthetic"
     assert record["metadata"]["synthetic_session_id"] is True
     assert record["metadata"]["synthetic_session_id_basis"] == "trace.id"
+
+
+def test_build_session_history_record_from_langfuse_uses_flattened_usage_metadata() -> None:
+    trace = {
+        "id": "trace-flat-usage",
+        "name": "litellm-pass_through_endpoint",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "call-flat-usage",
+        "traceId": "trace-flat-usage",
+        "type": "GENERATION",
+        "name": "/openai_passthrough/responses",
+        "model": None,
+        "startTime": "2026-05-22T12:11:36Z",
+        "endTime": "2026-05-22T12:11:42Z",
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "usage_cache_read_input_tokens": 84352,
+            "usage_cache_creation_input_tokens": 0,
+            "usage_provider_cache_status": "hit",
+            "usage_provider_cache_attempted": True,
+            "usage_provider_cache_miss": False,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-flat-usage",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["session_id"] == "trace-flat-usage"
+    assert record["metadata"]["session_id_source"] == "trace.id.synthetic"
+    assert record["input_tokens"] == 0
+    assert record["output_tokens"] == 0
+    assert record["cache_read_input_tokens"] == 84352
+    assert record["cache_creation_input_tokens"] == 0
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is False
+
+
+def test_build_session_history_record_from_langfuse_marks_gemini_quota_as_non_usage() -> None:
+    trace = {
+        "id": "trace-gemini-quota",
+        "name": "native_gemini_passthrough_retrieve_user_quota",
+        "sessionId": "trace-gemini-quota",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "call-gemini-quota",
+        "traceId": "trace-gemini-quota",
+        "type": "GENERATION",
+        "name": "/gemini/v1internal:retrieveUserQuota",
+        "model": "",
+        "startTime": "2026-05-22T12:12:14Z",
+        "endTime": "2026-05-22T12:12:15Z",
+        "usage": {"input": 0, "output": 0, "total": 0},
+        "usageDetails": {
+            "input": 0,
+            "output": 0,
+            "total": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        },
+        "metadata": {
+            "custom_llm_provider": "gemini",
+            "client_name": "gemini-cli",
+            "aawm_rate_limit_observation_only": True,
+            "google_retrieve_user_quota": {
+                "source": "google_retrieve_user_quota",
+                "buckets": {"items": []},
+            },
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-gemini-quota",
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["model"] == "google-retrieve-user-quota"
+    assert record["input_tokens"] == 0
+    assert record["output_tokens"] == 0
+    assert record["metadata"]["session_history_usage_record"] is False
+    assert (
+        record["metadata"]["d1_140_zero_token_class"]
+        == "non_usage_rate_limit_observation"
+    )
+    assert record["metadata"]["gemini_control_plane_excluded"] is True
+    assert record["metadata"]["gemini_control_plane_method"] == "retrieveUserQuota"
+
+
+def test_build_session_history_record_from_langfuse_marks_empty_gemini_adapter_response() -> None:
+    trace = {
+        "id": "trace-empty-gemini",
+        "name": "codex",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "call-empty-gemini",
+        "traceId": "trace-empty-gemini",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gemini-3.1-flash-lite-preview",
+        "startTime": "2026-05-22T18:37:00Z",
+        "endTime": "2026-05-22T18:37:05Z",
+        "usage": {"input": 0, "output": 0, "total": 0},
+        "usageDetails": {
+            "input": 0,
+            "output": 0,
+            "total": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        },
+        "output": {
+            "content": None,
+            "role": "assistant",
+            "tool_calls": None,
+            "function_call": None,
+        },
+        "metadata": {
+            "custom_llm_provider": "gemini",
+            "client_name": "codex-tui",
+            "passthrough_route_family": "codex_google_code_assist_adapter",
+            "codex_adapter_output_shape": "openai_responses",
+            "aawm_stream_chunk_count": 1,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-empty-gemini",
+    )
+
+    assert record is not None
+    assert record["provider"] == "gemini"
+    assert record["model"] == "gemini-3.1-flash-lite-preview"
+    assert record["input_tokens"] == 0
+    assert record["output_tokens"] == 0
+    assert record["metadata"]["session_history_usage_record"] is False
+    assert (
+        record["metadata"]["d1_140_zero_token_class"]
+        == "empty_provider_response_no_usage"
+    )
+
+
+def test_build_session_history_record_from_langfuse_recovers_anthropic_count_tokens_output() -> None:
+    trace = {
+        "id": "trace-count-tokens",
+        "name": "claude-code.orchestrator",
+        "sessionId": "claude-session-1",
+        "userId": "aawm-tap",
+        "environment": "prod",
+        "output": "{\"input_tokens\":28654}",
+    }
+    observation = {
+        "id": "call-count-tokens",
+        "traceId": "trace-count-tokens",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "",
+        "startTime": "2026-05-22T02:04:19.555Z",
+        "endTime": "2026-05-22T02:04:19.802Z",
+        "output": "{\"input_tokens\":28654}",
+        "metadata": {
+            "passthrough_route_family": "anthropic_messages",
+            "aawm_passthrough_endpoint_type": "anthropic",
+            "client_name": "claude-cli",
+            "client_version": "2.1.146",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-count-tokens",
+    )
+
+    assert record is not None
+    assert record["provider"] == "anthropic"
+    assert record["input_tokens"] == 28654
+    assert record["output_tokens"] == 0
+    assert record["total_tokens"] == 28654
+    assert record["metadata"]["usage_token_count_response"] is True
+    assert record["metadata"]["session_id_source"] == "trace.sessionId"
+
+
+def test_build_session_history_record_from_langfuse_merges_sparse_usage_object_with_flattened_metadata() -> None:
+    trace = {
+        "id": "trace-sparse-usage-object",
+        "name": "litellm-pass_through_endpoint",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "call-sparse-usage-object",
+        "traceId": "trace-sparse-usage-object",
+        "type": "GENERATION",
+        "name": "/openai_passthrough/responses",
+        "model": "unknown",
+        "startTime": "2026-05-22T13:00:00Z",
+        "endTime": "2026-05-22T13:00:04Z",
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "codex_auto_agent_selected_model": "gpt-5.4-mini",
+            "usage_object": {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "total_tokens": 15,
+            },
+            "usage_cache_read_input_tokens": 4096,
+            "usage_cache_creation_input_tokens": 0,
+            "usage_reasoning_tokens_reported": 2,
+            "usage_provider_cache_status": "hit",
+            "usage_provider_cache_attempted": True,
+            "usage_provider_cache_miss": False,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-sparse-usage-object",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["model"] == "gpt-5.4-mini"
+    assert record["input_tokens"] == 12
+    assert record["output_tokens"] == 3
+    assert record["total_tokens"] == 15
+    assert record["cache_read_input_tokens"] == 4096
+    assert record["cache_creation_input_tokens"] == 0
+    assert record["reasoning_tokens_reported"] == 2
+    assert record["reasoning_tokens_source"] == "provider_reported"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is False
+
+
+def test_build_session_history_record_from_langfuse_recovers_model_from_nested_responses_input() -> None:
+    trace = {
+        "id": "trace-input-model",
+        "name": "litellm-pass_through_endpoint",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "call-input-model",
+        "traceId": "trace-input-model",
+        "type": "GENERATION",
+        "name": "/openai_passthrough/responses",
+        "model": "unknown",
+        "startTime": "2026-05-23T00:33:21Z",
+        "endTime": "2026-05-23T00:33:24Z",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "model": "gpt-5.5",
+                            "instructions": "You are Codex.",
+                            "input": "continue",
+                        }
+                    ),
+                }
+            ]
+        },
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "usage_cache_read_input_tokens": 25472,
+            "usage_provider_cache_status": "hit",
+            "usage_provider_cache_attempted": True,
+            "usage_provider_cache_miss": False,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-input-model",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["model"] == "gpt-5.5"
+    assert record["cache_read_input_tokens"] == 25472
+    assert record["provider_cache_status"] == "hit"
+
+
+def test_build_session_history_record_from_langfuse_recovers_codex_spark_model_from_headers() -> None:
+    trace = {
+        "id": "trace-codex-header-model",
+        "name": "litellm-pass_through_endpoint",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "call-codex-header-model",
+        "traceId": "trace-codex-header-model",
+        "type": "GENERATION",
+        "name": "/openai_passthrough/responses",
+        "model": "unknown",
+        "startTime": "2026-05-22T17:27:23Z",
+        "endTime": "2026-05-22T17:27:31Z",
+        "input": "<truncated due to size exceeding limit>",
+        "output": "<truncated due to size exceeding limit>",
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "codex_response_headers": {
+                "source": "codex_response_headers",
+                "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+            },
+            "usage_cache_read_input_tokens": 222080,
+            "usage_tool_call_count": 1,
+            "usage_tool_names": ["apply_patch"],
+            "usage_reasoning_tokens_reported": 625,
+            "usage_reasoning_tokens_source": "provider_reported",
+            "usage_provider_cache_status": "hit",
+            "usage_provider_cache_attempted": True,
+            "usage_provider_cache_miss": False,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-codex-header-model",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["model"] == "gpt-5.3-codex-spark"
+    assert record["cache_read_input_tokens"] == 222080
+    assert record["reasoning_tokens_reported"] == 625
+    assert record["tool_call_count"] == 1
+    assert record["tool_names"] == ["apply_patch"]
+
+
+def test_build_session_history_record_from_langfuse_preserves_metadata_cache_miss_tokens() -> None:
+    trace = {
+        "id": "trace-cache-miss",
+        "name": "litellm-pass_through_endpoint",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "call-cache-miss",
+        "traceId": "trace-cache-miss",
+        "type": "GENERATION",
+        "name": "/openai_passthrough/responses",
+        "model": "unknown",
+        "startTime": "2026-05-23T00:14:26Z",
+        "endTime": "2026-05-23T00:14:39Z",
+        "input": "<truncated due to size exceeding limit>",
+        "output": "<truncated due to size exceeding limit>",
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "codex_response_headers": {
+                "source": "codex_response_headers",
+                "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+            },
+            "usage_reasoning_tokens_reported": 8,
+            "usage_reasoning_tokens_source": "provider_reported",
+            "usage_provider_cache_status": "miss",
+            "usage_provider_cache_attempted": True,
+            "usage_provider_cache_miss": True,
+            "usage_provider_cache_miss_reason": "prompt_cache_key_requested_without_hit",
+            "usage_provider_cache_miss_token_count": 237964,
+            "usage_provider_cache_miss_cost_usd": 0,
+            "usage_provider_cache_miss_cost_basis": "response_cost_zero",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-cache-miss",
+    )
+
+    assert record is not None
+    assert record["model"] == "gpt-5.3-codex-spark"
+    assert record["input_tokens"] == 0
+    assert record["output_tokens"] == 0
+    assert record["reasoning_tokens_reported"] == 8
+    assert record["provider_cache_status"] == "miss"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "prompt_cache_key_requested_without_hit"
+    assert record["provider_cache_miss_token_count"] == 237964
+    assert record["provider_cache_miss_cost_usd"] == 0
+
+
+def test_build_session_history_record_from_langfuse_recovers_raw_responses_output_usage() -> None:
+    trace = {
+        "id": "trace-raw-responses",
+        "name": "litellm-pass_through_endpoint",
+        "environment": "dev",
+    }
+    completed_event = json.dumps(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-raw-responses",
+                "model": "gpt-5.5",
+                "usage": {
+                    "input_tokens": 165422,
+                    "output_tokens": 41,
+                    "total_tokens": 165463,
+                    "input_tokens_details": {"cached_tokens": 164224},
+                    "output_tokens_details": {"reasoning_tokens": 40},
+                },
+            },
+        }
+    )
+    observation = {
+        "id": "call-raw-responses",
+        "traceId": "trace-raw-responses",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "unknown",
+        "startTime": "2026-05-23T02:22:54Z",
+        "endTime": "2026-05-23T02:23:01Z",
+        "output": (
+            "cannot parse chunks to standard response object. Chunks="
+            f"{['data: ' + completed_event]!r}"
+        ),
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "usage_cache_read_input_tokens": 164224,
+            "usage_cache_creation_input_tokens": 0,
+            "usage_provider_cache_status": "hit",
+            "usage_provider_cache_attempted": True,
+            "usage_provider_cache_miss": False,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-raw-responses",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openai"
+    assert record["model"] == "gpt-5.5"
+    assert record["provider_response_id"] == "resp-raw-responses"
+    assert record["input_tokens"] == 165422
+    assert record["output_tokens"] == 41
+    assert record["total_tokens"] == 165463
+    assert record["cache_read_input_tokens"] == 164224
+    assert record["reasoning_tokens_reported"] == 40
+    assert record["reasoning_tokens_source"] == "provider_reported"
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is False
 
 
 def test_build_session_history_record_from_langfuse_observation_counts_invalid_tool_results() -> None:
