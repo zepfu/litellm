@@ -1457,7 +1457,7 @@ class Router:
                 **kwargs,
             }
             response = litellm.completion(**input_kwargs)
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.completion(model={model_name})\033[32m 200 OK\033[0m"
             )
 
@@ -2123,7 +2123,7 @@ class Router:
                     )
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.acompletion(model={model_name})\033[32m 200 OK\033[0m"
             )
             # debug how often this deployment picked
@@ -2958,7 +2958,7 @@ class Router:
                 }
             )
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.image_generation(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -3051,7 +3051,7 @@ class Router:
                 response = await response
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.aimage_generation(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -3163,7 +3163,7 @@ class Router:
                 response = await response
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.atranscription(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -3313,7 +3313,7 @@ class Router:
             )
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.arerank(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -3457,7 +3457,7 @@ class Router:
                 response = await response
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.atext_completion(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -3556,7 +3556,7 @@ class Router:
                 response = await response  # type: ignore
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.aadapter_completion(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -3822,7 +3822,7 @@ class Router:
                 response = await response  # type: ignore
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"ageneric_api_call_with_fallbacks(model={model_name})\033[32m 200 OK\033[0m"
             )
 
@@ -3890,7 +3890,7 @@ class Router:
             )
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"{handler_name}(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -3963,7 +3963,7 @@ class Router:
                 }
             )
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.embedding(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -4058,7 +4058,7 @@ class Router:
                 response = await response
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.aembedding(model={model_name})\033[32m 200 OK\033[0m"
             )
             return response
@@ -4197,7 +4197,7 @@ class Router:
                     response = await response  # type: ignore
 
                 self.success_calls[model_name] += 1
-                verbose_router_logger.info(
+                verbose_router_logger.debug(
                     f"litellm.acreate_file(model={model_name})\033[32m 200 OK\033[0m"
                 )
 
@@ -4316,7 +4316,7 @@ class Router:
                 response = await response
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.avector_store_create(model={model_name})\033[32m 200 OK\033[0m"
             )
 
@@ -4438,7 +4438,7 @@ class Router:
                 response = await response  # type: ignore
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.acreate_batch(model={model_name})\033[32m 200 OK\033[0m"
             )
 
@@ -4672,7 +4672,7 @@ class Router:
                 response = await response  # type: ignore
 
             self.success_calls[model_name] += 1
-            verbose_router_logger.info(
+            verbose_router_logger.debug(
                 f"litellm.acancel_batch(model={model_name})\033[32m 200 OK\033[0m"
             )
 

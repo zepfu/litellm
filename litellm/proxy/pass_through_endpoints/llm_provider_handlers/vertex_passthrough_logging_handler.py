@@ -799,7 +799,7 @@ class VertexPassthroughLoggingHandler:
                     )
                 )
 
-                verbose_proxy_logger.info(
+                verbose_proxy_logger.debug(
                     f"Stored batch managed object with unified_object_id={unified_object_id}, batch_id={model_object_id}"
                 )
             else:
@@ -827,7 +827,7 @@ class VertexPassthroughLoggingHandler:
             if model_ids and len(model_ids) > 0:
                 # Use the first model ID found
                 actual_model_id = model_ids[0]
-                verbose_proxy_logger.info(
+                verbose_proxy_logger.debug(
                     f"Found model ID in router: {actual_model_id}"
                 )
                 return actual_model_id
