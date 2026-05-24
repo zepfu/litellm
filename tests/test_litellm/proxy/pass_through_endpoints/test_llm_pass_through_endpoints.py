@@ -11447,15 +11447,15 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
         }
     }
     openrouter_error = ProxyException(
-        message="openrouter rate limit",
+        message="openrouter overloaded",
         type="rate_limit_error",
         param="model",
-        code=429,
+        code=529,
     )
     openrouter_error.detail = {
         "error": {
-            "message": "rate_limit_exceeded",
-            "code": "rate_limit_exceeded",
+            "message": "overloaded_error",
+            "code": "overloaded_error",
         }
     }
 
@@ -11487,7 +11487,7 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
 
     assert response is mini_success
     assert mock_pass_through.await_count == 2
-    assert mock_gemini.await_count == 1
+    assert mock_gemini.await_count == 3
     mock_openrouter.assert_awaited_once()
     assert mock_openrouter.await_args.kwargs["adapter_model"] == (
         "deepseek/deepseek-v4-flash:free"
@@ -11504,14 +11504,22 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
         "last_resort"
     )
     attempts = last_body["litellm_metadata"]["codex_auto_agent_attempts"]
-    assert len(attempts) == 4
+    assert len(attempts) == 6
     assert attempts[1]["provider"] == "google_code_assist"
     assert attempts[1]["model"] == "gemini-3.1-flash-lite-preview"
     assert attempts[1]["status"] == "cooldown_set"
-    assert attempts[1]["cooldown_scope"] == "google_lane"
-    assert attempts[2]["provider"] == "openrouter"
-    assert attempts[2]["model"] == "deepseek/deepseek-v4-flash:free"
+    assert attempts[1]["cooldown_scope"] == "candidate"
+    assert attempts[2]["provider"] == "google_code_assist"
+    assert attempts[2]["model"] == "gemini-3-flash-preview"
     assert attempts[2]["status"] == "cooldown_set"
+    assert attempts[2]["cooldown_scope"] == "candidate"
+    assert attempts[3]["provider"] == "google_code_assist"
+    assert attempts[3]["model"] == "gemini-3.1-pro-preview"
+    assert attempts[3]["status"] == "cooldown_set"
+    assert attempts[3]["cooldown_scope"] == "candidate"
+    assert attempts[4]["provider"] == "openrouter"
+    assert attempts[4]["model"] == "deepseek/deepseek-v4-flash:free"
+    assert attempts[4]["status"] == "cooldown_set"
     skipped_models = {
         candidate["model"]
         for candidate in last_body["litellm_metadata"][
@@ -11520,6 +11528,158 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
     }
     assert "gemini-3-flash-preview" in skipped_models
     assert "gemini-3.1-pro-preview" in skipped_models
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_last_resort(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:session:codex-session",
+        60.0,
+    )
+    for model in (
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-pro-preview",
+    ):
+        await _set_codex_auto_agent_cooldown(
+            f"google_code_assist:{model}:google-lane",
+            60.0,
+        )
+    empty_openrouter_success = Response(
+        content=json.dumps(
+            {
+                "id": "resp_empty_deepseek",
+                "object": "response",
+                "model": "deepseek/deepseek-v4-flash:free",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 1,
+                    "total_tokens": 13,
+                },
+            }
+        ),
+        media_type="application/json",
+    )
+    mini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_adapter_pass_through_request",
+        new=AsyncMock(return_value=empty_openrouter_success),
+    ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=mini_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is mini_success
+    mock_openrouter.assert_awaited_once()
+    mock_pass_through.assert_awaited_once()
+    mini_body = mock_pass_through.await_args.kwargs["custom_body"]
+    assert mini_body["model"] == "gpt-5.4-mini"
+    attempts = mini_body["litellm_metadata"]["codex_auto_agent_attempts"]
+    assert attempts[-2]["provider"] == "openrouter"
+    assert attempts[-2]["model"] == "deepseek/deepseek-v4-flash:free"
+    assert attempts[-2]["status"] == "cooldown_set"
+    assert attempts[-2]["cooldown_seconds"] == 10800.0
+    assert "RATE_LIMIT_EXCEEDED" in attempts[-2]["error_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_openrouter_one_token_text_is_success(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:session:codex-session",
+        60.0,
+    )
+    for model in (
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-pro-preview",
+    ):
+        await _set_codex_auto_agent_cooldown(
+            f"google_code_assist:{model}:google-lane",
+            60.0,
+        )
+    short_openrouter_success = Response(
+        content=json.dumps(
+            {
+                "id": "resp_short_deepseek",
+                "object": "response",
+                "model": "deepseek/deepseek-v4-flash:free",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 1,
+                    "total_tokens": 13,
+                },
+            }
+        ),
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_adapter_pass_through_request",
+        new=AsyncMock(return_value=short_openrouter_success),
+    ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is short_openrouter_success
+    mock_openrouter.assert_awaited_once()
+    mock_pass_through.assert_not_awaited()
 
 
 @pytest.mark.asyncio

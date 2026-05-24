@@ -2012,6 +2012,36 @@ passed, and the dev runtime/backfill evidence is recorded in `COMPLETED.md`.
 
 ---
 
+### aawm.60 — Codex auto-agent ordered fallback and empty-success rollover
+
+**Status:** AAWM local hotfix.
+
+**What changed:** `aawm-codex-agent-auto` now treats retryable fresh-dispatch
+failures as per-candidate cooldowns in the explicit candidate order:
+Codex Spark, each Gemini candidate individually, OpenRouter
+`deepseek/deepseek-v4-flash:free`, then `gpt-5.4-mini` as the last resort.
+Default retryable cooldowns are approximately three hours, with longer
+provider reset hints still honored. OpenRouter DeepSeek Responses payloads
+that complete successfully but contain no meaningful output and report
+`output_tokens <= 1` are converted into retryable candidate failures so fresh
+dispatches roll forward instead of returning an unusable child result.
+
+**Why:** Fresh child dispatches should always start from the top of the alias
+candidate list and use the first non-cooled working model. In-flight affinity
+must remain scoped to the exact active session/thread, but active agents on
+Gemini, DeepSeek, or `gpt-5.4-mini` must not pin unrelated future fresh
+dispatches after Spark or an earlier Gemini candidate comes off cooldown.
+
+**Why not upstream:** This is an AAWM-specific Codex agent orchestration policy
+layered on top of native Codex, Google Code Assist, and OpenRouter
+pass-through routing.
+
+**Validation status:** Focused alias coverage proves the ordered fallback, 529
+retryability, per-candidate Gemini cooldowns, DeepSeek empty-success rollover
+to `gpt-5.4-mini`, and legitimate one-token text success behavior.
+
+---
+
 
 ## Dropped Patches
 
