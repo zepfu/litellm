@@ -296,6 +296,7 @@ _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_litellm_environment_created_idx ON public.session_history (litellm_environment, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_client_created_idx ON public.session_history (client_name, client_version, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_repository_created_idx ON public.session_history (repository, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_openrouter_free_observed_idx ON public.session_history ((COALESCE(end_time, start_time, created_at)) DESC) WHERE provider = 'openrouter' AND lower(COALESCE(model, '')) LIKE '%:free'",
 )
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
@@ -607,6 +608,14 @@ _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_session_idx ON public.rate_limit_observations (session_id, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS rate_limit_observations_trace_call_idx ON public.rate_limit_observations (trace_id, litellm_call_id)",
 )
+_AAWM_OPENROUTER_FREE_DAILY_REQUEST_COUNT_SQL = """
+SELECT COUNT(*)::integer
+FROM public.session_history
+WHERE provider = 'openrouter'
+  AND lower(COALESCE(model, '')) LIKE '%:free'
+  AND COALESCE(end_time, start_time, created_at) >= $1::timestamptz
+  AND COALESCE(end_time, start_time, created_at) < $2::timestamptz
+"""
 _AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.rate_limit_transitions (
     id BIGSERIAL PRIMARY KEY,
@@ -1516,6 +1525,9 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "anthropic_adapter_cache_control_present",
     "anthropic_adapter_unsupported_hosted_tools",
     "anthropic_adapter_unsupported_hosted_tool_choice",
+    "anthropic_adapter_model",
+    "anthropic_adapter_original_model",
+    "anthropic_adapter_target_endpoint",
     "codex_unsupported_hosted_tool_removed_count",
     "codex_unsupported_hosted_tool_types_removed",
     "codex_unsupported_hosted_tools_removed",
@@ -1697,8 +1709,12 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
     ),
 )
 _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
+    "...",
+    "memories",
+    "new",
     "path",
     "project",
+    "remote",
     "repo",
     "repository",
     "unknown",
@@ -1729,6 +1745,10 @@ _CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
 _AAWM_REPOSITORY_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$"
+)
+_AAWM_REPOSITORY_TRANSCRIPT_ARTIFACT_RE = re.compile(
+    r"^(?:rollout-\d{4}(?:-[A-Za-z0-9_.-]*)?|.*\.jsonl?)$",
+    re.IGNORECASE,
 )
 _CODEX_MEMORY_WORKFLOW_REQUIRED_MARKER = "memory writing agent"
 _CODEX_MEMORY_WORKFLOW_CONTEXT_MARKERS = (
@@ -2244,9 +2264,13 @@ def _is_valid_repository_identity(value: str) -> bool:
 
 def _is_disallowed_repository_identity(value: str) -> bool:
     normalized = value.strip().strip("/").lower()
+    if normalized.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
+        normalized = normalized[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
     if not normalized:
         return True
     if normalized in _AAWM_REPOSITORY_PLACEHOLDER_VALUES:
+        return True
+    if _AAWM_REPOSITORY_TRANSCRIPT_ARTIFACT_RE.fullmatch(normalized):
         return True
     if normalized in _AAWM_REPOSITORY_AGENT_ROLE_VALUES:
         return True
@@ -3805,6 +3829,8 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
 _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP = 1.0
 _AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT = timedelta(minutes=15)
 _AAWM_RATE_LIMIT_STALE_RESET_TOLERANCE = timedelta(minutes=15)
+_AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT_DEFAULT = 1000
+_AAWM_OPENROUTER_FREE_DAILY_SOURCE = "openrouter_free_daily_local_meter"
 _AAWM_RATE_LIMIT_SNAPSHOT_FIELDS = (
     "provider_resets_at",
     "used_percentage",
@@ -4168,6 +4194,217 @@ def _infer_rate_limit_client_family(
     ):
         return "claude"
     return provider
+
+
+def _openrouter_free_daily_request_limit() -> int:
+    configured_limit = _safe_int(
+        get_secret_str("AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT")
+    )
+    if configured_limit is not None and configured_limit > 0:
+        return configured_limit
+    return _AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT_DEFAULT
+
+
+def _openrouter_free_shared_account_hash() -> str:
+    return _short_hash(b"openrouter_free_daily_shared_pool")
+
+
+def _is_openrouter_free_model(model: Any) -> bool:
+    return str(model or "").strip().lower().endswith(":free")
+
+
+def _openrouter_free_daily_window(observed_at: Any) -> Tuple[datetime, datetime]:
+    observed_dt = _normalize_datetime(observed_at) or datetime.now(timezone.utc)
+    day_start = observed_dt.astimezone(timezone.utc).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return day_start, day_start + timedelta(days=1)
+
+
+def _openrouter_free_daily_observation_context_from_record(
+    record: Dict[str, Any],
+    observed_at: datetime,
+) -> Dict[str, Any]:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "observed_at": observed_at,
+        "provider": "openrouter",
+        "client_family": "openrouter",
+        "account_hash": _openrouter_free_shared_account_hash(),
+        "environment": record.get("litellm_environment"),
+        "tenant_id": record.get("tenant_id"),
+        "repository": record.get("repository"),
+        "session_id": record.get("session_id"),
+        "trace_id": record.get("trace_id"),
+        "litellm_call_id": record.get("litellm_call_id"),
+        "route_family": metadata.get("passthrough_route_family"),
+        "request_model": record.get("model"),
+        "response_model": None,
+        "model": None,
+        "model_family": "openrouter",
+        "model_tier": "free",
+        "client_name": record.get("client_name"),
+        "client_version": record.get("client_version"),
+        "client_user_agent": record.get("client_user_agent"),
+        "metadata": metadata,
+    }
+
+
+def _build_openrouter_free_daily_observation(
+    *,
+    context: Dict[str, Any],
+    day_start: datetime,
+    day_end: datetime,
+    used_requests: int,
+    total_requests: int,
+    signal: str,
+    status: str = "observed",
+    exhausted: bool = False,
+    reset_hint_seconds: Optional[int] = None,
+    provider_resets_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    bounded_total = max(total_requests, 1)
+    bounded_used = max(0, used_requests)
+    remaining_requests = max(0, bounded_total - bounded_used)
+    used_percentage = round(
+        min(100.0, (bounded_used / bounded_total) * 100.0),
+        3,
+    )
+    remaining_pct = round(max(0.0, 100.0 - used_percentage), 3)
+    return _finalize_rate_limit_observation(
+        {
+            "observed_at": context["observed_at"],
+            "source": _AAWM_OPENROUTER_FREE_DAILY_SOURCE,
+            "provider": "openrouter",
+            "client_family": "openrouter",
+            "account_hash": _openrouter_free_shared_account_hash(),
+            "limit_id": "openrouter_free_daily_requests",
+            "limit_name": "OpenRouter free daily requests",
+            "limit_scope": "requests",
+            "window_minutes": 1440,
+            "quota_period": "daily",
+            "quota_type": "requests",
+            "provider_resets_at": provider_resets_at or day_end,
+            "remaining_pct": remaining_pct,
+            "used_percentage": used_percentage,
+            "remaining_requests": remaining_requests,
+            "used_requests": bounded_used,
+            "total_requests": bounded_total,
+            "status": status,
+            "exhausted": exhausted or remaining_requests <= 0,
+            "exhaustion_kind": "request_quota" if exhausted else None,
+            "reset_hint_seconds": reset_hint_seconds,
+            "model": None,
+            "model_family": "openrouter",
+            "model_tier": "free",
+            "raw_provider_fields": {
+                "dailyLimit": bounded_total,
+                "usedRequests": bounded_used,
+                "remainingRequests": remaining_requests,
+                "windowStart": _json_safe_rate_limit_value(day_start),
+                "windowEnd": _json_safe_rate_limit_value(day_end),
+                "reset_anchor": "utc_midnight",
+                "model_scope": "openrouter_:free_shared_pool",
+                "meter_source": "local_session_history",
+            },
+            "evidence": {
+                "signals": [signal],
+                "provider_fields": [],
+                "scope_note": (
+                    "OpenRouter documents free-model quota as account-level; "
+                    "provider does not expose current free request usage."
+                ),
+            },
+        },
+        context,
+    )
+
+
+def _openrouter_free_record_observed_at(record: Dict[str, Any]) -> datetime:
+    return (
+        _normalize_datetime(record.get("end_time"))
+        or _normalize_datetime(record.get("start_time"))
+        or datetime.now(timezone.utc)
+    )
+
+
+def _is_openrouter_free_session_history_record(record: Dict[str, Any]) -> bool:
+    model = record.get("model")
+    if not _is_openrouter_free_model(model):
+        return False
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    provider = _normalize_session_history_provider(
+        record.get("provider"),
+        str(model or ""),
+        metadata,
+    )
+    return provider == "openrouter"
+
+
+async def _build_openrouter_free_daily_observations_for_records(
+    conn: Any,
+    records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    latest_record_by_window: Dict[
+        Tuple[datetime, datetime],
+        Tuple[datetime, Dict[str, Any]],
+    ] = {}
+    for record in records:
+        if record.get("_skip_session_history"):
+            continue
+        if not _is_openrouter_free_session_history_record(record):
+            continue
+        observed_at = _openrouter_free_record_observed_at(record)
+        window = _openrouter_free_daily_window(observed_at)
+        previous = latest_record_by_window.get(window)
+        if previous is None or observed_at >= previous[0]:
+            latest_record_by_window[window] = (observed_at, record)
+
+    if not latest_record_by_window:
+        return []
+
+    total_requests = _openrouter_free_daily_request_limit()
+    observations: List[Dict[str, Any]] = []
+    for (day_start, day_end), (observed_at, record) in sorted(
+        latest_record_by_window.items(),
+        key=lambda item: item[0][0],
+    ):
+        used_requests = _safe_int(
+            await conn.fetchval(
+                _AAWM_OPENROUTER_FREE_DAILY_REQUEST_COUNT_SQL,
+                day_start,
+                day_end,
+            )
+        )
+        if used_requests is None:
+            continue
+        observations.append(
+            _build_openrouter_free_daily_observation(
+                context=_openrouter_free_daily_observation_context_from_record(
+                    record,
+                    observed_at,
+                ),
+                day_start=day_start,
+                day_end=day_end,
+                used_requests=used_requests,
+                total_requests=total_requests,
+                signal="local_session_history_openrouter_free_count",
+                status=(
+                    "quota_exhausted"
+                    if used_requests >= total_requests
+                    else "observed"
+                ),
+                exhausted=used_requests >= total_requests,
+            )
+        )
+    return observations
 
 
 def _build_rate_limit_key(
@@ -5187,6 +5424,117 @@ def _extract_grok_billing_observations(
     return _dedupe_rate_limit_observations(observations)
 
 
+def _extract_openrouter_free_error_reset_at(
+    kwargs: Dict[str, Any],
+    result: Any,
+    dicts: List[Dict[str, Any]],
+    error_text: str,
+    observed_at: datetime,
+) -> Tuple[datetime, Optional[int]]:
+    headers = _extract_headers_from_kwargs(kwargs)
+    headers.update(_extract_provider_error_headers(result))
+    retry_after_seconds = _extract_provider_error_retry_after_seconds(
+        kwargs=kwargs,
+        result=result,
+        dicts=dicts,
+        error_text=error_text,
+    )
+    reset_hint_seconds = (
+        int(retry_after_seconds)
+        if retry_after_seconds is not None and retry_after_seconds >= 0
+        else None
+    )
+    reset_value = _first_non_empty_string(
+        headers.get("x-ratelimit-reset"),
+        headers.get("x-rate-limit-reset"),
+        headers.get("x-ratelimit-reset-at"),
+        headers.get("x-rate-limit-reset-at"),
+    )
+    provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
+        reset_value,
+        observed_at,
+        reset_hint_seconds,
+    )
+    if provider_resets_at is not None and not stale_reset:
+        return provider_resets_at, reset_hint_seconds
+    _day_start, day_end = _openrouter_free_daily_window(observed_at)
+    return day_end, reset_hint_seconds
+
+
+def _extract_openrouter_free_error_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        _AAWM_OPENROUTER_FREE_DAILY_SOURCE,
+    )
+    if context.get("provider") != "openrouter":
+        return []
+    model_candidates = (
+        context.get("model"),
+        context.get("request_model"),
+        _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"),
+            "request_body",
+            "model",
+        ),
+        _maybe_get_path(
+            kwargs.get("litellm_params"),
+            "proxy_server_request",
+            "body",
+            "model",
+        ),
+    )
+    if not any(_is_openrouter_free_model(model) for model in model_candidates):
+        return []
+
+    dicts = _extract_provider_error_dicts(result)
+    status_code = _extract_provider_error_status_code(result, dicts)
+    error_text = _extract_provider_error_text(result, dicts)
+    error_code, error_type = _extract_provider_error_code_and_type(result, dicts)
+    error_class = _classify_provider_error(
+        status_code=status_code,
+        error_code=error_code,
+        error_type=error_type,
+        error_text=error_text,
+    )
+    if error_class not in {"rate_limited", "usage_limit_reached"}:
+        return []
+
+    observed_dt = context["observed_at"]
+    day_start, day_end = _openrouter_free_daily_window(observed_dt)
+    provider_resets_at, reset_hint_seconds = _extract_openrouter_free_error_reset_at(
+        kwargs,
+        result,
+        dicts,
+        error_text,
+        observed_dt,
+    )
+    context = dict(context)
+    context["account_hash"] = _openrouter_free_shared_account_hash()
+    context["client_family"] = "openrouter"
+    context["model"] = None
+    total_requests = _openrouter_free_daily_request_limit()
+    return [
+        _build_openrouter_free_daily_observation(
+            context=context,
+            day_start=day_start,
+            day_end=day_end,
+            used_requests=total_requests,
+            total_requests=total_requests,
+            signal="openrouter_free_model_rate_limit_error",
+            status="quota_exhausted",
+            exhausted=True,
+            reset_hint_seconds=reset_hint_seconds,
+            provider_resets_at=provider_resets_at,
+        )
+    ]
+
+
 def _looks_like_google_quota_candidate(candidate: Dict[str, Any]) -> bool:
     request_quota_keys = {
         "buckets",
@@ -5515,6 +5863,7 @@ def _build_rate_limit_observations(
     observations.extend(_extract_codex_usage_limit_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_anthropic_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_grok_billing_observations(kwargs, result, observed_at))
+    observations.extend(_extract_openrouter_free_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_quota_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_error_observations(kwargs, result, observed_at))
     return _dedupe_rate_limit_observations(observations)
@@ -5962,7 +6311,6 @@ def _build_structured_output_failure_session_history_record(
 
     record.update(structured_output_state)
     return _normalize_session_history_record(record)
-
 
 def _build_failure_observation_only_record(
     kwargs: Dict[str, Any],
@@ -6419,6 +6767,18 @@ def _first_known_model_string(*candidates: Any) -> Optional[str]:
     return None
 
 
+def _first_explicit_openrouter_model_string(*candidates: Any) -> Optional[str]:
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = candidate.strip()
+        if cleaned.lower().startswith("openrouter/") and len(cleaned) > len(
+            "openrouter/"
+        ):
+            return cleaned
+    return None
+
+
 def _coerce_usage_object_to_dict(usage_obj: Any) -> Optional[Dict[str, Any]]:
     if isinstance(usage_obj, dict):
         return dict(usage_obj)
@@ -6709,6 +7069,81 @@ def _has_nested_path(obj: Any, *keys: str) -> bool:
     return _maybe_get_path(obj, *keys, default=sentinel) is not sentinel
 
 
+def _session_history_provider_from_model(model: Any) -> Optional[str]:
+    model_lower = str(model or "").strip().lower()
+    if not model_lower or model_lower == "unknown":
+        return None
+    if model_lower.startswith("nvidia/"):
+        return "nvidia_nim"
+    if model_lower.startswith("xai/") or model_lower.startswith("grok"):
+        return "xai"
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if "gemini" in model_lower or model_lower.startswith("google/"):
+        return "gemini"
+    if "claude" in model_lower or model_lower.startswith("anthropic/"):
+        return "anthropic"
+    if (
+        model_lower.startswith("gpt")
+        or model_lower.startswith("o1")
+        or model_lower.startswith("o3")
+        or model_lower.startswith("o4")
+        or model_lower.startswith("openai/")
+        or "codex" in model_lower
+    ):
+        return "openai"
+    return None
+
+
+def _session_history_provider_from_route_family(route_family: Any) -> Optional[str]:
+    if not isinstance(route_family, str) or not route_family.strip():
+        return None
+    route_lower = route_family.lower()
+    if "grok" in route_lower or "xai" in route_lower:
+        return "xai"
+    if "nvidia" in route_lower:
+        return "nvidia_nim"
+    if "openrouter" in route_lower:
+        return "openrouter"
+    if "gemini" in route_lower or "google" in route_lower:
+        return "gemini"
+    if "codex" in route_lower or "openai" in route_lower:
+        return "openai"
+    if "anthropic" in route_lower:
+        return "anthropic"
+    return None
+
+
+def _session_history_adapter_target_provider(
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    for tag in _metadata_request_tags(metadata):
+        tag_lower = tag.strip().lower()
+        if not tag_lower.startswith("anthropic-adapter-target:"):
+            continue
+        target = tag_lower.split(":", 1)[1].strip()
+        if target.startswith(("google", "gemini")):
+            return "gemini"
+        if target.startswith("openrouter"):
+            return "openrouter"
+        if target.startswith("nvidia"):
+            return "nvidia_nim"
+        if target.startswith(("xai", "grok")):
+            return "xai"
+        if target.startswith(("responses", "openai", "codex", "/v1/responses")):
+            return "openai"
+    return None
+
+
+def _session_history_adapter_model(metadata: Dict[str, Any]) -> Optional[str]:
+    prefix = "anthropic-adapter-model:"
+    for tag in _metadata_request_tags(metadata):
+        stripped_tag = tag.strip()
+        if stripped_tag.lower().startswith(prefix):
+            return stripped_tag[len(prefix) :].strip() or None
+    return None
+
+
 def _normalize_provider_cache_family(
     provider: Any,
     model: str,
@@ -6763,6 +7198,17 @@ def _normalize_session_history_provider(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     metadata = metadata or {}
+    adapter_target_provider = _session_history_adapter_target_provider(metadata)
+    if adapter_target_provider is not None:
+        return adapter_target_provider
+
+    route_provider = _session_history_provider_from_route_family(
+        metadata.get("passthrough_route_family")
+    )
+    if route_provider is not None and route_provider != "anthropic":
+        return route_provider
+
+    model_provider = _session_history_provider_from_model(model)
 
     def _normalize_known_provider(candidate: Any) -> Optional[str]:
         if not isinstance(candidate, str) or not candidate.strip():
@@ -6777,39 +7223,38 @@ def _normalize_session_history_provider(
         return candidate_lower
 
     normalized_provider = _normalize_known_provider(provider)
+    if (
+        normalized_provider == "anthropic"
+        and model_provider is not None
+        and model_provider != "anthropic"
+    ):
+        return model_provider
     if normalized_provider is not None:
         return normalized_provider
 
     for key in ("custom_llm_provider", "provider", "litellm_provider"):
         normalized_provider = _normalize_known_provider(metadata.get(key))
+        if (
+            normalized_provider == "anthropic"
+            and model_provider is not None
+            and model_provider != "anthropic"
+        ):
+            return model_provider
         if normalized_provider is not None:
             return normalized_provider
 
-    route_family = metadata.get("passthrough_route_family")
-    if isinstance(route_family, str) and route_family.strip():
-        route_lower = route_family.lower()
-        if "grok" in route_lower or "xai" in route_lower:
-            return "xai"
-        if "nvidia" in route_lower:
-            return "nvidia_nim"
-        if "openrouter" in route_lower:
-            return "openrouter"
-        if "gemini" in route_lower or "google" in route_lower:
-            return "gemini"
-        if "codex" in route_lower or "openai" in route_lower:
-            return "openai"
-        if "anthropic" in route_lower:
-            return "anthropic"
+    if route_provider is not None:
+        return route_provider
 
     request_route = metadata.get("user_api_key_request_route")
     if isinstance(request_route, str) and request_route.strip():
         route_lower = request_route.lower()
-        if route_lower.startswith("/anthropic/"):
-            return "anthropic"
         if "gemini" in route_lower or "google" in route_lower:
             return "gemini"
         if route_lower.startswith("/v1/"):
             return "openai"
+        if route_lower.startswith("/anthropic/"):
+            return "anthropic"
 
     api_base = metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base")
     if isinstance(api_base, str) and api_base.strip():
@@ -6827,29 +7272,7 @@ def _normalize_session_history_provider(
         if "openai.com" in api_base_lower:
             return "openai"
 
-    model_lower = str(model or "").strip().lower()
-    if not model_lower or model_lower == "unknown":
-        return None
-    if model_lower.startswith("nvidia/"):
-        return "nvidia_nim"
-    if model_lower.startswith("xai/") or model_lower.startswith("grok"):
-        return "xai"
-    if model_lower.startswith("openrouter/"):
-        return "openrouter"
-    if "gemini" in model_lower or model_lower.startswith("google/"):
-        return "gemini"
-    if "claude" in model_lower or model_lower.startswith("anthropic/"):
-        return "anthropic"
-    if (
-        model_lower.startswith("gpt")
-        or model_lower.startswith("o1")
-        or model_lower.startswith("o3")
-        or model_lower.startswith("o4")
-        or model_lower.startswith("openai/")
-        or "codex" in model_lower
-    ):
-        return "openai"
-    return None
+    return model_provider
 
 
 def _supports_prompt_caching_safe(
@@ -7413,16 +7836,48 @@ def _request_contains_prompt_cache_key(payload: Any) -> bool:
     return isinstance(prompt_cache_key, str) and bool(prompt_cache_key.strip())
 
 
-def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
-    return any(
-        _has_nested_path(usage_obj, *path)
-        for path in (
+def _openai_style_cached_tokens_source(usage_obj: Any) -> Optional[str]:
+    for path, source in (
+        (
+            ("prompt_tokens_details", "cached_tokens"),
+            "usage.prompt_tokens_details.cached_tokens",
+        ),
+        (
+            ("prompt_tokens_details", "cachedTokens"),
+            "usage.prompt_tokens_details.cachedTokens",
+        ),
+        (
             ("input_tokens_details", "cached_tokens"),
+            "usage.input_tokens_details.cached_tokens",
+        ),
+        (
             ("input_tokens_details", "cachedTokens"),
+            "usage.input_tokens_details.cachedTokens",
+        ),
+        (
+            ("promptTokensDetails", "cached_tokens"),
+            "usage.promptTokensDetails.cached_tokens",
+        ),
+        (
+            ("promptTokensDetails", "cachedTokens"),
+            "usage.promptTokensDetails.cachedTokens",
+        ),
+        (
             ("inputTokensDetails", "cached_tokens"),
+            "usage.inputTokensDetails.cached_tokens",
+        ),
+        (
             ("inputTokensDetails", "cachedTokens"),
-        )
-    )
+            "usage.inputTokensDetails.cachedTokens",
+        ),
+    ):
+        if _has_nested_path(usage_obj, *path):
+            return source
+    return None
+
+
+def _usage_has_openai_style_cached_tokens_field(usage_obj: Any) -> bool:
+    return _openai_style_cached_tokens_source(usage_obj) is not None
 
 
 def _usage_has_gemini_style_cached_content_field(usage_obj: Any) -> bool:
@@ -7434,8 +7889,9 @@ def _openai_cache_attempt_source(
 ) -> Optional[Tuple[str, str]]:
     if _request_contains_prompt_cache_key(request_body):
         return "prompt_cache_key_requested_without_hit", "request.prompt_cache_key"
-    if _usage_has_openai_style_cached_tokens_field(usage_obj):
-        return "cached_tokens_reported_zero", "usage.input_tokens_details.cached_tokens"
+    cached_tokens_source = _openai_style_cached_tokens_source(usage_obj)
+    if cached_tokens_source is not None:
+        return "cached_tokens_reported_zero", cached_tokens_source
     return None
 
 
@@ -7771,7 +8227,8 @@ def _resolve_provider_cache_state(
 
     request_has_cache_control = _request_contains_cache_control(request_body)
     request_has_cached_content = _request_contains_cached_content(request_body)
-    usage_has_openai_cached_tokens = _usage_has_openai_style_cached_tokens_field(usage_obj)
+    openai_cached_tokens_source = _openai_style_cached_tokens_source(usage_obj)
+    usage_has_openai_cached_tokens = openai_cached_tokens_source is not None
     usage_has_gemini_cached_content = _usage_has_gemini_style_cached_content_field(usage_obj)
     supports_prompt_caching = _supports_prompt_caching_safe(
         model=model,
@@ -7820,7 +8277,7 @@ def _resolve_provider_cache_state(
         elif usage_has_openai_cached_tokens:
             attempted = True
             miss_reason = miss_reason or "cached_tokens_reported_zero"
-            source = source or "usage.input_tokens_details.cached_tokens"
+            source = source or openai_cached_tokens_source
     elif provider_family == "gemini":
         if request_has_cached_content:
             attempted = True
@@ -8879,6 +9336,12 @@ def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
         return
 
     current_status = record.get("provider_cache_status")
+    if (
+        isinstance(current_status, str)
+        and current_status.strip()
+        and cache_state.get("status") == "not_attempted"
+    ):
+        return
     should_override = (
         not isinstance(current_status, str)
         or not current_status.strip()
@@ -10712,27 +11175,15 @@ def _infer_provider_from_langfuse_observation(
     observation: Dict[str, Any],
     metadata: Dict[str, Any],
 ) -> Optional[str]:
-    route_family = metadata.get("passthrough_route_family")
-    if isinstance(route_family, str) and route_family.strip():
-        route_lower = route_family.lower()
-        if "anthropic" in route_lower:
-            return "anthropic"
-        if "gemini" in route_lower:
-            return "gemini"
-        if "codex" in route_lower:
-            return "openai"
-        if "openai" in route_lower:
-            return "openai"
+    adapter_target_provider = _session_history_adapter_target_provider(metadata)
+    if adapter_target_provider is not None:
+        return adapter_target_provider
 
-    request_route = metadata.get("user_api_key_request_route")
-    if isinstance(request_route, str) and request_route.strip():
-        route_lower = request_route.lower()
-        if route_lower.startswith("/anthropic/"):
-            return "anthropic"
-        if "gemini" in route_lower:
-            return "gemini"
-        if route_lower.startswith("/v1/"):
-            return "openai"
+    route_provider = _session_history_provider_from_route_family(
+        metadata.get("passthrough_route_family")
+    )
+    if route_provider is not None:
+        return route_provider
 
     api_base = (
         metadata.get("api_base")
@@ -10748,22 +11199,24 @@ def _infer_provider_from_langfuse_observation(
         if "openai.com" in api_base_lower:
             return "openai"
 
-    model = _session_history_metadata_model(metadata) or observation.get("model")
-    if isinstance(model, str) and model.strip():
-        model_lower = model.lower()
-        if "claude" in model_lower:
-            return "anthropic"
-        if "gemini" in model_lower:
+    model = (
+        _session_history_adapter_model(metadata)
+        or _session_history_metadata_model(metadata)
+        or observation.get("model")
+    )
+    model_provider = _session_history_provider_from_model(model)
+    if model_provider is not None:
+        return model_provider
+
+    request_route = metadata.get("user_api_key_request_route")
+    if isinstance(request_route, str) and request_route.strip():
+        route_lower = request_route.lower()
+        if "gemini" in route_lower or "google" in route_lower:
             return "gemini"
-        if (
-            model_lower.startswith("gpt")
-            or model_lower.startswith("o1")
-            or model_lower.startswith("o3")
-            or model_lower.startswith("o4")
-            or "codex" in model_lower
-            or "text-embedding" in model_lower
-        ):
+        if route_lower.startswith("/v1/"):
             return "openai"
+        if route_lower.startswith("/anthropic/"):
+            return "anthropic"
 
     return _normalize_session_history_provider(
         metadata.get("custom_llm_provider"),
@@ -10867,7 +11320,16 @@ def _build_session_history_record_from_langfuse_trace_observation(
         _maybe_get(output_response_payload, "model"),
         _extract_model_from_langfuse_output(output_payload),
     )
+    explicit_openrouter_model = _first_explicit_openrouter_model_string(
+        metadata.get("anthropic_adapter_original_model"),
+        metadata.get("codex_adapter_original_model"),
+        metadata.get("model"),
+        observation.get("model"),
+        output_model,
+        _extract_model_from_langfuse_input(observation.get("input")),
+    )
     resolved_model = _first_known_model_string(
+        explicit_openrouter_model,
         _session_history_adapter_model(metadata),
         _session_history_metadata_model(metadata),
         observation.get("model"),
@@ -11015,7 +11477,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
     )
     provider_cache_state = _resolve_provider_cache_state(
         provider=provider,
-        model=str(observation.get("model") or ""),
+        model=resolved_model,
         usage_obj=usage_object,
         metadata=metadata,
         request_body=request_body,
@@ -11025,7 +11487,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         provider_cache_state.update(
             _compute_provider_cache_miss_cost_state(
                 provider_family=provider,
-                model=str(observation.get("model") or ""),
+                model=resolved_model,
                 usage_obj=usage_object,
                 cache_state=provider_cache_state,
                 metadata=metadata,
@@ -11386,6 +11848,28 @@ def _resolve_session_history_model(
     if grok_model_override:
         return grok_model_override
 
+    explicit_openrouter_model = _first_explicit_openrouter_model_string(
+        metadata.get("anthropic_adapter_original_model"),
+        metadata.get("codex_adapter_original_model"),
+        _maybe_get_path(
+            kwargs.get("litellm_params"),
+            "proxy_server_request",
+            "body",
+            "model",
+        ),
+        _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"),
+            "request_body",
+            "model",
+        ),
+        _maybe_get_path(standard_logging_object, "request_body", "model"),
+        metadata.get("model"),
+        kwargs.get("model"),
+        standard_logging_object.get("model"),
+    )
+    if explicit_openrouter_model is not None:
+        return explicit_openrouter_model
+
     if str(kwargs.get("custom_llm_provider") or "").lower() == "openrouter":
         for candidate in (
             _maybe_get_path(
@@ -11418,6 +11902,7 @@ def _resolve_session_history_model(
         standard_logging_object.get("model"),
         _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
         _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body", "model"),
+        _session_history_adapter_model(metadata),
         metadata.get("anthropic_adapter_model"),
         metadata.get("codex_adapter_model"),
         metadata.get("model"),
@@ -12443,12 +12928,16 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
                     tool_activity_payloads,
                 )
 
+        openrouter_free_daily_observations = (
+            await _build_openrouter_free_daily_observations_for_records(conn, [record])
+        )
         observations = record.get("rate_limit_observations")
         rate_limit_observations = [
             observation
             for observation in observations
             if isinstance(observation, dict)
         ] if isinstance(observations, list) else []
+        rate_limit_observations.extend(openrouter_free_daily_observations)
         if rate_limit_observations:
             (
                 rate_limit_observations,
@@ -12531,6 +13020,12 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
             )
+        openrouter_free_daily_observations = (
+            await _build_openrouter_free_daily_observations_for_records(
+                conn,
+                history_records,
+            )
+        )
         rate_limit_observations: List[Dict[str, Any]] = []
         for record in records:
             observations = record.get("rate_limit_observations")
@@ -12540,6 +13035,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
                     for observation in observations
                     if isinstance(observation, dict)
                 )
+        rate_limit_observations.extend(openrouter_free_daily_observations)
         if rate_limit_observations:
             (
                 rate_limit_observations,

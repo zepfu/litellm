@@ -67,9 +67,11 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _handle_anthropic_auto_agent_alias_route,
     _handle_codex_auto_agent_alias_route,
     _handle_codex_google_code_assist_adapter_route,
+    _is_codex_google_code_assist_empty_success_model_response,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
     _resolve_anthropic_auto_agent_alias_model,
+    _resolve_anthropic_openrouter_completion_adapter_model,
     _resolve_codex_auto_agent_alias_model,
     _select_anthropic_auto_agent_candidate,
     _select_codex_auto_agent_candidate,
@@ -95,6 +97,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _iterate_responses_sse_events,
     _log_google_completion_adapter_debug,
     _load_valid_local_google_oauth_access_token,
+    _normalize_passthrough_repository,
     _maybe_force_explicit_bash_tool_choice_for_completion_adapter,
     _maybe_force_explicit_bash_tool_choice_for_responses_adapter,
     _release_google_adapter_semaphore_once,
@@ -149,6 +152,25 @@ _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION = (
     "Agent-role guidance below only helps choose which agent to use after "
     "spawning is already authorized; it never authorizes spawning by itself."
 )
+
+
+@pytest.mark.parametrize(
+    "raw_repository",
+    [
+        "...",
+        "remote",
+        "remote (memory)",
+        "memories (memory)",
+        "new (memory)",
+        "rollout-2026-",
+        "rollout-2026-05-21T19-34-36-019e4ce4-136c-78f2-bf86-0e3f7a0d95db.json",
+        "rollout-2026-05-21T19-34-36-019e4ce4-136c-78f2-bf86-0e3f7a0d95db.json (memory)",
+    ],
+)
+def test_normalize_passthrough_repository_rejects_placeholders_and_transcripts(
+    raw_repository: str,
+) -> None:
+    assert _normalize_passthrough_repository(raw_repository) is None
 
 
 @pytest.fixture(autouse=True)
@@ -4975,6 +4997,128 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         }
 
     @pytest.mark.asyncio
+    async def test_codex_google_code_assist_auto_probe_empty_success_raises_before_logging(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as module
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+        adapter_request = SimpleNamespace(
+            annotated_target_url=httpx.URL(
+                "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+            ),
+            adapter_headers={},
+            google_adapter_rate_limit_key="google-lane",
+            target_url="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            wrapped_request_body={"request": {"contents": []}},
+            target_query_params={"alt": "sse"},
+            is_stream=True,
+            client_requested_stream=False,
+            google_model="gemini-3.1-flash-lite-preview",
+            completion_messages=[{"role": "user", "content": "hello"}],
+            gemini_optional_params={},
+            tool_name_mapping={},
+            codex_request_input="hello",
+            responses_api_request={"model": "gemini-3.1-flash-lite-preview"},
+        )
+        empty_model_response = SimpleNamespace(
+            id="chatcmpl-empty-gemini",
+            model="gemini-3.1-flash-lite-preview",
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=None,
+                        function_call=None,
+                    )
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=0,
+                total_tokens=10,
+            ),
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(
+                return_value=StreamingResponse(
+                    iter([b"data: [DONE]\n\n"]),
+                    media_type="text/event-stream",
+                )
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_model_response_from_stream",
+            new=AsyncMock(return_value=empty_model_response),
+        ), patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response",
+            return_value={"id": "should-not-log"},
+        ) as mock_transform:
+            with pytest.raises(ProxyException) as exc_info:
+                await module._perform_codex_google_code_assist_adapter_request(
+                    request=mock_request,
+                    user_api_key_dict=MagicMock(),
+                    adapter_request=adapter_request,
+                    use_alias_candidate_probe=True,
+                )
+
+        assert exc_info.value.detail["error"]["code"] == (
+            "aawm_codex_auto_agent_empty_success"
+        )
+        assert exc_info.value.detail["error"]["status"] == "RATE_LIMIT_EXCEEDED"
+        assert exc_info.value.detail["diagnostic"]["context"]["adapter"] == (
+            "codex_auto_agent_google_code_assist"
+        )
+        mock_transform.assert_not_called()
+
+    def test_codex_google_code_assist_empty_success_keeps_tool_calls_valid(self):
+        model_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "shell", "arguments": "{}"},
+                            }
+                        ],
+                        function_call=None,
+                    )
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=0,
+                total_tokens=10,
+            ),
+        )
+
+        assert (
+            _is_codex_google_code_assist_empty_success_model_response(model_response)
+            is False
+        )
+
+    @pytest.mark.asyncio
     async def test_nvidia_completion_adapter_preserves_agent_project_litellm_metadata(
         self,
     ):
@@ -5923,6 +6067,30 @@ class TestClaudePersistedOutputExpansion:
             == "acme/new-model"
         )
 
+    @pytest.mark.parametrize(
+        ("requested_model", "expected_model"),
+        [
+            ("openrouter/inclusionai/ling-2.6-flash", "inclusionai/ling-2.6-flash"),
+            (
+                "openrouter/deepseek/deepseek-v4-flash:free",
+                "deepseek/deepseek-v4-flash:free",
+            ),
+        ],
+    )
+    def test_resolve_anthropic_openrouter_completion_adapter_model_supports_chat_shape_models(
+        self,
+        requested_model: str,
+        expected_model: str,
+    ):
+        request_body = {"model": requested_model}
+
+        assert (
+            _resolve_anthropic_openrouter_completion_adapter_model(
+                request_body, endpoint="v1/messages"
+            )
+            == expected_model
+        )
+
     def test_load_claude_agent_declared_model_tolerates_cp1252_agent_file(
         self, tmp_path, monkeypatch
     ):
@@ -6473,14 +6641,6 @@ class TestClaudePersistedOutputExpansion:
             ("openrouter/qwen/qwen3.5-flash-02-23", "qwen/qwen3.5-flash-02-23"),
             ("qwen/qwen3.6-flash", "qwen/qwen3.6-flash"),
             ("openrouter/qwen/qwen3.6-flash", "qwen/qwen3.6-flash"),
-            (
-                "deepseek/deepseek-v4-flash:free",
-                "deepseek/deepseek-v4-flash:free",
-            ),
-            (
-                "openrouter/deepseek/deepseek-v4-flash:free",
-                "deepseek/deepseek-v4-flash:free",
-            ),
             ("qwen/qwen3-coder:free", "qwen/qwen3-coder:free"),
         ],
     )
@@ -6731,6 +6891,109 @@ class TestClaudePersistedOutputExpansion:
             credential_family="nvidia",
             expected_target_family="nvidia",
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("requested_model", "expected_model"),
+        [
+            (
+                "deepseek/deepseek-v4-flash:free",
+                "deepseek/deepseek-v4-flash:free",
+            ),
+            (
+                "openrouter/deepseek/deepseek-v4-flash:free",
+                "deepseek/deepseek-v4-flash:free",
+            ),
+        ],
+    )
+    async def test_anthropic_proxy_route_adapts_deepseek_free_to_openrouter_completion_adapter(
+        self,
+        requested_model: str,
+        expected_model: str,
+    ):
+        request_body = {
+            "model": requested_model,
+            "max_tokens": 256,
+            "metadata": {"existing_key": "existing-value"},
+            "messages": [{"role": "user", "content": "Say model ok"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer anthropic-cli-token",
+            "anthropic-version": "2023-06-01",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
+            return_value="openrouter-test-key",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ) as mock_validate_egress, patch(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+            new=AsyncMock(
+                return_value={
+                    "id": "msg_openrouter_deepseek",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": expected_model,
+                    "content": [{"type": "text", "text": "model ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ),
+        ) as mock_completion_adapter:
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+            )
+
+        translated_body = json.loads(result.body.decode("utf-8"))
+        assert translated_body["model"] == expected_model
+        call_kwargs = mock_completion_adapter.await_args.kwargs
+        assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
+        assert call_kwargs["api_key"] == "openrouter-test-key"
+        assert call_kwargs["api_base"] == "https://openrouter.ai/api/v1"
+        assert call_kwargs["model"] == expected_model
+        assert (
+            call_kwargs["metadata"]["passthrough_route_family"]
+            == "anthropic_openrouter_completion_adapter"
+        )
+        assert (
+            call_kwargs["metadata"]["anthropic_adapter_target_endpoint"]
+            == "openrouter:/v1/chat/completions"
+        )
+        assert (
+            "anthropic-openrouter-completion-adapter"
+            in call_kwargs["metadata"]["tags"]
+        )
+        assert (
+            call_kwargs["litellm_metadata"]["passthrough_route_family"]
+            == "anthropic_openrouter_completion_adapter"
+        )
+        assert (
+            mock_request.scope["query_string"]
+            == b"beta=true -> openrouter.ai/api/v1/chat/completions"
+        )
+        mock_validate_egress.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_adapts_unknown_nvidia_prefixed_model_to_completion_adapter(
@@ -7792,6 +8055,27 @@ class TestClaudePersistedOutputExpansion:
                 "arguments": '{"command":"pwd"}',
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_collect_responses_stream_drains_after_completed_for_logging(self):
+        state = {"yielded_after_completed": False}
+
+        async def _responses_stream():
+            yield b'event: response.created\ndata: {"type":"response.created"}\n\n'
+            yield b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_codex","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":12,"output_tokens":4}}}\n\n'
+            state["yielded_after_completed"] = True
+            yield b'event: done\ndata: [DONE]\n\n'
+
+        response = StreamingResponse(
+            _responses_stream(),
+            status_code=200,
+            media_type="text/event-stream",
+        )
+
+        collected = await _collect_responses_response_from_stream(response)
+
+        assert collected["id"] == "resp_codex"
+        assert state["yielded_after_completed"] is True
 
     @pytest.mark.asyncio
     async def test_gemini_tool_use_stream_preserves_input_json_delta_when_starting_new_block(
@@ -10923,6 +11207,63 @@ async def test_anthropic_auto_agent_alias_falls_back_to_gemini_after_spark_429(
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_routes_deepseek_through_openrouter_completion_adapter(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    await _set_anthropic_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:session:claude-session",
+        60.0,
+    )
+    for model in (
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-pro-preview",
+    ):
+        await _set_anthropic_auto_agent_cooldown(
+            f"google_code_assist:{model}:google-lane",
+            60.0,
+        )
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
+        new=AsyncMock(return_value=success),
+    ) as mock_openrouter_completion, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_openrouter_responses:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    mock_openrouter_completion.assert_awaited_once()
+    mock_openrouter_responses.assert_not_awaited()
+    assert mock_openrouter_completion.await_args.kwargs["adapter_model"] == (
+        "deepseek/deepseek-v4-flash:free"
+    )
+    candidate_body = mock_openrouter_completion.await_args.kwargs[
+        "prepared_request_body"
+    ]
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["anthropic_auto_agent_selected_route_family"] == (
+        "anthropic_openrouter_completion_adapter"
+    )
+    assert metadata["anthropic_auto_agent_selected_last_resort"] is False
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_routes_haiku_last_resort_native(
     monkeypatch,
 ):
@@ -11188,15 +11529,37 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
             f"google_code_assist:{model}:google-lane",
             60.0,
         )
-    success = Response(content="{\"ok\": true}", media_type="application/json")
+    success = {
+        "id": "chatcmpl_deepseek",
+        "created": 1744974432,
+        "model": "deepseek/deepseek-v4-flash:free",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "deepseek ok"},
+            }
+        ],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+    }
+
+    async def fake_openrouter_completion_operation(*, adapter_model, operation):
+        assert adapter_model == "deepseek/deepseek-v4-flash:free"
+        return await operation()
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
         new=AsyncMock(return_value="google-lane"),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_adapter_pass_through_request",
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
+        new=AsyncMock(side_effect=fake_openrouter_completion_operation),
+    ) as mock_openrouter, patch(
+        "litellm.acompletion",
         new=AsyncMock(return_value=success),
-    ) as mock_openrouter:
+    ) as mock_acompletion, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+    ):
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -11208,19 +11571,24 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
             forward_headers=True,
         )
 
-    assert response is success
+    translated = json.loads(response.body.decode("utf-8"))
+    assert translated["model"] == "deepseek/deepseek-v4-flash:free"
+    assert translated["output"][0]["content"][0]["text"] == "deepseek ok"
     mock_openrouter.assert_awaited_once()
     kwargs = mock_openrouter.await_args.kwargs
     assert kwargs["adapter_model"] == "deepseek/deepseek-v4-flash:free"
-    assert kwargs["target"] == "https://openrouter.ai/api/v1/responses"
-    assert kwargs["custom_headers"]["authorization"] == "Bearer or-test-key"
-    assert kwargs["custom_body"]["model"] == "deepseek/deepseek-v4-flash:free"
-    assert kwargs["custom_llm_provider"] == "openrouter"
-    assert kwargs["egress_credential_family"] == "openrouter"
-    assert kwargs["expected_target_family"] == "openrouter"
-    litellm_metadata = kwargs["custom_body"]["litellm_metadata"]
+    mock_acompletion.assert_awaited_once()
+    acompletion_kwargs = mock_acompletion.await_args.kwargs
+    assert acompletion_kwargs["model"] == "deepseek/deepseek-v4-flash:free"
+    assert acompletion_kwargs["custom_llm_provider"] == "openrouter"
+    assert acompletion_kwargs["api_base"] == "https://openrouter.ai/api/v1"
+    assert acompletion_kwargs["messages"][0]["content"] == "hello"
+    assert acompletion_kwargs["litellm_metadata"]["passthrough_route_family"] == (
+        "codex_openrouter_completion_adapter"
+    )
+    litellm_metadata = acompletion_kwargs["litellm_metadata"]
     assert litellm_metadata["codex_auto_agent_selected_route_family"] == (
-        "codex_openrouter_responses"
+        "codex_openrouter_completion_adapter"
     )
     assert litellm_metadata["codex_auto_agent_selected_last_resort"] is False
 
@@ -11471,7 +11839,7 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
         new=AsyncMock(side_effect=gemini_error),
     ) as mock_gemini, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_responses_request",
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
         new=AsyncMock(side_effect=openrouter_error),
     ) as mock_openrouter:
         response = await _handle_codex_auto_agent_alias_route(
@@ -11555,32 +11923,25 @@ async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_last_res
             f"google_code_assist:{model}:google-lane",
             60.0,
         )
-    empty_openrouter_success = Response(
-        content=json.dumps(
-            {
-                "id": "resp_empty_deepseek",
-                "object": "response",
-                "model": "deepseek/deepseek-v4-flash:free",
-                "status": "completed",
-                "output": [],
-                "usage": {
-                    "input_tokens": 12,
-                    "output_tokens": 1,
-                    "total_tokens": 13,
-                },
-            }
-        ),
-        media_type="application/json",
-    )
+    empty_openrouter_success = {
+        "id": "chatcmpl_empty_deepseek",
+        "created": 1744974432,
+        "model": "deepseek/deepseek-v4-flash:free",
+        "object": "chat.completion",
+        "choices": [],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13},
+    }
     mini_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
         new=AsyncMock(return_value="google-lane"),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_adapter_pass_through_request",
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
         new=AsyncMock(return_value=empty_openrouter_success),
     ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(return_value=mini_success),
     ) as mock_pass_through:
@@ -11609,6 +11970,84 @@ async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_last_res
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_alias_gemini_empty_success_rolls_to_next_gemini(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:session:codex-session",
+        60.0,
+    )
+    gemini_empty_error = ProxyException(
+        message=(
+            "Codex auto-agent Gemini Code Assist candidate returned an empty "
+            "successful Responses payload."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    gemini_empty_error.detail = {
+        "error": {
+            "message": gemini_empty_error.message,
+            "code": "aawm_codex_auto_agent_empty_success",
+            "status": "RATE_LIMIT_EXCEEDED",
+            "type": "rate_limit_error",
+        }
+    }
+    second_gemini_success = Response(
+        content='{"id":"resp_second_gemini"}',
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=[gemini_empty_error, second_gemini_success]),
+    ) as mock_gemini, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is second_gemini_success
+    mock_pass_through.assert_not_awaited()
+    assert [
+        call.kwargs["adapter_model"] for call in mock_gemini.await_args_list
+    ] == [
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
+    ]
+    second_body = mock_gemini.await_args_list[1].kwargs["prepared_request_body"]
+    attempts = second_body["litellm_metadata"]["codex_auto_agent_attempts"]
+    assert attempts[0]["model"] == "gemini-3.1-flash-lite-preview"
+    assert attempts[0]["status"] == "cooldown_set"
+    assert attempts[0]["cooldown_seconds"] == 10800.0
+    assert attempts[0]["cooldown_scope"] == "candidate"
+    assert "RATE_LIMIT_EXCEEDED" in attempts[0]["error_tokens"]
+    assert second_body["litellm_metadata"]["codex_auto_agent_selected_model"] == (
+        "gemini-3-flash-preview"
+    )
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_openrouter_one_token_text_is_success(
     monkeypatch,
 ):
@@ -11633,36 +12072,30 @@ async def test_codex_auto_agent_alias_openrouter_one_token_text_is_success(
             f"google_code_assist:{model}:google-lane",
             60.0,
         )
-    short_openrouter_success = Response(
-        content=json.dumps(
+    short_openrouter_success = {
+        "id": "chatcmpl_short_deepseek",
+        "created": 1744974432,
+        "model": "deepseek/deepseek-v4-flash:free",
+        "object": "chat.completion",
+        "choices": [
             {
-                "id": "resp_short_deepseek",
-                "object": "response",
-                "model": "deepseek/deepseek-v4-flash:free",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "ok"}],
-                    }
-                ],
-                "usage": {
-                    "input_tokens": 12,
-                    "output_tokens": 1,
-                    "total_tokens": 13,
-                },
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
             }
-        ),
-        media_type="application/json",
-    )
+        ],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13},
+    }
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
         new=AsyncMock(return_value="google-lane"),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_adapter_pass_through_request",
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
         new=AsyncMock(return_value=short_openrouter_success),
     ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(),
     ) as mock_pass_through:
@@ -11677,7 +12110,8 @@ async def test_codex_auto_agent_alias_openrouter_one_token_text_is_success(
             forward_headers=True,
         )
 
-    assert response is short_openrouter_success
+    translated = json.loads(response.body.decode("utf-8"))
+    assert translated["output"][0]["content"][0]["text"] == "ok"
     mock_openrouter.assert_awaited_once()
     mock_pass_through.assert_not_awaited()
 
@@ -11841,7 +12275,7 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(),
     ) as mock_pass_through:
-        with pytest.raises(ProxyException) as exc_info:
+        with pytest.raises(HTTPException) as exc_info:
             await _handle_codex_auto_agent_alias_route(
                 endpoint="/v1/responses",
                 request=request,
@@ -11853,7 +12287,36 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
                 forward_headers=True,
             )
 
-    assert exc_info.value is gemini_error
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    assert "Do not continue this child agent" in exc_info.value.detail["error"][
+        "message"
+    ]
+    assert "Redispatch a fresh subagent" in exc_info.value.detail["error"]["message"]
+    assert exc_info.value.detail["redispatch_model"] == "aawm-codex-agent-auto"
+    assert (
+        exc_info.value.detail["redispatch_reason"]
+        == "in_flight_retryable_provider_exhaustion"
+    )
+    assert exc_info.value.detail["selected_provider"] == "google_code_assist"
+    assert (
+        exc_info.value.detail["selected_model"] == "gemini-3.1-flash-lite-preview"
+    )
+    assert (
+        exc_info.value.detail["selected_route_family"]
+        == "codex_google_code_assist_adapter"
+    )
+    assert exc_info.value.detail["cooldown_seconds"] > 0
+    assert exc_info.value.detail["retry_after_seconds"] > 0
+    assert "RESOURCE_EXHAUSTED" in exc_info.value.detail["error_tokens"]
+    assert exc_info.value.detail["candidate"]["model"] == (
+        "gemini-3.1-flash-lite-preview"
+    )
+    assert exc_info.value.headers["Retry-After"] == str(
+        exc_info.value.detail["retry_after_seconds"]
+    )
     mock_gemini.assert_awaited_once()
     mock_pass_through.assert_not_called()
 

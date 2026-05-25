@@ -390,6 +390,54 @@ class TestGeminiPassthroughLoggingHandler:
         assert response.usage.completion_tokens == 73
         assert response.usage.completion_tokens_details.reasoning_tokens == 70
 
+    def test_build_complete_streaming_response_code_assist_combined_sse_chunk(self):
+        mock_logging_obj = self._create_mock_logging_obj()
+        content_event = "data: " + json.dumps(
+            {
+                "traceId": "trace-combined",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": "combined chunk"}],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ]
+                },
+            }
+        )
+        usage_event = "data: " + json.dumps(
+            {
+                "traceId": "trace-combined",
+                "response": {
+                    "candidates": [{"finishReason": "STOP", "index": 0}],
+                    "usageMetadata": {
+                        "promptTokenCount": 4,
+                        "candidatesTokenCount": 2,
+                        "totalTokenCount": 6,
+                    },
+                    "modelVersion": "gemini-3.1-flash-lite-preview",
+                },
+            }
+        )
+        combined_chunk = f"event: content\n{content_event}\n\n{usage_event}\n\ndata: [DONE]\n\n"
+
+        response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=[combined_chunk],
+            litellm_logging_obj=mock_logging_obj,
+            model="gemini-3.1-flash-lite-preview",
+            url_route="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+        )
+
+        assert response is not None
+        assert response.model == "gemini-3.1-flash-lite-preview"
+        assert response.choices[0].message.content == "combined chunk"
+        assert response.usage.prompt_tokens == 4
+        assert response.usage.completion_tokens == 2
+
     def test_build_complete_streaming_response_code_assist_preserves_tool_call_from_non_final_chunk(self):
         mock_logging_obj = self._create_mock_logging_obj()
         tool_chunk = "data: " + json.dumps(
