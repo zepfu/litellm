@@ -32,26 +32,62 @@ else:
 
 class GeminiPassthroughLoggingHandler:
     @staticmethod
-    def _parse_stream_chunk_json(chunk: str) -> Optional[Dict[str, Any]]:
-        normalized_chunk = chunk.strip()
-        if normalized_chunk.startswith("data:"):
-            normalized_chunk = normalized_chunk[len("data:") :].strip()
-        if normalized_chunk in {"", "[DONE]"}:
-            return None
+    def _parse_stream_payload_json_objects(payload: str) -> List[Dict[str, Any]]:
+        normalized_payload = payload.strip()
+        if normalized_payload in {"", "[DONE]"}:
+            return []
         try:
-            parsed_chunk = json.loads(normalized_chunk)
+            parsed_payload = json.loads(normalized_payload)
         except json.JSONDecodeError:
+            return []
+        if isinstance(parsed_payload, list):
+            return [item for item in parsed_payload if isinstance(item, dict)]
+        if isinstance(parsed_payload, dict):
+            return [parsed_payload]
+        return []
+
+    @staticmethod
+    def _extract_sse_data_payloads(chunk: str) -> List[str]:
+        normalized_chunk = chunk.strip()
+        if not normalized_chunk:
+            return []
+
+        payloads: List[str] = []
+        frames = re.split(r"\n\s*\n", normalized_chunk)
+        for frame in frames:
+            data_lines: List[str] = []
+            for line in frame.splitlines():
+                stripped_line = line.strip()
+                if stripped_line.startswith("data:"):
+                    data_lines.append(stripped_line[len("data:") :].strip())
+            if data_lines:
+                payloads.append("\n".join(data_lines).strip())
+
+        if payloads:
+            return payloads
+        if normalized_chunk.startswith("data:"):
+            return [normalized_chunk[len("data:") :].strip()]
+        return [normalized_chunk]
+
+    @staticmethod
+    def _parse_stream_chunk_json_objects(chunk: str) -> List[Dict[str, Any]]:
+        parsed_objects: List[Dict[str, Any]] = []
+        for payload in GeminiPassthroughLoggingHandler._extract_sse_data_payloads(chunk):
+            parsed_objects.extend(
+                GeminiPassthroughLoggingHandler._parse_stream_payload_json_objects(
+                    payload
+                )
+            )
+        return parsed_objects
+
+    @staticmethod
+    def _parse_stream_chunk_json(chunk: str) -> Optional[Dict[str, Any]]:
+        parsed_objects = (
+            GeminiPassthroughLoggingHandler._parse_stream_chunk_json_objects(chunk)
+        )
+        if not parsed_objects:
             return None
-        if isinstance(parsed_chunk, list):
-            for item in reversed(parsed_chunk):
-                if isinstance(item, dict):
-                    parsed_chunk = item
-                    break
-            else:
-                return None
-        if not isinstance(parsed_chunk, dict):
-            return None
-        return parsed_chunk
+        return parsed_objects[-1]
 
     @staticmethod
     def _unwrap_code_assist_response_body(response_body: Any) -> Any:
@@ -113,16 +149,14 @@ class GeminiPassthroughLoggingHandler:
     ) -> Optional[Dict[str, Any]]:
         usage_object: Optional[Dict[str, Any]] = None
         for chunk in all_chunks:
-            parsed_chunk = GeminiPassthroughLoggingHandler._parse_stream_chunk_json(
-                chunk
-            )
-            if parsed_chunk is None:
-                continue
-            extracted_usage = GeminiPassthroughLoggingHandler._extract_usage_object_from_response_body(
-                parsed_chunk
-            )
-            if extracted_usage:
-                usage_object = extracted_usage
+            for parsed_chunk in (
+                GeminiPassthroughLoggingHandler._parse_stream_chunk_json_objects(chunk)
+            ):
+                extracted_usage = GeminiPassthroughLoggingHandler._extract_usage_object_from_response_body(
+                    parsed_chunk
+                )
+                if extracted_usage:
+                    usage_object = extracted_usage
         return usage_object
 
     @staticmethod
@@ -329,15 +363,14 @@ class GeminiPassthroughLoggingHandler:
         model: str,
         url_route: str,
     ) -> Optional[Union[ModelResponse, TextCompletionResponse]]:
-        parsed_chunks = []
         if "generateContent" in url_route or "streamGenerateContent" in url_route:
             parsed_json_chunks = []
             for chunk in all_chunks:
-                parsed_chunk = GeminiPassthroughLoggingHandler._parse_stream_chunk_json(
-                    chunk
+                parsed_json_chunks.extend(
+                    GeminiPassthroughLoggingHandler._parse_stream_chunk_json_objects(
+                        chunk
+                    )
                 )
-                if parsed_chunk is not None:
-                    parsed_json_chunks.append(parsed_chunk)
 
             code_assist_chunks = [
                 chunk.get("response")
@@ -355,6 +388,8 @@ class GeminiPassthroughLoggingHandler:
                         )
                     )
                     if complete_streaming_response is not None:
+                        if getattr(complete_streaming_response, "model", None) is None:
+                            complete_streaming_response.model = model
                         return complete_streaming_response
 
                 transformed_httpx_response = httpx.Response(
@@ -384,6 +419,8 @@ class GeminiPassthroughLoggingHandler:
                 )
             )
             if complete_streaming_response is not None:
+                if getattr(complete_streaming_response, "model", None) is None:
+                    complete_streaming_response.model = model
                 return complete_streaming_response
         else:
             return None

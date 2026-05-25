@@ -1525,6 +1525,9 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "anthropic_adapter_cache_control_present",
     "anthropic_adapter_unsupported_hosted_tools",
     "anthropic_adapter_unsupported_hosted_tool_choice",
+    "anthropic_adapter_model",
+    "anthropic_adapter_original_model",
+    "anthropic_adapter_target_endpoint",
     "codex_unsupported_hosted_tool_removed_count",
     "codex_unsupported_hosted_tool_types_removed",
     "codex_unsupported_hosted_tools_removed",
@@ -1706,8 +1709,12 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
     ),
 )
 _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
+    "...",
+    "memories",
+    "new",
     "path",
     "project",
+    "remote",
     "repo",
     "repository",
     "unknown",
@@ -1738,6 +1745,10 @@ _CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
 _AAWM_REPOSITORY_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$"
+)
+_AAWM_REPOSITORY_TRANSCRIPT_ARTIFACT_RE = re.compile(
+    r"^(?:rollout-\d{4}(?:-[A-Za-z0-9_.-]*)?|.*\.jsonl?)$",
+    re.IGNORECASE,
 )
 _CODEX_MEMORY_WORKFLOW_REQUIRED_MARKER = "memory writing agent"
 _CODEX_MEMORY_WORKFLOW_CONTEXT_MARKERS = (
@@ -2253,9 +2264,13 @@ def _is_valid_repository_identity(value: str) -> bool:
 
 def _is_disallowed_repository_identity(value: str) -> bool:
     normalized = value.strip().strip("/").lower()
+    if normalized.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
+        normalized = normalized[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
     if not normalized:
         return True
     if normalized in _AAWM_REPOSITORY_PLACEHOLDER_VALUES:
+        return True
+    if _AAWM_REPOSITORY_TRANSCRIPT_ARTIFACT_RE.fullmatch(normalized):
         return True
     if normalized in _AAWM_REPOSITORY_AGENT_ROLE_VALUES:
         return True
@@ -6749,6 +6764,18 @@ def _first_known_model_string(*candidates: Any) -> Optional[str]:
         if not cleaned or cleaned.lower() in {"unknown", "none", "null"}:
             continue
         return cleaned
+    return None
+
+
+def _first_explicit_openrouter_model_string(*candidates: Any) -> Optional[str]:
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = candidate.strip()
+        if cleaned.lower().startswith("openrouter/") and len(cleaned) > len(
+            "openrouter/"
+        ):
+            return cleaned
     return None
 
 
@@ -11293,7 +11320,16 @@ def _build_session_history_record_from_langfuse_trace_observation(
         _maybe_get(output_response_payload, "model"),
         _extract_model_from_langfuse_output(output_payload),
     )
+    explicit_openrouter_model = _first_explicit_openrouter_model_string(
+        metadata.get("anthropic_adapter_original_model"),
+        metadata.get("codex_adapter_original_model"),
+        metadata.get("model"),
+        observation.get("model"),
+        output_model,
+        _extract_model_from_langfuse_input(observation.get("input")),
+    )
     resolved_model = _first_known_model_string(
+        explicit_openrouter_model,
         _session_history_adapter_model(metadata),
         _session_history_metadata_model(metadata),
         observation.get("model"),
@@ -11811,6 +11847,28 @@ def _resolve_session_history_model(
     grok_model_override = _resolve_xai_grok_model_override(kwargs, metadata)
     if grok_model_override:
         return grok_model_override
+
+    explicit_openrouter_model = _first_explicit_openrouter_model_string(
+        metadata.get("anthropic_adapter_original_model"),
+        metadata.get("codex_adapter_original_model"),
+        _maybe_get_path(
+            kwargs.get("litellm_params"),
+            "proxy_server_request",
+            "body",
+            "model",
+        ),
+        _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"),
+            "request_body",
+            "model",
+        ),
+        _maybe_get_path(standard_logging_object, "request_body", "model"),
+        metadata.get("model"),
+        kwargs.get("model"),
+        standard_logging_object.get("model"),
+    )
+    if explicit_openrouter_model is not None:
+        return explicit_openrouter_model
 
     if str(kwargs.get("custom_llm_provider") or "").lower() == "openrouter":
         for candidate in (

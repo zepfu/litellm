@@ -155,6 +155,12 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             )
             usage = getattr(completion_response, "usage", None)
             if not isinstance(model_info, dict) or usage is None:
+                if custom_llm_provider == "openrouter" and usage is not None:
+                    verbose_proxy_logger.debug(
+                        "OpenAI passthrough cost unavailable for unmapped OpenRouter model=%s; recording zero cost and preserving usage.",
+                        model,
+                    )
+                    return 0.0
                 raise
             input_cost_per_token = model_info.get("input_cost_per_token")
             output_cost_per_token = model_info.get("output_cost_per_token")
@@ -632,6 +638,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         text_parts: List[str] = []
         delta_keys_seen: set[str] = set()
 
+        current_sse_event_type: Optional[str] = None
         for chunk_str in all_chunks:
             parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
                 str_line=chunk_str
@@ -939,17 +946,22 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 event_types.append(event_type)
             event_counts[event_type] = event_counts.get(event_type, 0) + 1
 
+        current_sse_event_type: Optional[str] = None
         for chunk_str in all_chunks:
             stripped_line = chunk_str.strip()
             if stripped_line.startswith("event:"):
                 record_event_type(stripped_line.split(":", 1)[1].strip())
+                current_sse_event_type = stripped_line.split(":", 1)[1].strip()
                 continue
             parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
                 str_line=chunk_str
             )
             if not isinstance(parsed_chunk, dict):
                 continue
-            record_event_type(parsed_chunk.get("type"))
+            parsed_event_type = parsed_chunk.get("type")
+            if parsed_event_type != current_sse_event_type:
+                record_event_type(parsed_event_type)
+            current_sse_event_type = None
 
         tool_state: List[Dict[str, Any]] = []
         for item in OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(

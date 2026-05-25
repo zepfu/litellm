@@ -57,6 +57,7 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
 
 
 _VALID_IDENTITY_SQL = r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?( \(memory\))?$"
+_TRANSCRIPT_ARTIFACT_SQL = r"^(rollout-[0-9]{4}(-[A-Za-z0-9_.-]*)?|.*\.jsonl?)( \(memory\))?$"
 _AGENT_IDENTITY_SQL = _AAWM_REPOSITORY_AGENT_ID_RE.pattern
 _WAVE_AGENT_IDENTITY_SQL = _AAWM_REPOSITORY_WAVE_AGENT_RE.pattern
 _DISALLOWED_IDENTITY_VALUES = tuple(
@@ -143,10 +144,104 @@ def _load_known_repositories(projects_dir: Path) -> set[str]:
     }
 
 
+def _repository_from_cwd(cwd: str, known_repositories: set[str]) -> Optional[str]:
+    cleaned = str(cwd or "").strip().rstrip("/")
+    if not cleaned:
+        return None
+    name = cleaned.rsplit("/", 1)[-1]
+    if name in known_repositories:
+        return name
+    return None
+
+
+def _load_rollout_repository_map(
+    memories_dir: Path,
+    known_repositories: set[str],
+) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    memory_file = memories_dir / "MEMORY.md"
+    if memory_file.exists():
+        for line in memory_file.read_text(errors="replace").splitlines():
+            rollout_match = re.search(r"rollout_path=([^,\)]+)", line)
+            thread_match = re.search(r"thread_id=([0-9a-f-]{12,})", line)
+            cwd_match = re.search(r"cwd=([^,\)]+)", line)
+            if not cwd_match:
+                continue
+            repository = _repository_from_cwd(
+                cwd_match.group(1).strip(),
+                known_repositories,
+            )
+            if not repository:
+                continue
+            if rollout_match:
+                rollout_path = rollout_match.group(1).strip()
+                mapping[Path(rollout_path).name] = repository
+                mapping[Path(rollout_path).with_suffix(".json").name] = repository
+            if thread_match:
+                mapping[thread_match.group(1)] = repository
+
+    summaries_dir = memories_dir / "rollout_summaries"
+    if summaries_dir.exists():
+        for summary_path in summaries_dir.glob("*.md"):
+            try:
+                text = summary_path.read_text(errors="replace")
+            except OSError:
+                continue
+            header = "\n".join(text.splitlines()[:8])
+            thread_match = re.search(r"^thread_id:\s*([0-9a-f-]{12,})", header, re.M)
+            rollout_match = re.search(r"^rollout_path:\s*(\S+)", header, re.M)
+            cwd_match = re.search(r"^cwd:\s*(\S+)", header, re.M)
+            if not cwd_match:
+                continue
+            repository = _repository_from_cwd(cwd_match.group(1), known_repositories)
+            if not repository:
+                continue
+            if thread_match:
+                mapping[thread_match.group(1)] = repository
+            if rollout_match:
+                rollout_path = rollout_match.group(1)
+                mapping[Path(rollout_path).name] = repository
+                mapping[Path(rollout_path).with_suffix(".json").name] = repository
+    return mapping
+
+
 def _repo_base(identity: str) -> str:
     if identity.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
         return identity[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
     return identity
+
+
+def _has_memory_suffix(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX)
+
+
+def _rollout_repository_candidate(
+    value: Any,
+    rollout_repository_map: Dict[str, str],
+) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().strip("`'\"").strip("/")
+    if text.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
+        text = text[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
+    if not text:
+        return None
+    names = {text, Path(text).name}
+    for name in list(names):
+        if name.endswith(".json"):
+            names.add(f"{name}l")
+        elif name.endswith(".jsonl"):
+            names.add(name[:-1])
+    thread_match = re.search(r"([0-9a-f]{8}-[0-9a-f-]{20,})", text, re.I)
+    if thread_match:
+        names.add(thread_match.group(1))
+    for name in names:
+        repository = rollout_repository_map.get(name)
+        if repository:
+            if _has_memory_suffix(value):
+                return f"{repository}{_CODEX_MEMORY_REPOSITORY_SUFFIX}"
+            return repository
+    return None
 
 
 def _is_known_repository(identity: Optional[str], known_repositories: set[str]) -> bool:
@@ -179,6 +274,22 @@ def _repair_noisy_identity(
                 return f"{candidate}{_CODEX_MEMORY_REPOSITORY_SUFFIX}"
             return candidate
     return None
+
+
+def _is_bad_repository_fragment(value: Any, known_repositories: set[str]) -> bool:
+    if not isinstance(value, str):
+        return False
+    if _is_known_repository(value, known_repositories):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    base = _repo_base(text).strip().strip("/").lower()
+    if base in _DISALLOWED_IDENTITY_VALUES:
+        return True
+    if re.fullmatch(_TRANSCRIPT_ARTIFACT_SQL, text, re.IGNORECASE):
+        return True
+    return _normalize_repository_identity(text) is None
 
 
 def _known_repository_candidate(
@@ -255,13 +366,48 @@ def _build_session_repository_map(
     return best_by_session
 
 
+def _build_unique_session_repository_map(
+    rows: list[Dict[str, Any]],
+    known_repositories: set[str],
+) -> Dict[str, Dict[str, Any]]:
+    candidates_by_session: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for row in rows:
+        session_id = row.get("session_id")
+        if not session_id:
+            continue
+        candidate = _best_row_repository_candidate(row, known_repositories)
+        if candidate is None:
+            continue
+        repository, source, priority = candidate
+        session_key = str(session_id)
+        session_candidates = candidates_by_session.setdefault(session_key, {})
+        existing = session_candidates.get(repository)
+        if existing is not None and int(existing["priority"]) <= priority:
+            continue
+        session_candidates[repository] = {
+            "repository": repository,
+            "source": source,
+            "priority": priority,
+            "source_row_id": row.get("id"),
+        }
+
+    unique_by_session: Dict[str, Dict[str, Any]] = {}
+    for session_id, candidates in candidates_by_session.items():
+        if len(candidates) != 1:
+            continue
+        unique_by_session[session_id] = next(iter(candidates.values()))
+    return unique_by_session
+
+
 def _build_repaired_row(  # noqa: PLR0915
     row: Dict[str, Any],
     known_repositories: set[str],
     session_repositories: Optional[Dict[str, Dict[str, Any]]] = None,
     grok_repository: Optional[str] = None,
+    rollout_repository_map: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     session_repositories = session_repositories or {}
+    rollout_repository_map = rollout_repository_map or {}
     metadata = _safe_json_metadata(row.get("metadata"))
     original_metadata = _safe_json_metadata(row.get("metadata"))
     original_repository = row.get("repository")
@@ -283,6 +429,30 @@ def _build_repaired_row(  # noqa: PLR0915
     if grok_repository and _is_grok_row(row):
         repository = grok_repository
         repair_source = "grok_repository_override"
+    elif repository is None and (
+        rollout_repository := _rollout_repository_candidate(
+            original_repository,
+            rollout_repository_map,
+        )
+    ) is not None:
+        repository = rollout_repository
+        repair_source = "rollout_memory_registry"
+    elif repository is None and (
+        rollout_repository := _rollout_repository_candidate(
+            metadata.get("repository"),
+            rollout_repository_map,
+        )
+    ) is not None:
+        repository = rollout_repository
+        repair_source = "rollout_memory_registry"
+    elif repository is None and (
+        rollout_repository := _rollout_repository_candidate(
+            metadata.get("source_repository"),
+            rollout_repository_map,
+        )
+    ) is not None:
+        repository = rollout_repository
+        repair_source = "rollout_memory_registry"
     elif repository is None:
         if metadata_repository is not None:
             repository = metadata_repository
@@ -307,14 +477,31 @@ def _build_repaired_row(  # noqa: PLR0915
 
     if repository is not None:
         metadata["repository"] = repository
+        if repository.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
+            metadata["source_repository"] = _repo_base(repository)
     else:
         metadata.pop("repository", None)
+        if _is_bad_repository_fragment(
+            metadata.get("source_repository"),
+            known_repositories,
+        ):
+            metadata.pop("source_repository", None)
 
     if tenant_id is not None:
         metadata["tenant_id"] = tenant_id
     else:
         metadata.pop("tenant_id", None)
         metadata.pop("tenant_id_source", None)
+    trace_user_id = metadata.get("trace_user_id")
+    if trace_user_id in (
+        original_repository,
+        original_tenant_id,
+        original_metadata.get("repository"),
+    ):
+        if repository is not None:
+            metadata["trace_user_id"] = repository
+        else:
+            metadata.pop("trace_user_id", None)
 
     changed = (
         repository != original_repository
@@ -350,8 +537,51 @@ def _fetch_candidate_rows(
     cursor_id: int,
     batch_size: int,
     include_all_grok: bool = False,
+    null_repository_since: Optional[str] = None,
+    repository_values: Optional[list[str]] = None,
 ) -> list[Dict[str, Any]]:
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        if repository_values:
+            cur.execute(
+                """
+                SELECT id, session_id, provider, model, repository, tenant_id, metadata, created_at
+                FROM public.session_history
+                WHERE id > %s
+                  AND (
+                        repository = ANY(%s::text[])
+                     OR tenant_id = ANY(%s::text[])
+                  )
+                ORDER BY id ASC
+                LIMIT %s
+                """,
+                (
+                    cursor_id,
+                    repository_values,
+                    repository_values,
+                    batch_size,
+                ),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+        if null_repository_since and not include_all_grok:
+            cur.execute(
+                """
+                SELECT id, session_id, provider, model, repository, tenant_id, metadata, created_at
+                FROM public.session_history
+                WHERE id > %s
+                  AND repository IS NULL
+                  AND created_at >= %s::timestamptz
+                ORDER BY id ASC
+                LIMIT %s
+                """,
+                (
+                    cursor_id,
+                    null_repository_since,
+                    batch_size,
+                ),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
         cur.execute(
             """
             SELECT id, session_id, provider, model, repository, tenant_id, metadata, created_at
@@ -367,6 +597,8 @@ def _fetch_candidate_rows(
                     AND (
                             repository !~ %s
                          OR lower(repository) = ANY(%s::text[])
+                         OR lower(regexp_replace(repository, ' \\(memory\\)$', '')) = ANY(%s::text[])
+                         OR repository ~* %s
                          OR repository ~* %s
                          OR repository ~* %s
                         )
@@ -376,6 +608,8 @@ def _fetch_candidate_rows(
                     AND (
                             tenant_id !~ %s
                          OR lower(tenant_id) = ANY(%s::text[])
+                         OR lower(regexp_replace(tenant_id, ' \\(memory\\)$', '')) = ANY(%s::text[])
+                         OR tenant_id ~* %s
                          OR tenant_id ~* %s
                          OR tenant_id ~* %s
                         )
@@ -390,6 +624,8 @@ def _fetch_candidate_rows(
                               AND (
                                     metadata_entry.value !~ %s
                                  OR lower(metadata_entry.value) = ANY(%s::text[])
+                                 OR lower(regexp_replace(metadata_entry.value, ' \\(memory\\)$', '')) = ANY(%s::text[])
+                                 OR metadata_entry.value ~* %s
                                  OR metadata_entry.value ~* %s
                                  OR metadata_entry.value ~* %s
                               )
@@ -397,6 +633,11 @@ def _fetch_candidate_rows(
                     )
                  OR (repository IS NULL AND metadata ? 'aawm_claude_project')
                  OR (repository IS NULL AND (provider = 'xai' OR model ILIKE %s))
+                 OR (
+                        %s::timestamptz IS NOT NULL
+                    AND repository IS NULL
+                    AND created_at >= %s::timestamptz
+                    )
               )
             ORDER BY id ASC
             LIMIT %s
@@ -407,18 +648,26 @@ def _fetch_candidate_rows(
                 "%grok%",
                 _VALID_IDENTITY_SQL,
                 list(_DISALLOWED_IDENTITY_VALUES),
-                _AGENT_IDENTITY_SQL,
-                _WAVE_AGENT_IDENTITY_SQL,
-                _VALID_IDENTITY_SQL,
                 list(_DISALLOWED_IDENTITY_VALUES),
                 _AGENT_IDENTITY_SQL,
                 _WAVE_AGENT_IDENTITY_SQL,
+                _TRANSCRIPT_ARTIFACT_SQL,
+                _VALID_IDENTITY_SQL,
+                list(_DISALLOWED_IDENTITY_VALUES),
+                list(_DISALLOWED_IDENTITY_VALUES),
+                _AGENT_IDENTITY_SQL,
+                _WAVE_AGENT_IDENTITY_SQL,
+                _TRANSCRIPT_ARTIFACT_SQL,
                 list(_METADATA_IDENTITY_KEYS),
                 _VALID_IDENTITY_SQL,
                 list(_DISALLOWED_IDENTITY_VALUES),
+                list(_DISALLOWED_IDENTITY_VALUES),
                 _AGENT_IDENTITY_SQL,
                 _WAVE_AGENT_IDENTITY_SQL,
+                _TRANSCRIPT_ARTIFACT_SQL,
                 "%grok%",
+                null_repository_since,
+                null_repository_since,
                 batch_size,
             ),
         )
@@ -486,6 +735,10 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
         raise SystemExit("No database DSN found. Set AAWM_DB_* or pass --dsn.")
 
     known_repositories = _load_known_repositories(Path(args.projects_dir))
+    rollout_repository_map = _load_rollout_repository_map(
+        Path(args.memories_dir),
+        known_repositories,
+    )
     grok_repository = None
     if args.grok_repository:
         grok_repository = _normalize_repository_identity(args.grok_repository)
@@ -497,6 +750,8 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
     total_seen = 0
     total_repaired = 0
     repair_sources: Counter[str] = Counter()
+    repair_groups: Counter[str] = Counter()
+    unresolved_groups: Counter[str] = Counter()
     preview: list[Dict[str, Any]] = []
     cursor_id = args.cursor_id
 
@@ -511,6 +766,8 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
                 cursor_id=cursor_id,
                 batch_size=args.batch_size,
                 include_all_grok=grok_repository is not None,
+                null_repository_since=args.null_repository_since,
+                repository_values=args.repository_value,
             )
             if not rows:
                 break
@@ -521,10 +778,17 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
                 for row in rows
                 if row.get("session_id")
             }
-            session_repositories = _build_session_repository_map(
-                _fetch_session_identity_rows(conn, session_ids),
-                known_repositories,
-            )
+            session_identity_rows = _fetch_session_identity_rows(conn, session_ids)
+            if args.null_repository_since:
+                session_repositories = _build_unique_session_repository_map(
+                    session_identity_rows,
+                    known_repositories,
+                )
+            else:
+                session_repositories = _build_session_repository_map(
+                    session_identity_rows,
+                    known_repositories,
+                )
             repairs = [
                 repair
                 for row in rows
@@ -534,10 +798,21 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
                         known_repositories,
                         session_repositories,
                         grok_repository,
+                        rollout_repository_map,
                     )
                 )
                 is not None
             ]
+            repaired_ids = {int(repair["id"]) for repair in repairs}
+            if args.null_repository_since:
+                for row in rows:
+                    provider = str(row.get("provider") or "unknown")
+                    model = str(row.get("model") or "unknown")
+                    group_key = f"{provider}|{model}"
+                    if int(row["id"]) in repaired_ids:
+                        repair_groups[group_key] += 1
+                    else:
+                        unresolved_groups[group_key] += 1
             if repairs:
                 total_repaired += len(repairs)
                 repair_sources.update(str(repair["repair_source"]) for repair in repairs)
@@ -557,6 +832,10 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
     print(f"applied={str(bool(args.apply)).lower()}")  # noqa: T201
     for source, count in sorted(repair_sources.items()):
         print(f"repair_source {source}={count}")  # noqa: T201
+    for group, count in repair_groups.most_common(20):
+        print(f"repair_group {group}={count}")  # noqa: T201
+    for group, count in unresolved_groups.most_common(20):
+        print(f"unresolved_group {group}={count}")  # noqa: T201
     for repair in preview:
         print(  # noqa: T201
             "preview "
@@ -577,6 +856,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cursor-id", type=int, default=0)
     parser.add_argument("--preview-limit", type=int, default=20)
     parser.add_argument("--projects-dir", default="/home/zepfu/projects")
+    parser.add_argument("--memories-dir", default="/home/zepfu/.codex/memories")
+    parser.add_argument(
+        "--repository-value",
+        action="append",
+        help=(
+            "Limit repair candidates to an exact repository/tenant/metadata value. "
+            "May be passed multiple times for focused cleanup runs."
+        ),
+    )
+    parser.add_argument(
+        "--null-repository-since",
+        help=(
+            "Include rows with repository IS NULL and created_at at or after this "
+            "timestamptz. Uses strict single-repository session evidence."
+        ),
+    )
     parser.add_argument(
         "--grok-repository",
         help=(

@@ -894,6 +894,14 @@ def test_normalize_repository_identity_accepts_repo_shapes(
         "aegis commits=3a131aa skip_tests=true",
         "aawm-tap-dashboard all=true",
         "aawm-tap\\n\\n\\ (memory)",
+        "...",
+        "remote",
+        "remote (memory)",
+        "memories (memory)",
+        "new (memory)",
+        "rollout-2026-",
+        "rollout-2026-05-21T19-34-36-019e4ce4-136c-78f2-bf86-0e3f7a0d95db.json",
+        "rollout-2026-05-21T19-34-36-019e4ce4-136c-78f2-bf86-0e3f7a0d95db.json (memory)",
         "agent-ac357ffbc895e51d4",
         "agent-abc",
         "orchestrator",
@@ -2177,6 +2185,50 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert payload[63] == pytest.approx(40.0)
     assert payload[64] == pytest.approx(60.0)
     assert payload[65] == pytest.approx(5.0)
+
+
+def test_build_session_history_record_preserves_explicit_openrouter_model() -> None:
+    kwargs = _base_kwargs(trace_name="openrouter")
+    kwargs["model"] = "owl-alpha"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-openrouter-wildcard"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openrouter-wildcard",
+            "passthrough_route_family": "anthropic_openrouter_responses_adapter",
+            "anthropic_adapter_model": "owl-alpha",
+            "anthropic_adapter_original_model": "openrouter/owl-alpha",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "openrouter/owl-alpha",
+        "input": "hello",
+    }
+    result = {
+        "id": "provider-response-openrouter-wildcard",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "openrouter/owl-alpha"
+    assert record["metadata"]["anthropic_adapter_original_model"] == (
+        "openrouter/owl-alpha"
+    )
 
 
 def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None:
@@ -7520,6 +7572,53 @@ def test_build_session_history_record_from_langfuse_uses_adapter_target_over_ant
     assert record["provider"] == "gemini"
     assert record["model"] == "gemini-3-flash-preview"
     assert record["call_type"] == "/anthropic/v1/messages"
+
+
+def test_build_session_history_record_from_langfuse_preserves_explicit_openrouter_model() -> None:
+    trace = {
+        "id": "trace-adapter-openrouter",
+        "name": "claude-code.owl-alpha",
+        "sessionId": "session-adapter-openrouter",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-adapter-openrouter",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "unknown",
+        "startTime": "2026-05-05T10:18:45Z",
+        "endTime": "2026-05-05T10:18:47Z",
+        "usage": {
+            "input": 2195,
+            "output": 11,
+            "total": 2206,
+        },
+        "output": {"model": "owl-alpha"},
+        "metadata": {
+            "user_api_key_request_route": "/anthropic/v1/messages",
+            "passthrough_route_family": "anthropic_openrouter_responses_adapter",
+            "anthropic_adapter_original_model": "openrouter/owl-alpha",
+            "request_tags": [
+                "anthropic-adapter-model:owl-alpha",
+                "anthropic-adapter-target:openrouter:/v1/responses",
+            ],
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-adapter-openrouter",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "openrouter/owl-alpha"
+    assert record["call_type"] == "/anthropic/v1/messages"
+    assert (
+        record["metadata"]["passthrough_route_family"]
+        == "anthropic_openrouter_responses_adapter"
+    )
 
 
 def test_build_session_history_record_from_langfuse_trace_observation_sets_not_applicable_reasoning_source_when_absent() -> None:

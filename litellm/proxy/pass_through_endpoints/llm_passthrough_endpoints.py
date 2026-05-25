@@ -102,6 +102,7 @@ from litellm.utils import ProviderConfigManager
 
 from .passthrough_endpoint_router import PassthroughEndpointRouter
 
+
 vertex_llm_base = VertexBase()
 router = APIRouter()
 default_vertex_config = None
@@ -275,7 +276,7 @@ _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
         "model": "deepseek/deepseek-v4-flash:free",
-        "route_family": "codex_openrouter_responses",
+        "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     },
     {
@@ -316,7 +317,7 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
         "model": "deepseek/deepseek-v4-flash:free",
-        "route_family": "anthropic_openrouter_responses_adapter",
+        "route_family": "anthropic_openrouter_completion_adapter",
         "last_resort": False,
     },
     {
@@ -422,8 +423,12 @@ _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = (
     ),
 )
 _PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES = {
+    "...",
+    "memories",
+    "new",
     "path",
     "project",
+    "remote",
     "repo",
     "repository",
     "unknown",
@@ -449,6 +454,10 @@ _PASSTHROUGH_REPOSITORY_AGENT_ID_RE = re.compile(
 )
 _PASSTHROUGH_REPOSITORY_WAVE_AGENT_RE = re.compile(
     r"^wave\d+-(?:analyst|engineer|infra|ops|principal|qa|researcher|reviewer|salvage|tester)$",
+    re.IGNORECASE,
+)
+_PASSTHROUGH_REPOSITORY_TRANSCRIPT_ARTIFACT_RE = re.compile(
+    r"^(?:rollout-\d{4}(?:-[A-Za-z0-9_.-]*)?|.*\.jsonl?)$",
     re.IGNORECASE,
 )
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
@@ -483,7 +492,6 @@ _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
         "openai/gpt-oss-120b:free",
         "gpt-oss-20b:free",
         "gpt-oss-120b:free",
-        "deepseek/deepseek-v4-flash:free",
         "qwen/qwen3.5-flash-02-23",
         "qwen/qwen3.6-flash",
         "qwen/qwen3-coder:free",
@@ -491,7 +499,9 @@ _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
 )
 _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = frozenset(
     {
+        "deepseek/deepseek-v4-flash:free",
         "openrouter/elephant-alpha",
+        "inclusionai/ling-2.6-flash",
     }
 )
 _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES = (
@@ -1198,6 +1208,47 @@ def _raise_codex_auto_agent_in_flight_cooldown(
     )
 
 
+def _raise_codex_auto_agent_redispatch_required(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    error_tokens: set[str],
+) -> None:
+    retry_after_seconds = int(max(1.0, cooldown_seconds))
+    shaped_candidate = _codex_auto_agent_candidate_public_shape(
+        candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        reason="in_flight_retryable_provider_exhaustion",
+    )
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": (
+                    "Codex auto-agent alias target hit retryable provider exhaustion "
+                    "for an in-flight session. Do not continue this child agent. "
+                    f"Redispatch a fresh subagent using model {_CODEX_AUTO_AGENT_MODEL_ALIAS} "
+                    "so the auto selector can choose the next available candidate."
+                ),
+                "type": "rate_limit_error",
+                "code": "aawm_codex_auto_agent_redispatch_required",
+            },
+            "redispatch_model": _CODEX_AUTO_AGENT_MODEL_ALIAS,
+            "redispatch_reason": "in_flight_retryable_provider_exhaustion",
+            "selected_provider": candidate.get("provider"),
+            "selected_model": candidate.get("model"),
+            "selected_route_family": candidate.get("route_family"),
+            "cooldown_seconds": round(float(cooldown_seconds), 3),
+            "retry_after_seconds": retry_after_seconds,
+            "error_tokens": sorted(error_tokens),
+            "candidate": shaped_candidate,
+        },
+        headers={"Retry-After": str(retry_after_seconds)},
+    )
+
+
 async def _get_codex_auto_agent_active_cooldown_seconds(
     cooldown_key: str,
 ) -> float:
@@ -1491,13 +1542,14 @@ def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
 
 def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
     status_code = _extract_google_adapter_exception_status_code(exc)
-    if status_code in {429, 529}:
+    if status_code in {429, 503, 529}:
         return True
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     return bool(
         tokens
         & {
             "429",
+            "503",
             "usage_limit_reached",
             "RESOURCE_EXHAUSTED",
             "MODEL_CAPACITY_EXHAUSTED",
@@ -1551,7 +1603,7 @@ def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
         return _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
     if "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:
         return _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    if _extract_google_adapter_exception_status_code(exc) == 429:
+    if _extract_google_adapter_exception_status_code(exc) in {429, 503, 529}:
         return _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
     return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
 
@@ -7858,16 +7910,108 @@ def _is_codex_auto_agent_empty_success_responses_body(
         return False
 
 
+def _mapping_or_attr_get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _usage_has_no_more_than_one_output_token(usage: Any) -> bool:
+    if usage is None:
+        return True
+    saw_output_field = False
+    for field in ("completion_tokens", "output_tokens", "output"):
+        token_count = _coerce_optional_int(_mapping_or_attr_get(usage, field))
+        if token_count is None:
+            continue
+        saw_output_field = True
+        if token_count > 1:
+            return False
+    if saw_output_field:
+        return True
+    total_tokens = _coerce_optional_int(_mapping_or_attr_get(usage, "total_tokens"))
+    if total_tokens == 0:
+        return True
+    return False
+
+
+def _model_response_usage_dict(usage: Any) -> dict[str, Any]:
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return dict(usage)
+    model_dump = getattr(usage, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    result: dict[str, Any] = {}
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens", "output_tokens"):
+        value = getattr(usage, field, None)
+        if value is not None:
+            result[field] = value
+    return result
+
+
+def _is_codex_google_code_assist_empty_success_model_response(
+    model_response: Any,
+) -> bool:
+    choices = _mapping_or_attr_get(model_response, "choices") or []
+    if not isinstance(choices, list):
+        return False
+    if not choices:
+        return _usage_has_no_more_than_one_output_token(
+            _mapping_or_attr_get(model_response, "usage")
+        )
+
+    saw_message = False
+    for choice in choices:
+        message = _mapping_or_attr_get(choice, "message")
+        if message is None:
+            continue
+        saw_message = True
+        if not _is_codex_google_code_assist_empty_text_content(
+            _mapping_or_attr_get(message, "content")
+        ):
+            return False
+        if _mapping_or_attr_get(message, "tool_calls"):
+            return False
+        if _mapping_or_attr_get(message, "function_call"):
+            return False
+
+    if not saw_message:
+        return _usage_has_no_more_than_one_output_token(
+            _mapping_or_attr_get(model_response, "usage")
+        )
+    return _usage_has_no_more_than_one_output_token(
+        _mapping_or_attr_get(model_response, "usage")
+    )
+
+
 def _raise_codex_auto_agent_empty_success_response(
     *,
     response_body: dict[str, Any],
     adapter_model: str,
+    adapter: str = "codex_auto_agent_openrouter_responses",
+    adapter_label: str = "OpenRouter",
     stream_event_summaries: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     diagnostic = _build_empty_success_responses_diagnostic(
         response_body=response_body,
         diagnostic_context={
-            "adapter": "codex_auto_agent_openrouter_responses",
+            "adapter": adapter,
             "adapter_model": adapter_model,
             **(
                 {"stream_events": stream_event_summaries}
@@ -7878,7 +8022,7 @@ def _raise_codex_auto_agent_empty_success_response(
     )
     exc = ProxyException(
         message=(
-            "Codex auto-agent OpenRouter candidate returned an empty successful "
+            f"Codex auto-agent {adapter_label} candidate returned an empty successful "
             "Responses payload."
         ),
         type="rate_limit_error",
@@ -8134,6 +8278,7 @@ async def _collect_responses_response_from_stream(
     ordered_keys: list[str] = []
     key_aliases: dict[str, str] = {}
     key_by_output_index: dict[int, str] = {}
+    completed_response_dict: Optional[dict[str, Any]] = None
     event_iterator = _iterate_responses_sse_events(response.body_iterator)
     try:
         async for event in event_iterator:
@@ -8183,18 +8328,21 @@ async def _collect_responses_response_from_stream(
                     continue
                 response_dict = _coerce_namespace_to_mapping(response_payload)
                 if isinstance(response_dict, dict):
-                    return _finalize_collected_responses_stream_response(
-                        response_dict=response_dict,
-                        output_text_parts=output_text_parts,
-                        output_items=output_items,
-                        ordered_keys=ordered_keys,
-                    )
+                    completed_response_dict = response_dict
     finally:
-        await event_iterator.aclose()
-        body_iterator = getattr(response, "body_iterator", None)
-        aclose = getattr(body_iterator, "aclose", None)
-        if callable(aclose):
-            await aclose()
+        if completed_response_dict is None:
+            await event_iterator.aclose()
+            body_iterator = getattr(response, "body_iterator", None)
+            aclose = getattr(body_iterator, "aclose", None)
+            if callable(aclose):
+                await aclose()
+    if completed_response_dict is not None:
+        return _finalize_collected_responses_stream_response(
+            response_dict=completed_response_dict,
+            output_text_parts=output_text_parts,
+            output_items=output_items,
+            ordered_keys=ordered_keys,
+        )
     raise HTTPException(
         status_code=502,
         detail="OpenAI Responses stream completed without a response payload.",
@@ -8758,6 +8906,30 @@ async def _perform_codex_google_code_assist_adapter_request(
             model_response,
             adapter_request.tool_name_mapping,
         )
+        if (
+            use_alias_candidate_probe
+            and _is_codex_google_code_assist_empty_success_model_response(
+                model_response
+            )
+        ):
+            _raise_codex_auto_agent_empty_success_response(
+                response_body={
+                    "id": _mapping_or_attr_get(model_response, "id"),
+                    "model": _mapping_or_attr_get(
+                        model_response,
+                        "model",
+                        adapter_request.google_model,
+                    ),
+                    "status": "completed",
+                    "output": [],
+                    "usage": _model_response_usage_dict(
+                        _mapping_or_attr_get(model_response, "usage")
+                    ),
+                },
+                adapter_model=adapter_request.google_model,
+                adapter="codex_auto_agent_google_code_assist",
+                adapter_label="Gemini Code Assist",
+            )
         responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
             chat_completion_response=model_response,
             request_input=adapter_request.codex_request_input,
@@ -10384,8 +10556,11 @@ def _normalize_passthrough_repository(value: str) -> Optional[str]:
         return None
 
     normalized = cleaned.lower()
+    if normalized.endswith(" (memory)"):
+        normalized = normalized[: -len(" (memory)")]
     if (
         normalized in _PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES
+        or _PASSTHROUGH_REPOSITORY_TRANSCRIPT_ARTIFACT_RE.fullmatch(normalized)
         or normalized in _PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES
         or _PASSTHROUGH_REPOSITORY_AGENT_ID_RE.fullmatch(normalized)
         or _PASSTHROUGH_REPOSITORY_WAVE_AGENT_RE.fullmatch(normalized)
@@ -13432,14 +13607,27 @@ async def _handle_anthropic_auto_agent_alias_route(
                     use_alias_candidate_probe=True,
                 )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-                response = await _handle_anthropic_openrouter_responses_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                )
+                if (
+                    candidate.get("route_family")
+                    == "anthropic_openrouter_completion_adapter"
+                ):
+                    response = await _handle_anthropic_openrouter_completion_adapter_route(
+                        endpoint=endpoint,
+                        request=request,
+                        fastapi_response=fastapi_response,
+                        user_api_key_dict=user_api_key_dict,
+                        prepared_request_body=candidate_body,
+                        adapter_model=candidate["model"],
+                    )
+                else:
+                    response = await _handle_anthropic_openrouter_responses_adapter_route(
+                        endpoint=endpoint,
+                        request=request,
+                        fastapi_response=fastapi_response,
+                        user_api_key_dict=user_api_key_dict,
+                        prepared_request_body=candidate_body,
+                        adapter_model=candidate["model"],
+                    )
             else:
                 _safe_set_request_parsed_body(request, candidate_body)
                 response = await _perform_anthropic_native_passthrough_request(
@@ -15153,6 +15341,144 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     return response
 
 
+async def _perform_codex_auto_agent_openrouter_completion_request(
+    *,
+    request: Request,
+    adapter_model: str,
+    request_body: dict[str, Any],
+) -> Response:
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    openrouter_api_key = _get_openrouter_api_key()
+    if openrouter_api_key is None:
+        exc = ProxyException(
+            message=(
+                "OpenRouter Codex auto-agent candidate requires "
+                "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
+            ),
+            type="rate_limit_error",
+            param="model",
+            code=429,
+        )
+        exc.detail = {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        }
+        raise exc
+
+    requested_model = request_body.get("model")
+    route_family = "codex_openrouter_completion_adapter"
+    request_body = _merge_litellm_metadata(
+        _add_route_family_logging_metadata(request_body, route_family),
+        tags_to_add=[
+            "codex-openrouter-completion-adapter",
+            f"codex-adapter-model:{adapter_model}",
+            "codex-adapter-target:openrouter:/v1/chat/completions",
+        ],
+        extra_fields={
+            "codex_adapter_model": adapter_model,
+            "codex_adapter_original_model": requested_model,
+            "codex_adapter_target_endpoint": "openrouter:/v1/chat/completions",
+            "codex_adapter_input_shape": "openai_responses",
+            "codex_adapter_output_shape": "openai_responses",
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.openrouter_completion_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": adapter_model,
+                        "stream": bool(request_body.get("stream")),
+                    },
+                )
+            ],
+        },
+    )
+    request_input = request_body.get("input") or ""
+    responses_api_request = {
+        key: value
+        for key, value in request_body.items()
+        if key not in {"input", "model", "litellm_metadata"}
+    }
+    litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model=adapter_model,
+        input=request_input,
+        responses_api_request=responses_api_request,
+        custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
+        stream=bool(request_body.get("stream")),
+        metadata=litellm_metadata,
+    )
+    completion_kwargs["metadata"] = litellm_metadata
+
+    target_base_url = _get_openrouter_target_base()
+    target_url = f"{target_base_url.rstrip('/')}/v1/chat/completions"
+    validation_headers = {
+        **_build_openrouter_default_headers(),
+        "Authorization": f"Bearer {openrouter_api_key}",
+    }
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=target_url,
+        headers=validation_headers,
+        credential_family="openrouter",
+        expected_target_family="openrouter",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+
+    completion_response = await _perform_openrouter_completion_adapter_operation(
+        adapter_model=adapter_model,
+        operation=lambda: litellm.acompletion(
+            **completion_kwargs,
+            api_key=openrouter_api_key,
+            api_base=f"{target_base_url.rstrip('/')}/v1",
+            headers=_build_openrouter_default_headers(),
+            litellm_metadata=litellm_metadata,
+            proxy_server_request={
+                "headers": dict(request.headers),
+                "body": request_body,
+            },
+        ),
+    )
+    if bool(request_body.get("stream")):
+        from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+            LiteLLMCompletionStreamingIterator,
+        )
+
+        return StreamingResponse(
+            _responses_sse_from_iterator(
+                LiteLLMCompletionStreamingIterator(
+                    model=adapter_model,
+                    litellm_custom_stream_wrapper=completion_response,
+                    request_input=request_input,
+                    responses_api_request=responses_api_request,
+                    custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
+                    litellm_metadata=litellm_metadata,
+                )
+            ),
+            media_type="text/event-stream",
+        )
+
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        chat_completion_response=completion_response,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+    )
+    response_body = json.loads(
+        _serialize_responses_adapter_response(responses_api_response)
+    )
+    if _is_codex_auto_agent_empty_success_responses_body(response_body):
+        _raise_codex_auto_agent_empty_success_response(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter="codex_auto_agent_openrouter_completion_adapter",
+            adapter_label="OpenRouter chat-completions",
+        )
+    return _build_responses_response_from_adapter_response(responses_api_response)
+
+
 async def _handle_codex_auto_agent_alias_route(
     *,
     endpoint: str,
@@ -15200,13 +15526,23 @@ async def _handle_codex_auto_agent_alias_route(
                     use_alias_candidate_probe=True,
                 )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-                response = await _perform_codex_auto_agent_openrouter_responses_request(
-                    endpoint=endpoint,
-                    request=request,
-                    user_api_key_dict=user_api_key_dict,
-                    adapter_model=candidate["model"],
-                    request_body=candidate_body,
-                )
+                if (
+                    candidate.get("route_family")
+                    == "codex_openrouter_completion_adapter"
+                ):
+                    response = await _perform_codex_auto_agent_openrouter_completion_request(
+                        request=request,
+                        adapter_model=candidate["model"],
+                        request_body=candidate_body,
+                    )
+                else:
+                    response = await _perform_codex_auto_agent_openrouter_responses_request(
+                        endpoint=endpoint,
+                        request=request,
+                        user_api_key_dict=user_api_key_dict,
+                        adapter_model=candidate["model"],
+                        request_body=candidate_body,
+                    )
             else:
                 response = await _perform_codex_auto_agent_native_openai_request(
                     request=request,
@@ -15234,14 +15570,13 @@ async def _handle_codex_auto_agent_alias_route(
                 cooldown_seconds=cooldown_seconds,
                 exc=exc,
             )
+            error_tokens = _extract_codex_auto_agent_error_tokens(exc)
             attempt_record.update(
                 {
                     "status": "cooldown_set",
                     "cooldown_seconds": round(float(cooldown_seconds), 3),
                     "cooldown_scope": cooldown_scope,
-                    "error_tokens": sorted(
-                        _extract_codex_auto_agent_error_tokens(exc)
-                    ),
+                    "error_tokens": sorted(error_tokens),
                 }
             )
             if has_continuation_state:
@@ -15252,7 +15587,12 @@ async def _handle_codex_auto_agent_alias_route(
                     candidate["provider"],
                     candidate["model"],
                 )
-                raise
+                _raise_codex_auto_agent_redispatch_required(
+                    candidate=candidate,
+                    lane_key=selection.get("lane_key"),
+                    cooldown_seconds=cooldown_seconds,
+                    error_tokens=error_tokens,
+                )
             verbose_proxy_logger.warning(
                 "Codex auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",
                 candidate["provider"],
