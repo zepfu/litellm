@@ -2064,6 +2064,43 @@ adapter, and operational observability behavior in this fork.
 
 ---
 
+### aawm.62 — DeepSeek chat-shape auto-agent routing and observability repair
+
+**Status:** AAWM local hotfix.
+
+**What changed:** The Codex and Anthropic auto-agent aliases now route
+OpenRouter `deepseek/deepseek-v4-flash:free` through a chat/completions adapter
+instead of the OpenRouter Responses adapter. The Codex alias still exposes a
+Responses-shaped result to the caller, but the upstream request uses the
+request shape accepted by the free DeepSeek target. Gemini Code Assist
+empty-success responses with no meaningful output and no more than one output
+token are also treated as retryable alias candidate failures.
+
+The release also tightens session-history observability around the same traffic:
+Langfuse and `session_history` preserve explicit `openrouter/...` model names
+when the caller passed one, unmapped OpenRouter cost calculation preserves usage
+instead of dropping the row, Gemini stream logging parses multiple SSE JSON
+objects per chunk, noisy repository placeholders/transcript artifact names are
+rejected, and Langfuse payload-size warnings now identify the fields pushing an
+event near the SDK size limit without logging sensitive metadata values.
+
+**Why:** OpenRouter DeepSeek free was returning empty one-token successes from
+the Responses-shaped path. Treating that as a successful child agent left
+dispatches with no useful work. At the same time, native and repaired
+session-history rows exposed gaps in model attribution, Gemini stream usage
+parsing, and repository cleanup that could hide real usage from reports.
+
+**Why not upstream:** These changes are tied to AAWM's auto-agent alias policy,
+session-history schema, Langfuse tagging conventions, and OpenRouter free-model
+metering/repair workflows.
+
+**Validation status:** Focused unit coverage covers the OpenRouter completion
+adapter, auto-agent retry rollover, Gemini stream usage parsing, repository
+repair rules, Langfuse size-audit helper, and OpenRouter model attribution.
+Dev runtime was validated before prod infrastructure promotion.
+
+---
+
 
 ## Dropped Patches
 

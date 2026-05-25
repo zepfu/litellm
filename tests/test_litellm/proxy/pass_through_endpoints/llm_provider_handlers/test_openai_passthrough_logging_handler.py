@@ -773,6 +773,76 @@ class TestOpenAIPassthroughLoggingHandler:
         assert standard_logging_object["completion_tokens"] == 198
         assert standard_logging_object["total_tokens"] == 96027
 
+    def test_openai_passthrough_handler_preserves_unmapped_openrouter_responses_model(self):
+        response_body = {
+            "id": "resp-openrouter-wildcard-test",
+            "object": "response",
+            "created_at": 1775863780,
+            "model": "openrouter/owl-alpha",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_123",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "OK", "annotations": []}
+                    ],
+                }
+            ],
+            "usage": {
+                "input_tokens": 98,
+                "output_tokens": 2,
+                "total_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "cost": 0,
+            },
+        }
+        mock_httpx_response = self._create_mock_httpx_response(response_body)
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        with patch("litellm.completion_cost", side_effect=Exception("unmapped model")):
+            result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+                httpx_response=mock_httpx_response,
+                response_body=response_body,
+                logging_obj=mock_logging_obj,
+                url_route="https://openrouter.ai/api/v1/responses",
+                result="",
+                start_time=self.start_time,
+                end_time=self.end_time,
+                cache_hit=False,
+                request_body={"model": "openrouter/owl-alpha", "input": "Reply OK"},
+                passthrough_logging_payload=PassthroughStandardLoggingPayload(
+                    url="https://openrouter.ai/api/v1/responses",
+                    request_body={"model": "openrouter/owl-alpha", "input": "Reply OK"},
+                    request_method="POST",
+                ),
+                custom_llm_provider="openrouter",
+                litellm_params={
+                    "metadata": {
+                        "passthrough_route_family": (
+                            "anthropic_openrouter_responses_adapter"
+                        ),
+                        "anthropic_adapter_original_model": "openrouter/owl-alpha",
+                        "anthropic_adapter_model": "owl-alpha",
+                    }
+                },
+            )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        assert result["result"].model == "openrouter/owl-alpha"
+        assert usage.prompt_tokens == 98
+        assert usage.completion_tokens == 2
+        assert usage.total_tokens == 100
+        assert result["kwargs"]["response_cost"] == 0.0
+        assert standard_logging_object["model"] == "openrouter/owl-alpha"
+        assert standard_logging_object["prompt_tokens"] == 98
+        assert standard_logging_object["completion_tokens"] == 2
+        metadata = result["kwargs"]["litellm_params"]["metadata"]
+        assert metadata["anthropic_adapter_original_model"] == "openrouter/owl-alpha"
+
     @patch("litellm.completion_cost")
     def test_openai_streaming_handler_rebuilds_codex_stream_with_empty_output(
         self, mock_completion_cost

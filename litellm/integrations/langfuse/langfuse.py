@@ -1,5 +1,6 @@
 #### What this does ####
 #    On success, logs events to Langfuse
+import json
 import os
 import traceback
 from datetime import datetime
@@ -53,6 +54,164 @@ else:
     DynamicLoggingCache = Any
     StatefulTraceClient = Any
     Langfuse = Any
+
+
+_LANGFUSE_DEFAULT_MAX_EVENT_SIZE_BYTES = 1_000_000
+_LANGFUSE_SIZE_AUDIT_THRESHOLD_RATIO = 0.9
+_LANGFUSE_SIZE_AUDIT_METADATA_KEY_LIMIT = 10
+_SENSITIVE_METADATA_KEY_FRAGMENTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "password",
+    "secret",
+    "token",
+)
+
+
+def _get_langfuse_max_event_size_bytes() -> int:
+    raw_limit = os.environ.get("LANGFUSE_MAX_EVENT_SIZE_BYTES")
+    if raw_limit is None:
+        return _LANGFUSE_DEFAULT_MAX_EVENT_SIZE_BYTES
+    try:
+        parsed_limit = int(raw_limit)
+    except ValueError:
+        return _LANGFUSE_DEFAULT_MAX_EVENT_SIZE_BYTES
+    return parsed_limit if parsed_limit > 0 else _LANGFUSE_DEFAULT_MAX_EVENT_SIZE_BYTES
+
+
+def _json_size_bytes(value: Any) -> int:
+    try:
+        serialized_value = json.dumps(
+            value,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except Exception:
+        serialized_value = f"<unserializable:{type(value).__name__}>"
+    return len(serialized_value.encode("utf-8"))
+
+
+def _sanitize_metadata_key_for_size_audit(key: Any) -> str:
+    key_text = str(key)
+    key_lower = key_text.lower()
+    if any(fragment in key_lower for fragment in _SENSITIVE_METADATA_KEY_FRAGMENTS):
+        return "<redacted-key>"
+    return key_text
+
+
+def _largest_metadata_keys_by_size(metadata: Any) -> List[Dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return []
+
+    key_summaries: List[Dict[str, Any]] = []
+    for key, value in metadata.items():
+        key_summaries.append(
+            {
+                "key": _sanitize_metadata_key_for_size_audit(key),
+                "size_bytes": _json_size_bytes(value),
+                "value_type": type(value).__name__,
+            }
+        )
+
+    return sorted(
+        key_summaries,
+        key=lambda item: int(item.get("size_bytes", 0)),
+        reverse=True,
+    )[:_LANGFUSE_SIZE_AUDIT_METADATA_KEY_LIMIT]
+
+
+def _build_langfuse_payload_size_summary(
+    generation_params: Dict[str, Any],
+    *,
+    trace_id: Optional[str],
+    call_type: Optional[str],
+    max_event_size_bytes: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    max_bytes = max_event_size_bytes or _get_langfuse_max_event_size_bytes()
+    threshold_bytes = int(max_bytes * _LANGFUSE_SIZE_AUDIT_THRESHOLD_RATIO)
+    total_size_bytes = _json_size_bytes(generation_params)
+
+    if total_size_bytes < threshold_bytes:
+        return None
+
+    metadata = generation_params.get("metadata")
+    return {
+        "trace_id": trace_id,
+        "generation_id": generation_params.get("id"),
+        "generation_name": generation_params.get("name"),
+        "model": generation_params.get("model"),
+        "call_type": call_type,
+        "total_size_bytes": total_size_bytes,
+        "max_event_size_bytes": max_bytes,
+        "warning_threshold_bytes": threshold_bytes,
+        "input_size_bytes": _json_size_bytes(generation_params.get("input")),
+        "output_size_bytes": _json_size_bytes(generation_params.get("output")),
+        "metadata_size_bytes": _json_size_bytes(metadata),
+        "model_parameters_size_bytes": _json_size_bytes(
+            generation_params.get("model_parameters")
+        ),
+        "largest_metadata_keys": _largest_metadata_keys_by_size(metadata),
+    }
+
+
+def _log_langfuse_payload_size_if_needed(
+    generation_params: Dict[str, Any],
+    *,
+    trace_id: Optional[str],
+    call_type: Optional[str],
+) -> None:
+    size_summary = _build_langfuse_payload_size_summary(
+        generation_params=generation_params,
+        trace_id=trace_id,
+        call_type=call_type,
+    )
+    if size_summary is None:
+        return
+
+    verbose_logger.warning(
+        "Langfuse event near/exceeds size limit before SDK enqueue: %s",
+        json.dumps(size_summary, sort_keys=True),
+    )
+
+
+def _explicit_openrouter_model_for_langfuse(
+    metadata: Optional[dict],
+    standard_logging_object: Optional[dict],
+) -> Optional[str]:
+    candidates: List[Any] = []
+    if isinstance(metadata, dict):
+        candidates.extend(
+            [
+                metadata.get("anthropic_adapter_original_model"),
+                metadata.get("codex_adapter_original_model"),
+                metadata.get("model"),
+            ]
+        )
+    if isinstance(standard_logging_object, dict):
+        standard_metadata = standard_logging_object.get("metadata")
+        if isinstance(standard_metadata, dict):
+            candidates.extend(
+                [
+                    standard_metadata.get("anthropic_adapter_original_model"),
+                    standard_metadata.get("codex_adapter_original_model"),
+                    standard_metadata.get("model"),
+                ]
+            )
+        candidates.append(standard_logging_object.get("model"))
+
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = candidate.strip()
+        if cleaned.lower().startswith("openrouter/") and len(cleaned) > len(
+            "openrouter/"
+        ):
+            return cleaned
+    return None
 
 
 def _extract_cache_read_input_tokens(usage_obj) -> int:
@@ -941,6 +1100,12 @@ class LangFuseLogger:
             model_name = reconstruct_model_name(
                 kwargs.get("model", ""), custom_llm_provider, metadata
             )
+            explicit_openrouter_model = _explicit_openrouter_model_for_langfuse(
+                metadata,
+                standard_logging_object,
+            )
+            if explicit_openrouter_model is not None:
+                model_name = explicit_openrouter_model
             if (
                 (not model_name or model_name == "unknown")
                 and fallback_model_name is not None
@@ -983,6 +1148,12 @@ class LangFuseLogger:
                 generation_params["completion_start_time"] = kwargs.get(
                     "completion_start_time", None
                 )
+
+            _log_langfuse_payload_size_if_needed(
+                generation_params=generation_params,
+                trace_id=trace_id,
+                call_type=cast(Optional[str], kwargs.get("call_type")),
+            )
 
             generation_client = trace.generation(**generation_params)
 

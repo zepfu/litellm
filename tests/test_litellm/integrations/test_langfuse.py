@@ -456,6 +456,62 @@ class TestLangfuseUsageDetails(unittest.TestCase):
                 {"total": 0.123},
             )
 
+    def test_log_langfuse_v2_preserves_explicit_openrouter_model(self):
+        response_obj = MagicMock()
+        response_obj.id = "resp-openrouter"
+        response_obj.get = (
+            lambda key, default=None: response_obj.id if key == "id" else default
+        )
+        response_obj.usage = MagicMock()
+        response_obj.usage.prompt_tokens = 98
+        response_obj.usage.completion_tokens = 2
+        response_obj.usage.total_tokens = 100
+        response_obj.usage.get = lambda key, default=None: default
+
+        metadata = {
+            "passthrough_route_family": "anthropic_openrouter_responses_adapter",
+            "anthropic_adapter_original_model": "openrouter/owl-alpha",
+            "anthropic_adapter_model": "owl-alpha",
+        }
+        kwargs = {
+            "model": "owl-alpha",
+            "call_type": "pass_through_endpoint",
+            "custom_llm_provider": "openrouter",
+            "litellm_params": {"metadata": metadata},
+            "standard_logging_object": {
+                "metadata": metadata,
+                "prompt_tokens": 98,
+                "completion_tokens": 2,
+                "total_tokens": 100,
+                "response_cost": 0.0,
+                "model": "openrouter/owl-alpha",
+                "trace_id": "trace-openrouter",
+            },
+            "response_cost": 0.0,
+        }
+
+        with patch.object(self.logger, "_supports_prompt", return_value=False):
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata=metadata,
+                litellm_params=kwargs["litellm_params"],
+                output=None,
+                start_time=datetime.datetime(2024, 1, 1, 12, 0, 0),
+                end_time=datetime.datetime(2024, 1, 1, 12, 0, 1),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=response_obj,
+                level="DEFAULT",
+                litellm_call_id="call-openrouter",
+            )
+
+        generation_call = self.mock_langfuse_trace.generation.call_args
+        assert generation_call is not None
+        generation_kwargs = generation_call.kwargs
+
+        self.assertEqual(generation_kwargs["model"], "openrouter/owl-alpha")
+
     def test_log_langfuse_v2_sets_cost_details_from_response_cost(self):
         response_obj = MagicMock()
         response_obj.id = "resp-live"
