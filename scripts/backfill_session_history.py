@@ -770,6 +770,8 @@ class LangfuseClickHouseSource:
         session_id: Optional[str] = None,
         from_start_time: Optional[str] = None,
         to_start_time: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         predicates = ["o.type = 'GENERATION'", "o.is_deleted = 0"]
 
@@ -787,6 +789,30 @@ class LangfuseClickHouseSource:
             predicates.append(f"o.start_time >= toDateTime64({q(_clickhouse_datetime64_literal_value(from_dt))}, 3)")
         if to_dt is not None:
             predicates.append(f"o.start_time <= toDateTime64({q(_clickhouse_datetime64_literal_value(to_dt))}, 3)")
+
+        if model and model.strip():
+            model_literal = q(model.strip())
+            predicates.append(
+                "("
+                f"o.provided_model_name = {model_literal}"
+                f" OR o.metadata['model'] = {model_literal}"
+                f" OR o.metadata['anthropic_adapter_original_model'] = {model_literal}"
+                f" OR o.metadata['codex_adapter_original_model'] = {model_literal}"
+                f" OR o.metadata['codex_auto_agent_selected_model'] = {model_literal}"
+                ")"
+            )
+
+        if provider and provider.strip().lower() == "openrouter":
+            predicates.append(
+                "("
+                "positionCaseInsensitive(coalesce(o.provided_model_name, ''), 'openrouter') > 0"
+                " OR o.metadata['aawm_stream_logging_custom_llm_provider'] = 'openrouter'"
+                " OR positionCaseInsensitive(o.metadata['passthrough_route_family'], 'openrouter') > 0"
+                " OR positionCaseInsensitive(o.metadata['api_base'], 'openrouter') > 0"
+                " OR positionCaseInsensitive(o.metadata['anthropic_adapter_original_model'], 'openrouter/') = 1"
+                " OR positionCaseInsensitive(o.metadata['codex_adapter_original_model'], 'openrouter/') = 1"
+                ")"
+            )
 
         if cursor_start_time is not None and cursor_id is not None:
             cursor_literal = _clickhouse_datetime64_literal_value(cursor_start_time)
@@ -1611,6 +1637,8 @@ async def _run_langfuse_clickhouse_backfill(
             session_id=args.session_id,
             from_start_time=args.from_start_time,
             to_start_time=args.to_start_time,
+            provider=args.provider,
+            model=args.model,
         )
         if not rows:
             break

@@ -4171,6 +4171,108 @@ def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_
     assert record["provider_cache_miss_token_count"] == 1536
 
 
+@pytest.mark.asyncio
+async def test_async_logging_hook_handles_recursive_openrouter_request_body() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    request_body = {
+        "model": "openrouter/inclusionai/ling-2.6-flash",
+        "messages": [{"role": "user", "content": "Reply with ok."}],
+    }
+    request_body["self"] = request_body
+    kwargs["model"] = "openrouter/inclusionai/ling-2.6-flash"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-openrouter-recursive-hook"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openrouter-recursive-hook",
+            "passthrough_route_family": "openrouter_chat_completions",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": request_body,
+        "headers": {},
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = request_body
+    kwargs["standard_logging_object"].update(
+        {
+            "model": "openrouter/inclusionai/ling-2.6-flash",
+            "call_type": "acompletion",
+        }
+    )
+
+    updated_kwargs, _result = await logger.async_logging_hook(
+        kwargs,
+        {
+            "usage": {
+                "prompt_tokens": 25,
+                "completion_tokens": 2,
+                "total_tokens": 27,
+            },
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        },
+        "acompletion",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    assert metadata["usage_provider_cache_status"] == "not_attempted"
+    assert metadata["usage_provider_cache_attempted"] is False
+
+
+def test_build_session_history_record_handles_recursive_openrouter_request_body() -> None:
+    kwargs = _base_kwargs()
+    request_body = {
+        "model": "openrouter/inclusionai/ling-2.6-flash",
+        "messages": [{"role": "user", "content": "Reply with ok."}],
+    }
+    request_body["self"] = request_body
+    kwargs["model"] = "openrouter/inclusionai/ling-2.6-flash"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-openrouter-recursive-record"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openrouter-recursive-record",
+            "passthrough_route_family": "openrouter_chat_completions",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": request_body,
+        "headers": {},
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = request_body
+    kwargs["standard_logging_object"].update(
+        {
+            "model": "openrouter/inclusionai/ling-2.6-flash",
+            "call_type": "acompletion",
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "provider-response-openrouter-recursive-record",
+            "usage": {
+                "prompt_tokens": 25,
+                "completion_tokens": 2,
+                "total_tokens": 27,
+            },
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        },
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "openrouter/inclusionai/ling-2.6-flash"
+    assert record["input_tokens"] == 25
+    assert record["output_tokens"] == 2
+    _build_session_history_db_payload(record)
+
+
 def test_build_session_history_record_flows_nvidia_provider_cache_metadata() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "nvidia_nim/mistralai/devstral-2-123b-instruct-2512"
