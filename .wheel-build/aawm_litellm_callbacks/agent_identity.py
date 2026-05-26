@@ -1713,8 +1713,11 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
 )
 _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
     "...",
+    "0",
     "memories",
     "new",
+    "none",
+    "null",
     "path",
     "project",
     "remote",
@@ -1742,6 +1745,8 @@ _AAWM_REPOSITORY_WAVE_AGENT_RE = re.compile(
     r"^wave\d+-(?:analyst|engineer|infra|ops|principal|qa|researcher|reviewer|salvage|tester)$",
     re.IGNORECASE,
 )
+_AAWM_NUMERIC_IDENTITY_ALLOWLIST: frozenset[str] = frozenset()
+_AAWM_SCALAR_NUMERIC_IDENTITY_RE = re.compile(r"^[+-]?\d+$")
 _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL = "claude-auto-review"
 _CLAUDE_AUTO_REVIEW_TRACE_NAME = "claude-code.auto-reviewer"
 _CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
@@ -2142,7 +2147,7 @@ def _extract_tenant_identity_from_metadata_sources(
         if not source:
             continue
         for key in _AAWM_TENANT_ID_METADATA_KEYS:
-            tenant_id = _clean_non_empty_string(source.get(key))
+            tenant_id = _normalize_tenant_identity(source.get(key))
             if tenant_id:
                 return tenant_id, f"{source_name}.{key}"
 
@@ -2151,7 +2156,7 @@ def _extract_tenant_identity_from_metadata_sources(
             if not nested_source:
                 continue
             for key in _AAWM_TENANT_ID_METADATA_KEYS:
-                tenant_id = _clean_non_empty_string(nested_source.get(key))
+                tenant_id = _normalize_tenant_identity(nested_source.get(key))
                 if tenant_id:
                     return tenant_id, f"{source_name}.{nested_key}.{key}"
 
@@ -2223,7 +2228,9 @@ def _extract_tenant_identity_from_kwargs(
         return tenant_id, source
 
     headers = _extract_request_headers_from_kwargs(kwargs)
-    tenant_id = _get_header_value(headers, *_AAWM_TENANT_ID_HEADER_NAMES)
+    tenant_id = _normalize_tenant_identity(
+        _get_header_value(headers, *_AAWM_TENANT_ID_HEADER_NAMES)
+    )
     if tenant_id:
         return tenant_id, "request_headers"
 
@@ -2265,13 +2272,32 @@ def _is_valid_repository_identity(value: str) -> bool:
     return bool(_AAWM_REPOSITORY_ID_PATTERN.fullmatch(value))
 
 
-def _is_disallowed_repository_identity(value: str) -> bool:
-    normalized = value.strip().strip("/").lower()
+def _normalize_identity_for_placeholder_check(value: Any) -> Optional[str]:
+    cleaned = _clean_non_empty_string(value)
+    if cleaned is None:
+        return None
+    normalized = cleaned.strip("`'\"").strip().strip("/").lower()
     if normalized.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
         normalized = normalized[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
+    return normalized or None
+
+
+def _is_numeric_identity_placeholder(value: Any) -> bool:
+    normalized = _normalize_identity_for_placeholder_check(value)
+    return bool(
+        normalized
+        and normalized not in _AAWM_NUMERIC_IDENTITY_ALLOWLIST
+        and _AAWM_SCALAR_NUMERIC_IDENTITY_RE.fullmatch(normalized)
+    )
+
+
+def _is_disallowed_repository_identity(value: str) -> bool:
+    normalized = _normalize_identity_for_placeholder_check(value)
     if not normalized:
         return True
     if normalized in _AAWM_REPOSITORY_PLACEHOLDER_VALUES:
+        return True
+    if _is_numeric_identity_placeholder(normalized):
         return True
     if _AAWM_REPOSITORY_TRANSCRIPT_ARTIFACT_RE.fullmatch(normalized):
         return True
@@ -2280,6 +2306,19 @@ def _is_disallowed_repository_identity(value: str) -> bool:
     if _AAWM_REPOSITORY_AGENT_ID_RE.fullmatch(normalized):
         return True
     return bool(_AAWM_REPOSITORY_WAVE_AGENT_RE.fullmatch(normalized))
+
+
+def _normalize_tenant_identity(value: Any) -> Optional[str]:
+    cleaned = _clean_non_empty_string(value)
+    if not cleaned:
+        return None
+    cleaned = cleaned.strip("`'\"")
+    normalized = _normalize_identity_for_placeholder_check(cleaned)
+    if normalized in {"...", "none", "null", "unknown"}:
+        return None
+    if _is_numeric_identity_placeholder(cleaned):
+        return None
+    return cleaned
 
 
 def _normalize_repository_identity(value: Any) -> Optional[str]:
@@ -2862,11 +2901,14 @@ def _ensure_mutable_metadata(kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_generic_codex_trace_user_id(value: Any) -> bool:
     normalized = _clean_non_empty_string(value)
-    return normalized is not None and normalized.lower() in {
-        "codex",
-        "codex-cli",
-        "codex-tui",
-    }
+    return normalized is not None and (
+        _is_numeric_identity_placeholder(normalized)
+        or normalized.lower() in {
+            "codex",
+            "codex-cli",
+            "codex-tui",
+        }
+    )
 
 
 def _is_native_codex_passthrough_context(
@@ -2988,7 +3030,21 @@ def _promote_codex_repository_trace_user_id(
     if not _is_native_codex_passthrough_context(metadata, headers):
         return
 
-    metadata_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
+    if _is_numeric_identity_placeholder(metadata.get("repository")):
+        metadata.pop("repository", None)
+    if _is_numeric_identity_placeholder(metadata.get("tenant_id")):
+        metadata.pop("tenant_id", None)
+        metadata.pop("tenant_id_source", None)
+    if _is_numeric_identity_placeholder(metadata.get("trace_user_id")):
+        metadata.pop("trace_user_id", None)
+    if _is_numeric_identity_placeholder(
+        _get_header_value(headers, "langfuse_trace_user_id")
+    ):
+        headers.pop("langfuse_trace_user_id", None)
+
+    metadata_trace_user_id = _normalize_repository_identity(
+        metadata.get("trace_user_id")
+    )
     header_trace_user_id = _get_header_value(headers, "langfuse_trace_user_id")
     repository = _extract_repository_identity_from_kwargs(
         kwargs,
@@ -9611,7 +9667,7 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
 
 
 def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
-    tenant_id = _clean_non_empty_string(record.get("tenant_id"))
+    tenant_id = _normalize_tenant_identity(record.get("tenant_id"))
     if tenant_id:
         record["tenant_id"] = tenant_id
         return
@@ -9727,9 +9783,15 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     else:
         metadata.pop("repository", None)
 
-    tenant_id = _clean_non_empty_string(record.get("tenant_id"))
+    tenant_id = _normalize_tenant_identity(record.get("tenant_id"))
     if tenant_id is not None:
         metadata["tenant_id"] = tenant_id
+    else:
+        metadata.pop("tenant_id", None)
+        metadata.pop("tenant_id_source", None)
+
+    if _is_numeric_identity_placeholder(metadata.get("trace_user_id")):
+        metadata.pop("trace_user_id", None)
 
     record["metadata"] = metadata
 

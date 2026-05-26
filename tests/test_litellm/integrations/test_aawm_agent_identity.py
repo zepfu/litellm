@@ -227,6 +227,43 @@ def test_aawm_agent_identity_promotes_codex_repository_over_generic_user_header(
     assert langfuse_metadata["trace_user_id"] == "pytest-classifier"
 
 
+def test_aawm_agent_identity_rejects_codex_numeric_identity_placeholders() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "0",
+            "tenant_id": "0",
+            "tenant_id_source": "repository",
+            "session_id": "codex-session-123",
+            "trace_user_id": "0",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "langfuse_trace_user_id": "0",
+            "user-agent": "codex-tui/0.133.0",
+        }
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert "repository" not in metadata
+    assert "tenant_id" not in metadata
+    assert "tenant_id_source" not in metadata
+    assert "trace_user_id" not in metadata
+    assert "langfuse_trace_user_id" not in headers
+
+
 def test_aawm_agent_identity_promotes_grok_repository_without_custom_headers() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="grok-build")
@@ -895,6 +932,12 @@ def test_normalize_repository_identity_accepts_repo_shapes(
         "aawm-tap-dashboard all=true",
         "aawm-tap\\n\\n\\ (memory)",
         "...",
+        "0",
+        "1",
+        "42",
+        "0 (memory)",
+        "none",
+        "null",
         "remote",
         "remote (memory)",
         "memories (memory)",
@@ -1239,6 +1282,91 @@ def test_build_session_history_record_uses_repository_as_tenant_fallback() -> No
     assert record["metadata"]["repository"] == "zepfu/litellm"
     assert record["metadata"]["tenant_id"] == "zepfu/litellm"
     assert record["metadata"]["tenant_id_source"] == "repository"
+
+
+def test_build_session_history_record_rejects_numeric_identity_placeholders() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "codex-auto-review"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "responses"
+    kwargs["litellm_call_id"] = "call-codex-numeric-placeholder"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-numeric-placeholder",
+            "passthrough_route_family": "codex_responses",
+            "repository": "0",
+            "tenant_id": "0",
+            "tenant_id_source": "repository",
+            "trace_user_id": "0",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "langfuse_trace_user_id": "0",
+            "user-agent": "codex-tui/0.133.0",
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "codex-auto-review",
+        "input": [],
+    }
+
+    result = {
+        "id": "resp-codex-numeric-placeholder",
+        "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "ack"}]}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-05-26T03:00:00Z",
+        end_time="2026-05-26T03:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
+    assert "tenant_id" not in record["metadata"]
+    assert "tenant_id_source" not in record["metadata"]
+    assert "trace_user_id" not in record["metadata"]
+
+
+def test_build_session_history_record_rejects_numeric_header_tenant_fallback() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/qwen/qwen3.5-flash-02-23"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-numeric-header-tenant"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-numeric-header-tenant"
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"x-aawm-tenant-id": "0"}
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    result = {
+        "id": "resp-numeric-header-tenant",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-05-26T03:00:00Z",
+        end_time="2026-05-26T03:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
+    assert "tenant_id" not in record["metadata"]
+    assert "tenant_id_source" not in record["metadata"]
 
 
 def test_build_session_history_record_labels_codex_memory_repository() -> None:
