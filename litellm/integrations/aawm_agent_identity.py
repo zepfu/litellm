@@ -40,7 +40,7 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
@@ -1645,6 +1645,9 @@ _SESSION_HISTORY_LATENCY_FIELDS = (
     "latency_unclassified_ms",
 )
 _PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v2"
+_AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH = 16
+_AAWM_REQUEST_PAYLOAD_SCAN_MAX_ITEMS = 5000
+_AAWM_JSON_SAFE_MAX_DEPTH = 12
 _AAWM_TENANT_ID_METADATA_KEYS = (
     "tenant_id",
     "aawm_tenant_id",
@@ -3930,19 +3933,58 @@ def _resolve_rate_limit_reset_at(
     return provider_resets_at, False
 
 
-def _json_safe_rate_limit_value(value: Any) -> Any:
+def _json_safe_rate_limit_value(
+    value: Any,
+    *,
+    _seen: Optional[Set[int]] = None,
+    _depth: int = 0,
+) -> Any:
+    if _seen is None:
+        _seen = set()
+    if _depth > _AAWM_JSON_SAFE_MAX_DEPTH:
+        return "<max_depth>"
     if isinstance(value, datetime):
         return _format_langfuse_span_timestamp(value)
     if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in _seen:
+            return "<recursive>"
+        _seen.add(value_id)
         return {
-            str(key): _json_safe_rate_limit_value(nested_value)
+            str(key): _json_safe_rate_limit_value(
+                nested_value,
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
             for key, nested_value in list(value.items())
             if isinstance(key, (str, int, float, bool))
         }
     if isinstance(value, list):
-        return [_json_safe_rate_limit_value(item) for item in value[:100]]
+        value_id = id(value)
+        if value_id in _seen:
+            return ["<recursive>"]
+        _seen.add(value_id)
+        return [
+            _json_safe_rate_limit_value(
+                item,
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
+            for item in value[:100]
+        ]
     if isinstance(value, tuple):
-        return [_json_safe_rate_limit_value(item) for item in value[:100]]
+        value_id = id(value)
+        if value_id in _seen:
+            return ["<recursive>"]
+        _seen.add(value_id)
+        return [
+            _json_safe_rate_limit_value(
+                item,
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
+            for item in value[:100]
+        ]
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="replace")[:500]
@@ -7805,28 +7847,71 @@ def _extract_request_body_from_langfuse_input(value: Any) -> Optional[Dict[str, 
     return None
 
 
-def _request_contains_cache_control(payload: Any) -> bool:
-    if isinstance(payload, dict):
-        if payload.get("cache_control") is not None or payload.get("cacheControl") is not None:
-            return True
-        return any(_request_contains_cache_control(value) for value in list(payload.values()))
-    if isinstance(payload, list):
-        return any(_request_contains_cache_control(item) for item in payload)
+def _request_payload_contains(
+    payload: Any,
+    predicate: Any,
+) -> bool:
+    pending: List[Tuple[Any, int]] = [(payload, 0)]
+    seen: Set[int] = set()
+    scanned = 0
+
+    while pending and scanned < _AAWM_REQUEST_PAYLOAD_SCAN_MAX_ITEMS:
+        value, depth = pending.pop()
+        scanned += 1
+
+        if isinstance(value, dict):
+            value_id = id(value)
+            if value_id in seen:
+                continue
+            seen.add(value_id)
+
+            if predicate(value):
+                return True
+            if depth >= _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH:
+                continue
+            pending.extend(
+                (nested_value, depth + 1)
+                for nested_value in list(value.values())
+                if isinstance(nested_value, (dict, list, tuple))
+            )
+            continue
+
+        if isinstance(value, (list, tuple)):
+            value_id = id(value)
+            if value_id in seen:
+                continue
+            seen.add(value_id)
+
+            if depth >= _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH:
+                continue
+            pending.extend(
+                (item, depth + 1)
+                for item in list(value)
+                if isinstance(item, (dict, list, tuple))
+            )
+
     return False
+
+
+def _request_contains_cache_control(payload: Any) -> bool:
+    return _request_payload_contains(
+        payload,
+        lambda item: item.get("cache_control") is not None
+        or item.get("cacheControl") is not None,
+    )
 
 
 def _request_contains_cached_content(payload: Any) -> bool:
-    if isinstance(payload, dict):
-        cached_content = payload.get("cachedContent")
+    def _has_cached_content(item: Dict[str, Any]) -> bool:
+        cached_content = item.get("cachedContent")
         if isinstance(cached_content, str) and cached_content.strip():
             return True
-        cached_content_alias = payload.get("cached_content")
-        if isinstance(cached_content_alias, str) and cached_content_alias.strip():
-            return True
-        return any(_request_contains_cached_content(value) for value in list(payload.values()))
-    if isinstance(payload, list):
-        return any(_request_contains_cached_content(item) for item in payload)
-    return False
+        cached_content_alias = item.get("cached_content")
+        return isinstance(cached_content_alias, str) and bool(
+            cached_content_alias.strip()
+        )
+
+    return _request_payload_contains(payload, _has_cached_content)
 
 
 def _request_contains_prompt_cache_key(payload: Any) -> bool:
@@ -8539,7 +8624,16 @@ def _estimate_prompt_overhead_tokens(model: str, value: Any) -> int:
     return _fallback_text_token_estimate(text)
 
 
-def _extract_prompt_text_blocks(value: Any) -> List[str]:
+def _extract_prompt_text_blocks(
+    value: Any,
+    *,
+    _seen: Optional[Set[int]] = None,
+    _depth: int = 0,
+) -> List[str]:
+    if _seen is None:
+        _seen = set()
+    if _depth > _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH:
+        return []
     if value is None:
         return []
     if isinstance(value, str):
@@ -8551,15 +8645,35 @@ def _extract_prompt_text_blocks(value: Any) -> List[str]:
     if isinstance(value, (int, float, bool)):
         return [str(value)]
     if isinstance(value, list):
+        value_id = id(value)
+        if value_id in _seen:
+            return []
+        _seen.add(value_id)
         blocks: List[str] = []
         for item in value:
-            blocks.extend(_extract_prompt_text_blocks(item))
+            blocks.extend(
+                _extract_prompt_text_blocks(
+                    item,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+            )
         return blocks
     if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in _seen:
+            return []
+        _seen.add(value_id)
         blocks = []
         for key in ("text", "content", "parts", "systemInstruction", "system_instruction"):
             if key in value:
-                blocks.extend(_extract_prompt_text_blocks(value.get(key)))
+                blocks.extend(
+                    _extract_prompt_text_blocks(
+                        value.get(key),
+                        _seen=_seen,
+                        _depth=_depth + 1,
+                    )
+                )
         if blocks:
             return blocks
         return [_serialize_prompt_overhead_component(value)]
@@ -8699,7 +8813,16 @@ def _append_prompt_text_components(
         _append_prompt_component(components, name, path=path, value=value)
 
 
-def _extract_responses_visible_text_blocks(value: Any) -> List[str]:
+def _extract_responses_visible_text_blocks(
+    value: Any,
+    *,
+    _seen: Optional[Set[int]] = None,
+    _depth: int = 0,
+) -> List[str]:
+    if _seen is None:
+        _seen = set()
+    if _depth > _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH:
+        return []
     if value is None:
         return []
     if isinstance(value, str):
@@ -8708,11 +8831,25 @@ def _extract_responses_visible_text_blocks(value: Any) -> List[str]:
     if isinstance(value, (int, float, bool)):
         return [str(value)]
     if isinstance(value, list):
+        value_id = id(value)
+        if value_id in _seen:
+            return []
+        _seen.add(value_id)
         blocks: List[str] = []
         for item in value:
-            blocks.extend(_extract_responses_visible_text_blocks(item))
+            blocks.extend(
+                _extract_responses_visible_text_blocks(
+                    item,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+            )
         return blocks
     if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in _seen:
+            return []
+        _seen.add(value_id)
         content_type = str(value.get("type") or "").lower()
         if content_type in _RESPONSES_OPAQUE_CONTENT_TYPES:
             return []
@@ -8723,7 +8860,11 @@ def _extract_responses_visible_text_blocks(value: Any) -> List[str]:
             text = value["text"].strip()
             return [text] if text else []
         if "content" in value:
-            return _extract_responses_visible_text_blocks(value.get("content"))
+            return _extract_responses_visible_text_blocks(
+                value.get("content"),
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
     return []
 
 
@@ -8740,13 +8881,33 @@ def _record_responses_excluded_fields(
     value: Any,
     *,
     path: str,
+    _seen: Optional[Set[int]] = None,
+    _depth: int = 0,
 ) -> None:
+    if _seen is None:
+        _seen = set()
+    if _depth > _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH:
+        return
     if isinstance(value, list):
+        value_id = id(value)
+        if value_id in _seen:
+            return
+        _seen.add(value_id)
         for item in value:
-            _record_responses_excluded_fields(components, item, path=path)
+            _record_responses_excluded_fields(
+                components,
+                item,
+                path=path,
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
         return
     if not isinstance(value, dict):
         return
+    value_id = id(value)
+    if value_id in _seen:
+        return
+    _seen.add(value_id)
     content_type = str(value.get("type") or "").lower()
     if content_type == "item_reference":
         _append_prompt_component(
@@ -8769,6 +8930,8 @@ def _record_responses_excluded_fields(
                 components,
                 field_value,
                 path=f"{path}.{key}",
+                _seen=_seen,
+                _depth=_depth + 1,
             )
 
 
@@ -11638,7 +11801,7 @@ def _build_session_history_metadata(
     for key in _AAWM_SESSION_HISTORY_METADATA_KEYS:
         value = metadata.get(key)
         if value is not None:
-            history_metadata[key] = value
+            history_metadata[key] = _json_safe_rate_limit_value(value)
 
     return history_metadata
 
