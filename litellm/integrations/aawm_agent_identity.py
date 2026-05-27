@@ -1464,6 +1464,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "session_id_source",
     "synthetic_session_id",
     "synthetic_session_id_basis",
+    "source_status",
     "source_model",
     "logical_model",
     "aawm_claude_agent_name",
@@ -1705,7 +1706,7 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
     ),
     re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
     re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
-    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)"),
+    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^,`'\"\n<]+)"),
     re.compile(
         r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
         re.IGNORECASE,
@@ -1751,6 +1752,8 @@ _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL = "claude-auto-review"
 _CLAUDE_AUTO_REVIEW_TRACE_NAME = "claude-code.auto-reviewer"
 _CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
+_CODEX_MEMORY_ROOT_PATH = "/home/zepfu/.codex/memories"
+_CODEX_MEMORY_ROOT_REPOSITORY = "codex-memories"
 _AAWM_REPOSITORY_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$"
 )
@@ -2346,7 +2349,11 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
         except Exception:
             pass
     elif cleaned.startswith("/"):
-        cleaned = cleaned.rstrip("/").rsplit("/", 1)[-1]
+        normalized_path = cleaned.rstrip("/")
+        if normalized_path == _CODEX_MEMORY_ROOT_PATH:
+            cleaned = _CODEX_MEMORY_ROOT_REPOSITORY
+        else:
+            cleaned = normalized_path.rsplit("/", 1)[-1]
 
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
@@ -6397,6 +6404,7 @@ def _build_structured_output_failure_session_history_record(
         structured_output_state.get("structured_output_failed") or failure_reason
     )
     structured_output_state["structured_output_failure_reason"] = failure_reason
+    _ensure_mutable_metadata(kwargs)["source_status"] = "failure"
 
     record = _build_session_history_record(
         kwargs=kwargs,
@@ -9897,7 +9905,7 @@ def _extract_gemini_control_plane_method_from_record(
     return None
 
 
-def _session_history_record_usage_token_total(record: Dict[str, Any]) -> int:
+def _session_history_record_provider_usage_token_total(record: Dict[str, Any]) -> int:
     total = 0
     for field in (
         "input_tokens",
@@ -9905,7 +9913,6 @@ def _session_history_record_usage_token_total(record: Dict[str, Any]) -> int:
         "cache_read_input_tokens",
         "cache_creation_input_tokens",
         "reasoning_tokens_reported",
-        "reasoning_tokens_estimated",
     ):
         value = _safe_int(record.get(field))
         if value is not None and value > 0:
@@ -9914,7 +9921,7 @@ def _session_history_record_usage_token_total(record: Dict[str, Any]) -> int:
 
 
 def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
-    if _session_history_record_usage_token_total(record) > 0:
+    if _session_history_record_provider_usage_token_total(record) > 0:
         return
 
     metadata = record.get("metadata")
