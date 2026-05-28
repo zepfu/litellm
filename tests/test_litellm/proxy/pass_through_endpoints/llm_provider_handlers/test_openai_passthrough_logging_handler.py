@@ -850,9 +850,10 @@ class TestOpenAIPassthroughLoggingHandler:
         mock_completion_cost.return_value = 0.456
 
         mock_logging_obj = self._create_mock_logging_obj()
+        litellm_params = {"metadata": {"passthrough_route_family": "codex_responses"}}
         mock_logging_obj.model_call_details = {
             "custom_llm_provider": "openai",
-            "litellm_params": {},
+            "litellm_params": litellm_params,
         }
 
         streaming_chunks = [
@@ -918,6 +919,79 @@ class TestOpenAIPassthroughLoggingHandler:
         mock_completion_cost.assert_called_once()
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.456
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_codex_stream_with_missing_output(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.457
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        litellm_params = {"metadata": {"passthrough_route_family": "codex_responses"}}
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": litellm_params,
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-codex-stream","object":"response","created_at":1775868809,"status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.output_item.added',
+            'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pwd","id":"fc_pwd","name":"Bash","arguments":""}}',
+            'event: response.function_call_arguments.done',
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc_pwd","output_index":0,"arguments":"{\\"command\\":\\"pwd\\"}"}',
+            'event: response.output_text.delta',
+            'data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":1,"content_index":0,"delta":"langfuse "}',
+            'event: response.output_text.delta',
+            'data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":1,"content_index":0,"delta":"fixed"}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-codex-stream","object":"response","created_at":1775868809,"status":"completed","model":"gpt-5.4","usage":{"input_tokens":15519,"output_tokens":29,"total_tokens":15548,"input_tokens_details":{"cached_tokens":6528},"output_tokens_details":{"reasoning_tokens":19}}}}',
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4", "input": "langfuse fixed"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+            kwargs={"litellm_params": litellm_params},
+        )
+
+        usage = result["result"].usage
+        standard_logging_object = result["kwargs"]["standard_logging_object"]
+        metadata = result["kwargs"]["litellm_params"]["metadata"]
+        assert result["result"].choices[0].message.content == "langfuse fixed"
+        assert usage.prompt_tokens == 15519
+        assert usage.completion_tokens == 29
+        assert usage.total_tokens == 15548
+        assert usage.prompt_tokens_details.cached_tokens == 6528
+        assert standard_logging_object["model"] == "gpt-5.4"
+        assert standard_logging_object["prompt_tokens"] == 15519
+        assert standard_logging_object["completion_tokens"] == 29
+        assert standard_logging_object["total_tokens"] == 15548
+        assert "cannot parse chunks" not in json.dumps(
+            standard_logging_object, default=str
+        )
+        assert result["result"]._hidden_params["responses_output"] == [
+            {
+                "type": "function_call",
+                "call_id": "call_pwd",
+                "id": "fc_pwd",
+                "name": "Bash",
+                "arguments": '{"command":"pwd"}',
+            }
+        ]
+        spans = metadata["langfuse_spans"]
+        assert spans[0]["name"] == "codex.usage_normalize"
+        assert spans[0]["metadata"]["streaming"] is True
+        assert spans[0]["metadata"]["call_type"] == "responses"
+        assert spans[0]["metadata"]["total_tokens"] == 15548
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
+        assert result["kwargs"]["response_cost"] == 0.457
 
     def test_openai_passthrough_handler_adds_codex_usage_normalize_span(self):
         codex_response = {

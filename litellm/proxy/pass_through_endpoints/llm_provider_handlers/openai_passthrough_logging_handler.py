@@ -638,7 +638,6 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         text_parts: List[str] = []
         delta_keys_seen: set[str] = set()
 
-        current_sse_event_type: Optional[str] = None
         for chunk_str in all_chunks:
             parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
                 str_line=chunk_str
@@ -1638,8 +1637,17 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     fallback_model=model,
                 )
 
-            completed_response = ResponsesAPIResponse(**completed_response_payload)
             responses_output = completed_response_payload.get("output")
+            completed_response_model_payload = completed_response_payload
+            if "output" not in completed_response_model_payload:
+                completed_response_model_payload = {
+                    **completed_response_payload,
+                    "output": [],
+                }
+
+            completed_response = ResponsesAPIResponse(
+                **completed_response_model_payload
+            )
             reconstructed_output = (
                 OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
                     all_chunks
