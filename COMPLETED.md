@@ -1,5 +1,87 @@
 # Completed
 
+## 2026-05-28
+
+- Promoted the `aawm.63` Codex Responses stream logging repair to prod.
+
+  Release:
+  implementation commit `ac9b39fdfb8086a5bb975da0e7ed784c3831eea4`
+  is pushed to both `origin/main` and `origin/develop`, tagged as
+  `v1.82.3-aawm.63`, and GitHub Actions run `26595412545` succeeded. The
+  published fork image is `ghcr.io/zepfu/litellm:1.82.3-aawm.63`. Current
+  overlay releases verified with assets are callback `cb-v0.0.40`,
+  control-plane `cp-v0.0.7`, model-config `cfg-v0.0.13`, and harness
+  `h-v0.0.31`.
+
+  Runtime:
+  `/home/zepfu/projects/aawm-infrastructure` was rebuilt no-cache from
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.63`; local image
+  `aawm-litellm:latest` has image id
+  `sha256:46c05bd9b905e0bfa58244be7f8b5da9b5ada9beda89614017e900464c34199a`.
+  Prod container `620c607bca78` is healthy on `:4000`, and readiness reports
+  `litellm_version=1.82.3+aawm.63`. Running-container package inspection
+  reports `litellm=1.82.3+aawm.63`,
+  `aawm-litellm-callbacks=0.0.40`, and
+  `aawm-litellm-control-plane=0.0.7`.
+
+  Validation:
+  focused local checks passed: the OpenAI passthrough logging handler test file
+  reported `37 passed, 1 warning`, targeted Ruff checks passed, and
+  `git diff --check` passed for the release files. Dev Codex smoke trace
+  `eff987e4-d4c9-48cb-a7bc-0fec1e13d0f8` returned
+  `D1-165 aawm63 dev smoke` with `environment=dev`, route
+  `codex_responses`, and `codex.usage_normalize`.
+
+  Direct prod Codex smoke through profile `litellm` returned exactly
+  `D1-165 aawm63 prod smoke`. Exact database
+  `aawm_tristore.public.session_history` row `943566` records
+  `session_id=74aa0624-7da6-453f-8848-e64bb183bc95`,
+  `litellm_environment=prod`, `litellm_version=1.82.3+aawm.63`,
+  `tenant_id=litellm`, `repository=litellm`, `provider=openai`,
+  `model=gpt-5.5`, `client_name=codex_exec`, `client_version=0.134.0`,
+  `input_tokens=24627`, `output_tokens=87`, `total_tokens=24714`,
+  `cache_read_input_tokens=3456`, `provider_cache_status=hit`, and
+  `metadata.passthrough_route_family=codex_responses`.
+
+  Native passthrough shard artifact `/tmp/litellm-prod-native-aawm63.json`
+  passed native Anthropic, native OpenAI chat, native OpenAI Responses, native
+  Gemini generateContent, and native Gemini streamGenerateContent. The native
+  Codex case successfully reached prod and produced Langfuse trace
+  `1fb03c5c-9fe3-4c0a-af40-f7ab5feb1b8c` with output `native codex`,
+  `environment=prod`, `userId=litellm-harness.prod.native_openai_passthrough_responses_codex.1779995468-3833327`,
+  session id
+  `litellm-harness.prod.native_openai_passthrough_responses_codex.1779995468-3833327.session`,
+  route tag `route:codex_responses`, truthy `codex_response_headers`, and
+  `codex.usage_normalize` metadata `streaming=true`, `call_type=responses`,
+  `total_tokens=23445`, `response_cost=0.0156597`. Its matching
+  `session_history` row is stored under the stable harness session id with
+  `trace_id=1fb03c5c-9fe3-4c0a-af40-f7ab5feb1b8c`,
+  `model=gpt-5.4-mini`, `client_name=codex_exec`, and
+  `litellm_version=1.82.3+aawm.63`. The artifact still marked that case failed
+  because the harness also expected a row for the Codex CLI thread id
+  `019e7000-101f-7a73-8cf0-2d1e1b8bbedc` and stale tool-description prompt
+  tags; this was classified as a harness assertion mismatch, not a stream
+  logging regression.
+
+  Default prod harness artifact
+  `/tmp/litellm-prod-harness-1.82.3-aawm.63.json` passed the non-Codex
+  provider lanes except for a transient
+  `claude_adapter_gpt55_read_pages_sanitizer` 400. Focused recheck artifact
+  `/tmp/litellm-prod-gpt55-read-pages-sanitizer-aawm63-recheck.json` passed
+  that case with zero failures and zero warnings. The remaining default-suite
+  failures were Codex-dependent `claude_adapter_codex_tool_activity` and
+  `claude_adapter_spark`, both blocked by the documented Codex
+  `usage_limit_reached` response for `gpt-5.3-codex-spark` with reset at
+  `2026-05-31T12:02:12Z` / `2026-05-31T12:02:13Z`.
+
+  Log review:
+  prod log scan after promotion found no `cannot parse chunks`,
+  `Error rebuilding complete responses API stream`, or
+  `Failed to build complete response` entries. Observed log blockers were the
+  expected Codex quota-pressure `429` lines from the default harness, the
+  transient sanitizer `400`, an upstream `openai/gpt-5.5` adapter `404`, and
+  Langfuse payload-size warnings for large Codex/Claude harness events.
+
 ## 2026-05-23
 
 - Promoted the `aawm.59` session-history and OpenRouter `:free` release line to prod.
