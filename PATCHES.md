@@ -2101,6 +2101,34 @@ Dev runtime was validated before prod infrastructure promotion.
 
 ---
 
+### aawm.63 — Codex Responses stream logging repair
+
+**Status:** AAWM local hotfix.
+
+**What changed:** Codex Responses API passthrough stream logging now tolerates
+`response.completed.response` payloads that omit `output`. The logging path
+normalizes the strict response model payload with an empty output list, then
+continues to rebuild streamed text, tool output items, usage, cache-read
+tokens, and the `codex.usage_normalize` span from the collected SSE chunks.
+
+**Why:** The ChatGPT Codex backend can stream valid `response.output_*` events
+and finish with a `response.completed` payload that carries usage but no
+top-level `output` field. The previous strict reconstruction failed validation
+and stored Langfuse generation output beginning with `cannot parse chunks`
+instead of the actual Codex answer and usage.
+
+**Why not upstream:** This is tied to AAWM's direct Codex Responses passthrough
+route family, Langfuse/session-history normalization, and Codex-specific
+usage span behavior.
+
+**Validation status:** Focused unit coverage rebuilds a Codex Responses stream
+with missing completed-output payload, preserves usage/cache-read telemetry,
+and asserts the standard logging object no longer contains the chunk-parse
+fallback. Dev runtime was live-validated with Codex profile traffic before prod
+promotion.
+
+---
+
 
 ## Dropped Patches
 
