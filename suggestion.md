@@ -35,3 +35,12 @@
 - How it would help: this would reduce test churn and review time by making it
   obvious when a failing assertion is stale fixture metadata versus a routing or
   observability regression.
+
+## 2026-06-01 D1-174
+
+- Suggestion: promote the gated `oa_xai/*` live smoke into a small reusable
+  script that performs the request and prints the exact `session_history`,
+  provider-error, and quota-observation rows for the generated session id.
+- How it would help: this would make OAuth-managed xAI live verification a
+  single repeatable command once credentials are configured, while keeping the
+  default pytest harness secret-free and offline.
