@@ -250,6 +250,11 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
         # Map generationConfig to config parameter for Google GenAI compatibility
         if "generationConfig" in data and "config" not in data:
             data["config"] = data.pop("generationConfig")
+
+    from litellm.llms.xai.oauth import prepare_oa_xai_request
+
+    await prepare_oa_xai_request(data)
+
     if "api_key" in data or "api_base" in data:
         if llm_router is not None:
             return getattr(llm_router, f"{route_type}")(**data)

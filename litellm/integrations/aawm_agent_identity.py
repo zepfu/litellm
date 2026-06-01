@@ -1854,6 +1854,15 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "repository",
     "route_tag",
     "passthrough_route_family",
+    "route_family",
+    "auth_mode",
+    "credential_family",
+    "xai_oauth_managed",
+    "xai_oauth_public_model",
+    "xai_oauth_upstream_model",
+    "xai_quota_family",
+    "shared_quota_family",
+    "grok_subscription_quota_shared",
     "claude_internal_check",
     "claude_internal_check_type",
     "claude_permission_check",
@@ -4364,6 +4373,11 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
     "client_version",
     "repository",
     "passthrough_route_family",
+    "route_family",
+    "auth_mode",
+    "credential_family",
+    "xai_quota_family",
+    "shared_quota_family",
 )
 _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP = 1.0
 _AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT = timedelta(minutes=15)
@@ -6809,6 +6823,20 @@ def _build_provider_error_observation(
             value = metadata.get(key)
             if value is not None:
                 observation_metadata[key] = value
+    for key in (
+        "auth_mode",
+        "credential_family",
+        "xai_oauth_managed",
+        "xai_oauth_public_model",
+        "xai_oauth_upstream_model",
+        "xai_quota_family",
+        "shared_quota_family",
+        "grok_subscription_quota_shared",
+        "passthrough_route_family",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            observation_metadata[key] = value
     return {
         "observed_at": observed_at,
         "environment": runtime_identity.get("litellm_environment"),
