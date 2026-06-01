@@ -81,3 +81,12 @@
   letting the LiteLLM intake pass distinguish context-only external subagent
   telemetry from LiteLLM implementation defects without re-reading the full
   prompt summary.
+
+## 2026-06-01 investigate-codex-019e8590-7116-7cf2-8e47-52b5b64edd33
+
+- Suggestion: add a small intake-disposition helper that stamps start/end time,
+  moves `investigate-*.md` into `.analysis/investigation/`, and appends a
+  templated `.analysis/investigations.md` entry.
+- How it would help: this would reduce timestamp and ledger churn for recurring
+  investigation intake work, saving time and lowering the chance of incomplete
+  disposition evidence.
