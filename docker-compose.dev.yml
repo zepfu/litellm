@@ -16,6 +16,8 @@ services:
     volumes:
       # Mount source for live code changes (key files only)
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
+      - ./litellm/integrations/aawm_agent_quality_rules.py:/app/litellm/integrations/aawm_agent_quality_rules.py
+      - ./litellm/integrations/aawm_agent_quality_rules.json:/app/litellm/integrations/aawm_agent_quality_rules.json
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
       - ./litellm/integrations/aawm_passthrough_shape_capture.py:/app/litellm/integrations/aawm_passthrough_shape_capture.py
       - ./litellm/integrations/langfuse/langfuse.py:/app/litellm/integrations/langfuse/langfuse.py

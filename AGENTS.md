@@ -27,6 +27,38 @@ LiteLLM is a unified interface for 100+ LLMs that:
 - `ui/litellm-dashboard/` - Admin dashboard UI
 - `enterprise/` - Enterprise-specific features
 
+## ORCHESTRATOR PROMPT GUIDANCE
+
+### Broad Discovery Subtasks
+
+When delegating broad discovery work to a subagent, put the discovery contract in
+the actual subagent prompt. Do not rely on an unstated scoring rule,
+out-of-band expectation, or repo convention that the subagent cannot see.
+
+Use this for prompts that ask a worker to inspect named files plus broad language
+such as "any recent", "handoff", "contract", "investigate-*", "glob", "similar
+files", or "related docs":
+
+```text
+Discovery inventory required:
+- List the discovery command(s), source list, or transcript evidence you used.
+- List every candidate file/item that matched the requested scope.
+- Mark each candidate as inspected, omitted, or unavailable.
+- For omitted candidates, give the concrete reason.
+- Classify relevant candidates as actionable, stale, context-only, or not
+  relevant.
+- Base conclusions only on inspected candidates and call out any coverage gap.
+```
+
+If the task is intentionally narrow, say that in the delegated prompt, for
+example: `No broad discovery inventory is required; inspect only the named
+files.`
+
+Any later score, eval, or session-history flag for discovery coverage must judge
+only requirements that were communicated in the prompt and candidates visible in
+the transcript or tool output. Do not score an agent against hidden filesystem
+state or an inventory contract that was not included in the session.
+
 ## DEVELOPMENT GUIDELINES
 
 ### MAKING CODE CHANGES
