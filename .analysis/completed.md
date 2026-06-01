@@ -1,5 +1,28 @@
 ## 2026-06-01
 
+- Investigation intake `investigate-codex-019e857b-9e88-7f53-90f9-acef3062b597.md`
+  - Goal: disposition the new root investigation intake created after the
+    D1-176 push.
+  - Initiated: 2026-06-01 19:21:29 EDT.
+  - Completed: 2026-06-01 19:21:43 EDT.
+  - Duration: 14 seconds.
+  - Changed paths:
+    - `.analysis/investigations.md`
+    - `.analysis/investigation/investigate-codex-019e857b-9e88-7f53-90f9-acef3062b597.md`
+    - `.analysis/completed.md`
+    - `suggestion.md`
+  - Breakdown:
+    - Classified the intake as a context-only session-level subagent read-only
+      violation from `/home/zepfu/projects/aawm-tap-dashboard`, not a LiteLLM
+      implementation defect.
+    - Recorded the failure in `.analysis/investigations.md`, moved the original
+      file into `.analysis/investigation/`, and left no follow-up proposal.
+  - Verification evidence:
+    - `find .analysis -maxdepth 1 -type f \( -name 'handoff*.md' -o -name
+      'request*.md' -o -name 'investigate*.md' -o -name 'investigate-*.md' \)
+      -printf '%f\n' | sort` returned no files after archival.
+    - `git diff --cached --check` passed before the follow-up commit.
+
 - D1-176 xAI OAuth Hermes credential migration and live `oa_xai/*` validation
   - Goal: close the D1-172/D1-174 live-acceptance gap by migrating the real
     Hermes xAI OAuth credential into a LiteLLM-owned path, wiring the dev proxy
