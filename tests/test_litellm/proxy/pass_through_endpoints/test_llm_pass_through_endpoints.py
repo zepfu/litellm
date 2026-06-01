@@ -31,6 +31,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_adapter_request_shape_policy,
     _apply_google_adapter_system_prompt_policy,
     _apply_google_code_assist_native_tool_aliases,
+    _apply_codex_auto_agent_prevention_guidance_to_request_body,
     _apply_codex_google_code_assist_tool_contract_policy,
     _apply_openai_adapter_parallel_instruction_policy,
     _apply_openrouter_adapter_parallel_instruction_policy,
@@ -63,6 +64,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_google_adapter_semaphore,
     _get_openrouter_adapter_hidden_retry_budget_seconds,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
+    _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME,
+    _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION,
+    _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT,
     _handle_anthropic_nvidia_completion_adapter_route,
     _handle_anthropic_auto_agent_alias_route,
     _handle_codex_auto_agent_alias_route,
@@ -426,6 +430,78 @@ class TestResponsesAdapterToolChoice:
         assert updated_body is request_body
         assert updated_body["instructions"] == "Preserve these instructions."
         assert changes == {}
+
+    def test_applies_codex_auto_agent_prevention_guidance_to_existing_instructions(
+        self,
+    ):
+        request_body = {
+            "instructions": "Existing instructions.",
+            "litellm_metadata": {"tags": ["existing-tag"]},
+        }
+
+        updated_body, guidance_metadata = (
+            _apply_codex_auto_agent_prevention_guidance_to_request_body(request_body)
+        )
+
+        assert updated_body is not request_body
+        assert updated_body["instructions"].startswith("Existing instructions.")
+        assert "non-empty final answer" in updated_body["instructions"]
+        assert "required tool is unavailable or blocked" in updated_body[
+            "instructions"
+        ]
+        assert "generic explanation of the function or file" in updated_body[
+            "instructions"
+        ]
+        assert updated_body["litellm_metadata"]["tags"] == [
+            "existing-tag",
+            "codex-auto-agent-prevention-guidance",
+            (
+                "codex-auto-agent-prevention-guidance:"
+                f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION}"
+            ),
+        ]
+        assert (
+            updated_body["litellm_metadata"][
+                "codex_auto_agent_prevention_guidance_policy_name"
+            ]
+            == _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME
+        )
+        assert (
+            updated_body["litellm_metadata"][
+                "codex_auto_agent_prevention_guidance_policy_version"
+            ]
+            == _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION
+        )
+        assert (
+            updated_body["litellm_metadata"][
+                "codex_auto_agent_prevention_guidance_applied"
+            ]
+            is True
+        )
+        assert guidance_metadata == {
+            "codex_auto_agent_prevention_guidance_policy_name": (
+                _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME
+            ),
+            "codex_auto_agent_prevention_guidance_policy_version": (
+                _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION
+            ),
+            "codex_auto_agent_prevention_guidance_applied": True,
+            "codex_auto_agent_prevention_guidance_original_instruction_chars": len(
+                "Existing instructions."
+            ),
+            "codex_auto_agent_prevention_guidance_prompt_chars": len(
+                _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT
+            ),
+        }
+
+        second_body, second_metadata = (
+            _apply_codex_auto_agent_prevention_guidance_to_request_body(
+                updated_body,
+            )
+        )
+
+        assert second_body is updated_body
+        assert second_metadata == {}
 
     def test_skips_openai_parallel_instruction_policy_when_already_applied(self):
         request_body = {
@@ -12530,6 +12606,8 @@ async def test_openai_passthrough_codex_auto_agent_alias_uses_alias_router(
             return_value={
                 "model": "aawm-codex-agent-auto",
                 "input": "hello",
+                "instructions": "Existing instructions.",
+                "litellm_metadata": {"tags": ["existing-tag"]},
             }
         ),
     ), patch(
@@ -12557,11 +12635,88 @@ async def test_openai_passthrough_codex_auto_agent_alias_uses_alias_router(
     mock_create_pass_through_route.assert_not_called()
     prepared_body = mock_alias_handler.await_args.kwargs["prepared_request_body"]
     assert prepared_body["model"] == "aawm-codex-agent-auto"
+    assert prepared_body["instructions"].startswith("Existing instructions.")
+    assert "non-empty final answer" in prepared_body["instructions"]
+    assert "required tool is unavailable or blocked" in prepared_body[
+        "instructions"
+    ]
+    assert "generic explanation of the function or file" in prepared_body[
+        "instructions"
+    ]
     assert prepared_body["litellm_metadata"]["passthrough_route_family"] == (
         "codex_responses"
     )
+    assert "existing-tag" in prepared_body["litellm_metadata"]["tags"]
+    assert "route:codex_responses" in prepared_body["litellm_metadata"]["tags"]
+    assert (
+        "codex-auto-agent-prevention-guidance"
+        in prepared_body["litellm_metadata"]["tags"]
+    )
+    assert (
+        "codex-auto-agent-prevention-guidance:"
+        f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION}"
+    ) in prepared_body["litellm_metadata"]["tags"]
+    assert (
+        prepared_body["litellm_metadata"][
+            "codex_auto_agent_prevention_guidance_applied"
+        ]
+        is True
+    )
     assert mock_alias_handler.await_args.kwargs["target_url"] == (
         "https://chatgpt.com/backend-api/codex/responses"
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_codex_spark_does_not_get_prevention_guidance(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+    mock_request = _build_codex_auto_agent_request("codex-session-123")
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(
+            return_value={
+                "model": "gpt-5.3-codex-spark",
+                "input": "hello",
+                "instructions": "Existing instructions.",
+                "litellm_metadata": {"tags": ["existing-tag"]},
+            }
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=AsyncMock(return_value={"ok": True}),
+    ):
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://api.openai.com",
+            api_key="test_api_key",
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            forward_headers=True,
+        )
+
+    assert result == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    prepared_body = mock_set_parsed_body.call_args.args[1]
+    assert prepared_body["instructions"] == "Existing instructions."
+    assert "existing-tag" in prepared_body["litellm_metadata"]["tags"]
+    assert "route:codex_responses" in prepared_body["litellm_metadata"]["tags"]
+    assert (
+        "codex-auto-agent-prevention-guidance"
+        not in prepared_body["litellm_metadata"]["tags"]
+    )
+    assert (
+        "codex_auto_agent_prevention_guidance_applied"
+        not in prepared_body["litellm_metadata"]
     )
 
 
