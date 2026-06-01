@@ -1250,15 +1250,27 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 "kwargs": kwargs,
             }
 
-        # Extract model from request or response
-        model = (
-            request_body.get("model")
-            or response_body.get("model")
-            or OpenAIPassthroughLoggingHandler._extract_passthrough_model_fallback(
-                kwargs
-            )
-            or ""
+        custom_llm_provider = kwargs.get("custom_llm_provider") or "openai"
+        passthrough_model_fallback = (
+            OpenAIPassthroughLoggingHandler._extract_passthrough_model_fallback(kwargs)
         )
+
+        # Extract model from request or response. Native Grok Build embeddings
+        # send an upstream-only embedding model, but the reporting/cost contract
+        # is tied to the Grok Build model override.
+        if (
+            is_embeddings
+            and custom_llm_provider == "xai"
+            and passthrough_model_fallback
+        ):
+            model = passthrough_model_fallback
+        else:
+            model = (
+                request_body.get("model")
+                or response_body.get("model")
+                or passthrough_model_fallback
+                or ""
+            )
         if not model:
             verbose_proxy_logger.warning(
                 "No model found in request or response for OpenAI passthrough cost tracking"
@@ -1280,11 +1292,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         try:
             response_cost = 0.0
             litellm_model_response: Optional[
-                Union[ModelResponse, TextCompletionResponse, ImageResponse]
+                Union[
+                    ModelResponse,
+                    TextCompletionResponse,
+                    ImageResponse,
+                    EmbeddingResponse,
+                ]
             ] = None
             handler_instance = OpenAIPassthroughLoggingHandler()
-
-            custom_llm_provider = kwargs.get("custom_llm_provider") or "openai"
 
             if is_chat_completions:
                 # Handle chat completions with existing logic
@@ -1414,7 +1429,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 )
                 litellm_model_response = EmbeddingResponse(
                     data=response_body.get("data", []),
-                    model=response_body.get("model") or model,
+                    model=model,
                     usage=usage,
                     _response_headers=dict(httpx_response.headers),
                 )
