@@ -233,6 +233,16 @@ _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = """Codex tool contract:
 - If a previous tool call failed because required arguments were missing, either retry once with schema-valid arguments or stop and explain the blocker in the final answer.
 - Final answers must address the assigned task directly. Do not return generic descriptions of files unless the user asked for a file overview."""
 _CODEX_AUTO_AGENT_MODEL_ALIAS = "aawm-codex-agent-auto"
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME = (
+    "codex_auto_agent_prevention_guidance"
+)
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION = "2026-06-01.v1"
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT = """Codex auto-agent completion contract:
+- Always produce a non-empty final answer after completing or stopping the task; do not end a successful request with only reasoning, tool calls, or no visible assistant text.
+- Do not return internal planning text as the final answer. Complete the requested work, or state the exact blocker and the next concrete step.
+- If a required tool is unavailable or blocked, state the exact observed tool/platform error and continue with bounded evidence from available context; do not claim tools or filesystem are unavailable unless a tool/platform error proves it.
+- If the user requested code or artifact changes, either make the scoped change or explicitly say no files were modified and why. Do not answer with a generic explanation of the function or file when implementation or verification was requested.
+- If verification could not be run, name the command or check that was not run and why."""
 _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS = 6 * 60 * 60
 _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3 * 60 * 60.0
 _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = (
@@ -10734,6 +10744,77 @@ def _add_route_family_logging_metadata(
     )
 
 
+def _append_codex_auto_agent_prevention_guidance_to_instructions(
+    instructions: Optional[str],
+) -> str:
+    existing_instructions = instructions.strip() if isinstance(instructions, str) else ""
+    if _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT in existing_instructions:
+        return existing_instructions
+    if not existing_instructions:
+        return _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT
+    return (
+        f"{existing_instructions}\n\n"
+        f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT}"
+    )
+
+
+def _apply_codex_auto_agent_prevention_guidance_to_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    existing_instructions = request_body.get("instructions")
+    if existing_instructions is not None and not isinstance(existing_instructions, str):
+        return request_body, {}
+
+    updated_instructions = (
+        _append_codex_auto_agent_prevention_guidance_to_instructions(
+            existing_instructions
+        )
+    )
+    if updated_instructions == existing_instructions:
+        return request_body, {}
+
+    updated_body = dict(request_body)
+    updated_body["instructions"] = updated_instructions
+    original_chars = (
+        len(existing_instructions) if isinstance(existing_instructions, str) else 0
+    )
+    guidance_metadata = {
+        "codex_auto_agent_prevention_guidance_policy_name": (
+            _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME
+        ),
+        "codex_auto_agent_prevention_guidance_policy_version": (
+            _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION
+        ),
+        "codex_auto_agent_prevention_guidance_applied": True,
+        "codex_auto_agent_prevention_guidance_original_instruction_chars": (
+            original_chars
+        ),
+        "codex_auto_agent_prevention_guidance_prompt_chars": len(
+            _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT
+        ),
+    }
+    updated_body = _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            "codex-auto-agent-prevention-guidance",
+            (
+                "codex-auto-agent-prevention-guidance:"
+                f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION}"
+            ),
+        ],
+        extra_fields={
+            **guidance_metadata,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.auto_agent_prevention_guidance",
+                    metadata=guidance_metadata,
+                )
+            ],
+        },
+    )
+    return updated_body, guidance_metadata
+
+
 def _normalize_low_cardinality_tag_value(value: Any) -> Optional[str]:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -15690,6 +15771,11 @@ class BaseOpenAIPassThroughHandler:
                     endpoint=endpoint,
                 )
                 if codex_auto_agent_alias is not None:
+                    prepared_request_body, _codex_auto_agent_guidance_changes = (
+                        _apply_codex_auto_agent_prevention_guidance_to_request_body(
+                            prepared_request_body
+                        )
+                    )
                     prepared_request_body = _prepare_request_body_for_passthrough_observability(
                         request=request,
                         request_body=prepared_request_body,
