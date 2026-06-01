@@ -1097,17 +1097,32 @@ def test_normalize_llm_passthrough_logging_payload_uses_openai_handler_for_adapt
     assert mock_openai_handler.call_args.kwargs["custom_llm_provider"] == "xai"
 
 
-def test_normalize_llm_passthrough_logging_payload_skips_xai_embeddings_not_cohere():
+def test_normalize_llm_passthrough_logging_payload_normalizes_xai_embeddings_not_cohere():
     handler = PassThroughEndpointLogging()
-    mock_response = MagicMock(spec=httpx.Response)
+    response_body = {
+        "id": "grok-embed-test",
+        "object": "list",
+        "data": [{"object": "embedding", "embedding": [0.1, 0.2], "index": 0}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 0, "total_tokens": 12},
+        "model": "embedding-beta-3-small",
+    }
+    mock_response = httpx.Response(
+        200,
+        json=response_body,
+        request=httpx.Request(
+            "POST",
+            "https://cli-chat-proxy.grok.com/v1/embeddings",
+        ),
+    )
     mock_logging_obj = MagicMock()
+    mock_logging_obj.model_call_details = {}
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_provider_handlers.cohere_passthrough_logging_handler.CoherePassthroughLoggingHandler.cohere_passthrough_handler"
     ) as mock_cohere_handler:
         result = handler.normalize_llm_passthrough_logging_payload(
             httpx_response=mock_response,
-            response_body={"data": []},
+            response_body=response_body,
             request_body={"model": "grok-build"},
             logging_obj=mock_logging_obj,
             url_route="https://cli-chat-proxy.grok.com/v1/embeddings",
@@ -1118,7 +1133,11 @@ def test_normalize_llm_passthrough_logging_payload_skips_xai_embeddings_not_cohe
             custom_llm_provider="xai",
         )
 
-    assert result["standard_logging_response_object"] is None
+    normalized_response = result["standard_logging_response_object"]
+    assert normalized_response.model == "grok-build"
+    assert normalized_response.usage.prompt_tokens == 12
+    assert result["kwargs"]["custom_llm_provider"] == "xai"
+    assert result["kwargs"]["call_type"] == "embedding"
     assert mock_cohere_handler.call_count == 0
 
 
