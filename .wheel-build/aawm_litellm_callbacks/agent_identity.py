@@ -8913,6 +8913,7 @@ def _compute_provider_cache_miss_cost_state(
     cost_provider_family = "nvidia_nim" if provider_family == "nvidia" else provider_family
     cache_status = cache_state.get("status")
     cache_missed = bool(cache_state.get("miss"))
+    cache_miss_reason = cache_state.get("miss_reason")
     service_tier = _extract_service_tier_hint(usage_obj, metadata)
 
     def _fallback_miss_cost(
@@ -8964,31 +8965,9 @@ def _compute_provider_cache_miss_cost_state(
             )
         return float(response_cost), "response_cost_estimate"
 
-    if cache_status == "miss" and cache_missed:
-        miss_token_count = _extract_prompt_tokens(usage_obj)
-        if miss_token_count <= 0:
-            if existing_miss_token_count is not None and existing_miss_token_count > 0:
-                result["miss_token_count"] = existing_miss_token_count
-                if result["miss_cost_usd"] is not None:
-                    return result
-                fallback_cost, fallback_basis = _fallback_miss_cost(
-                    existing_miss_token_count
-                )
-                if fallback_cost is not None:
-                    result["miss_cost_usd"] = fallback_cost
-                    result["miss_cost_basis"] = fallback_basis
-                return result
-            result["miss_token_count"] = 0
-            fallback_cost, fallback_basis = _fallback_miss_cost(0)
-            if fallback_cost is not None:
-                result["miss_cost_usd"] = fallback_cost
-                result["miss_cost_basis"] = fallback_basis
-            return result
-
-        result["miss_token_count"] = miss_token_count
+    def _populate_prompt_vs_cache_read_delta_cost(miss_token_count: int) -> Dict[str, Any]:
         if result["miss_cost_usd"] is not None:
             return result
-
         try:
             from litellm.litellm_core_utils.llm_cost_calc.utils import (
                 _get_token_base_cost,
@@ -9001,10 +8980,22 @@ def _compute_provider_cache_miss_cost_state(
                 completion_tokens=0,
                 total_tokens=miss_token_count,
             )
-            model_info = get_model_info(
-                model=model,
-                custom_llm_provider=cost_provider_family,
-            )
+            try:
+                model_info = get_model_info(
+                    model=model,
+                    custom_llm_provider=cost_provider_family,
+                )
+            except Exception:
+                model_info = _lookup_bundled_model_cost_info(
+                    model=model,
+                    custom_llm_provider=cost_provider_family,
+                )
+            if not isinstance(model_info, dict):
+                fallback_cost, fallback_basis = _fallback_miss_cost(miss_token_count)
+                if fallback_cost is not None:
+                    result["miss_cost_usd"] = fallback_cost
+                    result["miss_cost_basis"] = fallback_basis
+                return result
             if "cache_read_input_token_cost" not in model_info:
                 fallback_cost, fallback_basis = _fallback_miss_cost(miss_token_count)
                 if fallback_cost is not None:
@@ -9040,6 +9031,50 @@ def _compute_provider_cache_miss_cost_state(
                 result["miss_cost_usd"] = fallback_cost
                 result["miss_cost_basis"] = fallback_basis
             return result
+
+    if (
+        cache_status == "hit"
+        and cache_missed
+        and cache_miss_reason == "partial_cache_hit"
+    ):
+        miss_token_count = (
+            existing_miss_token_count
+            if existing_miss_token_count is not None and existing_miss_token_count > 0
+            else None
+        )
+        if miss_token_count is None:
+            prompt_tokens = _extract_prompt_tokens(usage_obj)
+            cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
+            if prompt_tokens > cache_read_input_tokens > 0:
+                miss_token_count = prompt_tokens - cache_read_input_tokens
+        if miss_token_count is None or miss_token_count <= 0:
+            return result
+        result["miss_token_count"] = miss_token_count
+        return _populate_prompt_vs_cache_read_delta_cost(miss_token_count)
+
+    if cache_status == "miss" and cache_missed:
+        miss_token_count = _extract_prompt_tokens(usage_obj)
+        if miss_token_count <= 0:
+            if existing_miss_token_count is not None and existing_miss_token_count > 0:
+                result["miss_token_count"] = existing_miss_token_count
+                if result["miss_cost_usd"] is not None:
+                    return result
+                fallback_cost, fallback_basis = _fallback_miss_cost(
+                    existing_miss_token_count
+                )
+                if fallback_cost is not None:
+                    result["miss_cost_usd"] = fallback_cost
+                    result["miss_cost_basis"] = fallback_basis
+                return result
+            result["miss_token_count"] = 0
+            fallback_cost, fallback_basis = _fallback_miss_cost(0)
+            if fallback_cost is not None:
+                result["miss_cost_usd"] = fallback_cost
+                result["miss_cost_basis"] = fallback_basis
+            return result
+
+        result["miss_token_count"] = miss_token_count
+        return _populate_prompt_vs_cache_read_delta_cost(miss_token_count)
 
     if cache_status != "write":
         return result
@@ -9186,6 +9221,23 @@ def _resolve_provider_cache_state(
     cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
     cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
     state_from_metadata = _provider_cache_state_from_metadata(metadata, provider_family)
+    prompt_tokens = _extract_prompt_tokens(usage_obj)
+    if (
+        provider_family == "xai"
+        and state_from_metadata is not None
+        and state_from_metadata.get("status") == "hit"
+        and cache_read_input_tokens > 0
+        and prompt_tokens > cache_read_input_tokens
+    ):
+        return {
+            "attempted": True,
+            "status": "hit",
+            "miss": True,
+            "miss_reason": "partial_cache_hit",
+            "miss_token_count": prompt_tokens - cache_read_input_tokens,
+            "source": state_from_metadata.get("source") or "usage.cache_read_input_tokens",
+            "supports_prompt_caching": state_from_metadata.get("supports_prompt_caching"),
+        }
     if state_from_metadata is not None and state_from_metadata.get("status") is not None:
         return state_from_metadata
 
@@ -9200,6 +9252,16 @@ def _resolve_provider_cache_state(
     )
 
     if cache_read_input_tokens > 0:
+        if provider_family == "xai" and prompt_tokens > cache_read_input_tokens:
+            return {
+                "attempted": True,
+                "status": "hit",
+                "miss": True,
+                "miss_reason": "partial_cache_hit",
+                "miss_token_count": prompt_tokens - cache_read_input_tokens,
+                "source": "usage.cache_read_input_tokens",
+                "supports_prompt_caching": supports_prompt_caching,
+            }
         return {
             "attempted": True,
             "status": "hit",
@@ -12163,6 +12225,10 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
     elif status == "unsupported":
         tags_to_add.extend(
             ["provider-cache-unsupported", f"{provider_family}-provider-cache-unsupported"]
+        )
+    if cache_state.get("miss_reason") == "partial_cache_hit":
+        tags_to_add.extend(
+            ["provider-cache-partial-hit", f"{provider_family}-provider-cache-partial-hit"]
         )
     if tags_to_add:
         _merge_tags(metadata, tags_to_add)
