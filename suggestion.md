@@ -55,3 +55,19 @@
   batches, prevent stale wrong-parent dispositions from surviving unnoticed, and
   make root-intake cleanup less error-prone when new investigation files appear
   mid-task.
+
+## 2026-06-01 D1-176
+
+- Suggestion: add one dev smoke command for `oa_xai/*` that migrates the Hermes
+  xAI OAuth record to the LiteLLM-owned path, verifies the running dev proxy is
+  using that path with a writable refresh mount, calls every enabled
+  `oa_xai/*` chat model through `/v1/chat/completions`, and prints the matching
+  `session_history` evidence with secrets redacted. The same command should
+  enforce/verify `0600` permissions on the managed token file and query
+  `session_history` by exact generated session IDs instead of broad JSON
+  metadata predicates.
+- How it would help: this would have caught the D1-172/D1-174 mock-only closure,
+  the router-bypass bug, and the multi-agent chat-completions provider rejection
+  in one repeatable gate before the item was marked complete. It would also
+  reduce time/token churn from ad hoc slow DB probes and prevent a migrated
+  OAuth credential from being left world-readable after a refresh.

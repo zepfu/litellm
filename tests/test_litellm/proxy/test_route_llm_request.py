@@ -253,16 +253,22 @@ async def test_route_request_routes_oa_xai_with_managed_oauth():
     llm_router.has_model_id.return_value = False
     llm_router.acompletion.return_value = "fake_response"
 
-    with patch(
-        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
-        new=AsyncMock(return_value="managed-oauth-token"),
-    ), patch.object(litellm, "acompletion") as mock_completion:
-        response = await route_request(data, llm_router, None, "acompletion")
+    mock_completion = MagicMock(return_value="fake_response")
+    original_acompletion = litellm.acompletion
+    litellm.acompletion = mock_completion
+    try:
+        with patch(
+            "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+            new=AsyncMock(return_value="managed-oauth-token"),
+        ):
+            response = await route_request(data, llm_router, None, "acompletion")
+    finally:
+        litellm.acompletion = original_acompletion
 
     assert response == "fake_response"
-    mock_completion.assert_not_called()
-    llm_router.acompletion.assert_called_once()
-    call_kwargs = llm_router.acompletion.call_args.kwargs
+    llm_router.acompletion.assert_not_called()
+    mock_completion.assert_called_once()
+    call_kwargs = mock_completion.call_args.kwargs
     assert call_kwargs["model"] == "xai/grok-4.3"
     assert call_kwargs["api_key"] == "managed-oauth-token"
     assert call_kwargs["api_base"] == "https://api.x.ai/v1"

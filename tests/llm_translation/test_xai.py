@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -147,6 +148,148 @@ async def test_xai_oauth_managed_auth_file_refreshes_near_expiry(
     assert refreshed["key"] == "new-access-token"
     assert refreshed["access_token"] == "new-access-token"
     assert refreshed["refresh_token"] == "new-refresh-token"
+
+
+def test_xai_oauth_migrate_hermes_provider_tokens(tmp_path, monkeypatch):
+    from litellm.llms.xai import oauth
+
+    monkeypatch.delenv("LITELLM_XAI_OAUTH_SCOPE", raising=False)
+
+    source_path = tmp_path / "hermes" / "auth.json"
+    target_path = tmp_path / "litellm-owned" / "xai-oauth.json"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "xai-oauth": {
+                        "tokens": {
+                            "access_token": "hermes-access-token",
+                            "refresh_token": "hermes-refresh-token",
+                            "id_token": "hermes-id-token",
+                            "token_type": "Bearer",
+                            "expires_in": 600,
+                        },
+                        "discovery": {
+                            "token_endpoint": "https://auth.x.ai/oauth2/token"
+                        },
+                        "last_refresh": "2026-06-01T10:00:00Z",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    migrated_path = oauth.migrate_hermes_xai_oauth_credential(
+        hermes_auth_file=source_path,
+        target_auth_file=target_path,
+    )
+
+    default_scope = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+    migrated = json.loads(target_path.read_text(encoding="utf-8"))
+
+    assert migrated_path == target_path
+    assert list(migrated) == [default_scope]
+
+    record = migrated[default_scope]
+    assert record["key"] == "hermes-access-token"
+    assert record["access_token"] == "hermes-access-token"
+    assert record["refresh_token"] == "hermes-refresh-token"
+    assert record["id_token"] == "hermes-id-token"
+    assert record["token_type"] == "Bearer"
+    assert record["token_endpoint"] == "https://auth.x.ai/oauth2/token"
+    assert record["oidc_client_id"] == "b1a00492-073a-47ea-816f-4c329264a828"
+    assert record["source"] == "hermes.providers.xai-oauth"
+    assert record["expires_at"] == "2026-06-01T10:10:00Z"
+    if os.name != "nt":
+        assert stat.S_IMODE(target_path.stat().st_mode) == 0o600
+
+
+def test_xai_oauth_migrate_hermes_credential_pool_falls_back_to_first_usable_record(
+    tmp_path,
+    monkeypatch,
+):
+    from litellm.llms.xai import oauth
+
+    monkeypatch.delenv("LITELLM_XAI_OAUTH_SCOPE", raising=False)
+
+    source_path = tmp_path / "hermes" / "auth.json"
+    target_path = tmp_path / "litellm-owned" / "xai-oauth.json"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "base_url": "https://ignored.example",
+                        },
+                        {
+                            "access_token": "pool-access-token",
+                            "refresh_token": "pool-refresh-token",
+                            "id_token": "pool-id-token",
+                            "token_type": "Bearer",
+                            "base_url": "https://chosen.example",
+                            "last_refresh": "2026-06-01T11:00:00Z",
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    oauth.migrate_hermes_xai_oauth_credential(
+        hermes_auth_file=source_path,
+        target_auth_file=target_path,
+    )
+
+    default_scope = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+    migrated = json.loads(target_path.read_text(encoding="utf-8"))
+
+    assert list(migrated) == [default_scope]
+
+    record = migrated[default_scope]
+    assert record["key"] == "pool-access-token"
+    assert record["access_token"] == "pool-access-token"
+    assert record["refresh_token"] == "pool-refresh-token"
+    assert record["id_token"] == "pool-id-token"
+    assert record["token_type"] == "Bearer"
+    assert record["token_endpoint"] == "https://auth.x.ai/oauth2/token"
+    assert record["oidc_client_id"] == "b1a00492-073a-47ea-816f-4c329264a828"
+    assert record["source"] == "hermes.credential_pool.xai-oauth"
+    assert record["source_base_url"] == "https://chosen.example"
+    assert record["source_last_refresh"] == "2026-06-01T11:00:00Z"
+
+
+def test_xai_oauth_migration_rejects_target_under_hermes(tmp_path):
+    from litellm.llms.xai import oauth
+
+    source_path = tmp_path / "source" / "auth.json"
+    target_path = tmp_path / ".hermes" / "xai-oauth.json"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside the user's .hermes directory"):
+        oauth.migrate_hermes_xai_oauth_credential(
+            hermes_auth_file=source_path,
+            target_auth_file=target_path,
+        )
+
+
+def test_xai_oauth_migration_rejects_target_source_path(tmp_path):
+    from litellm.llms.xai import oauth
+
+    source_path = tmp_path / "hermes" / "auth.json"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot be the Hermes source file"):
+        oauth.migrate_hermes_xai_oauth_credential(
+            hermes_auth_file=source_path,
+            target_auth_file=source_path,
+        )
 
 
 @pytest.mark.asyncio

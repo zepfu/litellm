@@ -63,7 +63,9 @@ services:
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py
       - ./litellm/proxy/response_api_endpoints/endpoints.py:/app/litellm/proxy/response_api_endpoints/endpoints.py
+      - ./litellm/proxy/route_llm_request.py:/app/litellm/proxy/route_llm_request.py
       - ./litellm/litellm_core_utils/get_llm_provider_logic.py:/app/litellm/litellm_core_utils/get_llm_provider_logic.py
+      - ./litellm/llms/xai/oauth.py:/app/litellm/llms/xai/oauth.py
       - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
       - ./context-replacement:/app/context-replacement
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
@@ -75,6 +77,8 @@ services:
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
       # Gemini OAuth tokens for Anthropic->Google adapter testing
       - /home/zepfu/.gemini:/home/zepfu/.gemini:ro
+      # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.
+      - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
       # Gemini CLI install for OAuth client fallback during local adapter testing
       - /home/zepfu/.nvm/versions/node:/home/zepfu/.nvm/versions/node:ro
       # Capture output — written to /tmp/captures inside container, visible on host
@@ -131,6 +135,7 @@ services:
       - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
+      - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}

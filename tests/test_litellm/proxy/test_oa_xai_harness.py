@@ -78,13 +78,19 @@ class OaXaiHarness:
         with patch(
             "litellm.llms.xai.oauth.get_xai_oauth_access_token",
             new=AsyncMock(return_value=access_token),
-        ), patch.object(litellm, "acompletion") as mock_completion:
-            response = await route_request(data, llm_router, None, "acompletion")
+        ):
+            mock_completion = MagicMock(return_value={"ok": True})
+            original_acompletion = litellm.acompletion
+            litellm.acompletion = mock_completion
+            try:
+                response = await route_request(data, llm_router, None, "acompletion")
+            finally:
+                litellm.acompletion = original_acompletion
 
         assert response == {"ok": True}
-        mock_completion.assert_not_called()
-        llm_router.acompletion.assert_called_once()
-        return llm_router.acompletion.call_args.kwargs
+        llm_router.acompletion.assert_not_called()
+        mock_completion.assert_called_once()
+        return mock_completion.call_args.kwargs
 
     def kwargs_for_observability(self, public_model: str) -> dict[str, Any]:
         upstream_model = self.public_to_upstream[public_model]
