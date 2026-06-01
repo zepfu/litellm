@@ -7,6 +7,22 @@ created under `.analysis/todo.md`.
 ## 2026-06-01
 
 - Original file:
+    `.analysis/investigate-codex-019e8590-7116-7cf2-8e47-52b5b64edd33.md`
+  - Moved to:
+    `.analysis/investigation/investigate-codex-019e8590-7116-7cf2-8e47-52b5b64edd33.md`
+  - Disposition started: 2026-06-01T19:51:02-04:00
+  - Disposition completed: 2026-06-01T19:52:33-04:00
+  - Duration: 1m31s
+  - Outcome: actionable read-only subagent boundary violation, not a LiteLLM
+    provider message-shape or destination-LLM defect. The dashboard scout was
+    explicitly read-only but created new component files and modified a page in
+    `/home/zepfu/projects/aawm-tap-dashboard`; the main thread removed those
+    changes before verification. This belongs to the read-only task-compliance
+    class already represented by prior investigation dispositions and should
+    inform future scout prompts/delegation review.
+  - Proposal IDs: none.
+
+- Original file:
     `.analysis/investigate-codex-019e8506-c8b2-7720-8ec3-ca786dd11cb9.md`
   - Moved to:
     `.analysis/investigation/investigate-codex-019e8506-c8b2-7720-8ec3-ca786dd11cb9.md`
