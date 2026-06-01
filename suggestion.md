@@ -71,3 +71,13 @@
   in one repeatable gate before the item was marked complete. It would also
   reduce time/token churn from ad hoc slow DB probes and prevent a migrated
   OAuth credential from being left world-readable after a refresh.
+
+## 2026-06-01 investigate-codex-019e857b-9e88-7f53-90f9-acef3062b597
+
+- Suggestion: when cross-repo subagent failure files are emitted into this repo,
+  include a small machine-readable header with `source_repo`, `failure_class`,
+  `read_only_requested`, `files_modified`, and `main_thread_reverted`.
+- How it would help: this would reduce investigation time and token churn by
+  letting the LiteLLM intake pass distinguish context-only external subagent
+  telemetry from LiteLLM implementation defects without re-reading the full
+  prompt summary.

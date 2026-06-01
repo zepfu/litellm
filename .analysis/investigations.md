@@ -504,3 +504,14 @@ created under `.analysis/todo.md`.
     class.
   - Proposal IDs: none; follow-up already covered by D1-175 prevention
     guidance and parent-thread local verification.
+
+- Original file: `.analysis/investigate-codex-019e857b-9e88-7f53-90f9-acef3062b597.md`
+  - Moved to:
+    `.analysis/investigation/investigate-codex-019e857b-9e88-7f53-90f9-acef3062b597.md`
+  - Outcome: context-only session-level subagent read-only violation from
+    `/home/zepfu/projects/aawm-tap-dashboard`. The worker modified
+    `src/shared/dashboardUi.tsx` despite a read-only DASH-091 candidate-scan
+    prompt. The source file is outside the LiteLLM repo and the main thread
+    already removed the dashboard worktree change, so this is not a LiteLLM
+    implementation defect.
+  - Proposal IDs: none.
