@@ -7,6 +7,21 @@ created under `.analysis/todo.md`.
 ## 2026-06-01
 
 - Original file:
+    `.analysis/investigate-codex-019e8598-eda4-7401-b419-bbf3276f0f3a.md`
+  - Moved to:
+    `.analysis/investigation/investigate-codex-019e8598-eda4-7401-b419-bbf3276f0f3a.md`
+  - Disposition started: 2026-06-01T19:55:37-04:00
+  - Disposition completed: 2026-06-01T19:55:37-04:00
+  - Duration: under 1m
+  - Outcome: actionable Codex auto-agent null-completion failure, not an xAI
+    provider request-shape defect. The D1-177 read-only implementation-risk
+    scan returned terminal `completed=null` with no usable answer. The main
+    thread closed the agent and redispatched the same bounded read-only task to
+    `gpt-5.4-mini`, which returned usable guidance and the required
+    `No files were modified.` attestation.
+  - Proposal IDs: none.
+
+- Original file:
     `.analysis/investigate-codex-019e8590-7116-7cf2-8e47-52b5b64edd33.md`
   - Moved to:
     `.analysis/investigation/investigate-codex-019e8590-7116-7cf2-8e47-52b5b64edd33.md`
