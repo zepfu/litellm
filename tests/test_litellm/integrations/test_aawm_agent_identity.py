@@ -901,6 +901,59 @@ def test_build_session_history_record_uses_grok_header_model_override() -> None:
     assert record["output_tokens"] == 4
 
 
+def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
+    kwargs = _base_kwargs(trace_name="oa-xai")
+    kwargs["model"] = "xai/grok-4.3"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-oa-xai"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "oa-xai-session-123",
+            "auth_mode": "oauth",
+            "credential_family": "xai_oauth",
+            "passthrough_route_family": "xai_oauth_api",
+            "route_family": "xai_oauth_api",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "xai_quota_family": "xai_grok_subscription",
+            "shared_quota_family": "xai_grok_subscription",
+            "grok_subscription_quota_shared": True,
+            "model_group": "oa_xai/grok-4.3",
+            "tags": ["route:xai_oauth_api", "auth:xai_oauth"],
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-oa-xai",
+            "model": "grok-4.3",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-01T19:00:00Z",
+        end_time="2026-06-01T19:00:01Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "xai"
+    assert record["model"] == "oa_xai/grok-4.3"
+    assert record["model_group"] == "oa_xai/grok-4.3"
+    assert record["response_cost_usd"] is not None
+    assert record["response_cost_usd"] > 0
+    metadata = record["metadata"]
+    assert metadata["auth_mode"] == "oauth"
+    assert metadata["credential_family"] == "xai_oauth"
+    assert metadata["passthrough_route_family"] == "xai_oauth_api"
+    assert metadata["xai_oauth_public_model"] == "oa_xai/grok-4.3"
+    assert metadata["xai_oauth_upstream_model"] == "xai/grok-4.3"
+    assert metadata["shared_quota_family"] == "xai_grok_subscription"
+    assert metadata["grok_subscription_quota_shared"] is True
+    assert "route:xai_oauth_api" in metadata["request_tags"]
+
+
 @pytest.mark.parametrize(
     ("raw_repository", "expected_repository"),
     [
@@ -7196,6 +7249,50 @@ def test_build_provider_error_observation_classifies_grok_auth_failure() -> None
     assert observation["route_family"] == "grok_cli_chat_proxy"
     assert observation["status_code"] == 401
     assert observation["error_class"] == "auth_failed"
+
+
+def test_build_provider_error_observation_preserves_oa_xai_oauth_metadata() -> None:
+    kwargs = _base_kwargs(trace_name="oa-xai")
+    kwargs["model"] = "xai/grok-4.3"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_call_id"] = "call-oa-xai-provider-error"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-oa-xai-provider-error",
+            "auth_mode": "oauth",
+            "credential_family": "xai_oauth",
+            "passthrough_route_family": "xai_oauth_api",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "shared_quota_family": "xai_grok_subscription",
+            "model_group": "oa_xai/grok-4.3",
+        }
+    )
+    error = HTTPException(
+        status_code=401,
+        detail={"error": "invalid_grant", "message": "expired managed OAuth token"},
+    )
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result=error,
+        start_time="2026-06-01T19:00:00Z",
+        end_time="2026-06-01T19:00:01Z",
+    )
+
+    assert observation is not None
+    assert observation["provider"] == "xai"
+    assert observation["model"] == "oa_xai/grok-4.3"
+    assert observation["model_group"] == "oa_xai/grok-4.3"
+    assert observation["route_family"] == "xai_oauth_api"
+    assert observation["error_class"] == "auth_failed"
+    metadata = observation["metadata"]
+    assert metadata["auth_mode"] == "oauth"
+    assert metadata["credential_family"] == "xai_oauth"
+    assert metadata["xai_oauth_public_model"] == "oa_xai/grok-4.3"
+    assert metadata["xai_oauth_upstream_model"] == "xai/grok-4.3"
+    assert metadata["shared_quota_family"] == "xai_grok_subscription"
 
 
 def test_build_provider_error_observation_uses_auto_review_logical_model() -> None:
