@@ -1247,6 +1247,36 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         return kwargs
 
     @staticmethod
+    def _merge_passthrough_logging_metadata(
+        parsed_body: dict,
+        passthrough_logging_metadata: Optional[dict[str, Any]],
+    ) -> dict:
+        if not passthrough_logging_metadata:
+            return parsed_body
+
+        updated_body = dict(parsed_body)
+        existing_metadata = updated_body.get("litellm_metadata")
+        metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+
+        existing_tags = metadata.get("tags")
+        merged_tags = list(existing_tags) if isinstance(existing_tags, list) else []
+        incoming_tags = passthrough_logging_metadata.get("tags")
+        if isinstance(incoming_tags, list):
+            for tag in incoming_tags:
+                if isinstance(tag, str) and tag not in merged_tags:
+                    merged_tags.append(tag)
+
+        for key, value in passthrough_logging_metadata.items():
+            if key == "tags":
+                continue
+            metadata[key] = value
+
+        if merged_tags:
+            metadata["tags"] = merged_tags
+        updated_body["litellm_metadata"] = metadata
+        return updated_body
+
+    @staticmethod
     def construct_target_url_with_subpath(
         base_target: str, subpath: str, include_subpath: Optional[bool]
     ) -> str:
@@ -1309,6 +1339,7 @@ async def pass_through_request(  # noqa: PLR0915
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
     raw_body_passthrough: bool = False,
+    passthrough_logging_metadata: Optional[dict[str, Any]] = None,
 ):
     """
     Pass through endpoint handler, makes the httpx request for pass-through endpoints and ensures logging hooks are called
@@ -1334,6 +1365,9 @@ async def pass_through_request(  # noqa: PLR0915
         raw_body_passthrough: Forward the original request body as bytes while
             using a small synthetic body for logging. This is intended for
             native binary/protobuf side-channel endpoints.
+        passthrough_logging_metadata: Optional metadata to merge only into the
+            logging body. This lets routes identify GET/raw-body requests
+            without changing the upstream request body.
     """
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.pass_through_endpoints.passthrough_guardrails import (
@@ -1418,6 +1452,10 @@ async def pass_through_request(  # noqa: PLR0915
             }
         else:
             _parsed_body = await _read_request_body(request)
+        _parsed_body = HttpPassThroughEndpointHelpers._merge_passthrough_logging_metadata(
+            parsed_body=_parsed_body,
+            passthrough_logging_metadata=passthrough_logging_metadata,
+        )
         normalized_tool_schema_count = _normalize_openai_function_tool_schemas_in_body(
             _parsed_body
         )

@@ -3003,8 +3003,9 @@ class TestGoogleAdapterRequestShapePolicy:
                 "completion_tokens": 0,
                 "total_tokens": 12,
             },
+            "model": "embedding-beta-3-small",
         }
-        request_body = {"input": "embed me"}
+        request_body = {"model": "embedding-beta-3-small", "input": "embed me"}
         httpx_response = httpx.Response(
             200,
             json=response_body,
@@ -3713,6 +3714,78 @@ class TestPassThroughRequestRetryableFailures:
                 ]
                 == 2
             )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_uses_logging_metadata_without_changing_raw_body(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/traces"
+        mock_request.headers = {"content-type": "application/x-protobuf"}
+        mock_request.query_params = {}
+        mock_request.body = AsyncMock(return_value=b"\x00\x01trace")
+
+        target_url = "https://cli-chat-proxy.grok.com/v1/traces"
+        mock_httpx_response = httpx.Response(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            content=b'{"ok": true}',
+            request=httpx.Request("POST", target_url),
+        )
+        logging_metadata = {
+            "client_name": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "grok_cli_chat_proxy": True,
+            "tags": ["grok-build", "route:grok_cli_chat_proxy"],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ) as mock_success_handler:
+            mock_client = MagicMock()
+            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                side_effect=lambda **kwargs: kwargs["data"]
+            )
+            mock_logging_obj.post_call_success_hook = AsyncMock()
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                stream=False,
+                raw_body_passthrough=True,
+                passthrough_logging_metadata=logging_metadata,
+            )
+
+        sent_request = mock_client.request.call_args.kwargs
+        assert sent_request["content"] == b"\x00\x01trace"
+        assert "json" not in sent_request
+
+        mock_success_handler.assert_called_once()
+        success_metadata = mock_success_handler.call_args.kwargs["litellm_params"][
+            "metadata"
+        ]
+        assert success_metadata["client_name"] == "grok-build"
+        assert success_metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+        assert success_metadata["grok_cli_chat_proxy"] is True
+        assert "route:grok_cli_chat_proxy" in success_metadata["tags"]
 
 
 class TestOpenRouterAdapterRetry:
@@ -15576,6 +15649,7 @@ class TestGrokProxyRoute:
         assert metadata["grok_model_override"] == "grok-build"
         assert metadata["model_group"] == "grok-build"
         assert "route:grok_cli_chat_proxy" in metadata["tags"]
+        assert call_kwargs["passthrough_logging_metadata"] == metadata
 
     @pytest.mark.asyncio
     async def test_grok_proxy_route_avoids_double_v1_for_custom_upstream_base(self):
@@ -15611,6 +15685,11 @@ class TestGrokProxyRoute:
         assert call_kwargs["target"] == "https://proxy.example.com/v1/responses/resp_123"
         assert call_kwargs["query_params"] == {}
         assert call_kwargs["custom_body"] is None
+        metadata = call_kwargs["passthrough_logging_metadata"]
+        assert metadata["client_name"] == "grok-build"
+        assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+        assert metadata["grok_cli_chat_proxy"] is True
+        assert "route:grok_cli_chat_proxy" in metadata["tags"]
 
     @pytest.mark.asyncio
     async def test_grok_proxy_route_passes_binary_trace_body_without_json_parse(self):
@@ -15650,6 +15729,11 @@ class TestGrokProxyRoute:
         assert call_kwargs["target"] == "https://cli-chat-proxy.grok.com/v1/traces"
         assert call_kwargs["custom_body"] is None
         assert call_kwargs["raw_body_passthrough"] is True
+        metadata = call_kwargs["passthrough_logging_metadata"]
+        assert metadata["client_name"] == "grok-build"
+        assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+        assert metadata["grok_cli_chat_proxy"] is True
+        assert "route:grok_cli_chat_proxy" in metadata["tags"]
         assert "x-grok-client-version" in call_kwargs["allowed_forward_headers"]
 
 

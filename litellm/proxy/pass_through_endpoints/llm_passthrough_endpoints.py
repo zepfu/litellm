@@ -12836,7 +12836,7 @@ def _get_grok_litellm_auth_header(request: Request) -> str:
     return request.headers.get("Authorization", "")
 
 
-def _prepare_grok_request_body_for_passthrough(
+def _prepare_grok_logging_body_for_passthrough(
     *,
     request: Request,
     request_body: dict[str, Any],
@@ -12869,6 +12869,28 @@ def _prepare_grok_request_body_for_passthrough(
         request=request,
         request_body=updated_body,
     )
+
+
+def _prepare_grok_request_body_for_passthrough(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    return _prepare_grok_logging_body_for_passthrough(
+        request=request,
+        request_body=request_body,
+    )
+
+
+def _get_grok_passthrough_logging_metadata(request: Request) -> dict[str, Any]:
+    logging_body = _prepare_grok_logging_body_for_passthrough(
+        request=request,
+        request_body={},
+    )
+    litellm_metadata = logging_body.get("litellm_metadata")
+    if isinstance(litellm_metadata, dict):
+        return dict(litellm_metadata)
+    return {}
 
 
 def _is_grok_json_request(request: Request) -> bool:
@@ -13196,6 +13218,7 @@ async def grok_proxy_route(
     _log_grok_forward_header_compare(endpoint=endpoint, request=request)
 
     custom_body: Optional[dict[str, Any]] = None
+    passthrough_logging_metadata = _get_grok_passthrough_logging_metadata(request)
     if request.method in {"POST", "PUT", "PATCH"}:
         if not raw_body_passthrough:
             request_body = await get_request_body(request)
@@ -13206,6 +13229,9 @@ async def grok_proxy_route(
                 )
                 if custom_body is not request_body:
                     _safe_set_request_parsed_body(request, custom_body)
+                custom_metadata = custom_body.get("litellm_metadata")
+                if isinstance(custom_metadata, dict):
+                    passthrough_logging_metadata = dict(custom_metadata)
 
     query_params = {
         key: value
@@ -13227,6 +13253,7 @@ async def grok_proxy_route(
         expected_target_family="xai",
         allowed_forward_headers=list(_GROK_CLI_FORWARD_HEADER_ALLOWLIST),
         raw_body_passthrough=raw_body_passthrough,
+        passthrough_logging_metadata=passthrough_logging_metadata,
     )
 
 
