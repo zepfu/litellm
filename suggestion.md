@@ -44,3 +44,14 @@
 - How it would help: this would make OAuth-managed xAI live verification a
   single repeatable command once credentials are configured, while keeping the
   default pytest harness secret-free and offline.
+
+## 2026-06-01 D1-175
+
+- Suggestion: add a small `scripts/disposition_investigate_codex.py` helper that
+  inventories root `.analysis/investigate-codex-*.md` files, flags duplicate
+  archived copies, emits a per-file disposition template, and optionally moves
+  processed intake into `.analysis/investigation/`.
+- How it would help: this would reduce time and token churn for large intake
+  batches, prevent stale wrong-parent dispositions from surviving unnoticed, and
+  make root-intake cleanup less error-prone when new investigation files appear
+  mid-task.
