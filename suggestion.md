@@ -25,3 +25,13 @@
 - How it would help: D1-172 could be closed with live evidence as soon as a
   LiteLLM-owned xAI OAuth credential is configured, without reassembling curl,
   docker, and database checks by hand.
+
+## 2026-06-01 D1-173
+
+- Suggestion: keep a small manifest of Grok Build fixture expectations next to
+  the pass-through harness: required forwarded headers, required stripped
+  headers, endpoint/body modes, expected session-history identity, and expected
+  quota buckets.
+- How it would help: this would reduce test churn and review time by making it
+  obvious when a failing assertion is stale fixture metadata versus a routing or
+  observability regression.
