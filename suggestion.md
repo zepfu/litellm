@@ -15,3 +15,13 @@
 - How it would help: this would reduce time and token churn by replacing ad hoc
   curl/psql stitching with one repeatable command that proves client identity,
   route metadata, cost, and embedding persistence against the intended DB.
+
+## 2026-06-01 D1-172
+
+- Suggestion: add a dev-only xAI OAuth smoke command that validates
+  `LITELLM_XAI_OAUTH_AUTH_FILE`, redacts the credential payload, calls each
+  enabled `oa_xai/*` model, and prints the matching `session_history` and
+  provider-error metadata checks.
+- How it would help: D1-172 could be closed with live evidence as soon as a
+  LiteLLM-owned xAI OAuth credential is configured, without reassembling curl,
+  docker, and database checks by hand.

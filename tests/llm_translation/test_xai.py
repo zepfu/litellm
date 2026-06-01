@@ -1,7 +1,8 @@
+import asyncio
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 sys.path.insert(
@@ -47,6 +48,202 @@ def test_xai_chat_config_get_openai_compatible_provider_info():
         api_base, api_key = config._get_openai_compatible_provider_info(None, None)
         assert api_base == "https://env.x.ai/v1"
         assert api_key == "env_api_key"
+
+
+@pytest.mark.asyncio
+async def test_xai_oauth_managed_auth_file_loads_scoped_token(tmp_path, monkeypatch):
+    from litellm.llms.xai import oauth
+
+    credential_path = tmp_path / "xai-oauth.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                    "key": "managed-access-token",
+                    "refresh_token": "refresh-token",
+                    "expires_at": (
+                        datetime.now(timezone.utc) + timedelta(hours=1)
+                    ).isoformat(),
+                    "oidc_client_id": "client-id",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
+
+    assert await oauth.get_xai_oauth_access_token() == "managed-access-token"
+
+
+@pytest.mark.asyncio
+async def test_xai_oauth_managed_auth_file_is_required(monkeypatch):
+    from litellm.llms.xai import oauth
+
+    monkeypatch.delenv("LITELLM_XAI_OAUTH_AUTH_FILE", raising=False)
+
+    with pytest.raises(ValueError, match="LITELLM_XAI_OAUTH_AUTH_FILE"):
+        await oauth.get_xai_oauth_access_token()
+
+
+@pytest.mark.asyncio
+async def test_xai_oauth_managed_auth_file_refreshes_near_expiry(
+    tmp_path,
+    monkeypatch,
+):
+    from litellm.llms.xai import oauth
+
+    credential_path = tmp_path / "xai-oauth.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "key": "old-access-token",
+                "refresh_token": "old-refresh-token",
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+                "oidc_client_id": "client-id",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, data, headers):
+            captured["url"] = url
+            captured["data"] = data
+            captured["headers"] = headers
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "new-access-token",
+                    "refresh_token": "new-refresh-token",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
+        assert await oauth.get_xai_oauth_access_token() == "new-access-token"
+
+    assert captured["url"] == "https://auth.test/token"
+    assert captured["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "old-refresh-token",
+        "client_id": "client-id",
+    }
+    refreshed = json.loads(credential_path.read_text(encoding="utf-8"))
+    assert refreshed["key"] == "new-access-token"
+    assert refreshed["access_token"] == "new-access-token"
+    assert refreshed["refresh_token"] == "new-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_xai_oauth_managed_refresh_requires_refresh_token(
+    tmp_path,
+    monkeypatch,
+):
+    from litellm.llms.xai import oauth
+
+    credential_path = tmp_path / "xai-oauth.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "key": "old-access-token",
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+                "oidc_client_id": "client-id",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
+
+    with pytest.raises(ValueError, match="Reseed or relogin"):
+        await oauth.get_xai_oauth_access_token()
+
+
+@pytest.mark.asyncio
+async def test_xai_oauth_managed_auth_file_serializes_refresh(
+    tmp_path,
+    monkeypatch,
+):
+    from litellm.llms.xai import oauth
+
+    credential_path = tmp_path / "xai-oauth.json"
+    credential_path.write_text(
+        json.dumps(
+            {
+                "key": "old-access-token",
+                "refresh_token": "old-refresh-token",
+                "expires_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+                "oidc_client_id": "client-id",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
+    refresh_count = 0
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, data, headers):
+            nonlocal refresh_count
+            refresh_count += 1
+            await asyncio.sleep(0)
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "new-access-token",
+                    "refresh_token": "new-refresh-token",
+                    "expires_in": 3600,
+                },
+            )
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
+        tokens = await asyncio.gather(
+            oauth.get_xai_oauth_access_token(),
+            oauth.get_xai_oauth_access_token(),
+        )
+
+    assert tokens == ["new-access-token", "new-access-token"]
+    assert refresh_count == 1
+
+
+def test_xai_oauth_model_mapping_and_metadata():
+    from litellm.llms.xai import oauth
+
+    upstream_model = oauth.resolve_oa_xai_upstream_model("oa_xai/grok-4.3")
+    metadata = oauth.build_oa_xai_metadata("oa_xai/grok-4.3", upstream_model)
+
+    assert upstream_model == "xai/grok-4.3"
+    assert metadata["auth_mode"] == "oauth"
+    assert metadata["credential_family"] == "xai_oauth"
+    assert metadata["passthrough_route_family"] == "xai_oauth_api"
+    assert metadata["shared_quota_family"] == "xai_grok_subscription"
 
 
 def test_xai_chat_config_map_openai_params():

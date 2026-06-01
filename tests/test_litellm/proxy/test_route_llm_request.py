@@ -8,7 +8,7 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from litellm.proxy.route_llm_request import route_request
 
@@ -237,3 +237,41 @@ async def test_route_request_with_router_settings_override_preserves_existing():
     assert call_kwargs["num_retries"] == 10
     # Key/team timeout should be applied since not in request
     assert call_kwargs["timeout"] == 30
+
+
+@pytest.mark.asyncio
+async def test_route_request_routes_oa_xai_with_managed_oauth():
+    import litellm
+
+    data = {
+        "model": "oa_xai/grok-4.3",
+        "messages": [{"role": "user", "content": "hello"}],
+        "metadata": {"session_id": "session-oa-xai"},
+    }
+    llm_router = MagicMock()
+    llm_router.model_names = []
+    llm_router.has_model_id.return_value = False
+    llm_router.acompletion.return_value = "fake_response"
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="managed-oauth-token"),
+    ), patch.object(litellm, "acompletion") as mock_completion:
+        response = await route_request(data, llm_router, None, "acompletion")
+
+    assert response == "fake_response"
+    mock_completion.assert_not_called()
+    llm_router.acompletion.assert_called_once()
+    call_kwargs = llm_router.acompletion.call_args.kwargs
+    assert call_kwargs["model"] == "xai/grok-4.3"
+    assert call_kwargs["api_key"] == "managed-oauth-token"
+    assert call_kwargs["api_base"] == "https://api.x.ai/v1"
+    assert call_kwargs["custom_llm_provider"] == "xai"
+    metadata = call_kwargs["metadata"]
+    assert metadata["auth_mode"] == "oauth"
+    assert metadata["credential_family"] == "xai_oauth"
+    assert metadata["passthrough_route_family"] == "xai_oauth_api"
+    assert metadata["xai_oauth_public_model"] == "oa_xai/grok-4.3"
+    assert metadata["xai_oauth_upstream_model"] == "xai/grok-4.3"
+    assert metadata["shared_quota_family"] == "xai_grok_subscription"
+    assert "route:xai_oauth_api" in metadata["tags"]
