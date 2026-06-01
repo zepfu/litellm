@@ -44,6 +44,10 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
+from litellm.integrations.aawm_agent_quality_rules import (
+    AgentQualityCommand,
+    score_agent_quality_context,
+)
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.secret_managers.main import get_secret_str
 
@@ -236,7 +240,56 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     llm_upstream_time_to_first_byte_ms DOUBLE PRECISION,
     llm_upstream_stream_ms DOUBLE PRECISION,
     latency_unclassified_ms DOUBLE PRECISION,
-    previous_response_to_current_request_ms DOUBLE PRECISION
+    previous_response_to_current_request_ms DOUBLE PRECISION,
+    trace_quality_score DOUBLE PRECISION,
+    empty_completion_failure BOOLEAN,
+    large_tool_result_payload_risk BOOLEAN,
+    destructive_checkout_after_work BOOLEAN,
+    invalid_tool_call_error BOOLEAN,
+    read_only_policy_compliance_score DOUBLE PRECISION,
+    read_only_policy_violation_count INTEGER,
+    response_meaningfulness_score DOUBLE PRECISION,
+    instruction_adherence_score DOUBLE PRECISION,
+    answer_completeness_score DOUBLE PRECISION,
+    evidence_fidelity_score DOUBLE PRECISION,
+    tool_result_fidelity_score DOUBLE PRECISION,
+    error_attribution_quality_score DOUBLE PRECISION,
+    repetition_loop_risk_score DOUBLE PRECISION,
+    context_retention_score DOUBLE PRECISION,
+    tool_use_validity_score DOUBLE PRECISION,
+    tool_error_recovery_score DOUBLE PRECISION,
+    stall_risk_score DOUBLE PRECISION,
+    output_contract_compliance_score DOUBLE PRECISION,
+    task_progress_score DOUBLE PRECISION,
+    scope_control_score DOUBLE PRECISION,
+    destructive_action_policy_score DOUBLE PRECISION,
+    ignored_path_tracking_policy_score DOUBLE PRECISION,
+    ignored_path_tracking_violation_count INTEGER,
+    baseline_deflection_attempted_score DOUBLE PRECISION,
+    baseline_deflection_incident_score DOUBLE PRECISION,
+    baseline_deflection_attempt_count INTEGER,
+    baseline_deflection_tool_call_count INTEGER,
+    baseline_deflection_input_tokens INTEGER,
+    baseline_deflection_elapsed_ms DOUBLE PRECISION,
+    quality_gate_trigger_count INTEGER,
+    quality_gate_fix_attempt_count INTEGER,
+    quality_gate_rerun_count INTEGER,
+    sleep_wellness_interruption_attempted_score DOUBLE PRECISION,
+    sleep_wellness_interruption_incident_score DOUBLE PRECISION,
+    sleep_wellness_interruption_count INTEGER,
+    sleep_wellness_interruption_output_tokens INTEGER,
+    sleep_wellness_interruption_input_tokens INTEGER,
+    sleep_wellness_interruption_elapsed_ms DOUBLE PRECISION,
+    sleep_wellness_interruption_after_user_pushback_count INTEGER,
+    sleep_wellness_interruption_repeated_count INTEGER,
+    terminal_completion_score DOUBLE PRECISION,
+    discovery_inventory_coverage_score DOUBLE PRECISION,
+    discovery_inventory_missing_count INTEGER,
+    agent_score_reasons JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_compact_summary BOOLEAN NOT NULL DEFAULT FALSE,
+    compact_summary_source TEXT,
+    compact_summary_id TEXT,
+    compact_summary_role TEXT
 )
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
@@ -287,6 +340,76 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_stream_ms DOUBLE PRECISION",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS latency_unclassified_ms DOUBLE PRECISION",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS previous_response_to_current_request_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS trace_quality_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS empty_completion_failure BOOLEAN",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS large_tool_result_payload_risk BOOLEAN",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS destructive_checkout_after_work BOOLEAN",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS invalid_tool_call_error BOOLEAN",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "read_only_policy_compliance_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS read_only_policy_violation_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS response_meaningfulness_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS instruction_adherence_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS answer_completeness_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS evidence_fidelity_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_result_fidelity_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS error_attribution_quality_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS repetition_loop_risk_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS context_retention_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_use_validity_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_error_recovery_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS stall_risk_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "output_contract_compliance_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS task_progress_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS scope_control_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "destructive_action_policy_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "ignored_path_tracking_policy_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "ignored_path_tracking_violation_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "baseline_deflection_attempted_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "baseline_deflection_incident_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_attempt_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "baseline_deflection_tool_call_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_input_tokens INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "baseline_deflection_elapsed_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_trigger_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_fix_attempt_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_rerun_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_attempted_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_incident_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_output_tokens INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_input_tokens INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_elapsed_ms DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_after_user_pushback_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "sleep_wellness_interruption_repeated_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS terminal_completion_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "discovery_inventory_coverage_score DOUBLE PRECISION",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
+    "discovery_inventory_missing_count INTEGER",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_score_reasons "
+    "JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS is_compact_summary "
+    "BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS compact_summary_source TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS compact_summary_role TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS compact_summary_id TEXT",
 )
 _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_created_at_idx ON public.session_history (created_at DESC)",
@@ -296,6 +419,7 @@ _AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_litellm_environment_created_idx ON public.session_history (litellm_environment, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_client_created_idx ON public.session_history (client_name, client_version, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_repository_created_idx ON public.session_history (repository, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_compact_summary_idx ON public.session_history (session_id, compact_summary_id, created_at DESC) WHERE is_compact_summary",
     "CREATE INDEX IF NOT EXISTS session_history_openrouter_free_observed_idx ON public.session_history ((COALESCE(end_time, start_time, created_at)) DESC) WHERE provider = 'openrouter' AND lower(COALESCE(model, '')) LIKE '%:free'",
 )
 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL = """
@@ -812,7 +936,56 @@ INSERT INTO public.session_history (
     structured_output_failed,
     structured_output_mode,
     structured_output_schema_hash,
-    structured_output_failure_reason
+    structured_output_failure_reason,
+    trace_quality_score,
+    empty_completion_failure,
+    large_tool_result_payload_risk,
+    destructive_checkout_after_work,
+    invalid_tool_call_error,
+    read_only_policy_compliance_score,
+    read_only_policy_violation_count,
+    response_meaningfulness_score,
+    instruction_adherence_score,
+    answer_completeness_score,
+    evidence_fidelity_score,
+    tool_result_fidelity_score,
+    error_attribution_quality_score,
+    repetition_loop_risk_score,
+    context_retention_score,
+    tool_use_validity_score,
+    tool_error_recovery_score,
+    stall_risk_score,
+    output_contract_compliance_score,
+    task_progress_score,
+    scope_control_score,
+    destructive_action_policy_score,
+    ignored_path_tracking_policy_score,
+    ignored_path_tracking_violation_count,
+    baseline_deflection_attempted_score,
+    baseline_deflection_incident_score,
+    baseline_deflection_attempt_count,
+    baseline_deflection_tool_call_count,
+    baseline_deflection_input_tokens,
+    baseline_deflection_elapsed_ms,
+    quality_gate_trigger_count,
+    quality_gate_fix_attempt_count,
+    quality_gate_rerun_count,
+    sleep_wellness_interruption_attempted_score,
+    sleep_wellness_interruption_incident_score,
+    sleep_wellness_interruption_count,
+    sleep_wellness_interruption_output_tokens,
+    sleep_wellness_interruption_input_tokens,
+    sleep_wellness_interruption_elapsed_ms,
+    sleep_wellness_interruption_after_user_pushback_count,
+    sleep_wellness_interruption_repeated_count,
+    terminal_completion_score,
+    discovery_inventory_coverage_score,
+    discovery_inventory_missing_count,
+    agent_score_reasons,
+    is_compact_summary,
+    compact_summary_source,
+    compact_summary_id,
+    compact_summary_role
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
@@ -820,7 +993,13 @@ INSERT INTO public.session_history (
     $32, $33, $34, $35, $36, $37, $38, $39, $40::jsonb, $41, $42, $43, $44, $45, $46, $47::jsonb, $48,
     $49, $50, $51, $52, $53, $54, $55, $56, $57,
     $58, $59, $60, $61, $62, $63, $64, $65, $66, $67,
-    $68, $69, $70, $71, $72
+    $68, $69, $70, $71, $72,
+    $73, $74, $75, $76, $77, $78, $79, $80, $81, $82,
+    $83, $84, $85, $86, $87, $88, $89, $90, $91, $92,
+    $93, $94, $95, $96,
+    $97, $98, $99, $100, $101, $102, $103, $104, $105, $106,
+    $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117::jsonb,
+    $118, $119, $120, $121
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -908,6 +1087,199 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     structured_output_failure_reason = COALESCE(
         NULLIF(EXCLUDED.structured_output_failure_reason, ''),
         session_history.structured_output_failure_reason
+    ),
+    trace_quality_score = COALESCE(
+        EXCLUDED.trace_quality_score,
+        session_history.trace_quality_score
+    ),
+    empty_completion_failure = COALESCE(
+        EXCLUDED.empty_completion_failure,
+        session_history.empty_completion_failure
+    ),
+    large_tool_result_payload_risk = COALESCE(
+        EXCLUDED.large_tool_result_payload_risk,
+        session_history.large_tool_result_payload_risk
+    ),
+    destructive_checkout_after_work = COALESCE(
+        EXCLUDED.destructive_checkout_after_work,
+        session_history.destructive_checkout_after_work
+    ),
+    invalid_tool_call_error = COALESCE(
+        EXCLUDED.invalid_tool_call_error,
+        session_history.invalid_tool_call_error
+    ),
+    read_only_policy_compliance_score = COALESCE(
+        EXCLUDED.read_only_policy_compliance_score,
+        session_history.read_only_policy_compliance_score
+    ),
+    read_only_policy_violation_count = COALESCE(
+        EXCLUDED.read_only_policy_violation_count,
+        session_history.read_only_policy_violation_count
+    ),
+    response_meaningfulness_score = COALESCE(
+        EXCLUDED.response_meaningfulness_score,
+        session_history.response_meaningfulness_score
+    ),
+    instruction_adherence_score = COALESCE(
+        EXCLUDED.instruction_adherence_score,
+        session_history.instruction_adherence_score
+    ),
+    answer_completeness_score = COALESCE(
+        EXCLUDED.answer_completeness_score,
+        session_history.answer_completeness_score
+    ),
+    evidence_fidelity_score = COALESCE(
+        EXCLUDED.evidence_fidelity_score,
+        session_history.evidence_fidelity_score
+    ),
+    tool_result_fidelity_score = COALESCE(
+        EXCLUDED.tool_result_fidelity_score,
+        session_history.tool_result_fidelity_score
+    ),
+    error_attribution_quality_score = COALESCE(
+        EXCLUDED.error_attribution_quality_score,
+        session_history.error_attribution_quality_score
+    ),
+    repetition_loop_risk_score = COALESCE(
+        EXCLUDED.repetition_loop_risk_score,
+        session_history.repetition_loop_risk_score
+    ),
+    context_retention_score = COALESCE(
+        EXCLUDED.context_retention_score,
+        session_history.context_retention_score
+    ),
+    tool_use_validity_score = COALESCE(
+        EXCLUDED.tool_use_validity_score,
+        session_history.tool_use_validity_score
+    ),
+    tool_error_recovery_score = COALESCE(
+        EXCLUDED.tool_error_recovery_score,
+        session_history.tool_error_recovery_score
+    ),
+    stall_risk_score = COALESCE(
+        EXCLUDED.stall_risk_score,
+        session_history.stall_risk_score
+    ),
+    output_contract_compliance_score = COALESCE(
+        EXCLUDED.output_contract_compliance_score,
+        session_history.output_contract_compliance_score
+    ),
+    task_progress_score = COALESCE(
+        EXCLUDED.task_progress_score,
+        session_history.task_progress_score
+    ),
+    scope_control_score = COALESCE(
+        EXCLUDED.scope_control_score,
+        session_history.scope_control_score
+    ),
+    destructive_action_policy_score = COALESCE(
+        EXCLUDED.destructive_action_policy_score,
+        session_history.destructive_action_policy_score
+    ),
+    ignored_path_tracking_policy_score = COALESCE(
+        EXCLUDED.ignored_path_tracking_policy_score,
+        session_history.ignored_path_tracking_policy_score
+    ),
+    ignored_path_tracking_violation_count = COALESCE(
+        EXCLUDED.ignored_path_tracking_violation_count,
+        session_history.ignored_path_tracking_violation_count
+    ),
+    baseline_deflection_attempted_score = COALESCE(
+        EXCLUDED.baseline_deflection_attempted_score,
+        session_history.baseline_deflection_attempted_score
+    ),
+    baseline_deflection_incident_score = COALESCE(
+        EXCLUDED.baseline_deflection_incident_score,
+        session_history.baseline_deflection_incident_score
+    ),
+    baseline_deflection_attempt_count = COALESCE(
+        EXCLUDED.baseline_deflection_attempt_count,
+        session_history.baseline_deflection_attempt_count
+    ),
+    baseline_deflection_tool_call_count = COALESCE(
+        EXCLUDED.baseline_deflection_tool_call_count,
+        session_history.baseline_deflection_tool_call_count
+    ),
+    baseline_deflection_input_tokens = COALESCE(
+        EXCLUDED.baseline_deflection_input_tokens,
+        session_history.baseline_deflection_input_tokens
+    ),
+    baseline_deflection_elapsed_ms = COALESCE(
+        EXCLUDED.baseline_deflection_elapsed_ms,
+        session_history.baseline_deflection_elapsed_ms
+    ),
+    quality_gate_trigger_count = COALESCE(
+        EXCLUDED.quality_gate_trigger_count,
+        session_history.quality_gate_trigger_count
+    ),
+    quality_gate_fix_attempt_count = COALESCE(
+        EXCLUDED.quality_gate_fix_attempt_count,
+        session_history.quality_gate_fix_attempt_count
+    ),
+    quality_gate_rerun_count = COALESCE(
+        EXCLUDED.quality_gate_rerun_count,
+        session_history.quality_gate_rerun_count
+    ),
+    sleep_wellness_interruption_attempted_score = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_attempted_score,
+        session_history.sleep_wellness_interruption_attempted_score
+    ),
+    sleep_wellness_interruption_incident_score = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_incident_score,
+        session_history.sleep_wellness_interruption_incident_score
+    ),
+    sleep_wellness_interruption_count = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_count,
+        session_history.sleep_wellness_interruption_count
+    ),
+    sleep_wellness_interruption_output_tokens = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_output_tokens,
+        session_history.sleep_wellness_interruption_output_tokens
+    ),
+    sleep_wellness_interruption_input_tokens = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_input_tokens,
+        session_history.sleep_wellness_interruption_input_tokens
+    ),
+    sleep_wellness_interruption_elapsed_ms = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_elapsed_ms,
+        session_history.sleep_wellness_interruption_elapsed_ms
+    ),
+    sleep_wellness_interruption_after_user_pushback_count = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_after_user_pushback_count,
+        session_history.sleep_wellness_interruption_after_user_pushback_count
+    ),
+    sleep_wellness_interruption_repeated_count = COALESCE(
+        EXCLUDED.sleep_wellness_interruption_repeated_count,
+        session_history.sleep_wellness_interruption_repeated_count
+    ),
+    terminal_completion_score = COALESCE(
+        EXCLUDED.terminal_completion_score,
+        session_history.terminal_completion_score
+    ),
+    discovery_inventory_coverage_score = COALESCE(
+        EXCLUDED.discovery_inventory_coverage_score,
+        session_history.discovery_inventory_coverage_score
+    ),
+    discovery_inventory_missing_count = COALESCE(
+        EXCLUDED.discovery_inventory_missing_count,
+        session_history.discovery_inventory_missing_count
+    ),
+    agent_score_reasons = COALESCE(
+        session_history.agent_score_reasons,
+        '{}'::jsonb
+    ) || COALESCE(EXCLUDED.agent_score_reasons, '{}'::jsonb),
+    is_compact_summary = session_history.is_compact_summary OR EXCLUDED.is_compact_summary,
+    compact_summary_source = COALESCE(
+        NULLIF(EXCLUDED.compact_summary_source, ''),
+        session_history.compact_summary_source
+    ),
+    compact_summary_role = COALESCE(
+        NULLIF(EXCLUDED.compact_summary_role, ''),
+        session_history.compact_summary_role
+    ),
+    compact_summary_id = COALESCE(
+        NULLIF(EXCLUDED.compact_summary_id, ''),
+        session_history.compact_summary_id
     ),
     tool_names = CASE
         WHEN jsonb_array_length(
@@ -1557,6 +1929,57 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "usage_structured_output_mode",
     "usage_structured_output_schema_hash",
     "usage_structured_output_failure_reason",
+    "usage_trace_quality_score",
+    "usage_empty_completion_failure",
+    "usage_large_tool_result_payload_risk",
+    "usage_destructive_checkout_after_work",
+    "usage_invalid_tool_call_error",
+    "usage_read_only_policy_compliance_score",
+    "usage_read_only_policy_violation_count",
+    "usage_response_meaningfulness_score",
+    "usage_instruction_adherence_score",
+    "usage_answer_completeness_score",
+    "usage_evidence_fidelity_score",
+    "usage_tool_result_fidelity_score",
+    "usage_error_attribution_quality_score",
+    "usage_repetition_loop_risk_score",
+    "usage_context_retention_score",
+    "usage_tool_use_validity_score",
+    "usage_tool_error_recovery_score",
+    "usage_stall_risk_score",
+    "usage_output_contract_compliance_score",
+    "usage_task_progress_score",
+    "usage_scope_control_score",
+    "usage_destructive_action_policy_score",
+    "usage_ignored_path_tracking_policy_score",
+    "usage_ignored_path_tracking_violation_count",
+    "usage_baseline_deflection_attempted_score",
+    "usage_baseline_deflection_incident_score",
+    "usage_baseline_deflection_attempt_count",
+    "usage_baseline_deflection_tool_call_count",
+    "usage_baseline_deflection_input_tokens",
+    "usage_baseline_deflection_elapsed_ms",
+    "usage_quality_gate_trigger_count",
+    "usage_quality_gate_fix_attempt_count",
+    "usage_quality_gate_rerun_count",
+    "usage_sleep_wellness_interruption_attempted_score",
+    "usage_sleep_wellness_interruption_incident_score",
+    "usage_sleep_wellness_interruption_count",
+    "usage_sleep_wellness_interruption_output_tokens",
+    "usage_sleep_wellness_interruption_input_tokens",
+    "usage_sleep_wellness_interruption_elapsed_ms",
+    "usage_sleep_wellness_interruption_after_user_pushback_count",
+    "usage_sleep_wellness_interruption_repeated_count",
+    "usage_terminal_completion_score",
+    "usage_discovery_inventory_coverage_score",
+    "usage_discovery_inventory_missing_count",
+    "usage_agent_score_reasons",
+    "usage_agent_score_source",
+    "gemini_user_prompt_id",
+    "is_compact_summary",
+    "compact_summary_source",
+    "compact_summary_role",
+    "compact_summary_id",
     "usage_tool_names",
     "google_adapter_system_prompt_policy_name",
     "google_adapter_system_prompt_policy",
@@ -1644,6 +2067,56 @@ _SESSION_HISTORY_LATENCY_FIELDS = (
     "llm_upstream_time_to_first_byte_ms",
     "llm_upstream_stream_ms",
     "latency_unclassified_ms",
+)
+_SESSION_HISTORY_AGENT_SCORE_FLOAT_FIELDS = (
+    "trace_quality_score",
+    "read_only_policy_compliance_score",
+    "response_meaningfulness_score",
+    "instruction_adherence_score",
+    "answer_completeness_score",
+    "evidence_fidelity_score",
+    "tool_result_fidelity_score",
+    "error_attribution_quality_score",
+    "repetition_loop_risk_score",
+    "context_retention_score",
+    "tool_use_validity_score",
+    "tool_error_recovery_score",
+    "stall_risk_score",
+    "output_contract_compliance_score",
+    "task_progress_score",
+    "scope_control_score",
+    "destructive_action_policy_score",
+    "ignored_path_tracking_policy_score",
+    "baseline_deflection_attempted_score",
+    "baseline_deflection_incident_score",
+    "baseline_deflection_elapsed_ms",
+    "sleep_wellness_interruption_attempted_score",
+    "sleep_wellness_interruption_incident_score",
+    "sleep_wellness_interruption_elapsed_ms",
+    "terminal_completion_score",
+    "discovery_inventory_coverage_score",
+)
+_SESSION_HISTORY_AGENT_SCORE_BOOL_FIELDS = (
+    "empty_completion_failure",
+    "large_tool_result_payload_risk",
+    "destructive_checkout_after_work",
+    "invalid_tool_call_error",
+)
+_SESSION_HISTORY_AGENT_SCORE_INT_FIELDS = (
+    "read_only_policy_violation_count",
+    "ignored_path_tracking_violation_count",
+    "baseline_deflection_attempt_count",
+    "baseline_deflection_tool_call_count",
+    "baseline_deflection_input_tokens",
+    "quality_gate_trigger_count",
+    "quality_gate_fix_attempt_count",
+    "quality_gate_rerun_count",
+    "sleep_wellness_interruption_count",
+    "sleep_wellness_interruption_output_tokens",
+    "sleep_wellness_interruption_input_tokens",
+    "sleep_wellness_interruption_after_user_pushback_count",
+    "sleep_wellness_interruption_repeated_count",
+    "discovery_inventory_missing_count",
 )
 _PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v2"
 _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH = 16
@@ -6831,9 +7304,32 @@ def _session_history_metadata_model(metadata: Dict[str, Any]) -> Optional[str]:
         metadata.get("codex_auto_agent_selected_model"),
         metadata.get("codex_adapter_model"),
         metadata.get("litellm_model"),
+        _session_history_model_from_request_tags(metadata),
         metadata.get("model"),
         _maybe_get(hidden_params, "model"),
     )
+
+
+_SESSION_HISTORY_CLAUDE_MODEL_TAG_RE = re.compile(
+    r"^claude-(?:opus|sonnet|haiku)-[a-z0-9_.-]+$",
+    re.IGNORECASE,
+)
+
+
+def _session_history_model_from_request_tags(
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    for tag in _metadata_request_tags(metadata):
+        if not isinstance(tag, str):
+            continue
+        stripped_tag = tag.strip()
+        tag_lower = stripped_tag.lower()
+        if not tag_lower.startswith("claude-exp:"):
+            continue
+        candidate = stripped_tag.split(":", 1)[1].strip()
+        if _SESSION_HISTORY_CLAUDE_MODEL_TAG_RE.fullmatch(candidate):
+            return candidate
+    return None
 
 
 def _extract_model_from_langfuse_input(input_payload: Any) -> Optional[str]:
@@ -7175,10 +7671,65 @@ def _has_nested_path(obj: Any, *keys: str) -> bool:
     return _maybe_get_path(obj, *keys, default=sentinel) is not sentinel
 
 
+def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    candidate_lower = candidate.strip().lower()
+    if candidate_lower in {"unknown", "none", "null", "litellm"}:
+        return None
+    if candidate_lower in {"google", "google_code_assist", "google-code-assist"}:
+        return "gemini"
+    if candidate_lower in {"nvidia", "nvidia_nim", "nvidia-nim"}:
+        return "nvidia_nim"
+    if candidate_lower == "grok":
+        return "xai"
+    if candidate_lower in {
+        "local_embed",
+        "local-embed",
+        "local_rerank",
+        "local-rerank",
+        "local_llm",
+        "local-llm",
+        "local_biomed",
+        "local-biomed",
+        "openrouter",
+        "openai",
+        "anthropic",
+        "gemini",
+        "xai",
+    }:
+        return candidate_lower.replace("-", "_")
+    return candidate_lower
+
+
+@lru_cache(maxsize=512)
+def _session_history_provider_from_model_catalog(model: str) -> Optional[str]:
+    normalized_model = str(model or "").strip()
+    if not normalized_model or normalized_model.lower() == "unknown":
+        return None
+    try:
+        from litellm.utils import get_model_info
+
+        model_info = get_model_info(model=normalized_model)
+    except Exception:
+        return None
+    if not isinstance(model_info, dict):
+        return None
+    return _normalize_session_history_provider_name(model_info.get("litellm_provider"))
+
+
 def _session_history_provider_from_model(model: Any) -> Optional[str]:
     model_lower = str(model or "").strip().lower()
     if not model_lower or model_lower == "unknown":
         return None
+    if model_lower.startswith("local_embed/"):
+        return "local_embed"
+    if model_lower.startswith("local_rerank/"):
+        return "local_rerank"
+    if model_lower.startswith("local_llm/"):
+        return "local_llm"
+    if model_lower.startswith("local_biomed/"):
+        return "local_biomed"
     if model_lower.startswith("nvidia/"):
         return "nvidia_nim"
     if model_lower.startswith("xai/") or model_lower.startswith("grok"):
@@ -7198,7 +7749,7 @@ def _session_history_provider_from_model(model: Any) -> Optional[str]:
         or "codex" in model_lower
     ):
         return "openai"
-    return None
+    return _session_history_provider_from_model_catalog(str(model or ""))
 
 
 def _session_history_provider_from_route_family(route_family: Any) -> Optional[str]:
@@ -7211,6 +7762,14 @@ def _session_history_provider_from_route_family(route_family: Any) -> Optional[s
         return "nvidia_nim"
     if "openrouter" in route_lower:
         return "openrouter"
+    if "local_embed" in route_lower or "local-embed" in route_lower:
+        return "local_embed"
+    if "local_rerank" in route_lower or "local-rerank" in route_lower:
+        return "local_rerank"
+    if "local_llm" in route_lower or "local-llm" in route_lower:
+        return "local_llm"
+    if "local_biomed" in route_lower or "local-biomed" in route_lower:
+        return "local_biomed"
     if "gemini" in route_lower or "google" in route_lower:
         return "gemini"
     if "codex" in route_lower or "openai" in route_lower:
@@ -7239,6 +7798,19 @@ def _session_history_adapter_target_provider(
         if target.startswith(("responses", "openai", "codex", "/v1/responses")):
             return "openai"
     return None
+
+
+def _session_history_auto_agent_selected_provider(
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    selected_provider = _normalize_session_history_provider_name(
+        metadata.get("codex_auto_agent_selected_provider")
+    )
+    if selected_provider is not None:
+        return selected_provider
+    return _normalize_session_history_provider_name(
+        metadata.get("aawm_auto_agent_selected_provider")
+    )
 
 
 def _session_history_adapter_model(metadata: Dict[str, Any]) -> Optional[str]:
@@ -7308,6 +7880,10 @@ def _normalize_session_history_provider(
     if adapter_target_provider is not None:
         return adapter_target_provider
 
+    auto_agent_provider = _session_history_auto_agent_selected_provider(metadata)
+    if auto_agent_provider is not None:
+        return auto_agent_provider
+
     route_provider = _session_history_provider_from_route_family(
         metadata.get("passthrough_route_family")
     )
@@ -7316,34 +7892,27 @@ def _normalize_session_history_provider(
 
     model_provider = _session_history_provider_from_model(model)
 
-    def _normalize_known_provider(candidate: Any) -> Optional[str]:
-        if not isinstance(candidate, str) or not candidate.strip():
-            return None
-        candidate_lower = candidate.strip().lower()
-        if candidate_lower in {"unknown", "none", "null"}:
-            return None
-        if candidate_lower == "google":
-            return "gemini"
-        if candidate_lower in {"nvidia", "nvidia_nim", "nvidia-nim"}:
-            return "nvidia_nim"
-        return candidate_lower
-
-    normalized_provider = _normalize_known_provider(provider)
+    normalized_provider = _normalize_session_history_provider_name(provider)
     if (
-        normalized_provider == "anthropic"
+        normalized_provider in {"anthropic", "openai"}
         and model_provider is not None
-        and model_provider != "anthropic"
+        and model_provider != normalized_provider
     ):
         return model_provider
     if normalized_provider is not None:
         return normalized_provider
 
-    for key in ("custom_llm_provider", "provider", "litellm_provider"):
-        normalized_provider = _normalize_known_provider(metadata.get(key))
+    for key in (
+        "custom_llm_provider",
+        "provider",
+        "litellm_provider",
+        "aawm_stream_logging_custom_llm_provider",
+    ):
+        normalized_provider = _normalize_session_history_provider_name(metadata.get(key))
         if (
-            normalized_provider == "anthropic"
+            normalized_provider in {"anthropic", "openai"}
             and model_provider is not None
-            and model_provider != "anthropic"
+            and model_provider != normalized_provider
         ):
             return model_provider
         if normalized_provider is not None:
@@ -7983,6 +8552,252 @@ def _request_contains_prompt_cache_key(payload: Any) -> bool:
         return False
     prompt_cache_key = payload.get("prompt_cache_key")
     return isinstance(prompt_cache_key, str) and bool(prompt_cache_key.strip())
+
+
+_CODEX_THREAD_ID_RE = re.compile(
+    r"\bCODEX_THREAD_ID=(?P<thread_id>[A-Za-z0-9][A-Za-z0-9._:-]{7,})\b"
+)
+_GEMINI_COMPACT_PROMPT_ID_RE = re.compile(r"^compress-[A-Za-z0-9._:-]+$")
+_CLAUDE_CODE_COMPACT_REQUEST_MARKERS = (
+    "your task is to create a detailed summary of the conversation so far",
+    "respond with text only",
+    "do not call any tools",
+)
+
+
+def _append_request_content_text(texts: List[str], content: Any) -> None:
+    text = _content_to_text(content).strip()
+    if text:
+        texts.append(text)
+
+
+def _extract_request_user_texts(request_body: Any) -> List[str]:
+    if not isinstance(request_body, dict):
+        return []
+
+    texts: List[str] = []
+    messages = request_body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "").lower() == "user":
+                _append_request_content_text(texts, message.get("content"))
+
+    input_items = request_body.get("input")
+    if isinstance(input_items, str):
+        texts.append(input_items.strip())
+    elif isinstance(input_items, list):
+        for item in input_items:
+            if isinstance(item, str):
+                if item.strip():
+                    texts.append(item.strip())
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            role = str(item.get("role") or "").lower()
+            if item_type == "input_text":
+                _append_request_content_text(texts, item.get("text"))
+            elif role == "user" and item_type in {"", "message"}:
+                _append_request_content_text(texts, item.get("content"))
+
+    return texts
+
+
+def _join_compact_request_user_texts(request_body: Any) -> str:
+    return "\n".join(_extract_request_user_texts(request_body))
+
+
+def _extract_codex_compact_thread_id(
+    metadata: Dict[str, Any],
+    request_body: Any,
+    request_text: str,
+) -> Optional[str]:
+    if isinstance(request_body, dict):
+        prompt_cache_key = _clean_non_empty_string(request_body.get("prompt_cache_key"))
+        if prompt_cache_key is not None:
+            return prompt_cache_key
+
+    for candidate in (
+        metadata.get("prompt_cache_key"),
+        metadata.get("codex_prompt_cache_key"),
+        metadata.get("CODEX_THREAD_ID"),
+        metadata.get("codex_thread_id"),
+    ):
+        thread_id = _clean_non_empty_string(candidate)
+        if thread_id is not None:
+            return thread_id
+
+    match = _CODEX_THREAD_ID_RE.search(request_text)
+    if match:
+        return match.group("thread_id")
+    return None
+
+
+def _extract_gemini_compact_prompt_id(
+    metadata: Dict[str, Any],
+    request_body: Any,
+) -> Optional[str]:
+    candidates = [metadata.get("gemini_user_prompt_id")]
+    if isinstance(request_body, dict):
+        candidates.extend(
+            [
+                request_body.get("user_prompt_id"),
+                _maybe_get_path(request_body, "request", "user_prompt_id"),
+            ]
+        )
+    for candidate in candidates:
+        prompt_id = _clean_non_empty_string(candidate)
+        if prompt_id and _GEMINI_COMPACT_PROMPT_ID_RE.match(prompt_id):
+            return prompt_id
+    return None
+
+
+def _base_gemini_compact_prompt_id(prompt_id: str) -> str:
+    if prompt_id.endswith("-verify"):
+        return prompt_id[: -len("-verify")]
+    return prompt_id
+
+
+def _extract_compact_output_text(output_payload: Any) -> str:
+    parsed = _safe_json_load(output_payload, output_payload)
+
+    for extractor in (_extract_first_response_message, _extract_first_langfuse_response_message):
+        message = extractor(parsed)
+        if message is None:
+            continue
+        text = _content_to_text(_maybe_get(message, "content")).strip()
+        if text:
+            return text
+
+    if isinstance(parsed, dict):
+        content = parsed.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+        candidates = parsed.get("candidates")
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                parts = _maybe_get_path(candidate, "content", "parts")
+                text = _content_to_text(parts).strip()
+                if text:
+                    return text
+
+    return _content_to_text(parsed).strip()
+
+
+def _is_claude_code_compact_context(metadata: Dict[str, Any]) -> bool:
+    client_name = str(metadata.get("client_name") or "").strip().lower()
+    trace_name = str(metadata.get("trace_name") or "").strip().lower()
+    route_family = str(metadata.get("passthrough_route_family") or "").strip().lower()
+    return (
+        client_name in {"claude-cli", "claude-code"}
+        or trace_name.startswith("claude-code")
+        or route_family in {"anthropic_messages", "anthropic_completion"}
+    )
+
+
+def _is_codex_compact_context(metadata: Dict[str, Any]) -> bool:
+    client_name = str(metadata.get("client_name") or "").strip().lower()
+    trace_name = str(metadata.get("trace_name") or "").strip().lower()
+    route_family = str(metadata.get("passthrough_route_family") or "").strip().lower()
+    return (
+        client_name == "codex-tui"
+        or trace_name.startswith("codex")
+        or route_family == "codex_responses"
+    )
+
+
+def _is_gemini_cli_compact_context(metadata: Dict[str, Any]) -> bool:
+    client_name = str(metadata.get("client_name") or "").strip().lower()
+    user_agent = str(metadata.get("client_user_agent") or "").strip().lower()
+    route_family = str(metadata.get("passthrough_route_family") or "").strip().lower()
+    return (
+        client_name == "gemini-cli"
+        or user_agent.startswith("geminicli-tui/")
+        or route_family == "gemini_generate_content"
+    )
+
+
+def _classify_compact_summary_state(
+    *,
+    metadata: Dict[str, Any],
+    request_body: Any,
+    output_payload: Any,
+    session_id: Optional[str],
+    litellm_call_id: Optional[str],
+    trace_id: Optional[str],
+) -> Dict[str, Any]:
+    request_text = _join_compact_request_user_texts(request_body)
+    request_text_lower = request_text.lower()
+    output_text = _extract_compact_output_text(output_payload)
+    output_text_lower = output_text.lower()
+
+    if _is_codex_compact_context(metadata):
+        compact_id = _extract_codex_compact_thread_id(
+            metadata,
+            request_body,
+            request_text,
+        )
+        if (
+            "context checkpoint compaction" in request_text_lower
+        ):
+            return {
+                "is_compact_summary": True,
+                "compact_summary_source": "codex",
+                "compact_summary_role": "event",
+                "compact_summary_id": compact_id or litellm_call_id or trace_id or session_id,
+            }
+        if "another language model started to solve this problem" in request_text_lower:
+            return {
+                "is_compact_summary": False,
+                "compact_summary_source": "codex",
+                "compact_summary_role": "resume_context",
+                "compact_summary_id": compact_id or session_id,
+            }
+
+    gemini_prompt_id = _extract_gemini_compact_prompt_id(metadata, request_body)
+    if gemini_prompt_id is not None and _is_gemini_cli_compact_context(metadata):
+        is_verify = gemini_prompt_id.endswith("-verify")
+        if not is_verify and not output_text_lower.startswith("<state_snapshot>"):
+            return {
+                "is_compact_summary": False,
+                "compact_summary_source": None,
+                "compact_summary_role": None,
+                "compact_summary_id": None,
+            }
+        return {
+            "is_compact_summary": not is_verify,
+            "compact_summary_source": "gemini-cli",
+            "compact_summary_role": "verify" if is_verify else "event",
+            "compact_summary_id": _base_gemini_compact_prompt_id(gemini_prompt_id),
+        }
+
+    if _is_claude_code_compact_context(metadata):
+        has_compact_tags = "<analysis>" in request_text_lower and "<summary>" in request_text_lower
+        strict_prompt_shape = all(
+            marker in request_text_lower for marker in _CLAUDE_CODE_COMPACT_REQUEST_MARKERS
+        )
+        compact_summary_phrase = (
+            "summarize the current context" in request_text_lower
+            or "context compacted" in request_text_lower
+        )
+        if has_compact_tags and (strict_prompt_shape or compact_summary_phrase):
+            compact_id = litellm_call_id or trace_id or session_id
+            return {
+                "is_compact_summary": True,
+                "compact_summary_source": "claude-code",
+                "compact_summary_role": "event",
+                "compact_summary_id": compact_id,
+            }
+
+    return {
+        "is_compact_summary": False,
+        "compact_summary_source": None,
+        "compact_summary_role": None,
+        "compact_summary_id": None,
+    }
 
 
 def _openai_style_cached_tokens_source(usage_obj: Any) -> Optional[str]:
@@ -9638,6 +10453,16 @@ _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS = (
 )
 
 
+def _is_harness_tenant_identity(value: Any) -> bool:
+    normalized = _normalize_identity_for_placeholder_check(value)
+    if not normalized:
+        return False
+    return any(
+        fragment in normalized
+        for fragment in _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS
+    )
+
+
 def _normalize_request_header_tenant_repository(value: Any) -> Optional[str]:
     repository = _normalize_repository_identity(value)
     if repository is None:
@@ -9675,6 +10500,33 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
 
 
 def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
+    raw_tenant_id = record.get("tenant_id")
+    if _is_harness_tenant_identity(raw_tenant_id):
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        else:
+            metadata = dict(metadata)
+
+        original_tenant_id = _clean_non_empty_string(raw_tenant_id)
+        if original_tenant_id:
+            metadata["aawm_original_tenant_id"] = original_tenant_id
+        metadata["aawm_harness_tenant_alias"] = True
+
+        repository = (
+            _normalize_repository_identity(record.get("repository"))
+            or _normalize_request_header_tenant_repository(raw_tenant_id)
+        )
+        record["tenant_id"] = repository
+        if repository is not None:
+            metadata["tenant_id"] = repository
+            metadata["tenant_id_source"] = "harness_tenant_repository"
+        else:
+            metadata.pop("tenant_id", None)
+            metadata["tenant_id_source"] = "harness_tenant_excluded"
+        record["metadata"] = metadata
+        return
+
     tenant_id = _normalize_tenant_identity(record.get("tenant_id"))
     if tenant_id:
         record["tenant_id"] = tenant_id
@@ -9743,6 +10595,50 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
             metadata.pop(metadata_key, None)
         else:
             metadata[metadata_key] = value
+
+    metadata["is_compact_summary"] = bool(record.get("is_compact_summary"))
+    for field in (
+        "compact_summary_source",
+        "compact_summary_role",
+        "compact_summary_id",
+    ):
+        value = _clean_non_empty_string(record.get(field))
+        if value is None:
+            metadata.pop(field, None)
+        else:
+            metadata[field] = value
+
+    for field in _SESSION_HISTORY_AGENT_SCORE_FLOAT_FIELDS:
+        value = _safe_float(record.get(field))
+        metadata_key = f"usage_{field}"
+        if value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = value
+
+    for field in _SESSION_HISTORY_AGENT_SCORE_BOOL_FIELDS:
+        value = _optional_metadata_bool(record.get(field))
+        metadata_key = f"usage_{field}"
+        if value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = value
+
+    for field in _SESSION_HISTORY_AGENT_SCORE_INT_FIELDS:
+        value = _safe_int(record.get(field))
+        metadata_key = f"usage_{field}"
+        if value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = value
+
+    agent_score_reasons = _normalize_agent_score_reasons(
+        record.get("agent_score_reasons")
+    )
+    if agent_score_reasons:
+        metadata["usage_agent_score_reasons"] = agent_score_reasons
+    else:
+        metadata.pop("usage_agent_score_reasons", None)
 
     provider_family = _normalize_provider_cache_family(
         record.get("provider"),
@@ -9854,6 +10750,344 @@ def _normalize_structured_output_state_on_record(record: Dict[str, Any]) -> None
     )
     if not failed:
         record["structured_output_failure_reason"] = None
+
+
+def _normalize_compact_summary_state_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    is_compact = (
+        _optional_metadata_bool(record.get("is_compact_summary"))
+        if record.get("is_compact_summary") is not None
+        else _optional_metadata_bool(metadata.get("is_compact_summary"))
+    )
+    record["is_compact_summary"] = bool(is_compact)
+    record["compact_summary_source"] = _first_non_empty_string(
+        record.get("compact_summary_source"),
+        metadata.get("compact_summary_source"),
+    )
+    record["compact_summary_role"] = _first_non_empty_string(
+        record.get("compact_summary_role"),
+        metadata.get("compact_summary_role"),
+    )
+    record["compact_summary_id"] = _first_non_empty_string(
+        record.get("compact_summary_id"),
+        metadata.get("compact_summary_id"),
+    )
+
+    if record["is_compact_summary"]:
+        record["compact_summary_role"] = record["compact_summary_role"] or "event"
+
+
+def _optional_metadata_bool(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    return _metadata_bool(value)
+
+
+def _normalize_agent_score_reasons(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return {}
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _append_agent_quality_text(
+    *,
+    role: Optional[str],
+    content: Any,
+    user_texts: List[str],
+    assistant_texts: List[str],
+    tool_result_texts: List[str],
+) -> None:
+    text = _content_to_text(content).strip()
+    if not text:
+        return
+    role_lower = str(role or "").lower()
+    if role_lower in {"assistant", "model"}:
+        assistant_texts.append(text)
+    elif role_lower in {"tool", "function"}:
+        tool_result_texts.append(text)
+    else:
+        user_texts.append(text)
+
+
+def _append_agent_quality_command_from_arguments(
+    *,
+    commands: List[AgentQualityCommand],
+    name: str,
+    arguments: Any,
+) -> None:
+    command_text = _extract_command_text_from_tool_arguments(arguments)
+    if not command_text:
+        return
+    commands.append(
+        AgentQualityCommand(
+            name=name,
+            command=command_text,
+            affected_paths=tuple(_extract_file_paths_from_tool_arguments(arguments)),
+        )
+    )
+
+
+def _append_agent_quality_commands_from_message(
+    *,
+    message: Dict[str, Any],
+    commands: List[AgentQualityCommand],
+) -> None:
+    content = message.get("content")
+    content_blocks = content if isinstance(content, list) else [content]
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").lower()
+        if block_type not in {"tool_use", "function_call", "custom_tool_call"}:
+            continue
+        arguments = block.get("input")
+        if arguments is None:
+            arguments = block.get("arguments")
+        _append_agent_quality_command_from_arguments(
+            commands=commands,
+            name=str(block.get("name") or block_type or "tool"),
+            arguments=arguments,
+        )
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if isinstance(function, dict):
+                _append_agent_quality_command_from_arguments(
+                    commands=commands,
+                    name=str(function.get("name") or tool_call.get("type") or "tool"),
+                    arguments=function.get("arguments"),
+                )
+                continue
+            _append_agent_quality_command_from_arguments(
+                commands=commands,
+                name=str(tool_call.get("name") or tool_call.get("type") or "tool"),
+                arguments=tool_call.get("arguments") or tool_call.get("input"),
+            )
+
+
+def _collect_agent_quality_context_from_request_body(
+    request_body: Any,
+) -> Tuple[List[str], List[str], List[str], List[AgentQualityCommand]]:
+    user_texts: List[str] = []
+    assistant_texts: List[str] = []
+    tool_result_texts: List[str] = []
+    commands: List[AgentQualityCommand] = []
+    if not isinstance(request_body, dict):
+        return user_texts, assistant_texts, tool_result_texts, commands
+
+    messages = request_body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "")
+            content = message.get("content")
+            if role.lower() == "user" and isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_result_texts.append(_content_to_text(block.get("content")))
+            if role.lower() in {"assistant", "model"}:
+                _append_agent_quality_commands_from_message(
+                    message=message,
+                    commands=commands,
+                )
+            _append_agent_quality_text(
+                role=role,
+                content=content,
+                user_texts=user_texts,
+                assistant_texts=assistant_texts,
+                tool_result_texts=tool_result_texts,
+            )
+
+    input_items = request_body.get("input")
+    if isinstance(input_items, list):
+        for item in input_items:
+            if not isinstance(item, dict):
+                user_texts.append(_content_to_text(item))
+                continue
+            item_type = str(item.get("type") or "").lower()
+            role = str(item.get("role") or "")
+            if item_type in {"message", ""} or role:
+                _append_agent_quality_text(
+                    role=role or "user",
+                    content=item.get("content"),
+                    user_texts=user_texts,
+                    assistant_texts=assistant_texts,
+                    tool_result_texts=tool_result_texts,
+                )
+                continue
+            if item_type in {"function_call_output", "tool_result"}:
+                tool_result_texts.append(_content_to_text(item.get("output")))
+                continue
+            if item_type in {"function_call", "tool_use", "custom_tool_call"}:
+                command_text = _extract_command_text_from_tool_arguments(
+                    item.get("arguments") or item.get("input")
+                )
+                if command_text:
+                    commands.append(
+                        AgentQualityCommand(
+                            name=str(item.get("name") or item_type),
+                            command=command_text,
+                            affected_paths=tuple(
+                                _extract_file_paths_from_tool_arguments(
+                                    item.get("arguments") or item.get("input")
+                                )
+                            ),
+                        )
+                    )
+
+    return user_texts, assistant_texts, tool_result_texts, commands
+
+
+def _collect_agent_quality_response_texts(result: Any) -> List[str]:
+    assistant_texts: List[str] = []
+    message = _extract_first_response_message(result)
+    if message is not None:
+        text = _content_to_text(_maybe_get(message, "content")).strip()
+        if text:
+            assistant_texts.append(text)
+
+    output_items = _maybe_get(result, "output")
+    if isinstance(output_items, list):
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            if item.get("type") == "message" or role == "assistant":
+                text = _content_to_text(item.get("content")).strip()
+                if text:
+                    assistant_texts.append(text)
+    return assistant_texts
+
+
+def _agent_quality_commands_from_tool_activity(
+    tool_activity: List[Dict[str, Any]],
+) -> List[AgentQualityCommand]:
+    commands: List[AgentQualityCommand] = []
+    for item in tool_activity:
+        if not isinstance(item, dict):
+            continue
+        command_text = item.get("command_text")
+        if not isinstance(command_text, str) or not command_text.strip():
+            continue
+        affected_paths = tuple(
+            value
+            for value in (
+                list(item.get("file_paths_modified") or [])
+                + list(item.get("file_paths_read") or [])
+            )
+            if isinstance(value, str)
+        )
+        commands.append(
+            AgentQualityCommand(
+                name=str(item.get("tool_name") or ""),
+                command=command_text,
+                affected_paths=affected_paths,
+            )
+        )
+    return commands
+
+
+def _apply_runtime_agent_quality_scores(
+    *,
+    record: Dict[str, Any],
+    request_body: Any,
+    result: Any,
+    tool_activity: List[Dict[str, Any]],
+) -> None:
+    user_texts, assistant_texts, tool_result_texts, commands = (
+        _collect_agent_quality_context_from_request_body(request_body)
+    )
+    assistant_texts.extend(_collect_agent_quality_response_texts(result))
+    commands.extend(_agent_quality_commands_from_tool_activity(tool_activity))
+
+    start_time = record.get("start_time")
+    end_time = record.get("end_time")
+    elapsed_ms: Optional[float] = None
+    if isinstance(start_time, datetime) and isinstance(end_time, datetime):
+        elapsed_ms = max(0.0, (end_time - start_time).total_seconds() * 1000)
+
+    task_progress = bool(
+        record.get("output_tokens")
+        or record.get("tool_call_count")
+        or record.get("file_modified_count")
+        or record.get("git_commit_count")
+    )
+    result_scores = score_agent_quality_context(
+        user_texts=user_texts,
+        assistant_texts=assistant_texts,
+        tool_result_texts=tool_result_texts,
+        commands=commands,
+        input_tokens=_safe_int(record.get("input_tokens")) or 0,
+        output_tokens=_safe_int(record.get("output_tokens")) or 0,
+        elapsed_ms=elapsed_ms,
+        task_progress=task_progress,
+    )
+    for field, value in result_scores.fields.items():
+        if record.get(field) is None:
+            record[field] = value
+
+    reasons = _normalize_agent_score_reasons(record.get("agent_score_reasons"))
+    for key, value in result_scores.reasons.items():
+        if value:
+            reasons[key] = value
+    record["agent_score_reasons"] = reasons
+
+
+def _normalize_agent_score_state_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    for field in _SESSION_HISTORY_AGENT_SCORE_FLOAT_FIELDS:
+        record[field] = _first_non_none(
+            _safe_float(record.get(field)),
+            _safe_float(metadata.get(f"usage_{field}")),
+            _safe_float(metadata.get(field)),
+        )
+
+    for field in _SESSION_HISTORY_AGENT_SCORE_BOOL_FIELDS:
+        record[field] = _first_non_none(
+            _optional_metadata_bool(record.get(field)),
+            _optional_metadata_bool(metadata.get(f"usage_{field}")),
+            _optional_metadata_bool(metadata.get(field)),
+        )
+
+    for field in _SESSION_HISTORY_AGENT_SCORE_INT_FIELDS:
+        value = _first_non_none(
+            _safe_int(record.get(field)),
+            _safe_int(metadata.get(f"usage_{field}")),
+            _safe_int(metadata.get(field)),
+        )
+        record[field] = value if value is not None and value >= 0 else None
+
+    metadata_reasons = _normalize_agent_score_reasons(
+        _first_non_none(
+            metadata.get("usage_agent_score_reasons"),
+            metadata.get("agent_score_reasons"),
+        )
+    )
+    record_reasons = _normalize_agent_score_reasons(record.get("agent_score_reasons"))
+    record["agent_score_reasons"] = {
+        **metadata_reasons,
+        **record_reasons,
+    }
 
 
 def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
@@ -9986,6 +11220,9 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_provider_cache_state_on_record(record)
     _normalize_invalid_tool_call_state_on_record(record)
     _normalize_structured_output_state_on_record(record)
+    _normalize_compact_summary_state_on_record(record)
+    _normalize_reporting_exclusion_state_on_record(record)
+    _normalize_agent_score_state_on_record(record)
     _normalize_prompt_overhead_state_on_record(record)
     _normalize_session_runtime_identity_on_record(record)
     _apply_claude_auto_review_identity_to_record(record)
@@ -9995,6 +11232,35 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _classify_zero_token_session_history_record(record)
     _sync_session_history_record_metadata(record)
     return record
+
+
+def _normalize_reporting_exclusion_state_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+
+    call_type = str(record.get("call_type") or "").strip().lower()
+    model = str(record.get("model") or "").strip().lower()
+    source = str(metadata.get("source") or "").strip().lower()
+
+    if call_type == "codex_transcript" or source == "codex_transcript":
+        metadata["session_history_usage_record"] = False
+        metadata["session_history_reporting_excluded"] = True
+        metadata["session_history_reporting_exclusion_reason"] = (
+            "synthetic_codex_transcript"
+        )
+
+    if model == "unknown":
+        metadata["session_history_model_unresolved"] = True
+        metadata["session_history_model_reporting_excluded"] = True
+        metadata.setdefault(
+            "session_history_model_unresolved_reason",
+            "missing_source_model_evidence",
+        )
+
+    record["metadata"] = metadata
 
 
 _TOOL_ACTIVITY_READ_NAMES = {
@@ -11411,6 +12677,10 @@ def _infer_provider_from_langfuse_observation(
     if adapter_target_provider is not None:
         return adapter_target_provider
 
+    auto_agent_provider = _session_history_auto_agent_selected_provider(metadata)
+    if auto_agent_provider is not None:
+        return auto_agent_provider
+
     route_provider = _session_history_provider_from_route_family(
         metadata.get("passthrough_route_family")
     )
@@ -11422,14 +12692,12 @@ def _infer_provider_from_langfuse_observation(
         or _maybe_get(metadata.get("hidden_params"), "api_base")
         or observation.get("apiBase")
     )
-    if isinstance(api_base, str) and api_base.strip():
-        api_base_lower = api_base.lower()
-        if "anthropic.com" in api_base_lower:
-            return "anthropic"
-        if "googleapis.com" in api_base_lower or "generativelanguage" in api_base_lower:
-            return "gemini"
-        if "openai.com" in api_base_lower:
-            return "openai"
+    api_base_provider = _session_history_provider_from_api_base(
+        api_base,
+        call_type=metadata.get("user_api_key_request_route") or observation.get("name"),
+    )
+    if api_base_provider is not None:
+        return api_base_provider
 
     model = (
         _session_history_adapter_model(metadata)
@@ -11553,6 +12821,8 @@ def _build_session_history_record_from_langfuse_trace_observation(
         _extract_model_from_langfuse_output(output_payload),
     )
     explicit_openrouter_model = _first_explicit_openrouter_model_string(
+        metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("aawm_auto_agent_selected_model"),
         metadata.get("anthropic_adapter_original_model"),
         metadata.get("codex_adapter_original_model"),
         metadata.get("model"),
@@ -11576,6 +12846,49 @@ def _build_session_history_record_from_langfuse_trace_observation(
         _extract_model_from_langfuse_input(observation.get("input")),
         _extract_codex_model_from_response_headers(metadata),
     ) or ""
+    model_group = _normalize_session_history_model_group(
+        _clean_non_empty_string(metadata.get("model_group")),
+        metadata,
+        resolved_model,
+    )
+    call_type = metadata.get("user_api_key_request_route") or observation.get("name")
+    api_base = (
+        metadata.get("api_base")
+        or _maybe_get(metadata.get("hidden_params"), "api_base")
+        or observation.get("apiBase")
+    )
+    api_base_provider = _session_history_provider_from_api_base(
+        api_base,
+        call_type=call_type,
+    )
+    if api_base_provider is not None and (
+        provider in {None, "openai"} or api_base_provider != "openai"
+    ):
+        provider = api_base_provider
+    provider, resolved_model = _apply_local_embedding_route_metadata(
+        metadata=metadata,
+        resolved_provider=provider,
+        resolved_model=resolved_model,
+        model_group=model_group,
+        call_type=call_type,
+        api_base=api_base,
+    )
+    provider, resolved_model = _apply_local_llm_route_metadata(
+        metadata=metadata,
+        resolved_provider=provider,
+        resolved_model=resolved_model,
+        model_group=model_group,
+        call_type=call_type,
+        api_base=api_base,
+    )
+    provider, resolved_model, model_group = _apply_local_biomed_route_metadata(
+        metadata=metadata,
+        resolved_provider=provider,
+        resolved_model=resolved_model,
+        model_group=model_group,
+        call_type=call_type,
+        api_base=api_base,
+    )
     permission_decision = _extract_claude_permission_check_decision_from_value(
         output_payload
     )
@@ -11759,6 +13072,14 @@ def _build_session_history_record_from_langfuse_trace_observation(
         trace_environment=trace.get("environment"),
         allow_runtime=False,
     )
+    compact_summary_state = _classify_compact_summary_state(
+        metadata=metadata,
+        request_body=request_body,
+        output_payload=output_payload,
+        session_id=session_id,
+        litellm_call_id=observation.get("id"),
+        trace_id=trace_id,
+    )
 
     return _normalize_session_history_record({
         "litellm_call_id": observation.get("id"),
@@ -11770,11 +13091,11 @@ def _build_session_history_record_from_langfuse_trace_observation(
         ),
         "provider": provider,
         "model": resolved_model,
-        "model_group": metadata.get("model_group"),
+        "model_group": model_group,
         "agent_name": agent_name,
         "tenant_id": tenant_id,
         "repository": repository,
-        "call_type": metadata.get("user_api_key_request_route") or observation.get("name"),
+        "call_type": call_type,
         "start_time": _parse_datetime_value(observation.get("startTime")),
         "end_time": _parse_datetime_value(observation.get("endTime")),
         "input_tokens": prompt_tokens,
@@ -11815,6 +13136,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "git_push_count": tool_activity_summary["git_push_count"],
         "tool_activity": tool_activity,
         "response_cost_usd": response_cost_usd,
+        **compact_summary_state,
         **permission_usage_fields,
         "litellm_environment": runtime_identity["litellm_environment"],
         "litellm_version": runtime_identity["litellm_version"],
@@ -11965,10 +13287,123 @@ def _get_session_history_model_group(
     )
 
 
+def _normalize_session_history_model_group(
+    model_group: Optional[str],
+    metadata: Dict[str, Any],
+    resolved_model: str,
+) -> Optional[str]:
+    normalized_group = _clean_non_empty_string(model_group)
+    if normalized_group is None:
+        return None
+    group_lower = normalized_group.lower()
+    auto_alias = _first_non_empty_string(
+        metadata.get("codex_auto_agent_alias"),
+        metadata.get("aawm_auto_agent_alias"),
+        "aawm-codex-agent-auto"
+        if "aawm-codex-agent-auto" in group_lower
+        else None,
+    )
+    if auto_alias and group_lower == auto_alias.lower():
+        return _first_non_empty_string(
+            metadata.get("codex_auto_agent_selected_model"),
+            metadata.get("aawm_auto_agent_selected_model"),
+            resolved_model,
+        )
+    return normalized_group
+
+
 def _is_completion_call_type(call_type: Any) -> bool:
     if not isinstance(call_type, str) or not call_type.strip():
         return False
     return "completion" in call_type.strip().lower()
+
+
+def _is_embedding_call_type(call_type: Any, api_base: Optional[str]) -> bool:
+    call_lower = str(call_type or "").strip().lower()
+    if "embedding" in call_lower or "aembedding" in call_lower:
+        return True
+    sanitized = _sanitize_session_history_api_base(api_base)
+    if not sanitized:
+        return False
+    try:
+        path = urlsplit(sanitized).path.lower()
+    except ValueError:
+        return False
+    return "embedding" in path
+
+
+def _strip_local_provider_model_prefix(model: str) -> str:
+    normalized = str(model or "").strip()
+    lowered = normalized.lower()
+    for prefix in ("local_embed/", "local_rerank/", "local_llm/", "local_biomed/"):
+        if lowered.startswith(prefix):
+            return normalized[len(prefix) :].strip() or normalized
+    return normalized
+
+
+def _session_history_provider_from_api_base(
+    api_base: Any,
+    *,
+    call_type: Any = None,
+) -> Optional[str]:
+    sanitized = _sanitize_session_history_api_base(api_base)
+    if not sanitized:
+        return None
+    api_base_lower = sanitized.lower()
+    if "api.x.ai" in api_base_lower or "cli-chat-proxy.grok.com" in api_base_lower:
+        return "xai"
+    if "integrate.api.nvidia.com" in api_base_lower:
+        return "nvidia_nim"
+    if "openrouter.ai" in api_base_lower:
+        return "openrouter"
+    if "anthropic.com" in api_base_lower:
+        return "anthropic"
+    if "googleapis.com" in api_base_lower or "generativelanguage" in api_base_lower:
+        return "gemini"
+    if "openai.com" in api_base_lower:
+        return "openai"
+    if _is_local_session_history_api_base(sanitized) and _is_embedding_call_type(
+        call_type,
+        sanitized,
+    ):
+        return "local_embed"
+    return None
+
+
+def _apply_local_embedding_route_metadata(
+    *,
+    metadata: Dict[str, Any],
+    resolved_provider: Optional[str],
+    resolved_model: str,
+    model_group: Optional[str],
+    call_type: Any,
+    api_base: Optional[str],
+) -> Tuple[Optional[str], str]:
+    if not _is_embedding_call_type(call_type, api_base):
+        return resolved_provider, resolved_model
+    if not _is_local_session_history_api_base(api_base):
+        return resolved_provider, resolved_model
+    if resolved_provider not in {None, "openai", "local_embed"}:
+        return resolved_provider, resolved_model
+
+    upstream_model = _strip_local_provider_model_prefix(resolved_model)
+    route_model = _clean_non_empty_string(upstream_model) or _clean_non_empty_string(
+        model_group
+    )
+    if not route_model:
+        return "local_embed", resolved_model
+
+    metadata["aawm_local_route"] = True
+    metadata["aawm_local_route_family"] = "local_embedding"
+    if model_group:
+        metadata["aawm_local_model_group"] = model_group
+    metadata["aawm_local_upstream_provider"] = "local_embed"
+    metadata["aawm_local_upstream_model"] = route_model
+    sanitized_api_base = _sanitize_session_history_api_base(api_base)
+    if sanitized_api_base:
+        metadata["aawm_local_upstream_api_base"] = sanitized_api_base
+
+    return "local_embed", route_model
 
 
 def _apply_local_llm_route_metadata(
@@ -12081,6 +13516,8 @@ def _resolve_session_history_model(
         return grok_model_override
 
     explicit_openrouter_model = _first_explicit_openrouter_model_string(
+        metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("aawm_auto_agent_selected_model"),
         metadata.get("anthropic_adapter_original_model"),
         metadata.get("codex_adapter_original_model"),
         _maybe_get_path(
@@ -12130,8 +13567,11 @@ def _resolve_session_history_model(
         _maybe_get(standard_logging_object.get("response"), "response")
     )
     candidates = (
+        metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("aawm_auto_agent_selected_model"),
         kwargs.get("model"),
         standard_logging_object.get("model"),
+        _session_history_model_from_request_tags(metadata),
         _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
         _maybe_get_path(kwargs.get("litellm_params"), "proxy_server_request", "body", "model"),
         _session_history_adapter_model(metadata),
@@ -12264,13 +13704,35 @@ def _build_session_history_record(
         standard_logging_object=standard_logging_object,
         metadata=metadata,
     )
+    call_type = kwargs.get("call_type") or standard_logging_object.get("call_type")
+    api_base_provider = _session_history_provider_from_api_base(
+        api_base,
+        call_type=call_type,
+    )
+    if api_base_provider is not None and (
+        resolved_provider in {None, "openai"} or api_base_provider != "openai"
+    ):
+        resolved_provider = api_base_provider
     provider_for_cache = resolved_provider
+    model_group = _normalize_session_history_model_group(
+        model_group,
+        metadata,
+        resolved_model,
+    )
+    resolved_provider, resolved_model = _apply_local_embedding_route_metadata(
+        metadata=metadata,
+        resolved_provider=resolved_provider,
+        resolved_model=resolved_model,
+        model_group=model_group,
+        call_type=call_type,
+        api_base=api_base,
+    )
     resolved_provider, resolved_model = _apply_local_llm_route_metadata(
         metadata=metadata,
         resolved_provider=resolved_provider,
         resolved_model=resolved_model,
         model_group=model_group,
-        call_type=kwargs.get("call_type") or standard_logging_object.get("call_type"),
+        call_type=call_type,
         api_base=api_base,
     )
     resolved_provider, resolved_model, model_group = _apply_local_biomed_route_metadata(
@@ -12278,7 +13740,7 @@ def _build_session_history_record(
         resolved_provider=resolved_provider,
         resolved_model=resolved_model,
         model_group=model_group,
-        call_type=kwargs.get("call_type") or standard_logging_object.get("call_type"),
+        call_type=call_type,
         api_base=api_base,
     )
 
@@ -12486,11 +13948,20 @@ def _build_session_history_record(
         kwargs=kwargs,
         allow_runtime=allow_runtime_identity,
     )
+    trace_id = _extract_trace_id(kwargs)
+    compact_summary_state = _classify_compact_summary_state(
+        metadata=metadata,
+        request_body=request_body,
+        output_payload=result,
+        session_id=session_id,
+        litellm_call_id=kwargs.get("litellm_call_id"),
+        trace_id=trace_id,
+    )
 
     record = {
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "session_id": session_id,
-        "trace_id": _extract_trace_id(kwargs),
+        "trace_id": trace_id,
         "provider_response_id": _maybe_get(result, "id"),
         "provider": resolved_provider,
         "model": resolved_model,
@@ -12539,6 +14010,7 @@ def _build_session_history_record(
         "git_push_count": tool_activity_summary["git_push_count"],
         "tool_activity": tool_activity,
         "response_cost_usd": response_cost_usd,
+        **compact_summary_state,
         **permission_usage_fields,
         "litellm_environment": runtime_identity["litellm_environment"],
         "litellm_version": runtime_identity["litellm_version"],
@@ -12554,6 +14026,12 @@ def _build_session_history_record(
             tenant_id=tenant_id,
         ),
     }
+    _apply_runtime_agent_quality_scores(
+        record=record,
+        request_body=request_body,
+        result=result,
+        tool_activity=tool_activity,
+    )
     _apply_claude_auto_review_identity_to_record(record)
     return _normalize_session_history_record(record)
 
@@ -12699,6 +14177,55 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("structured_output_mode"),
         record.get("structured_output_schema_hash"),
         record.get("structured_output_failure_reason"),
+        record.get("trace_quality_score"),
+        record.get("empty_completion_failure"),
+        record.get("large_tool_result_payload_risk"),
+        record.get("destructive_checkout_after_work"),
+        record.get("invalid_tool_call_error"),
+        record.get("read_only_policy_compliance_score"),
+        record.get("read_only_policy_violation_count"),
+        record.get("response_meaningfulness_score"),
+        record.get("instruction_adherence_score"),
+        record.get("answer_completeness_score"),
+        record.get("evidence_fidelity_score"),
+        record.get("tool_result_fidelity_score"),
+        record.get("error_attribution_quality_score"),
+        record.get("repetition_loop_risk_score"),
+        record.get("context_retention_score"),
+        record.get("tool_use_validity_score"),
+        record.get("tool_error_recovery_score"),
+        record.get("stall_risk_score"),
+        record.get("output_contract_compliance_score"),
+        record.get("task_progress_score"),
+        record.get("scope_control_score"),
+        record.get("destructive_action_policy_score"),
+        record.get("ignored_path_tracking_policy_score"),
+        record.get("ignored_path_tracking_violation_count"),
+        record.get("baseline_deflection_attempted_score"),
+        record.get("baseline_deflection_incident_score"),
+        record.get("baseline_deflection_attempt_count"),
+        record.get("baseline_deflection_tool_call_count"),
+        record.get("baseline_deflection_input_tokens"),
+        record.get("baseline_deflection_elapsed_ms"),
+        record.get("quality_gate_trigger_count"),
+        record.get("quality_gate_fix_attempt_count"),
+        record.get("quality_gate_rerun_count"),
+        record.get("sleep_wellness_interruption_attempted_score"),
+        record.get("sleep_wellness_interruption_incident_score"),
+        record.get("sleep_wellness_interruption_count"),
+        record.get("sleep_wellness_interruption_output_tokens"),
+        record.get("sleep_wellness_interruption_input_tokens"),
+        record.get("sleep_wellness_interruption_elapsed_ms"),
+        record.get("sleep_wellness_interruption_after_user_pushback_count"),
+        record.get("sleep_wellness_interruption_repeated_count"),
+        record.get("terminal_completion_score"),
+        record.get("discovery_inventory_coverage_score"),
+        record.get("discovery_inventory_missing_count"),
+        json.dumps(record.get("agent_score_reasons") or {}),
+        record.get("is_compact_summary", False),
+        record.get("compact_summary_source"),
+        record.get("compact_summary_id"),
+        record.get("compact_summary_role"),
     )
 
 

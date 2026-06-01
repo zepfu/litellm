@@ -11,3 +11,6 @@ dependencies = ["litellm"]
 
 [project.optional-dependencies]
 dev = ["build"]
+
+[tool.setuptools.package-data]
+aawm_litellm_callbacks = ["aawm_agent_quality_rules.json"]
