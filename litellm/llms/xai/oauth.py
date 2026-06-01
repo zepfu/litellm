@@ -19,6 +19,9 @@ XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY = "xai_grok_subscription"
 _DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 _DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 _DEFAULT_REFRESH_BUFFER_SECONDS = 300
+_DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID = "xai-oauth"
+_DEFAULT_HERMES_AUTH_PATH = "~/.hermes/auth.json"
+_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = "~/.litellm/xai/oauth-auth.json"
 
 _XAI_OAUTH_MODEL_MAP = {
     "oa_xai/grok-4.3": "xai/grok-4.3",
@@ -122,6 +125,218 @@ async def get_xai_oauth_access_token() -> str:
             credential_path=Path(credential_path),
             scope=scope,
         )
+
+
+def default_litellm_xai_oauth_auth_path() -> Path:
+    configured = get_secret_str("LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE")
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured.strip()).expanduser()
+    return Path(_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH).expanduser()
+
+
+def migrate_hermes_xai_oauth_credential(
+    *,
+    hermes_auth_file: Optional[Path] = None,
+    target_auth_file: Optional[Path] = None,
+    scope: Optional[str] = None,
+    overwrite: bool = False,
+) -> Path:
+    source_path = (
+        hermes_auth_file
+        or Path(
+            get_secret_str("LITELLM_XAI_OAUTH_HERMES_AUTH_FILE")
+            or _DEFAULT_HERMES_AUTH_PATH
+        )
+    ).expanduser()
+    target_path = (
+        target_auth_file or default_litellm_xai_oauth_auth_path()
+    ).expanduser()
+    _validate_xai_oauth_migration_target(source_path, target_path)
+
+    if target_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"xAI OAuth target credential already exists at {target_path}. "
+            "Pass overwrite=True or choose a different LiteLLM-owned path."
+        )
+
+    hermes_payload = _read_json_object(
+        source_path,
+        description="Hermes auth file",
+    )
+    credential_scope = (
+        scope
+        or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
+        or _DEFAULT_XAI_OAUTH_SCOPE
+    )
+    credential = _build_litellm_xai_oauth_record_from_hermes(
+        hermes_payload,
+        scope=credential_scope,
+    )
+    _write_credential_payload(target_path, {credential_scope: credential})
+    return target_path
+
+
+def _validate_xai_oauth_migration_target(source_path: Path, target_path: Path) -> None:
+    resolved_source_parent = source_path.expanduser().resolve().parent
+    resolved_target = target_path.expanduser().resolve()
+    if any(part == ".hermes" for part in resolved_target.parts):
+        raise ValueError(
+            "xAI OAuth migration target must be outside the user's .hermes directory."
+        )
+    if resolved_target == source_path.expanduser().resolve():
+        raise ValueError("xAI OAuth migration target cannot be the Hermes source file.")
+    try:
+        resolved_target.relative_to(resolved_source_parent)
+    except ValueError:
+        return
+    raise ValueError(
+        "xAI OAuth migration target must be outside the Hermes auth directory."
+    )
+
+
+def _read_json_object(path: Path, *, description: str) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError as exc:
+        raise ValueError(f"{description} not found at {path}.") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{description} at {path} is not valid JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{description} must contain a JSON object.")
+    return payload
+
+
+def _build_litellm_xai_oauth_record_from_hermes(
+    payload: Dict[str, Any],
+    *,
+    scope: str,
+) -> Dict[str, Any]:
+    provider = _extract_hermes_xai_oauth_provider(payload)
+    provider_tokens = provider.get("tokens") if isinstance(provider, dict) else None
+    credential = (
+        _record_from_hermes_provider_tokens(provider, provider_tokens, scope=scope)
+        if isinstance(provider_tokens, dict)
+        else None
+    )
+    if credential is None:
+        credential = _record_from_hermes_credential_pool(payload, scope=scope)
+    if credential is None:
+        raise ValueError(
+            "Hermes auth file does not contain a usable xai-oauth credential."
+        )
+    return credential
+
+
+def _extract_hermes_xai_oauth_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
+    providers = payload.get("providers")
+    if isinstance(providers, dict):
+        provider = providers.get(_DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID)
+        if isinstance(provider, dict):
+            return provider
+    return {}
+
+
+def _record_from_hermes_provider_tokens(
+    provider: Dict[str, Any],
+    tokens: Dict[str, Any],
+    *,
+    scope: str,
+) -> Optional[Dict[str, Any]]:
+    access_token = _clean_oauth_string(tokens.get("access_token"))
+    refresh_token = _clean_oauth_string(tokens.get("refresh_token"))
+    if not access_token and not refresh_token:
+        return None
+
+    record = _base_xai_oauth_record(scope)
+    _copy_oauth_token_fields(record, tokens)
+
+    discovery = provider.get("discovery")
+    if isinstance(discovery, dict):
+        token_endpoint = _clean_oauth_string(discovery.get("token_endpoint"))
+        if token_endpoint:
+            record["token_endpoint"] = token_endpoint
+
+    last_refresh = _parse_expires_at(provider.get("last_refresh"))
+    expires_in = tokens.get("expires_in")
+    if last_refresh is not None and isinstance(expires_in, (int, float)):
+        expires_at = last_refresh + timedelta(seconds=float(expires_in))
+        record["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
+
+    auth_mode = _clean_oauth_string(provider.get("auth_mode"))
+    if auth_mode:
+        record["source_auth_mode"] = auth_mode
+    redirect_uri = _clean_oauth_string(provider.get("redirect_uri"))
+    if redirect_uri:
+        record["redirect_uri"] = redirect_uri
+    record["source"] = "hermes.providers.xai-oauth"
+    return record
+
+
+def _record_from_hermes_credential_pool(
+    payload: Dict[str, Any],
+    *,
+    scope: str,
+) -> Optional[Dict[str, Any]]:
+    credential_pool = payload.get("credential_pool")
+    if not isinstance(credential_pool, dict):
+        return None
+    pool = credential_pool.get(_DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID)
+    if not isinstance(pool, list):
+        return None
+
+    for item in pool:
+        if not isinstance(item, dict):
+            continue
+        access_token = _clean_oauth_string(item.get("access_token"))
+        refresh_token = _clean_oauth_string(item.get("refresh_token"))
+        if not access_token and not refresh_token:
+            continue
+        record = _base_xai_oauth_record(scope)
+        _copy_oauth_token_fields(record, item)
+        base_url = _clean_oauth_string(item.get("base_url"))
+        if base_url:
+            record["source_base_url"] = base_url
+        last_refresh = _parse_expires_at(item.get("last_refresh"))
+        if last_refresh is not None:
+            record["source_last_refresh"] = last_refresh.isoformat().replace(
+                "+00:00",
+                "Z",
+            )
+        source = _clean_oauth_string(item.get("source"))
+        record["source"] = source or "hermes.credential_pool.xai-oauth"
+        return record
+    return None
+
+
+def _base_xai_oauth_record(scope: str) -> Dict[str, Any]:
+    client_id = _clean_oauth_string(
+        scope.rsplit("::", 1)[-1] if "::" in scope else None
+    )
+    record: Dict[str, Any] = {
+        "token_endpoint": _DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT,
+    }
+    if client_id:
+        record["oidc_client_id"] = client_id
+    return record
+
+
+def _copy_oauth_token_fields(record: Dict[str, Any], source: Dict[str, Any]) -> None:
+    access_token = _clean_oauth_string(source.get("access_token"))
+    if access_token:
+        record["key"] = access_token
+        record["access_token"] = access_token
+    for key in ("refresh_token", "id_token", "token_type"):
+        value = _clean_oauth_string(source.get(key))
+        if value:
+            record[key] = value
+
+
+def _clean_oauth_string(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 async def _get_xai_oauth_access_token_locked(
@@ -351,4 +566,5 @@ def _write_credential_payload(credential_path: Path, payload: Dict[str, Any]) ->
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    tmp_path.chmod(0o600)
     os.replace(tmp_path, credential_path)
