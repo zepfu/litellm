@@ -253,7 +253,9 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
 
     from litellm.llms.xai.oauth import prepare_oa_xai_request
 
-    await prepare_oa_xai_request(data)
+    prepared_oa_xai_request = await prepare_oa_xai_request(data)
+    if prepared_oa_xai_request:
+        return getattr(litellm, f"{route_type}")(**data)
 
     if "api_key" in data or "api_base" in data:
         if llm_router is not None:
