@@ -90,3 +90,13 @@
 - How it would help: this would reduce timestamp and ledger churn for recurring
   investigation intake work, saving time and lowering the chance of incomplete
   disposition evidence.
+
+## 2026-06-01 investigate-codex-019e8598-eda4-7401-b419-bbf3276f0f3a
+
+- Suggestion: when `aawm-codex-agent-auto` returns terminal `completed=null`,
+  have the spawning tool surface the last provider status/error class, even if
+  no final answer exists.
+- How it would help: this would reduce triage time and token churn by making it
+  clear whether the next action should be a same-alias retry for 429/capacity,
+  a smaller-model redispatch, or a local fallback for a deterministic null
+  completion.
