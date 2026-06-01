@@ -4498,6 +4498,86 @@ def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_
     assert record["provider_cache_miss_token_count"] == 2048
 
 
+def test_build_session_history_record_marks_xai_partial_cache_hit_miss_cost() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-xai-partial-cache-hit"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-xai-partial-cache-hit",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+
+    result = {
+        "id": "provider-response-xai-partial-cache-hit",
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 12,
+            "total_tokens": 1012,
+            "cache_read_input_tokens": 700,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "grok output"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == "xai"
+    assert record["cache_read_input_tokens"] == 700
+    assert record["provider_cache_attempted"] is True
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "partial_cache_hit"
+    assert record["provider_cache_miss_token_count"] == 300
+    assert record["provider_cache_miss_cost_usd"] == pytest.approx(
+        (0.00000125 - 0.0000002) * 300
+    )
+
+
+def test_build_session_history_record_repairs_xai_metadata_partial_cache_hit() -> None:
+    record = aawm_agent_identity._normalize_session_history_record(
+        {
+            "provider": "xai",
+            "model": "grok-build",
+            "tenant_id": "aawm-tap",
+            "repository": "aawm-tap",
+            "input_tokens": 1000,
+            "output_tokens": 12,
+            "total_tokens": 1012,
+            "cache_read_input_tokens": 700,
+            "cache_creation_input_tokens": 0,
+            "provider_cache_attempted": True,
+            "provider_cache_status": "hit",
+            "provider_cache_miss": False,
+            "provider_cache_miss_reason": None,
+            "provider_cache_miss_token_count": None,
+            "provider_cache_miss_cost_usd": None,
+            "metadata": {
+                "usage_provider_cache_attempted": True,
+                "usage_provider_cache_status": "hit",
+                "usage_provider_cache_miss": False,
+                "usage_provider_cache_source": "usage.cache_read_input_tokens",
+            },
+        }
+    )
+
+    assert record["provider_cache_status"] == "hit"
+    assert record["provider_cache_miss"] is True
+    assert record["provider_cache_miss_reason"] == "partial_cache_hit"
+    assert record["provider_cache_miss_token_count"] == 300
+    assert record["provider_cache_miss_cost_usd"] == pytest.approx(
+        (0.00000125 - 0.0000002) * 300
+    )
+
+
 def test_build_session_history_record_tracks_git_global_option_commit_and_push() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -5920,6 +6000,58 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
         span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
     ]
     assert "codex.usage_breakout" in span_names
+
+
+def test_aawm_agent_identity_adds_xai_partial_cache_hit_metadata() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
+        "grok_cli_chat_proxy"
+    )
+
+    result = {
+        "id": "resp-xai-partial-cache-hit",
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 12,
+            "total_tokens": 1012,
+            "cache_read_input_tokens": 700,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "grok output"}}],
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result=result,
+        call_type="pass_through_endpoint",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    request_tags = updated_kwargs["standard_logging_object"]["request_tags"]
+
+    assert metadata["usage_provider_cache_attempted"] is True
+    assert metadata["usage_provider_cache_status"] == "hit"
+    assert metadata["usage_provider_cache_miss"] is True
+    assert metadata["usage_provider_cache_miss_reason"] == "partial_cache_hit"
+    assert metadata["usage_provider_cache_miss_token_count"] == 300
+    assert metadata["usage_provider_cache_miss_cost_usd"] == pytest.approx(
+        (0.00000125 - 0.0000002) * 300
+    )
+    assert metadata["usage_provider_cache_miss_cost_basis"] == (
+        "prompt_vs_cache_read_delta"
+    )
+    assert metadata["xai_provider_cache_status"] == "hit"
+    assert metadata["xai_provider_cache_miss"] is True
+    assert "provider-cache-status:hit" in request_tags
+    assert "xai-provider-cache-status:hit" in request_tags
+    assert "provider-cache-hit" in request_tags
+    assert "xai-provider-cache-hit" in request_tags
+    assert "provider-cache-miss" in request_tags
+    assert "xai-provider-cache-miss" in request_tags
+    assert "provider-cache-partial-hit" in request_tags
+    assert "xai-provider-cache-partial-hit" in request_tags
 
 
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags_from_standard_logging_output() -> None:
