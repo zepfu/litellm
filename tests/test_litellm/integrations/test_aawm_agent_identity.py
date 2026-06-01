@@ -1133,10 +1133,54 @@ def test_build_session_history_record_maps_harness_tenant_to_litellm_repository(
     )
 
     assert record is not None
-    assert record["tenant_id"] == tenant_id
+    assert record["tenant_id"] == "litellm"
     assert record["repository"] == "litellm"
+    assert record["metadata"]["aawm_original_tenant_id"] == tenant_id
+    assert record["metadata"]["aawm_harness_tenant_alias"] is True
+    assert record["metadata"]["tenant_id_source"] == "harness_tenant_repository"
     assert record["metadata"]["repository"] == "litellm"
     assert record["metadata"]["repository_source"] == "tenant_id.request_headers"
+
+
+def test_normalize_session_history_record_excludes_codex_transcript_usage() -> None:
+    record = aawm_agent_identity._normalize_session_history_record(
+        {
+            "litellm_call_id": "codex-transcript:child-session",
+            "provider": None,
+            "model": "codex-transcript",
+            "call_type": "codex_transcript",
+            "metadata": {
+                "source": "codex_transcript",
+                "session_history_usage_record": True,
+            },
+        }
+    )
+
+    assert record["metadata"]["session_history_usage_record"] is False
+    assert record["metadata"]["session_history_reporting_excluded"] is True
+    assert (
+        record["metadata"]["session_history_reporting_exclusion_reason"]
+        == "synthetic_codex_transcript"
+    )
+
+
+def test_normalize_session_history_record_marks_unknown_model_unresolved() -> None:
+    record = aawm_agent_identity._normalize_session_history_record(
+        {
+            "litellm_call_id": "call-unknown-model",
+            "provider": "anthropic",
+            "model": "unknown",
+            "call_type": "pass_through_endpoint",
+            "metadata": {},
+        }
+    )
+
+    assert record["metadata"]["session_history_model_unresolved"] is True
+    assert record["metadata"]["session_history_model_reporting_excluded"] is True
+    assert (
+        record["metadata"]["session_history_model_unresolved_reason"]
+        == "missing_source_model_evidence"
+    )
 
 
 def test_build_session_history_record_uses_claude_project_over_agent_repository_noise() -> None:
@@ -2226,12 +2270,477 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
     assert record["metadata"]["usage_structured_output_mode"] == "json_schema"
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 72
+    assert len(payload) == 121
     assert payload[67] is True
     assert payload[68] is False
     assert payload[69] == "json_schema"
     assert payload[70] == record["structured_output_schema_hash"]
     assert payload[71] is None
+    assert payload[72:94] == (None,) * 22
+    assert payload[94] == pytest.approx(1.0)
+    assert payload[95] == 0
+    assert payload[96:113] == (
+        0.0,
+        0.0,
+        0,
+        0,
+        0,
+        None,
+        0,
+        0,
+        0,
+        0.0,
+        0.0,
+        0,
+        0,
+        0,
+        None,
+        0,
+        0,
+    )
+    assert payload[113:116] == (None, None, None)
+    assert json.loads(payload[116]) == {
+        "agent_quality_rule_catalog_version": "2026-05-31.v1"
+    }
+    assert payload[117:121] == (False, None, None, None)
+
+
+def test_build_session_history_record_persists_agent_score_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-agent-score-metadata"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-agent-score-metadata",
+            "usage_trace_quality_score": 0.0,
+            "usage_empty_completion_failure": True,
+            "usage_invalid_tool_call_error": False,
+            "usage_read_only_policy_compliance_score": 0.0,
+            "usage_read_only_policy_violation_count": 2,
+            "usage_response_meaningfulness_score": 0.0,
+            "usage_instruction_adherence_score": 0.0,
+            "usage_answer_completeness_score": 1.0,
+            "usage_evidence_fidelity_score": 0.5,
+            "usage_tool_result_fidelity_score": 1.0,
+            "usage_error_attribution_quality_score": 1.0,
+            "usage_repetition_loop_risk_score": 0.0,
+            "usage_context_retention_score": 0.0,
+            "usage_tool_use_validity_score": 1.0,
+            "usage_tool_error_recovery_score": 1.0,
+            "usage_stall_risk_score": 0.0,
+            "usage_output_contract_compliance_score": 0.0,
+            "usage_task_progress_score": 0.0,
+            "usage_destructive_action_policy_score": 1.0,
+            "usage_agent_score_reasons": {
+                "response_meaningfulness": ["no_meaningful_output"],
+                "read_only_policy_compliance": ["mutating_tool:Bash"],
+            },
+        }
+    )
+    result = {
+        "id": "resp-agent-score-metadata",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+        "choices": [{"message": {"role": "assistant", "content": ""}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["trace_quality_score"] == pytest.approx(0.0)
+    assert record["empty_completion_failure"] is True
+    assert record["invalid_tool_call_error"] is False
+    assert record["read_only_policy_compliance_score"] == pytest.approx(0.0)
+    assert record["read_only_policy_violation_count"] == 2
+    assert record["response_meaningfulness_score"] == pytest.approx(0.0)
+    assert record["instruction_adherence_score"] == pytest.approx(0.0)
+    assert record["answer_completeness_score"] == pytest.approx(1.0)
+    assert record["evidence_fidelity_score"] == pytest.approx(0.5)
+    assert record["tool_result_fidelity_score"] == pytest.approx(1.0)
+    assert record["error_attribution_quality_score"] == pytest.approx(1.0)
+    assert record["repetition_loop_risk_score"] == pytest.approx(0.0)
+    assert record["context_retention_score"] == pytest.approx(0.0)
+    assert record["tool_use_validity_score"] == pytest.approx(1.0)
+    assert record["tool_error_recovery_score"] == pytest.approx(1.0)
+    assert record["stall_risk_score"] == pytest.approx(0.0)
+    assert record["output_contract_compliance_score"] == pytest.approx(0.0)
+    assert record["task_progress_score"] == pytest.approx(0.0)
+    assert record["scope_control_score"] is None
+    assert record["destructive_action_policy_score"] == pytest.approx(1.0)
+
+    payload = _build_session_history_db_payload(record)
+    assert len(payload) == 121
+    assert payload[72] == pytest.approx(0.0)
+    assert payload[73] is True
+    assert payload[76] is False
+    assert payload[77] == pytest.approx(0.0)
+    assert payload[78] == 2
+    assert payload[79] == pytest.approx(0.0)
+    assert payload[80] == pytest.approx(0.0)
+    assert payload[81] == pytest.approx(1.0)
+    assert payload[82] == pytest.approx(0.5)
+    assert payload[83] == pytest.approx(1.0)
+    assert payload[84] == pytest.approx(1.0)
+    assert payload[85] == pytest.approx(0.0)
+    assert payload[86] == pytest.approx(0.0)
+    assert payload[87] == pytest.approx(1.0)
+    assert payload[88] == pytest.approx(1.0)
+    assert payload[89] == pytest.approx(0.0)
+    assert payload[90] == pytest.approx(0.0)
+    assert payload[91] == pytest.approx(0.0)
+    assert payload[92] is None
+    assert payload[93] == pytest.approx(1.0)
+    assert payload[94] == pytest.approx(1.0)
+    assert payload[95] == 0
+    assert payload[96] == pytest.approx(0.0)
+    assert payload[97] == pytest.approx(0.0)
+    assert payload[105] == pytest.approx(0.0)
+    assert payload[106] == pytest.approx(0.0)
+    assert payload[113:116] == (None, None, None)
+    assert json.loads(payload[116]) == {
+        "response_meaningfulness": ["no_meaningful_output"],
+        "read_only_policy_compliance": ["mutating_tool:Bash"],
+        "agent_quality_rule_catalog_version": "2026-05-31.v1",
+    }
+    assert payload[117:121] == (False, None, None, None)
+    payload_metadata = json.loads(payload[46])
+    assert payload_metadata["usage_trace_quality_score"] == pytest.approx(0.0)
+    assert payload_metadata["usage_empty_completion_failure"] is True
+    assert payload_metadata["usage_answer_completeness_score"] == pytest.approx(1.0)
+    assert payload_metadata["usage_context_retention_score"] == pytest.approx(0.0)
+    assert payload_metadata["usage_agent_score_reasons"] == {
+        "response_meaningfulness": ["no_meaningful_output"],
+        "read_only_policy_compliance": ["mutating_tool:Bash"],
+        "agent_quality_rule_catalog_version": "2026-05-31.v1",
+    }
+
+
+def test_build_session_history_record_scores_runtime_ignored_path_tracking() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-runtime-ignored-path"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-runtime-ignored-path"
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [
+            {"role": "user", "content": "Update the planning notes."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"cmd": "git add -f .analysis/todo.md"},
+                    }
+                ],
+            },
+        ],
+    }
+    result = {
+        "id": "resp-runtime-ignored-path",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "Done."}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["ignored_path_tracking_policy_score"] == pytest.approx(0.0)
+    assert record["ignored_path_tracking_violation_count"] == 1
+    reasons = record["agent_score_reasons"]
+    assert reasons["ignored_path_tracking_policy"] == ["forced_tracking_ignored_path"]
+    assert reasons["ignored_path_tracking_evidence"][0]["evidence_mode"] == (
+        "inferred_common_ignored_path"
+    )
+
+
+def test_build_session_history_record_scores_runtime_baseline_deflection() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-runtime-baseline-deflection"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-runtime-baseline-deflection"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [
+            {"role": "user", "content": "Fix the classifier failure."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"cmd": "git show HEAD~1"}},
+                    {"type": "tool_use", "name": "Bash", "input": {"cmd": "git log -- src/app.py"}},
+                    {"type": "tool_use", "name": "Bash", "input": {"cmd": "git blame src/app.py"}},
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"cmd": "rg -n source_hash .pytest-classifier/cache"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"cmd": "sqlite3 source-analysis.sqlite3 .schema"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": "pytest-classifier failed: Actionable classifier findings TS1",
+                    }
+                ],
+            },
+        ],
+    }
+    result = {
+        "id": "resp-runtime-baseline-deflection",
+        "usage": {"prompt_tokens": 40000, "completion_tokens": 20, "total_tokens": 40020},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "I need to prove whether this was already present in the baseline.",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["baseline_deflection_attempted_score"] == pytest.approx(1.0)
+    assert record["baseline_deflection_incident_score"] == pytest.approx(1.0)
+    assert record["baseline_deflection_tool_call_count"] == 5
+    assert record["metadata"]["usage_baseline_deflection_incident_score"] == pytest.approx(1.0)
+
+
+def test_build_session_history_record_does_not_score_persona_guidance_as_baseline_deflection() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-runtime-baseline-guidance"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-runtime-baseline-guidance"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Fix-what-blocks-you. If a failure (test, lint, type-check, "
+                    "build, gate, classifier, pre-commit hook) blocks your work, "
+                    "fix it. Do not spend ANY turns investigating whether you "
+                    "caused it, whether it is pre-existing, baseline, from a "
+                    "prior commit, or not in scope. Attribution does not matter. "
+                    "Apply the smallest fix that resolves the failure. Never "
+                    "report this is pre-existing, this is baseline, not from my "
+                    "changes, or similar as a completion state."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"cmd": "./.venv/bin/pytest-classifier scan"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"cmd": "apply_patch <<'PATCH'\n*** Begin Patch\nPATCH"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": "Actionable classifier findings: TS1 type_shape",
+                    }
+                ],
+            },
+        ],
+    }
+    result = {
+        "id": "resp-runtime-baseline-guidance",
+        "usage": {"prompt_tokens": 200, "completion_tokens": 8, "total_tokens": 208},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Fixed and reran the gate.",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["baseline_deflection_attempted_score"] == pytest.approx(0.0)
+    assert record["baseline_deflection_incident_score"] == pytest.approx(0.0)
+    assert record["quality_gate_trigger_count"] >= 1
+    assert record["quality_gate_fix_attempt_count"] == 1
+    assert "baseline_deflection" not in record["agent_score_reasons"]
+
+
+def test_build_session_history_record_scores_runtime_discovery_inventory_gap() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-runtime-discovery-inventory"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-runtime-discovery-inventory"
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Read `.analysis/seed-handoff.md` and any recent handoff "
+                    "docs. Discovery inventory required: list the discovery "
+                    "commands, list every candidate, mark each candidate as "
+                    "inspected, omitted, or unavailable, classify relevant "
+                    "candidates, and call out any coverage gap."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {
+                            "cmd": "find .analysis -maxdepth 1 -name '*handoff*.md' -print"
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": (
+                            ".analysis/seed-handoff.md\n"
+                            ".analysis/recent-handoff.md\n"
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+    result = {
+        "id": "resp-runtime-discovery-inventory",
+        "usage": {"prompt_tokens": 500, "completion_tokens": 40, "total_tokens": 540},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "Discovery command: find .analysis -maxdepth 1 "
+                        "-name '*handoff*.md' -print. Candidates: "
+                        ".analysis/seed-handoff.md inspected actionable. "
+                        "Coverage gaps: one discovered handoff was not reviewed."
+                    ),
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["discovery_inventory_coverage_score"] == pytest.approx(0.0)
+    assert record["discovery_inventory_missing_count"] == 1
+    assert record["metadata"]["usage_discovery_inventory_coverage_score"] == pytest.approx(
+        0.0
+    )
+    assert (
+        "omitted_discovered_candidate:.analysis/recent-handoff.md"
+        in record["agent_score_reasons"]["discovery_inventory_coverage"]
+    )
+
+
+def test_build_session_history_record_scores_runtime_sleep_interruption() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-runtime-sleep"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-runtime-sleep"
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "messages": [{"role": "user", "content": "Continue the deployment work."}],
+    }
+    result = {
+        "id": "resp-runtime-sleep",
+        "usage": {"prompt_tokens": 12000, "completion_tokens": 12, "total_tokens": 12012},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "It's late. Go get some rest and we'll pick back up "
+                        "in the morning."
+                    ),
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["sleep_wellness_interruption_attempted_score"] == pytest.approx(1.0)
+    assert record["sleep_wellness_interruption_incident_score"] == pytest.approx(1.0)
+    assert record["sleep_wellness_interruption_count"] >= 1
+    assert record["metadata"][
+        "usage_sleep_wellness_interruption_incident_score"
+    ] == pytest.approx(1.0)
 
 
 def test_build_session_history_record_omits_empty_read_pages_from_tool_activity() -> None:
@@ -2407,7 +2916,7 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 72
+    assert len(payload) == 121
     assert payload[57] == pytest.approx(25.0)
     assert payload[58] == pytest.approx(100.0)
     assert payload[59] == pytest.approx(130.0)
@@ -3469,6 +3978,122 @@ def test_build_session_history_record_calculates_local_embedding_estimated_cost(
     assert record["response_cost_usd"] == pytest.approx(1000 * 4.6e-09)
 
 
+def test_build_session_history_record_routes_auto_agent_alias_to_selected_provider() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "aawm-codex-agent-auto"
+    kwargs["custom_llm_provider"] = "litellm"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-auto-agent-openrouter-selected"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-auto-agent-openrouter-selected",
+            "model_group": "aawm-codex-agent-auto",
+            "codex_auto_agent_alias": "aawm-codex-agent-auto",
+            "codex_auto_agent_selected_provider": "openrouter",
+            "codex_auto_agent_selected_model": "deepseek/deepseek-v4-flash:free",
+        }
+    )
+
+    result = {
+        "id": "auto-agent-openrouter-response-1",
+        "model": "deepseek/deepseek-v4-flash:free",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 8,
+            "total_tokens": 108,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "deepseek/deepseek-v4-flash:free"
+    assert record["model_group"] == "deepseek/deepseek-v4-flash:free"
+
+
+def test_build_session_history_record_routes_openai_compatible_openrouter_model() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "inclusionai/ling-2.6-flash"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-openrouter-openai-compatible"
+    kwargs["litellm_params"]["api_base"] = "https://openrouter.ai/api/v1/chat/completions"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-openrouter-openai-compatible"
+    )
+
+    result = {
+        "id": "openrouter-openai-compatible-response-1",
+        "model": "inclusionai/ling-2.6-flash",
+        "usage": {
+            "prompt_tokens": 40,
+            "completion_tokens": 6,
+            "total_tokens": 46,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "inclusionai/ling-2.6-flash"
+
+
+def test_build_session_history_record_routes_openai_compatible_local_embedding() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "local_embed/nomic-embed-code.Q8_0.gguf"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "embedding"
+    kwargs["litellm_call_id"] = "call-local-nomic-openai-compatible"
+    kwargs["litellm_params"]["api_base"] = "http://172.20.0.1:8082/v1/embeddings"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-local-nomic-openai-compatible",
+            "model_group": "nomic-embed-code",
+        }
+    )
+
+    result = {
+        "id": "local-nomic-openai-compatible-response-1",
+        "usage": {
+            "prompt_tokens": 512,
+            "completion_tokens": 0,
+            "total_tokens": 512,
+        },
+        "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "local_embed"
+    assert record["model"] == "nomic-embed-code.Q8_0.gguf"
+    assert record["model_group"] == "nomic-embed-code"
+    assert record["metadata"]["aawm_local_route"] is True
+    assert record["metadata"]["aawm_local_route_family"] == "local_embedding"
+
+
 def test_build_session_history_record_marks_local_openai_chat_route() -> None:
     kwargs = _base_kwargs(trace_name="local-llm")
     kwargs["model"] = "qwen3-4b-heretic-q8"
@@ -3973,7 +4598,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 72
+    assert len(payload) == 121
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -3994,7 +4619,10 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
         None,
         None,
     )
-    assert payload[67:] == (False, False, None, None, None)
+    assert payload[67:72] == (False, False, None, None, None)
+    assert payload[72:116] == (None,) * 44
+    assert json.loads(payload[116]) == {}
+    assert payload[117:121] == (False, None, None, None)
     assert payload[38] == "aawm.25"
     assert "aawm-litellm-callbacks" in payload[39]
     assert payload[40] == "codex-tui"
@@ -4007,6 +4635,396 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
     assert payload_metadata["litellm_environment"] == "dev"
     assert payload_metadata["client_name"] == "codex-tui"
     assert payload_metadata["usage_invalid_tool_call_count"] == 0
+
+
+def test_d1_169_detects_claude_code_compact_summary_event() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code")
+    kwargs["model"] = "claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-compact-summary"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-code-compact-summary",
+            "passthrough_route_family": "anthropic_messages",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Please summarize the current context. <analysis>",
+                },
+                {
+                    "type": "text",
+                    "text": "<summary>context compacted snapshot</summary>",
+                },
+            ],
+        }
+    ]
+
+    result = {
+        "id": "resp-claude-code-compact-summary",
+        "usage": {
+            "input_tokens": 220,
+            "output_tokens": 50,
+            "total_tokens": 270,
+            "cache_creation_input_tokens": 12,
+        },
+        "choices": [
+            {"message": {"role": "assistant", "content": "summary created"}}
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["is_compact_summary"] is True
+    assert record["compact_summary_source"] == "claude-code"
+    assert record["compact_summary_role"] == "event"
+
+
+def test_d1_169_detects_codex_compact_event_uses_thread_id_as_compact_id() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "responses"
+    kwargs["litellm_call_id"] = "call-codex-compact-summary"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-compact-summary",
+            "passthrough_route_family": "codex_responses",
+            "CODEX_THREAD_ID": "thread-7a7e-compact",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "role": "user",
+                "content": "CONTEXT CHECKPOINT COMPACTION started",
+            }
+        ],
+        "prompt_cache_key": "thread-7a7e-compact",
+        "metadata": {"thread_id": "thread-7a7e-compact"},
+    }
+
+    result = {
+        "id": "resp-codex-compact-summary",
+        "usage": {
+            "input_tokens": 200,
+            "output_tokens": 30,
+            "total_tokens": 230,
+        },
+        "output": [
+            {
+                "type": "message",
+                "content": "compact context recorded",
+                "role": "assistant",
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["is_compact_summary"] is True
+    assert record["compact_summary_source"] == "codex"
+    assert record["compact_summary_role"] == "event"
+    assert record["compact_summary_id"] == "thread-7a7e-compact"
+
+
+def test_d1_169_recognizes_codex_resume_handoff_as_compact_context_not_counted() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "responses"
+    kwargs["litellm_call_id"] = "call-codex-resume-handoff"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-resume-handoff",
+            "passthrough_route_family": "codex_responses",
+            "prompt_cache_key": "thread-7a7e-resume",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "role": "user",
+                "content": "Another language model started to solve this problem."
+            }
+        ],
+    }
+
+    result = {
+        "id": "resp-codex-resume-handoff",
+        "usage": {
+            "input_tokens": 210,
+            "output_tokens": 28,
+            "total_tokens": 238,
+        },
+        "output": [
+            {
+                "type": "message",
+                "content": "continuing from previous model",
+                "role": "assistant",
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record.get("is_compact_summary") is False
+    assert record.get("compact_summary_source") == "codex"
+    assert record.get("compact_summary_role") == "resume_context"
+    assert record.get("compact_summary_id") == "thread-7a7e-resume"
+
+
+def test_d1_169_detects_gemini_compact_output_state_snapshot() -> None:
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "gemini-3-flash-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-gemini-compact-summary"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-gemini-compact-summary",
+            "passthrough_route_family": "gemini_generate_content",
+            "gemini_user_prompt_id": "compress-1780246649610",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"user-agent": "GeminiCLI/0.9.1 (linux; x64; terminal)"}
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gemini-3-flash-preview",
+        "user_prompt_id": "compress-1780246649610",
+        "contents": [
+            {"role": "user", "parts": [{"text": "checkpoint"}]}
+        ],
+    }
+
+    result = {
+        "id": "resp-gemini-compact-summary",
+        "usageMetadata": {
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 20,
+            "totalTokenCount": 120,
+        },
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "text": (
+                                "<state_snapshot><summary>compact point</summary></state_snapshot>"
+                            )
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["is_compact_summary"] is True
+    assert record["compact_summary_source"] == "gemini-cli"
+    assert record["compact_summary_role"] == "event"
+    assert record["compact_summary_id"] == "compress-1780246649610"
+
+
+def test_d1_169_recognizes_gemini_compact_verify_not_counted_with_base_id() -> None:
+    kwargs = _base_kwargs(trace_name="gemini")
+    kwargs["model"] = "gemini-3-flash-preview"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-gemini-compact-verify"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-gemini-compact-verify",
+            "passthrough_route_family": "gemini_generate_content",
+            "gemini_user_prompt_id": "compress-1780246649610-verify",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"user-agent": "GeminiCLI/0.9.1 (linux; x64; terminal)"}
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gemini-3-flash-preview",
+        "user_prompt_id": "compress-1780246649610-verify",
+        "contents": [
+            {"role": "user", "parts": [{"text": "checkpoint verification"}]}
+        ],
+    }
+
+    result = {
+        "id": "resp-gemini-compact-verify",
+        "usageMetadata": {
+            "promptTokenCount": 90,
+            "candidatesTokenCount": 10,
+            "totalTokenCount": 100,
+        },
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record.get("is_compact_summary") is False
+    assert record["compact_summary_source"] == "gemini-cli"
+    assert record["compact_summary_role"] == "verify"
+    assert record["compact_summary_id"] == "compress-1780246649610"
+
+
+def test_d1_169_does_not_count_normal_compact_prose() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code")
+    kwargs["model"] = "claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-compact-prose"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-compact-prose",
+            "passthrough_route_family": "anthropic_messages",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
+        {
+            "role": "user",
+            "content": "Could you /compact this bugfix into a short report?",
+        }
+    ]
+
+    result = {
+        "id": "resp-compact-prose",
+        "usage": {"prompt_tokens": 120, "output_tokens": 16, "total_tokens": 136},
+        "choices": [{"message": {"role": "assistant", "content": "done"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record.get("is_compact_summary") is False
+    assert record.get("compact_summary_source") is None
+    assert record.get("compact_summary_role") is None
+
+
+def test_d1_169_ignores_claude_tool_advertisement_compaction_metadata() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code")
+    kwargs["model"] = "claude-opus-4-7"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-tool-compaction"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-tool-compaction",
+            "passthrough_route_family": "anthropic_messages",
+            "claude_tool_advertisement_compaction_count": 1,
+            "tags": ["claude-tool-advertisement-compaction"],
+        }
+    )
+
+    result = {
+        "id": "resp-claude-tool-compaction",
+        "usage": {
+            "prompt_tokens": 80,
+            "output_tokens": 10,
+            "total_tokens": 90,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record.get("is_compact_summary") is False
+    assert record.get("compact_summary_source") is None
+    assert record.get("compact_summary_role") is None
+
+
+def test_d1_169_build_session_history_db_payload_appends_compact_summary_fields() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-compact-summary-payload"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-compact-summary-payload",
+            "passthrough_route_family": "codex_responses",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "role": "user",
+                "content": "CONTEXT CHECKPOINT COMPACTION payload test",
+            }
+        ],
+    }
+
+    result = {
+        "id": "resp-compact-summary-payload",
+        "usage": {"input_tokens": 30, "output_tokens": 5, "total_tokens": 35},
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    payload = _build_session_history_db_payload(record)
+    assert len(payload) == 121
+    assert payload[117] == record["is_compact_summary"]
+    assert payload[118] == record["compact_summary_source"]
+    assert payload[119] == record["compact_summary_id"]
+    assert payload[120] == record["compact_summary_role"]
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
@@ -6535,7 +7553,7 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert mock_conn.execute.await_count == 2
     executed_args = mock_conn.execute.await_args_list[0].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 72
+    assert len(executed_args[1:]) == 121
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
@@ -6979,6 +7997,200 @@ def test_build_session_history_record_from_langfuse_trace_observation() -> None:
     assert record["metadata"]["session_id_source"] == "trace.sessionId"
     assert record["metadata"]["trace_id_source"] == "trace.id"
     assert "route:anthropic_messages" in record["metadata"]["request_tags"]
+
+
+def test_d1_169_backfill_langfuse_marks_claude_code_compact_summary_event() -> None:
+    request_body = {
+        "model": "claude-opus-4-7",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+                            "Your task is to create a detailed summary of the "
+                            "conversation so far.\n"
+                            "Return an <analysis> block followed by a <summary> block."
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    trace = {
+        "id": "trace-d1-169-claude-compact",
+        "name": "claude-code.orchestrator",
+        "sessionId": "fa9b8332-18f9-4913-ad25-bcc7a09d46dc",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "time-16-24-46-086503_7d95b64a-8992-49d3-84a1-379a5e582aa1",
+        "traceId": "trace-d1-169-claude-compact",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "claude-opus-4-7",
+        "input": {"messages": [{"role": "user", "content": json.dumps(request_body)}]},
+        "output": {
+            "content": "<analysis>reviewed</analysis><summary>compact summary</summary>",
+            "role": "assistant",
+        },
+        "usageDetails": {"input": 220, "output": 50, "total": 270},
+        "metadata": {
+            "client_name": "claude-cli",
+            "passthrough_route_family": "anthropic_messages",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-d1-169",
+    )
+
+    assert record is not None
+    assert record["is_compact_summary"] is True
+    assert record["compact_summary_source"] == "claude-code"
+    assert record["compact_summary_role"] == "event"
+    assert record["compact_summary_id"] == observation["id"]
+    assert record["metadata"]["backfill_source"] == "LangfuseTraces"
+    assert record["metadata"]["is_compact_summary"] is True
+
+
+def test_d1_169_backfill_langfuse_marks_codex_compact_and_resume_context() -> None:
+    trace = {
+        "id": "trace-d1-169-codex-compact",
+        "name": "codex",
+        "sessionId": "trace-session-codex",
+        "environment": "prod",
+    }
+    base_observation = {
+        "traceId": "trace-d1-169-codex-compact",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.5",
+        "usageDetails": {"input": 200, "output": 30, "total": 230},
+        "metadata": {
+            "client_name": "codex-tui",
+            "passthrough_route_family": "codex_responses",
+        },
+    }
+    compact_request = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "role": "user",
+                "content": "You are performing a CONTEXT CHECKPOINT COMPACTION.",
+            }
+        ],
+        "prompt_cache_key": "019e7ee9-0832-7321-906e-eceb5f2c0e2b",
+    }
+    compact_observation = {
+        **base_observation,
+        "id": "time-16-46-20-555218_resp_01200ce0f283fdc3016a1c65dcff948194bc57ef62f6c21308",
+        "input": {"messages": [{"role": "user", "content": json.dumps(compact_request)}]},
+        "output": {"content": "handoff summary", "role": "assistant"},
+    }
+    resume_request = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "role": "user",
+                "content": "Another language model started to solve this problem.",
+            }
+        ],
+        "prompt_cache_key": "019e7ee9-0832-7321-906e-eceb5f2c0e2b",
+    }
+    resume_observation = {
+        **base_observation,
+        "id": "time-16-46-37-375884_resp_0ff00d5101e48612016a1c65ee01f4819693a09e19d4449124",
+        "input": {"messages": [{"role": "user", "content": json.dumps(resume_request)}]},
+        "output": {"content": "continuing", "role": "assistant"},
+    }
+
+    compact_record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        compact_observation,
+        backfill_run_id="run-d1-169",
+    )
+    resume_record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        resume_observation,
+        backfill_run_id="run-d1-169",
+    )
+
+    assert compact_record is not None
+    assert compact_record["is_compact_summary"] is True
+    assert compact_record["compact_summary_source"] == "codex"
+    assert compact_record["compact_summary_role"] == "event"
+    assert compact_record["compact_summary_id"] == "019e7ee9-0832-7321-906e-eceb5f2c0e2b"
+    assert resume_record is not None
+    assert resume_record["is_compact_summary"] is False
+    assert resume_record["compact_summary_source"] == "codex"
+    assert resume_record["compact_summary_role"] == "resume_context"
+    assert resume_record["compact_summary_id"] == "019e7ee9-0832-7321-906e-eceb5f2c0e2b"
+
+
+def test_d1_169_backfill_langfuse_marks_gemini_compact_and_verify_context() -> None:
+    trace = {
+        "id": "trace-d1-169-gemini-compact",
+        "name": "gemini",
+        "sessionId": "4435b6f0-6090-47e6-8a6c-6b01be58fd3c",
+        "environment": "prod",
+    }
+    base_observation = {
+        "traceId": "trace-d1-169-gemini-compact",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gemini-3-flash-preview",
+        "input": {"messages": None},
+        "usageDetails": {"input": 100, "output": 20, "total": 120},
+        "metadata": {
+            "client_name": "gemini-cli",
+            "passthrough_route_family": "gemini_generate_content",
+        },
+    }
+    compact_observation = {
+        **base_observation,
+        "id": "time-16-57-29-634126_960c7fa4-473e-4e4a-8aba-6835aa9f5a2f",
+        "metadata": {
+            **base_observation["metadata"],
+            "gemini_user_prompt_id": "compress-1780246649610",
+        },
+        "output": {"content": "<state_snapshot>compact point</state_snapshot>"},
+    }
+    verify_observation = {
+        **base_observation,
+        "id": "time-16-57-34-656194_cb07bb75-04bd-4da5-89a3-bc40990ea032",
+        "metadata": {
+            **base_observation["metadata"],
+            "gemini_user_prompt_id": "compress-1780246649610-verify",
+        },
+        "output": {"content": "<state_snapshot>verified</state_snapshot>"},
+    }
+
+    compact_record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        compact_observation,
+        backfill_run_id="run-d1-169",
+    )
+    verify_record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        verify_observation,
+        backfill_run_id="run-d1-169",
+    )
+
+    assert compact_record is not None
+    assert compact_record["is_compact_summary"] is True
+    assert compact_record["compact_summary_source"] == "gemini-cli"
+    assert compact_record["compact_summary_role"] == "event"
+    assert compact_record["compact_summary_id"] == "compress-1780246649610"
+    assert verify_record is not None
+    assert verify_record["is_compact_summary"] is False
+    assert verify_record["compact_summary_source"] == "gemini-cli"
+    assert verify_record["compact_summary_role"] == "verify"
+    assert verify_record["compact_summary_id"] == "compress-1780246649610"
 
 
 def test_build_session_history_record_from_langfuse_passthrough_uses_synthetic_session_id() -> None:
@@ -8000,6 +9212,133 @@ def test_build_session_history_record_from_langfuse_preserves_explicit_openroute
     )
 
 
+def test_build_session_history_record_from_langfuse_recovers_claude_model_from_exp_tag() -> None:
+    trace = {
+        "id": "trace-claude-exp-model",
+        "name": "claude-code.orchestrator",
+        "sessionId": "session-claude-exp-model",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "obs-claude-exp-model",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "unknown",
+        "startTime": "2026-05-31T03:30:13Z",
+        "endTime": "2026-05-31T03:30:15Z",
+        "usage": {
+            "input": 100,
+            "output": 10,
+            "total": 110,
+        },
+        "output": {"content": "ack"},
+        "metadata": {
+            "custom_llm_provider": "anthropic",
+            "passthrough_route_family": "anthropic_messages",
+            "request_tags": [
+                "claude-exp:claude-opus-4-8",
+                "claude-effort:high",
+            ],
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-claude-exp-model",
+    )
+
+    assert record is not None
+    assert record["provider"] == "anthropic"
+    assert record["model"] == "claude-opus-4-8"
+
+
+def test_build_session_history_record_from_langfuse_routes_openrouter_api_base() -> None:
+    trace = {
+        "id": "trace-openrouter-api-base",
+        "name": "codex",
+        "sessionId": "session-openrouter-api-base",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-openrouter-api-base",
+        "type": "GENERATION",
+        "name": "litellm-completion",
+        "model": "inclusionai/ling-2.6-flash",
+        "apiBase": "https://openrouter.ai/api/v1/chat/completions",
+        "startTime": "2026-06-01T04:00:00Z",
+        "endTime": "2026-06-01T04:00:01Z",
+        "usage": {
+            "input": 20,
+            "output": 5,
+            "total": 25,
+        },
+        "output": {
+            "choices": [
+                {"message": {"role": "assistant", "content": "OK"}}
+            ]
+        },
+        "metadata": {
+            "custom_llm_provider": "openai",
+            "api_base": "https://openrouter.ai/api/v1/chat/completions",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-openrouter-api-base",
+    )
+
+    assert record is not None
+    assert record["provider"] == "openrouter"
+    assert record["model"] == "inclusionai/ling-2.6-flash"
+
+
+def test_build_session_history_record_from_langfuse_routes_local_embedding_api_base() -> None:
+    trace = {
+        "id": "trace-local-nomic-api-base",
+        "name": "codex",
+        "sessionId": "session-local-nomic-api-base",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-local-nomic-api-base",
+        "type": "GENERATION",
+        "name": "litellm-embedding",
+        "model": "local_embed/nomic-embed-code.Q8_0.gguf",
+        "apiBase": "http://172.20.0.1:8082/v1/embeddings",
+        "startTime": "2026-06-01T05:15:23Z",
+        "endTime": "2026-06-01T05:15:24Z",
+        "usage": {
+            "input": 512,
+            "output": 0,
+            "total": 512,
+        },
+        "output": {
+            "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}]
+        },
+        "metadata": {
+            "custom_llm_provider": "openai",
+            "api_base": "http://172.20.0.1:8082/v1/embeddings",
+            "model_group": "nomic-embed-code",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-local-nomic-api-base",
+    )
+
+    assert record is not None
+    assert record["provider"] == "local_embed"
+    assert record["model"] == "nomic-embed-code.Q8_0.gguf"
+    assert record["model_group"] == "nomic-embed-code"
+    assert record["metadata"]["aawm_local_route"] is True
+    assert record["metadata"]["aawm_local_route_family"] == "local_embedding"
+
+
 def test_build_session_history_record_from_langfuse_trace_observation_sets_not_applicable_reasoning_source_when_absent() -> None:
     trace = {
         "id": "trace-no-reasoning",
@@ -8293,7 +9632,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
-    assert len(history_args[1][0]) == 72
+    assert len(history_args[1][0]) == 121
     assert history_args[1][0][0] == "call-1"
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
