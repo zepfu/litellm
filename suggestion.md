@@ -100,3 +100,15 @@
   clear whether the next action should be a same-alias retry for 429/capacity,
   a smaller-model redispatch, or a local fallback for a deterministic null
   completion.
+
+## 2026-06-01 D1-177
+
+- Suggestion: add one reusable `oa_xai` smoke script that can run both chat and
+  Responses-backed aliases, restarts or verifies the target dev proxy is using
+  the current worktree code, then prints exact `/health`, model-cost mode,
+  client response, `session_history`, and quota-observation evidence for the
+  generated session IDs.
+- How it would help: this would have made the multi-agent follow-up impossible
+  to miss after D1-176, because the script would fail if a model reaches xAI on
+  the wrong endpoint or if the live proxy is still serving a stale loaded module
+  after code changes.

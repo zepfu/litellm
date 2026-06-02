@@ -931,6 +931,62 @@ def mock_completion(
         raise Exception("Mock completion response failed - {}".format(e))
 
 
+_BUNDLED_RESPONSES_MODEL_INFO: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _get_bundled_responses_model_info() -> Dict[str, Dict[str, Any]]:
+    global _BUNDLED_RESPONSES_MODEL_INFO
+    if _BUNDLED_RESPONSES_MODEL_INFO is None:
+        try:
+            from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+
+            bundled_model_cost = GetModelCostMap.load_local_model_cost_map()
+            _BUNDLED_RESPONSES_MODEL_INFO = {
+                model_name: model_info
+                for model_name, model_info in bundled_model_cost.items()
+                if isinstance(model_info, dict)
+                and model_info.get("mode") == "responses"
+            }
+        except Exception as e:
+            verbose_logger.debug(
+                "Error loading bundled responses model info: {}".format(e)
+            )
+            _BUNDLED_RESPONSES_MODEL_INFO = {}
+    return _BUNDLED_RESPONSES_MODEL_INFO
+
+
+def _get_bundled_responses_model_override(
+    model: str,
+    custom_llm_provider: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    bundled_responses_models = _get_bundled_responses_model_info()
+    candidate_models: List[str] = []
+
+    def _add_candidate(candidate_model: str) -> None:
+        if candidate_model and candidate_model not in candidate_models:
+            candidate_models.append(candidate_model)
+
+    _add_candidate(model)
+    if custom_llm_provider is not None:
+        provider_prefix = f"{custom_llm_provider}/"
+        if not model.startswith(provider_prefix):
+            _add_candidate(f"{provider_prefix}{model}")
+
+    for candidate_model in candidate_models:
+        bundled_model_info = bundled_responses_models.get(candidate_model)
+        if not isinstance(bundled_model_info, dict):
+            continue
+        bundled_provider = bundled_model_info.get("litellm_provider")
+        if (
+            custom_llm_provider is None
+            or bundled_provider is None
+            or bundled_provider == custom_llm_provider
+        ):
+            return {"key": candidate_model, **bundled_model_info}
+
+    return None
+
+
 def responses_api_bridge_check(
     model: str,
     custom_llm_provider: str,
@@ -950,6 +1006,14 @@ def responses_api_bridge_check(
             model = model.replace("responses/", "")
             mode = "responses"
             model_info["mode"] = mode
+
+        if model_info.get("mode") != "responses":
+            bundled_responses_model_info = _get_bundled_responses_model_override(
+                model=model,
+                custom_llm_provider=custom_llm_provider,
+            )
+            if bundled_responses_model_info is not None:
+                model_info.update(bundled_responses_model_info)
 
         if web_search_options is not None and custom_llm_provider == "xai":
             model_info["mode"] = "responses"
