@@ -678,6 +678,88 @@ def test_responses_api_bridge_check_gpt_5_4_tools_without_reasoning_stays_chat()
     assert model_info.get("mode") != "responses"
 
 
+def test_responses_api_bridge_check_uses_bundled_responses_metadata_when_remote_map_is_stale(
+    monkeypatch,
+):
+    """If the fetched model map is stale, bundled responses-only metadata should win."""
+    import litellm.main as litellm_main
+
+    monkeypatch.setattr(litellm_main, "_BUNDLED_RESPONSES_MODEL_INFO", None)
+    bundled_model_info = {
+        "xai/grok-4.20-multi-agent-0309": {
+            "litellm_provider": "xai",
+            "mode": "responses",
+            "supports_function_calling": False,
+            "supports_tool_choice": False,
+        }
+    }
+
+    with patch("litellm.main._get_model_info_helper") as mock_get_model_info:
+        mock_get_model_info.return_value = {
+            "key": "xai/grok-4.20-multi-agent-0309",
+            "litellm_provider": "xai",
+            "mode": "chat",
+            "supports_function_calling": True,
+            "supports_tool_choice": True,
+        }
+        with patch(
+            "litellm.litellm_core_utils.get_model_cost_map.GetModelCostMap.load_local_model_cost_map",
+            return_value=bundled_model_info,
+        ):
+            model_info, model = litellm_main.responses_api_bridge_check(
+                model="grok-4.20-multi-agent-0309",
+                custom_llm_provider="xai",
+            )
+
+    assert model == "grok-4.20-multi-agent-0309"
+    assert model_info["key"] == "xai/grok-4.20-multi-agent-0309"
+    assert model_info["mode"] == "responses"
+    assert model_info["supports_function_calling"] is False
+    assert model_info["supports_tool_choice"] is False
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "grok-4.3",
+        "grok-4.20-0309-reasoning",
+        "grok-4.20-0309-non-reasoning",
+    ],
+)
+def test_responses_api_bridge_check_does_not_force_other_xai_oauth_models_to_responses(
+    model_name,
+    monkeypatch,
+):
+    """D1-177 should not change the three xAI OAuth aliases that live-smoked on chat."""
+    import litellm.main as litellm_main
+
+    monkeypatch.setattr(
+        litellm_main,
+        "_BUNDLED_RESPONSES_MODEL_INFO",
+        {
+            "xai/grok-4.20-multi-agent-0309": {
+                "litellm_provider": "xai",
+                "mode": "responses",
+            }
+        },
+    )
+
+    with patch("litellm.main._get_model_info_helper") as mock_get_model_info:
+        mock_get_model_info.return_value = {
+            "key": f"xai/{model_name}",
+            "litellm_provider": "xai",
+            "mode": "chat",
+        }
+        model_info, model = litellm_main.responses_api_bridge_check(
+            model=model_name,
+            custom_llm_provider="xai",
+        )
+
+    assert model == model_name
+    assert model_info["key"] == f"xai/{model_name}"
+    assert model_info["mode"] == "chat"
+
+
 @patch("litellm.completion_extras.responses_api_bridge.completion")
 def test_gpt_5_4_responses_bridge_preserves_reasoning_summary_dict(
     mock_responses_completion,

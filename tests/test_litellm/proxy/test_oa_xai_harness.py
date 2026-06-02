@@ -297,9 +297,18 @@ async def test_oa_xai_harness_routes_litellm_client_to_upstream_oauth(
     assert "api_base" not in harness.request_data(public_model)
 
 
-def test_oa_xai_harness_validates_session_history_provider_error_and_quota_metadata():
+@pytest.mark.parametrize(
+    "public_model",
+    [
+        "oa_xai/grok-4.3",
+        "oa_xai/grok-4.20-multi-agent-0309",
+    ],
+)
+def test_oa_xai_harness_validates_session_history_provider_error_and_quota_metadata(
+    public_model,
+):
     harness = OaXaiHarness()
-    kwargs = harness.kwargs_for_observability("oa_xai/grok-4.3")
+    kwargs = harness.kwargs_for_observability(public_model)
     record = _build_session_history_record(
         kwargs=kwargs,
         result=harness.response_body(),
@@ -309,8 +318,8 @@ def test_oa_xai_harness_validates_session_history_provider_error_and_quota_metad
 
     assert record is not None
     assert record["provider"] == "xai"
-    assert record["model"] == "oa_xai/grok-4.3"
-    assert record["model_group"] == "oa_xai/grok-4.3"
+    assert record["model"] == public_model
+    assert record["model_group"] == public_model
     assert record["input_tokens"] == 17
     assert record["output_tokens"] == 4
     assert record["response_cost_usd"] is not None
@@ -335,7 +344,7 @@ def test_oa_xai_harness_validates_session_history_provider_error_and_quota_metad
 
     assert provider_error is not None
     assert provider_error["provider"] == "xai"
-    assert provider_error["model"] == "oa_xai/grok-4.3"
+    assert provider_error["model"] == public_model
     assert provider_error["route_family"] == "xai_oauth_api"
     assert provider_error["error_class"] == "auth_failed"
     assert provider_error["metadata"]["credential_family"] == "xai_oauth"
@@ -344,7 +353,7 @@ def test_oa_xai_harness_validates_session_history_provider_error_and_quota_metad
         observation={
             "source": "xai_oauth_api_headers",
             "provider": "xai",
-            "model": "oa_xai/grok-4.3",
+            "model": public_model,
             "limit_id": "xai_grok_subscription",
             "quota_type": "requests",
             "remaining_pct": 80.0,
@@ -361,7 +370,7 @@ def test_oa_xai_harness_validates_session_history_provider_error_and_quota_metad
     )
 
     assert quota_observation["provider"] == "xai"
-    assert quota_observation["model"] == "oa_xai/grok-4.3"
+    assert quota_observation["model"] == public_model
     assert quota_observation["metadata"]["auth_mode"] == "oauth"
     assert quota_observation["metadata"]["credential_family"] == "xai_oauth"
     assert quota_observation["metadata"]["shared_quota_family"] == (

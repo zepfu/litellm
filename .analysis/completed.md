@@ -1,5 +1,99 @@
 ## 2026-06-01
 
+- D1-177 xAI OAuth multi-agent model must route off chat completions
+  - Goal: make `oa_xai/grok-4.20-multi-agent-0309` stop reaching xAI
+    `/chat/completions`, while preserving the three D1-176 `oa_xai/*` chat
+    aliases that already live-smoked successfully.
+  - Initiated: 2026-06-01 19:51:42 EDT.
+  - Completed: 2026-06-01 20:15:35 EDT.
+  - Duration: 23 minutes 53 seconds.
+  - Changed paths:
+    - `litellm/main.py`
+    - `model_prices_and_context_window.json`
+    - `litellm/bundled_model_prices_and_context_window_fallback.json`
+    - `tests/test_litellm/test_main.py`
+    - `tests/test_litellm/proxy/test_route_llm_request.py`
+    - `tests/test_litellm/proxy/test_oa_xai_harness.py`
+    - `.analysis/todo.md`
+    - `.analysis/completed.md`
+    - `suggestion.md`
+  - Implementation notes:
+    - Updated both model-cost files so
+      `xai/grok-4.20-multi-agent-0309` and
+      `oa_xai/grok-4.20-multi-agent-0309` are `mode: responses` with
+      `supports_function_calling=false` and `supports_tool_choice=false`.
+    - Added a metadata-driven bridge fallback in `responses_api_bridge_check`:
+      if the fetched remote model-cost map is stale, a bundled model-cost entry
+      with `mode: responses` can override stale chat metadata for the current
+      provider. This keeps the route decision in model metadata instead of a
+      hardcoded xAI model branch.
+    - Extended proxy route tests to cover all four `oa_xai/*` aliases and
+      prove managed OAuth token/base/provider metadata still reaches the shared
+      LiteLLM completion path.
+    - Added bridge regression tests proving stale chat metadata is overridden
+      for the multi-agent model, while `grok-4.3`,
+      `grok-4.20-0309-reasoning`, and
+      `grok-4.20-0309-non-reasoning` remain chat.
+    - Extended the `oa_xai` harness observability checks so the multi-agent
+      public model/model_group and quota-family metadata are covered.
+  - Verification evidence:
+    - `env LITELLM_LOCAL_MODEL_COST_MAP=True ./.venv/bin/python -m pytest
+      tests/test_litellm/test_main.py::test_responses_api_bridge_check_uses_bundled_responses_metadata_when_remote_map_is_stale
+      tests/test_litellm/test_main.py::test_responses_api_bridge_check_does_not_force_other_xai_oauth_models_to_responses
+      tests/test_litellm/proxy/test_route_llm_request.py::test_route_request_routes_oa_xai_with_managed_oauth
+      tests/test_litellm/proxy/test_oa_xai_harness.py::test_oa_xai_harness_routes_litellm_client_to_upstream_oauth
+      tests/test_litellm/proxy/test_oa_xai_harness.py::test_oa_xai_harness_validates_session_history_provider_error_and_quota_metadata
+      -q` passed: `14 passed, 1 warning in 7.27s`.
+    - `./.venv/bin/ruff check litellm/main.py
+      tests/test_litellm/proxy/test_route_llm_request.py
+      tests/test_litellm/proxy/test_oa_xai_harness.py` passed. Broader
+      `tests/test_litellm/test_main.py` lint remains blocked by pre-existing
+      unrelated prints/unused imports.
+    - Direct bridge sanity with local model-cost loading and patched
+      `responses_api_bridge.completion` returned:
+      `bridge_called True`, `model grok-4.20-multi-agent-0309`,
+      `custom_llm_provider xai`, `api_key managed-oauth-token`, and
+      `api_base https://api.x.ai/v1`.
+    - Restarted `litellm-dev` so the running proxy loaded the patched
+      `litellm/main.py`. Fresh `/health` returned HTTP 200.
+    - `docker exec litellm-dev ... responses_api_bridge_check(...)` returned
+      `mode=responses`, `key=xai/grok-4.20-multi-agent-0309`,
+      `supports_function_calling=False`, and `supports_tool_choice=False`.
+      A matching container metadata check returned
+      `xai/grok-4.20-multi-agent-0309 responses False False`,
+      `oa_xai/grok-4.20-multi-agent-0309 responses False False`, and
+      `xai/grok-4.3 chat True True`.
+    - Live `/v1/chat/completions` smoke through `litellm-dev` using only
+      `Authorization: Bearer sk-1234` for session
+      `d1-177-verify-multiagent-20260602T001200` returned HTTP 200 and exact
+      assistant content `oa xai responses smoke`.
+    - Exact DB identity query returned `aawm_tristore|172.19.0.6|5432`.
+      Exact `public.session_history` row for
+      `d1-177-verify-multiagent-20260602T001200` returned
+      `provider=xai`,
+      `model=oa_xai/grok-4.20-multi-agent-0309`,
+      `model_group=oa_xai/grok-4.20-multi-agent-0309`,
+      `call_type=responses`, `input_tokens=12167`, `output_tokens=2668`,
+      `has_cost=t`,
+      `xai_oauth_public_model=oa_xai/grok-4.20-multi-agent-0309`,
+      `xai_oauth_upstream_model=xai/grok-4.20-multi-agent-0309`, and
+      `shared_quota_family=xai_grok_subscription`.
+    - Live regression smokes for the three chat aliases returned HTTP 200 after
+      the restart:
+      `oa_xai/grok-4.3` session `d1-177-verify-chat-grok43-20260602T001502`,
+      `oa_xai/grok-4.20-0309-reasoning` session
+      `d1-177-verify-chat-grok4200309reasoning-20260602T001503`, and
+      `oa_xai/grok-4.20-0309-non-reasoning` session
+      `d1-177-verify-chat-grok4200309nonreasoning-20260602T001507`.
+    - Exact `public.session_history` query for those three chat sessions
+      returned `call_type=acompletion` for all three with public
+      model/model_group preserved and upstream metadata set to the matching
+      `xai/*` model.
+    - Exact `public.rate_limit_observations` query for the multi-agent smoke
+      session returned no rows; this table currently records provider quota
+      headers only. The quota-family metadata contract remains covered by
+      `session_history` live evidence and the offline harness finalization test.
+
 - Investigation intake `investigate-codex-019e857b-9e88-7f53-90f9-acef3062b597.md`
   - Goal: disposition the new root investigation intake created after the
     D1-176 push.
