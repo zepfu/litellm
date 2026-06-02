@@ -76,7 +76,40 @@ def test_should_parse_claude_usage_and_tool_activity(tmp_path: Path) -> None:
     assert record["response_cost_usd"] is not None
     assert record["tool_call_count"] == 1
     assert record["file_read_count"] == 1
+    assert record["changed_env_file"] is False
+    assert record["changed_pyproject_toml"] is False
     assert record["reasoning_present"] is True
+
+
+def test_should_flag_sensitive_config_changes_from_local_tool_activity() -> None:
+    record = backfill._base_record(
+        source_client_name="codex",
+        created_at=backfill._parse_datetime("2026-03-01T12:00:00Z"),
+        litellm_call_id="call-sensitive-config",
+        session_id="session-sensitive-config",
+        provider="openai",
+        model="gpt-5.4-mini",
+        repository="/repo",
+        metadata={},
+        tool_activity=[
+            {
+                "tool_index": 0,
+                "tool_name": "apply_patch",
+                "tool_kind": "modify",
+                "file_paths_modified": [
+                    ".pre-commit-config.yaml",
+                    ".env.local",
+                    "pyproject.toml",
+                    "./.gitignore",
+                ],
+            }
+        ],
+    )
+
+    assert record["changed_pre_commit_config"] is True
+    assert record["changed_env_file"] is True
+    assert record["changed_pyproject_toml"] is True
+    assert record["changed_gitignore"] is True
 
 
 def test_should_coalesce_claude_split_rows_by_message_id(tmp_path: Path) -> None:
@@ -376,7 +409,7 @@ def test_history_payload_should_include_cache_miss_detail() -> None:
     payload = backfill._history_payload(record)
 
     assert backfill.SESSION_HISTORY_INSERT_SQL.count("%s") == len(payload)
-    assert len(payload) == 46
+    assert len(payload) == 50
     assert payload[24] == "write"
     assert payload[25] is True
     assert payload[26] == "cache_write_only"
