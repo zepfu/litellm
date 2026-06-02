@@ -74,6 +74,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _handle_anthropic_auto_agent_alias_route,
     _handle_codex_auto_agent_alias_route,
     _handle_codex_google_code_assist_adapter_route,
+    _is_oa_xai_responses_model,
     _is_codex_google_code_assist_empty_success_model_response,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
@@ -11696,12 +11697,22 @@ async def test_anthropic_proxy_route_uses_auto_alias_only_on_anthropic_messages(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_proxy_route_routes_oa_xai_chat_model_to_completion_adapter(
+@pytest.mark.parametrize(
+    "model",
+    [
+        "oa_xai/grok-4.3",
+        "oa_xai/grok-4.20-0309-reasoning",
+        "oa_xai/grok-4.20-0309-non-reasoning",
+        "oa_xai/grok-4.20-multi-agent-0309",
+    ],
+)
+async def test_anthropic_proxy_route_routes_all_oa_xai_models_to_responses_adapter(
+    model,
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "oa_xai/grok-4.3",
+        "model": model,
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -11716,47 +11727,6 @@ async def test_anthropic_proxy_route_routes_oa_xai_chat_model_to_completion_adap
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_completion_adapter_route",
         new=AsyncMock(return_value={"ok": True}),
-    ) as mock_completion, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
-        new=AsyncMock(),
-    ) as mock_responses, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
-    ) as mock_create_pass_through_route:
-        result = await anthropic_proxy_route(
-            endpoint="/v1/messages",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-        )
-
-    assert result == {"ok": True}
-    mock_completion.assert_awaited_once()
-    mock_responses.assert_not_called()
-    mock_create_pass_through_route.assert_not_called()
-    assert mock_completion.await_args.kwargs["adapter_model"] == "oa_xai/grok-4.3"
-
-
-@pytest.mark.asyncio
-async def test_anthropic_proxy_route_routes_oa_xai_multi_agent_to_responses_adapter(
-    monkeypatch,
-):
-    request = _build_anthropic_auto_agent_request()
-    body = {
-        "model": "oa_xai/grok-4.20-multi-agent-0309",
-        "messages": [{"role": "user", "content": "hello"}],
-        "max_tokens": 64,
-        "stream": False,
-    }
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
-        new=AsyncMock(return_value=body),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
-        new=AsyncMock(return_value=(body, 0, set(), {})),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_completion_adapter_route",
-        new=AsyncMock(),
     ) as mock_completion, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
         new=AsyncMock(return_value={"ok": True}),
@@ -11774,9 +11744,8 @@ async def test_anthropic_proxy_route_routes_oa_xai_multi_agent_to_responses_adap
     mock_completion.assert_not_called()
     mock_responses.assert_awaited_once()
     mock_create_pass_through_route.assert_not_called()
-    assert mock_responses.await_args.kwargs["adapter_model"] == (
-        "oa_xai/grok-4.20-multi-agent-0309"
-    )
+    assert mock_responses.await_args.kwargs["adapter_model"] == model
+    assert _is_oa_xai_responses_model(model) is True
 
 
 @pytest.mark.asyncio
@@ -11873,13 +11842,24 @@ async def test_anthropic_xai_oauth_completion_adapter_uses_managed_oauth(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "public_model,upstream_model",
+    [
+        ("oa_xai/grok-4.3", "grok-4.3"),
+        ("oa_xai/grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning"),
+        ("oa_xai/grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning"),
+        ("oa_xai/grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309"),
+    ],
+)
 async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
+    public_model,
+    upstream_model,
     monkeypatch,
 ):
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "oa_xai/grok-4.20-multi-agent-0309",
+        "model": public_model,
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -11907,7 +11887,7 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
-            adapter_model="oa_xai/grok-4.20-multi-agent-0309",
+            adapter_model=public_model,
         )
 
     assert response is success_response
@@ -11921,7 +11901,7 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert call_kwargs["egress_credential_family"] == "xai"
     assert call_kwargs["expected_target_family"] == "xai"
     custom_body = call_kwargs["custom_body"]
-    assert custom_body["model"] == "grok-4.20-multi-agent-0309"
+    assert custom_body["model"] == upstream_model
     assert "api_key" not in custom_body
     assert "api_base" not in custom_body
     assert "custom_llm_provider" not in custom_body
@@ -11929,15 +11909,74 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert metadata["passthrough_route_family"] == (
         "anthropic_xai_oauth_responses_adapter"
     )
-    assert metadata["xai_oauth_public_model"] == (
-        "oa_xai/grok-4.20-multi-agent-0309"
-    )
-    assert metadata["xai_oauth_upstream_model"] == (
-        "xai/grok-4.20-multi-agent-0309"
-    )
+    assert metadata["xai_oauth_public_model"] == public_model
+    assert metadata["xai_oauth_upstream_model"] == f"xai/{upstream_model}"
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert "route:xai_oauth_api" in metadata["tags"]
     assert "route:anthropic_xai_oauth_responses_adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_xai_oauth_responses_adapter_streams_with_tools(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "oa_xai/grok-4.3",
+        "messages": [{"role": "user", "content": "use the tool"}],
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [
+            {
+                "name": "lookup",
+                "description": "Look up a value.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ],
+        "litellm_metadata": {"session_id": "claude-stream-session"},
+    }
+    upstream_response = StreamingResponse(
+        iter([b'data: {"type":"response.completed","response":{"output":[]}}\n\n']),
+        media_type="text/event-stream",
+    )
+    translated_stream = StreamingResponse(iter([b"ok"]), media_type="text/event-stream")
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_streaming_response_from_responses_stream",
+        return_value=translated_stream,
+    ) as mock_stream_builder:
+        response = await _handle_anthropic_xai_oauth_responses_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model="oa_xai/grok-4.3",
+        )
+
+    assert response is translated_stream
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["target"] == "https://api.x.ai/v1/responses"
+    assert call_kwargs["stream"] is True
+    custom_body = call_kwargs["custom_body"]
+    assert custom_body["model"] == "grok-4.3"
+    assert custom_body["stream"] is True
+    assert custom_body["tools"]
+    assert custom_body["litellm_metadata"]["xai_oauth_public_model"] == (
+        "oa_xai/grok-4.3"
+    )
+    mock_stream_builder.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -16060,12 +16099,24 @@ class TestOpenAIPassthroughRoute:
         assert "route:xai_oauth_api" in metadata["tags"]
 
     @pytest.mark.asyncio
-    async def test_openai_passthrough_oa_xai_multi_agent_uses_responses(
-        self, monkeypatch
+    @pytest.mark.parametrize(
+        "public_model,upstream_model",
+        [
+            ("oa_xai/grok-4.3", "grok-4.3"),
+            ("oa_xai/grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning"),
+            ("oa_xai/grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning"),
+            ("oa_xai/grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309"),
+        ],
+    )
+    async def test_openai_passthrough_oa_xai_models_use_responses(
+        self,
+        public_model,
+        upstream_model,
+        monkeypatch,
     ):
         monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
         body = {
-            "model": "oa_xai/grok-4.20-multi-agent-0309",
+            "model": public_model,
             "input": "hello",
         }
         mock_request = MagicMock(spec=Request)
@@ -16113,12 +16164,13 @@ class TestOpenAIPassthroughRoute:
         )
         assert call_args["_forward_headers"] is False
         prepared_body = mock_set_body.call_args.args[1]
-        assert prepared_body["model"] == "grok-4.20-multi-agent-0309"
+        assert prepared_body["model"] == upstream_model
         assert prepared_body["litellm_metadata"]["openai_passthrough_route_family"] == (
             "openai_responses"
         )
-        assert prepared_body["litellm_metadata"]["xai_oauth_public_model"] == (
-            "oa_xai/grok-4.20-multi-agent-0309"
+        assert prepared_body["litellm_metadata"]["xai_oauth_public_model"] == public_model
+        assert prepared_body["litellm_metadata"]["xai_oauth_upstream_model"] == (
+            f"xai/{upstream_model}"
         )
         assert "api_key" not in prepared_body
         assert "api_base" not in prepared_body
