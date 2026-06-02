@@ -1,3 +1,13 @@
+## 2026-06-02 workspace cleanup
+
+- Suggestion: add a lightweight scratch-file triage command that lists
+  untracked root `repro*`, `test_*`, and package-local one-off files, checks
+  whether each is imported or matched by pytest discovery, and emits a
+  keep/discard/archive recommendation.
+- How it would help: this would reduce time and risk when cleaning up after
+  investigation work by separating real repo artifacts from local repro scripts
+  before staging or deleting anything.
+
 ## 2026-06-01 D1-123
 
 - Suggestion: add a provider-cache repair mode that accepts a predicate such as
