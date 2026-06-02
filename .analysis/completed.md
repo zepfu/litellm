@@ -1,3 +1,41 @@
+## 2026-06-02
+
+- Workspace scratch cleanup and investigation intake
+  - Goal: decide whether the remaining untracked files should be committed or
+    discarded, and disposition the new root investigation intake before pushing
+    a clean repo state.
+  - Initiated: 2026-06-02 00:06:50 EDT.
+  - Completed: 2026-06-02 00:07:08 EDT.
+  - Duration: 18 seconds.
+  - Changed paths:
+    - `.analysis/investigations.md`
+    - `.analysis/investigation/investigate-codex-019e85db-7bd6-7e61-8ff0-b93d7e5440f2.md`
+    - `.analysis/completed.md`
+    - `suggestion.md`
+  - Discarded untracked scratch files:
+    - `litellm/proxy_auth/xai_credentials.py`
+    - `repro.py`
+    - `repro_is_llm_api_route.py`
+    - `repro_list.py`
+    - `reproduction.py`
+    - `test_gemini_grounding.py`
+    - `test_module_setattr.py`
+  - Breakdown:
+    - Classified the root `repro*` and `test_*` files as ad hoc print-based
+      scratch scripts rather than repo tests.
+    - Classified `litellm/proxy_auth/xai_credentials.py` as an unreferenced,
+      unexported, untested xAI OAuth credential wrapper and discarded it rather
+      than adding a new credential surface outside the D1-177 contract.
+    - Moved the new root investigation intake into `.analysis/investigation/`
+      and recorded it in `.analysis/investigations.md` as a context-only
+      external-dashboard read-only scope violation.
+  - Verification evidence:
+    - `.analysis/todo.md` still reports `No current non-deferred open items`.
+    - Root intake audit for `.analysis/handoff*`, `.analysis/request*`, and
+      `.analysis/investigate*` files returned no files after archival.
+    - `git status --short` returned clean before force-adding the ignored
+      investigation archive and ledger updates for commit.
+
 ## 2026-06-01
 
 - D1-177 xAI OAuth multi-agent model must route off chat completions

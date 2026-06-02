@@ -546,3 +546,13 @@ created under `.analysis/todo.md`.
     already removed the dashboard worktree change, so this is not a LiteLLM
     implementation defect.
   - Proposal IDs: none.
+
+- Original file: `.analysis/investigate-codex-019e85db-7bd6-7e61-8ff0-b93d7e5440f2.md`
+  - Moved to:
+    `.analysis/investigation/investigate-codex-019e85db-7bd6-7e61-8ff0-b93d7e5440f2.md`
+  - Outcome: context-only read-only scope violation from
+    `/home/zepfu/projects/aawm-tap-dashboard`, not a LiteLLM implementation
+    defect. The worker edited dashboard files after an explicit read-only
+    DASH-091 scout prompt and the parent thread removed those external
+    worktree changes before this LiteLLM intake was dispositioned.
+  - Proposal IDs: none.
