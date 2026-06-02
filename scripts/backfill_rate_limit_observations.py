@@ -215,6 +215,11 @@ class ClickHouseClient:
             "llm_provider-anthropic-ratelimit",
             "codex_response_headers",
             "x-codex-",
+            "xai_oauth_response_headers",
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-remaining-requests",
+            "x-ratelimit-limit-tokens",
+            "x-ratelimit-remaining-tokens",
         )
         marker_predicates = [
             f"positionUTF8(toString(o.metadata), {_quote_clickhouse_string(marker)}) > 0"
