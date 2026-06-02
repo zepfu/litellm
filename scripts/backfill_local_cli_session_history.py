@@ -57,6 +57,12 @@ SECRET_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 GIT_COMMAND_RE = re.compile(r"(?<!\S)git\s+(?P<verb>commit|push)\b", re.IGNORECASE)
+SENSITIVE_CONFIG_CHANGE_FIELDS = (
+    "changed_pre_commit_config",
+    "changed_env_file",
+    "changed_pyproject_toml",
+    "changed_gitignore",
+)
 
 READ_TOOL_NAMES = {
     "cat",
@@ -420,6 +426,35 @@ def _dedupe(values: Iterable[str]) -> list[str]:
     return result
 
 
+def _changed_file_basename(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().strip("'\"").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized:
+        return None
+    return normalized.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _sensitive_config_change_flags_from_paths(paths: Iterable[str]) -> dict[str, bool]:
+    flags = {field: False for field in SENSITIVE_CONFIG_CHANGE_FIELDS}
+    for path in _dedupe(str(path) for path in paths):
+        basename = _changed_file_basename(path)
+        if not basename:
+            continue
+        basename_lower = basename.lower()
+        if basename_lower in {".pre-commit-config.yaml", ".pre-commit-config.yml"}:
+            flags["changed_pre_commit_config"] = True
+        if basename_lower.startswith(".env"):
+            flags["changed_env_file"] = True
+        if basename_lower == "pyproject.toml":
+            flags["changed_pyproject_toml"] = True
+        if basename_lower == ".gitignore":
+            flags["changed_gitignore"] = True
+    return flags
+
+
 def _tool_kind(tool_name: str) -> str:
     normalized = tool_name.lower().replace("-", "_")
     if normalized in READ_TOOL_NAMES:
@@ -513,6 +548,7 @@ def _tool_summary(tool_activity: list[dict[str, Any]]) -> dict[str, Any]:
         "tool_names": _dedupe(names),
         "file_read_count": len(_dedupe(read_paths)),
         "file_modified_count": len(_dedupe(modified_paths)),
+        **_sensitive_config_change_flags_from_paths(modified_paths),
         "git_commit_count": git_commit_count,
         "git_push_count": git_push_count,
     }
@@ -795,6 +831,10 @@ def _base_record(
         "tool_names": summary["tool_names"],
         "file_read_count": summary["file_read_count"],
         "file_modified_count": summary["file_modified_count"],
+        "changed_pre_commit_config": summary["changed_pre_commit_config"],
+        "changed_env_file": summary["changed_env_file"],
+        "changed_pyproject_toml": summary["changed_pyproject_toml"],
+        "changed_gitignore": summary["changed_gitignore"],
         "git_commit_count": summary["git_commit_count"],
         "git_push_count": summary["git_push_count"],
         "response_cost_usd": response_cost_usd,
@@ -1501,6 +1541,10 @@ INSERT INTO public.session_history (
     tool_names,
     file_read_count,
     file_modified_count,
+    changed_pre_commit_config,
+    changed_env_file,
+    changed_pyproject_toml,
+    changed_gitignore,
     git_commit_count,
     git_push_count,
     response_cost_usd,
@@ -1518,7 +1562,7 @@ INSERT INTO public.session_history (
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s::jsonb, %s
+    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
 )
 ON CONFLICT (litellm_call_id) DO NOTHING
 """
@@ -1587,6 +1631,10 @@ def _history_payload(record: dict[str, Any]) -> tuple[Any, ...]:
         json.dumps(record.get("tool_names") or []),
         record.get("file_read_count") or 0,
         record.get("file_modified_count") or 0,
+        record.get("changed_pre_commit_config"),
+        record.get("changed_env_file"),
+        record.get("changed_pyproject_toml"),
+        record.get("changed_gitignore"),
         record.get("git_commit_count") or 0,
         record.get("git_push_count") or 0,
         record.get("response_cost_usd"),
