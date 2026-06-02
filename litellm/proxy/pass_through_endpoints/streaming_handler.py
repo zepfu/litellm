@@ -48,6 +48,12 @@ class PassThroughStreamingHandler:
     _CODEX_RATE_LIMIT_HEADER_NAMES = {
         "x-oai-request-id",
     }
+    _XAI_OAUTH_RATE_LIMIT_HEADER_PREFIXES = (
+        "x-ratelimit-",
+    )
+    _XAI_OAUTH_RATE_LIMIT_HEADER_NAMES = {
+        "retry-after",
+    }
 
     @staticmethod
     def _ensure_streaming_metadata(success_handler_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -107,6 +113,42 @@ class PassThroughStreamingHandler:
         return sanitized
 
     @staticmethod
+    def _sanitize_xai_oauth_rate_limit_headers(
+        response_headers: httpx.Headers,
+    ) -> Dict[str, str]:
+        sanitized: Dict[str, str] = {}
+        for header_name, header_value in response_headers.items():
+            normalized_name = str(header_name).lower()
+            if not (
+                normalized_name.startswith(
+                    PassThroughStreamingHandler._XAI_OAUTH_RATE_LIMIT_HEADER_PREFIXES
+                )
+                or normalized_name
+                in PassThroughStreamingHandler._XAI_OAUTH_RATE_LIMIT_HEADER_NAMES
+            ):
+                continue
+            sanitized[normalized_name] = str(header_value)
+        if sanitized:
+            sanitized["source"] = "xai_oauth_response_headers"
+        return sanitized
+
+    @staticmethod
+    def _is_xai_oauth_metadata(metadata: Dict[str, Any]) -> bool:
+        if metadata.get("xai_oauth_managed") is True:
+            return True
+        credential_family = str(metadata.get("credential_family") or "").lower()
+        route_family = str(
+            metadata.get("passthrough_route_family")
+            or metadata.get("route_family")
+            or ""
+        ).lower()
+        return (
+            credential_family == "xai_oauth"
+            or "xai_oauth" in route_family
+            or metadata.get("xai_oauth_public_model") is not None
+        )
+
+    @staticmethod
     def _record_upstream_rate_limit_headers_metadata(
         success_handler_kwargs: Optional[Dict[str, Any]],
         *,
@@ -117,6 +159,16 @@ class PassThroughStreamingHandler:
         metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
             success_handler_kwargs
         )
+        if (
+            custom_llm_provider == "xai"
+            and PassThroughStreamingHandler._is_xai_oauth_metadata(metadata)
+        ):
+            sanitized_headers = PassThroughStreamingHandler._sanitize_xai_oauth_rate_limit_headers(
+                response.headers
+            )
+            if sanitized_headers:
+                metadata["xai_oauth_response_headers"] = sanitized_headers
+            return
         if endpoint_type == EndpointType.ANTHROPIC or custom_llm_provider == "anthropic":
             sanitized_headers = PassThroughStreamingHandler._sanitize_anthropic_rate_limit_headers(
                 response.headers

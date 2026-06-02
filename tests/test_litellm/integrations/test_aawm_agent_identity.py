@@ -6773,6 +6773,155 @@ def test_build_rate_limit_observations_extracts_anthropic_exception_headers() ->
     assert observations[0]["used_percentage"] == 25.0
 
 
+def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> None:
+    kwargs = _base_kwargs(trace_name="oa-xai")
+    kwargs["model"] = "xai/grok-4.3"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_call_id"] = "call-xai-oauth-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-xai-oauth-rate-headers",
+            "credential_family": "xai_oauth",
+            "passthrough_route_family": "xai_oauth_api",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "provider_account_id": "acct_xai_user_123",
+            "shared_quota_family": "xai_grok_subscription",
+            "xai_oauth_response_headers": {
+                "source": "xai_oauth_response_headers",
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "97",
+                "x-ratelimit-limit-tokens": "15000000",
+                "x-ratelimit-remaining-tokens": "14925000",
+            },
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = "oa_xai/grok-4.3"
+    end_time = datetime(2026, 6, 2, 6, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"model": "xai/grok-4.3", "choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    request_observation = by_scope["requests"]
+    token_observation = by_scope["tokens"]
+    assert request_observation["source"] == "xai_oauth_response_headers"
+    assert request_observation["provider"] == "xai"
+    assert request_observation["client_family"] == "xai_oauth"
+    assert request_observation["model"] == "oa_xai/grok-4.3"
+    assert request_observation["quota_type"] == "requests"
+    assert request_observation["remaining_requests"] == 97
+    assert request_observation["used_requests"] == 3
+    assert request_observation["remaining_pct"] == pytest.approx(97.0)
+    assert request_observation["used_percentage"] == pytest.approx(3.0)
+    assert request_observation["provider_resets_at"] is None
+    assert request_observation["evidence"]["reset_absent"] is True
+    assert request_observation["account_hash"] == aawm_agent_identity._short_hash(
+        b"acct_xai_user_123"
+    )
+    assert request_observation["metadata"]["xai_oauth_public_model"] == "oa_xai/grok-4.3"
+    assert token_observation["quota_type"] == "tokens"
+    assert token_observation["remaining_pct"] == pytest.approx(99.5)
+    assert token_observation["used_requests"] == 75000
+    assert token_observation["raw_provider_fields"]["quota_unit_interpretation"] == "tokens"
+
+    request_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+        request_observation
+    )
+    token_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+        token_observation
+    )
+    assert request_payload[1] == "xai_oauth"
+    assert request_payload[4] == "xai"
+    assert request_payload[5] == "oa_xai/grok-4.3"
+    assert request_payload[6] == "xai_oauth_requests:requests"
+    assert request_payload[8] == "requests"
+    assert request_payload[10] == pytest.approx(97.0)
+    assert token_payload[6] == "xai_oauth_tokens:tokens"
+    assert token_payload[8] == "tokens"
+    assert token_payload[10] == pytest.approx(99.5)
+    assert request_payload[6] != "xai_grok_build_monthly_requests:requests"
+
+
+def test_build_rate_limit_observations_skips_xai_headers_without_oauth_context() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "xai/grok-4.3"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_call_id"] = "call-xai-non-oauth-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-xai-non-oauth-rate-headers",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "xai_oauth_response_headers": {
+                "source": "xai_oauth_response_headers",
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "97",
+            },
+        }
+    )
+    end_time = datetime(2026, 6, 2, 6, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"model": "xai/grok-4.3", "choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert observations == []
+
+
+def test_build_rate_limit_observations_extracts_xai_oauth_hidden_headers() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code")
+    kwargs["model"] = "xai/grok-4.3"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_call_id"] = "call-xai-oauth-hidden-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-xai-oauth-hidden-rate-headers",
+            "credential_family": "xai_oauth",
+            "passthrough_route_family": "anthropic_xai_oauth_completion_adapter",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "shared_quota_family": "xai_grok_subscription",
+        }
+    )
+    result = SimpleNamespace(
+        _hidden_params={
+            "headers": {
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "96",
+                "x-ratelimit-limit-tokens": "200000",
+                "x-ratelimit-remaining-tokens": "198000",
+            }
+        },
+        model="xai/grok-4.3",
+    )
+    end_time = datetime(2026, 6, 2, 6, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=result,
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    assert by_scope["requests"]["source"] == "xai_oauth_response_headers"
+    assert by_scope["requests"]["client_family"] == "xai_oauth"
+    assert by_scope["requests"]["model"] == "oa_xai/grok-4.3"
+    assert by_scope["requests"]["remaining_pct"] == pytest.approx(96.0)
+    assert by_scope["tokens"]["remaining_pct"] == pytest.approx(99.0)
+
+
 def test_build_rate_limit_observations_extracts_google_quota_buckets() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gemini/gemini-2.5-flash"

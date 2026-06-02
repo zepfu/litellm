@@ -4376,6 +4376,9 @@ _AAWM_RATE_LIMIT_METADATA_KEYS = (
     "route_family",
     "auth_mode",
     "credential_family",
+    "xai_oauth_managed",
+    "xai_oauth_public_model",
+    "xai_oauth_upstream_model",
     "xai_quota_family",
     "shared_quota_family",
 )
@@ -4760,6 +4763,15 @@ def _infer_rate_limit_client_family(
         )
         if value is not None
     ).lower()
+    credential_family = str(metadata.get("credential_family") or "").lower()
+    if (
+        "xai_oauth" in source_lower
+        or credential_family == "xai_oauth"
+        or metadata.get("xai_oauth_managed") is True
+        or metadata.get("xai_oauth_public_model") is not None
+        or "xai_oauth" in route_family
+    ):
+        return "xai_oauth"
     if (
         "google_code_assist" in source_lower
         or "google_retrieve_user_quota" in source_lower
@@ -5283,6 +5295,7 @@ def _rate_limit_candidate_roots(kwargs: Dict[str, Any], result: Any) -> List[Any
         "codex_response_headers",
         "anthropic_response_headers",
         "anthropic_rate_limit_headers",
+        "xai_oauth_response_headers",
         "google_retrieve_user_quota",
         "google_generate_content_error",
         "google_user_quota",
@@ -5877,6 +5890,200 @@ def _first_quota_float(candidate: Dict[str, Any], *keys: str) -> Optional[float]
     return None
 
 
+def _looks_like_xai_oauth_rate_limit_context(context: Dict[str, Any]) -> bool:
+    metadata = context.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    credential_family = str(metadata.get("credential_family") or "").lower()
+    route_family = str(
+        metadata.get("passthrough_route_family")
+        or metadata.get("route_family")
+        or context.get("route_family")
+        or ""
+    ).lower()
+    model = str(context.get("model") or "").lower()
+    request_model = str(context.get("request_model") or "").lower()
+    return (
+        credential_family == "xai_oauth"
+        or metadata.get("xai_oauth_managed") is True
+        or metadata.get("xai_oauth_public_model") is not None
+        or "xai_oauth" in route_family
+        or model.startswith("oa_xai/")
+        or request_model.startswith("oa_xai/")
+    )
+
+
+def _extract_xai_oauth_account_hash(metadata: Dict[str, Any]) -> Optional[str]:
+    for key in ("xai_oauth_account_hash", "provider_account_hash"):
+        value = _clean_non_empty_string(metadata.get(key))
+        if value:
+            return value
+    for key in (
+        "xai_oauth_account_id",
+        "provider_account_id",
+        "organization_id",
+        "org_id",
+    ):
+        value = _clean_non_empty_string(metadata.get(key))
+        if value:
+            return _short_hash(value.encode("utf-8"))
+    return None
+
+
+def _xai_oauth_header_remaining_pct(
+    total: Optional[int],
+    remaining: Optional[int],
+) -> Optional[float]:
+    if total is None or remaining is None or total <= 0:
+        return None
+    return round(max(0.0, min(100.0, (remaining / total) * 100.0)), 3)
+
+
+def _extract_xai_oauth_header_rate_limit_observations(
+    kwargs: Dict[str, Any],
+    result: Any,
+    observed_at: Any,
+) -> List[Dict[str, Any]]:
+    context = _build_rate_limit_context(
+        kwargs,
+        result,
+        observed_at,
+        "xai_oauth_response_headers",
+    )
+    if context.get("provider") != "xai" or not _looks_like_xai_oauth_rate_limit_context(
+        context
+    ):
+        return []
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    account_hash = _extract_xai_oauth_account_hash(metadata)
+    model = _clean_non_empty_string(metadata.get("xai_oauth_public_model")) or (
+        _clean_non_empty_string(context.get("model"))
+        if context.get("model") != "unknown"
+        else None
+    )
+    observations: List[Dict[str, Any]] = []
+    for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        source = str(candidate.get("source") or "").lower()
+        has_xai_header = any(
+            isinstance(key, str) and key.lower().startswith("x-ratelimit-")
+            for key in list(candidate.keys())
+        )
+        if not has_xai_header and source != "xai_oauth_response_headers":
+            continue
+
+        for limit_scope, total_key, remaining_key, reset_keys in (
+            (
+                "requests",
+                "x-ratelimit-limit-requests",
+                "x-ratelimit-remaining-requests",
+                (
+                    "x-ratelimit-reset-requests",
+                    "x-ratelimit-reset-request",
+                    "x-ratelimit-reset",
+                ),
+            ),
+            (
+                "tokens",
+                "x-ratelimit-limit-tokens",
+                "x-ratelimit-remaining-tokens",
+                (
+                    "x-ratelimit-reset-tokens",
+                    "x-ratelimit-reset-token",
+                    "x-ratelimit-reset",
+                ),
+            ),
+        ):
+            total = _safe_int(_get_rate_limit_header_value(candidate, total_key))
+            remaining = _safe_int(_get_rate_limit_header_value(candidate, remaining_key))
+            reset_value = _get_rate_limit_header_value(candidate, *reset_keys)
+            reset_hint_seconds = _parse_reset_hint_seconds(
+                _get_rate_limit_header_value(candidate, "retry-after")
+            )
+            if (
+                total is None
+                and remaining is None
+                and reset_value is None
+                and reset_hint_seconds is None
+            ):
+                continue
+            if total is not None and total <= 0:
+                continue
+            provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
+                reset_value,
+                context["observed_at"],
+                reset_hint_seconds,
+            )
+            if stale_reset:
+                continue
+            used = (
+                max(0, total - remaining)
+                if total is not None and remaining is not None
+                else None
+            )
+            remaining_pct = _xai_oauth_header_remaining_pct(total, remaining)
+            used_percentage = (
+                round(max(0.0, min(100.0, 100.0 - remaining_pct)), 3)
+                if remaining_pct is not None
+                else None
+            )
+            exhausted = remaining is not None and remaining <= 0
+            observations.append(
+                _finalize_rate_limit_observation(
+                    {
+                        "observed_at": context["observed_at"],
+                        "source": "xai_oauth_response_headers",
+                        "provider": "xai",
+                        "client_family": "xai_oauth",
+                        "account_hash": account_hash,
+                        "limit_id": f"xai_oauth_{limit_scope}",
+                        "limit_name": f"xAI OAuth {limit_scope} rate limit",
+                        "limit_scope": limit_scope,
+                        "quota_type": limit_scope,
+                        "provider_resets_at": provider_resets_at,
+                        "remaining_pct": remaining_pct,
+                        "used_percentage": used_percentage,
+                        "remaining_requests": remaining,
+                        "used_requests": used,
+                        "total_requests": total,
+                        "status": "quota_exhausted" if exhausted else "observed",
+                        "exhausted": exhausted,
+                        "exhaustion_kind": "rate_limit" if exhausted else None,
+                        "reset_hint_seconds": reset_hint_seconds,
+                        "model": model,
+                        "model_family": "grok",
+                        "raw_provider_fields": {
+                            total_key: _get_rate_limit_header_value(candidate, total_key),
+                            remaining_key: _get_rate_limit_header_value(
+                                candidate,
+                                remaining_key,
+                            ),
+                            "reset": reset_value,
+                            "retry-after": _get_rate_limit_header_value(
+                                candidate,
+                                "retry-after",
+                            ),
+                            "quota_unit": f"xai_oauth_{limit_scope}",
+                            "quota_unit_interpretation": limit_scope,
+                        },
+                        "evidence": {
+                            "signals": ["xai_oauth_response_rate_limit_headers"],
+                            "provider_fields": [
+                                total_key,
+                                remaining_key,
+                                *reset_keys,
+                                "retry-after",
+                            ],
+                            "reset_absent": (
+                                reset_value is None and reset_hint_seconds is None
+                            ),
+                        },
+                    },
+                    context,
+                )
+            )
+    return _dedupe_rate_limit_observations(observations)
+
+
 def _grok_billing_quota_value(value: Any) -> Optional[float]:
     if isinstance(value, dict):
         value = value.get("val")
@@ -6454,6 +6661,7 @@ def _build_rate_limit_observations(
     observations.extend(_extract_codex_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_codex_usage_limit_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_anthropic_header_rate_limit_observations(kwargs, result, observed_at))
+    observations.extend(_extract_xai_oauth_header_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_grok_billing_observations(kwargs, result, observed_at))
     observations.extend(_extract_openrouter_free_error_observations(kwargs, result, observed_at))
     observations.extend(_extract_google_quota_observations(kwargs, result, observed_at))

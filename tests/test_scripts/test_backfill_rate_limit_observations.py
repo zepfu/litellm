@@ -215,3 +215,44 @@ def test_should_extract_anthropic_quota_from_structured_metadata() -> None:
     assert observation["client_family"] == "claude"
     assert observation["limit_scope"] == "5h"
     assert observation["used_percentage"] == 42.0
+
+
+def test_should_extract_xai_oauth_quota_from_structured_metadata() -> None:
+    row = {
+        "observation_id": "obs-xai-oauth",
+        "observation_trace_id": "trace-xai-oauth",
+        "observation_start_time": "2026-06-02T06:00:00Z",
+        "observation_end_time": "2026-06-02T06:00:01Z",
+        "observation_name": "litellm-pass_through_endpoint",
+        "observation_metadata": {
+            "credential_family": "xai_oauth",
+            "passthrough_route_family": "xai_oauth_api",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "xai_oauth_response_headers": {
+                "source": "xai_oauth_response_headers",
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "97",
+                "x-ratelimit-limit-tokens": "15000000",
+                "x-ratelimit-remaining-tokens": "14925000",
+            },
+        },
+        "observation_input": None,
+        "observation_output": None,
+        "observation_model": "xai/grok-4.3",
+        "observation_environment": "dev",
+    }
+
+    record = quota_backfill.build_record_from_clickhouse_row(row)
+
+    assert record is not None
+    observations = record["rate_limit_observations"]
+    assert len(observations) == 2
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    assert by_scope["requests"]["provider"] == "xai"
+    assert by_scope["requests"]["client_family"] == "xai_oauth"
+    assert by_scope["requests"]["model"] == "oa_xai/grok-4.3"
+    assert by_scope["requests"]["remaining_pct"] == 97.0
+    assert by_scope["tokens"]["quota_type"] == "tokens"
+    assert by_scope["tokens"]["remaining_pct"] == 99.5
