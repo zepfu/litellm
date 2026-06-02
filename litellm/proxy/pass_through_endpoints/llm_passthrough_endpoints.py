@@ -9412,6 +9412,11 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
                 "openai_adapter_parallel_instruction_rewritten_chars"
             ),
         )
+    translated_request_body, _xai_unsupported_request_params = (
+        _drop_unsupported_codex_request_params_from_request_body(
+            translated_request_body
+        )
+    )
 
     prepared_oa_xai, target_base_url, xai_api_key = (
         await _prepare_oa_xai_passthrough_request(translated_request_body)
@@ -9525,6 +9530,11 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
                 "openai_adapter_parallel_instruction_rewritten_chars"
             ),
         )
+    translated_request_body, _grok_unsupported_request_params = (
+        _drop_unsupported_codex_request_params_from_request_body(
+            translated_request_body
+        )
+    )
 
     (
         prepared_grok_native,

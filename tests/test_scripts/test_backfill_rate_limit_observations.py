@@ -236,6 +236,9 @@ def test_should_extract_xai_oauth_quota_from_structured_metadata() -> None:
                 "x-ratelimit-remaining-requests": "97",
                 "x-ratelimit-limit-tokens": "15000000",
                 "x-ratelimit-remaining-tokens": "14925000",
+                "config": {
+                    "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+                },
             },
         },
         "observation_input": None,
@@ -254,5 +257,11 @@ def test_should_extract_xai_oauth_quota_from_structured_metadata() -> None:
     assert by_scope["requests"]["client_family"] == "xai_oauth"
     assert by_scope["requests"]["model"] == "oa_xai/grok-4.3"
     assert by_scope["requests"]["remaining_pct"] == 97.0
+    assert by_scope["requests"]["provider_resets_at"] == datetime(
+        2026, 7, 1, tzinfo=timezone.utc
+    )
     assert by_scope["tokens"]["quota_type"] == "tokens"
     assert by_scope["tokens"]["remaining_pct"] == 99.5
+    assert by_scope["tokens"]["provider_resets_at"] == datetime(
+        2026, 7, 1, tzinfo=timezone.utc
+    )

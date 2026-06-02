@@ -31,6 +31,7 @@ _DEFAULT_GROK_XAI_OAUTH_AUTH_PATH = "~/.grok/auth.json"
 _GROK_NATIVE_OAUTH_MODELS = frozenset(
     {
         "grok-build",
+        "grok-build-0.1",
         "grok-composer-2.5-fast",
     }
 )
