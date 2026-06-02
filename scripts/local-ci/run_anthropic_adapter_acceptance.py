@@ -348,14 +348,18 @@ def _apply_target_profile_to_config(
         metadata_required_equals['litellm_environment'] = profile[
             'expected_trace_environment'
         ]
-        metadata_required_equals.setdefault('tenant_id', tenant_id)
+        require_trace_user_id = (
+            updated_case.get('require_trace_user_id', True) is not False
+        )
+        if require_trace_user_id:
+            metadata_required_equals.setdefault('tenant_id', tenant_id)
         session_history_validation['metadata_required_equals'] = (
             metadata_required_equals
         )
         metadata_required_truthy = list(
             session_history_validation.get('metadata_required_truthy') or []
         )
-        if 'tenant_id_source' not in metadata_required_truthy:
+        if require_trace_user_id and 'tenant_id_source' not in metadata_required_truthy:
             metadata_required_truthy.append('tenant_id_source')
         session_history_validation['metadata_required_truthy'] = metadata_required_truthy
         expected_rows = session_history_validation.get('expected_rows')
@@ -365,7 +369,7 @@ def _apply_target_profile_to_config(
                 _with_expected_row_tenant(row, tenant_id)
                 for row in expected_rows
             ]
-        else:
+        elif require_trace_user_id:
             session_history_validation.setdefault('expected_tenant_id', tenant_id)
         session_history_validation.setdefault('require_runtime_identity', True)
         updated_case['session_history_validation'] = session_history_validation

@@ -3363,6 +3363,44 @@ def test_build_session_history_record_does_not_infer_config_changes_from_reads_o
     assert "super-secret" not in json.dumps(command_activity)
 
 
+def test_sensitive_config_change_flags_match_nested_paths_and_reject_lookalikes() -> None:
+    flags = aawm_agent_identity._sensitive_config_change_flags_from_paths(
+        [
+            "services/api/.pre-commit-config.yml",
+            "packages/backend/.env.production",
+            "src/python/pyproject.toml",
+            "worktrees/example/.gitignore",
+            "notes.env.example.txt",
+            "pyproject.toml.bak",
+            "not-.gitignore",
+            ".pre-commit-config.yaml.bak",
+        ]
+    )
+
+    assert flags == {
+        "changed_pre_commit_config": True,
+        "changed_env_file": True,
+        "changed_pyproject_toml": True,
+        "changed_gitignore": True,
+    }
+
+    lookalike_flags = aawm_agent_identity._sensitive_config_change_flags_from_paths(
+        [
+            "notes.env.example.txt",
+            "pyproject.toml.bak",
+            "not-.gitignore",
+            ".pre-commit-config.yaml.bak",
+        ]
+    )
+
+    assert lookalike_flags == {
+        "changed_pre_commit_config": False,
+        "changed_env_file": False,
+        "changed_pyproject_toml": False,
+        "changed_gitignore": False,
+    }
+
+
 @pytest.mark.parametrize(
     ("trace_name", "provider", "model"),
     [
@@ -3396,12 +3434,53 @@ def test_build_session_history_record_flags_config_changes_across_agent_families
                     "role": "assistant",
                     "tool_calls": [
                         {
+                            "id": "tool-pre-commit",
+                            "type": "function",
+                            "function": {
+                                "name": "apply_patch",
+                                "arguments": json.dumps(
+                                    {
+                                        "patch": (
+                                            "*** Begin Patch\n"
+                                            "*** Update File: .pre-commit-config.yaml\n"
+                                            "@@\n"
+                                            "+repos: []\n"
+                                            "*** End Patch\n"
+                                        )
+                                    }
+                                ),
+                            },
+                        },
+                        {
+                            "id": "tool-env",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {"file_path": "config/.env.test", "content": "x=1"}
+                                ),
+                            },
+                        },
+                        {
                             "id": "tool-pyproject",
                             "type": "function",
                             "function": {
                                 "name": "Write",
                                 "arguments": json.dumps(
-                                    {"file_path": "pyproject.toml", "content": "x = 1"}
+                                    {
+                                        "file_path": "packages/example/pyproject.toml",
+                                        "content": "x = 1",
+                                    }
+                                ),
+                            },
+                        },
+                        {
+                            "id": "tool-gitignore",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {"file_path": "repo/.gitignore", "content": ".env\n"}
                                 ),
                             },
                         }
@@ -3420,10 +3499,10 @@ def test_build_session_history_record_flags_config_changes_across_agent_families
 
     assert record is not None
     assert record["provider"] == provider
+    assert record["changed_pre_commit_config"] is True
+    assert record["changed_env_file"] is True
     assert record["changed_pyproject_toml"] is True
-    assert record["changed_pre_commit_config"] is False
-    assert record["changed_env_file"] is False
-    assert record["changed_gitignore"] is False
+    assert record["changed_gitignore"] is True
 
 
 def test_build_session_history_record_recovers_anthropic_count_tokens_result() -> None:

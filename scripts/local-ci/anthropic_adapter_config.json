@@ -692,17 +692,20 @@
         "expected_provider": "xai",
         "expected_model": "grok-build",
         "expected_client_name": "grok-build",
-        "client_user_agent_contains": "grok/",
+        "client_user_agent_contains": "grok-shell/",
         "metadata_required_equals": {
           "trace_environment": "dev",
           "litellm_environment": "dev",
           "client_name": "grok-build",
-          "passthrough_route_family": "grok_cli_chat_proxy",
-          "grok_cli_chat_proxy": true,
-          "grok_model_override": "grok-build",
-          "model_group": "grok-build"
+          "passthrough_route_family": "grok_cli_chat_proxy"
         },
         "metadata_required_truthy": ["request_tags", "client_version"],
+        "required_equals": {
+          "changed_pre_commit_config": false,
+          "changed_env_file": false,
+          "changed_pyproject_toml": false,
+          "changed_gitignore": false
+        },
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,
@@ -749,17 +752,20 @@
         "expected_provider": "xai",
         "expected_model": "grok-composer-2.5-fast",
         "expected_client_name": "grok-build",
-        "client_user_agent_contains": "grok/",
+        "client_user_agent_contains": "grok-shell/",
         "metadata_required_equals": {
           "trace_environment": "dev",
           "litellm_environment": "dev",
           "client_name": "grok-build",
-          "passthrough_route_family": "grok_cli_chat_proxy",
-          "grok_cli_chat_proxy": true,
-          "grok_model_override": "grok-composer-2.5-fast",
-          "model_group": "grok-composer-2.5-fast"
+          "passthrough_route_family": "grok_cli_chat_proxy"
         },
         "metadata_required_truthy": ["request_tags", "client_version"],
+        "required_equals": {
+          "changed_pre_commit_config": false,
+          "changed_env_file": false,
+          "changed_pyproject_toml": false,
+          "changed_gitignore": false
+        },
         "minimums": {
           "input_tokens": 1,
           "output_tokens": 1,
