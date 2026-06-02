@@ -3066,6 +3066,97 @@ class TestGoogleAdapterRequestShapePolicy:
         assert headers["anthropic-ratelimit-unified-5h-utilization"] == "0.42"
         assert "authorization" not in headers
 
+    def test_streaming_handler_records_xai_oauth_rate_limit_headers(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "credential_family": "xai_oauth",
+                    "passthrough_route_family": "xai_oauth_api",
+                    "xai_oauth_managed": True,
+                }
+            }
+        }
+        response = httpx.Response(
+            status_code=200,
+            headers={
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "97",
+                "x-ratelimit-limit-tokens": "15000000",
+                "x-ratelimit-remaining-tokens": "14925000",
+                "retry-after": "60",
+                "authorization": "Bearer should-not-be-logged",
+                "x-request-id": "req_should_not_be_logged",
+            },
+        )
+
+        PassThroughStreamingHandler._record_upstream_rate_limit_headers_metadata(
+            kwargs,
+            response=response,
+            endpoint_type=EndpointType.OPENAI,
+            custom_llm_provider="xai",
+        )
+
+        headers = kwargs["litellm_params"]["metadata"]["xai_oauth_response_headers"]
+        assert headers["source"] == "xai_oauth_response_headers"
+        assert headers["x-ratelimit-limit-requests"] == "100"
+        assert headers["x-ratelimit-remaining-tokens"] == "14925000"
+        assert headers["retry-after"] == "60"
+        assert "authorization" not in headers
+        assert "x-request-id" not in headers
+
+    def test_success_handler_records_nonstream_xai_oauth_rate_limit_headers(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "credential_family": "xai_oauth",
+                    "passthrough_route_family": "xai_oauth_api",
+                    "xai_oauth_public_model": "oa_xai/grok-4.3",
+                }
+            }
+        }
+        response = httpx.Response(
+            status_code=200,
+            headers={
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "97",
+                "x-ratelimit-limit-tokens": "15000000",
+                "x-ratelimit-remaining-tokens": "14925000",
+                "authorization": "Bearer should-not-be-logged",
+            },
+        )
+
+        PassThroughEndpointLogging()._record_upstream_rate_limit_headers_metadata(
+            kwargs,
+            httpx_response=response,
+            url_route="https://api.x.ai/v1/chat/completions",
+            custom_llm_provider="xai",
+        )
+
+        headers = kwargs["litellm_params"]["metadata"]["xai_oauth_response_headers"]
+        assert headers["source"] == "xai_oauth_response_headers"
+        assert headers["x-ratelimit-remaining-requests"] == "97"
+        assert headers["x-ratelimit-limit-tokens"] == "15000000"
+        assert "authorization" not in headers
+
+    def test_success_handler_skips_xai_rate_limit_headers_without_oauth_metadata(self):
+        kwargs = {"litellm_params": {"metadata": {"client_name": "grok-build"}}}
+        response = httpx.Response(
+            status_code=200,
+            headers={
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "97",
+            },
+        )
+
+        PassThroughEndpointLogging()._record_upstream_rate_limit_headers_metadata(
+            kwargs,
+            httpx_response=response,
+            url_route="https://api.x.ai/v1/chat/completions",
+            custom_llm_provider="xai",
+        )
+
+        assert "xai_oauth_response_headers" not in kwargs["litellm_params"]["metadata"]
+
     def test_success_handler_normalizes_xai_embedding_passthrough_payload(self):
         from datetime import datetime
 
