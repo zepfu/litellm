@@ -130,6 +130,19 @@ class TestXAICostCalculator:
         assert math.isclose(prompt_cost, expected_prompt_cost, rel_tol=1e-10)
         assert math.isclose(completion_cost, expected_completion_cost, rel_tol=1e-10)
 
+    def test_grok_composer_25_fast_uses_cursor_pricing(self):
+        """Test Cursor-published pricing for Grok Composer 2.5 Fast."""
+        usage = Usage(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
+
+        prompt_cost, completion_cost = cost_per_token(
+            model="grok-composer-2.5-fast",
+            usage=usage,
+        )
+
+        assert math.isclose(prompt_cost, 1000 * 3e-6, rel_tol=1e-10)
+        assert math.isclose(completion_cost, 200 * 1.5e-5, rel_tol=1e-10)
+        assert prompt_cost + completion_cost > 0
+
     def test_grok_3_fast_beta_cost_calculation(self):
         """Test cost calculation for grok-3-fast-beta model."""
         usage = Usage(
