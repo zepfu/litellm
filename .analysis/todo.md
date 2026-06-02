@@ -99,6 +99,80 @@ Deferred work lives in `.analysis/todo.deferred.md`.
     - If this changes reporting/observability schema fields, create the
       required sibling dashboard-shell handoff before completion.
 
+- D1-179 validate xAI OAuth quota details in provider rate limits
+  - Added: 2026-06-02T00:25:11-04:00
+  - Goal: validate and, if needed, implement collection and exposure of quota
+    details for the `oa_xai/*` managed OAuth path so native Codex/OpenAI and
+    native Anthropic traffic can appear in provider rate-limit telemetry with
+    semantics comparable to Grok Build OIDC/native traffic. The target surface
+    is provider rate limits backed by `public.rate_limit_observations`, not
+    only `session_history` quota-family metadata.
+  - Main references:
+    - D1-177 in `.analysis/completed.md`: the live multi-agent OAuth smoke
+      recorded `shared_quota_family=xai_grok_subscription` in
+      `public.session_history`, but the exact
+      `public.rate_limit_observations` query for that session returned no
+      rows because the table currently records provider quota headers only.
+    - D1-103/D1-107 in `.analysis/completed.md`: Grok Build `/grok/v1/billing`
+      payloads are normalized into provider rate-limit rows with
+      `provider=xai`, `client=grok-build`, `model=grok-build`,
+      `quota_key=xai_grok_build_monthly_requests:requests`,
+      `quota_type=requests`, `source=grok_billing`, and a billing-period
+      reset timestamp.
+    - D1-173 and D1-107 in `.analysis/completed.md`: native Grok Build
+      pass-through traffic carries `passthrough_route_family=grok_cli_chat_proxy`
+      and already has a test/live contract for Grok billing quota metadata.
+    - `litellm/llms/xai/oauth.py` owns `oa_xai/*` mapping and managed OAuth
+      metadata; `litellm/integrations/aawm_agent_identity.py` and
+      `.wheel-build/aawm_litellm_callbacks/agent_identity.py` own normalized
+      rate-limit observation capture.
+    - `litellm/proxy/pass_through_endpoints/success_handler.py`,
+      `scripts/backfill_rate_limit_observations.py`,
+      `tests/test_litellm/integrations/test_aawm_agent_identity.py`, and
+      `tests/test_scripts/test_backfill_rate_limit_observations.py` cover the
+      current provider-rate-limit ingestion and backfill paths.
+  - Acceptance evidence:
+    - Inventory the exact quota signals available on the xAI OAuth path from
+      live native Codex/OpenAI and native Anthropic adapter traffic: response
+      headers, response bodies, billing endpoint access, OAuth account
+      metadata, or absence of all quota-bearing fields. Do not infer parity
+      from `shared_quota_family` alone.
+    - Add focused offline tests proving any xAI OAuth quota headers, billing
+      payloads, or equivalent managed-OAuth quota metadata are parsed into the
+      same normalized provider-rate-limit semantics used by Grok Build OIDC
+      where possible, including stable `provider`, `client`, `model`,
+      `quota_key`, `quota_type`, `remaining_pct`, `expected_reset_at`,
+      `source`, account hashing, and duplicate-suppression behavior.
+    - Run live dev-proxy smokes through the native Codex/OpenAI passthrough
+      and native Anthropic adapter using only a LiteLLM client key for at
+      least one chat-capable `oa_xai/*` model and the Responses-backed
+      `oa_xai/grok-4.20-multi-agent-0309` model.
+    - Query exact `aawm_tristore.public.session_history` rows for those live
+      session IDs and verify public `oa_xai/*` model/model_group semantics,
+      `xai_oauth_*` metadata, adapter route metadata, and
+      `shared_quota_family=xai_grok_subscription`.
+    - Query exact `aawm_tristore.public.rate_limit_observations` rows for the
+      same sessions or latest matching xAI OAuth quota snapshots and verify
+      they are visible to the provider-rate-limit surface. If xAI OAuth does
+      not expose quota headers or billing data, record the live negative
+      evidence explicitly and keep the provider-rate-limit surface honest by
+      exposing only the closest available quota-family/status metadata.
+    - If new columns, quota keys, client names, or interpretation rules are
+      added for provider rate limits, create the required sibling
+      dashboard-shell handoff before marking this complete.
+  - Known hazards:
+    - Do not silently mix Grok Build OIDC quota keys with `oa_xai/*` OAuth
+      quota keys unless live evidence proves they are the same account and
+      reset boundary.
+    - Do not expose managed xAI OAuth bearer tokens, account identifiers, or
+      raw billing payloads in logs, database rows, dashboard payloads, or test
+      fixtures; hash account identifiers consistently.
+    - Provider-rate-limit rows should remain normalized snapshots, not raw
+      per-request dumps, and should preserve existing duplicate-suppression
+      behavior.
+    - Native Codex/OpenAI and Anthropic adapter request paths may surface
+      different response metadata; validate both before claiming coverage.
+
 ## Proposals (Pending Operator Feedback)
 
 No current proposals.
