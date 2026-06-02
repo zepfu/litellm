@@ -5979,6 +5979,56 @@ def _xai_oauth_header_remaining_pct(
     return round(max(0.0, min(100.0, (remaining / total) * 100.0)), 3)
 
 
+def _next_utc_month_start(value: Any) -> Optional[datetime]:
+    observed_dt = _normalize_datetime(value)
+    if observed_dt is None:
+        return None
+    observed_dt = observed_dt.astimezone(timezone.utc)
+    if observed_dt.month == 12:
+        return datetime(observed_dt.year + 1, 1, 1, tzinfo=timezone.utc)
+    return datetime(observed_dt.year, observed_dt.month + 1, 1, tzinfo=timezone.utc)
+
+
+def _is_xai_oauth_subscription_quota_context(metadata: Dict[str, Any]) -> bool:
+    quota_family = str(
+        metadata.get("xai_quota_family") or metadata.get("shared_quota_family") or ""
+    ).strip().lower()
+    return (
+        quota_family == "xai_grok_subscription"
+        or metadata.get("grok_subscription_quota_shared") is True
+    )
+
+
+def _extract_xai_oauth_billing_period_end(
+    *,
+    candidate: Dict[str, Any],
+    metadata: Dict[str, Any],
+    observed_at: Any,
+) -> Tuple[Optional[datetime], Optional[str]]:
+    for source, value in (
+        ("payload_billing_period_end", candidate.get("billingPeriodEnd")),
+        (
+            "payload_config_billing_period_end",
+            _maybe_get_path(candidate, "config", "billingPeriodEnd"),
+        ),
+        ("metadata_billing_period_end", metadata.get("billingPeriodEnd")),
+        (
+            "metadata_xai_oauth_billing_period_end",
+            metadata.get("xai_oauth_billing_period_end"),
+        ),
+    ):
+        parsed = _parse_provider_timestamp(value)
+        if parsed is not None:
+            return parsed, source
+
+    if _is_xai_oauth_subscription_quota_context(metadata):
+        fallback = _next_utc_month_start(observed_at)
+        if fallback is not None:
+            return fallback, "xai_grok_subscription_month_boundary"
+
+    return None, None
+
+
 def _extract_xai_oauth_header_rate_limit_observations(
     kwargs: Dict[str, Any],
     result: Any,
@@ -6055,6 +6105,15 @@ def _extract_xai_oauth_header_rate_limit_observations(
             )
             if stale_reset:
                 continue
+            reset_source = "response_header" if provider_resets_at is not None else None
+            if provider_resets_at is None and reset_hint_seconds is None:
+                provider_resets_at, reset_source = _extract_xai_oauth_billing_period_end(
+                    candidate=candidate,
+                    metadata=metadata,
+                    observed_at=context["observed_at"],
+                )
+            elif reset_hint_seconds is not None and provider_resets_at is not None:
+                reset_source = "retry_after"
             used = (
                 max(0, total - remaining)
                 if total is not None and remaining is not None
@@ -6078,6 +6137,7 @@ def _extract_xai_oauth_header_rate_limit_observations(
                         "limit_id": f"xai_oauth_{limit_scope}",
                         "limit_name": f"xAI OAuth {limit_scope} rate limit",
                         "limit_scope": limit_scope,
+                        "quota_period": "monthly" if provider_resets_at is not None else None,
                         "quota_type": limit_scope,
                         "provider_resets_at": provider_resets_at,
                         "remaining_pct": remaining_pct,
@@ -6102,6 +6162,12 @@ def _extract_xai_oauth_header_rate_limit_observations(
                                 candidate,
                                 "retry-after",
                             ),
+                            "billingPeriodEnd": _json_safe_rate_limit_value(
+                                _maybe_get_path(candidate, "config", "billingPeriodEnd")
+                                or candidate.get("billingPeriodEnd")
+                                or metadata.get("xai_oauth_billing_period_end")
+                                or metadata.get("billingPeriodEnd")
+                            ),
                             "quota_unit": f"xai_oauth_{limit_scope}",
                             "quota_unit_interpretation": limit_scope,
                         },
@@ -6113,9 +6179,11 @@ def _extract_xai_oauth_header_rate_limit_observations(
                                 *reset_keys,
                                 "retry-after",
                             ],
-                            "reset_absent": (
+                            "reset_absent": provider_resets_at is None,
+                            "reset_header_absent": (
                                 reset_value is None and reset_hint_seconds is None
                             ),
+                            "reset_source": reset_source,
                         },
                     },
                     context,

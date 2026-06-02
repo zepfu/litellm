@@ -192,7 +192,9 @@ class GrokBuildPassthroughHarness:
         }
 
 
-@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+@pytest.mark.parametrize(
+    "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
+)
 @pytest.mark.asyncio
 async def test_grok_build_harness_routes_json_headers_and_filters_litellm_auth(model):
     harness = GrokBuildPassthroughHarness(model=model)
@@ -251,7 +253,9 @@ async def test_grok_build_harness_routes_protobuf_raw_body_without_json_parse():
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
 
 
-@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+@pytest.mark.parametrize(
+    "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
+)
 def test_grok_build_harness_normalizes_final_response_and_session_history_identity(
     model,
 ):
@@ -427,7 +431,9 @@ def test_grok_build_harness_captures_provider_error_and_quota_metadata():
     assert quota["remaining_pct"] == 99.0
 
 
-@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+@pytest.mark.parametrize(
+    "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
+)
 @pytest.mark.asyncio
 async def test_grok_build_harness_live_smoke_is_explicitly_gated(model):
     if os.getenv("AAWM_GROK_BUILD_LIVE_SMOKE") != "1":

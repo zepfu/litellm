@@ -148,6 +148,24 @@ def test_oa_xai_harness_maps_all_public_models(public_model, upstream_model):
     assert "route:xai_oauth_api" in metadata["tags"]
 
 
+@pytest.mark.parametrize(
+    "model,normalized",
+    [
+        ("grok-build", "grok-build"),
+        ("xai/grok-build", "grok-build"),
+        ("grok-build-0.1", "grok-build-0.1"),
+        ("xai/grok-build-0.1", "grok-build-0.1"),
+        ("grok-composer-2.5-fast", "grok-composer-2.5-fast"),
+    ],
+)
+def test_grok_native_oauth_model_selection_includes_build_0_1(
+    model,
+    normalized,
+):
+    assert oauth.normalize_grok_native_oauth_model(model) == normalized
+    assert oauth.is_grok_native_oauth_model(model) is True
+
+
 @pytest.mark.asyncio
 async def test_oa_xai_harness_loads_litellm_owned_scoped_credential(
     tmp_path,
