@@ -739,6 +739,8 @@ _openrouter_adapter_failure_circuit_until_monotonic_by_key: dict[str, float] = {
 _CODEX_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID = "spawn-agent-fanout-policy"
 _CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD = "unsupported_hosted_tools"
+_CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params"
+_CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
     "on the critical path. Do not duplicate the same task across agents.\n\n"
@@ -939,7 +941,7 @@ def _build_grok_native_oauth_headers(
         "x-grok-req-id": request_id,
         "x-request-id": request_id,
         "x-xai-token-auth": (
-            get_secret_str("LITELLM_XAI_GROK_XAI_TOKEN_AUTH") or "true"
+            get_secret_str("LITELLM_XAI_GROK_XAI_TOKEN_AUTH") or "xai-grok-cli"
         ),
     }
     session_id = _get_grok_native_oauth_session_id(
@@ -11696,6 +11698,14 @@ def _get_codex_tool_policy_model_cost_candidates(model: Any) -> list[str]:
         f"openai/{split_model_name}",
         f"openai/{split_model_name.lower()}",
     ]
+    grok_native_model = normalize_grok_native_oauth_model(model_name)
+    if grok_native_model is not None:
+        candidates.extend(
+            [
+                f"xai/{grok_native_model}",
+                f"xai/{grok_native_model.lower()}",
+            ]
+        )
 
     unique_candidates: list[str] = []
     for candidate in candidates:
@@ -11728,6 +11738,66 @@ def _get_unsupported_hosted_tool_types_for_model(model: Any) -> set[str]:
             return {
                 normalized
                 for value in unsupported_tools
+                if (normalized := _normalize_low_cardinality_tag_value(value))
+            }
+
+    return set()
+
+
+def _get_unsupported_request_param_names_for_model(model: Any) -> set[str]:
+    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
+    if not candidate_model_cost_keys:
+        return set()
+
+    model_cost_sources = [
+        litellm.model_cost,
+        _load_bundled_model_cost_map_for_codex_tool_policy(),
+    ]
+    for model_cost in model_cost_sources:
+        for key in candidate_model_cost_keys:
+            model_info = model_cost.get(key)
+            if not isinstance(model_info, dict):
+                continue
+
+            unsupported_params = model_info.get(
+                _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD
+            )
+            if not isinstance(unsupported_params, list):
+                continue
+
+            return {
+                normalized
+                for value in unsupported_params
+                if (normalized := _normalize_low_cardinality_tag_value(value))
+            }
+
+    return set()
+
+
+def _get_unsupported_input_item_types_for_model(model: Any) -> set[str]:
+    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
+    if not candidate_model_cost_keys:
+        return set()
+
+    model_cost_sources = [
+        litellm.model_cost,
+        _load_bundled_model_cost_map_for_codex_tool_policy(),
+    ]
+    for model_cost in model_cost_sources:
+        for key in candidate_model_cost_keys:
+            model_info = model_cost.get(key)
+            if not isinstance(model_info, dict):
+                continue
+
+            unsupported_input_item_types = model_info.get(
+                _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD
+            )
+            if not isinstance(unsupported_input_item_types, list):
+                continue
+
+            return {
+                normalized
+                for value in unsupported_input_item_types
                 if (normalized := _normalize_low_cardinality_tag_value(value))
             }
 
@@ -11806,6 +11876,183 @@ def _add_codex_unsupported_hosted_tool_logging_metadata(
         tags_to_add=tags_to_add,
         extra_fields=extra_fields,
     )
+
+
+def _add_codex_unsupported_request_param_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    removed_params: list[str],
+) -> dict[str, Any]:
+    normalized_params = _dedupe_sorted_str_list(
+        [
+            normalized
+            for param in removed_params
+            if (normalized := _normalize_low_cardinality_tag_value(param))
+        ]
+    )
+    span_metadata: dict[str, Any] = {
+        "removed_count": len(removed_params),
+        "removed_params": normalized_params,
+    }
+    tags_to_add = ["codex-unsupported-request-param-removed"]
+    tags_to_add.extend(
+        f"codex-unsupported-request-param:{param}" for param in normalized_params
+    )
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields={
+            "codex_unsupported_request_param_removed_count": len(removed_params),
+            "codex_unsupported_request_params_removed": normalized_params,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.unsupported_request_param_removed",
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _drop_unsupported_codex_request_params_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    unsupported_params = _get_unsupported_request_param_names_for_model(
+        request_body.get("model")
+    )
+    if not unsupported_params:
+        return request_body, []
+
+    def _drop_from_value(value: Any) -> tuple[Any, list[str], bool]:
+        if isinstance(value, dict):
+            updated_dict: dict[str, Any] = {}
+            removed: list[str] = []
+            changed = False
+            for key, child_value in value.items():
+                if _normalize_low_cardinality_tag_value(key) in unsupported_params:
+                    removed.append(key)
+                    changed = True
+                    continue
+                updated_child, child_removed, child_changed = _drop_from_value(
+                    child_value
+                )
+                updated_dict[key] = updated_child
+                removed.extend(child_removed)
+                changed = changed or child_changed
+            return (updated_dict if changed else value), removed, changed
+
+        if isinstance(value, list):
+            updated_list: list[Any] = []
+            removed: list[str] = []
+            changed = False
+            for item in value:
+                updated_item, item_removed, item_changed = _drop_from_value(item)
+                updated_list.append(updated_item)
+                removed.extend(item_removed)
+                changed = changed or item_changed
+            return (updated_list if changed else value), removed, changed
+
+        return value, [], False
+
+    updated_value, removed_params, changed = _drop_from_value(request_body)
+    if not removed_params:
+        return request_body, []
+
+    updated_body = (
+        updated_value
+        if changed and isinstance(updated_value, dict)
+        else dict(request_body)
+    )
+
+    updated_body = _add_codex_unsupported_request_param_logging_metadata(
+        updated_body,
+        removed_params=removed_params,
+    )
+    return updated_body, removed_params
+
+
+def _add_codex_unsupported_input_item_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    removed_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    removed_item_types = _dedupe_sorted_str_list(
+        [
+            item["type"]
+            for item in removed_items
+            if isinstance(item.get("type"), str) and item["type"]
+        ]
+    )
+    span_metadata: dict[str, Any] = {
+        "removed_count": len(removed_items),
+        "removed_item_types": removed_item_types,
+    }
+
+    tags_to_add = ["codex-unsupported-input-item-removed"]
+    tags_to_add.extend(
+        f"codex-unsupported-input-item:{item_type}"
+        for item_type in removed_item_types
+    )
+
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields={
+            "codex_unsupported_input_item_removed_count": len(removed_items),
+            "codex_unsupported_input_item_types_removed": removed_item_types,
+            "codex_unsupported_input_items_removed": removed_items,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.unsupported_input_item_removed",
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _drop_unsupported_codex_input_items_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    unsupported_input_item_types = _get_unsupported_input_item_types_for_model(
+        request_body.get("model")
+    )
+    if not unsupported_input_item_types:
+        return request_body, []
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body, []
+
+    updated_input_items: list[Any] = []
+    removed_items: list[dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            updated_input_items.append(item)
+            continue
+
+        item_type = _normalize_low_cardinality_tag_value(item.get("type"))
+        if item_type in unsupported_input_item_types:
+            removed_items.append(
+                {
+                    "type": item_type,
+                    "index": index,
+                }
+            )
+            continue
+
+        updated_input_items.append(item)
+
+    if not removed_items:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["input"] = updated_input_items
+    updated_body = _add_codex_unsupported_input_item_logging_metadata(
+        updated_body,
+        removed_items=removed_items,
+    )
+    return updated_body, removed_items
 
 
 def _drop_unsupported_codex_hosted_tools_from_request_body(
@@ -16474,6 +16721,38 @@ class BaseOpenAIPassThroughHandler:
             request_body = await get_request_body(request)
             prepared_request_body = request_body
             body_was_prepared = False
+            is_codex_responses_request = (
+                _request_uses_codex_native_auth(request)
+                and _is_openai_responses_endpoint(endpoint)
+            )
+            if is_codex_responses_request:
+                prepared_request_body = _add_route_family_logging_metadata(
+                    prepared_request_body,
+                    "codex_responses",
+                )
+                prepared_request_body, _codex_tool_description_patch_events = (
+                    _apply_codex_tool_description_patches_to_request_body(
+                        prepared_request_body
+                    )
+                )
+                prepared_request_body, _codex_unsupported_hosted_tools = (
+                    _drop_unsupported_codex_hosted_tools_from_request_body(
+                        prepared_request_body
+                    )
+                )
+                prepared_request_body, _codex_unsupported_request_params = (
+                    _drop_unsupported_codex_request_params_from_request_body(
+                        prepared_request_body
+                    )
+                )
+                prepared_request_body, _codex_unsupported_input_items = (
+                    _drop_unsupported_codex_input_items_from_request_body(
+                        prepared_request_body
+                    )
+                )
+                prepared_request_body = _add_codex_request_breakout_logging_metadata(
+                    prepared_request_body
+                )
             oa_xai_context = await (
                 BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
                     endpoint=endpoint,
@@ -16514,71 +16793,52 @@ class BaseOpenAIPassThroughHandler:
                     forward_headers = False
                     egress_credential_family = "xai"
                     expected_target_family = "xai"
-            elif _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
-                endpoint
-            ):
-                prepared_request_body = _add_route_family_logging_metadata(
-                    prepared_request_body,
-                    "codex_responses",
-                )
-                prepared_request_body, _codex_tool_description_patch_events = (
-                    _apply_codex_tool_description_patches_to_request_body(
-                        prepared_request_body
+                elif is_codex_responses_request:
+                    codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
                     )
-                )
-                prepared_request_body, _codex_unsupported_hosted_tools = (
-                    _drop_unsupported_codex_hosted_tools_from_request_body(
-                        prepared_request_body
-                    )
-                )
-                prepared_request_body = _add_codex_request_breakout_logging_metadata(
-                    prepared_request_body
-                )
-                codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
-                    prepared_request_body,
-                    endpoint=endpoint,
-                )
-                if codex_auto_agent_alias is not None:
-                    prepared_request_body, _codex_auto_agent_guidance_changes = (
-                        _apply_codex_auto_agent_prevention_guidance_to_request_body(
-                            prepared_request_body
+                    if codex_auto_agent_alias is not None:
+                        prepared_request_body, _codex_auto_agent_guidance_changes = (
+                            _apply_codex_auto_agent_prevention_guidance_to_request_body(
+                                prepared_request_body
+                            )
                         )
-                    )
-                    prepared_request_body = _prepare_request_body_for_passthrough_observability(
-                        request=request,
-                        request_body=prepared_request_body,
-                    )
-                    if prepared_request_body is not request_body:
-                        _safe_set_request_parsed_body(request, prepared_request_body)
-                    return await _handle_codex_auto_agent_alias_route(
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
+                        )
+                        if prepared_request_body is not request_body:
+                            _safe_set_request_parsed_body(request, prepared_request_body)
+                        return await _handle_codex_auto_agent_alias_route(
+                            endpoint=endpoint,
+                            request=request,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            prepared_request_body=prepared_request_body,
+                            target_url=str(updated_url),
+                            api_key=api_key,
+                            forward_headers=forward_headers,
+                        )
+                    google_adapter_model = _resolve_codex_google_code_assist_adapter_model(
+                        prepared_request_body,
                         endpoint=endpoint,
-                        request=request,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        prepared_request_body=prepared_request_body,
-                        target_url=str(updated_url),
-                        api_key=api_key,
-                        forward_headers=forward_headers,
                     )
-                google_adapter_model = _resolve_codex_google_code_assist_adapter_model(
-                    prepared_request_body,
-                    endpoint=endpoint,
-                )
-                if google_adapter_model is not None:
-                    prepared_request_body = _prepare_request_body_for_passthrough_observability(
-                        request=request,
-                        request_body=prepared_request_body,
-                    )
-                    if prepared_request_body is not request_body:
-                        _safe_set_request_parsed_body(request, prepared_request_body)
-                    return await _handle_codex_google_code_assist_adapter_route(
-                        endpoint=endpoint,
-                        request=request,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        prepared_request_body=prepared_request_body,
-                        adapter_model=google_adapter_model,
-                    )
+                    if google_adapter_model is not None:
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
+                        )
+                        if prepared_request_body is not request_body:
+                            _safe_set_request_parsed_body(request, prepared_request_body)
+                        return await _handle_codex_google_code_assist_adapter_route(
+                            endpoint=endpoint,
+                            request=request,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            prepared_request_body=prepared_request_body,
+                            adapter_model=google_adapter_model,
+                        )
             else:
                 prepared_request_body = _add_route_family_logging_metadata(
                     prepared_request_body,

@@ -77,6 +77,8 @@ services:
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
       # Gemini OAuth tokens for Anthropic->Google adapter testing
       - /home/zepfu/.gemini:/home/zepfu/.gemini:ro
+      # Grok CLI OAuth tokens for native Grok OIDC passthrough testing
+      - /home/zepfu/.grok:/home/zepfu/.grok:ro
       # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
       # Gemini CLI install for OAuth client fallback during local adapter testing
@@ -136,6 +138,8 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
+      - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
+      - LITELLM_XAI_GROK_AUTH_LOCK_FILE=${LITELLM_XAI_GROK_AUTH_LOCK_FILE:-/tmp/grok-auth.json.lock}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
