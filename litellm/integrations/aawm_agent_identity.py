@@ -11542,6 +11542,17 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
     elif metadata.get("source_status") == "failure":
         zero_token_class = "failed_observation_no_usage"
         zero_token_reason = "langfuse_observation_failed_without_usage"
+    elif (
+        provider in {"xai", "grok"}
+        and str(record.get("model") or "").strip().lower() == "unknown"
+        and str(metadata.get("passthrough_route_family") or "").strip().lower()
+        == "grok_cli_chat_proxy"
+    ):
+        zero_token_class = "grok_cli_side_channel_no_usage"
+        zero_token_reason = "grok_side_channel_without_model_usage"
+        metadata["session_history_reporting_excluded"] = True
+        metadata["session_history_reporting_exclusion_reason"] = zero_token_reason
+        metadata["grok_side_channel_excluded"] = True
 
     if zero_token_class is not None:
         metadata.setdefault("session_history_usage_record", False)

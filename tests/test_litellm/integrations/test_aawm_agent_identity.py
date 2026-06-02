@@ -901,6 +901,61 @@ def test_build_session_history_record_uses_grok_header_model_override() -> None:
     assert record["output_tokens"] == 4
 
 
+def test_build_session_history_record_uses_grok_composer_override_and_cost() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "unknown"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-composer-response"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "session_id": "grok-composer-session-123",
+            "model_group": "grok-composer-2.5-fast",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "x-grok-model-override": "grok-composer-2.5-fast",
+            "x-grok-session-id": "grok-composer-session-123",
+        },
+        "body": {"model": "grok-composer-2.5-fast", "input": "hello"},
+    }
+    kwargs["passthrough_logging_payload"]["request_headers"] = {
+        "x-grok-model-override": "grok-composer-2.5-fast",
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+    }
+
+    result = {
+        "id": "resp-grok-composer",
+        "model": "unknown",
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "total_tokens": 1200,
+        },
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "ack"}]}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-02T15:00:00Z",
+        end_time="2026-06-02T15:00:01Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "xai"
+    assert record["model"] == "grok-composer-2.5-fast"
+    assert record["model_group"] == "grok-composer-2.5-fast"
+    assert record["client_name"] == "grok-build"
+    assert record["response_cost_usd"] == pytest.approx(0.006)
+
+
 def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
     kwargs = _base_kwargs(trace_name="oa-xai")
     kwargs["model"] = "xai/grok-4.3"
@@ -1233,6 +1288,35 @@ def test_normalize_session_history_record_marks_unknown_model_unresolved() -> No
     assert (
         record["metadata"]["session_history_model_unresolved_reason"]
         == "missing_source_model_evidence"
+    )
+
+
+def test_normalize_session_history_record_excludes_grok_side_channel_usage() -> None:
+    record = aawm_agent_identity._normalize_session_history_record(
+        {
+            "litellm_call_id": "call-grok-settings-side-channel",
+            "provider": "xai",
+            "model": "unknown",
+            "model_group": None,
+            "client_name": "grok-build",
+            "call_type": "pass_through_endpoint",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "metadata": {"passthrough_route_family": "grok_cli_chat_proxy"},
+        }
+    )
+
+    assert record["metadata"]["session_history_usage_record"] is False
+    assert record["metadata"]["session_history_reporting_excluded"] is True
+    assert record["metadata"]["session_history_model_reporting_excluded"] is True
+    assert (
+        record["metadata"]["session_history_zero_token_class"]
+        == "grok_cli_side_channel_no_usage"
+    )
+    assert (
+        record["metadata"]["session_history_reporting_exclusion_reason"]
+        == "grok_side_channel_without_model_usage"
     )
 
 
@@ -7406,6 +7490,36 @@ def test_build_rate_limit_observations_skips_invalid_grok_billing_limit() -> Non
     )
 
     assert observations == []
+
+
+def test_build_rate_limit_observations_skips_grok_non_billing_side_channel() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/settings",
+        "request_headers": {"x-xai-token-auth": "true"},
+        "response_body": {"settings": {"theme": "dark"}},
+    }
+    end_time = datetime(2026, 6, 2, 15, 30, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"settings": {"theme": "dark"}},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert [
+        observation
+        for observation in observations
+        if observation.get("source") == "grok_billing"
+    ] == []
 
 
 def test_build_rate_limit_observations_extracts_openrouter_free_429() -> None:
