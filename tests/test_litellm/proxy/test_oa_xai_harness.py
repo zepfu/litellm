@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -132,8 +133,12 @@ class OaXaiHarness:
 )
 def test_oa_xai_harness_maps_all_public_models(public_model, upstream_model):
     metadata = oauth.build_oa_xai_metadata(public_model, upstream_model)
+    catalog = json.loads(
+        Path("model_prices_and_context_window.json").read_text(encoding="utf-8")
+    )
 
     assert oauth.resolve_oa_xai_upstream_model(public_model) == upstream_model
+    assert catalog[public_model]["mode"] == "responses"
     assert metadata["xai_oauth_public_model"] == public_model
     assert metadata["xai_oauth_upstream_model"] == upstream_model
     assert metadata["auth_mode"] == "oauth"
