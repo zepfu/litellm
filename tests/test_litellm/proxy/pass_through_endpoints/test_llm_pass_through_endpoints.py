@@ -26,6 +26,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     RouteChecks,
     _drop_unsupported_codex_hosted_tools_from_request_body,
+    _drop_unsupported_codex_input_items_from_request_body,
+    _drop_unsupported_codex_request_params_from_request_body,
     _apply_codex_tool_description_patches_to_request_body,
     _apply_google_adapter_completion_message_window,
     _apply_google_adapter_request_shape_policy,
@@ -11207,6 +11209,139 @@ def test_codex_non_spark_keeps_image_generation_tool():
     assert updated_body["tools"] == [{"type": "image_generation"}]
 
 
+@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+def test_grok_native_unsupported_custom_tool_is_removed(model):
+    request_body = {
+        "model": model,
+        "tools": [
+            {"type": "custom", "name": "exec_command"},
+            {"type": "namespace", "name": "functions"},
+            {"type": "tool_search", "name": "tool_search_tool"},
+            {"type": "image_generation"},
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "tool_choice": {"type": "tool_search", "name": "tool_search_tool"},
+    }
+
+    updated_body, removed_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
+    )
+
+    assert removed_tools == [
+        {"type": "custom", "index": 0, "name": "exec_command"},
+        {"type": "namespace", "index": 1, "name": "functions"},
+        {"type": "tool_search", "index": 2, "name": "tool_search_tool"},
+        {"type": "image_generation", "index": 3},
+    ]
+    assert updated_body["tools"] == [request_body["tools"][4]]
+    assert "tool_choice" not in updated_body
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert litellm_metadata["codex_unsupported_hosted_tool_removed_count"] == 4
+    assert litellm_metadata["codex_unsupported_hosted_tool_types_removed"] == [
+        "custom",
+        "image_generation",
+        "namespace",
+        "tool_search",
+    ]
+
+
+@pytest.mark.parametrize(
+    "model", ["oa_xai/grok-4.3", "grok-build", "grok-composer-2.5-fast"]
+)
+def test_grok_responses_unsupported_external_web_access_param_is_removed(model):
+    request_body = {
+        "model": model,
+        "input": "hello",
+        "external_web_access": True,
+    }
+
+    updated_body, removed_params = (
+        _drop_unsupported_codex_request_params_from_request_body(request_body)
+    )
+
+    assert removed_params == ["external_web_access"]
+    assert "external_web_access" not in updated_body
+    assert updated_body["input"] == "hello"
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert litellm_metadata["codex_unsupported_request_param_removed_count"] == 1
+    assert litellm_metadata["codex_unsupported_request_params_removed"] == [
+        "external_web_access"
+    ]
+
+
+def test_grok_responses_nested_external_web_access_tool_param_is_removed():
+    request_body = {
+        "model": "grok-build",
+        "input": "hello",
+        "tools": [{"type": "web_search", "external_web_access": True}],
+    }
+
+    updated_body, removed_params = (
+        _drop_unsupported_codex_request_params_from_request_body(request_body)
+    )
+
+    assert removed_params == ["external_web_access"]
+    assert updated_body["tools"] == [{"type": "web_search"}]
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert litellm_metadata["codex_unsupported_request_param_removed_count"] == 1
+    assert litellm_metadata["codex_unsupported_request_params_removed"] == [
+        "external_web_access"
+    ]
+
+
+@pytest.mark.parametrize(
+    "model", ["oa_xai/grok-4.3", "grok-build", "grok-composer-2.5-fast"]
+)
+def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
+    request_body = {
+        "model": model,
+        "input": [
+            {"type": "message", "role": "user", "content": "hello"},
+            {"type": "reasoning", "summary": []},
+            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+    }
+
+    updated_body, removed_items = (
+        _drop_unsupported_codex_input_items_from_request_body(request_body)
+    )
+
+    assert removed_items == [{"type": "reasoning", "index": 1}]
+    assert updated_body["input"] == [
+        request_body["input"][0],
+        request_body["input"][2],
+        request_body["input"][3],
+    ]
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert litellm_metadata["codex_unsupported_input_item_removed_count"] == 1
+    assert litellm_metadata["codex_unsupported_input_item_types_removed"] == [
+        "reasoning"
+    ]
+
+
+def test_codex_non_grok_keeps_reasoning_input_item():
+    request_body = {
+        "model": "gpt-5.3-codex",
+        "input": [{"type": "reasoning", "summary": []}],
+    }
+
+    updated_body, removed_items = (
+        _drop_unsupported_codex_input_items_from_request_body(request_body)
+    )
+
+    assert updated_body is request_body
+    assert removed_items == []
+
+
 def _build_codex_auto_agent_request(session_id: str = "codex-session"):
     mock_request = MagicMock(spec=Request)
     mock_request.method = "POST"
@@ -12031,7 +12166,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert call_kwargs["custom_headers"]["authorization"] == (
         "Bearer grok-oidc-token"
     )
-    assert call_kwargs["custom_headers"]["x-xai-token-auth"] == "true"
+    assert call_kwargs["custom_headers"]["x-xai-token-auth"] == "xai-grok-cli"
     assert call_kwargs["custom_headers"]["x-grok-model-override"] == (
         "grok-composer-2.5-fast"
     )
@@ -16117,7 +16252,28 @@ class TestOpenAIPassthroughRoute:
         monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
         body = {
             "model": public_model,
-            "input": "hello",
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"},
+                {"type": "reasoning", "summary": []},
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+            ],
+            "tools": [
+                {"type": "custom", "name": "exec_command"},
+                {"type": "namespace", "name": "functions"},
+                {"type": "tool_search", "name": "tool_search_tool"},
+                {"type": "image_generation"},
+                {"type": "web_search", "external_web_access": True},
+            ],
+            "tool_choice": {"type": "tool_search", "name": "tool_search_tool"},
         }
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
@@ -16165,9 +16321,43 @@ class TestOpenAIPassthroughRoute:
         assert call_args["_forward_headers"] is False
         prepared_body = mock_set_body.call_args.args[1]
         assert prepared_body["model"] == upstream_model
+        assert prepared_body["input"] == [
+            body["input"][0],
+            body["input"][2],
+            body["input"][3],
+        ]
+        assert prepared_body["tools"] == [{"type": "web_search"}]
+        assert "tool_choice" not in prepared_body
         assert prepared_body["litellm_metadata"]["openai_passthrough_route_family"] == (
             "openai_responses"
         )
+        assert (
+            prepared_body["litellm_metadata"][
+                "codex_unsupported_hosted_tool_removed_count"
+            ]
+            == 4
+        )
+        assert prepared_body["litellm_metadata"][
+            "codex_unsupported_hosted_tool_types_removed"
+        ] == ["custom", "image_generation", "namespace", "tool_search"]
+        assert (
+            prepared_body["litellm_metadata"][
+                "codex_unsupported_request_param_removed_count"
+            ]
+            == 1
+        )
+        assert prepared_body["litellm_metadata"][
+            "codex_unsupported_request_params_removed"
+        ] == ["external_web_access"]
+        assert (
+            prepared_body["litellm_metadata"][
+                "codex_unsupported_input_item_removed_count"
+            ]
+            == 1
+        )
+        assert prepared_body["litellm_metadata"][
+            "codex_unsupported_input_item_types_removed"
+        ] == ["reasoning"]
         assert prepared_body["litellm_metadata"]["xai_oauth_public_model"] == public_model
         assert prepared_body["litellm_metadata"]["xai_oauth_upstream_model"] == (
             f"xai/{upstream_model}"
@@ -16189,7 +16379,28 @@ class TestOpenAIPassthroughRoute:
         )
         body = {
             "model": model,
-            "input": "hello",
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"},
+                {"type": "reasoning", "summary": []},
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+            ],
+            "tools": [
+                {"type": "custom", "name": "exec_command"},
+                {"type": "namespace", "name": "functions"},
+                {"type": "tool_search", "name": "tool_search_tool"},
+                {"type": "image_generation"},
+                {"type": "web_search", "external_web_access": True},
+            ],
+            "tool_choice": {"type": "tool_search", "name": "tool_search_tool"},
             "metadata": {"session_id": "codex-grok-session"},
         }
         mock_request = MagicMock(spec=Request)
@@ -16237,7 +16448,7 @@ class TestOpenAIPassthroughRoute:
         assert call_args["custom_headers"]["authorization"] == (
             "Bearer grok-oidc-token"
         )
-        assert call_args["custom_headers"]["x-xai-token-auth"] == "true"
+        assert call_args["custom_headers"]["x-xai-token-auth"] == "xai-grok-cli"
         assert call_args["custom_headers"]["x-grok-model-override"] == model
         assert call_args["custom_headers"]["x-grok-session-id"] == (
             "codex-grok-session"
@@ -16247,6 +16458,13 @@ class TestOpenAIPassthroughRoute:
         assert call_args["expected_target_family"] == "xai"
         prepared_body = mock_set_body.call_args.args[1]
         assert prepared_body["model"] == model
+        assert prepared_body["input"] == [
+            body["input"][0],
+            body["input"][2],
+            body["input"][3],
+        ]
+        assert prepared_body["tools"] == [{"type": "web_search"}]
+        assert "tool_choice" not in prepared_body
         assert "api_key" not in prepared_body
         assert "api_base" not in prepared_body
         assert "custom_llm_provider" not in prepared_body
@@ -16258,6 +16476,21 @@ class TestOpenAIPassthroughRoute:
         assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
         assert metadata["openai_passthrough_route_family"] == "openai_responses"
         assert metadata["grok_native_entrypoint"] == "openai_responses"
+        assert metadata["codex_unsupported_hosted_tool_removed_count"] == 4
+        assert metadata["codex_unsupported_hosted_tool_types_removed"] == [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+        ]
+        assert metadata["codex_unsupported_request_param_removed_count"] == 1
+        assert metadata["codex_unsupported_request_params_removed"] == [
+            "external_web_access"
+        ]
+        assert metadata["codex_unsupported_input_item_removed_count"] == 1
+        assert metadata["codex_unsupported_input_item_types_removed"] == [
+            "reasoning"
+        ]
         assert "route:grok_cli_chat_proxy" in metadata["tags"]
         assert "openai-grok-native-responses-adapter" in metadata["tags"]
 
