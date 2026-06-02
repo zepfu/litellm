@@ -112,6 +112,44 @@ def test_should_flag_sensitive_config_changes_from_local_tool_activity() -> None
     assert record["changed_gitignore"] is True
 
 
+def test_should_match_nested_sensitive_config_paths_and_ignore_lookalikes() -> None:
+    flags = backfill._sensitive_config_change_flags_from_paths(
+        [
+            "services/api/.pre-commit-config.yml",
+            "packages/backend/.env.production",
+            "src/python/pyproject.toml",
+            "worktrees/example/.gitignore",
+            "notes.env.example.txt",
+            "pyproject.toml.bak",
+            "not-.gitignore",
+            ".pre-commit-config.yaml.bak",
+        ]
+    )
+
+    assert flags == {
+        "changed_pre_commit_config": True,
+        "changed_env_file": True,
+        "changed_pyproject_toml": True,
+        "changed_gitignore": True,
+    }
+
+    lookalike_flags = backfill._sensitive_config_change_flags_from_paths(
+        [
+            "notes.env.example.txt",
+            "pyproject.toml.bak",
+            "not-.gitignore",
+            ".pre-commit-config.yaml.bak",
+        ]
+    )
+
+    assert lookalike_flags == {
+        "changed_pre_commit_config": False,
+        "changed_env_file": False,
+        "changed_pyproject_toml": False,
+        "changed_gitignore": False,
+    }
+
+
 def test_should_coalesce_claude_split_rows_by_message_id(tmp_path: Path) -> None:
     transcript = (
         tmp_path

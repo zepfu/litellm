@@ -609,6 +609,42 @@ def test_target_profile_can_skip_trace_environment_validation():
     assert "trace_environment" not in validation["metadata_required_equals"]
 
 
+def test_target_profile_does_not_force_tenant_expectations_when_trace_user_id_is_disabled():
+    harness = _load_harness_module()
+
+    config = {
+        "cases": {
+            "native_grok_cli_passthrough_grok_build": {
+                "require_trace_user_id": False,
+                "session_history_validation": {
+                    "expected_provider": "xai",
+                    "metadata_required_equals": {
+                        "passthrough_route_family": "grok_cli_chat_proxy"
+                    },
+                },
+            }
+        }
+    }
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    validation = updated["cases"]["native_grok_cli_passthrough_grok_build"][
+        "session_history_validation"
+    ]
+
+    assert "expected_tenant_id" not in validation
+    assert "tenant_id" not in validation["metadata_required_equals"]
+    assert "tenant_id_source" not in validation["metadata_required_truthy"]
+
+
 def test_http_request_retry_uses_status_code_for_api_error_status(monkeypatch):
     harness = _load_harness_module()
     runs = [
@@ -887,6 +923,37 @@ def _assert_openrouter_free_daily_rate_limit_validation(case_config):
     assert "expected_reset_at" in expected_row[
         "required_timestamp_after_observed"
     ]
+
+
+def test_grok_cli_cases_validate_session_history_config_flags():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    expected_false_flags = {
+        "changed_pre_commit_config": False,
+        "changed_env_file": False,
+        "changed_pyproject_toml": False,
+        "changed_gitignore": False,
+    }
+
+    for case_name, expected_model in (
+        ("native_grok_cli_passthrough_grok_build", "grok-build"),
+        ("native_grok_cli_passthrough_grok_composer", "grok-composer-2.5-fast"),
+    ):
+        case_config = config["cases"][case_name]
+        validation = case_config["session_history_validation"]
+
+        assert case_config["cli_passthrough"] == "grok"
+        assert "AAWM_ENABLE_GROK_CLI_HARNESS" in case_config["required_env"]
+        assert case_config["allowed_generation_routes"] == ["/grok/v1/responses"]
+        assert validation["expected_provider"] == "xai"
+        assert validation["expected_model"] == expected_model
+        assert validation["expected_client_name"] == "grok-build"
+        assert validation["client_user_agent_contains"] == "grok-shell/"
+        assert validation["metadata_required_equals"][
+            "passthrough_route_family"
+        ] == "grok_cli_chat_proxy"
+        assert "grok_cli_chat_proxy" not in validation["metadata_required_equals"]
+        assert "grok_model_override" not in validation["metadata_required_equals"]
+        assert validation["required_equals"] == expected_false_flags
 
 
 def test_codex_tool_activity_parity_cases_have_stream_state_gates():
@@ -2774,6 +2841,10 @@ def test_session_history_and_tool_activity_validators_share_db_connection(monkey
         "system_safety_tokens_estimated",
         "system_instructional_tokens_estimated",
         "system_unclassified_tokens_estimated",
+        "changed_pre_commit_config",
+        "changed_env_file",
+        "changed_pyproject_toml",
+        "changed_gitignore",
     ):
         assert column_name in session_history_query
     assert connections[0][0]["autocommit"] is True
