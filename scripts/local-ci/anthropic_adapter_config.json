@@ -63,6 +63,8 @@
     "native_openai_passthrough_responses",
     "native_openai_passthrough_responses_codex",
     "native_openai_passthrough_responses_codex_tool_activity",
+    "native_grok_cli_passthrough_grok_build",
+    "native_grok_cli_passthrough_grok_composer",
     "native_gemini_passthrough_generate_content",
     "native_gemini_passthrough_stream_generate_content"
   ],
@@ -652,6 +654,120 @@
       },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60
+    },
+    "native_grok_cli_passthrough_grok_build": {
+      "cli_passthrough": "grok",
+      "required_env": ["AAWM_ENABLE_GROK_CLI_HARNESS"],
+      "command": [
+        "grok",
+        "--model",
+        "grok-build",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--no-subagents",
+        "--max-turns",
+        "1",
+        "-p",
+        "Reply with exactly two words: native grok"
+      ],
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "require_trace_user_id": false,
+      "post_run_wait_seconds": 4,
+      "allowed_generation_routes": ["/grok/v1/responses"],
+      "required_trace_tags": ["route:grok_cli_chat_proxy"],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "grok_cli_chat_proxy",
+        "grok_model_override"
+      ],
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "xai",
+        "expected_model": "grok-build",
+        "expected_client_name": "grok-build",
+        "client_user_agent_contains": "grok/",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "grok-build",
+          "passthrough_route_family": "grok_cli_chat_proxy",
+          "grok_cli_chat_proxy": true,
+          "grok_model_override": "grok-build",
+          "model_group": "grok-build"
+        },
+        "metadata_required_truthy": ["request_tags", "client_version"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90
+    },
+    "native_grok_cli_passthrough_grok_composer": {
+      "cli_passthrough": "grok",
+      "required_env": ["AAWM_ENABLE_GROK_CLI_HARNESS"],
+      "command": [
+        "grok",
+        "--model",
+        "grok-composer-2.5-fast",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--no-subagents",
+        "--max-turns",
+        "1",
+        "-p",
+        "Reply with exactly two words: native composer"
+      ],
+      "require_trace_session_id": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "require_trace_user_id": false,
+      "post_run_wait_seconds": 4,
+      "allowed_generation_routes": ["/grok/v1/responses"],
+      "required_trace_tags": ["route:grok_cli_chat_proxy"],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "grok_cli_chat_proxy",
+        "grok_model_override"
+      ],
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "xai",
+        "expected_model": "grok-composer-2.5-fast",
+        "expected_client_name": "grok-build",
+        "client_user_agent_contains": "grok/",
+        "metadata_required_equals": {
+          "trace_environment": "dev",
+          "litellm_environment": "dev",
+          "client_name": "grok-build",
+          "passthrough_route_family": "grok_cli_chat_proxy",
+          "grok_cli_chat_proxy": true,
+          "grok_model_override": "grok-composer-2.5-fast",
+          "model_group": "grok-composer-2.5-fast"
+        },
+        "metadata_required_truthy": ["request_tags", "client_version"],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90
     },
     "native_gemini_passthrough_generate_content": {
       "cli_passthrough": "gemini",

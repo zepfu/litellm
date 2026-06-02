@@ -532,7 +532,7 @@ def _ensure_cli_harness_context(
 ) -> dict[str, Any]:
     updated = dict(config)
     cli_kind = str(updated.get('cli_passthrough') or '').strip().lower()
-    if cli_kind not in {'codex', 'gemini'}:
+    if cli_kind not in {'codex', 'gemini', 'grok'}:
         return updated
 
     tenant_id = str(updated.get('tenant_id') or 'adapter-harness-tenant')
@@ -592,8 +592,18 @@ def _ensure_cli_harness_context(
             env.get('GEMINI_CLI_CUSTOM_HEADERS'),
             controlled_headers,
         )
+    if cli_kind == 'grok':
+        env['GROK_CLI_CHAT_PROXY_BASE_URL'] = (
+            f"{profile['litellm_base_url']}/grok/v1"
+        )
+        env.setdefault('GROK_DISABLE_UPDATE_CHECK', '1')
+        env.setdefault('GROK_SANDBOX', 'workspace')
     updated['env'] = env
-    updated['expected_user_ids'] = [harness_user_id]
+    if cli_kind == 'grok':
+        updated['expected_user_ids'] = []
+        updated['require_trace_user_id'] = False
+    else:
+        updated['expected_user_ids'] = [harness_user_id]
     if cli_kind == 'codex':
         updated['expected_trace_session_id'] = session_id
     else:

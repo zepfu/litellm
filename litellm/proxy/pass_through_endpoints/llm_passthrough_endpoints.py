@@ -46,7 +46,11 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
 )
 from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
 from litellm.llms.xai.oauth import (
+    build_grok_native_oauth_metadata,
+    get_grok_native_oauth_access_token,
+    is_grok_native_oauth_model,
     is_oa_xai_model,
+    normalize_grok_native_oauth_model,
     prepare_oa_xai_request,
     resolve_oa_xai_upstream_model,
 )
@@ -799,6 +803,10 @@ def _is_oa_xai_request_body(request_body: dict[str, Any]) -> bool:
     return is_oa_xai_model(request_body.get("model"))
 
 
+def _is_grok_native_oauth_request_body(request_body: dict[str, Any]) -> bool:
+    return is_grok_native_oauth_model(request_body.get("model"))
+
+
 @lru_cache(maxsize=1)
 def _load_local_model_metadata() -> dict[str, Any]:
     model_metadata_path = (
@@ -864,6 +872,135 @@ async def _prepare_oa_xai_passthrough_request(
         api_base if isinstance(api_base, str) and api_base.strip() else None,
         api_key if isinstance(api_key, str) and api_key.strip() else None,
     )
+
+
+def _get_grok_native_oauth_client_version() -> str:
+    return (
+        get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION")
+        or get_secret_str("GROK_CLIENT_VERSION")
+        or "0.1.210"
+    )
+
+
+def _get_grok_native_oauth_session_id(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    metadata = request_body.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        session_id = metadata.get("session_id")
+        if isinstance(session_id, str) and session_id.strip():
+            return session_id.strip()
+
+    for header_name in ("x-grok-session-id", "session_id", "x-session-id"):
+        header_value = _get_case_insensitive_header(
+            _safe_get_request_headers(request),
+            header_name,
+        )
+        if header_value:
+            return header_value
+    return None
+
+
+def _get_grok_native_oauth_request_id(request: Request) -> str:
+    for header_name in ("x-grok-req-id", "x-request-id", "request_id"):
+        header_value = _get_case_insensitive_header(
+            _safe_get_request_headers(request),
+            header_name,
+        )
+        if header_value:
+            return header_value
+    return str(uuid4())
+
+
+def _build_grok_native_oauth_headers(
+    *,
+    access_token: str,
+    model: str,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    client_version = _get_grok_native_oauth_client_version()
+    request_id = _get_grok_native_oauth_request_id(request)
+    headers: dict[str, Any] = {
+        "accept": "application/json",
+        "authorization": f"Bearer {access_token}",
+        "content-type": "application/json",
+        "user-agent": (
+            get_secret_str("LITELLM_XAI_GROK_USER_AGENT")
+            or f"grok/{client_version}"
+        ),
+        "x-grok-client-identifier": (
+            get_secret_str("LITELLM_XAI_GROK_CLIENT_IDENTIFIER") or "grok-cli"
+        ),
+        "x-grok-client-version": client_version,
+        "x-grok-model-override": model,
+        "x-grok-req-id": request_id,
+        "x-request-id": request_id,
+        "x-xai-token-auth": (
+            get_secret_str("LITELLM_XAI_GROK_XAI_TOKEN_AUTH") or "true"
+        ),
+    }
+    session_id = _get_grok_native_oauth_session_id(
+        request=request,
+        request_body=request_body,
+    )
+    if session_id:
+        headers["x-grok-session-id"] = session_id
+    return headers
+
+
+def _add_grok_native_oauth_metadata(
+    request_body: dict[str, Any],
+    *,
+    model: str,
+    tags_to_add: Optional[list[str]] = None,
+    extra_fields: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    metadata = build_grok_native_oauth_metadata(model)
+    metadata_tags = metadata.pop("tags", [])
+    merged_extra_fields = {
+        **(extra_fields or {}),
+        **metadata,
+    }
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=[
+            *(metadata_tags if isinstance(metadata_tags, list) else []),
+            *(tags_to_add or []),
+        ],
+        extra_fields=merged_extra_fields,
+    )
+
+
+async def _prepare_grok_native_oauth_passthrough_request(
+    request_body: dict[str, Any],
+    *,
+    request: Request,
+    tags_to_add: Optional[list[str]] = None,
+    extra_fields: Optional[dict[str, Any]] = None,
+) -> tuple[bool, Optional[str], dict[str, Any], dict[str, Any]]:
+    model = normalize_grok_native_oauth_model(request_body.get("model"))
+    if model is None:
+        return False, None, {}, request_body
+
+    prepared_body = dict(request_body)
+    prepared_body["model"] = model
+    prepared_body = _add_grok_native_oauth_metadata(
+        prepared_body,
+        model=model,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
+    )
+    access_token = await get_grok_native_oauth_access_token()
+    headers = _build_grok_native_oauth_headers(
+        access_token=access_token,
+        model=model,
+        request=request,
+        request_body=prepared_body,
+    )
+    return True, _get_grok_passthrough_target_base(), headers, prepared_body
 
 
 def _get_gemini_passthrough_route_family(endpoint: str) -> Optional[str]:
@@ -2107,6 +2244,19 @@ def _resolve_anthropic_xai_oauth_adapter_model(
     for candidate in _get_anthropic_adapter_model_candidates(request_body):
         if is_oa_xai_model(candidate):
             return candidate
+    return None
+
+
+def _resolve_anthropic_grok_native_oauth_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = normalize_grok_native_oauth_model(candidate)
+        if normalized_model is not None:
+            return normalized_model
     return None
 
 
@@ -9338,6 +9488,122 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
     return translated_response
 
 
+async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    translated_request_body = _build_anthropic_responses_adapter_request_body(
+        prepared_request_body,
+        adapter_model=adapter_model,
+        route_family="anthropic_grok_native_responses_adapter",
+        tag_prefix="anthropic-grok-native-responses-adapter",
+        span_name="anthropic.grok_native_responses_adapter",
+        target_endpoint="xai:/v1/responses",
+    )
+    (
+        translated_request_body,
+        openai_parallel_instruction_policy_changes,
+    ) = _apply_openai_adapter_parallel_instruction_policy(translated_request_body)
+    if openai_parallel_instruction_policy_changes:
+        verbose_proxy_logger.debug(
+            "Applied Grok native responses adapter parallel instruction policy; tools=%s original_chars=%s rewritten_chars=%s",
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_tool_names"
+            ),
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_original_chars"
+            ),
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_rewritten_chars"
+            ),
+        )
+
+    (
+        prepared_grok_native,
+        target_base_url,
+        grok_headers,
+        translated_request_body,
+    ) = await _prepare_grok_native_oauth_passthrough_request(
+        translated_request_body,
+        request=request,
+        tags_to_add=[
+            "anthropic-grok-native-responses-adapter-entrypoint",
+        ],
+        extra_fields={
+            "anthropic_grok_native_requested_model": prepared_request_body.get("model"),
+            "anthropic_grok_native_adapter_model": adapter_model,
+            "anthropic_adapter_target_endpoint": "xai:/v1/responses",
+            "grok_native_entrypoint": "anthropic_messages",
+        },
+    )
+    if not prepared_grok_native or target_base_url is None:
+        raise Exception(
+            "Anthropic adapter requests for Grok native OAuth models require a Grok OIDC credential."
+        )
+
+    target_url = _join_grok_passthrough_url(
+        base_target_url=target_base_url,
+        endpoint="/v1/responses",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    upstream_response = await pass_through_request(
+        request=request,
+        target=str(target_url),
+        custom_headers=grok_headers,
+        user_api_key_dict=user_api_key_dict,
+        custom_body=translated_request_body,
+        forward_headers=False,
+        stream=bool(translated_request_body.get("stream")),
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        egress_credential_family="xai",
+        expected_target_family="xai",
+    )
+
+    if isinstance(upstream_response, StreamingResponse):
+        if not client_requested_stream:
+            response_body = await _collect_responses_response_from_stream(
+                upstream_response
+            )
+            translated_response = _build_anthropic_response_from_responses_response(
+                response_body
+            )
+            _copy_translated_anthropic_adapter_response_headers(
+                translated_response=translated_response,
+                upstream_response=upstream_response,
+            )
+            translated_response.status_code = upstream_response.status_code
+            return translated_response
+        return _build_anthropic_streaming_response_from_responses_stream(
+            upstream_response,
+            model=adapter_model,
+            request_body=translated_request_body,
+        )
+
+    if not isinstance(upstream_response, Response):
+        raise HTTPException(
+            status_code=502,
+            detail="Unexpected upstream response type from Grok native Responses passthrough.",
+        )
+
+    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    translated_response = _build_anthropic_response_from_responses_response(
+        response_body
+    )
+    _copy_translated_anthropic_adapter_response_headers(
+        translated_response=translated_response,
+        upstream_response=upstream_response,
+    )
+    translated_response.status_code = upstream_response.status_code
+    return translated_response
+
+
 async def _handle_anthropic_xai_oauth_completion_adapter_route(
     *,
     endpoint: str,
@@ -13181,7 +13447,8 @@ def _normalize_grok_endpoint_for_target(endpoint: str, base_target_url: str) -> 
         normalized_endpoint = "/" + normalized_endpoint
 
     base_url = httpx.URL(base_target_url)
-    if base_url.path.rstrip("/") == "/v1" and normalized_endpoint.startswith("/v1/"):
+    base_path = base_url.path.rstrip("/")
+    if base_path.endswith("/v1") and normalized_endpoint.startswith("/v1/"):
         normalized_endpoint = normalized_endpoint[len("/v1") :]
     return normalized_endpoint
 
@@ -14223,6 +14490,20 @@ async def anthropic_proxy_route(
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=prepared_request_body,
                 adapter_model=xai_oauth_adapter_model,
+            )
+
+        grok_native_oauth_adapter_model = _resolve_anthropic_grok_native_oauth_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if grok_native_oauth_adapter_model is not None:
+            return await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=grok_native_oauth_adapter_model,
             )
 
         adapter_model = _resolve_anthropic_openai_responses_adapter_model(
@@ -15647,9 +15928,14 @@ async def openai_proxy_route(
     """
     request_body: dict[str, Any] = {}
     is_oa_xai_request = False
+    is_grok_native_oauth_request = False
     if request.method == "POST":
         request_body = await get_request_body(request)
         is_oa_xai_request = _is_oa_xai_request_body(request_body)
+        is_grok_native_oauth_request = (
+            _is_openai_responses_endpoint(endpoint)
+            and _is_grok_native_oauth_request_body(request_body)
+        )
 
     base_target_url = _get_openai_passthrough_target_base(
         request=request,
@@ -15663,6 +15949,8 @@ async def openai_proxy_route(
     forward_headers = False
     if is_oa_xai_request:
         base_target_url = os.getenv("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
+    elif is_grok_native_oauth_request:
+        base_target_url = _get_grok_passthrough_target_base()
     elif preserve_client_auth:
         forward_headers = True
     else:
@@ -16061,6 +16349,101 @@ async def _handle_codex_auto_agent_alias_route(
 
 class BaseOpenAIPassThroughHandler:
     @staticmethod
+    async def _prepare_openai_oa_xai_context(
+        *,
+        endpoint: str,
+        request_body: dict[str, Any],
+    ) -> Optional[tuple[str, str, dict[str, Any], str]]:
+        (
+            prepared_oa_xai,
+            oa_xai_api_base,
+            oa_xai_api_key,
+        ) = await _prepare_oa_xai_passthrough_request(request_body)
+        if not prepared_oa_xai:
+            return None
+        if oa_xai_api_base is None or oa_xai_api_key is None:
+            raise Exception(
+                "OpenAI passthrough requests for xAI OAuth models require a managed xAI OAuth credential."
+            )
+
+        request_body["model"] = _to_xai_native_passthrough_model(
+            request_body.get("model")
+        )
+        openai_route_family = _get_openai_passthrough_route_family(endpoint)
+        encoded_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+            endpoint=endpoint,
+            base_target_url=oa_xai_api_base,
+        )
+        updated_url = BaseOpenAIPassThroughHandler._join_url_paths(
+            base_url=httpx.URL(oa_xai_api_base),
+            path=encoded_endpoint,
+            custom_llm_provider=litellm.LlmProviders.XAI,
+        )
+        prepared_request_body = _merge_litellm_metadata(
+            request_body,
+            tags_to_add=[
+                f"openai-passthrough-route:{openai_route_family}",
+            ],
+            extra_fields={
+                "openai_passthrough_route_family": openai_route_family,
+            },
+        )
+        return (
+            oa_xai_api_base,
+            oa_xai_api_key,
+            prepared_request_body,
+            updated_url,
+        )
+
+    @staticmethod
+    async def _prepare_openai_grok_native_oauth_context(
+        *,
+        endpoint: str,
+        request: Request,
+        request_body: dict[str, Any],
+        extra_headers: Optional[dict],
+    ) -> Optional[tuple[str, dict[str, Any], dict[str, Any], str]]:
+        (
+            prepared_grok_native,
+            grok_target_base_url,
+            grok_headers,
+            grok_prepared_body,
+        ) = await _prepare_grok_native_oauth_passthrough_request(
+            request_body,
+            request=request,
+            tags_to_add=[
+                "openai-grok-native-responses-adapter",
+            ],
+            extra_fields={
+                "openai_passthrough_route_family": (
+                    _get_openai_passthrough_route_family(endpoint)
+                ),
+                "grok_native_entrypoint": "openai_responses",
+            },
+        )
+        if not prepared_grok_native:
+            return None
+        if grok_target_base_url is None:
+            raise Exception(
+                "OpenAI passthrough requests for Grok native OAuth models require a Grok target base URL."
+            )
+
+        merged_headers = {
+            **(extra_headers or {}),
+            **grok_headers,
+        }
+        updated_url = _join_grok_passthrough_url(
+            base_target_url=grok_target_base_url,
+            endpoint="/v1/responses",
+        )
+        return (
+            grok_target_base_url,
+            merged_headers,
+            grok_prepared_body,
+            updated_url,
+        )
+
+    @staticmethod
     async def _base_openai_pass_through_handler(
         endpoint: str,
         request: Request,
@@ -16084,48 +16467,53 @@ class BaseOpenAIPassThroughHandler:
             path=encoded_endpoint,
             custom_llm_provider=custom_llm_provider,
         )
+        egress_credential_family: Optional[str] = None
+        expected_target_family: Optional[str] = None
 
         if request.method == "POST":
             request_body = await get_request_body(request)
             prepared_request_body = request_body
             body_was_prepared = False
-            (
-                prepared_oa_xai,
-                oa_xai_api_base,
-                oa_xai_api_key,
-            ) = await _prepare_oa_xai_passthrough_request(prepared_request_body)
-            if prepared_oa_xai:
-                body_was_prepared = True
-                if oa_xai_api_base is None or oa_xai_api_key is None:
-                    raise Exception(
-                        "OpenAI passthrough requests for xAI OAuth models require a managed xAI OAuth credential."
-                    )
-                prepared_request_body["model"] = _to_xai_native_passthrough_model(
-                    prepared_request_body.get("model")
+            oa_xai_context = await (
+                BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
+                    endpoint=endpoint,
+                    request_body=prepared_request_body,
                 )
-                openai_route_family = _get_openai_passthrough_route_family(endpoint)
-                base_target_url = oa_xai_api_base
-                api_key = oa_xai_api_key
+            )
+            if oa_xai_context is not None:
+                body_was_prepared = True
+                (
+                    base_target_url,
+                    api_key,
+                    prepared_request_body,
+                    updated_url,
+                ) = oa_xai_context
                 custom_llm_provider = litellm.LlmProviders.XAI
                 forward_headers = False
-                encoded_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
-                    endpoint=endpoint,
-                    base_target_url=base_target_url,
+                egress_credential_family = "xai"
+                expected_target_family = "xai"
+            elif _is_openai_responses_endpoint(endpoint):
+                grok_native_context = await (
+                    BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
+                        endpoint=endpoint,
+                        request=request,
+                        request_body=prepared_request_body,
+                        extra_headers=extra_headers,
+                    )
                 )
-                updated_url = BaseOpenAIPassThroughHandler._join_url_paths(
-                    base_url=httpx.URL(base_target_url),
-                    path=encoded_endpoint,
-                    custom_llm_provider=custom_llm_provider,
-                )
-                prepared_request_body = _merge_litellm_metadata(
-                    prepared_request_body,
-                    tags_to_add=[
-                        f"openai-passthrough-route:{openai_route_family}",
-                    ],
-                    extra_fields={
-                        "openai_passthrough_route_family": openai_route_family,
-                    },
-                )
+                if grok_native_context is not None:
+                    body_was_prepared = True
+                    (
+                        base_target_url,
+                        extra_headers,
+                        prepared_request_body,
+                        updated_url,
+                    ) = grok_native_context
+                    api_key = None
+                    custom_llm_provider = litellm.LlmProviders.XAI
+                    forward_headers = False
+                    egress_credential_family = "xai"
+                    expected_target_family = "xai"
             elif _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
                 endpoint
             ):
@@ -16204,9 +16592,7 @@ class BaseOpenAIPassThroughHandler:
                 _safe_set_request_parsed_body(request, prepared_request_body)
 
         ## check for streaming
-        is_streaming_request = False
-        if "stream" in str(updated_url):
-            is_streaming_request = True
+        is_streaming_request = "stream" in str(updated_url)
 
         ## CREATE PASS-THROUGH
         endpoint_func = create_pass_through_route(
@@ -16220,14 +16606,14 @@ class BaseOpenAIPassThroughHandler:
             custom_llm_provider=custom_llm_provider.value
             if isinstance(custom_llm_provider, litellm.LlmProviders)
             else custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
         )  # dynamically construct pass-through endpoint based on incoming path
-        received_value = await endpoint_func(
+        return await endpoint_func(
             request,
             fastapi_response,
             user_api_key_dict,
         )
-
-        return received_value
 
     @staticmethod
     def _append_openai_beta_header(headers: dict, request: Request) -> dict:

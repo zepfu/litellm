@@ -38,6 +38,11 @@ class GrokBuildPassthroughHarness:
     user_id = "user_harness"
     litellm_api_key = "litellm-harness-key"
 
+    def __init__(self, *, model: str | None = None) -> None:
+        if model is not None:
+            self.model = model
+            self.session_id = f"grok-harness-session-{model.replace('.', '-')}"
+
     def headers(self, *, content_type: str = "application/json") -> Headers:
         return Headers(
             {
@@ -187,9 +192,10 @@ class GrokBuildPassthroughHarness:
         }
 
 
+@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
 @pytest.mark.asyncio
-async def test_grok_build_harness_routes_json_headers_and_filters_litellm_auth():
-    harness = GrokBuildPassthroughHarness()
+async def test_grok_build_harness_routes_json_headers_and_filters_litellm_auth(model):
+    harness = GrokBuildPassthroughHarness(model=model)
 
     call_kwargs, auth_mock, _, _ = await harness.invoke_route(
         endpoint="v1/responses",
@@ -245,8 +251,11 @@ async def test_grok_build_harness_routes_protobuf_raw_body_without_json_parse():
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
 
 
-def test_grok_build_harness_normalizes_final_response_and_session_history_identity():
-    harness = GrokBuildPassthroughHarness()
+@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+def test_grok_build_harness_normalizes_final_response_and_session_history_identity(
+    model,
+):
+    harness = GrokBuildPassthroughHarness(model=model)
     response_body = harness.final_response_body()
     request_body = harness.request_body()
     httpx_response = httpx.Response(
@@ -295,8 +304,8 @@ def test_grok_build_harness_normalizes_final_response_and_session_history_identi
 
     assert record is not None
     assert record["provider"] == "xai"
-    assert record["model"] == "grok-build"
-    assert record["model_group"] == "grok-build"
+    assert record["model"] == model
+    assert record["model_group"] == model
     assert record["client_name"] == "grok-build"
     assert record["client_version"] == "0.1.210"
     assert record["session_id"] == harness.session_id
@@ -418,8 +427,9 @@ def test_grok_build_harness_captures_provider_error_and_quota_metadata():
     assert quota["remaining_pct"] == 99.0
 
 
+@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
 @pytest.mark.asyncio
-async def test_grok_build_harness_live_smoke_is_explicitly_gated():
+async def test_grok_build_harness_live_smoke_is_explicitly_gated(model):
     if os.getenv("AAWM_GROK_BUILD_LIVE_SMOKE") != "1":
         pytest.skip("set AAWM_GROK_BUILD_LIVE_SMOKE=1 to run live Grok smoke")
 
@@ -448,7 +458,7 @@ async def test_grok_build_harness_live_smoke_is_explicitly_gated():
             "AAWM_GROK_BUILD_LIVE_CLIENT_VERSION",
             "0.1.210",
         ),
-        "x-grok-model-override": "grok-build",
+        "x-grok-model-override": model,
         "x-grok-session-id": "grok-live-smoke-session",
         "user-agent": "grok-live-smoke",
     }
@@ -457,7 +467,7 @@ async def test_grok_build_harness_live_smoke_is_explicitly_gated():
         response = await client.post(
             f"{base_url}/grok/v1/responses",
             headers=headers,
-            json={"model": "grok-build", "input": "Reply exactly: grok live smoke"},
+            json={"model": model, "input": "Reply exactly: grok live smoke"},
         )
 
     assert response.status_code < 500
