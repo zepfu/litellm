@@ -11209,7 +11209,9 @@ def test_codex_non_spark_keeps_image_generation_tool():
     assert updated_body["tools"] == [{"type": "image_generation"}]
 
 
-@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+@pytest.mark.parametrize(
+    "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
+)
 def test_grok_native_unsupported_custom_tool_is_removed(model):
     request_body = {
         "model": model,
@@ -11250,7 +11252,8 @@ def test_grok_native_unsupported_custom_tool_is_removed(model):
 
 
 @pytest.mark.parametrize(
-    "model", ["oa_xai/grok-4.3", "grok-build", "grok-composer-2.5-fast"]
+    "model",
+    ["oa_xai/grok-4.3", "grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
 )
 def test_grok_responses_unsupported_external_web_access_param_is_removed(model):
     request_body = {
@@ -11270,6 +11273,40 @@ def test_grok_responses_unsupported_external_web_access_param_is_removed(model):
     assert litellm_metadata["codex_unsupported_request_param_removed_count"] == 1
     assert litellm_metadata["codex_unsupported_request_params_removed"] == [
         "external_web_access"
+    ]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "oa_xai/grok-4.20-0309-reasoning",
+        "grok-build",
+        "grok-build-0.1",
+    ],
+)
+def test_grok_responses_unsupported_reasoning_request_params_are_removed(model):
+    request_body = {
+        "model": model,
+        "input": "hello",
+        "reasoning": {"effort": "medium"},
+        "reasoning_effort": "medium",
+        "reasoningEffort": "medium",
+    }
+
+    updated_body, removed_params = (
+        _drop_unsupported_codex_request_params_from_request_body(request_body)
+    )
+
+    assert removed_params == ["reasoning", "reasoning_effort", "reasoningEffort"]
+    assert "reasoning" not in updated_body
+    assert "reasoning_effort" not in updated_body
+    assert "reasoningEffort" not in updated_body
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert litellm_metadata["codex_unsupported_request_param_removed_count"] == 3
+    assert litellm_metadata["codex_unsupported_request_params_removed"] == [
+        "reasoning",
+        "reasoning_effort",
+        "reasoningeffort",
     ]
 
 
@@ -11294,7 +11331,8 @@ def test_grok_responses_nested_external_web_access_tool_param_is_removed():
 
 
 @pytest.mark.parametrize(
-    "model", ["oa_xai/grok-4.3", "grok-build", "grok-composer-2.5-fast"]
+    "model",
+    ["oa_xai/grok-4.3", "grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
 )
 def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
     request_body = {
@@ -11884,7 +11922,9 @@ async def test_anthropic_proxy_route_routes_all_oa_xai_models_to_responses_adapt
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+@pytest.mark.parametrize(
+    "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
+)
 async def test_anthropic_proxy_route_routes_grok_native_models_to_responses_adapter(
     model,
 ):
@@ -11998,6 +12038,7 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
+        "thinking": {"type": "enabled", "budget_tokens": 5000},
         "litellm_metadata": {"session_id": "claude-session"},
     }
     success_response = Response(content='{"ok": true}', media_type="application/json")
@@ -12037,10 +12078,13 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert call_kwargs["expected_target_family"] == "xai"
     custom_body = call_kwargs["custom_body"]
     assert custom_body["model"] == upstream_model
+    assert "reasoning" not in custom_body
     assert "api_key" not in custom_body
     assert "api_base" not in custom_body
     assert "custom_llm_provider" not in custom_body
     metadata = custom_body["litellm_metadata"]
+    assert metadata["codex_unsupported_request_param_removed_count"] == 1
+    assert metadata["codex_unsupported_request_params_removed"] == ["reasoning"]
     assert metadata["passthrough_route_family"] == (
         "anthropic_xai_oauth_responses_adapter"
     )
@@ -12133,6 +12177,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
+        "thinking": {"type": "enabled", "budget_tokens": 5000},
         "litellm_metadata": {"session_id": "claude-grok-session"},
     }
     success_response = Response(content='{"ok": true}', media_type="application/json")
@@ -12179,7 +12224,10 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert call_kwargs["expected_target_family"] == "xai"
     custom_body = call_kwargs["custom_body"]
     assert custom_body["model"] == "grok-composer-2.5-fast"
+    assert "reasoning" not in custom_body
     metadata = custom_body["litellm_metadata"]
+    assert metadata["codex_unsupported_request_param_removed_count"] == 1
+    assert metadata["codex_unsupported_request_params_removed"] == ["reasoning"]
     assert metadata["client_name"] == "grok-build"
     assert metadata["grok_native_oauth_managed"] is True
     assert metadata["grok_model_override"] == "grok-composer-2.5-fast"
@@ -16266,6 +16314,7 @@ class TestOpenAIPassthroughRoute:
                     "output": "ok",
                 },
             ],
+            "reasoning": {"effort": "medium"},
             "tools": [
                 {"type": "custom", "name": "exec_command"},
                 {"type": "namespace", "name": "functions"},
@@ -16321,6 +16370,7 @@ class TestOpenAIPassthroughRoute:
         assert call_args["_forward_headers"] is False
         prepared_body = mock_set_body.call_args.args[1]
         assert prepared_body["model"] == upstream_model
+        assert "reasoning" not in prepared_body
         assert prepared_body["input"] == [
             body["input"][0],
             body["input"][2],
@@ -16344,11 +16394,11 @@ class TestOpenAIPassthroughRoute:
             prepared_body["litellm_metadata"][
                 "codex_unsupported_request_param_removed_count"
             ]
-            == 1
+            == 2
         )
         assert prepared_body["litellm_metadata"][
             "codex_unsupported_request_params_removed"
-        ] == ["external_web_access"]
+        ] == ["external_web_access", "reasoning"]
         assert (
             prepared_body["litellm_metadata"][
                 "codex_unsupported_input_item_removed_count"
@@ -16367,7 +16417,9 @@ class TestOpenAIPassthroughRoute:
         assert "custom_llm_provider" not in prepared_body
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+    @pytest.mark.parametrize(
+        "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
+    )
     async def test_openai_passthrough_grok_native_models_use_grok_oidc_headers(
         self,
         monkeypatch,
@@ -16393,6 +16445,7 @@ class TestOpenAIPassthroughRoute:
                     "output": "ok",
                 },
             ],
+            "reasoning": {"effort": "medium"},
             "tools": [
                 {"type": "custom", "name": "exec_command"},
                 {"type": "namespace", "name": "functions"},
@@ -16458,6 +16511,7 @@ class TestOpenAIPassthroughRoute:
         assert call_args["expected_target_family"] == "xai"
         prepared_body = mock_set_body.call_args.args[1]
         assert prepared_body["model"] == model
+        assert "reasoning" not in prepared_body
         assert prepared_body["input"] == [
             body["input"][0],
             body["input"][2],
@@ -16483,9 +16537,10 @@ class TestOpenAIPassthroughRoute:
             "namespace",
             "tool_search",
         ]
-        assert metadata["codex_unsupported_request_param_removed_count"] == 1
+        assert metadata["codex_unsupported_request_param_removed_count"] == 2
         assert metadata["codex_unsupported_request_params_removed"] == [
-            "external_web_access"
+            "external_web_access",
+            "reasoning",
         ]
         assert metadata["codex_unsupported_input_item_removed_count"] == 1
         assert metadata["codex_unsupported_input_item_types_removed"] == [

@@ -7181,6 +7181,9 @@ def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> 
                 "x-ratelimit-remaining-requests": "97",
                 "x-ratelimit-limit-tokens": "15000000",
                 "x-ratelimit-remaining-tokens": "14925000",
+                "config": {
+                    "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+                },
             },
         }
     )
@@ -7207,13 +7210,26 @@ def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> 
     assert request_observation["used_requests"] == 3
     assert request_observation["remaining_pct"] == pytest.approx(97.0)
     assert request_observation["used_percentage"] == pytest.approx(3.0)
-    assert request_observation["provider_resets_at"] is None
-    assert request_observation["evidence"]["reset_absent"] is True
+    assert request_observation["quota_period"] == "monthly"
+    assert request_observation["provider_resets_at"] == datetime(
+        2026, 7, 1, tzinfo=timezone.utc
+    )
+    assert request_observation["evidence"]["reset_absent"] is False
+    assert (
+        request_observation["evidence"]["reset_source"]
+        == "payload_config_billing_period_end"
+    )
+    assert request_observation["raw_provider_fields"]["billingPeriodEnd"] == (
+        "2026-07-01T00:00:00+00:00"
+    )
     assert request_observation["account_hash"] == aawm_agent_identity._short_hash(
         b"acct_xai_user_123"
     )
     assert request_observation["metadata"]["xai_oauth_public_model"] == "oa_xai/grok-4.3"
     assert token_observation["quota_type"] == "tokens"
+    assert token_observation["provider_resets_at"] == datetime(
+        2026, 7, 1, tzinfo=timezone.utc
+    )
     assert token_observation["remaining_pct"] == pytest.approx(99.5)
     assert token_observation["used_requests"] == 75000
     assert token_observation["raw_provider_fields"]["quota_unit_interpretation"] == "tokens"
@@ -7306,6 +7322,12 @@ def test_build_rate_limit_observations_extracts_xai_oauth_hidden_headers() -> No
     assert by_scope["requests"]["client_family"] == "xai_oauth"
     assert by_scope["requests"]["model"] == "oa_xai/grok-4.3"
     assert by_scope["requests"]["remaining_pct"] == pytest.approx(96.0)
+    assert by_scope["requests"]["provider_resets_at"] == datetime(
+        2026, 7, 1, tzinfo=timezone.utc
+    )
+    assert by_scope["requests"]["evidence"]["reset_source"] == (
+        "xai_grok_subscription_month_boundary"
+    )
     assert by_scope["tokens"]["remaining_pct"] == pytest.approx(99.0)
 
 
