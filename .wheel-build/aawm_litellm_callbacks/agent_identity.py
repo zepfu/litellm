@@ -207,6 +207,10 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
     file_read_count INTEGER NOT NULL DEFAULT 0,
     file_modified_count INTEGER NOT NULL DEFAULT 0,
+    changed_pre_commit_config BOOLEAN,
+    changed_env_file BOOLEAN,
+    changed_pyproject_toml BOOLEAN,
+    changed_gitignore BOOLEAN,
     git_commit_count INTEGER NOT NULL DEFAULT 0,
     git_push_count INTEGER NOT NULL DEFAULT 0,
     response_cost_usd DOUBLE PRECISION,
@@ -296,6 +300,10 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tenant_id TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_read_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_modified_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_pre_commit_config BOOLEAN",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_env_file BOOLEAN",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_pyproject_toml BOOLEAN",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_gitignore BOOLEAN",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_commit_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_push_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_attempted BOOLEAN NOT NULL DEFAULT FALSE",
@@ -898,6 +906,10 @@ INSERT INTO public.session_history (
     tool_names,
     file_read_count,
     file_modified_count,
+    changed_pre_commit_config,
+    changed_env_file,
+    changed_pyproject_toml,
+    changed_gitignore,
     git_commit_count,
     git_push_count,
     response_cost_usd,
@@ -990,16 +1002,16 @@ INSERT INTO public.session_history (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
-    $32, $33, $34, $35, $36, $37, $38, $39, $40::jsonb, $41, $42, $43, $44, $45, $46, $47::jsonb, $48,
-    $49, $50, $51, $52, $53, $54, $55, $56, $57,
-    $58, $59, $60, $61, $62, $63, $64, $65, $66, $67,
-    $68, $69, $70, $71, $72,
-    $73, $74, $75, $76, $77, $78, $79, $80, $81, $82,
-    $83, $84, $85, $86, $87, $88, $89, $90, $91, $92,
-    $93, $94, $95, $96,
-    $97, $98, $99, $100, $101, $102, $103, $104, $105, $106,
-    $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117::jsonb,
-    $118, $119, $120, $121
+    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44::jsonb, $45, $46, $47, $48, $49, $50, $51::jsonb, $52,
+    $53, $54, $55, $56, $57, $58, $59, $60, $61,
+    $62, $63, $64, $65, $66, $67, $68, $69, $70, $71,
+    $72, $73, $74, $75, $76,
+    $77, $78, $79, $80, $81, $82, $83, $84, $85, $86,
+    $87, $88, $89, $90, $91, $92, $93, $94, $95, $96,
+    $97, $98, $99, $100,
+    $101, $102, $103, $104, $105, $106, $107, $108, $109, $110,
+    $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121::jsonb,
+    $122, $123, $124, $125
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -1300,6 +1312,34 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     END,
     file_read_count = GREATEST(session_history.file_read_count, EXCLUDED.file_read_count),
     file_modified_count = GREATEST(session_history.file_modified_count, EXCLUDED.file_modified_count),
+    changed_pre_commit_config = CASE
+        WHEN session_history.changed_pre_commit_config IS NULL
+            AND EXCLUDED.changed_pre_commit_config IS NULL
+            THEN NULL
+        ELSE COALESCE(session_history.changed_pre_commit_config, FALSE)
+            OR COALESCE(EXCLUDED.changed_pre_commit_config, FALSE)
+    END,
+    changed_env_file = CASE
+        WHEN session_history.changed_env_file IS NULL
+            AND EXCLUDED.changed_env_file IS NULL
+            THEN NULL
+        ELSE COALESCE(session_history.changed_env_file, FALSE)
+            OR COALESCE(EXCLUDED.changed_env_file, FALSE)
+    END,
+    changed_pyproject_toml = CASE
+        WHEN session_history.changed_pyproject_toml IS NULL
+            AND EXCLUDED.changed_pyproject_toml IS NULL
+            THEN NULL
+        ELSE COALESCE(session_history.changed_pyproject_toml, FALSE)
+            OR COALESCE(EXCLUDED.changed_pyproject_toml, FALSE)
+    END,
+    changed_gitignore = CASE
+        WHEN session_history.changed_gitignore IS NULL
+            AND EXCLUDED.changed_gitignore IS NULL
+            THEN NULL
+        ELSE COALESCE(session_history.changed_gitignore, FALSE)
+            OR COALESCE(EXCLUDED.changed_gitignore, FALSE)
+    END,
     git_commit_count = GREATEST(session_history.git_commit_count, EXCLUDED.git_commit_count),
     git_push_count = GREATEST(session_history.git_push_count, EXCLUDED.git_push_count),
     response_cost_usd = COALESCE(
@@ -11527,6 +11567,7 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_session_repository_on_record(record)
     _normalize_session_tenant_on_record(record)
     _normalize_session_latency_state_on_record(record)
+    _normalize_sensitive_config_change_state_on_record(record)
     _classify_zero_token_session_history_record(record)
     _sync_session_history_record_metadata(record)
     return record
@@ -11638,6 +11679,34 @@ _TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS = {
     "title",
     "summary",
 }
+_SENSITIVE_CONFIG_CHANGE_FIELDS = (
+    "changed_pre_commit_config",
+    "changed_env_file",
+    "changed_pyproject_toml",
+    "changed_gitignore",
+)
+_SENSITIVE_CONFIG_ENV_REDACTION = "[redacted_sensitive_config_file_content]"
+_SENSITIVE_CONFIG_ENV_REDACT_ARGUMENT_KEYS = {
+    "bash",
+    "cmd",
+    "code",
+    "command",
+    "content",
+    "input",
+    "new_str",
+    "old_str",
+    "patch",
+    "raw_text",
+    "replacement",
+    "script",
+    "shell",
+    "text",
+    "value",
+}
+_SENSITIVE_CONFIG_ENV_COMMAND_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])\.env[A-Za-z0-9._-]*(?![A-Za-z0-9_/-])",
+    re.IGNORECASE,
+)
 
 
 def _dedupe_strings(values: List[str]) -> List[str]:
@@ -11650,6 +11719,95 @@ def _dedupe_strings(values: List[str]) -> List[str]:
         seen.add(stripped)
         result.append(stripped)
     return result
+
+
+def _normalize_changed_file_path(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().strip("'\"").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized:
+        return None
+    return normalized
+
+
+def _changed_file_basename(value: Any) -> Optional[str]:
+    normalized = _normalize_changed_file_path(value)
+    if normalized is None:
+        return None
+    return normalized.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _sensitive_config_change_flags_from_paths(paths: List[str]) -> Dict[str, bool]:
+    flags = {field: False for field in _SENSITIVE_CONFIG_CHANGE_FIELDS}
+    for path in _dedupe_strings(paths):
+        basename = _changed_file_basename(path)
+        if not basename:
+            continue
+        basename_lower = basename.lower()
+        if basename_lower in {".pre-commit-config.yaml", ".pre-commit-config.yml"}:
+            flags["changed_pre_commit_config"] = True
+        if basename_lower.startswith(".env"):
+            flags["changed_env_file"] = True
+        if basename_lower == "pyproject.toml":
+            flags["changed_pyproject_toml"] = True
+        if basename_lower == ".gitignore":
+            flags["changed_gitignore"] = True
+    return flags
+
+
+def _text_mentions_env_file(value: Any) -> bool:
+    return isinstance(value, str) and bool(_SENSITIVE_CONFIG_ENV_COMMAND_RE.search(value))
+
+
+def _redact_sensitive_config_argument_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for key, nested_value in value.items():
+            key_lower = str(key).lower()
+            if key_lower in _SENSITIVE_CONFIG_ENV_REDACT_ARGUMENT_KEYS:
+                redacted[key] = _SENSITIVE_CONFIG_ENV_REDACTION
+            else:
+                redacted[key] = _redact_sensitive_config_argument_value(nested_value)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_config_argument_value(item) for item in value]
+    return value
+
+
+def _sanitize_tool_activity_arguments_for_sensitive_config(
+    arguments: Any,
+    *,
+    file_paths_modified: List[str],
+    command_text: Optional[str] = None,
+) -> Any:
+    flags = _sensitive_config_change_flags_from_paths(file_paths_modified)
+    if not flags["changed_env_file"] and not _text_mentions_env_file(command_text):
+        return arguments
+    if isinstance(arguments, str):
+        return _SENSITIVE_CONFIG_ENV_REDACTION
+    return _redact_sensitive_config_argument_value(arguments)
+
+
+def _normalize_sensitive_config_change_state_on_record(record: Dict[str, Any]) -> None:
+    modified_paths: List[str] = []
+    tool_activity = record.get("tool_activity")
+    if not isinstance(tool_activity, list):
+        return
+    if isinstance(tool_activity, list):
+        for item in tool_activity:
+            if not isinstance(item, dict):
+                continue
+            modified_paths.extend(
+                value
+                for value in (item.get("file_paths_modified") or [])
+                if isinstance(value, str)
+            )
+
+    flags = _sensitive_config_change_flags_from_paths(modified_paths)
+    for field, derived_value in flags.items():
+        record[field] = bool(record.get(field)) or derived_value
 
 
 def _parse_tool_arguments(arguments: Any) -> Any:
@@ -11845,6 +12003,19 @@ def _build_tool_activity_entry(
         git_commit_count = _count_git_subcommand(command_text, "commit")
         git_push_count = _count_git_subcommand(command_text, "push")
 
+    sensitive_config_flags = _sensitive_config_change_flags_from_paths(
+        file_paths_modified
+    )
+    stored_arguments = _sanitize_tool_activity_arguments_for_sensitive_config(
+        parsed_arguments,
+        file_paths_modified=file_paths_modified,
+        command_text=command_text,
+    )
+    if (
+        sensitive_config_flags["changed_env_file"] or _text_mentions_env_file(command_text)
+    ) and command_text is not None:
+        command_text = _SENSITIVE_CONFIG_ENV_REDACTION
+
     return {
         "tool_index": tool_index,
         "tool_call_id": tool_call_id,
@@ -11855,7 +12026,7 @@ def _build_tool_activity_entry(
         "git_commit_count": git_commit_count,
         "git_push_count": git_push_count,
         "command_text": command_text,
-        "arguments": parsed_arguments,
+        "arguments": stored_arguments,
         "metadata": {"source": source} if source else {},
     }
 
@@ -12039,6 +12210,7 @@ def _summarize_tool_activity(tool_activity: List[Dict[str, Any]]) -> Dict[str, i
     return {
         "file_read_count": len(_dedupe_strings(read_paths)),
         "file_modified_count": len(_dedupe_strings(modified_paths)),
+        **_sensitive_config_change_flags_from_paths(modified_paths),
         "git_commit_count": git_commit_count,
         "git_push_count": git_push_count,
     }
@@ -13434,6 +13606,12 @@ def _build_session_history_record_from_langfuse_trace_observation(
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
+        "changed_pre_commit_config": tool_activity_summary[
+            "changed_pre_commit_config"
+        ],
+        "changed_env_file": tool_activity_summary["changed_env_file"],
+        "changed_pyproject_toml": tool_activity_summary["changed_pyproject_toml"],
+        "changed_gitignore": tool_activity_summary["changed_gitignore"],
         "git_commit_count": tool_activity_summary["git_commit_count"],
         "git_push_count": tool_activity_summary["git_push_count"],
         "tool_activity": tool_activity,
@@ -14308,6 +14486,12 @@ def _build_session_history_record(
         "tool_names": tool_names,
         "file_read_count": tool_activity_summary["file_read_count"],
         "file_modified_count": tool_activity_summary["file_modified_count"],
+        "changed_pre_commit_config": tool_activity_summary[
+            "changed_pre_commit_config"
+        ],
+        "changed_env_file": tool_activity_summary["changed_env_file"],
+        "changed_pyproject_toml": tool_activity_summary["changed_pyproject_toml"],
+        "changed_gitignore": tool_activity_summary["changed_gitignore"],
         "git_commit_count": tool_activity_summary["git_commit_count"],
         "git_push_count": tool_activity_summary["git_push_count"],
         "tool_activity": tool_activity,
@@ -14440,6 +14624,10 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         json.dumps(record["tool_names"]),
         record.get("file_read_count", 0),
         record.get("file_modified_count", 0),
+        record.get("changed_pre_commit_config"),
+        record.get("changed_env_file"),
+        record.get("changed_pyproject_toml"),
+        record.get("changed_gitignore"),
         record.get("git_commit_count", 0),
         record.get("git_push_count", 0),
         record["response_cost_usd"],

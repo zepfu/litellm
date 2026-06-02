@@ -1044,7 +1044,7 @@ def test_build_session_history_record_uses_repository_header_and_metadata() -> N
     assert record["metadata"]["repository"] == "zepfu/litellm"
 
     payload = _build_session_history_db_payload(record)
-    assert payload[47] == "zepfu/litellm"
+    assert payload[51] == "zepfu/litellm"
 
 
 def test_build_session_history_record_prefers_repository_header_over_request_context() -> None:
@@ -2323,16 +2323,16 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
     assert record["metadata"]["usage_structured_output_mode"] == "json_schema"
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 121
-    assert payload[67] is True
-    assert payload[68] is False
-    assert payload[69] == "json_schema"
-    assert payload[70] == record["structured_output_schema_hash"]
-    assert payload[71] is None
-    assert payload[72:94] == (None,) * 22
-    assert payload[94] == pytest.approx(1.0)
-    assert payload[95] == 0
-    assert payload[96:113] == (
+    assert len(payload) == 125
+    assert payload[71] is True
+    assert payload[72] is False
+    assert payload[73] == "json_schema"
+    assert payload[74] == record["structured_output_schema_hash"]
+    assert payload[75] is None
+    assert payload[76:98] == (None,) * 22
+    assert payload[98] == pytest.approx(1.0)
+    assert payload[99] == 0
+    assert payload[100:117] == (
         0.0,
         0.0,
         0,
@@ -2351,11 +2351,11 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
         0,
         0,
     )
-    assert payload[113:116] == (None, None, None)
-    assert json.loads(payload[116]) == {
+    assert payload[117:120] == (None, None, None)
+    assert json.loads(payload[120]) == {
         "agent_quality_rule_catalog_version": "2026-05-31.v1"
     }
-    assert payload[117:121] == (False, None, None, None)
+    assert payload[121:125] == (False, None, None, None)
 
 
 def test_build_session_history_record_persists_agent_score_metadata() -> None:
@@ -2428,41 +2428,41 @@ def test_build_session_history_record_persists_agent_score_metadata() -> None:
     assert record["destructive_action_policy_score"] == pytest.approx(1.0)
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 121
-    assert payload[72] == pytest.approx(0.0)
-    assert payload[73] is True
-    assert payload[76] is False
-    assert payload[77] == pytest.approx(0.0)
-    assert payload[78] == 2
-    assert payload[79] == pytest.approx(0.0)
-    assert payload[80] == pytest.approx(0.0)
-    assert payload[81] == pytest.approx(1.0)
-    assert payload[82] == pytest.approx(0.5)
-    assert payload[83] == pytest.approx(1.0)
-    assert payload[84] == pytest.approx(1.0)
-    assert payload[85] == pytest.approx(0.0)
-    assert payload[86] == pytest.approx(0.0)
+    assert len(payload) == 125
+    assert payload[76] == pytest.approx(0.0)
+    assert payload[77] is True
+    assert payload[80] is False
+    assert payload[81] == pytest.approx(0.0)
+    assert payload[82] == 2
+    assert payload[83] == pytest.approx(0.0)
+    assert payload[84] == pytest.approx(0.0)
+    assert payload[85] == pytest.approx(1.0)
+    assert payload[86] == pytest.approx(0.5)
     assert payload[87] == pytest.approx(1.0)
     assert payload[88] == pytest.approx(1.0)
     assert payload[89] == pytest.approx(0.0)
     assert payload[90] == pytest.approx(0.0)
-    assert payload[91] == pytest.approx(0.0)
-    assert payload[92] is None
-    assert payload[93] == pytest.approx(1.0)
-    assert payload[94] == pytest.approx(1.0)
-    assert payload[95] == 0
-    assert payload[96] == pytest.approx(0.0)
-    assert payload[97] == pytest.approx(0.0)
-    assert payload[105] == pytest.approx(0.0)
-    assert payload[106] == pytest.approx(0.0)
-    assert payload[113:116] == (None, None, None)
-    assert json.loads(payload[116]) == {
+    assert payload[91] == pytest.approx(1.0)
+    assert payload[92] == pytest.approx(1.0)
+    assert payload[93] == pytest.approx(0.0)
+    assert payload[94] == pytest.approx(0.0)
+    assert payload[95] == pytest.approx(0.0)
+    assert payload[96] is None
+    assert payload[97] == pytest.approx(1.0)
+    assert payload[98] == pytest.approx(1.0)
+    assert payload[99] == 0
+    assert payload[100] == pytest.approx(0.0)
+    assert payload[101] == pytest.approx(0.0)
+    assert payload[109] == pytest.approx(0.0)
+    assert payload[110] == pytest.approx(0.0)
+    assert payload[117:120] == (None, None, None)
+    assert json.loads(payload[120]) == {
         "response_meaningfulness": ["no_meaningful_output"],
         "read_only_policy_compliance": ["mutating_tool:Bash"],
         "agent_quality_rule_catalog_version": "2026-05-31.v1",
     }
-    assert payload[117:121] == (False, None, None, None)
-    payload_metadata = json.loads(payload[46])
+    assert payload[121:125] == (False, None, None, None)
+    payload_metadata = json.loads(payload[50])
     assert payload_metadata["usage_trace_quality_score"] == pytest.approx(0.0)
     assert payload_metadata["usage_empty_completion_failure"] is True
     assert payload_metadata["usage_answer_completeness_score"] == pytest.approx(1.0)
@@ -2969,17 +2969,17 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 121
-    assert payload[57] == pytest.approx(25.0)
-    assert payload[58] == pytest.approx(100.0)
-    assert payload[59] == pytest.approx(130.0)
-    assert payload[60] == pytest.approx(50.0)
-    assert payload[61] == pytest.approx(10.0)
-    assert payload[62] == pytest.approx(15.0)
-    assert payload[66] is None
-    assert payload[63] == pytest.approx(40.0)
-    assert payload[64] == pytest.approx(60.0)
-    assert payload[65] == pytest.approx(5.0)
+    assert len(payload) == 125
+    assert payload[61] == pytest.approx(25.0)
+    assert payload[62] == pytest.approx(100.0)
+    assert payload[63] == pytest.approx(130.0)
+    assert payload[64] == pytest.approx(50.0)
+    assert payload[65] == pytest.approx(10.0)
+    assert payload[66] == pytest.approx(15.0)
+    assert payload[70] is None
+    assert payload[67] == pytest.approx(40.0)
+    assert payload[68] == pytest.approx(60.0)
+    assert payload[69] == pytest.approx(5.0)
 
 
 def test_build_session_history_record_preserves_explicit_openrouter_model() -> None:
@@ -3116,6 +3116,230 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
     assert record["metadata"]["request_tags"] == ["reasoning-present"]
     assert record["metadata"]["tenant_id"] == "aegis"
     assert record["metadata"]["cc_version"] == "2.1.112"
+
+
+def test_build_session_history_record_flags_sensitive_config_file_changes() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_call_id"] = "call-sensitive-config"
+    kwargs["model"] = "openai/gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-sensitive-config"
+    result = {
+        "id": "response-sensitive-config",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "tool-pre-commit",
+                            "type": "function",
+                            "function": {
+                                "name": "apply_patch",
+                                "arguments": json.dumps(
+                                    {
+                                        "patch": (
+                                            "*** Begin Patch\n"
+                                            "*** Update File: .pre-commit-config.yaml\n"
+                                            "@@\n"
+                                            "+repos: []\n"
+                                            "*** End Patch\n"
+                                        )
+                                    }
+                                ),
+                            },
+                        },
+                        {
+                            "id": "tool-env",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {
+                                        "file_path": ".env.local",
+                                        "content": "API_KEY=super-secret",
+                                    }
+                                ),
+                            },
+                        },
+                        {
+                            "id": "tool-pyproject",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {"file_path": "pyproject.toml", "content": "x = 1"}
+                                ),
+                            },
+                        },
+                        {
+                            "id": "tool-gitignore",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {"file_path": "./.gitignore", "content": ".env\n"}
+                                ),
+                            },
+                        },
+                    ],
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["file_modified_count"] == 4
+    assert record["changed_pre_commit_config"] is True
+    assert record["changed_env_file"] is True
+    assert record["changed_pyproject_toml"] is True
+    assert record["changed_gitignore"] is True
+    env_activity = record["tool_activity"][1]
+    assert env_activity["file_paths_modified"] == [".env.local"]
+    assert env_activity["arguments"]["content"] == (
+        aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION
+    )
+    assert "super-secret" not in json.dumps(env_activity)
+
+
+def test_build_session_history_record_does_not_infer_config_changes_from_reads_or_commands() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_call_id"] = "call-sensitive-config-negative"
+    kwargs["model"] = "openai/gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-sensitive-config-negative"
+    )
+    result = {
+        "id": "response-sensitive-config-negative",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "tool-read-env",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": json.dumps({"file_path": ".env.local"}),
+                            },
+                        },
+                        {
+                            "id": "tool-bash",
+                            "type": "function",
+                            "function": {
+                                "name": "Bash",
+                                "arguments": json.dumps(
+                                    {
+                                        "command": (
+                                            "echo API_KEY=super-secret > .env.local && "
+                                            "touch pyproject.toml .gitignore"
+                                        )
+                                    }
+                                ),
+                            },
+                        },
+                    ],
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["file_read_count"] == 1
+    assert record["file_modified_count"] == 0
+    assert record["changed_pre_commit_config"] is False
+    assert record["changed_env_file"] is False
+    assert record["changed_pyproject_toml"] is False
+    assert record["changed_gitignore"] is False
+    command_activity = record["tool_activity"][1]
+    assert command_activity["command_text"] == (
+        aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION
+    )
+    assert command_activity["arguments"]["command"] == (
+        aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION
+    )
+    assert "super-secret" not in json.dumps(command_activity)
+
+
+@pytest.mark.parametrize(
+    ("trace_name", "provider", "model"),
+    [
+        ("codex", "openai", "openai/gpt-5.4-mini"),
+        ("claude-code.orchestrator", "anthropic", "anthropic/claude-opus-4-6"),
+        ("gemini", "gemini", "gemini/gemini-2.5-flash"),
+        ("grok-build", "xai", "xai/grok-4.3"),
+    ],
+)
+def test_build_session_history_record_flags_config_changes_across_agent_families(
+    trace_name: str,
+    provider: str,
+    model: str,
+) -> None:
+    kwargs = _base_kwargs(trace_name=trace_name)
+    kwargs["litellm_call_id"] = f"call-config-family-{provider}"
+    kwargs["model"] = model
+    kwargs["custom_llm_provider"] = provider
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": f"session-config-family-{provider}",
+            "model_group": model,
+        }
+    )
+    result = {
+        "id": f"response-config-family-{provider}",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "tool-pyproject",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {"file_path": "pyproject.toml", "content": "x = 1"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["provider"] == provider
+    assert record["changed_pyproject_toml"] is True
+    assert record["changed_pre_commit_config"] is False
+    assert record["changed_env_file"] is False
+    assert record["changed_gitignore"] is False
 
 
 def test_build_session_history_record_recovers_anthropic_count_tokens_result() -> None:
@@ -4731,16 +4955,16 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 121
+    assert len(payload) == 125
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
     assert payload[22] is True
     assert payload[23] == "hit"
     assert payload[29] == 0
-    assert payload[36] == "dev"
-    assert payload[37] == "1.82.3+aawm.25"
-    assert payload[57:67] == (
+    assert payload[40] == "dev"
+    assert payload[41] == "1.82.3+aawm.25"
+    assert payload[61:71] == (
         None,
         None,
         None,
@@ -4752,19 +4976,19 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
         None,
         None,
     )
-    assert payload[67:72] == (False, False, None, None, None)
-    assert payload[72:116] == (None,) * 44
-    assert json.loads(payload[116]) == {}
-    assert payload[117:121] == (False, None, None, None)
-    assert payload[38] == "aawm.25"
-    assert "aawm-litellm-callbacks" in payload[39]
-    assert payload[40] == "codex-tui"
-    assert payload[41] == "0.124.0"
-    assert payload[42] == "codex-tui/0.124.0"
-    assert payload[43] == 100
-    assert payload[44] == 7
-    assert payload[45] == pytest.approx(0.016138)
-    payload_metadata = json.loads(payload[46])
+    assert payload[71:76] == (False, False, None, None, None)
+    assert payload[76:120] == (None,) * 44
+    assert json.loads(payload[120]) == {}
+    assert payload[121:125] == (False, None, None, None)
+    assert payload[42] == "aawm.25"
+    assert "aawm-litellm-callbacks" in payload[43]
+    assert payload[44] == "codex-tui"
+    assert payload[45] == "0.124.0"
+    assert payload[46] == "codex-tui/0.124.0"
+    assert payload[47] == 100
+    assert payload[48] == 7
+    assert payload[49] == pytest.approx(0.016138)
+    payload_metadata = json.loads(payload[50])
     assert payload_metadata["litellm_environment"] == "dev"
     assert payload_metadata["client_name"] == "codex-tui"
     assert payload_metadata["usage_invalid_tool_call_count"] == 0
@@ -5153,11 +5377,11 @@ def test_d1_169_build_session_history_db_payload_appends_compact_summary_fields(
 
     assert record is not None
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 121
-    assert payload[117] == record["is_compact_summary"]
-    assert payload[118] == record["compact_summary_source"]
-    assert payload[119] == record["compact_summary_id"]
-    assert payload[120] == record["compact_summary_role"]
+    assert len(payload) == 125
+    assert payload[121] == record["is_compact_summary"]
+    assert payload[122] == record["compact_summary_source"]
+    assert payload[123] == record["compact_summary_id"]
+    assert payload[124] == record["compact_summary_role"]
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
@@ -7535,9 +7759,9 @@ def test_failure_record_persists_structured_output_failure_in_session_history() 
     ] is True
 
     payload = _build_session_history_db_payload(record)
-    assert payload[67] is True
-    assert payload[68] is True
-    assert payload[71] == "schema_validation_error"
+    assert payload[71] is True
+    assert payload[72] is True
+    assert payload[75] == "schema_validation_error"
 
 
 def test_failure_record_persists_structured_output_attempt_for_unrelated_error() -> None:
@@ -7931,7 +8155,7 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert mock_conn.execute.await_count == 2
     executed_args = mock_conn.execute.await_args_list[0].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 121
+    assert len(executed_args[1:]) == 125
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
@@ -10010,7 +10234,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
-    assert len(history_args[1][0]) == 121
+    assert len(history_args[1][0]) == 125
     assert history_args[1][0][0] == "call-1"
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
@@ -10095,11 +10319,11 @@ async def test_persist_session_history_records_inherits_auto_review_parent_ident
     permission_payload = next(
         payload for payload in payloads if payload[0] == "call-auto-review-child"
     )
-    metadata = json.loads(permission_payload[46])
+    metadata = json.loads(permission_payload[50])
     assert permission_payload[5] == "claude-auto-review"
     assert permission_payload[7] == "auto-reviewer"
     assert permission_payload[8] == "dashboard-shell"
-    assert permission_payload[47] == "dashboard-shell"
+    assert permission_payload[51] == "dashboard-shell"
     assert metadata["repository"] == "dashboard-shell"
     assert metadata["tenant_id"] == "dashboard-shell"
     assert metadata["trace_user_id"] == "dashboard-shell"
@@ -10317,6 +10541,58 @@ def test_session_history_upsert_sql_guards_scalar_tool_names() -> None:
 
     assert "jsonb_typeof(EXCLUDED.tool_names) = 'array'" in sql
     assert "jsonb_typeof(session_history.tool_names) = 'array'" in sql
+
+
+def test_session_history_insert_sql_includes_sensitive_config_change_flags() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
+
+    assert "changed_pre_commit_config" in sql
+    assert "changed_env_file" in sql
+    assert "changed_pyproject_toml" in sql
+    assert "changed_gitignore" in sql
+    assert "changed_env_file = CASE" in sql
+    assert "AND EXCLUDED.changed_env_file IS NULL" in sql
+    assert "THEN NULL" in sql
+
+
+def test_session_history_payload_preserves_unknown_sensitive_config_flags() -> None:
+    payload = _build_session_history_db_payload(
+        {
+            "litellm_call_id": "call-no-tool-evidence",
+            "session_id": "session-no-tool-evidence",
+            "trace_id": None,
+            "provider_response_id": None,
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "model_group": "gpt-5.4-mini",
+            "agent_name": None,
+            "tenant_id": None,
+            "call_type": "responses",
+            "start_time": None,
+            "end_time": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens_reported": None,
+            "reasoning_tokens_estimated": None,
+            "reasoning_tokens_source": "not_applicable",
+            "reasoning_present": False,
+            "thinking_signature_present": False,
+            "tool_call_count": 0,
+            "invalid_tool_call_count": 0,
+            "tool_names": [],
+            "file_read_count": 0,
+            "file_modified_count": 0,
+            "git_commit_count": 0,
+            "git_push_count": 0,
+            "response_cost_usd": None,
+            "metadata": {},
+        }
+    )
+
+    assert payload[33:37] == (None, None, None, None)
 
 
 def test_tool_activity_upsert_sql_guards_scalar_file_paths() -> None:
