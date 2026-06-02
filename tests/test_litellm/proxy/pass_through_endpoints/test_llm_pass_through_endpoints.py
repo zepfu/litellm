@@ -67,6 +67,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT,
+    _handle_anthropic_grok_native_oauth_responses_adapter_route,
     _handle_anthropic_nvidia_completion_adapter_route,
     _handle_anthropic_xai_oauth_completion_adapter_route,
     _handle_anthropic_xai_oauth_responses_adapter_route,
@@ -3137,6 +3138,38 @@ class TestGoogleAdapterRequestShapePolicy:
         assert headers["x-ratelimit-remaining-requests"] == "97"
         assert headers["x-ratelimit-limit-tokens"] == "15000000"
         assert "authorization" not in headers
+
+    def test_success_handler_records_grok_native_oauth_rate_limit_headers(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "grok_native_oauth_managed": True,
+                    "passthrough_route_family": "grok_cli_chat_proxy",
+                }
+            }
+        }
+        response = httpx.Response(
+            status_code=200,
+            headers={
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "95",
+                "authorization": "Bearer should-not-be-logged",
+                "x-request-id": "req_should_not_be_logged",
+            },
+        )
+
+        PassThroughEndpointLogging()._record_upstream_rate_limit_headers_metadata(
+            kwargs,
+            httpx_response=response,
+            url_route="https://cli-chat-proxy.grok.com/v1/responses",
+            custom_llm_provider="xai",
+        )
+
+        headers = kwargs["litellm_params"]["metadata"]["xai_oauth_response_headers"]
+        assert headers["source"] == "xai_oauth_response_headers"
+        assert headers["x-ratelimit-remaining-requests"] == "95"
+        assert "authorization" not in headers
+        assert "x-request-id" not in headers
 
     def test_success_handler_skips_xai_rate_limit_headers_without_oauth_metadata(self):
         kwargs = {"litellm_params": {"metadata": {"client_name": "grok-build"}}}
@@ -11747,6 +11780,44 @@ async def test_anthropic_proxy_route_routes_oa_xai_multi_agent_to_responses_adap
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+async def test_anthropic_proxy_route_routes_grok_native_models_to_responses_adapter(
+    model,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(return_value=body),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        new=AsyncMock(return_value=(body, 0, set(), {})),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+    ) as mock_create_pass_through_route:
+        result = await anthropic_proxy_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+        )
+
+    assert result == {"ok": True}
+    mock_grok_native.assert_awaited_once()
+    mock_create_pass_through_route.assert_not_called()
+    assert mock_grok_native.await_args.kwargs["adapter_model"] == model
+
+
+@pytest.mark.asyncio
 async def test_anthropic_xai_oauth_completion_adapter_uses_managed_oauth(
     monkeypatch,
 ):
@@ -11867,6 +11938,82 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert "route:xai_oauth_api" in metadata["tags"]
     assert "route:anthropic_xai_oauth_responses_adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "http://localhost:4001/grok/v1",
+    )
+    request = _build_anthropic_auto_agent_request()
+    request.headers = {
+        "authorization": "Bearer inbound-anthropic-key",
+        "session_id": "claude-grok-session",
+        "user-agent": "claude-cli/2.0.0",
+    }
+    body = {
+        "model": "grok-composer-2.5-fast",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-grok-session"},
+    }
+    success_response = Response(content='{"ok": true}', media_type="application/json")
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","model":"grok-composer-2.5-fast","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+        return_value=success_response,
+    ):
+        response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model="grok-composer-2.5-fast",
+        )
+
+    assert response is success_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["target"] == "http://localhost:4001/grok/v1/responses"
+    assert call_kwargs["custom_headers"]["authorization"] == (
+        "Bearer grok-oidc-token"
+    )
+    assert call_kwargs["custom_headers"]["x-xai-token-auth"] == "true"
+    assert call_kwargs["custom_headers"]["x-grok-model-override"] == (
+        "grok-composer-2.5-fast"
+    )
+    assert call_kwargs["custom_headers"]["x-grok-session-id"] == (
+        "claude-grok-session"
+    )
+    assert call_kwargs["forward_headers"] is False
+    assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+    assert call_kwargs["egress_credential_family"] == "xai"
+    assert call_kwargs["expected_target_family"] == "xai"
+    custom_body = call_kwargs["custom_body"]
+    assert custom_body["model"] == "grok-composer-2.5-fast"
+    metadata = custom_body["litellm_metadata"]
+    assert metadata["client_name"] == "grok-build"
+    assert metadata["grok_native_oauth_managed"] is True
+    assert metadata["grok_model_override"] == "grok-composer-2.5-fast"
+    assert metadata["model_group"] == "grok-composer-2.5-fast"
+    assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+    assert metadata["grok_native_entrypoint"] == "anthropic_messages"
+    assert "route:grok_cli_chat_proxy" in metadata["tags"]
+    assert "anthropic-grok-native-responses-adapter" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -15978,6 +16125,91 @@ class TestOpenAIPassthroughRoute:
         assert "custom_llm_provider" not in prepared_body
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+    async def test_openai_passthrough_grok_native_models_use_grok_oidc_headers(
+        self,
+        monkeypatch,
+        model,
+    ):
+        monkeypatch.setenv(
+            "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+            "http://localhost:4001/grok/v1",
+        )
+        body = {
+            "model": model,
+            "input": "hello",
+            "metadata": {"session_id": "codex-grok-session"},
+        }
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer inbound-codex-token",
+            "chatgpt-account-id": "acct_123",
+            "originator": "codex_exec",
+            "session_id": "codex-grok-session",
+            "user-agent": "codex_exec/0.119.0",
+        }
+        mock_request.query_params = {}
+        mock_request.scope = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+            new=AsyncMock(return_value="grok-oidc-token"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials"
+        ) as mock_get_credentials, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_create_route.return_value = AsyncMock(return_value={"ok": True})
+
+            result = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert result == {"ok": True}
+        mock_get_credentials.assert_not_called()
+        call_args = mock_create_route.call_args.kwargs
+        assert call_args["target"] == "http://localhost:4001/grok/v1/responses"
+        assert call_args["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+        assert call_args["custom_headers"]["authorization"] == (
+            "Bearer grok-oidc-token"
+        )
+        assert call_args["custom_headers"]["x-xai-token-auth"] == "true"
+        assert call_args["custom_headers"]["x-grok-model-override"] == model
+        assert call_args["custom_headers"]["x-grok-session-id"] == (
+            "codex-grok-session"
+        )
+        assert call_args["_forward_headers"] is False
+        assert call_args["egress_credential_family"] == "xai"
+        assert call_args["expected_target_family"] == "xai"
+        prepared_body = mock_set_body.call_args.args[1]
+        assert prepared_body["model"] == model
+        assert "api_key" not in prepared_body
+        assert "api_base" not in prepared_body
+        assert "custom_llm_provider" not in prepared_body
+        metadata = prepared_body["litellm_metadata"]
+        assert metadata["client_name"] == "grok-build"
+        assert metadata["grok_native_oauth_managed"] is True
+        assert metadata["grok_model_override"] == model
+        assert metadata["model_group"] == model
+        assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+        assert metadata["openai_passthrough_route_family"] == "openai_responses"
+        assert metadata["grok_native_entrypoint"] == "openai_responses"
+        assert "route:grok_cli_chat_proxy" in metadata["tags"]
+        assert "openai-grok-native-responses-adapter" in metadata["tags"]
+
+    @pytest.mark.asyncio
     async def test_openai_passthrough_responses_api_preserves_client_auth(self):
         """
         Test that /openai_passthrough preserves inbound client auth for Responses API
@@ -16251,7 +16483,11 @@ class TestGrokProxyRoute:
 
         with patch.dict(
             os.environ,
-            {"GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL": "https://proxy.example.com/v1"},
+            {
+                "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL": (
+                    "https://proxy.example.com/grok/v1"
+                )
+            },
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
             AsyncMock(return_value=mock_user_api_key_dict),
@@ -16267,7 +16503,9 @@ class TestGrokProxyRoute:
 
         assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-query-key"
         call_kwargs = mock_pass_through.await_args.kwargs
-        assert call_kwargs["target"] == "https://proxy.example.com/v1/responses/resp_123"
+        assert call_kwargs["target"] == (
+            "https://proxy.example.com/grok/v1/responses/resp_123"
+        )
         assert call_kwargs["query_params"] == {}
         assert call_kwargs["custom_body"] is None
         metadata = call_kwargs["passthrough_logging_metadata"]

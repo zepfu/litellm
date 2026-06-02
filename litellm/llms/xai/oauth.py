@@ -1,9 +1,10 @@
 import asyncio
+from contextlib import contextmanager
 import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 import httpx
 
@@ -15,6 +16,9 @@ OA_XAI_PROVIDER_PREFIX = "oa_xai/"
 XAI_OAUTH_ROUTE_FAMILY = "xai_oauth_api"
 XAI_OAUTH_CREDENTIAL_FAMILY = "xai_oauth"
 XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY = "xai_grok_subscription"
+GROK_NATIVE_OAUTH_ROUTE_FAMILY = "grok_cli_chat_proxy"
+GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY = "xai_grok_oidc"
+GROK_NATIVE_OAUTH_CLIENT_NAME = "grok-build"
 
 _DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 _DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
@@ -22,6 +26,14 @@ _DEFAULT_REFRESH_BUFFER_SECONDS = 300
 _DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID = "xai-oauth"
 _DEFAULT_HERMES_AUTH_PATH = "~/.hermes/auth.json"
 _DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = "~/.litellm/xai/oauth-auth.json"
+_DEFAULT_GROK_XAI_OAUTH_AUTH_PATH = "~/.grok/auth.json"
+
+_GROK_NATIVE_OAUTH_MODELS = frozenset(
+    {
+        "grok-build",
+        "grok-composer-2.5-fast",
+    }
+)
 
 _XAI_OAUTH_MODEL_MAP = {
     "oa_xai/grok-4.3": "xai/grok-4.3",
@@ -35,6 +47,21 @@ _refresh_locks: Dict[str, asyncio.Lock] = {}
 
 def is_oa_xai_model(model: Any) -> bool:
     return isinstance(model, str) and model.startswith(OA_XAI_PROVIDER_PREFIX)
+
+
+def normalize_grok_native_oauth_model(model: Any) -> Optional[str]:
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
+    if candidate.startswith("xai/"):
+        candidate = candidate[len("xai/") :]
+    if candidate in _GROK_NATIVE_OAUTH_MODELS:
+        return candidate
+    return None
+
+
+def is_grok_native_oauth_model(model: Any) -> bool:
+    return normalize_grok_native_oauth_model(model) is not None
 
 
 def resolve_oa_xai_upstream_model(model: str) -> str:
@@ -63,6 +90,31 @@ def build_oa_xai_metadata(public_model: str, upstream_model: str) -> Dict[str, A
             "auth:xai_oauth",
             "provider:xai",
             "quota:xai_grok_subscription",
+        ],
+    }
+
+
+def build_grok_native_oauth_metadata(public_model: str) -> Dict[str, Any]:
+    return {
+        "auth_mode": "grok_oidc",
+        "credential_family": GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+        "client_name": GROK_NATIVE_OAUTH_CLIENT_NAME,
+        "grok_cli_chat_proxy": True,
+        "grok_model_override": public_model,
+        "grok_native_oauth_managed": True,
+        "model_group": public_model,
+        "passthrough_route_family": GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+        "route_family": GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+        "shared_quota_family": XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY,
+        "xai_cli_chat_proxy": True,
+        "xai_quota_family": XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY,
+        "tags": [
+            "grok-build",
+            "route:grok_cli_chat_proxy",
+            "auth:grok_oidc",
+            "provider:xai",
+            "quota:xai_grok_subscription",
+            f"grok-model:{public_model}",
         ],
     }
 
@@ -127,11 +179,51 @@ async def get_xai_oauth_access_token() -> str:
         )
 
 
+async def get_grok_native_oauth_access_token() -> str:
+    credential_path = default_grok_xai_oauth_auth_path()
+    scope = (
+        get_secret_str("LITELLM_XAI_GROK_OAUTH_SCOPE")
+        or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
+        or _DEFAULT_XAI_OAUTH_SCOPE
+    )
+    lock_key = f"grok-native:{credential_path}:{scope}"
+    lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        return await _get_xai_oauth_access_token_locked(
+            credential_path=credential_path,
+            scope=scope,
+            lock_path=default_grok_xai_oauth_auth_lock_path(credential_path),
+        )
+
+
 def default_litellm_xai_oauth_auth_path() -> Path:
     configured = get_secret_str("LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE")
     if isinstance(configured, str) and configured.strip():
         return Path(configured.strip()).expanduser()
     return Path(_DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH).expanduser()
+
+
+def default_grok_xai_oauth_auth_path() -> Path:
+    configured = (
+        get_secret_str("LITELLM_XAI_GROK_AUTH_FILE")
+        or get_secret_str("LITELLM_XAI_OAUTH_GROK_AUTH_FILE")
+        or get_secret_str("GROK_AUTH_FILE")
+    )
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured.strip()).expanduser()
+
+    grok_home = get_secret_str("GROK_HOME")
+    if isinstance(grok_home, str) and grok_home.strip():
+        return Path(grok_home.strip()).expanduser() / "auth.json"
+
+    return Path(_DEFAULT_GROK_XAI_OAUTH_AUTH_PATH).expanduser()
+
+
+def default_grok_xai_oauth_auth_lock_path(credential_path: Path) -> Path:
+    configured = get_secret_str("LITELLM_XAI_GROK_AUTH_LOCK_FILE")
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured.strip()).expanduser()
+    return credential_path.with_name(f"{credential_path.name}.lock")
 
 
 def migrate_hermes_xai_oauth_credential(
@@ -343,23 +435,51 @@ async def _get_xai_oauth_access_token_locked(
     *,
     credential_path: Path,
     scope: str,
+    lock_path: Optional[Path] = None,
 ) -> str:
-    raw_payload = _read_credential_payload(credential_path)
-    credential = _select_credential_record(raw_payload, scope)
-    token = _credential_access_token(credential)
-    if token and not _credential_needs_refresh(credential):
-        return token
+    with _credential_file_lock(lock_path):
+        raw_payload = _read_credential_payload(credential_path)
+        credential = _select_credential_record(raw_payload, scope)
+        token = _credential_access_token(credential)
+        if token and not _credential_needs_refresh(credential):
+            return token
 
-    refreshed = await _refresh_xai_oauth_credential(credential)
-    _update_credential_record(credential, refreshed)
-    _write_credential_payload(credential_path, raw_payload)
-    refreshed_token = _credential_access_token(credential)
-    if refreshed_token:
-        return refreshed_token
+        refreshed = await _refresh_xai_oauth_credential(credential)
+        _update_credential_record(credential, refreshed)
+        _write_credential_payload(credential_path, raw_payload)
+        refreshed_token = _credential_access_token(credential)
+        if refreshed_token:
+            return refreshed_token
     raise ValueError(
         "xAI OAuth refresh did not return an access token. Reseed or relogin "
         "the managed xAI OAuth credential before calling oa_xai/*."
     )
+
+
+@contextmanager
+def _credential_file_lock(lock_path: Optional[Path]) -> Iterator[None]:
+    if lock_path is None:
+        yield
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        yield
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        handle.close()
 
 
 def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:

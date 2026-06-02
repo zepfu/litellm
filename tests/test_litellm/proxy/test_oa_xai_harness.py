@@ -159,6 +159,92 @@ async def test_oa_xai_harness_loads_litellm_owned_scoped_credential(
 
 
 @pytest.mark.asyncio
+async def test_grok_native_oauth_loads_default_grok_auth_json_scoped_record(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    grok_home = tmp_path / ".grok"
+    grok_home.mkdir()
+    credential_path = grok_home / "auth.json"
+    credential_path.write_text(
+        json.dumps(
+            harness.credential_payload(token="grok-native-token", scoped=True)
+        ),
+        encoding="utf-8",
+    )
+    credential_path.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LITELLM_XAI_GROK_AUTH_FILE", raising=False)
+    monkeypatch.delenv("LITELLM_XAI_OAUTH_GROK_AUTH_FILE", raising=False)
+    monkeypatch.delenv("GROK_AUTH_FILE", raising=False)
+    monkeypatch.delenv("GROK_HOME", raising=False)
+
+    assert await oauth.get_grok_native_oauth_access_token() == "grok-native-token"
+
+
+@pytest.mark.asyncio
+async def test_grok_native_oauth_refreshes_with_auth_json_lock_and_preserves_mode(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    grok_home = tmp_path / ".grok"
+    grok_home.mkdir()
+    credential_path = grok_home / "auth.json"
+    credential_path.write_text(
+        json.dumps(
+            harness.credential_payload(
+                token="expiring-grok-token",
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+                scoped=True,
+            )
+        ),
+        encoding="utf-8",
+    )
+    credential_path.chmod(0o600)
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(credential_path))
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
+    refresh_calls: list[dict[str, Any]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, data, headers):
+            refresh_calls.append({"url": url, "data": data, "headers": headers})
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "refreshed-grok-native-token",
+                    "refresh_token": "refreshed-grok-refresh-token",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
+        assert (
+            await oauth.get_grok_native_oauth_access_token()
+            == "refreshed-grok-native-token"
+        )
+
+    assert len(refresh_calls) == 1
+    assert (grok_home / "auth.json.lock").exists()
+    refreshed_payload = json.loads(credential_path.read_text(encoding="utf-8"))
+    refreshed_record = refreshed_payload[oauth._DEFAULT_XAI_OAUTH_SCOPE]
+    assert refreshed_record["access_token"] == "refreshed-grok-native-token"
+    assert refreshed_record["refresh_token"] == "refreshed-grok-refresh-token"
+    assert credential_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
 async def test_oa_xai_harness_refreshes_and_serializes_near_expiry_credentials(
     tmp_path,
     monkeypatch,

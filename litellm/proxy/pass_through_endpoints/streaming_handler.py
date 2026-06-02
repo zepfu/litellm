@@ -136,6 +136,8 @@ class PassThroughStreamingHandler:
     def _is_xai_oauth_metadata(metadata: Dict[str, Any]) -> bool:
         if metadata.get("xai_oauth_managed") is True:
             return True
+        if metadata.get("grok_native_oauth_managed") is True:
+            return True
         credential_family = str(metadata.get("credential_family") or "").lower()
         route_family = str(
             metadata.get("passthrough_route_family")
