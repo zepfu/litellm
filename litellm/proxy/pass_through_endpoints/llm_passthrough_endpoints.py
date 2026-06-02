@@ -39,11 +39,17 @@ from litellm._uuid import uuid4
 from litellm.constants import (
     ALLOWED_VERTEX_AI_PASSTHROUGH_HEADERS,
     BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES,
+    XAI_API_BASE,
 )
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
 )
 from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
+from litellm.llms.xai.oauth import (
+    is_oa_xai_model,
+    prepare_oa_xai_request,
+    resolve_oa_xai_upstream_model,
+)
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
 from litellm.proxy.auth.route_checks import RouteChecks
@@ -787,6 +793,77 @@ def _get_openai_passthrough_route_family(endpoint: str) -> str:
     if normalized_path in {"/chat/completions", "/v1/chat/completions"}:
         return "openai_chat_completions"
     return "openai_passthrough"
+
+
+def _is_oa_xai_request_body(request_body: dict[str, Any]) -> bool:
+    return is_oa_xai_model(request_body.get("model"))
+
+
+@lru_cache(maxsize=1)
+def _load_local_model_metadata() -> dict[str, Any]:
+    model_metadata_path = (
+        Path(__file__).resolve().parents[3] / "model_prices_and_context_window.json"
+    )
+    try:
+        with model_metadata_path.open("r", encoding="utf-8") as model_metadata_file:
+            metadata = json.load(model_metadata_file)
+    except Exception:
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _get_model_metadata_entry(model: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(model, str):
+        return None
+    model_info = litellm.model_cost.get(model)
+    if isinstance(model_info, dict):
+        return model_info
+    local_model_info = _load_local_model_metadata().get(model)
+    return local_model_info if isinstance(local_model_info, dict) else None
+
+
+def _is_oa_xai_responses_model(model: Any) -> bool:
+    if not is_oa_xai_model(model):
+        return False
+
+    candidate_models = [model]
+    try:
+        candidate_models.append(resolve_oa_xai_upstream_model(cast(str, model)))
+    except Exception:
+        pass
+
+    for candidate_model in candidate_models:
+        model_info = _get_model_metadata_entry(candidate_model)
+        if isinstance(model_info, dict) and model_info.get("mode") == "responses":
+            return True
+    return False
+
+
+def _to_xai_native_passthrough_model(model: Any) -> Any:
+    if isinstance(model, str) and model.startswith("xai/"):
+        return model[len("xai/") :]
+    return model
+
+
+async def _prepare_oa_xai_passthrough_request(
+    request_body: dict[str, Any],
+) -> tuple[bool, Optional[str], Optional[str]]:
+    if is_oa_xai_model(request_body.get("model")) and not isinstance(
+        request_body.get("litellm_metadata"), dict
+    ):
+        request_body["litellm_metadata"] = {}
+    prepared = await prepare_oa_xai_request(request_body)
+    if not prepared:
+        return False, None, None
+
+    api_base = request_body.pop("api_base", None)
+    api_key = request_body.pop("api_key", None)
+    request_body.pop("custom_llm_provider", None)
+    return (
+        True,
+        api_base if isinstance(api_base, str) and api_base.strip() else None,
+        api_key if isinstance(api_key, str) and api_key.strip() else None,
+    )
 
 
 def _get_gemini_passthrough_route_family(endpoint: str) -> Optional[str]:
@@ -2018,6 +2095,18 @@ def _resolve_anthropic_openai_responses_adapter_model(
         )
         if normalized_model is not None:
             return normalized_model
+    return None
+
+
+def _resolve_anthropic_xai_oauth_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        if is_oa_xai_model(candidate):
+            return candidate
     return None
 
 
@@ -9136,6 +9225,228 @@ async def _handle_anthropic_openai_responses_adapter_route(
     translated_response.status_code = upstream_response.status_code
     return translated_response
 
+async def _handle_anthropic_xai_oauth_responses_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    translated_request_body = _build_anthropic_responses_adapter_request_body(
+        prepared_request_body,
+        adapter_model=adapter_model,
+        route_family="anthropic_xai_oauth_responses_adapter",
+        tag_prefix="anthropic-xai-oauth-responses-adapter",
+        span_name="anthropic.xai_oauth_responses_adapter",
+        target_endpoint="xai:/v1/responses",
+    )
+    (
+        translated_request_body,
+        openai_parallel_instruction_policy_changes,
+    ) = _apply_openai_adapter_parallel_instruction_policy(translated_request_body)
+    if openai_parallel_instruction_policy_changes:
+        verbose_proxy_logger.debug(
+            "Applied xAI OAuth responses adapter parallel instruction policy; tools=%s original_chars=%s rewritten_chars=%s",
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_tool_names"
+            ),
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_original_chars"
+            ),
+            openai_parallel_instruction_policy_changes.get(
+                "openai_adapter_parallel_instruction_rewritten_chars"
+            ),
+        )
+
+    prepared_oa_xai, target_base_url, xai_api_key = (
+        await _prepare_oa_xai_passthrough_request(translated_request_body)
+    )
+    if not prepared_oa_xai or target_base_url is None or xai_api_key is None:
+        raise Exception(
+            "Anthropic adapter requests for xAI OAuth models require a managed xAI OAuth credential."
+        )
+    translated_request_body["model"] = _to_xai_native_passthrough_model(
+        translated_request_body.get("model")
+    )
+
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint="/v1/responses",
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.XAI,
+    )
+    custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=xai_api_key,
+        request=request,
+    )
+
+    upstream_response = await pass_through_request(
+        request=request,
+        target=str(target_url),
+        custom_headers=custom_headers,
+        user_api_key_dict=user_api_key_dict,
+        custom_body=translated_request_body,
+        forward_headers=False,
+        stream=bool(translated_request_body.get("stream")),
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        egress_credential_family="xai",
+        expected_target_family="xai",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    if isinstance(upstream_response, StreamingResponse):
+        if not client_requested_stream:
+            response_body = await _collect_responses_response_from_stream(
+                upstream_response
+            )
+            translated_response = _build_anthropic_response_from_responses_response(
+                response_body
+            )
+            _copy_translated_anthropic_adapter_response_headers(
+                translated_response=translated_response,
+                upstream_response=upstream_response,
+            )
+            translated_response.status_code = upstream_response.status_code
+            return translated_response
+        return _build_anthropic_streaming_response_from_responses_stream(
+            upstream_response,
+            model=adapter_model,
+            request_body=translated_request_body,
+        )
+
+    if not isinstance(upstream_response, Response):
+        raise HTTPException(
+            status_code=502,
+            detail="Unexpected upstream response type from xAI Responses passthrough.",
+        )
+
+    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    translated_response = _build_anthropic_response_from_responses_response(
+        response_body
+    )
+    _copy_translated_anthropic_adapter_response_headers(
+        translated_response=translated_response,
+        upstream_response=upstream_response,
+    )
+    translated_response.status_code = upstream_response.status_code
+    return translated_response
+
+
+async def _handle_anthropic_xai_oauth_completion_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler,
+    )
+
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    requested_model = prepared_request_body.get("model")
+    route_family = "anthropic_xai_oauth_completion_adapter"
+    target_endpoint_label = "xai:/v1/chat/completions"
+
+    prepared_request_body = _merge_litellm_metadata(
+        _add_route_family_logging_metadata(prepared_request_body, route_family),
+        tags_to_add=[
+            "anthropic-xai-oauth-completion-adapter",
+            f"anthropic-adapter-model:{adapter_model}",
+            f"anthropic-adapter-target:{target_endpoint_label}",
+        ],
+        extra_fields={
+            "anthropic_adapter_model": adapter_model,
+            "anthropic_adapter_original_model": requested_model,
+            "anthropic_adapter_target_endpoint": target_endpoint_label,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="anthropic.xai_oauth_completion_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": adapter_model,
+                        "stream": client_requested_stream,
+                    },
+                )
+            ],
+        },
+    )
+    forced_tool_choice_changes = _maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+        prepared_request_body,
+    )
+    if forced_tool_choice_changes:
+        prepared_request_body = _merge_litellm_metadata(
+            prepared_request_body,
+            extra_fields=forced_tool_choice_changes,
+        )
+
+    prepared_oa_xai, target_base_url, xai_api_key = (
+        await _prepare_oa_xai_passthrough_request(prepared_request_body)
+    )
+    if not prepared_oa_xai or target_base_url is None or xai_api_key is None:
+        raise Exception(
+            "Anthropic adapter requests for xAI OAuth models require a managed xAI OAuth credential."
+        )
+
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint="/v1/chat/completions",
+        base_target_url=target_base_url,
+    )
+    target_url = BaseOpenAIPassThroughHandler._join_url_paths(
+        httpx.URL(target_base_url),
+        normalized_endpoint,
+        litellm.LlmProviders.XAI,
+    )
+    validation_headers = {"Authorization": f"Bearer {xai_api_key}"}
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=str(target_url),
+        headers=validation_headers,
+        credential_family="xai",
+        expected_target_family="xai",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    completion_response = await LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
+        max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
+        messages=prepared_request_body.get("messages") or [],
+        model=cast(str, prepared_request_body.get("model")),
+        metadata=_build_completion_adapter_metadata(prepared_request_body),
+        stop_sequences=prepared_request_body.get("stop_sequences"),
+        stream=client_requested_stream,
+        system=prepared_request_body.get("system"),
+        temperature=prepared_request_body.get("temperature"),
+        thinking=prepared_request_body.get("thinking"),
+        tool_choice=prepared_request_body.get("tool_choice"),
+        tools=prepared_request_body.get("tools"),
+        top_k=prepared_request_body.get("top_k"),
+        top_p=prepared_request_body.get("top_p"),
+        output_format=prepared_request_body.get("output_format"),
+        output_config=prepared_request_body.get("output_config"),
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        api_key=xai_api_key,
+        api_base=target_base_url,
+        litellm_metadata=prepared_request_body.get("litellm_metadata") or {},
+        proxy_server_request={
+            "headers": dict(request.headers),
+            "body": prepared_request_body,
+        },
+    )
+
+    if client_requested_stream:
+        return _build_anthropic_streaming_response_from_completion_adapter_stream(
+            completion_response,
+        )
+    return _build_anthropic_response_from_completion_adapter_response(
+        completion_response,
+    )
 
 
 async def _handle_anthropic_nvidia_completion_adapter_route(
@@ -13891,6 +14202,29 @@ async def anthropic_proxy_route(
                 custom_headers=custom_headers,
             )
 
+        xai_oauth_adapter_model = _resolve_anthropic_xai_oauth_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if xai_oauth_adapter_model is not None:
+            if _is_oa_xai_responses_model(xai_oauth_adapter_model):
+                return await _handle_anthropic_xai_oauth_responses_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=prepared_request_body,
+                    adapter_model=xai_oauth_adapter_model,
+                )
+            return await _handle_anthropic_xai_oauth_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=xai_oauth_adapter_model,
+            )
+
         adapter_model = _resolve_anthropic_openai_responses_adapter_model(
             prepared_request_body,
             endpoint=encoded_endpoint,
@@ -15311,6 +15645,12 @@ async def openai_proxy_route(
 
     [Docs](https://docs.litellm.ai/docs/pass_through/openai_passthrough)
     """
+    request_body: dict[str, Any] = {}
+    is_oa_xai_request = False
+    if request.method == "POST":
+        request_body = await get_request_body(request)
+        is_oa_xai_request = _is_oa_xai_request_body(request_body)
+
     base_target_url = _get_openai_passthrough_target_base(
         request=request,
         endpoint=endpoint,
@@ -15321,7 +15661,9 @@ async def openai_proxy_route(
     )
     openai_api_key: Optional[str] = None
     forward_headers = False
-    if preserve_client_auth:
+    if is_oa_xai_request:
+        base_target_url = os.getenv("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
+    elif preserve_client_auth:
         forward_headers = True
     else:
         openai_api_key = passthrough_endpoint_router.get_credentials(
@@ -15746,7 +16088,45 @@ class BaseOpenAIPassThroughHandler:
         if request.method == "POST":
             request_body = await get_request_body(request)
             prepared_request_body = request_body
-            if _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
+            body_was_prepared = False
+            (
+                prepared_oa_xai,
+                oa_xai_api_base,
+                oa_xai_api_key,
+            ) = await _prepare_oa_xai_passthrough_request(prepared_request_body)
+            if prepared_oa_xai:
+                body_was_prepared = True
+                if oa_xai_api_base is None or oa_xai_api_key is None:
+                    raise Exception(
+                        "OpenAI passthrough requests for xAI OAuth models require a managed xAI OAuth credential."
+                    )
+                prepared_request_body["model"] = _to_xai_native_passthrough_model(
+                    prepared_request_body.get("model")
+                )
+                openai_route_family = _get_openai_passthrough_route_family(endpoint)
+                base_target_url = oa_xai_api_base
+                api_key = oa_xai_api_key
+                custom_llm_provider = litellm.LlmProviders.XAI
+                forward_headers = False
+                encoded_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+                    endpoint=endpoint,
+                    base_target_url=base_target_url,
+                )
+                updated_url = BaseOpenAIPassThroughHandler._join_url_paths(
+                    base_url=httpx.URL(base_target_url),
+                    path=encoded_endpoint,
+                    custom_llm_provider=custom_llm_provider,
+                )
+                prepared_request_body = _merge_litellm_metadata(
+                    prepared_request_body,
+                    tags_to_add=[
+                        f"openai-passthrough-route:{openai_route_family}",
+                    ],
+                    extra_fields={
+                        "openai_passthrough_route_family": openai_route_family,
+                    },
+                )
+            elif _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
                 endpoint
             ):
                 prepared_request_body = _add_route_family_logging_metadata(
@@ -15820,7 +16200,7 @@ class BaseOpenAIPassThroughHandler:
                 request=request,
                 request_body=prepared_request_body,
             )
-            if prepared_request_body is not request_body:
+            if body_was_prepared or prepared_request_body is not request_body:
                 _safe_set_request_parsed_body(request, prepared_request_body)
 
         ## check for streaming
@@ -15837,6 +16217,9 @@ class BaseOpenAIPassThroughHandler:
             ),
             _forward_headers=forward_headers,
             is_streaming_request=is_streaming_request,  # type: ignore
+            custom_llm_provider=custom_llm_provider.value
+            if isinstance(custom_llm_provider, litellm.LlmProviders)
+            else custom_llm_provider,
         )  # dynamically construct pass-through endpoint based on incoming path
         received_value = await endpoint_func(
             request,
@@ -15919,6 +16302,10 @@ class BaseOpenAIPassThroughHandler:
             and "chatgpt.com" in base_url.host
             and base_url.path.rstrip("/") == "/backend-api/codex"
             and normalized_endpoint.startswith("/v1/")
+        ):
+            return normalized_endpoint[len("/v1") :]
+        if base_url.path.rstrip("/") == "/v1" and normalized_endpoint.startswith(
+            "/v1/"
         ):
             return normalized_endpoint[len("/v1") :]
         return normalized_endpoint
