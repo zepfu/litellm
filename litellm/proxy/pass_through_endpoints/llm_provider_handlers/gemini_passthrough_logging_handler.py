@@ -198,6 +198,7 @@ class GeminiPassthroughLoggingHandler:
         end_time: datetime,
         cache_hit: bool,
         request_body: dict,
+        custom_llm_provider: str = "gemini",
         **kwargs,
     ) -> PassThroughEndpointLoggingTypedDict:
         if "predictLongRunning" in url_route:
@@ -279,7 +280,7 @@ class GeminiPassthroughLoggingHandler:
                 start_time=start_time,
                 end_time=end_time,
                 logging_obj=logging_obj,
-                custom_llm_provider="gemini",
+                custom_llm_provider=custom_llm_provider,
                 usage_object=GeminiPassthroughLoggingHandler._extract_usage_object_from_response_body(
                     response_body
                 ),
@@ -307,6 +308,7 @@ class GeminiPassthroughLoggingHandler:
         model: Optional[str],
         end_time: datetime,
         kwargs: Optional[Dict[str, Any]] = None,
+        custom_llm_provider: str = "gemini",
     ) -> PassThroughEndpointLoggingTypedDict:
         """
         Takes raw chunks from Gemini passthrough endpoint and logs them in litellm callbacks
@@ -345,7 +347,7 @@ class GeminiPassthroughLoggingHandler:
             start_time=start_time,
             end_time=end_time,
             logging_obj=litellm_logging_obj,
-            custom_llm_provider="gemini",
+            custom_llm_provider=custom_llm_provider,
             usage_object=GeminiPassthroughLoggingHandler._extract_usage_object_from_stream_chunks(
                 all_chunks
             ),
@@ -496,11 +498,22 @@ class GeminiPassthroughLoggingHandler:
             usage_object,
         )
 
-        response_cost = litellm.completion_cost(
-            completion_response=litellm_model_response,
-            model=model,
-            custom_llm_provider="gemini",
-        )
+        response_cost = None
+        if custom_llm_provider != "antigravity":
+            try:
+                response_cost = litellm.completion_cost(
+                    completion_response=litellm_model_response,
+                    model=model,
+                    custom_llm_provider="gemini",
+                )
+            except Exception as exc:
+                verbose_proxy_logger.warning(
+                    "Gemini-shaped passthrough cost calculation failed for "
+                    "model=%s custom_llm_provider=%s: %s",
+                    model,
+                    custom_llm_provider,
+                    exc,
+                )
 
         apply_passthrough_logging_contract(
             litellm_response=litellm_model_response,

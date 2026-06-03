@@ -32,12 +32,15 @@ GOOGLE_CODE_ASSIST_QUOTA_LOG_KEYS = {
 
 def sanitize_google_code_assist_quota_for_logging(
     value: Any,
+    *,
+    source: str = "google_retrieve_user_quota",
 ) -> Optional[dict[str, Any]]:
     if isinstance(value, list):
         sanitized_items = [
             item
             for item in (
-                sanitize_google_code_assist_quota_for_logging(item) for item in value
+                sanitize_google_code_assist_quota_for_logging(item, source=source)
+                for item in value
             )
             if item
         ]
@@ -61,9 +64,12 @@ def sanitize_google_code_assist_quota_for_logging(
         "modelQuotas",
     ):
         nested_value = value.get(nested_key)
-        nested_sanitized = sanitize_google_code_assist_quota_for_logging(nested_value)
+        nested_sanitized = sanitize_google_code_assist_quota_for_logging(
+            nested_value,
+            source=source,
+        )
         if nested_sanitized:
             sanitized[nested_key] = nested_sanitized
     if sanitized:
-        sanitized["source"] = "google_retrieve_user_quota"
+        sanitized["source"] = source
     return sanitized or None

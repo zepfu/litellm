@@ -4485,6 +4485,45 @@ def _quota_period_from_window_minutes(window_minutes: Optional[int]) -> Optional
     return f"{window_minutes}_minutes"
 
 
+def _normalize_quota_period(value: Any) -> Optional[str]:
+    normalized = _clean_non_empty_string(value)
+    if normalized is None:
+        return None
+    normalized = normalized.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "1h": "hourly",
+        "hour": "hourly",
+        "hourly": "hourly",
+        "5h": "five_hour",
+        "five_h": "five_hour",
+        "five_hour": "five_hour",
+        "five_hours": "five_hour",
+        "daily": "daily",
+        "day": "daily",
+        "1d": "daily",
+        "7d": "seven_day",
+        "seven_day": "seven_day",
+        "seven_days": "seven_day",
+        "weekly": "weekly",
+        "week": "weekly",
+        "monthly": "monthly",
+        "month": "monthly",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _window_minutes_from_quota_period(quota_period: Optional[str]) -> Optional[int]:
+    if quota_period == "hourly":
+        return 60
+    if quota_period == "five_hour":
+        return 300
+    if quota_period == "daily":
+        return 1440
+    if quota_period in {"seven_day", "weekly"}:
+        return 10080
+    return None
+
+
 def _parse_reset_hint_seconds(*values: Any) -> Optional[int]:
     for value in values:
         parsed = _safe_int(value)
@@ -4804,6 +4843,14 @@ def _infer_rate_limit_client_family(
         if value is not None
     ).lower()
     credential_family = str(metadata.get("credential_family") or "").lower()
+    if (
+        provider == "antigravity"
+        or "antigravity" in route_family
+        or metadata.get("aawm_stream_logging_custom_llm_provider") == "antigravity"
+        or str(metadata.get("custom_llm_provider") or "").lower() == "antigravity"
+        or model_lower.startswith(("antigravity/", "agy/", "google-antigravity/"))
+    ):
+        return "antigravity_code_assist"
     if (
         "xai_oauth" in source_lower
         or credential_family == "xai_oauth"
@@ -5189,7 +5236,9 @@ def _finalize_rate_limit_observation(
     )
     finalized["model_family"] = finalized.get("model_family") or model_family
     finalized["model_tier"] = finalized.get("model_tier") or model_tier
-    finalized["client_family"] = _infer_rate_limit_client_family(
+    finalized["client_family"] = finalized.get(
+        "client_family"
+    ) or _infer_rate_limit_client_family(
         finalized.get("provider"),
         str(finalized.get("model") or ""),
         finalized.get("metadata") if isinstance(finalized.get("metadata"), dict) else {},
@@ -6475,6 +6524,21 @@ def _looks_like_google_quota_candidate(candidate: Dict[str, Any]) -> bool:
     )
 
 
+def _antigravity_quota_pool_for_model(model: Optional[str]) -> Tuple[str, str, str]:
+    normalized = str(model or "").strip().lower()
+    if normalized.startswith("claude-") or normalized.startswith("gpt-oss"):
+        return (
+            "vertex_pool",
+            "Antigravity Code Assist Vertex pool",
+            "vertex",
+        )
+    return (
+        "gemini_pool",
+        "Antigravity Code Assist Gemini pool",
+        "gemini",
+    )
+
+
 def _extract_google_quota_observations(
     kwargs: Dict[str, Any],
     result: Any,
@@ -6487,9 +6551,18 @@ def _extract_google_quota_observations(
         "google_retrieve_user_quota",
     )
     observations: List[Dict[str, Any]] = []
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    default_quota_source = _clean_non_empty_string(
+        _maybe_get(metadata.get("google_retrieve_user_quota"), "source")
+    )
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         if not _looks_like_google_quota_candidate(candidate):
             continue
+        quota_source = (
+            _clean_non_empty_string(candidate.get("source"))
+            or default_quota_source
+            or "google_retrieve_user_quota"
+        )
         remaining_requests = _first_quota_number(
             candidate,
             "remainingRequests",
@@ -6557,46 +6630,87 @@ def _extract_google_quota_observations(
             or context.get("model")
         )
         model_family, model_tier = _infer_model_family_and_tier(model)
-        quota_period = _clean_non_empty_string(candidate.get("quotaPeriod")) or _clean_non_empty_string(
-            candidate.get("period")
-        ) or "daily"
-        window_minutes = 1440 if quota_period == "daily" else None
-        limit_scope = (
-            "model_requests"
-            if _clean_non_empty_string(candidate.get("modelId"))
-            or _clean_non_empty_string(candidate.get("model"))
-            else "daily_request_pool"
-        )
         token_type = _clean_non_empty_string(candidate.get("tokenType"))
+        provider = context.get("provider") or "gemini"
+        client_family = context.get("client_family") or _infer_rate_limit_client_family(
+            provider,
+            str(model or ""),
+            metadata,
+            quota_source,
+        )
+        is_antigravity_quota = (
+            provider == "antigravity" or client_family == "antigravity_code_assist"
+        )
+        if is_antigravity_quota and provider_resets_at is None:
+            continue
+        explicit_quota_period = (
+            _normalize_quota_period(candidate.get("quotaPeriod"))
+            or _normalize_quota_period(candidate.get("period"))
+        )
+        quota_period = explicit_quota_period or (
+            "five_hour" if is_antigravity_quota else "daily"
+        )
+        window_minutes = None
+        for window_candidate in (
+            candidate.get("windowMinutes"),
+            candidate.get("window_minutes"),
+            candidate.get("windowMinutesEstimate"),
+        ):
+            parsed_window_minutes = _safe_int(window_candidate)
+            if parsed_window_minutes is not None and parsed_window_minutes > 0:
+                window_minutes = parsed_window_minutes
+                break
+        window_minutes = window_minutes or _window_minutes_from_quota_period(
+            quota_period
+        )
+        if is_antigravity_quota:
+            limit_scope, limit_name, model_family = _antigravity_quota_pool_for_model(
+                model
+            )
+            limit_id = "antigravity_code_assist"
+            stored_model = None
+            quota_type = str(token_type or "wtus").strip().lower()
+            model_tier = None
+        else:
+            limit_scope = (
+                "model_requests"
+                if _clean_non_empty_string(candidate.get("modelId"))
+                or _clean_non_empty_string(candidate.get("model"))
+                else "daily_request_pool"
+            )
+            limit_id = (
+                f"google_code_assist_requests_{model}"
+                if limit_scope == "model_requests" and model
+                else "google_code_assist_requests"
+            )
+            limit_name = (
+                f"Google Code Assist {model} requests"
+                if model
+                else "Google Code Assist requests"
+            )
+            stored_model = model
+            quota_type = None
         observations.append(
             _finalize_rate_limit_observation(
                 {
                     "observed_at": context["observed_at"],
-                    "source": _clean_non_empty_string(candidate.get("source"))
-                    or "google_retrieve_user_quota",
-                    "provider": "gemini",
-                    "client_family": "google_code_assist",
+                    "source": quota_source,
+                    "provider": provider,
+                    "client_family": client_family,
                     "limit_id": _clean_non_empty_string(candidate.get("quotaId"))
-                    or (
-                        f"google_code_assist_requests_{model}"
-                        if limit_scope == "model_requests" and model
-                        else "google_code_assist_requests"
-                    ),
+                    or limit_id,
                     "limit_name": _clean_non_empty_string(candidate.get("quotaName"))
-                    or (
-                        f"Google Code Assist {model} requests"
-                        if model
-                        else "Google Code Assist requests"
-                    ),
+                    or limit_name,
                     "limit_scope": limit_scope,
                     "window_minutes": window_minutes,
                     "quota_period": quota_period,
+                    "quota_type": quota_type,
                     "provider_resets_at": provider_resets_at,
                     "used_percentage": used_percentage,
                     "remaining_requests": remaining_requests,
                     "used_requests": used_requests,
                     "total_requests": total_requests,
-                    "model": model,
+                    "model": stored_model,
                     "model_family": model_family,
                     "model_tier": model_tier,
                     "raw_provider_fields": {
@@ -6617,7 +6731,13 @@ def _extract_google_quota_observations(
                             "period",
                             "model",
                             "quotaId",
+                            "resetsAt",
+                            "resets_at",
+                            "resetAt",
                             "resetTime",
+                            "windowMinutes",
+                            "window_minutes",
+                            "windowMinutesEstimate",
                         )
                         if key in candidate
                     },
@@ -8001,6 +8121,7 @@ def _extract_cache_creation_input_tokens(usage_obj: Any) -> int:
 
 
 _PROVIDER_CACHE_TARGET_FAMILIES = {
+    "antigravity",
     "anthropic",
     "openai",
     "openrouter",
@@ -8023,6 +8144,8 @@ def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
         return None
     if candidate_lower in {"google", "google_code_assist", "google-code-assist"}:
         return "gemini"
+    if candidate_lower in {"agy", "google-antigravity"}:
+        return "antigravity"
     if candidate_lower in {"nvidia", "nvidia_nim", "nvidia-nim"}:
         return "nvidia_nim"
     if candidate_lower == "grok":
@@ -8036,6 +8159,7 @@ def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
         "local-llm",
         "local_biomed",
         "local-biomed",
+        "antigravity",
         "openrouter",
         "openai",
         "anthropic",
@@ -8080,6 +8204,8 @@ def _session_history_provider_from_model(model: Any) -> Optional[str]:
         return "xai"
     if model_lower.startswith("openrouter/"):
         return "openrouter"
+    if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
+        return "antigravity"
     if "gemini" in model_lower or model_lower.startswith("google/"):
         return "gemini"
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
@@ -8106,6 +8232,8 @@ def _session_history_provider_from_route_family(route_family: Any) -> Optional[s
         return "nvidia_nim"
     if "openrouter" in route_lower:
         return "openrouter"
+    if "antigravity" in route_lower:
+        return "antigravity"
     if "local_embed" in route_lower or "local-embed" in route_lower:
         return "local_embed"
     if "local_rerank" in route_lower or "local-rerank" in route_lower:
@@ -8135,6 +8263,8 @@ def _session_history_adapter_target_provider(
             return "gemini"
         if target.startswith("openrouter"):
             return "openrouter"
+        if target.startswith(("antigravity", "agy", "google-antigravity")):
+            return "antigravity"
         if target.startswith("nvidia"):
             return "nvidia_nim"
         if target.startswith(("xai", "grok")):
@@ -8180,6 +8310,8 @@ def _normalize_provider_cache_family(
             return "nvidia"
         if "openrouter" in route_family_lower:
             return "openrouter"
+        if "antigravity" in route_family_lower:
+            return "antigravity"
         if "gemini" in route_family_lower or "google" in route_family_lower:
             return "gemini"
         if "anthropic" in route_family_lower:
@@ -8191,6 +8323,8 @@ def _normalize_provider_cache_family(
         provider_lower = provider.strip().lower()
         if provider_lower == "google":
             return "gemini"
+        if provider_lower in {"antigravity", "agy", "google-antigravity"}:
+            return "antigravity"
         if provider_lower in {"nvidia_nim", "nvidia-nim"}:
             return "nvidia"
         if provider_lower in _PROVIDER_CACHE_TARGET_FAMILIES:
@@ -8203,6 +8337,8 @@ def _normalize_provider_cache_family(
         return "xai"
     if model_lower.startswith("openrouter/"):
         return "openrouter"
+    if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
+        return "antigravity"
     if "gemini" in model_lower:
         return "gemini"
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
@@ -13414,8 +13550,10 @@ def _build_session_history_record_from_langfuse_trace_observation(
         api_base,
         call_type=call_type,
     )
-    if api_base_provider is not None and (
-        provider in {None, "openai"} or api_base_provider != "openai"
+    if (
+        api_base_provider is not None
+        and provider != "antigravity"
+        and (provider in {None, "openai"} or api_base_provider != "openai")
     ):
         provider = api_base_provider
     provider, resolved_model = _apply_local_embedding_route_metadata(
@@ -14268,8 +14406,10 @@ def _build_session_history_record(
         api_base,
         call_type=call_type,
     )
-    if api_base_provider is not None and (
-        resolved_provider in {None, "openai"} or api_base_provider != "openai"
+    if (
+        api_base_provider is not None
+        and resolved_provider != "antigravity"
+        and (resolved_provider in {None, "openai"} or api_base_provider != "openai")
     ):
         resolved_provider = api_base_provider
     provider_for_cache = resolved_provider
@@ -14913,6 +15053,8 @@ def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
     provider = _clean_non_empty_string(record.get("provider")) or "unknown"
     source = str(record.get("source") or "").lower()
     client_family = str(record.get("client_family") or "").lower()
+    if provider == "antigravity" or client_family == "antigravity_code_assist":
+        return "antigravity"
     if (
         provider in {"gemini", "google_code_assist"}
         or client_family in {"gemini", "google_code_assist"}

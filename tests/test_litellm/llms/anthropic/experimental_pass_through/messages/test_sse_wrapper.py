@@ -412,6 +412,78 @@ def test_sync_wrapper_preserves_read_tool_after_thinking_block():
     assert thinking_deltas == []
 
 
+def test_sync_wrapper_starts_thinking_block_for_reasoning_content():
+    class MockCompletionStreamWithReasoningContent:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                reasoning_content="I should answer directly.",
+                                content="",
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="Done"),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content=""),
+                            index=0,
+                            finish_reason="stop",
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= len(self.responses):
+                raise StopIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=MockCompletionStreamWithReasoningContent(),
+        model="claude-sonnet-4-6",
+    )
+
+    chunks = list(wrapper)
+    first_start = next(
+        chunk for chunk in chunks if chunk["type"] == "content_block_start"
+    )
+    first_delta = next(
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "thinking_delta"
+    )
+
+    assert first_start["content_block"] == {
+        "type": "thinking",
+        "thinking": "",
+        "signature": "",
+    }
+    assert first_delta["index"] == first_start["index"]
+    assert first_delta["delta"]["thinking"] == "I should answer directly."
+
+
 def test_sync_wrapper_preserves_terminal_tool_call_after_text_delta():
     class MockCompletionStreamWithTextThenTerminalTool:
         def __init__(self):

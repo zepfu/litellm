@@ -81,8 +81,12 @@ services:
       - /home/zepfu/.grok:/home/zepfu/.grok:ro
       # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
+      # Home-level local-only analysis artifacts; raw full-payload captures may include credentials.
+      - /home/zepfu/.analysis:/home/zepfu/.analysis
       # Gemini CLI install for OAuth client fallback during local adapter testing
       - /home/zepfu/.nvm/versions/node:/home/zepfu/.nvm/versions/node:ro
+      # Antigravity CLI binary for OAuth client fallback during local adapter testing
+      - /home/zepfu/.local/bin/agy:/home/zepfu/.local/bin/agy:ro
       # Capture output — written to /tmp/captures inside container, visible on host
       - ./captures:/tmp/captures
     environment:
@@ -92,6 +96,7 @@ services:
       - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
       - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=${LITELLM_LANGFUSE_TRACE_ENVIRONMENT:-dev}
       - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
+      - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
       # AAWM dynamic injection database access
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-postgres18}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-5432}
