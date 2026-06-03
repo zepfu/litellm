@@ -991,6 +991,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
     @staticmethod
     def get_endpoint_type(url: str) -> EndpointType:
         parsed_url = urlparse(url)
+        hostname = parsed_url.hostname or ""
+        path = parsed_url.path or ""
+        if (
+            (hostname == "opencode.ai" or hostname.endswith(".opencode.ai"))
+            and (path.endswith("/messages") or "/messages/" in path)
+        ):
+            return EndpointType.ANTHROPIC
         if (
             ("generateContent") in url
             or ("streamGenerateContent") in url
@@ -1006,6 +1013,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             or parsed_url.hostname == "chatgpt.com"
             or parsed_url.hostname == "openrouter.ai"
             or (parsed_url.hostname and parsed_url.hostname.endswith(".openrouter.ai"))
+            or hostname == "opencode.ai"
+            or hostname.endswith(".opencode.ai")
             or parsed_url.hostname == "api.x.ai"
             or parsed_url.hostname == "cli-chat-proxy.grok.com"
             or (parsed_url.hostname and "openai.com" in parsed_url.hostname)
