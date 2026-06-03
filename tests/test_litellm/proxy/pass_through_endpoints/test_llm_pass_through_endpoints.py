@@ -1,10 +1,12 @@
 import asyncio
+import base64
 import copy
 import json
 import os
 import sys
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -25,6 +27,7 @@ import litellm
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     RouteChecks,
+    antigravity_proxy_route,
     _drop_unsupported_codex_hosted_tools_from_request_body,
     _drop_unsupported_codex_input_items_from_request_body,
     _drop_unsupported_codex_request_params_from_request_body,
@@ -57,8 +60,11 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_google_code_assist_prime_cache_key,
     _get_google_code_assist_prime_ttl_seconds,
     _get_gemini_passthrough_route_family,
+    _join_antigravity_passthrough_url,
+    _load_valid_local_antigravity_access_token,
     _get_openai_passthrough_route_family,
     _google_adapter_rate_limit_until_monotonic_by_key,
+    _antigravity_oauth_access_token_cache,
     _google_code_assist_project_cache,
     _google_code_assist_prime_quota_by_key,
     _google_code_assist_prime_until_monotonic_by_key,
@@ -81,8 +87,10 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
     _resolve_anthropic_auto_agent_alias_model,
+    _resolve_anthropic_antigravity_code_assist_adapter_model,
     _resolve_anthropic_openrouter_completion_adapter_model,
     _resolve_codex_auto_agent_alias_model,
+    _resolve_codex_antigravity_code_assist_adapter_model,
     _select_anthropic_auto_agent_candidate,
     _select_codex_auto_agent_candidate,
     _set_anthropic_auto_agent_cooldown,
@@ -145,7 +153,9 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
     LiteLLMMessagesToCompletionTransformationHandler,
 )
 from litellm.integrations.aawm_passthrough_shape_capture import (
+    capture_passthrough_shape,
     capture_passthrough_stream_shape,
+    passthrough_full_payload_capture_enabled,
 )
 
 
@@ -1344,6 +1354,31 @@ class TestGoogleAdapterRequestShapePolicy:
         }
         assert changes["injected_default_thinking_config"] is True
         assert changes["injected_default_thinking_level"] == "low"
+
+    def test_preserves_large_max_output_tokens_when_required_by_thinking_budget(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP", raising=False)
+        payload = {
+            "request": {
+                "generationConfig": {
+                    "max_output_tokens": 33023,
+                    "thinkingConfig": {
+                        "includeThoughts": True,
+                        "thinkingBudget": 31999,
+                    },
+                }
+            }
+        }
+
+        changes = _apply_google_adapter_request_shape_policy(payload)
+
+        assert payload["request"]["generationConfig"]["max_output_tokens"] == 33023
+        assert changes == {
+            "preserved_oversized_max_output_tokens_for_thinking_budget": 33023,
+            "preserved_oversized_thinking_budget": 31999,
+            "preserved_oversized_max_output_tokens_cap": 8192,
+        }
 
     def test_injects_default_thinking_config_for_google_adapter(self, monkeypatch):
         monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG", raising=False)
@@ -2922,6 +2957,202 @@ class TestGoogleAdapterRequestShapePolicy:
             == 1777996982
         )
 
+    def test_passthrough_full_payload_capture_uses_runtime_control_file(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        control_file = tmp_path / "full-payload.enabled"
+        full_payload_dir = tmp_path / "full-payloads"
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+        monkeypatch.setenv(
+            "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE",
+            str(control_file),
+        )
+        monkeypatch.setenv(
+            "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR",
+            str(full_payload_dir),
+        )
+
+        control_file.write_text("1", encoding="utf-8")
+        assert passthrough_full_payload_capture_enabled() is True
+
+        upstream_request = httpx.Request(
+            "POST",
+            "https://cli-chat-proxy.grok.com/v1/billing",
+            headers={
+                "authorization": "Bearer upstream-request-token",
+                "x-xai-token-auth": "request-xai-token",
+                "content-type": "application/json",
+            },
+            content=b'{"prompt":"persist this full upstream request body"}',
+        )
+        artifact_path = capture_passthrough_shape(
+            mode="nonstream",
+            provider="xai",
+            endpoint_type=EndpointType.OPENAI,
+            url_route="https://cli-chat-proxy.grok.com/v1/billing",
+            request_body={"prompt": "persist this full request body"},
+            response=httpx.Response(
+                200,
+                headers={
+                    "authorization": "Bearer upstream-response-token",
+                    "content-type": "application/json",
+                },
+                request=upstream_request,
+            ),
+            upstream_request=upstream_request,
+            response_body={"config": {"used": {"val": 91}}},
+            response_content=b'{"config":{"used":{"val":91}}}',
+            litellm_call_id="call-full-body",
+        )
+
+        assert artifact_path is not None
+        assert Path(artifact_path).parent == full_payload_dir
+        artifact = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        rendered = json.dumps(artifact)
+        assert artifact["capture_kind"] == "aawm_passthrough_full_payload"
+        assert artifact["capture_scope"] == "upstream_http_transaction"
+        assert artifact["request"]["method"] == "POST"
+        assert artifact["request"]["url"] == "https://cli-chat-proxy.grok.com/v1/billing"
+        assert (
+            artifact["request"]["headers"]["authorization"]
+            == "Bearer upstream-request-token"
+        )
+        assert artifact["request"]["headers"]["x-xai-token-auth"] == "request-xai-token"
+        assert artifact["request"]["body"]["json"]["prompt"] == (
+            "persist this full upstream request body"
+        )
+        assert artifact["response"]["body"]["json"]["config"]["used"]["val"] == 91
+        assert artifact["response"]["headers"]["authorization"] == (
+            "Bearer upstream-response-token"
+        )
+        assert "upstream-request-token" in rendered
+        assert "upstream-response-token" in rendered
+        assert "content-type" in artifact["response"]["headers"]
+
+        control_file.write_text("0", encoding="utf-8")
+        assert passthrough_full_payload_capture_enabled() is False
+        assert (
+            capture_passthrough_shape(
+                mode="nonstream",
+                provider="xai",
+                endpoint_type=EndpointType.OPENAI,
+                url_route="https://cli-chat-proxy.grok.com/v1/billing",
+                request_body={"prompt": "should not be captured"},
+                response=httpx.Response(200),
+                response_content=b"{}",
+                litellm_call_id="call-disabled",
+            )
+            is None
+        )
+
+    def test_passthrough_full_payload_capture_persists_complete_stream(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        control_file = tmp_path / "full-payload.enabled"
+        full_payload_dir = tmp_path / "full-payloads"
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+        monkeypatch.setenv(
+            "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE",
+            str(control_file),
+        )
+        monkeypatch.setenv(
+            "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR",
+            str(full_payload_dir),
+        )
+        control_file.write_text("1", encoding="utf-8")
+
+        all_chunks = []
+        for index in range(45):
+            all_chunks.extend(
+                [
+                    "event: response.output_text.delta",
+                    f'data: {{"delta":"token-{index}"}}',
+                ]
+            )
+        all_chunks.extend(
+            [
+                "event: response.completed",
+                (
+                    'data: {"type":"response.completed","response":'
+                    '{"usage":{"input_tokens":3,"output_tokens":4}}}'
+                ),
+            ]
+        )
+        raw_bytes = [
+            b"event: response.created\n",
+            (
+                b'data: {"type":"response.completed","response":'
+                b'{"usage":{"input_tokens":3,"output_tokens":4}}}\n'
+            ),
+        ]
+        upstream_request = httpx.Request(
+            "POST",
+            "https://cli-chat-proxy.grok.com/v1/responses",
+            headers={
+                "authorization": "Bearer stream-request-token",
+                "x-xai-token-auth": "stream-xai-token",
+                "content-type": "application/json",
+            },
+            content=(
+                b'{"model":"grok-composer-2.5-fast",'
+                b'"input":"persist streamed upstream request body"}'
+            ),
+        )
+
+        artifact_path = capture_passthrough_stream_shape(
+            provider="xai",
+            endpoint_type=EndpointType.OPENAI,
+            url_route="https://cli-chat-proxy.grok.com/v1/responses",
+            request_body={
+                "model": "grok-composer-2.5-fast",
+                "input": "persist streamed request body",
+            },
+            response=httpx.Response(
+                200,
+                headers={
+                    "x-ratelimit-remaining-requests": "895",
+                    "authorization": "Bearer stream-response-token",
+                },
+                request=upstream_request,
+            ),
+            upstream_request=upstream_request,
+            all_chunks=all_chunks,
+            raw_bytes=raw_bytes,
+            litellm_call_id="call-full-stream",
+        )
+
+        assert artifact_path is not None
+        artifact = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        rendered = json.dumps(artifact)
+        stream = artifact["response"]["stream"]
+        assert artifact["capture_kind"] == "aawm_passthrough_full_payload"
+        assert artifact["capture_scope"] == "upstream_http_transaction"
+        assert (
+            artifact["request"]["headers"]["authorization"]
+            == "Bearer stream-request-token"
+        )
+        assert artifact["request"]["headers"]["x-xai-token-auth"] == "stream-xai-token"
+        assert artifact["response"]["headers"]["authorization"] == (
+            "Bearer stream-response-token"
+        )
+        assert artifact["request"]["body"]["json"]["model"] == (
+            "grok-composer-2.5-fast"
+        )
+        assert stream["line_count"] == len(all_chunks)
+        assert stream["lines"][-2] == "event: response.completed"
+        assert '"usage"' in stream["lines"][-1]
+        assert stream["raw_chunk_count"] == 2
+        decoded_last_chunk = base64.b64decode(stream["raw_chunks_base64"][-1])
+        assert b'"usage":{"input_tokens":3,"output_tokens":4}' in decoded_last_chunk
+        assert "persist streamed upstream request body" in rendered
+        assert "should-not-appear" not in rendered
+
     @pytest.mark.asyncio
     async def test_openai_stream_rate_limit_metadata_reaches_logging_object(
         self,
@@ -3320,9 +3551,11 @@ class TestGoogleAdapterRequestShapePolicy:
         assert bucket["resetTime"] == "2026-05-06T00:25:54Z"
         assert "ignoredContent" not in bucket
 
+    @pytest.mark.parametrize("custom_llm_provider", ["gemini", "antigravity"])
     @pytest.mark.asyncio
     async def test_google_code_assist_retrieve_user_quota_logs_observation_only_metadata(
         self,
+        custom_llm_provider,
     ):
         from datetime import datetime
 
@@ -3364,7 +3597,7 @@ class TestGoogleAdapterRequestShapePolicy:
                 cache_hit=False,
                 request_body={"project": "project_123"},
                 passthrough_logging_payload={},
-                custom_llm_provider="gemini",
+                custom_llm_provider=custom_llm_provider,
                 litellm_params={"metadata": {}},
             )
 
@@ -3374,7 +3607,12 @@ class TestGoogleAdapterRequestShapePolicy:
         ]
         assert metadata["aawm_rate_limit_observation_only"] is True
         quota = metadata["google_retrieve_user_quota"]
-        assert quota["source"] == "google_retrieve_user_quota"
+        expected_source = (
+            "antigravity_retrieve_user_quota"
+            if custom_llm_provider == "antigravity"
+            else "google_retrieve_user_quota"
+        )
+        assert quota["source"] == expected_source
         assert "privateProjectId" not in quota
         assert quota["buckets"]["items"][0]["modelId"] == "gemini-2.5-flash"
 
@@ -4780,6 +5018,338 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "source": "google_retrieve_user_quota",
         }
 
+    @pytest.mark.asyncio
+    async def test_anthropic_antigravity_completion_adapter_uses_antigravity_oauth_and_metadata(
+        self,
+    ):
+        prepared_body = await _prepare_claude_code_agent_project_request_body(
+            "antigravity/claude-sonnet-4-6"
+        )
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/anthropic/v1/messages?beta=true"
+        )
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"beta=true",
+        }
+        mock_request.query_params = {}
+
+        translated_response = Response(
+            content=json.dumps(
+                {
+                    "id": "msg_antigravity",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "antigravity ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 4, "output_tokens": 2},
+                }
+            ).encode("utf-8"),
+            media_type="application/json",
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+            new=AsyncMock(return_value="ya29.antigravity-token"),
+        ) as mock_load_antigravity, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
+            new=AsyncMock(return_value="unexpected-google-token"),
+        ) as mock_load_google, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+            new=AsyncMock(return_value="project_agy"),
+        ) as mock_load_project, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
+            new=AsyncMock(return_value=None),
+        ) as mock_prime, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
+            new=AsyncMock(
+                return_value=(
+                    {
+                        "model": "claude-sonnet-4-6",
+                        "project": "project_agy",
+                        "user_prompt_id": "prompt-agy",
+                        "request": {
+                            "contents": [{"parts": [{"text": "hello"}]}],
+                        },
+                    },
+                    {},
+                    prepared_body["messages"],
+                    {},
+                    {},
+                    {},
+                )
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(
+                return_value=StreamingResponse(
+                    iter([b"data: [DONE]\n\n"]),
+                    media_type="text/event-stream",
+                )
+            ),
+        ) as mock_pass_through_request, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_response_from_stream",
+            new=AsyncMock(return_value=translated_response),
+        ):
+            response = await _handle_anthropic_google_completion_adapter_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="claude-sonnet-4-6",
+                adapter_provider="antigravity",
+            )
+
+        mock_load_antigravity.assert_awaited_once()
+        mock_load_google.assert_not_awaited()
+        assert mock_load_project.await_args.kwargs["adapter_provider"] == "antigravity"
+        assert mock_prime.await_args.kwargs["adapter_provider"] == "antigravity"
+
+        translated_body = json.loads(response.body.decode("utf-8"))
+        assert translated_body["model"] == "claude-sonnet-4-6"
+        assert translated_body["content"][0]["text"] == "antigravity ok"
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["target"] == (
+            "https://daily-cloudcode-pa.googleapis.com/"
+            "v1internal:streamGenerateContent"
+        )
+        assert call_kwargs["custom_llm_provider"] == "antigravity"
+        assert call_kwargs["custom_headers"]["User-Agent"] == "antigravity-cli/1.0.4"
+        assert call_kwargs["custom_body"]["model"] == "claude-sonnet-4-6"
+        assert call_kwargs["custom_body"]["project"] == "project_agy"
+        litellm_metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        _assert_claude_code_agent_project_litellm_metadata(litellm_metadata)
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "anthropic_antigravity_completion_adapter"
+        )
+        assert litellm_metadata["anthropic_adapter_provider"] == "antigravity"
+        assert litellm_metadata["antigravity_code_assist"] is True
+        assert (
+            "route:anthropic_antigravity_completion_adapter"
+            in litellm_metadata["tags"]
+        )
+        assert "anthropic-antigravity-completion-adapter" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_anthropic_antigravity_completion_adapter_sanitizes_tool_schemas(
+        self,
+    ):
+        prepared_body = await _prepare_claude_code_agent_project_request_body(
+            "antigravity/claude-sonnet-4-6"
+        )
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.url = httpx.URL("http://127.0.0.1:4001/anthropic/v1/messages")
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+
+        translated_response = Response(
+            content=json.dumps(
+                {
+                    "id": "msg_antigravity_schema",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 4, "output_tokens": 2},
+                }
+            ).encode("utf-8"),
+            media_type="application/json",
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+            new=AsyncMock(return_value="ya29.antigravity-token"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+            new=AsyncMock(return_value="project_agy"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
+            new=AsyncMock(
+                return_value=(
+                    {
+                        "model": "claude-sonnet-4-6",
+                        "project": "project_agy",
+                        "user_prompt_id": "prompt-agy",
+                        "request": {
+                            "contents": [{"parts": [{"text": "hello"}]}],
+                            "tools": [
+                                {
+                                    "functionDeclarations": [
+                                        {
+                                            "name": "empty_object",
+                                            "description": "empty schema",
+                                            "parameters": {"type": "object"},
+                                        },
+                                        {
+                                            "name": "array_without_items",
+                                            "description": "array schema",
+                                            "parameters": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "paths": {"type": "array"}
+                                                },
+                                            },
+                                        },
+                                        {
+                                            "name": "SendMessage",
+                                            "description": "send a message",
+                                            "parameters": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "message": {
+                                                        "anyOf": [
+                                                            {
+                                                                "type": "string",
+                                                                "description": (
+                                                                    "Plain text"
+                                                                ),
+                                                            },
+                                                            {
+                                                                "anyOf": [
+                                                                    {
+                                                                        "type": "object",
+                                                                        "properties": {
+                                                                            "type": {
+                                                                                "type": "string"
+                                                                            },
+                                                                            "reason": {
+                                                                                "type": "string"
+                                                                            },
+                                                                        },
+                                                                        "required": [
+                                                                            "type"
+                                                                        ],
+                                                                    },
+                                                                    {
+                                                                        "type": "object",
+                                                                        "properties": {
+                                                                            "type": {
+                                                                                "type": "string"
+                                                                            },
+                                                                            "request_id": {
+                                                                                "type": "string"
+                                                                            },
+                                                                            "approve": {
+                                                                                "type": "boolean"
+                                                                            },
+                                                                        },
+                                                                        "required": [
+                                                                            "type",
+                                                                            "request_id",
+                                                                            "approve",
+                                                                        ],
+                                                                    },
+                                                                ]
+                                                            },
+                                                        ]
+                                                    }
+                                                },
+                                                "required": ["message"],
+                                            },
+                                        },
+                                    ]
+                                }
+                            ],
+                        },
+                    },
+                    {},
+                    prepared_body["messages"],
+                    {},
+                    {},
+                    {},
+                )
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(
+                return_value=StreamingResponse(
+                    iter([b"data: [DONE]\n\n"]),
+                    media_type="text/event-stream",
+                )
+            ),
+        ) as mock_pass_through_request, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_response_from_stream",
+            new=AsyncMock(return_value=translated_response),
+        ):
+            await _handle_anthropic_google_completion_adapter_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="claude-sonnet-4-6",
+                adapter_provider="antigravity",
+            )
+
+        custom_body = mock_pass_through_request.await_args.kwargs["custom_body"]
+        declarations = custom_body["request"]["tools"][0]["functionDeclarations"]
+
+        assert declarations[0]["parameters"] == {
+            "type": "object",
+            "properties": {},
+        }
+        assert declarations[1]["parameters"]["properties"]["paths"] == {
+            "type": "array",
+            "items": {"type": "string"},
+        }
+        assert declarations[2]["parameters"]["properties"]["message"] == {
+            "type": "string",
+            "description": "Plain text",
+        }
+        assert "anyOf" not in json.dumps(declarations)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_antigravity_completion_adapter_normalizes_thinking_budget(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "thinking-repro"}
+
+        (
+            wrapped_request,
+            _tool_name_mapping,
+            _completion_messages,
+            gemini_optional_params,
+            _litellm_params,
+            changes,
+        ) = await _build_google_code_assist_request_from_completion_kwargs(
+            completion_kwargs={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "stream": True,
+                "thinking": {"type": "enabled", "budget_tokens": 64},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            adapter_model="claude-sonnet-4-6",
+            project="project_agy",
+            request=mock_request,
+        )
+
+        generation_config = wrapped_request["request"]["generationConfig"]
+        thinking_config = generation_config["thinkingConfig"]
+        assert thinking_config["thinkingBudget"] == 64
+        assert generation_config["max_output_tokens"] > thinking_config["thinkingBudget"]
+        assert gemini_optional_params["max_output_tokens"] == 1088
+        assert changes["google_adapter_thinking_max_tokens_normalized"] is True
+        assert changes["google_adapter_thinking_budget_tokens"] == 64
+        assert changes["google_adapter_thinking_original_max_tokens"] == 64
+        assert changes["google_adapter_thinking_normalized_max_tokens"] == 1088
+
     def test_resolve_codex_google_code_assist_adapter_model(self):
         assert (
             _resolve_codex_google_code_assist_adapter_model(
@@ -4813,6 +5383,43 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             _resolve_codex_google_code_assist_adapter_model(
                 {"model": "gemini-3.1-pro-preview"},
                 endpoint="/v1/chat/completions",
+            )
+            is None
+        )
+
+    def test_resolve_antigravity_code_assist_adapter_models(self):
+        assert (
+            _resolve_codex_antigravity_code_assist_adapter_model(
+                {"model": "antigravity/gemini-3.5-flash-low"},
+                endpoint="/v1/responses",
+            )
+            == "gemini-3.5-flash-low"
+        )
+        assert (
+            _resolve_codex_antigravity_code_assist_adapter_model(
+                {"model": "agy/gpt-oss-120b-medium"},
+                endpoint="/responses",
+            )
+            == "gpt-oss-120b-medium"
+        )
+        assert (
+            _resolve_anthropic_antigravity_code_assist_adapter_model(
+                {"model": "google-antigravity/claude-sonnet-4-6"},
+                endpoint="/v1/messages",
+            )
+            == "claude-sonnet-4-6"
+        )
+        assert (
+            _resolve_codex_antigravity_code_assist_adapter_model(
+                {"model": "gemini-3.5-flash-low"},
+                endpoint="/v1/responses",
+            )
+            is None
+        )
+        assert (
+            _resolve_anthropic_antigravity_code_assist_adapter_model(
+                {"model": "antigravity/gemini-3.1-flash-image"},
+                endpoint="/v1/messages",
             )
             is None
         )
@@ -5272,6 +5879,144 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert json.loads(response.body.decode("utf-8")) == {
             "id": "resp_codex_google",
             "model": "gemini-3.1-pro-preview",
+        }
+
+    @pytest.mark.asyncio
+    async def test_codex_antigravity_code_assist_route_uses_antigravity_oauth_and_native_envelope(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-antigravity-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+
+        prepared_body = {
+            "model": "antigravity/gpt-oss-120b-medium",
+            "input": "just a test msg",
+            "stream": False,
+            "litellm_metadata": {
+                "passthrough_route_family": "codex_responses",
+                "tags": ["route:codex_responses"],
+            },
+        }
+        wrapped_body = {
+            "model": "gpt-oss-120b-medium",
+            "project": "project_agy",
+            "user_prompt_id": "prompt-agy",
+            "request": {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": "just a test msg"}],
+                    }
+                ],
+                "session_id": "session-agy",
+            },
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+            new=AsyncMock(return_value="ya29.antigravity-token"),
+        ) as mock_load_antigravity, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
+            new=AsyncMock(return_value="unexpected-google-token"),
+        ) as mock_load_google, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+            new=AsyncMock(return_value="project_agy"),
+        ) as mock_load_project, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
+            new=AsyncMock(
+                return_value={
+                    "remainingRequests": 1499,
+                    "totalRequests": 1500,
+                    "source": "google_retrieve_user_quota",
+                }
+            ),
+        ) as mock_prime, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
+            new=AsyncMock(
+                return_value=(
+                    dict(wrapped_body),
+                    {},
+                    [{"role": "user", "content": "just a test msg"}],
+                    {},
+                    {},
+                    {},
+                )
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_google_adapter_pass_through_request",
+            new=AsyncMock(
+                return_value=StreamingResponse(
+                    iter([b"data: [DONE]\n\n"]),
+                    media_type="text/event-stream",
+                )
+            ),
+        ) as mock_pass_through_request, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._collect_google_code_assist_model_response_from_stream",
+            new=AsyncMock(return_value=MagicMock()),
+        ), patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response",
+            return_value={
+                "id": "resp_codex_antigravity",
+                "model": "gpt-oss-120b-medium",
+            },
+        ):
+            response = await _handle_codex_google_code_assist_adapter_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="gpt-oss-120b-medium",
+                adapter_provider="antigravity",
+            )
+
+        mock_load_antigravity.assert_awaited_once()
+        mock_load_google.assert_not_awaited()
+        assert mock_load_project.await_args.kwargs["adapter_provider"] == "antigravity"
+        assert mock_prime.await_args.kwargs["adapter_provider"] == "antigravity"
+
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["custom_headers"]["Authorization"] == (
+            "Bearer ya29.antigravity-token"
+        )
+        assert call_kwargs["custom_headers"]["User-Agent"] == "antigravity-cli/1.0.4"
+        assert call_kwargs["custom_headers"]["x-goog-api-client"] == (
+            "antigravity-cli/1.0.4"
+        )
+        assert call_kwargs["target"] == (
+            "https://daily-cloudcode-pa.googleapis.com/"
+            "v1internal:streamGenerateContent"
+        )
+        assert call_kwargs["query_params"] == {"alt": "sse"}
+        assert call_kwargs["custom_llm_provider"] == "antigravity"
+        assert call_kwargs["custom_body"]["model"] == "gpt-oss-120b-medium"
+        assert call_kwargs["custom_body"]["project"] == "project_agy"
+        litellm_metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "codex_antigravity_code_assist_adapter"
+        )
+        assert litellm_metadata["codex_adapter_provider"] == "antigravity"
+        assert litellm_metadata["antigravity_code_assist"] is True
+        assert "route:codex_antigravity_code_assist_adapter" in litellm_metadata["tags"]
+        assert "codex-antigravity-code-assist-adapter" in litellm_metadata["tags"]
+        assert json.loads(response.body.decode("utf-8")) == {
+            "id": "resp_codex_antigravity",
+            "model": "gpt-oss-120b-medium",
         }
 
     @pytest.mark.asyncio
@@ -13458,6 +14203,316 @@ async def test_openai_passthrough_codex_spark_drops_image_generation_tool(
     assert "codex-unsupported-hosted-tool:image_generation" in litellm_metadata[
         "tags"
     ]
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_from_env(
+    tmp_path, monkeypatch
+):
+    token_path = tmp_path / "antigravity-oauth-token"
+    token_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "test-antigravity-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-not-used",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN_FILE", raising=False)
+
+    assert await _load_valid_local_antigravity_access_token() == (
+        "test-antigravity-token"
+    )
+
+
+def test_load_antigravity_oauth_client_values_from_local_cli_binary(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _load_antigravity_oauth_client_values_from_local_cli_binary,
+    )
+
+    cli_path = tmp_path / "agy"
+    cli_path.write_bytes(
+        b"111111111111-far.apps.googleusercontent.com"
+        b"\x00padding\x00"
+        b"GOCSPX-test-client-secret"
+        b"\x00"
+        b"222222222222-near.apps.googleusercontent.com"
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", raising=False)
+
+    client_id, client_secret = (
+        _load_antigravity_oauth_client_values_from_local_cli_binary()
+    )
+
+    assert client_id == "222222222222-near.apps.googleusercontent.com"
+    assert client_secret == "GOCSPX-test-client-secret"
+
+
+@pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_uses_cli_binary_client_values(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    cli_path = tmp_path / "agy"
+    cli_path.write_bytes(
+        b"222222222222-client.apps.googleusercontent.com"
+        b"\x00GOCSPX-client-secret\x00"
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", raising=False)
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        200,
+        json={"access_token": "ya29.refreshed-antigravity", "expires_in": 3600},
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ):
+        refreshed = await _refresh_local_antigravity_oauth_token_data(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+
+    assert refreshed["token"]["access_token"] == "ya29.refreshed-antigravity"
+    assert refreshed["token"]["refresh_token"] == "refresh-token-123"
+    assert isinstance(refreshed["token"]["expiry"], str)
+    assert mock_client.post.await_args.kwargs["data"] == {
+        "client_id": "222222222222-client.apps.googleusercontent.com",
+        "client_secret": "GOCSPX-client-secret",
+        "refresh_token": "refresh-token-123",
+        "grant_type": "refresh_token",
+    }
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_caches_concurrent_refresh(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    token_path = tmp_path / "antigravity-oauth-token"
+    token_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    future_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    async def refresh_token_data(_token_data):
+        await asyncio.sleep(0.01)
+        return {
+            "auth_method": "consumer",
+            "token": {
+                "access_token": "ya29.refreshed-antigravity",
+                "expiry": future_expiry.isoformat(),
+                "refresh_token": "refresh-token-123",
+                "token_type": "Bearer",
+            },
+        }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._refresh_local_antigravity_oauth_token_data",
+        new=AsyncMock(side_effect=refresh_token_data),
+    ) as refresh_mock:
+        tokens = await asyncio.gather(
+            _load_valid_local_antigravity_access_token(),
+            _load_valid_local_antigravity_access_token(),
+        )
+
+    assert tokens == ["ya29.refreshed-antigravity", "ya29.refreshed-antigravity"]
+    assert refresh_mock.await_count == 1
+
+
+def test_join_antigravity_passthrough_url_preserves_code_assist_colon_path():
+    assert _join_antigravity_passthrough_url(
+        "https://daily-cloudcode-pa.googleapis.com",
+        "v1internal:streamGenerateContent",
+    ) == (
+        "https://daily-cloudcode-pa.googleapis.com/"
+        "v1internal:streamGenerateContent"
+    )
+    assert _join_antigravity_passthrough_url(
+        "https://proxy.example.com/antigravity",
+        "v1internal:fetchAvailableModels",
+    ) == (
+        "https://proxy.example.com/antigravity/"
+        "v1internal:fetchAvailableModels"
+    )
+
+
+@pytest.mark.asyncio
+async def test_antigravity_proxy_route_uses_local_oauth_token_and_client_headers(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4000/antigravity/v1internal:streamGenerateContent"
+    mock_request.headers = {
+        "content-type": "application/json",
+        "x-litellm-api-key": "litellm-test-key",
+        "x-aawm-repository": "https://github.com/zepfu/litellm.git",
+    }
+    mock_request.query_params = {
+        "key": "query-litellm-key",
+        "alt": "sse",
+        "requestId": "request-123",
+    }
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+    request_body = {
+        "model": "gemini-3.1-pro-low",
+        "request": {"session_id": "agy-session-123"},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+        AsyncMock(return_value=mock_user_api_key_dict),
+    ) as mock_auth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        AsyncMock(return_value="agy-oauth-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        AsyncMock(return_value=request_body),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        AsyncMock(return_value={"ok": True}),
+    ) as mock_pass_through:
+        result = await antigravity_proxy_route(
+            endpoint="v1internal:streamGenerateContent",
+            request=mock_request,
+            fastapi_response=mock_response,
+        )
+
+    assert result == {"ok": True}
+    assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-test-key"
+    mock_set_parsed_body.assert_called_once()
+
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["target"] == (
+        "https://daily-cloudcode-pa.googleapis.com/"
+        "v1internal:streamGenerateContent"
+    )
+    assert call_kwargs["custom_headers"]["Authorization"] == (
+        "Bearer agy-oauth-token"
+    )
+    assert call_kwargs["custom_headers"]["User-Agent"] == "antigravity-cli/1.0.4"
+    assert call_kwargs["custom_headers"]["x-goog-api-client"] == (
+        "antigravity-cli/1.0.4"
+    )
+    assert call_kwargs["forward_headers"] is False
+    assert call_kwargs["query_params"] == {
+        "alt": "sse",
+        "requestId": "request-123",
+    }
+    assert call_kwargs["stream"] is True
+    assert call_kwargs["custom_llm_provider"] == "antigravity"
+    assert call_kwargs["egress_credential_family"] == "google"
+    assert call_kwargs["expected_target_family"] == "google"
+    assert call_kwargs["allowed_forward_headers"] is None
+
+    metadata = call_kwargs["custom_body"]["litellm_metadata"]
+    assert metadata["client_name"] == "antigravity-cli"
+    assert metadata["antigravity_code_assist"] is True
+    assert metadata["passthrough_route_family"] == "antigravity_code_assist"
+    assert metadata["session_id"] == "agy-session-123"
+    assert metadata["trace_environment"] == "dev"
+    assert metadata["repository"] == "zepfu/litellm"
+    assert "route:antigravity_code_assist" in metadata["tags"]
+    assert call_kwargs["passthrough_logging_metadata"] == metadata
+
+
+@pytest.mark.asyncio
+async def test_antigravity_proxy_route_preserves_inbound_google_oauth_headers(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "ANTIGRAVITY_CODE_ASSIST_ENDPOINT",
+        "https://proxy.example.com/antigravity",
+    )
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "GET"
+    mock_request.url = "http://localhost:4000/antigravity/v1internal:fetchAvailableModels"
+    mock_request.headers = {
+        "authorization": "Bearer ya29.client-token",
+        "x-litellm-api-key": "litellm-test-key",
+        "x-goog-api-client": "antigravity-cli/1.0.4",
+        "user-agent": "antigravity-cli/1.0.4",
+    }
+    mock_request.query_params = {"key": "query-litellm-key", "requestId": "req-1"}
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+        AsyncMock(return_value=mock_user_api_key_dict),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        AsyncMock(return_value="unexpected-token"),
+    ) as mock_load_token, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        AsyncMock(return_value={"models": []}),
+    ) as mock_pass_through:
+        result = await antigravity_proxy_route(
+            endpoint="v1internal:fetchAvailableModels",
+            request=mock_request,
+            fastapi_response=mock_response,
+        )
+
+    assert result == {"models": []}
+    mock_load_token.assert_not_awaited()
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["target"] == (
+        "https://proxy.example.com/antigravity/"
+        "v1internal:fetchAvailableModels"
+    )
+    assert call_kwargs["custom_headers"] == {}
+    assert call_kwargs["forward_headers"] is True
+    assert call_kwargs["query_params"] == {"requestId": "req-1"}
+    assert call_kwargs["stream"] is False
+    assert "authorization" in call_kwargs["allowed_forward_headers"]
+    assert "x-goog-api-client" in call_kwargs["allowed_forward_headers"]
+    assert "x-litellm-api-key" not in call_kwargs["allowed_forward_headers"]
+    assert (
+        call_kwargs["passthrough_logging_metadata"]["passthrough_route_family"]
+        == "antigravity_code_assist"
+    )
 
 
 @pytest.mark.asyncio

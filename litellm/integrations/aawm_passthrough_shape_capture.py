@@ -1,14 +1,24 @@
 """Sanitized pass-through response shape capture for AAWM investigations.
 
-This is intentionally separate from ``aawm_payload_capture``. It captures the
-shape of upstream provider responses as LiteLLM receives them, while avoiding
-full prompt/body/content persistence.
+This is intentionally separate from ``aawm_payload_capture``. By default it
+captures the shape of upstream provider responses as LiteLLM receives them,
+while avoiding full prompt/body/content persistence.
 
 Enable with ``AAWM_CAPTURE_PASSTHROUGH_SHAPES=1``. Artifacts are written under
 ``/tmp/captures/pass_through_shapes`` by default, which maps to ``./captures``
 in the local dev compose stack.
+
+For targeted investigations that need the complete provider payload, enable
+``AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS=1`` or write a truthy value to
+``/tmp/captures/pass_through_full_payloads.enabled``. Full payload artifacts are
+written under ``/tmp/captures/pass_through_full_payloads`` by default and
+intentionally persist request/response bodies without content redaction.
+Request and response headers are persisted without redaction. The control file
+is checked on each capture attempt, so it can be flipped without restarting the
+proxy process.
 """
 
+import base64
 import json
 import os
 import re
@@ -26,7 +36,15 @@ from litellm._logging import verbose_proxy_logger
 
 _ENV_FLAG = "AAWM_CAPTURE_PASSTHROUGH_SHAPES"
 _DIR_ENV = "AAWM_CAPTURE_PASSTHROUGH_SHAPES_DIR"
+_FULL_PAYLOAD_ENV_FLAG = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS"
+_FULL_PAYLOAD_DIR_ENV = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR"
+_FULL_PAYLOAD_CONTROL_FILE_ENV = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE"
+_FULL_PAYLOAD_MAX_BYTES_ENV = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_MAX_BYTES"
 _DEFAULT_CAPTURE_DIR = Path("/tmp/captures/pass_through_shapes")
+_DEFAULT_FULL_PAYLOAD_CAPTURE_DIR = Path("/tmp/captures/pass_through_full_payloads")
+_DEFAULT_FULL_PAYLOAD_CONTROL_FILE = Path(
+    "/tmp/captures/pass_through_full_payloads.enabled"
+)
 _MAX_KEY_PATHS = 240
 _MAX_QUOTA_HITS = 80
 _MAX_EVENT_SAMPLES = 40
@@ -121,11 +139,46 @@ def passthrough_shape_capture_enabled() -> bool:
     return _is_truthy(os.environ.get(_ENV_FLAG, ""))
 
 
+def passthrough_full_payload_capture_enabled() -> bool:
+    control_file = Path(
+        os.environ.get(
+            _FULL_PAYLOAD_CONTROL_FILE_ENV,
+            str(_DEFAULT_FULL_PAYLOAD_CONTROL_FILE),
+        )
+    )
+    try:
+        if control_file.exists():
+            return _is_truthy(control_file.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return _is_truthy(os.environ.get(_FULL_PAYLOAD_ENV_FLAG, ""))
+
+
 def _capture_dir() -> Path:
     configured = os.environ.get(_DIR_ENV)
     if configured:
         return Path(configured)
     return _DEFAULT_CAPTURE_DIR
+
+
+def _full_payload_capture_dir() -> Path:
+    configured = os.environ.get(_FULL_PAYLOAD_DIR_ENV)
+    if configured:
+        return Path(configured)
+    return _DEFAULT_FULL_PAYLOAD_CAPTURE_DIR
+
+
+def _full_payload_max_bytes() -> Optional[int]:
+    configured = os.environ.get(_FULL_PAYLOAD_MAX_BYTES_ENV)
+    if not configured:
+        return None
+    try:
+        value = int(configured)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
 
 
 def _next_counter() -> int:
@@ -300,6 +353,7 @@ def _url_shape(url_route: Optional[str]) -> Dict[str, Any]:
     parsed = urlparse(url_route or "")
     query_keys = sorted({key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)})
     return {
+        "raw": url_route or None,
         "scheme": parsed.scheme or None,
         "host": parsed.hostname or None,
         "path": parsed.path or None,
@@ -340,10 +394,58 @@ def _sanitize_headers(headers: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _full_payload_headers(headers: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+    if not headers:
+        return {}
+    values: Dict[str, str] = {}
+    for header_name, header_value in headers.items():
+        values[str(header_name)] = str(header_value)
+    return dict(sorted(values.items(), key=lambda item: item[0].lower()))
+
+
+def _full_payload_header_items(
+    headers: Optional[Mapping[str, Any]],
+) -> List[Dict[str, str]]:
+    if not headers:
+        return []
+    try:
+        raw_items = list(headers.multi_items())  # type: ignore[attr-defined]
+    except Exception:
+        raw_items = list(headers.items())
+    return [
+        {"name": str(header_name), "value": str(header_value)}
+        for header_name, header_value in raw_items
+    ]
+
+
 def _response_headers(response: Optional[httpx.Response]) -> Optional[Mapping[str, Any]]:
     if response is None:
         return None
     return response.headers
+
+
+def _maybe_truncate_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    max_bytes = _full_payload_max_bytes()
+    if max_bytes is None:
+        return value
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="replace")
+
+
+def _maybe_truncate_bytes(value: bytes) -> bytes:
+    max_bytes = _full_payload_max_bytes()
+    if max_bytes is None or len(value) <= max_bytes:
+        return value
+    return value[:max_bytes]
+
+
+def _was_truncated_bytes(value: bytes) -> bool:
+    max_bytes = _full_payload_max_bytes()
+    return max_bytes is not None and len(value) > max_bytes
 
 
 def _decode_body_bytes(content: Optional[bytes]) -> Optional[str]:
@@ -355,6 +457,45 @@ def _decode_body_bytes(content: Optional[bytes]) -> Optional[str]:
         return None
 
 
+def _jsonable_full_payload(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        payload = _maybe_truncate_bytes(value)
+        return {
+            "encoding": "base64",
+            "data": base64.b64encode(payload).decode("ascii"),
+            "truncated": _was_truncated_bytes(value),
+            "original_bytes": len(value),
+            "stored_bytes": len(payload),
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable_full_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_full_payload(item) for item in value]
+    return str(value)
+
+
+def _full_response_body(
+    response_body: Any,
+    response_content: Optional[bytes],
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    parsed_body = response_body
+    if parsed_body is None:
+        parsed_body = _parse_json_text(_decode_body_bytes(response_content))
+    if parsed_body is not None:
+        body["json"] = _jsonable_full_payload(parsed_body)
+    if response_content is not None:
+        stored_content = _maybe_truncate_bytes(response_content)
+        body["content_base64"] = base64.b64encode(stored_content).decode("ascii")
+        body["content_text"] = _maybe_truncate_text(_decode_body_bytes(stored_content))
+        body["truncated"] = _was_truncated_bytes(response_content)
+        body["original_bytes"] = len(response_content)
+        body["stored_bytes"] = len(stored_content)
+    return body
+
+
 def _parse_json_text(text: Optional[str]) -> Any:
     if not text:
         return None
@@ -362,6 +503,43 @@ def _parse_json_text(text: Optional[str]) -> Any:
         return json.loads(text)
     except Exception:
         return None
+
+
+def _httpx_request_content(upstream_request: Optional[httpx.Request]) -> Optional[bytes]:
+    if upstream_request is None:
+        return None
+    try:
+        return upstream_request.content
+    except Exception:
+        return None
+
+
+def _httpx_request_payload(
+    upstream_request: Optional[httpx.Request],
+    *,
+    fallback_url_route: Optional[str],
+    fallback_request_body: Any,
+) -> Dict[str, Any]:
+    if upstream_request is None:
+        return {
+            "body": _jsonable_full_payload(fallback_request_body),
+        }
+
+    request_content = _httpx_request_content(upstream_request)
+    payload: Dict[str, Any] = {
+        "method": upstream_request.method,
+        "url": str(upstream_request.url),
+        "headers": _full_payload_headers(upstream_request.headers),
+        "header_items": _full_payload_header_items(upstream_request.headers),
+    }
+    if request_content is not None:
+        payload["body"] = _full_response_body(None, request_content)
+    else:
+        payload["body"] = _jsonable_full_payload(fallback_request_body)
+        payload["body_source"] = "fallback_request_body"
+    if fallback_url_route and str(upstream_request.url) != fallback_url_route:
+        payload["logging_url"] = fallback_url_route
+    return payload
 
 
 def _body_shape(response_body: Any, response_content: Optional[bytes]) -> Dict[str, Any]:
@@ -508,6 +686,51 @@ def _base_artifact(
     return artifact
 
 
+def _base_full_payload_artifact(
+    *,
+    mode: str,
+    provider: Optional[str],
+    endpoint_type: Any,
+    url_route: Optional[str],
+    request_body: Any,
+    response: Optional[httpx.Response],
+    upstream_request: Optional[httpx.Request],
+    litellm_call_id: Optional[str],
+    extra_metadata: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    artifact: Dict[str, Any] = {
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "capture_kind": "aawm_passthrough_full_payload",
+        "capture_scope": (
+            "upstream_http_transaction"
+            if upstream_request is not None
+            else "passthrough_logging_capture"
+        ),
+        "mode": mode,
+        "provider": provider,
+        "endpoint_type": _safe_enum_value(endpoint_type),
+        "litellm_call_id": litellm_call_id,
+        "url": _url_shape(url_route),
+        "request": _httpx_request_payload(
+            upstream_request,
+            fallback_url_route=url_route,
+            fallback_request_body=request_body,
+        ),
+        "response": {
+            "status_code": response.status_code if response is not None else None,
+            "headers": _full_payload_headers(_response_headers(response)),
+            "header_items": _full_payload_header_items(_response_headers(response)),
+        },
+    }
+    if extra_metadata:
+        artifact["metadata"] = {
+            str(key): value
+            for key, value in extra_metadata.items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+    return artifact
+
+
 def _write_artifact(artifact: Dict[str, Any]) -> Optional[str]:
     if not passthrough_shape_capture_enabled():
         return None
@@ -524,10 +747,42 @@ def _write_artifact(artifact: Dict[str, Any]) -> Optional[str]:
             json.dumps(artifact, indent=2, sort_keys=True, default=str),
             encoding="utf-8",
         )
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
         return str(path)
     except Exception as exc:
         verbose_proxy_logger.warning(
             "AawmPassthroughShapeCapture: capture failed: %s", exc
+        )
+        return None
+
+
+def _write_full_payload_artifact(artifact: Dict[str, Any]) -> Optional[str]:
+    if not passthrough_full_payload_capture_enabled():
+        return None
+    try:
+        capture_dir = _full_payload_capture_dir()
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        counter = _next_counter()
+        provider = _sanitize_filename_part(artifact.get("provider"))
+        mode = _sanitize_filename_part(artifact.get("mode"))
+        call_id = _sanitize_filename_part(artifact.get("litellm_call_id"))[:18]
+        path = capture_dir / f"{ts}_{counter:04d}_{provider}_{mode}_{call_id}.json"
+        path.write_text(
+            json.dumps(artifact, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+        return str(path)
+    except Exception as exc:
+        verbose_proxy_logger.warning(
+            "AawmPassthroughFullPayloadCapture: capture failed: %s", exc
         )
         return None
 
@@ -540,13 +795,39 @@ def capture_passthrough_shape(
     url_route: Optional[str] = None,
     request_body: Any = None,
     response: Optional[httpx.Response] = None,
+    upstream_request: Optional[httpx.Request] = None,
     response_body: Any = None,
     response_content: Optional[bytes] = None,
     litellm_call_id: Optional[str] = None,
     extra_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    if not passthrough_shape_capture_enabled():
+    shape_enabled = passthrough_shape_capture_enabled()
+    full_payload_enabled = passthrough_full_payload_capture_enabled()
+    if not shape_enabled and not full_payload_enabled:
         return None
+
+    full_payload_path: Optional[str] = None
+    if full_payload_enabled:
+        full_payload_artifact = _base_full_payload_artifact(
+            mode=mode,
+            provider=provider,
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            request_body=request_body,
+            response=response,
+            upstream_request=upstream_request,
+            litellm_call_id=litellm_call_id,
+            extra_metadata=extra_metadata,
+        )
+        full_payload_artifact["response"]["body"] = _full_response_body(
+            response_body,
+            response_content,
+        )
+        full_payload_path = _write_full_payload_artifact(full_payload_artifact)
+
+    if not shape_enabled:
+        return full_payload_path
+
     artifact = _base_artifact(
         mode=mode,
         provider=provider,
@@ -568,12 +849,50 @@ def capture_passthrough_stream_shape(
     url_route: Optional[str] = None,
     request_body: Any = None,
     response: Optional[httpx.Response] = None,
+    upstream_request: Optional[httpx.Request] = None,
     all_chunks: Sequence[str],
+    raw_bytes: Optional[Sequence[bytes]] = None,
     litellm_call_id: Optional[str] = None,
     extra_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    if not passthrough_shape_capture_enabled():
+    shape_enabled = passthrough_shape_capture_enabled()
+    full_payload_enabled = passthrough_full_payload_capture_enabled()
+    if not shape_enabled and not full_payload_enabled:
         return None
+
+    full_payload_path: Optional[str] = None
+    if full_payload_enabled:
+        full_payload_artifact = _base_full_payload_artifact(
+            mode="stream",
+            provider=provider,
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            request_body=request_body,
+            response=response,
+            upstream_request=upstream_request,
+            litellm_call_id=litellm_call_id,
+            extra_metadata=extra_metadata,
+        )
+        stream_payload: Dict[str, Any] = {
+            "line_count": len(all_chunks),
+            "lines": [_maybe_truncate_text(str(line)) for line in all_chunks],
+        }
+        if raw_bytes is not None:
+            stored_raw_chunks = [_maybe_truncate_bytes(chunk) for chunk in raw_bytes]
+            stream_payload["raw_chunk_count"] = len(raw_bytes)
+            stream_payload["raw_total_bytes"] = sum(len(chunk) for chunk in raw_bytes)
+            stream_payload["raw_chunks_base64"] = [
+                base64.b64encode(chunk).decode("ascii") for chunk in stored_raw_chunks
+            ]
+            stream_payload["raw_chunks_truncated"] = [
+                _was_truncated_bytes(chunk) for chunk in raw_bytes
+            ]
+        full_payload_artifact["response"]["stream"] = stream_payload
+        full_payload_path = _write_full_payload_artifact(full_payload_artifact)
+
+    if not shape_enabled:
+        return full_payload_path
+
     artifact = _base_artifact(
         mode="stream",
         provider=provider,

@@ -635,6 +635,62 @@ class TestGeminiPassthroughLoggingHandler:
             "cacheCreationInputTokens"
         ] == 5
 
+    @patch("litellm.completion_cost")
+    def test_handle_logging_antigravity_collected_chunks_preserves_usage_without_cost_lookup(
+        self, mock_completion_cost
+    ):
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            {
+                "traceId": "trace-antigravity",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": "antigravity streamed"}],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 3,
+                        "totalTokenCount": 13,
+                    },
+                },
+            }
+        )
+
+        result = GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route="https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            request_body={"model": "gemini-3.1-pro-low"},
+            endpoint_type=MagicMock(),
+            start_time=self.start_time,
+            all_chunks=[chunk, "data: [DONE]"],
+            model="gemini-3.1-pro-low",
+            end_time=self.end_time,
+            custom_llm_provider="antigravity",
+        )
+
+        assert result["result"] is not None
+        assert result["kwargs"]["model"] == "gemini-3.1-pro-low"
+        assert result["kwargs"]["custom_llm_provider"] == "antigravity"
+        assert "response_cost" not in result["kwargs"]
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "totalTokenCount"
+        ] == 13
+        assert mock_logging_obj.model_call_details["model"] == "gemini-3.1-pro-low"
+        assert (
+            mock_logging_obj.model_call_details["custom_llm_provider"]
+            == "antigravity"
+        )
+        assert "response_cost" not in mock_logging_obj.model_call_details
+        mock_completion_cost.assert_not_called()
+
     def test_gemini_passthrough_handler_non_gemini_route(self):
         """Test that non-Gemini routes return None"""
         mock_httpx_response = self._create_mock_httpx_response()

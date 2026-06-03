@@ -2349,6 +2349,102 @@ async def test_pass_through_request_forwards_raw_body_without_json_parse():
 
 
 @pytest.mark.asyncio
+async def test_pass_through_request_full_payload_capture_uses_upstream_http_request(
+    tmp_path,
+    monkeypatch,
+):
+    control_file = tmp_path / "full-payload.enabled"
+    capture_dir = tmp_path / "full-payloads"
+    control_file.write_text("1", encoding="utf-8")
+    monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+    monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+    monkeypatch.setenv(
+        "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE",
+        str(control_file),
+    )
+    monkeypatch.setenv(
+        "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR",
+        str(capture_dir),
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4001/openai_passthrough/v1/responses"
+    mock_request.headers = Headers({"content-type": "application/json"})
+    mock_request.query_params = QueryParams("")
+
+    target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+    upstream_request = httpx.Request(
+        "POST",
+        target_url,
+        headers={
+            "authorization": "Bearer full-upstream-token",
+            "x-xai-token-auth": "full-xai-token",
+            "content-type": "application/json",
+        },
+        content=b'{"model":"grok-composer-2.5-fast","input":"wire body"}',
+    )
+    mock_response = httpx.Response(
+        status_code=200,
+        headers={
+            "authorization": "Bearer response-token",
+            "x-ratelimit-remaining-requests": "900",
+            "content-type": "application/json",
+        },
+        content=b'{"id":"resp_1","model":"grok-composer-2.5-fast"}',
+        request=upstream_request,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+        new_callable=AsyncMock,
+    ):
+        mock_client = MagicMock()
+        mock_client.request = AsyncMock(return_value=mock_response)
+        mock_client_obj = MagicMock(client=mock_client)
+        mock_get_client.return_value = mock_client_obj
+
+        mock_logging_obj.pre_call_hook = AsyncMock(
+            side_effect=lambda **kwargs: kwargs["data"]
+        )
+        mock_logging_obj.post_call_success_hook = AsyncMock()
+        mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+        await pass_through_request(
+            request=mock_request,
+            target=target_url,
+            custom_headers={"authorization": "Bearer full-upstream-token"},
+            user_api_key_dict=MagicMock(),
+            custom_body={
+                "model": "grok-composer-2.5-fast",
+                "input": "logging body",
+                "litellm_metadata": {"source": "test"},
+            },
+            stream=False,
+            custom_llm_provider="xai",
+        )
+
+    artifacts = list(capture_dir.glob("*.json"))
+    assert len(artifacts) == 1
+    artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert artifact["capture_kind"] == "aawm_passthrough_full_payload"
+    assert artifact["capture_scope"] == "upstream_http_transaction"
+    assert artifact["request"]["method"] == "POST"
+    assert artifact["request"]["url"] == target_url
+    assert artifact["request"]["headers"]["authorization"] == (
+        "Bearer full-upstream-token"
+    )
+    assert artifact["request"]["headers"]["x-xai-token-auth"] == "full-xai-token"
+    assert artifact["request"]["body"]["json"]["input"] == "wire body"
+    assert artifact["response"]["headers"]["authorization"] == "Bearer response-token"
+    assert artifact["response"]["body"]["json"]["model"] == "grok-composer-2.5-fast"
+
+
+@pytest.mark.asyncio
 async def test_pass_through_with_httpbin_redirect():
     """
     Integration test using httpbin.org redirect endpoint to test real redirect handling.
@@ -3312,6 +3408,13 @@ async def test_route_streaming_logging_records_finalize_metrics():
         await PassThroughStreamingHandler._route_streaming_logging_to_handler(
             litellm_logging_obj=logging_obj,
             passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            response=httpx.Response(
+                200,
+                request=httpx.Request(
+                    "POST",
+                    "https://chatgpt.com/backend-api/codex/responses",
+                ),
+            ),
             url_route="https://chatgpt.com/backend-api/codex/responses",
             request_body={"model": "gpt-5.4"},
             endpoint_type=EndpointType.OPENAI,
@@ -3335,8 +3438,11 @@ async def test_route_streaming_logging_records_finalize_metrics():
     assert "proxy.post_response_finalize" in span_names
 
 
+@pytest.mark.parametrize("custom_llm_provider", ["gemini", "antigravity"])
 @pytest.mark.asyncio
-async def test_route_streaming_logging_skips_gemini_control_plane():
+async def test_route_streaming_logging_skips_code_assist_control_plane(
+    custom_llm_provider,
+):
     logging_obj = MagicMock()
     logging_obj.async_success_handler = AsyncMock()
     success_handler = PassThroughEndpointLogging()
@@ -3344,14 +3450,91 @@ async def test_route_streaming_logging_skips_gemini_control_plane():
     await PassThroughStreamingHandler._route_streaming_logging_to_handler(
         litellm_logging_obj=logging_obj,
         passthrough_success_handler_obj=success_handler,
+        response=httpx.Response(
+            200,
+            request=httpx.Request(
+                "POST",
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+            ),
+        ),
         url_route="https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
         request_body={"request": {"session_id": "gemini-session-123"}},
         endpoint_type=EndpointType.VERTEX_AI,
         start_time=datetime.now() - timedelta(milliseconds=10),
-        raw_bytes=[b'{"response":{"sessionId":"gemini-session-123"}}'],
+        raw_bytes=[b'{"response":{"sessionId":"code-assist-session-123"}}'],
         end_time=datetime.now(),
-        custom_llm_provider="gemini",
+        custom_llm_provider=custom_llm_provider,
         success_handler_kwargs={},
     )
 
     logging_obj.async_success_handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize("custom_llm_provider", ["gemini", "antigravity"])
+@pytest.mark.asyncio
+async def test_route_streaming_logging_captures_code_assist_quota_observation(
+    custom_llm_provider,
+):
+    logging_obj = MagicMock()
+    logging_obj.async_success_handler = AsyncMock()
+    logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
+    success_handler = PassThroughEndpointLogging()
+    success_handler_kwargs = {
+        "litellm_params": {"metadata": {}},
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+    }
+    quota_payload = {
+        "remainingRequests": 1499,
+        "totalRequests": 1500,
+        "buckets": [
+            {
+                "quotaPeriod": "DAILY",
+                "remainingRequests": 1499,
+                "totalRequests": 1500,
+                "resetTime": "2026-06-04T00:00:00Z",
+            }
+        ],
+    }
+
+    await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+        litellm_logging_obj=logging_obj,
+        passthrough_success_handler_obj=success_handler,
+        response=httpx.Response(
+            200,
+            request=httpx.Request(
+                "POST",
+                "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+            ),
+        ),
+        url_route="https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+        request_body={"request": {"session_id": "gemini-session-123"}},
+        endpoint_type=EndpointType.VERTEX_AI,
+        start_time=datetime.now() - timedelta(milliseconds=10),
+        raw_bytes=[f"data: {json.dumps(quota_payload)}\n\n".encode("utf-8")],
+        end_time=datetime.now(),
+        custom_llm_provider=custom_llm_provider,
+        success_handler_kwargs=success_handler_kwargs,
+    )
+
+    logging_obj.async_success_handler.assert_awaited_once()
+    call_kwargs = logging_obj.async_success_handler.await_args.kwargs
+    metadata = call_kwargs["litellm_params"]["metadata"]
+    assert metadata["aawm_rate_limit_observation_only"] is True
+    expected_source = (
+        "antigravity_retrieve_user_quota"
+        if custom_llm_provider == "antigravity"
+        else "google_retrieve_user_quota"
+    )
+    assert (
+        metadata["google_retrieve_user_quota"]["source"]
+        == expected_source
+    )
+    assert (
+        metadata["google_retrieve_user_quota"]["remainingRequests"] == 1499
+    )
+    assert (
+        metadata["google_retrieve_user_quota"]["buckets"]["items"][0][
+            "resetTime"
+        ]
+        == "2026-06-04T00:00:00Z"
+    )
