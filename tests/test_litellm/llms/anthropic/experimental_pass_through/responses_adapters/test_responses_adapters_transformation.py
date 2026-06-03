@@ -474,8 +474,8 @@ class TestTranslateMessagesToResponsesInput:
             },
         ]
 
-    def test_assistant_thinking_block_becomes_reasoning_item(self):
-        """Assistant thinking block is preserved as a hidden reasoning item."""
+    def test_assistant_thinking_block_without_responses_id_is_skipped(self):
+        """Anthropic-only thinking blocks are not valid Responses input items."""
         messages = [
             {
                 "role": "assistant",
@@ -485,10 +485,27 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
         result = _translate_messages(messages)
+        assert result == []
+
+    def test_assistant_thinking_block_with_responses_id_becomes_reasoning_item(self):
+        """Responses reasoning items with native rs IDs are preserved."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "id": "rs_123",
+                        "thinking": "Let me reason step by step.",
+                    }
+                ],
+            }
+        ]
+        result = _translate_messages(messages)
         assert result == [
             {
                 "type": "reasoning",
-                "id": "anthropic-thinking-1",
+                "id": "rs_123",
                 "summary": [{"type": "summary_text", "text": ""}],
                 "content": [
                     {
@@ -496,7 +513,6 @@ class TestTranslateMessagesToResponsesInput:
                         "text": "Let me reason step by step.",
                     }
                 ],
-                "status": "completed",
             }
         ]
 
@@ -511,8 +527,8 @@ class TestTranslateMessagesToResponsesInput:
         result = _translate_messages(messages)
         assert result == []
 
-    def test_assistant_redacted_thinking_block_becomes_reasoning_item(self):
-        """Assistant redacted thinking is preserved as hidden reasoning data."""
+    def test_assistant_redacted_thinking_block_without_responses_id_is_skipped(self):
+        """Anthropic-only redacted thinking cannot be replayed to Responses."""
         messages = [
             {
                 "role": "assistant",
@@ -520,13 +536,29 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
         result = _translate_messages(messages)
+        assert result == []
+
+    def test_assistant_redacted_thinking_block_with_responses_id_becomes_reasoning_item(self):
+        """Responses encrypted reasoning with native rs IDs is preserved."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "redacted_thinking",
+                        "id": "rs_opaque",
+                        "data": "opaque-thought",
+                    }
+                ],
+            }
+        ]
+        result = _translate_messages(messages)
         assert result == [
             {
                 "type": "reasoning",
-                "id": "anthropic-thinking-1",
+                "id": "rs_opaque",
                 "summary": [{"type": "summary_text", "text": ""}],
                 "encrypted_content": "opaque-thought",
-                "status": "completed",
             }
         ]
 
@@ -552,15 +584,11 @@ class TestTranslateMessagesToResponsesInput:
         result = _translate_messages(messages)
         assert [item["type"] for item in result] == [
             "message",
-            "reasoning",
             "function_call",
-            "reasoning",
             "message",
         ]
         assert result[0]["content"] == [{"type": "output_text", "text": "Before tool."}]
-        assert result[1]["content"] == [{"type": "reasoning_text", "text": "Hidden step."}]
-        assert result[3]["encrypted_content"] == "opaque-thought"
-        assert result[4]["content"] == [{"type": "output_text", "text": "After tool."}]
+        assert result[2]["content"] == [{"type": "output_text", "text": "After tool."}]
 
     def test_mixed_messages_ordering(self):
         """Full multi-turn conversation is converted in order."""

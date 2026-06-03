@@ -562,7 +562,14 @@ def test_target_profile_sets_session_history_runtime_identity_expectations(monke
     case_env = updated["cases"]["claude_adapter_gpt55"]["env"]
     assert validation["expected_provider"] == "openai"
     assert validation["expected_litellm_environment"] == "dev"
+    assert validation["expected_tenant_id"] == "litellm"
     assert validation["require_runtime_identity"] is True
+    assert validation["metadata_required_equals"]["tenant_id"] == "litellm"
+    assert (
+        validation["metadata_required_equals"]["aawm_original_tenant_id"]
+        == "adapter-harness-tenant"
+    )
+    assert validation["metadata_required_equals"]["aawm_harness_tenant_alias"] is True
     assert updated["cases"]["claude_adapter_gpt55"]["require_trace_user_id"] is True
     assert updated["cases"]["claude_adapter_gpt55"]["expected_user_ids"] == [
         "adapter-harness-tenant"

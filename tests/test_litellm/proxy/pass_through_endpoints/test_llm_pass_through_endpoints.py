@@ -18586,6 +18586,7 @@ class TestGrokProxyRoute:
         assert call_kwargs["egress_credential_family"] == "xai"
         assert call_kwargs["expected_target_family"] == "xai"
         assert call_kwargs["query_params"] == {"debug": "1"}
+        assert call_kwargs["retryable_upstream_status_codes"] == []
         assert "authorization" in call_kwargs["allowed_forward_headers"]
         assert "x-xai-token-auth" in call_kwargs["allowed_forward_headers"]
         assert "x-grok-agent-id" in call_kwargs["allowed_forward_headers"]
@@ -18698,6 +18699,65 @@ class TestGrokProxyRoute:
         assert metadata["grok_cli_chat_proxy"] is True
         assert "route:grok_cli_chat_proxy" in metadata["tags"]
         assert "x-grok-client-version" in call_kwargs["allowed_forward_headers"]
+
+    @pytest.mark.parametrize(
+        "endpoint,expected_target",
+        [
+            (
+                "v1/sessions/register",
+                "https://cli-chat-proxy.grok.com/v1/sessions/register",
+            ),
+            (
+                "v1/sessions/session_123/replicas/update",
+                "https://cli-chat-proxy.grok.com/v1/sessions/session_123/replicas/update",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_marks_session_side_channels_retryable(
+        self,
+        endpoint,
+        expected_target,
+    ):
+        """should suppress generic 5xx exception logging for retryable Grok session side channels"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = f"http://localhost:4000/grok/{endpoint}"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "content-type": "application/json",
+            "user-agent": "grok/0.1",
+        }
+        mock_request.query_params = {"key": "query-litellm-key"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value={"sessionId": "session_123"}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        call_kwargs = mock_pass_through.await_args.kwargs
+        assert call_kwargs["target"] == expected_target
+        assert call_kwargs["retryable_upstream_status_codes"] == [
+            500,
+            502,
+            503,
+            504,
+        ]
 
 
 class TestCursorProxyRoute:

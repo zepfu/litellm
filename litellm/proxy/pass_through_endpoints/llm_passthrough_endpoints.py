@@ -15298,6 +15298,24 @@ def _is_grok_json_request(request: Request) -> bool:
     )
 
 
+def _get_grok_side_channel_retryable_status_codes(endpoint: str) -> list[int]:
+    endpoint_path = httpx.URL(endpoint).path
+    if not endpoint_path.startswith("/"):
+        endpoint_path = "/" + endpoint_path
+    if endpoint_path.startswith("/v1/"):
+        endpoint_path = endpoint_path[len("/v1") :]
+
+    is_session_side_channel = (
+        endpoint_path == "/sessions/register"
+        or endpoint_path.startswith("/sessions/")
+        and endpoint_path.endswith("/replicas/update")
+    )
+    if not is_session_side_channel:
+        return []
+
+    return [500, 502, 503, 504]
+
+
 def _log_grok_forward_header_compare(
     *,
     endpoint: str,
@@ -15810,6 +15828,9 @@ async def grok_proxy_route(
         allowed_forward_headers=list(_GROK_CLI_FORWARD_HEADER_ALLOWLIST),
         raw_body_passthrough=raw_body_passthrough,
         passthrough_logging_metadata=passthrough_logging_metadata,
+        retryable_upstream_status_codes=_get_grok_side_channel_retryable_status_codes(
+            endpoint
+        ),
     )
 
 
