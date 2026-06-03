@@ -69,6 +69,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             or hostname == "ai.api.nvidia.com"
             or hostname == "openrouter.ai"
             or hostname.endswith(".openrouter.ai")
+            or hostname == "opencode.ai"
+            or hostname.endswith(".opencode.ai")
             or hostname == "api.x.ai"
             or hostname == "cli-chat-proxy.grok.com"
         )
@@ -93,6 +95,11 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 candidates.append(f"xai/{model}")
             else:
                 candidates.append(model.removeprefix("xai/"))
+        elif custom_llm_provider == "opencode_zen":
+            if not model.startswith("opencode/"):
+                candidates.append(f"opencode/{model}")
+            else:
+                candidates.append(model.removeprefix("opencode/"))
         return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
     @staticmethod
