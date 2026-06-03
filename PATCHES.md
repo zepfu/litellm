@@ -2129,6 +2129,49 @@ promotion.
 
 ---
 
+### aawm.64 — Native alternate-provider routing and quota/session telemetry expansion
+
+**Status:** AAWM local release candidate.
+
+**What changed:** The fork now carries the current native alternate-provider
+route set for Grok/xAI, Google Antigravity Code Assist, and OpenCode Zen.
+Grok/xAI changes add managed OAuth aliases and native Grok CLI/OIDC
+passthrough models across OpenAI/Codex and Anthropic-style endpoints, Composer
+and Grok Build pricing/side-channel handling, xAI quota/header extraction into
+provider rate-limit observations, and corrected Responses-path routing for the
+new Grok model family. Google Antigravity changes add Code Assist routing,
+model-selection support for the exposed Gemini/Vertex-family pools, and
+pool-level rate-limit attribution. OpenCode Zen changes add the saved-credential
+provider route, current free-model allowlist, Codex/OpenAI and Claude/Anthropic
+adapter paths, path-aware `/responses`, `/chat/completions`, and `/messages`
+parsing, plus free-model pricing/catalog entries. Session-history changes add
+tracked flags for changes touching pre-commit config, `.env*`, `pyproject.toml`,
+and `.gitignore`, and the agent-quality ruleset is packaged with both the
+source tree and callback overlay.
+
+**Why:** AAWM routes local TUI clients through LiteLLM so Codex, Claude Code,
+Gemini/Grok/OpenCode clients, and production reporting share a single model
+usage, identity, quota, and session-history surface. The providers expose
+different authentication artifacts, endpoint shapes, side channels, quota
+families, model aliases, and unsupported parameters, so the fork needs
+provider-specific adapters and telemetry normalization rather than generic
+OpenAI-compatible handling.
+
+**Why not upstream:** These integrations depend on local AAWM credential
+locations, provider-specific TUI behavior, `aawm_tristore` session-history and
+rate-limit schemas, AAWM callback enrichment, and local Codex/Claude/Gemini/Grok
+acceptance harness conventions.
+
+**Validation status:** Focused unit and harness coverage exists for the Grok/xAI
+native/OAuth paths, Google Antigravity Code Assist quota pools, OpenCode Zen
+passthrough and adapter behavior, session-history config-change flags,
+rate-limit backfills, and agent-quality scoring. Dev runtime smoke evidence
+exists for the added provider lanes on `:4001`; prod promotion still requires
+the normal release runbook steps, image publication, infrastructure rebuild,
+built-image inspection, and prod validation after the container restart.
+
+---
+
 
 ## Dropped Patches
 

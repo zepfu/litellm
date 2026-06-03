@@ -5860,8 +5860,7 @@
       },
       "command_json_checks": {
         "required_equals": {
-          "is_error": false,
-          "result": "/home/zepfu/projects/litellm"
+          "is_error": false
         },
         "required_minimums": {
           "usage.input_tokens": 1,

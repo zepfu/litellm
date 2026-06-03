@@ -310,6 +310,9 @@ def _apply_target_profile_to_config(
         updated_case['target_profile'] = target
         updated_case['case_name'] = case_name
         tenant_id = _resolve_harness_tenant_id(updated_config, updated_case)
+        expected_session_history_tenant_id = (
+            _resolve_expected_session_history_tenant_id(tenant_id)
+        )
         updated_case['tenant_id'] = tenant_id
         harness_run_id = str(
             updated_case.get('harness_run_id')
@@ -352,7 +355,19 @@ def _apply_target_profile_to_config(
             updated_case.get('require_trace_user_id', True) is not False
         )
         if require_trace_user_id:
-            metadata_required_equals.setdefault('tenant_id', tenant_id)
+            metadata_required_equals.setdefault(
+                'tenant_id',
+                expected_session_history_tenant_id,
+            )
+            if expected_session_history_tenant_id != tenant_id:
+                metadata_required_equals.setdefault(
+                    'aawm_original_tenant_id',
+                    tenant_id,
+                )
+                metadata_required_equals.setdefault(
+                    'aawm_harness_tenant_alias',
+                    True,
+                )
         session_history_validation['metadata_required_equals'] = (
             metadata_required_equals
         )
@@ -366,11 +381,14 @@ def _apply_target_profile_to_config(
         has_expected_rows = isinstance(expected_rows, list) and bool(expected_rows)
         if has_expected_rows:
             session_history_validation['expected_rows'] = [
-                _with_expected_row_tenant(row, tenant_id)
+                _with_expected_row_tenant(row, expected_session_history_tenant_id)
                 for row in expected_rows
             ]
         elif require_trace_user_id:
-            session_history_validation.setdefault('expected_tenant_id', tenant_id)
+            session_history_validation.setdefault(
+                'expected_tenant_id',
+                expected_session_history_tenant_id,
+            )
         session_history_validation.setdefault('require_runtime_identity', True)
         updated_case['session_history_validation'] = session_history_validation
         if isinstance(updated_case.get('http_request'), dict):
@@ -409,6 +427,19 @@ def _resolve_harness_tenant_id(
     if isinstance(value, (str, int, float)) and str(value).strip():
         return str(value).strip()
     return 'adapter-harness-tenant'
+
+
+def _is_harness_tenant_alias(value: str) -> bool:
+    normalized = value.strip().lower()
+    return bool(normalized) and (
+        'harness' in normalized or 'validation' in normalized
+    )
+
+
+def _resolve_expected_session_history_tenant_id(tenant_id: str) -> str:
+    if _is_harness_tenant_alias(tenant_id):
+        return 'litellm'
+    return tenant_id
 
 
 def _with_expected_row_tenant(row: Any, tenant_id: str) -> Any:

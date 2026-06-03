@@ -133,6 +133,19 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         return reasoning_item
 
     @staticmethod
+    def _responses_reasoning_id_from_anthropic_block(
+        block: Dict[str, Any],
+    ) -> Optional[str]:
+        for key in ("id", "signature"):
+            value = block.get(key)
+            if not isinstance(value, str):
+                continue
+            value = value.strip()
+            if value.startswith("rs"):
+                return value
+        return None
+
+    @staticmethod
     def _deserialize_tool_input(arguments: Any) -> Dict[str, Any]:
         if arguments in (None, ""):
             return {}
@@ -522,13 +535,16 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                     {"type": "output_text", "text": output_text}
                                 )
                         elif btype in ("thinking", "redacted_thinking"):
+                            reasoning_id = (
+                                self._responses_reasoning_id_from_anthropic_block(
+                                    block
+                                )
+                            )
+                            if reasoning_id is None:
+                                continue
                             reasoning_item = self._anthropic_thinking_block_to_reasoning_item(
                                 block,
-                                reasoning_id=str(
-                                    block.get("signature")
-                                    or block.get("id")
-                                    or f"anthropic-thinking-{reasoning_item_index + 1}"
-                                ),
+                                reasoning_id=reasoning_id,
                             )
                             if reasoning_item is not None:
                                 flush_assistant_parts()
