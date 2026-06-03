@@ -7450,6 +7450,135 @@ def test_build_rate_limit_observations_treats_codex_adapter_quota_as_code_assist
     assert observations[0]["used_percentage"] == pytest.approx(25.0)
 
 
+def test_build_rate_limit_observations_preserves_antigravity_quota_identity() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "google-antigravity/claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "antigravity"
+    kwargs["litellm_call_id"] = "call-antigravity-claude-quota"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-antigravity-claude-quota",
+            "passthrough_route_family": "anthropic_antigravity_completion_adapter",
+            "aawm_stream_logging_custom_llm_provider": "antigravity",
+            "anthropic_adapter_original_model": (
+                "google-antigravity/claude-sonnet-4-6"
+            ),
+            "google_retrieve_user_quota": {
+                "source": "antigravity_retrieve_user_quota",
+                "buckets": {
+                    "items": [
+                        {
+                            "modelId": "claude-sonnet-4-6",
+                            "tokenType": "WTUS",
+                            "remainingFraction": 0.5,
+                            "resetTime": "2026-06-03T15:23:07Z",
+                        },
+                        {
+                            "modelId": "gpt-oss-120b-medium",
+                            "tokenType": "WTUS",
+                            "remainingFraction": 0.5,
+                            "resetTime": "2026-06-03T15:23:07Z",
+                        },
+                        {
+                            "modelId": "gemini-3.5-flash-low",
+                            "tokenType": "WTUS",
+                            "remainingFraction": 0.75,
+                            "resetTime": "2026-06-03T17:31:26Z",
+                        },
+                        {
+                            "modelId": "tab_flash_lite_preview",
+                            "tokenType": "WTUS",
+                            "remainingFraction": 1,
+                        }
+                    ]
+                },
+            },
+        }
+    )
+    end_time = datetime(2026, 6, 3, 14, 29, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    vertex_observation = by_scope["vertex_pool"]
+    gemini_observation = by_scope["gemini_pool"]
+    assert vertex_observation["source"] == "antigravity_retrieve_user_quota"
+    assert vertex_observation["provider"] == "antigravity"
+    assert vertex_observation["client_family"] == "antigravity_code_assist"
+    assert vertex_observation["model"] is None
+    assert vertex_observation["model_family"] == "vertex"
+    assert vertex_observation["quota_period"] == "five_hour"
+    assert vertex_observation["window_minutes"] == 300
+    assert vertex_observation["limit_id"] == "antigravity_code_assist"
+    assert vertex_observation["limit_scope"] == "vertex_pool"
+    assert vertex_observation["used_percentage"] == pytest.approx(50.0)
+    assert gemini_observation["model"] is None
+    assert gemini_observation["model_family"] == "gemini"
+    assert gemini_observation["limit_scope"] == "gemini_pool"
+    assert gemini_observation["quota_period"] == "five_hour"
+    assert gemini_observation["used_percentage"] == pytest.approx(25.0)
+    assert vertex_observation["limit_key"].startswith(
+        "antigravity:antigravity_code_assist:"
+    )
+
+    db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+        vertex_observation
+    )
+    assert db_payload[1] == "antigravity_code_assist"
+    assert db_payload[4] == "antigravity"
+    assert db_payload[5] is None
+    assert db_payload[6] == "antigravity_code_assist:vertex_pool"
+    assert db_payload[7] == "five_hour"
+    assert db_payload[8] == "wtus"
+
+
+def test_build_rate_limit_observations_normalizes_google_quota_period_windows() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "google-antigravity/claude-opus-4-6-thinking"
+    kwargs["custom_llm_provider"] = "antigravity"
+    kwargs["litellm_call_id"] = "call-antigravity-five-hour-quota"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-antigravity-five-hour-quota",
+            "passthrough_route_family": "anthropic_antigravity_completion_adapter",
+            "aawm_stream_logging_custom_llm_provider": "antigravity",
+            "google_retrieve_user_quota": {
+                "source": "antigravity_retrieve_user_quota",
+                "modelId": "claude-opus-4-6-thinking",
+                "tokenType": "WTUS",
+                "remainingFraction": 0.25,
+                "quotaPeriod": "FIVE-HOUR",
+                "resetTime": "2026-06-03T19:00:00Z",
+            },
+        }
+    )
+    end_time = datetime(2026, 6, 3, 14, 30, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["source"] == "antigravity_retrieve_user_quota"
+    assert observation["provider"] == "antigravity"
+    assert observation["client_family"] == "antigravity_code_assist"
+    assert observation["model"] is None
+    assert observation["limit_scope"] == "vertex_pool"
+    assert observation["quota_period"] == "five_hour"
+    assert observation["window_minutes"] == 300
+    assert observation["used_percentage"] == pytest.approx(75.0)
+
+
 def test_build_rate_limit_observations_keeps_google_capacity_distinct_from_quota() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gemini/gemini-3.1-pro-preview"
@@ -10343,6 +10472,62 @@ def test_build_session_history_record_uses_gemini_signature_fallback_when_usage_
     assert record["reasoning_tokens_reported"] == 1
     assert record["reasoning_tokens_source"] == "provider_signature_present"
     assert record["reasoning_present"] is True
+
+
+def test_build_session_history_record_preserves_antigravity_provider_over_google_api_base() -> None:
+    kwargs = _base_kwargs("orchestrator")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-antigravity-1",
+            "passthrough_route_family": "antigravity_code_assist",
+            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            "aawm_stream_logging_custom_llm_provider": "antigravity",
+            "usage_object": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 13,
+            },
+        }
+    )
+    kwargs["standard_logging_object"]["metadata"] = dict(
+        kwargs["litellm_params"]["metadata"]
+    )
+    kwargs["standard_logging_object"]["api_base"] = (
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+    )
+    kwargs["custom_llm_provider"] = "antigravity"
+    kwargs["model"] = "gemini-3.1-pro-low"
+    result = {
+        "id": "provider-response-antigravity-1",
+        "model": "gemini-3.1-pro-low",
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "antigravity result",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-03T12:35:20Z",
+        end_time="2026-06-03T12:35:22Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "antigravity"
+    assert record["model"] == "gemini-3.1-pro-low"
+    assert record["input_tokens"] == 10
+    assert record["output_tokens"] == 3
+    assert record["total_tokens"] == 13
 
 
 def test_derive_langfuse_trace_tags_from_langfuse_trace_merges_observation_metadata() -> None:

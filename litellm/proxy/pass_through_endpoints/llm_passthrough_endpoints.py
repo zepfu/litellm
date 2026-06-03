@@ -18,7 +18,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import lru_cache
 from importlib.resources import files
@@ -126,6 +126,45 @@ _GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST = frozenset(
         "content-type",
         "user-agent",
         "x-goog-api-client",
+    }
+)
+
+_ANTIGRAVITY_CODE_ASSIST_DEFAULT_BASE_URL = "https://daily-cloudcode-pa.googleapis.com"
+_ANTIGRAVITY_CLIENT_HEADER_DEFAULT = "antigravity-cli/1.0.4"
+_ANTIGRAVITY_AUTH_FILE_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_AUTH_FILE",
+    "ANTIGRAVITY_OAUTH_TOKEN_FILE",
+)
+_ANTIGRAVITY_DEFAULT_AUTH_PATHS = (
+    "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token",
+    "~/.gemini/antigravity-cli/antigravity-oauth-token",
+)
+_ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+    "ANTIGRAVITY_OAUTH_CLIENT_ID",
+)
+_ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+    "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+)
+_ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_CLI_PATH",
+    "ANTIGRAVITY_CLI_PATH",
+)
+_ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS = (
+    "/home/zepfu/.local/bin/agy",
+    "~/.local/bin/agy",
+)
+_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST = frozenset(
+    {
+        "accept",
+        "authorization",
+        "content-type",
+        "user-agent",
+        "x-goog-api-client",
+        "x-goog-fieldmask",
+        "x-goog-request-params",
+        "x-goog-request-reason",
     }
 )
 
@@ -532,6 +571,30 @@ _CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES = (
     "gemini-3.1",
     "gemini-3-flash-preview",
 )
+_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER = "antigravity"
+_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "chat_20706",
+        "chat_23310",
+        "claude-opus-4-6-thinking",
+        "claude-sonnet-4-6",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash-thinking",
+        "gemini-2.5-pro",
+        "gemini-3-flash",
+        "gemini-3-flash-agent",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-pro-high",
+        "gemini-3.1-pro-low",
+        "gemini-3.5-flash-extra-low",
+        "gemini-3.5-flash-low",
+        "gemini-pro-agent",
+        "gpt-oss-120b-medium",
+        "tab_flash_lite_preview",
+        "tab_jump_flash_lite_preview",
+    }
+)
 _CODEX_GOOGLE_CODE_ASSIST_DEFAULT_MAX_TOKENS = 8192
 _CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE = 2048
 _codex_google_code_assist_tool_call_name_cache: dict[str, str] = {}
@@ -609,6 +672,12 @@ _ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN = re.compile(
 )
 _ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN = re.compile(
     r'OAUTH_CLIENT_SECRET\s*=\s*"(?P<value>[^"]+)"'
+)
+_ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN = re.compile(
+    r"(?P<value>[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com)"
+)
+_ANTIGRAVITY_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN = re.compile(
+    r"(?P<value>GOCSPX-[A-Za-z0-9_-]+)"
 )
 _CLAUDE_AGENT_SPEC_DIR_ENV_VARS = (
     "LITELLM_CLAUDE_AGENTS_DIR",
@@ -723,6 +792,8 @@ _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
 _claude_agent_model_cache: dict[Path, tuple[Optional[int], Optional[str]]] = {}
 _google_oauth_access_token_cache: dict[str, tuple[str, int]] = {}
 _google_oauth_access_token_lock = asyncio.Lock()
+_antigravity_oauth_access_token_cache: dict[str, tuple[str, int]] = {}
+_antigravity_oauth_access_token_lock = asyncio.Lock()
 _google_code_assist_project_cache: dict[str, str] = {}
 _google_code_assist_project_lock = asyncio.Lock()
 _google_code_assist_prime_until_monotonic_by_key: dict[str, float] = {}
@@ -1073,12 +1144,16 @@ def _split_anthropic_adapter_provider_prefix(model: Any) -> tuple[Optional[str],
 
     prefix, remainder = normalized_model.split("/", 1)
     provider = {
+        "agy": "antigravity",
         "chatgpt": "openai",
         "gemini": "google",
+        "google-antigravity": "antigravity",
         "nvidia_nim": "nvidia",
     }.get(
         prefix,
-        prefix if prefix in ("openai", "google", "openrouter", "nvidia") else None,
+        prefix
+        if prefix in ("openai", "google", "openrouter", "nvidia", "antigravity")
+        else None,
     )
     if provider is None:
         return None, normalized_model
@@ -1186,6 +1261,22 @@ def _normalize_anthropic_google_completion_adapter_model_name(
     return None
 
 
+def _normalize_antigravity_code_assist_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider not in {
+        "antigravity",
+        "agy",
+        "google-antigravity",
+    } or candidate is None:
+        return None
+    normalized_candidate = candidate.strip()
+    if normalized_candidate in _ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS:
+        return normalized_candidate
+    return None
+
+
 def _normalize_codex_google_code_assist_adapter_model_name(
     model: Any,
 ) -> Optional[str]:
@@ -1220,6 +1311,16 @@ def _normalize_codex_google_code_assist_adapter_model_name(
     return None
 
 
+def _resolve_anthropic_antigravity_code_assist_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    _ = endpoint
+    return _normalize_antigravity_code_assist_adapter_model_name(
+        request_body.get("model")
+    )
+
+
 def _resolve_codex_google_code_assist_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
@@ -1227,6 +1328,17 @@ def _resolve_codex_google_code_assist_adapter_model(
     if not _is_openai_responses_endpoint(endpoint):
         return None
     return _normalize_codex_google_code_assist_adapter_model_name(
+        request_body.get("model")
+    )
+
+
+def _resolve_codex_antigravity_code_assist_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    return _normalize_antigravity_code_assist_adapter_model_name(
         request_body.get("model")
     )
 
@@ -2740,10 +2852,39 @@ def _resolve_google_adapter_user_prompt_id(
     return str(uuid5(NAMESPACE_URL, seed))
 
 
+def _build_code_assist_adapter_native_headers(
+    *,
+    adapter_provider: str,
+    access_token: str,
+    model: Optional[str],
+    accept: str,
+) -> dict[str, str]:
+    if adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER:
+        headers = _build_antigravity_native_headers(access_token)
+        headers["Accept"] = accept
+        return headers
+    return _build_google_adapter_native_headers(
+        access_token=access_token,
+        model=model,
+        accept=accept,
+    )
+
+
+def _get_code_assist_adapter_target_base(adapter_provider: str) -> str:
+    if adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER:
+        return _get_antigravity_passthrough_target_base()
+    return _get_anthropic_adapter_google_target_base()
+
+
 async def _get_or_load_google_code_assist_project(
     access_token: str,
+    *,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
 ) -> str:
-    cache_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    target_base = _get_code_assist_adapter_target_base(adapter_provider)
+    cache_key = hashlib.sha256(
+        f"{adapter_provider}:{target_base}:{access_token}".encode("utf-8")
+    ).hexdigest()
     cached_project = _google_code_assist_project_cache.get(cache_key)
     if isinstance(cached_project, str) and cached_project:
         return cached_project
@@ -2753,7 +2894,6 @@ async def _get_or_load_google_code_assist_project(
         if isinstance(cached_project, str) and cached_project:
             return cached_project
 
-        target_base = _get_anthropic_adapter_google_target_base()
         load_url = f"{target_base.rstrip('/')}/v1internal:loadCodeAssist"
         request_body = {
             "metadata": {
@@ -2762,7 +2902,8 @@ async def _get_or_load_google_code_assist_project(
                 "pluginType": "GEMINI",
             },
         }
-        headers = _build_google_adapter_native_headers(
+        headers = _build_code_assist_adapter_native_headers(
+            adapter_provider=adapter_provider,
             access_token=access_token,
             model=None,
             accept="application/json",
@@ -2783,13 +2924,16 @@ async def _get_or_load_google_code_assist_project(
             response_body = None
         capture_passthrough_shape(
             mode="google_code_assist_loadCodeAssist",
-            provider=litellm.LlmProviders.GEMINI.value,
+            provider=adapter_provider,
             url_route=load_url,
             request_body=request_body,
             response=response,
             response_body=response_body,
             response_content=response.content,
-            extra_metadata={"direct_google_code_assist_preflight": True},
+            extra_metadata={
+                "direct_google_code_assist_preflight": True,
+                "code_assist_adapter_provider": adapter_provider,
+            },
         )
         if response.status_code != 200:
             raise HTTPException(
@@ -3542,7 +3686,32 @@ def _apply_google_adapter_request_shape_policy(payload: dict[str, Any]) -> dict[
 
     max_output_tokens = generation_config.get("max_output_tokens")
     cap = _get_google_adapter_max_output_tokens_cap()
-    if isinstance(max_output_tokens, int) and cap is not None and max_output_tokens > cap:
+    thinking_config = generation_config.get("thinkingConfig")
+    thinking_budget = (
+        thinking_config.get("thinkingBudget")
+        if isinstance(thinking_config, dict)
+        else None
+    )
+    should_preserve_max_output_for_thinking = (
+        isinstance(max_output_tokens, int)
+        and not isinstance(max_output_tokens, bool)
+        and isinstance(thinking_budget, int)
+        and not isinstance(thinking_budget, bool)
+        and thinking_budget > 0
+        and max_output_tokens > thinking_budget
+    )
+    if (
+        isinstance(max_output_tokens, int)
+        and cap is not None
+        and max_output_tokens > cap
+        and should_preserve_max_output_for_thinking
+    ):
+        changes["preserved_oversized_max_output_tokens_for_thinking_budget"] = (
+            max_output_tokens
+        )
+        changes["preserved_oversized_thinking_budget"] = thinking_budget
+        changes["preserved_oversized_max_output_tokens_cap"] = cap
+    elif isinstance(max_output_tokens, int) and cap is not None and max_output_tokens > cap:
         generation_config.pop("max_output_tokens", None)
         changes["removed_oversized_max_output_tokens_from"] = max_output_tokens
         changes["removed_oversized_max_output_tokens_cap"] = cap
@@ -4498,10 +4667,17 @@ async def _perform_openrouter_adapter_pass_through_request(
 async def _prime_google_code_assist_session(
     access_token: str,
     companion_project: str,
+    *,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
 ) -> Optional[dict[str, Any]]:
     ttl_seconds = _get_google_code_assist_prime_ttl_seconds()
+    prime_access_token_key = (
+        f"{adapter_provider}:{access_token}"
+        if adapter_provider != litellm.LlmProviders.GEMINI.value
+        else access_token
+    )
     cache_key = _get_google_code_assist_prime_cache_key(
-        access_token,
+        prime_access_token_key,
         companion_project,
     )
     async with _google_code_assist_prime_lock:
@@ -4517,11 +4693,13 @@ async def _prime_google_code_assist_session(
                     )
                 return _google_code_assist_prime_quota_by_key.get(cache_key)
 
-        target_base = _get_anthropic_adapter_google_target_base().rstrip("/")
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        }
+        target_base = _get_code_assist_adapter_target_base(adapter_provider).rstrip("/")
+        headers = _build_code_assist_adapter_native_headers(
+            adapter_provider=adapter_provider,
+            access_token=access_token,
+            model=None,
+            accept="application/json",
+        )
         metadata = {
             "ideType": "IDE_UNSPECIFIED",
             "platform": "PLATFORM_UNSPECIFIED",
@@ -4562,7 +4740,7 @@ async def _prime_google_code_assist_session(
                     response_body = None
                 capture_passthrough_shape(
                     mode="google_code_assist_preflight",
-                    provider=litellm.LlmProviders.GEMINI.value,
+                    provider=adapter_provider,
                     url_route=url,
                     request_body=body,
                     response=response,
@@ -4570,13 +4748,20 @@ async def _prime_google_code_assist_session(
                     response_content=response.content,
                     extra_metadata={
                         "direct_google_code_assist_preflight": True,
+                        "code_assist_adapter_provider": adapter_provider,
                         "preflight_endpoint": url.rsplit(":", 1)[-1],
                     },
                 )
                 if "retrieveUserQuota" not in url:
                     continue
+                quota_source = (
+                    "antigravity_retrieve_user_quota"
+                    if adapter_provider == "antigravity"
+                    else "google_retrieve_user_quota"
+                )
                 sanitized_quota_response = _sanitize_google_code_assist_quota_for_logging(
-                    response_body
+                    response_body,
+                    source=quota_source,
                 )
         if ttl_seconds > 0:
             _google_code_assist_prime_until_monotonic_by_key[cache_key] = (
@@ -4635,6 +4820,143 @@ def _sanitize_google_schema_array_items(schema_node: Any) -> int:
     elif isinstance(schema_node, list):
         for item in schema_node:
             fix_count += _sanitize_google_schema_array_items(item)
+    return fix_count
+
+
+def _merge_google_code_assist_schema_annotations(
+    source: dict[str, Any],
+    target: dict[str, Any],
+) -> None:
+    for key in ("description", "title", "default"):
+        if key in source and key not in target:
+            target[key] = copy.deepcopy(source[key])
+
+
+def _simplify_google_code_assist_union_schema(schema_node: dict[str, Any]) -> int:
+    fix_count = 0
+    for union_key in ("anyOf", "oneOf", "allOf"):
+        variants = schema_node.get(union_key)
+        if not isinstance(variants, list):
+            continue
+        dict_variants = [variant for variant in variants if isinstance(variant, dict)]
+        if not dict_variants:
+            schema_node.pop(union_key, None)
+            fix_count += 1
+            continue
+
+        nullable = any(variant.get("type") == "null" for variant in dict_variants)
+        non_null_variants = [
+            variant for variant in dict_variants if variant.get("type") != "null"
+        ]
+        if len(non_null_variants) == 1:
+            replacement = copy.deepcopy(non_null_variants[0])
+            _merge_google_code_assist_schema_annotations(schema_node, replacement)
+            if nullable:
+                replacement["nullable"] = True
+            schema_node.clear()
+            schema_node.update(replacement)
+            fix_count += 1
+            continue
+
+        string_variant = next(
+            (
+                variant
+                for variant in non_null_variants
+                if variant.get("type") == "string"
+            ),
+            None,
+        )
+        if string_variant is not None:
+            replacement = {
+                key: copy.deepcopy(value)
+                for key, value in string_variant.items()
+                if key in {"type", "description", "title", "enum", "default"}
+            }
+            replacement.setdefault("type", "string")
+            _merge_google_code_assist_schema_annotations(schema_node, replacement)
+            if nullable:
+                replacement["nullable"] = True
+            schema_node.clear()
+            schema_node.update(replacement)
+            fix_count += 1
+            continue
+
+        object_variants = [
+            variant
+            for variant in non_null_variants
+            if variant.get("type") == "object"
+            and isinstance(variant.get("properties"), dict)
+        ]
+        if object_variants:
+            merged_properties: dict[str, Any] = {}
+            for variant in object_variants:
+                merged_properties.update(copy.deepcopy(variant.get("properties") or {}))
+            replacement = {
+                "type": "object",
+                "properties": merged_properties,
+            }
+            _merge_google_code_assist_schema_annotations(schema_node, replacement)
+            if nullable:
+                replacement["nullable"] = True
+            schema_node.clear()
+            schema_node.update(replacement)
+            fix_count += 1
+            continue
+
+        typed_variant = next(
+            (
+                variant
+                for variant in non_null_variants
+                if isinstance(variant.get("type"), str)
+            ),
+            None,
+        )
+        if typed_variant is not None:
+            replacement = copy.deepcopy(typed_variant)
+            _merge_google_code_assist_schema_annotations(schema_node, replacement)
+            if nullable:
+                replacement["nullable"] = True
+            schema_node.clear()
+            schema_node.update(replacement)
+            fix_count += 1
+            continue
+
+        schema_node.pop(union_key, None)
+        schema_node.setdefault("type", "object")
+        schema_node.setdefault("properties", {})
+        fix_count += 1
+    return fix_count
+
+
+def _sanitize_google_code_assist_union_schemas(schema_node: Any) -> int:
+    fix_count = 0
+    if isinstance(schema_node, dict):
+        fix_count += _simplify_google_code_assist_union_schema(schema_node)
+        for value in list(schema_node.values()):
+            fix_count += _sanitize_google_code_assist_union_schemas(value)
+    elif isinstance(schema_node, list):
+        for item in schema_node:
+            fix_count += _sanitize_google_code_assist_union_schemas(item)
+    return fix_count
+
+
+def _sanitize_google_code_assist_tool_schema(schema_node: Any) -> int:
+    fix_count = 0
+    if not isinstance(schema_node, dict):
+        return fix_count
+
+    fix_count += _sanitize_google_code_assist_union_schemas(schema_node)
+    if schema_node.get("type") is None:
+        schema_node["type"] = "object"
+        fix_count += 1
+    if schema_node.get("type") == "object" and not isinstance(
+        schema_node.get("properties"), dict
+    ):
+        schema_node["properties"] = {}
+        fix_count += 1
+
+    fix_count += _sanitize_google_schema_array_items(schema_node)
+    fix_count += _sanitize_openai_object_schema_properties(schema_node)
     return fix_count
 
 
@@ -5094,6 +5416,36 @@ def _normalize_codex_google_code_assist_reasoning_effort(
     }
 
 
+def _normalize_google_code_assist_thinking_max_tokens(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    thinking = completion_kwargs.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+        return completion_kwargs, {}
+
+    budget_tokens = thinking.get("budget_tokens")
+    max_tokens = completion_kwargs.get("max_tokens")
+    if (
+        not isinstance(budget_tokens, int)
+        or isinstance(budget_tokens, bool)
+        or budget_tokens <= 0
+        or not isinstance(max_tokens, int)
+        or isinstance(max_tokens, bool)
+        or max_tokens > budget_tokens
+    ):
+        return completion_kwargs, {}
+
+    normalized_max_tokens = budget_tokens + 1024
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["max_tokens"] = normalized_max_tokens
+    return updated_kwargs, {
+        "google_adapter_thinking_max_tokens_normalized": True,
+        "google_adapter_thinking_budget_tokens": budget_tokens,
+        "google_adapter_thinking_original_max_tokens": max_tokens,
+        "google_adapter_thinking_normalized_max_tokens": normalized_max_tokens,
+    }
+
+
 def _remember_codex_google_code_assist_tool_call_name(
     tool_call_id: Any,
     function_name: Any,
@@ -5391,6 +5743,9 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         )
         openai_chat_shape_changes = {}
         codex_tool_pair_changes = {}
+    completion_kwargs, thinking_max_tokens_changes = _normalize_google_code_assist_thinking_max_tokens(
+        completion_kwargs
+    )
     completion_kwargs, system_prompt_policy_changes = _apply_google_adapter_system_prompt_policy(
         completion_kwargs
     )
@@ -5515,6 +5870,7 @@ async def _build_google_code_assist_request_from_completion_kwargs(
         **openai_chat_shape_changes,
         **codex_tool_pair_changes,
         **reasoning_effort_policy_changes,
+        **thinking_max_tokens_changes,
         **native_tool_alias_changes,
         **duplicate_tool_response_changes,
         **system_prompt_policy_changes,
@@ -5604,27 +5960,51 @@ async def _prepare_codex_google_code_assist_adapter_request(
     request: Request,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
 ) -> SimpleNamespace:
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
 
-    google_access_token = await _load_valid_local_google_oauth_access_token()
-    google_project = await _get_or_load_google_code_assist_project(google_access_token)
+    google_access_token = (
+        await _load_valid_local_antigravity_access_token()
+        if adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
+        else await _load_valid_local_google_oauth_access_token()
+    )
+    google_project = await _get_or_load_google_code_assist_project(
+        google_access_token,
+        adapter_provider=adapter_provider,
+    )
     google_quota_observation = await _prime_google_code_assist_session(
         google_access_token,
         google_project,
+        adapter_provider=adapter_provider,
     )
 
-    route_family = "codex_google_code_assist_adapter"
+    is_antigravity_adapter = (
+        adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
+    )
+    route_family = (
+        "codex_antigravity_code_assist_adapter"
+        if is_antigravity_adapter
+        else "codex_google_code_assist_adapter"
+    )
+    adapter_tag = (
+        "codex-antigravity-code-assist-adapter"
+        if is_antigravity_adapter
+        else "codex-google-code-assist-adapter"
+    )
+    target_provider_label = "antigravity" if is_antigravity_adapter else "google"
     requested_model = prepared_request_body.get("model")
-    google_target_base = _get_anthropic_adapter_google_target_base()
+    google_target_base = _get_code_assist_adapter_target_base(adapter_provider)
     google_model = _normalize_google_completion_adapter_model_name(adapter_model)
     google_adapter_rate_limit_key = _get_google_adapter_rate_limit_key(
         google_model,
         access_token=google_access_token,
         companion_project=google_project,
     )
+    if is_antigravity_adapter:
+        google_adapter_rate_limit_key = f"antigravity:{google_adapter_rate_limit_key}"
     client_requested_stream = bool(prepared_request_body.get("stream"))
     target_endpoint_label = "/v1internal:streamGenerateContent"
     target_query_params = {"alt": "sse"}
@@ -5637,16 +6017,24 @@ async def _prepare_codex_google_code_assist_adapter_request(
     prepared_request_body = _merge_litellm_metadata(
         _add_route_family_logging_metadata(prepared_request_body, route_family),
         tags_to_add=[
-            "codex-google-code-assist-adapter",
+            adapter_tag,
             f"codex-adapter-model:{google_model}",
-            f"codex-adapter-target:google:{target_endpoint_label}",
+            f"codex-adapter-target:{target_provider_label}:{target_endpoint_label}",
         ],
         extra_fields={
             "codex_adapter_model": google_model,
             "codex_adapter_original_model": requested_model,
-            "codex_adapter_target_endpoint": f"google:{target_endpoint_label}",
+            "codex_adapter_provider": adapter_provider,
+            "codex_adapter_target_endpoint": (
+                f"{target_provider_label}:{target_endpoint_label}"
+            ),
             "codex_adapter_input_shape": "openai_responses",
             "codex_adapter_output_shape": "openai_responses",
+            **(
+                {"antigravity_code_assist": True}
+                if is_antigravity_adapter
+                else {}
+            ),
             **(
                 {"google_retrieve_user_quota": google_quota_observation}
                 if google_quota_observation
@@ -5654,10 +6042,15 @@ async def _prepare_codex_google_code_assist_adapter_request(
             ),
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
-                    name="codex.google_code_assist_adapter",
+                    name=(
+                        "codex.antigravity_code_assist_adapter"
+                        if is_antigravity_adapter
+                        else "codex.google_code_assist_adapter"
+                    ),
                     metadata={
                         "requested_model": requested_model,
                         "adapter_model": google_model,
+                        "adapter_provider": adapter_provider,
                         "stream": client_requested_stream,
                         "upstream_stream": True,
                     },
@@ -5698,7 +6091,8 @@ async def _prepare_codex_google_code_assist_adapter_request(
     generation_policy_changes = _apply_google_adapter_request_shape_policy(
         wrapped_request_body
     )
-    adapter_headers = _build_google_adapter_native_headers(
+    adapter_headers = _build_code_assist_adapter_native_headers(
+        adapter_provider=adapter_provider,
         access_token=google_access_token,
         model=google_model,
         accept="*/*",
@@ -5737,6 +6131,7 @@ async def _prepare_codex_google_code_assist_adapter_request(
         is_stream=True,
         litellm_metadata=dict(wrapped_request_body.get("litellm_metadata") or {}),
         litellm_params=litellm_params,
+        custom_llm_provider=adapter_provider,
         responses_api_request=responses_api_request,
         target_query_params=target_query_params,
         target_url=target_url,
@@ -8721,10 +9116,16 @@ def _sanitize_google_code_assist_request_schemas(wrapped_request_body: Any) -> i
         if not isinstance(decls, list):
             continue
         for declaration in decls:
-            if isinstance(declaration, dict):
-                sanitized_schema_fix_count += _sanitize_google_schema_array_items(
-                    declaration.get("parameters")
-                )
+            if not isinstance(declaration, dict):
+                continue
+            parameters = declaration.get("parameters")
+            if not isinstance(parameters, dict):
+                parameters = {"type": "object", "properties": {}}
+                declaration["parameters"] = parameters
+                sanitized_schema_fix_count += 1
+            sanitized_schema_fix_count += _sanitize_google_code_assist_tool_schema(
+                parameters
+            )
     return sanitized_schema_fix_count
 
 
@@ -8783,23 +9184,47 @@ async def _prepare_anthropic_google_completion_adapter_request(
     request: Request,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
 ) -> SimpleNamespace:
-    google_access_token = await _load_valid_local_google_oauth_access_token()
-    google_project = await _get_or_load_google_code_assist_project(google_access_token)
+    google_access_token = (
+        await _load_valid_local_antigravity_access_token()
+        if adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
+        else await _load_valid_local_google_oauth_access_token()
+    )
+    google_project = await _get_or_load_google_code_assist_project(
+        google_access_token,
+        adapter_provider=adapter_provider,
+    )
     google_quota_observation = await _prime_google_code_assist_session(
         google_access_token,
         google_project,
+        adapter_provider=adapter_provider,
     )
 
-    route_family = "anthropic_google_completion_adapter"
+    is_antigravity_adapter = (
+        adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
+    )
+    route_family = (
+        "anthropic_antigravity_completion_adapter"
+        if is_antigravity_adapter
+        else "anthropic_google_completion_adapter"
+    )
+    adapter_tag = (
+        "anthropic-antigravity-completion-adapter"
+        if is_antigravity_adapter
+        else "anthropic-google-completion-adapter"
+    )
+    target_provider_label = "antigravity" if is_antigravity_adapter else "google"
     requested_model = prepared_request_body.get("model")
-    google_target_base = _get_anthropic_adapter_google_target_base()
+    google_target_base = _get_code_assist_adapter_target_base(adapter_provider)
     google_model = _normalize_google_completion_adapter_model_name(adapter_model)
     google_adapter_rate_limit_key = _get_google_adapter_rate_limit_key(
         google_model,
         access_token=google_access_token,
         companion_project=google_project,
     )
+    if is_antigravity_adapter:
+        google_adapter_rate_limit_key = f"antigravity:{google_adapter_rate_limit_key}"
     client_requested_stream = bool(prepared_request_body.get("stream"))
     is_stream = True
     target_endpoint_label = "/v1internal:streamGenerateContent"
@@ -8823,9 +9248,9 @@ async def _prepare_anthropic_google_completion_adapter_request(
     prepared_request_body = _merge_litellm_metadata(
         _add_route_family_logging_metadata(prepared_request_body, route_family),
         tags_to_add=[
-            "anthropic-google-completion-adapter",
+            adapter_tag,
             f"anthropic-adapter-model:{google_model}",
-            f"anthropic-adapter-target:google:{target_endpoint_label}",
+            f"anthropic-adapter-target:{target_provider_label}:{target_endpoint_label}",
             *([
                 "google-adapter-persisted-output-compacted",
                 *[
@@ -8838,7 +9263,15 @@ async def _prepare_anthropic_google_completion_adapter_request(
         extra_fields={
             "anthropic_adapter_model": google_model,
             "anthropic_adapter_original_model": requested_model,
-            "anthropic_adapter_target_endpoint": f"google:{target_endpoint_label}",
+            "anthropic_adapter_provider": adapter_provider,
+            "anthropic_adapter_target_endpoint": (
+                f"{target_provider_label}:{target_endpoint_label}"
+            ),
+            **(
+                {"antigravity_code_assist": True}
+                if is_antigravity_adapter
+                else {}
+            ),
             "google_adapter_persisted_output_compacted": bool(
                 google_persisted_output_compacted_count
             ),
@@ -8852,10 +9285,15 @@ async def _prepare_anthropic_google_completion_adapter_request(
             ),
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
-                    name="anthropic.google_completion_adapter",
+                    name=(
+                        "anthropic.antigravity_completion_adapter"
+                        if is_antigravity_adapter
+                        else "anthropic.google_completion_adapter"
+                    ),
                     metadata={
                         "requested_model": requested_model,
                         "adapter_model": google_model,
+                        "adapter_provider": adapter_provider,
                         "stream": client_requested_stream,
                         "upstream_stream": True,
                         "persisted_output_compacted_count": google_persisted_output_compacted_count,
@@ -8879,7 +9317,8 @@ async def _prepare_anthropic_google_completion_adapter_request(
 
     generation_policy_changes = _apply_google_adapter_request_shape_policy(wrapped_request_body)
 
-    adapter_headers = _build_google_adapter_native_headers(
+    adapter_headers = _build_code_assist_adapter_native_headers(
+        adapter_provider=adapter_provider,
         access_token=google_access_token,
         model=google_model,
         accept="*/*",
@@ -8912,6 +9351,7 @@ async def _prepare_anthropic_google_completion_adapter_request(
         google_model=google_model,
         is_stream=is_stream,
         litellm_params=litellm_params,
+        custom_llm_provider=adapter_provider,
         target_query_params=target_query_params,
         target_url=target_url,
         tool_name_mapping=tool_name_mapping,
@@ -8979,7 +9419,7 @@ async def _perform_anthropic_google_completion_adapter_request(
             forward_headers=False,
             query_params=adapter_request.target_query_params,
             stream=adapter_request.is_stream,
-            custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+            custom_llm_provider=adapter_request.custom_llm_provider,
             egress_credential_family="google",
             expected_target_family="google",
             google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
@@ -9050,12 +9490,14 @@ async def _handle_anthropic_google_completion_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
     use_alias_candidate_probe: bool = False,
 ) -> Response:
     adapter_request = await _prepare_anthropic_google_completion_adapter_request(
         request=request,
         prepared_request_body=prepared_request_body,
         adapter_model=adapter_model,
+        adapter_provider=adapter_provider,
     )
     return await _perform_anthropic_google_completion_adapter_request(
         request=request,
@@ -9104,7 +9546,7 @@ async def _perform_codex_google_code_assist_adapter_request(
             forward_headers=False,
             query_params=adapter_request.target_query_params,
             stream=adapter_request.is_stream,
-            custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+            custom_llm_provider=adapter_request.custom_llm_provider,
             egress_credential_family="google",
             expected_target_family="google",
             google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
@@ -9204,12 +9646,14 @@ async def _handle_codex_google_code_assist_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
     use_alias_candidate_probe: bool = False,
 ) -> Response:
     adapter_request = await _prepare_codex_google_code_assist_adapter_request(
         request=request,
         prepared_request_body=prepared_request_body,
         adapter_model=adapter_model,
+        adapter_provider=adapter_provider,
     )
     return await _perform_codex_google_code_assist_adapter_request(
         request=request,
@@ -13690,6 +14134,386 @@ def _get_gemini_passthrough_target_base(
     return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
 
 
+def _get_antigravity_auth_file_path() -> Optional[Path]:
+    for env_name in _ANTIGRAVITY_AUTH_FILE_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if not raw_value:
+            continue
+        path = Path(raw_value).expanduser()
+        if path.exists():
+            return path
+
+    for candidate_str in _ANTIGRAVITY_DEFAULT_AUTH_PATHS:
+        candidate = Path(candidate_str).expanduser()
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+async def _load_local_antigravity_oauth_token_data() -> tuple[dict[str, Any], Path]:
+    auth_path = _get_antigravity_auth_file_path()
+    if auth_path is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Antigravity passthrough requires local OAuth token data at "
+                "'~/.gemini/antigravity-cli/antigravity-oauth-token' or "
+                "'LITELLM_ANTIGRAVITY_AUTH_FILE'."
+            ),
+        )
+
+    try:
+        token_data = json.loads(auth_path.read_text())
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read Antigravity OAuth token data from {auth_path}: {exc}",
+        ) from exc
+
+    if not isinstance(token_data, dict):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Antigravity OAuth token data at {auth_path} is not a JSON object.",
+        )
+
+    return token_data, auth_path
+
+
+def _parse_antigravity_token_expiry(expiry: Any) -> Optional[datetime]:
+    if not isinstance(expiry, str) or not expiry.strip():
+        return None
+    cleaned = expiry.strip()
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _antigravity_access_token_is_valid(token_data: dict[str, Any]) -> bool:
+    token_block = token_data.get("token")
+    if not isinstance(token_block, dict):
+        return False
+    access_token = _clean_codex_auth_value(token_block.get("access_token"))
+    if access_token is None:
+        return False
+    expiry = _parse_antigravity_token_expiry(token_block.get("expiry"))
+    if expiry is None:
+        return True
+    return expiry > datetime.now(timezone.utc) + timedelta(seconds=60)
+
+
+def _antigravity_oauth_cached_token_is_valid(cached_token: tuple[str, int]) -> bool:
+    _access_token, expiry_date = cached_token
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return expiry_date > now_ms + 60_000
+
+
+def _get_antigravity_oauth_expiry_date(token_data: dict[str, Any]) -> Optional[int]:
+    token_block = token_data.get("token")
+    if not isinstance(token_block, dict):
+        return None
+    expiry = _parse_antigravity_token_expiry(token_block.get("expiry"))
+    if expiry is None:
+        return None
+    return int(expiry.timestamp() * 1000)
+
+
+def _iter_antigravity_cli_binary_candidates() -> list[Path]:
+    candidate_files: list[Path] = []
+    seen_paths: set[str] = set()
+    for env_name in _ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if not raw_value:
+            continue
+        candidate = Path(raw_value).expanduser()
+        if candidate.is_file():
+            resolved = str(candidate.resolve())
+            if resolved not in seen_paths:
+                seen_paths.add(resolved)
+                candidate_files.append(candidate)
+
+    for candidate_str in _ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS:
+        candidate = Path(candidate_str).expanduser()
+        if not candidate.is_file():
+            continue
+        resolved = str(candidate.resolve())
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        candidate_files.append(candidate)
+    return candidate_files
+
+
+def _extract_antigravity_oauth_client_values_from_cli_text(
+    cli_text: str,
+) -> tuple[Optional[str], Optional[str]]:
+    client_secret_matches = list(
+        _ANTIGRAVITY_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN.finditer(cli_text)
+    )
+    client_id_matches = list(
+        _ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN.finditer(cli_text)
+    )
+    if not client_secret_matches or not client_id_matches:
+        return None, None
+
+    client_secret_match = client_secret_matches[0]
+    client_id_match = min(
+        client_id_matches,
+        key=lambda match: abs(match.start() - client_secret_match.start()),
+    )
+    return (
+        _clean_codex_auth_value(client_id_match.group("value")),
+        _clean_codex_auth_value(client_secret_match.group("value")),
+    )
+
+
+def _load_antigravity_oauth_client_values_from_local_cli_binary(
+) -> tuple[Optional[str], Optional[str]]:
+    for candidate in _iter_antigravity_cli_binary_candidates():
+        try:
+            cli_text = candidate.read_bytes().decode("latin1", errors="ignore")
+        except OSError:
+            continue
+        client_id, client_secret = _extract_antigravity_oauth_client_values_from_cli_text(
+            cli_text
+        )
+        if client_id and client_secret:
+            return client_id, client_secret
+    return None, None
+
+
+async def _refresh_local_antigravity_oauth_token_data(
+    token_data: dict[str, Any],
+) -> dict[str, Any]:
+    token_block = token_data.get("token")
+    if not isinstance(token_block, dict):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Antigravity OAuth token data does not contain a token object."
+            ),
+        )
+    refresh_token = _clean_codex_auth_value(token_block.get("refresh_token"))
+    if refresh_token is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Antigravity OAuth token data does not contain a refresh_token. "
+                "Re-authenticate Antigravity CLI before using Antigravity passthrough."
+            ),
+        )
+
+    client_id = _get_google_oauth_client_value(
+        token_data,
+        ("client_id", "clientId"),
+        _ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS,
+    )
+    client_secret = _get_google_oauth_client_value(
+        token_data,
+        ("client_secret", "clientSecret"),
+        _ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS,
+    )
+    if client_id is None or client_secret is None:
+        (
+            binary_client_id,
+            binary_client_secret,
+        ) = _load_antigravity_oauth_client_values_from_local_cli_binary()
+        client_id = client_id or binary_client_id
+        client_secret = client_secret or binary_client_secret
+    if client_id is None or client_secret is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Antigravity OAuth token data does not contain client_id/client_secret "
+                "and no fallback env vars or Antigravity CLI binary values were found."
+            ),
+        )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            _ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to refresh Antigravity OAuth access token: "
+                f"{response.text}"
+            ),
+        )
+
+    refreshed = response.json()
+    expires_in = refreshed.get("expires_in")
+    expiry: Optional[datetime] = None
+    if isinstance(expires_in, (int, float)):
+        expiry = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+
+    updated_token_block = dict(token_block)
+    updated_token_block.update(refreshed)
+    updated_token_block["refresh_token"] = refresh_token
+    if expiry is not None:
+        updated_token_block["expiry"] = expiry.isoformat()
+
+    updated_token_data = dict(token_data)
+    updated_token_data["token"] = updated_token_block
+    return updated_token_data
+
+
+async def _load_valid_local_antigravity_access_token() -> str:
+    token_data, auth_path = await _load_local_antigravity_oauth_token_data()
+    cache_key = str(auth_path.expanduser())
+    cached_token = _antigravity_oauth_access_token_cache.get(cache_key)
+    if cached_token is not None and _antigravity_oauth_cached_token_is_valid(
+        cached_token
+    ):
+        return cached_token[0]
+
+    async with _antigravity_oauth_access_token_lock:
+        cached_token = _antigravity_oauth_access_token_cache.get(cache_key)
+        if cached_token is not None and _antigravity_oauth_cached_token_is_valid(
+            cached_token
+        ):
+            return cached_token[0]
+
+        token_data, auth_path = await _load_local_antigravity_oauth_token_data()
+        if not _antigravity_access_token_is_valid(token_data):
+            token_data = await _refresh_local_antigravity_oauth_token_data(token_data)
+
+    token_block = token_data.get("token")
+    if not isinstance(token_block, dict):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Antigravity OAuth token data at {auth_path} does not contain "
+                "a token object."
+            ),
+        )
+    access_token = _clean_codex_auth_value(token_block.get("access_token"))
+    if access_token is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Antigravity OAuth token data at {auth_path} does not contain "
+                "an access_token."
+            ),
+        )
+    expiry_date = _get_antigravity_oauth_expiry_date(token_data)
+    if expiry_date is not None:
+        _antigravity_oauth_access_token_cache[cache_key] = (access_token, expiry_date)
+    return access_token
+
+
+def _get_antigravity_passthrough_target_base() -> str:
+    return (
+        os.getenv("ANTIGRAVITY_CODE_ASSIST_ENDPOINT")
+        or os.getenv("ANTIGRAVITY_CLI_CODE_ASSIST_ENDPOINT")
+        or _ANTIGRAVITY_CODE_ASSIST_DEFAULT_BASE_URL
+    )
+
+
+def _get_antigravity_client_header() -> str:
+    return (
+        _clean_codex_auth_value(os.getenv("AAWM_ANTIGRAVITY_CLIENT_HEADER"))
+        or _ANTIGRAVITY_CLIENT_HEADER_DEFAULT
+    )
+
+
+def _build_antigravity_native_headers(access_token: str) -> dict[str, str]:
+    client_header = _get_antigravity_client_header()
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": client_header,
+        "x-goog-api-client": client_header,
+        "Accept": "application/json",
+    }
+
+
+def _request_has_google_oauth_bearer(request: Request) -> bool:
+    authorization = request.headers.get("authorization", "").strip()
+    return authorization.lower().startswith("bearer ya29.")
+
+
+def _get_antigravity_litellm_auth_header(request: Request) -> str:
+    header_key = request.headers.get("x-litellm-api-key")
+    if header_key:
+        return _format_litellm_passthrough_api_key(header_key)
+
+    query_key = request.query_params.get("key")
+    if query_key:
+        return _format_litellm_passthrough_api_key(query_key)
+
+    return request.headers.get("authorization", "")
+
+
+def _prepare_antigravity_request_body_for_passthrough(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    updated_body = _merge_litellm_metadata(
+        request_body,
+        tags_to_add=["antigravity-code-assist", "route:antigravity_code_assist"],
+        extra_fields={
+            "client_name": "antigravity-cli",
+            "antigravity_code_assist": True,
+            "passthrough_route_family": "antigravity_code_assist",
+        },
+    )
+    return _prepare_request_body_for_passthrough_observability(
+        request=request,
+        request_body=updated_body,
+    )
+
+
+def _get_antigravity_passthrough_logging_metadata(request: Request) -> dict[str, Any]:
+    logging_body = _prepare_antigravity_request_body_for_passthrough(
+        request=request,
+        request_body={},
+    )
+    litellm_metadata = logging_body.get("litellm_metadata")
+    if isinstance(litellm_metadata, dict):
+        return dict(litellm_metadata)
+    return {}
+
+
+def _normalize_antigravity_endpoint_for_target(endpoint: str) -> str:
+    normalized_endpoint = endpoint.split("?", 1)[0].lstrip("/")
+    if not normalized_endpoint:
+        return "/"
+    return f"/{normalized_endpoint}"
+
+
+def _join_antigravity_passthrough_url(base_target_url: str, endpoint: str) -> str:
+    endpoint_path = _normalize_antigravity_endpoint_for_target(endpoint)
+    base_url = httpx.URL(base_target_url)
+    base_path = base_url.path.rstrip("/")
+    if base_path:
+        endpoint_path = f"{base_path}/{endpoint_path.lstrip('/')}"
+    return str(base_url.copy_with(path=endpoint_path))
+
+
+def _is_antigravity_streaming_endpoint(endpoint: str, request: Request) -> bool:
+    normalized_endpoint = endpoint.lstrip("/")
+    return "streamGenerateContent" in normalized_endpoint or (
+        str(request.query_params.get("alt", "")).lower() == "sse"
+    )
+
+
 def _get_grok_passthrough_target_base() -> str:
     return (
         os.getenv("GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL")
@@ -14095,6 +14919,86 @@ async def gemini_proxy_route(
     )
 
     return received_value
+
+
+@router.api_route(
+    "/antigravity/{endpoint:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    tags=["Antigravity Code Assist Pass-through", "pass-through"],
+)
+async def antigravity_proxy_route(
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+):
+    """
+    Native Antigravity CLI pass-through for Google Code Assist.
+
+    Antigravity uses its own Google OAuth credential and Code Assist client
+    headers. LiteLLM auth should be supplied separately with
+    `x-litellm-api-key` or a `key` query parameter when preserving an inbound
+    Google OAuth Authorization header.
+    """
+    user_api_key_dict = await user_api_key_auth(
+        request=request,
+        api_key=_get_antigravity_litellm_auth_header(request),
+    )
+
+    has_google_oauth_bearer = _request_has_google_oauth_bearer(request)
+    custom_headers: dict[str, str]
+    if has_google_oauth_bearer:
+        custom_headers = {}
+    else:
+        custom_headers = _build_antigravity_native_headers(
+            await _load_valid_local_antigravity_access_token()
+        )
+
+    target_url = _join_antigravity_passthrough_url(
+        base_target_url=_get_antigravity_passthrough_target_base(),
+        endpoint=endpoint,
+    )
+    query_params = {
+        key: value
+        for key, value in dict(request.query_params).items()
+        if str(key).lower() != "key"
+    }
+
+    custom_body: Optional[dict[str, Any]] = None
+    passthrough_logging_metadata = _get_antigravity_passthrough_logging_metadata(
+        request
+    )
+    if request.method in {"POST", "PUT", "PATCH"}:
+        request_body = await get_request_body(request)
+        if isinstance(request_body, dict):
+            custom_body = _prepare_antigravity_request_body_for_passthrough(
+                request=request,
+                request_body=request_body,
+            )
+            if custom_body is not request_body:
+                _safe_set_request_parsed_body(request, custom_body)
+            custom_metadata = custom_body.get("litellm_metadata")
+            if isinstance(custom_metadata, dict):
+                passthrough_logging_metadata = dict(custom_metadata)
+
+    return await pass_through_request(
+        request=request,
+        target=target_url,
+        custom_headers=custom_headers,
+        user_api_key_dict=user_api_key_dict,
+        custom_body=custom_body,
+        forward_headers=has_google_oauth_bearer,
+        query_params=query_params,
+        stream=_is_antigravity_streaming_endpoint(endpoint, request),
+        custom_llm_provider="antigravity",
+        egress_credential_family="google",
+        expected_target_family="google",
+        allowed_forward_headers=(
+            list(_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST)
+            if has_google_oauth_bearer
+            else None
+        ),
+        passthrough_logging_metadata=passthrough_logging_metadata,
+    )
 
 
 @router.api_route(
@@ -14775,6 +15679,21 @@ async def anthropic_proxy_route(
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=prepared_request_body,
                 adapter_model=adapter_model,
+            )
+
+        antigravity_adapter_model = _resolve_anthropic_antigravity_code_assist_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if antigravity_adapter_model is not None:
+            return await _handle_anthropic_google_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=antigravity_adapter_model,
+                adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
             )
 
         google_adapter_model = _resolve_anthropic_google_completion_adapter_model(
@@ -16830,6 +17749,27 @@ class BaseOpenAIPassThroughHandler:
                             api_key=api_key,
                             forward_headers=forward_headers,
                         )
+                    antigravity_adapter_model = _resolve_codex_antigravity_code_assist_adapter_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
+                    )
+                    if antigravity_adapter_model is not None:
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
+                        )
+                        if prepared_request_body is not request_body:
+                            _safe_set_request_parsed_body(request, prepared_request_body)
+                        return await _handle_codex_google_code_assist_adapter_route(
+                            endpoint=endpoint,
+                            request=request,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            prepared_request_body=prepared_request_body,
+                            adapter_model=antigravity_adapter_model,
+                            adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+                        )
+
                     google_adapter_model = _resolve_codex_google_code_assist_adapter_model(
                         prepared_request_body,
                         endpoint=endpoint,

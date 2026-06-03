@@ -308,6 +308,7 @@ class PassThroughEndpointLogging:
                     end_time=end_time,
                     cache_hit=cache_hit,
                     request_body=request_body,
+                    custom_llm_provider=custom_llm_provider or "gemini",
                     **kwargs,
                 )
             )
@@ -469,9 +470,10 @@ class PassThroughEndpointLogging:
         elif self.is_langfuse_route(url_route):
             # Don't log langfuse pass-through requests
             return
-        elif custom_llm_provider == "gemini" and not self.is_gemini_route(
-            url_route, custom_llm_provider
-        ):
+        elif custom_llm_provider in {
+            "gemini",
+            "antigravity",
+        } and not self.is_gemini_route(url_route, custom_llm_provider):
             # Gemini CLI performs Code Assist control-plane calls before model
             # generation. Most do not contain model/usage data and should not
             # create fallback session_history rows. retrieveUserQuota is the
@@ -479,8 +481,14 @@ class PassThroughEndpointLogging:
             # rate-limit observation only.
             if "retrieveUserQuota" not in url_route:
                 return
+            quota_source = (
+                "antigravity_retrieve_user_quota"
+                if custom_llm_provider == "antigravity"
+                else "google_retrieve_user_quota"
+            )
             sanitized_quota = sanitize_google_code_assist_quota_for_logging(
-                response_body
+                response_body,
+                source=quota_source,
             )
             if not sanitized_quota:
                 return
@@ -630,7 +638,10 @@ class PassThroughEndpointLogging:
         """Check if the URL route is a Gemini API route."""
         normalized_url_route = url_route.lower()
         for route in self.TRACKED_GEMINI_ROUTES:
-            if route.lower() in normalized_url_route and custom_llm_provider == "gemini":
+            if route.lower() in normalized_url_route and custom_llm_provider in {
+                "gemini",
+                "antigravity",
+            }:
                 return True
         return False
 
