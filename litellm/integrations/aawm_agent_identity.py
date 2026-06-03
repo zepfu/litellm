@@ -1954,6 +1954,9 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_unsupported_hosted_tool_types_removed",
     "codex_unsupported_hosted_tools_removed",
     "codex_unsupported_hosted_tool_choice_removed",
+    "opencode_zen_removed_unsupported_tool_count",
+    "opencode_zen_removed_unsupported_tool_types",
+    "opencode_zen_removed_unsupported_tool_names",
     "codex_adapter_model",
     "codex_adapter_original_model",
     "codex_adapter_target_endpoint",
@@ -4852,6 +4855,14 @@ def _infer_rate_limit_client_family(
         or model_lower.startswith(("antigravity/", "agy/", "google-antigravity/"))
     ):
         return "antigravity_code_assist"
+    if (
+        "opencode" in source_lower
+        or credential_family == "opencode"
+        or metadata.get("opencode_zen") is True
+        or "opencode" in route_family
+        or model_lower.startswith(("opencode/", "opencode-zen/", "zen/"))
+    ):
+        return "opencode_zen"
     if (
         "xai_oauth" in source_lower
         or credential_family == "xai_oauth"
@@ -8133,6 +8144,7 @@ _PROVIDER_CACHE_TARGET_FAMILIES = {
     "anthropic",
     "openai",
     "openrouter",
+    "opencode_zen",
     "gemini",
     "nvidia",
     "xai",
@@ -8156,6 +8168,8 @@ def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
         return "antigravity"
     if candidate_lower in {"nvidia", "nvidia_nim", "nvidia-nim"}:
         return "nvidia_nim"
+    if candidate_lower in {"opencode", "opencode-zen", "opencode_zen", "zen"}:
+        return "opencode_zen"
     if candidate_lower == "grok":
         return "xai"
     if candidate_lower in {
@@ -8169,6 +8183,7 @@ def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
         "local-biomed",
         "antigravity",
         "openrouter",
+        "opencode_zen",
         "openai",
         "anthropic",
         "gemini",
@@ -8212,6 +8227,8 @@ def _session_history_provider_from_model(model: Any) -> Optional[str]:
         return "xai"
     if model_lower.startswith("openrouter/"):
         return "openrouter"
+    if model_lower.startswith(("opencode/", "opencode-zen/", "zen/")):
+        return "opencode_zen"
     if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
         return "antigravity"
     if "gemini" in model_lower or model_lower.startswith("google/"):
@@ -8240,6 +8257,8 @@ def _session_history_provider_from_route_family(route_family: Any) -> Optional[s
         return "nvidia_nim"
     if "openrouter" in route_lower:
         return "openrouter"
+    if "opencode" in route_lower:
+        return "opencode_zen"
     if "antigravity" in route_lower:
         return "antigravity"
     if "local_embed" in route_lower or "local-embed" in route_lower:
@@ -8271,6 +8290,8 @@ def _session_history_adapter_target_provider(
             return "gemini"
         if target.startswith("openrouter"):
             return "openrouter"
+        if target.startswith(("opencode", "opencode_zen", "zen")):
+            return "opencode_zen"
         if target.startswith(("antigravity", "agy", "google-antigravity")):
             return "antigravity"
         if target.startswith("nvidia"):
@@ -8318,6 +8339,8 @@ def _normalize_provider_cache_family(
             return "nvidia"
         if "openrouter" in route_family_lower:
             return "openrouter"
+        if "opencode" in route_family_lower:
+            return "opencode_zen"
         if "antigravity" in route_family_lower:
             return "antigravity"
         if "gemini" in route_family_lower or "google" in route_family_lower:
@@ -8335,6 +8358,8 @@ def _normalize_provider_cache_family(
             return "antigravity"
         if provider_lower in {"nvidia_nim", "nvidia-nim"}:
             return "nvidia"
+        if provider_lower in {"opencode", "opencode-zen", "opencode_zen", "zen"}:
+            return "opencode_zen"
         if provider_lower in _PROVIDER_CACHE_TARGET_FAMILIES:
             return provider_lower
 
@@ -8345,6 +8370,8 @@ def _normalize_provider_cache_family(
         return "xai"
     if model_lower.startswith("openrouter/"):
         return "openrouter"
+    if model_lower.startswith(("opencode/", "opencode-zen/", "zen/")):
+        return "opencode_zen"
     if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
         return "antigravity"
     if "gemini" in model_lower:
@@ -8428,6 +8455,8 @@ def _normalize_session_history_provider(
             return "nvidia_nim"
         if "openrouter.ai" in api_base_lower:
             return "openrouter"
+        if "opencode.ai/zen" in api_base_lower:
+            return "opencode_zen"
         if "anthropic.com" in api_base_lower:
             return "anthropic"
         if "googleapis.com" in api_base_lower or "generativelanguage" in api_base_lower:
@@ -14061,6 +14090,8 @@ def _session_history_provider_from_api_base(
         return "nvidia_nim"
     if "openrouter.ai" in api_base_lower:
         return "openrouter"
+    if "opencode.ai/zen" in api_base_lower:
+        return "opencode_zen"
     if "anthropic.com" in api_base_lower:
         return "anthropic"
     if "googleapis.com" in api_base_lower or "generativelanguage" in api_base_lower:
@@ -15067,6 +15098,12 @@ def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
         or source.startswith("antigravity_")
     ):
         return "antigravity"
+    if (
+        provider in {"opencode", "opencode_zen"}
+        or client_family == "opencode_zen"
+        or source.startswith("opencode_")
+    ):
+        return "opencode_zen"
     if (
         provider in {"gemini", "google_code_assist"}
         or client_family in {"gemini", "google_code_assist"}

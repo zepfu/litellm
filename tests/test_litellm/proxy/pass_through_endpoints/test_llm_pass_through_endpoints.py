@@ -60,12 +60,16 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_google_code_assist_prime_cache_key,
     _get_google_code_assist_prime_ttl_seconds,
     _get_gemini_passthrough_route_family,
+    _get_opencode_zen_target_base,
     _join_antigravity_passthrough_url,
+    _join_opencode_zen_passthrough_url,
+    _load_local_opencode_zen_api_key,
     _load_valid_local_antigravity_access_token,
     _get_openai_passthrough_route_family,
     _google_adapter_rate_limit_until_monotonic_by_key,
     _antigravity_oauth_access_token_cache,
     _ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
+    _OPENCODE_ZEN_FREE_MODELS,
     _google_code_assist_project_cache,
     _google_code_assist_prime_quota_by_key,
     _google_code_assist_prime_until_monotonic_by_key,
@@ -78,9 +82,11 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT,
     _handle_anthropic_grok_native_oauth_responses_adapter_route,
     _handle_anthropic_nvidia_completion_adapter_route,
+    _handle_anthropic_opencode_zen_responses_adapter_route,
     _handle_anthropic_xai_oauth_completion_adapter_route,
     _handle_anthropic_xai_oauth_responses_adapter_route,
     _handle_anthropic_auto_agent_alias_route,
+    _handle_codex_opencode_zen_adapter_route,
     _handle_codex_auto_agent_alias_route,
     _handle_codex_google_code_assist_adapter_route,
     _is_oa_xai_responses_model,
@@ -89,6 +95,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_google_adapter_pass_through_request,
     _resolve_anthropic_auto_agent_alias_model,
     _resolve_anthropic_antigravity_code_assist_adapter_model,
+    _resolve_anthropic_opencode_zen_adapter_model,
     _resolve_anthropic_openrouter_completion_adapter_model,
     _resolve_codex_auto_agent_alias_model,
     _resolve_codex_antigravity_code_assist_adapter_model,
@@ -101,6 +108,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _prime_google_code_assist_session,
     _resolve_google_adapter_session_id,
     _resolve_codex_google_code_assist_adapter_model,
+    _resolve_codex_opencode_zen_adapter_model,
     _sanitize_google_code_assist_quota_for_logging,
     _set_google_adapter_cooldown,
     _remember_codex_google_code_assist_tool_call_name,
@@ -128,6 +136,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     gemini_proxy_route,
     grok_proxy_route,
     llm_passthrough_factory_proxy_route,
+    opencode_zen_proxy_route,
     milvus_proxy_route,
     openai_proxy_route,
     vertex_discovery_proxy_route,
@@ -136,6 +145,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
 )
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler import (
     OpenAIPassthroughLoggingHandler,
+)
+from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    HttpPassThroughEndpointHelpers,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
@@ -5475,6 +5487,105 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             is None
         )
 
+    def test_resolve_opencode_zen_adapter_models(self):
+        assert (
+            _resolve_codex_opencode_zen_adapter_model(
+                {"model": "opencode/big-pickle"},
+                endpoint="/v1/responses",
+            )
+            == "big-pickle"
+        )
+        assert (
+            _resolve_codex_opencode_zen_adapter_model(
+                {"model": "opencode-zen/qwen3.6-plus-free"},
+                endpoint="/responses",
+            )
+            == "qwen3.6-plus-free"
+        )
+        assert (
+            _resolve_anthropic_opencode_zen_adapter_model(
+                {"model": "zen/grok-code"},
+                endpoint="/v1/messages",
+            )
+            == "grok-code"
+        )
+        assert (
+            _resolve_codex_opencode_zen_adapter_model(
+                {"model": "big-pickle"},
+                endpoint="/v1/responses",
+            )
+            is None
+        )
+        assert (
+            _resolve_anthropic_opencode_zen_adapter_model(
+                {"model": "opencode/claude-sonnet-4"},
+                endpoint="/v1/messages",
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("model_id", sorted(_OPENCODE_ZEN_FREE_MODELS))
+    def test_resolve_opencode_zen_adapter_all_free_models(self, model_id):
+        assert (
+            _resolve_codex_opencode_zen_adapter_model(
+                {"model": f"opencode/{model_id}"},
+                endpoint="/v1/responses",
+            )
+            == model_id
+        )
+        assert (
+            _resolve_anthropic_opencode_zen_adapter_model(
+                {"model": f"opencode-zen/{model_id}"},
+                endpoint="/v1/messages",
+            )
+            == model_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_load_local_opencode_zen_api_key_from_auth_file(
+        self, tmp_path, monkeypatch
+    ):
+        auth_path = tmp_path / "auth.json"
+        auth_path.write_text(
+            json.dumps({"opencode": {"type": "api", "key": "opencode-test-key"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(auth_path))
+        monkeypatch.delenv("LITELLM_OPENCODE_API_KEY", raising=False)
+        monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+
+        assert await _load_local_opencode_zen_api_key() == "opencode-test-key"
+
+    @pytest.mark.asyncio
+    async def test_load_local_opencode_zen_api_key_rejects_non_api_auth_type(
+        self, tmp_path, monkeypatch
+    ):
+        auth_path = tmp_path / "auth.json"
+        auth_path.write_text(
+            json.dumps(
+                {"opencode": {"type": "oauth", "key": "opencode-test-key"}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(auth_path))
+        monkeypatch.delenv("LITELLM_OPENCODE_API_KEY", raising=False)
+        monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+
+        with pytest.raises(ValueError, match="API-key auth"):
+            await _load_local_opencode_zen_api_key()
+
+    def test_opencode_zen_target_url_normalization(self, monkeypatch):
+        monkeypatch.setenv("OPENCODE_ZEN_API_BASE", "https://opencode.ai/zen/v1")
+
+        assert _get_opencode_zen_target_base() == "https://opencode.ai/zen"
+        assert (
+            _join_opencode_zen_passthrough_url(
+                base_target_url=_get_opencode_zen_target_base(),
+                endpoint="/v1/responses",
+            )
+            == "https://opencode.ai/zen/v1/responses"
+        )
+
     def test_codex_google_code_assist_completion_kwargs_stay_chat_shaped(self):
         completion_kwargs, request_input, responses_request = (
             _build_codex_google_code_assist_completion_kwargs(
@@ -5832,6 +5943,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "input": "just a test msg",
             "stream": False,
             "litellm_metadata": {
+                "client_name": "codex_exec",
                 "passthrough_route_family": "codex_responses",
                 "tags": ["route:codex_responses"],
             },
@@ -5958,6 +6070,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "input": "just a test msg",
             "stream": False,
             "litellm_metadata": {
+                "client_name": "codex_exec",
                 "passthrough_route_family": "codex_responses",
                 "tags": ["route:codex_responses"],
             },
@@ -6069,6 +6182,319 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "id": "resp_codex_antigravity",
             "model": "gpt-oss-120b-medium",
         }
+
+    @pytest.mark.asyncio
+    async def test_codex_opencode_zen_route_uses_saved_opencode_auth_and_responses_envelope(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-opencode-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+
+        prepared_body = {
+            "model": "opencode/big-pickle",
+            "input": "just a test msg",
+            "stream": False,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "repo_status",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {"type": "custom", "name": "apply_patch"},
+                {"type": "namespace", "name": "shell"},
+                {"type": "tool_search", "name": "tool_search"},
+                {"type": "web_search", "name": "web_search"},
+            ],
+            "litellm_metadata": {
+                "client_name": "codex_exec",
+                "passthrough_route_family": "codex_responses",
+                "tags": ["route:codex_responses"],
+            },
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(
+                return_value=Response(
+                    content=json.dumps(
+                        {"id": "resp_opencode", "model": "big-pickle"}
+                    ),
+                    media_type="application/json",
+                )
+            ),
+        ) as mock_pass_through_request:
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="big-pickle",
+            )
+
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["target"] == "https://opencode.ai/zen/v1/responses"
+        assert call_kwargs["custom_headers"]["authorization"] == (
+            "Bearer opencode-test-key"
+        )
+        assert call_kwargs["forward_headers"] is False
+        assert call_kwargs["custom_llm_provider"] == "opencode_zen"
+        assert call_kwargs["egress_credential_family"] == "opencode"
+        assert call_kwargs["expected_target_family"] == "opencode"
+        assert call_kwargs["custom_body"]["model"] == "big-pickle"
+        assert call_kwargs["custom_body"]["tools"] == [
+            {
+                "type": "function",
+                "name": "repo_status",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        litellm_metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "codex_opencode_zen_adapter"
+        )
+        assert litellm_metadata["opencode_zen"] is True
+        assert litellm_metadata["opencode_zen_requested_model"] == (
+            "opencode/big-pickle"
+        )
+        assert litellm_metadata["client_name"] == "codex_exec"
+        assert litellm_metadata["codex_adapter_provider"] == "opencode_zen"
+        assert litellm_metadata["opencode_zen_removed_unsupported_tool_count"] == 4
+        assert litellm_metadata["opencode_zen_removed_unsupported_tool_types"] == [
+            "custom",
+            "namespace",
+            "tool_search",
+            "web_search",
+        ]
+        assert litellm_metadata["opencode_zen_removed_unsupported_tool_names"] == [
+            "apply_patch",
+            "shell",
+            "tool_search",
+            "web_search",
+        ]
+        assert "route:codex_opencode_zen_adapter" in litellm_metadata["tags"]
+        assert "codex-opencode-zen-adapter" in litellm_metadata["tags"]
+        assert (
+            "opencode-zen-unsupported-tools-stripped"
+            in litellm_metadata["tags"]
+        )
+        assert json.loads(response.body.decode("utf-8")) == {
+            "id": "resp_opencode",
+            "model": "big-pickle",
+        }
+
+    @pytest.mark.asyncio
+    async def test_codex_opencode_zen_stream_injects_responses_item_lifecycle(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-opencode-stream-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+
+        async def _opencode_stream():
+            yield (
+                b'event: response.output_text.delta\n'
+                b'data: {"id":"resp_opencode_stream","type":"response.output_text.delta",'
+                b'"delta":"OPENCODE CODEX OK","response":{"id":"resp_opencode_stream",'
+                b'"model":"deepseek-v4-flash"}}\n\n'
+            )
+            yield (
+                b'event: response.completed\n'
+                b'data: {"id":"resp_opencode_stream","type":"response.completed",'
+                b'"response":{"id":"resp_opencode_stream","model":"deepseek-v4-flash",'
+                b'"usage":{"input_tokens":88,"output_tokens":39,"total_tokens":127}}}\n\n'
+            )
+
+        prepared_body = {
+            "model": "opencode/deepseek-v4-flash-free",
+            "input": "just a stream test msg",
+            "stream": True,
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(
+                return_value=StreamingResponse(
+                    _opencode_stream(),
+                    status_code=200,
+                    headers={"x-opencode-upstream": "1"},
+                    media_type="text/event-stream",
+                )
+            ),
+        ):
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="deepseek-v4-flash-free",
+            )
+
+        assert isinstance(response, StreamingResponse)
+        chunks = [chunk async for chunk in response.body_iterator]
+        payload = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            for chunk in chunks
+        )
+        assert "event: response.created" in payload
+        assert "event: response.output_item.added" in payload
+        assert "event: response.content_part.added" in payload
+        assert "event: response.output_text.delta" in payload
+        assert '"item_id":"msg_' in payload
+        assert '"output_index":0' in payload
+        assert '"content_index":0' in payload
+        assert "event: response.output_text.done" in payload
+        assert "event: response.content_part.done" in payload
+        assert "event: response.output_item.done" in payload
+        assert "event: response.completed" in payload
+        assert '"OPENCODE CODEX OK"' in payload
+        assert '"output":[{"id":"msg_' in payload
+        assert payload.rstrip().endswith("data: [DONE]")
+
+    @pytest.mark.asyncio
+    async def test_anthropic_opencode_zen_route_translates_to_responses_passthrough(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "x-api-key": "claude-client-key",
+            "session_id": "claude-opencode-session",
+        }
+        mock_request.url = httpx.URL("http://127.0.0.1:4001/anthropic/v1/messages")
+        mock_request.scope = {
+            "path": "/anthropic/v1/messages",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+        prepared_body = {
+            "model": "opencode-zen/qwen3.6-plus-free",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 32,
+            "stream": False,
+        }
+        translated_body = {
+            "model": "qwen3.6-plus-free",
+            "input": "hello",
+            "stream": False,
+            "litellm_metadata": {
+                "client_name": "claude-cli",
+                "passthrough_route_family": (
+                    "anthropic_opencode_zen_responses_adapter"
+                ),
+                "tags": ["route:anthropic_opencode_zen_responses_adapter"],
+            },
+        }
+        translated_response = Response(
+            content=json.dumps(
+                {
+                    "id": "msg_opencode",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "qwen3.6-plus-free",
+                    "content": [{"type": "text", "text": "ok"}],
+                }
+            ),
+            media_type="application/json",
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_responses_adapter_request_body",
+            return_value=dict(translated_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(
+                return_value=Response(
+                    content=json.dumps(
+                        {
+                            "id": "resp_opencode",
+                            "object": "response",
+                            "model": "qwen3.6-plus-free",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [
+                                        {"type": "output_text", "text": "ok"}
+                                    ],
+                                }
+                            ],
+                        }
+                    ),
+                    media_type="application/json",
+                )
+            ),
+        ) as mock_pass_through_request, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+            return_value=translated_response,
+        ):
+            response = await _handle_anthropic_opencode_zen_responses_adapter_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="qwen3.6-plus-free",
+            )
+
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["target"] == "https://opencode.ai/zen/v1/responses"
+        assert call_kwargs["custom_headers"]["authorization"] == (
+            "Bearer opencode-test-key"
+        )
+        assert call_kwargs["custom_llm_provider"] == "opencode_zen"
+        assert call_kwargs["egress_credential_family"] == "opencode"
+        assert call_kwargs["expected_target_family"] == "opencode"
+        litellm_metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        assert (
+            litellm_metadata["passthrough_route_family"]
+            == "anthropic_opencode_zen_responses_adapter"
+        )
+        assert litellm_metadata["opencode_zen"] is True
+        assert litellm_metadata["opencode_zen_adapter_model"] == (
+            "qwen3.6-plus-free"
+        )
+        assert litellm_metadata["client_name"] == "claude-cli"
+        assert response.body == translated_response.body
 
     @pytest.mark.asyncio
     async def test_codex_google_code_assist_auto_probe_empty_success_raises_before_logging(
@@ -12718,6 +13144,42 @@ async def test_anthropic_proxy_route_routes_all_oa_xai_models_to_responses_adapt
 
 
 @pytest.mark.asyncio
+async def test_anthropic_proxy_route_routes_opencode_zen_model_to_responses_adapter():
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "opencode/qwen3.6-plus-free",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(return_value=body),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        new=AsyncMock(return_value=(body, 0, set(), {})),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_opencode_zen_responses_adapter_route",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_opencode, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+    ) as mock_create_pass_through_route:
+        result = await anthropic_proxy_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+        )
+
+    assert result == {"ok": True}
+    mock_opencode.assert_awaited_once()
+    mock_create_pass_through_route.assert_not_called()
+    assert mock_opencode.await_args.kwargs["adapter_model"] == "qwen3.6-plus-free"
+    assert mock_opencode.await_args.kwargs["prepared_request_body"] is body
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
 )
@@ -14563,6 +15025,91 @@ async def test_antigravity_proxy_route_preserves_inbound_google_oauth_headers(
     assert (
         call_kwargs["passthrough_logging_metadata"]["passthrough_route_family"]
         == "antigravity_code_assist"
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_zen_proxy_route_uses_saved_auth_and_route_metadata(monkeypatch):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = httpx.URL(
+        "http://localhost:4000/opencode/v1/responses?key=litellm-test-key"
+    )
+    mock_request.headers = {
+        "content-type": "application/json",
+        "user-agent": "opencode/1.15.13",
+    }
+    mock_request.scope = {
+        "path": "/opencode/v1/responses",
+        "query_string": b"key=litellm-test-key",
+    }
+    mock_request.query_params = {"key": "litellm-test-key", "requestId": "req-1"}
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+    body = {
+        "model": "big-pickle",
+        "input": "hello",
+        "stream": True,
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+        AsyncMock(return_value=mock_user_api_key_dict),
+    ) as mock_auth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        AsyncMock(return_value=body),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+        AsyncMock(return_value="opencode-test-key"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        AsyncMock(return_value={"ok": True}),
+    ) as mock_pass_through:
+        result = await opencode_zen_proxy_route(
+            endpoint="v1/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+        )
+
+    assert result == {"ok": True}
+    assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-test-key"
+    mock_set_parsed_body.assert_called_once()
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["target"] == "https://opencode.ai/zen/v1/responses"
+    assert call_kwargs["custom_headers"]["authorization"] == (
+        "Bearer opencode-test-key"
+    )
+    assert call_kwargs["forward_headers"] is False
+    assert call_kwargs["query_params"] == {"requestId": "req-1"}
+    assert call_kwargs["stream"] is True
+    assert call_kwargs["custom_llm_provider"] == "opencode_zen"
+    assert call_kwargs["egress_credential_family"] == "opencode"
+    assert call_kwargs["expected_target_family"] == "opencode"
+    metadata = call_kwargs["custom_body"]["litellm_metadata"]
+    assert metadata["client_name"] == "opencode-zen"
+    assert metadata["opencode_zen"] is True
+    assert metadata["opencode_zen_requested_model"] == "big-pickle"
+    assert metadata["passthrough_route_family"] == "opencode_zen"
+    assert metadata["trace_environment"] == "dev"
+    assert "route:opencode_zen" in metadata["tags"]
+    assert call_kwargs["passthrough_logging_metadata"] == metadata
+
+
+def test_opencode_zen_target_family_is_distinct_from_openai():
+    assert (
+        HttpPassThroughEndpointHelpers.get_target_provider_family(
+            "https://opencode.ai/zen/v1/responses"
+        )
+        == "opencode"
+    )
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url="https://opencode.ai/zen/v1/responses",
+        headers={"authorization": "Bearer opencode-test-key"},
+        credential_family="opencode",
+        expected_target_family="opencode",
     )
 
 
@@ -17386,6 +17933,83 @@ class TestOpenAIPassthroughRoute:
             "openai_chat_completions"
         )
         assert "route:xai_oauth_api" in metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_openai_passthrough_routes_opencode_zen_model_to_saved_auth(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("OPENCODE_ZEN_API_BASE", "https://opencode.ai/zen/v1")
+        body = {
+            "model": "opencode/big-pickle",
+            "input": "hello",
+            "stream": False,
+            "litellm_metadata": {
+                "client_name": "codex_exec",
+                "tags": ["route:openai_responses"],
+            },
+        }
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer client-litellm-key",
+            "originator": "codex_exec",
+            "user-agent": "codex_exec/0.119.0",
+        }
+        mock_request.query_params = {}
+        mock_request.scope = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(
+                return_value=Response(
+                    content=json.dumps(
+                        {"id": "resp_opencode", "model": "big-pickle"}
+                    ),
+                    media_type="application/json",
+                )
+            ),
+        ) as mock_pass_through_request:
+            result = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        call_kwargs = mock_pass_through_request.await_args.kwargs
+        assert call_kwargs["target"] == "https://opencode.ai/zen/v1/responses"
+        assert call_kwargs["custom_headers"]["authorization"] == (
+            "Bearer opencode-test-key"
+        )
+        assert call_kwargs["custom_llm_provider"] == "opencode_zen"
+        assert call_kwargs["egress_credential_family"] == "opencode"
+        assert call_kwargs["expected_target_family"] == "opencode"
+        prepared_body = mock_set_body.call_args.args[1]
+        assert prepared_body["model"] == "opencode/big-pickle"
+        custom_body = call_kwargs["custom_body"]
+        assert custom_body["model"] == "big-pickle"
+        metadata = custom_body["litellm_metadata"]
+        assert metadata["client_name"] == "codex_exec"
+        assert metadata["opencode_zen"] is True
+        assert metadata["opencode_zen_adapter_model"] == "big-pickle"
+        assert metadata["codex_adapter_original_model"] == "opencode/big-pickle"
+        assert metadata["passthrough_route_family"] == "codex_opencode_zen_adapter"
+        assert "route:codex_opencode_zen_adapter" in metadata["tags"]
+        assert json.loads(result.body.decode("utf-8")) == {
+            "id": "resp_opencode",
+            "model": "big-pickle",
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -383,6 +383,8 @@ def get_llm_provider(  # noqa: PLR0915
         ## openrouter
         elif model in litellm.openrouter_models:
             custom_llm_provider = "openrouter"
+        elif model in litellm.opencode_zen_models:
+            custom_llm_provider = "opencode_zen"
         ## maritalk
         elif model in litellm.maritalk_models:
             custom_llm_provider = "maritalk"

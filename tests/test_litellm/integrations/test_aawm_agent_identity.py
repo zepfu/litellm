@@ -10603,6 +10603,101 @@ def test_build_session_history_record_preserves_antigravity_provider_over_google
     assert record["total_tokens"] == 13
 
 
+def test_build_session_history_record_preserves_opencode_zen_provider_identity() -> None:
+    kwargs = _base_kwargs("orchestrator")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-opencode-zen-1",
+            "passthrough_route_family": "codex_opencode_zen_adapter",
+            "api_base": "https://opencode.ai/zen/v1/responses",
+            "opencode_zen": True,
+            "opencode_zen_removed_unsupported_tool_count": 4,
+            "opencode_zen_removed_unsupported_tool_types": [
+                "custom",
+                "namespace",
+                "tool_search",
+                "web_search",
+            ],
+            "opencode_zen_removed_unsupported_tool_names": [
+                "apply_patch",
+                "shell",
+                "tool_search",
+                "web_search",
+            ],
+            "usage_object": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "total_tokens": 14,
+            },
+        }
+    )
+    kwargs["standard_logging_object"]["metadata"] = dict(
+        kwargs["litellm_params"]["metadata"]
+    )
+    kwargs["standard_logging_object"]["api_base"] = (
+        "https://opencode.ai/zen/v1/responses"
+    )
+    kwargs["custom_llm_provider"] = "opencode_zen"
+    kwargs["model"] = "big-pickle"
+    result = {
+        "id": "provider-response-opencode-1",
+        "model": "big-pickle",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "total_tokens": 14,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "opencode result",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-03T16:45:20Z",
+        end_time="2026-06-03T16:45:22Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "opencode_zen"
+    assert record["model"] == "big-pickle"
+    assert record["input_tokens"] == 10
+    assert record["output_tokens"] == 4
+    assert record["total_tokens"] == 14
+    assert record["metadata"]["opencode_zen_removed_unsupported_tool_count"] == 4
+    assert record["metadata"]["opencode_zen_removed_unsupported_tool_types"] == [
+        "custom",
+        "namespace",
+        "tool_search",
+        "web_search",
+    ]
+    assert record["metadata"]["opencode_zen_removed_unsupported_tool_names"] == [
+        "apply_patch",
+        "shell",
+        "tool_search",
+        "web_search",
+    ]
+
+
+def test_rate_limit_storage_provider_preserves_opencode_zen_identity() -> None:
+    assert (
+        aawm_agent_identity._rate_limit_storage_provider(
+            {
+                "provider": "opencode_zen",
+                "client_family": "opencode_zen",
+                "source": "opencode_zen_response_headers",
+            }
+        )
+        == "opencode_zen"
+    )
+
+
 def test_derive_langfuse_trace_tags_from_langfuse_trace_merges_observation_metadata() -> None:
     trace = {
         "id": "trace-tags-123",
