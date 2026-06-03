@@ -742,6 +742,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             or hostname.endswith(".openrouter.ai")
         ):
             return "openrouter"
+        if hostname == "opencode.ai" or hostname.endswith(".opencode.ai"):
+            return "opencode"
         if (
             hostname == "api.x.ai"
             or hostname.endswith(".x.ai")
