@@ -128,11 +128,20 @@ class AnthropicPassthroughLoggingHandler:
             if custom_llm_provider and not model.startswith(f"{custom_llm_provider}/"):
                 model_for_cost = f"{custom_llm_provider}/{model}"
 
-            response_cost = litellm.completion_cost(
-                completion_response=litellm_model_response,
-                model=model_for_cost,
-                custom_llm_provider=custom_llm_provider,
-            )
+            try:
+                response_cost = litellm.completion_cost(
+                    completion_response=litellm_model_response,
+                    model=model_for_cost,
+                    custom_llm_provider=custom_llm_provider,
+                )
+            except Exception as exc:
+                if custom_llm_provider != "opencode_zen":
+                    raise
+                response_cost = AnthropicPassthroughLoggingHandler._opencode_zen_cost_fallback(
+                    litellm_model_response=litellm_model_response,
+                    model=model,
+                    original_exception=exc,
+                )
 
             apply_passthrough_logging_contract(
                 litellm_response=litellm_model_response,
@@ -157,6 +166,46 @@ class AnthropicPassthroughLoggingHandler:
                 "Error creating Anthropic response logging payload: %s", e
             )
             return kwargs
+
+    @staticmethod
+    def _opencode_zen_cost_fallback(
+        *,
+        litellm_model_response: Union[ModelResponse, TextCompletionResponse],
+        model: str,
+        original_exception: Exception,
+    ) -> float:
+        from litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler import (
+            OpenAIPassthroughLoggingHandler,
+        )
+
+        model_info = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            model,
+            "opencode_zen",
+        )
+        if not isinstance(model_info, dict):
+            raise original_exception
+
+        usage = getattr(litellm_model_response, "usage", None)
+        input_cost_per_token = model_info.get("input_cost_per_token")
+        output_cost_per_token = model_info.get("output_cost_per_token")
+        if not isinstance(input_cost_per_token, (int, float)) or not isinstance(
+            output_cost_per_token,
+            (int, float),
+        ):
+            raise original_exception
+
+        prompt_tokens = getattr(usage, "prompt_tokens", None) or 0
+        completion_tokens = getattr(usage, "completion_tokens", None) or 0
+        fallback_cost = (
+            float(prompt_tokens) * float(input_cost_per_token)
+            + float(completion_tokens) * float(output_cost_per_token)
+        )
+        verbose_proxy_logger.warning(
+            "Anthropic passthrough cost fallback used for model=%s provider=opencode_zen after completion_cost error: %s",
+            model,
+            str(original_exception),
+        )
+        return fallback_cost
 
     @staticmethod
     def _handle_logging_anthropic_collected_chunks(

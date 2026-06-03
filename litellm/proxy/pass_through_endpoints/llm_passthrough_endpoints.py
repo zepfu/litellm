@@ -186,23 +186,8 @@ _OPENCODE_ZEN_FREE_MODELS = frozenset(
     {
         "big-pickle",
         "deepseek-v4-flash-free",
-        "glm-4.7-free",
-        "glm-5-free",
-        "grok-code",
-        "hy3-preview-free",
-        "kimi-k2.5-free",
-        "ling-2.6-flash-free",
-        "mimo-v2-flash-free",
-        "mimo-v2-omni-free",
-        "mimo-v2-pro-free",
         "mimo-v2.5-free",
-        "minimax-m2.1-free",
-        "minimax-m2.5-free",
-        "minimax-m3-free",
         "nemotron-3-super-free",
-        "qwen3.6-plus-free",
-        "ring-2.6-1t-free",
-        "trinity-large-preview-free",
     }
 )
 

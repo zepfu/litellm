@@ -5497,17 +5497,17 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         )
         assert (
             _resolve_codex_opencode_zen_adapter_model(
-                {"model": "opencode-zen/qwen3.6-plus-free"},
+                {"model": "opencode-zen/mimo-v2.5-free"},
                 endpoint="/responses",
             )
-            == "qwen3.6-plus-free"
+            == "mimo-v2.5-free"
         )
         assert (
             _resolve_anthropic_opencode_zen_adapter_model(
-                {"model": "zen/grok-code"},
+                {"model": "zen/nemotron-3-super-free"},
                 endpoint="/v1/messages",
             )
-            == "grok-code"
+            == "nemotron-3-super-free"
         )
         assert (
             _resolve_codex_opencode_zen_adapter_model(
@@ -5519,6 +5519,20 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert (
             _resolve_anthropic_opencode_zen_adapter_model(
                 {"model": "opencode/claude-sonnet-4"},
+                endpoint="/v1/messages",
+            )
+            is None
+        )
+        assert (
+            _resolve_codex_opencode_zen_adapter_model(
+                {"model": "opencode-zen/qwen3.6-plus-free"},
+                endpoint="/responses",
+            )
+            is None
+        )
+        assert (
+            _resolve_anthropic_opencode_zen_adapter_model(
+                {"model": "zen/grok-code"},
                 endpoint="/v1/messages",
             )
             is None
@@ -13147,7 +13161,7 @@ async def test_anthropic_proxy_route_routes_all_oa_xai_models_to_responses_adapt
 async def test_anthropic_proxy_route_routes_opencode_zen_model_to_responses_adapter():
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "opencode/qwen3.6-plus-free",
+        "model": "opencode/mimo-v2.5-free",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -13175,7 +13189,7 @@ async def test_anthropic_proxy_route_routes_opencode_zen_model_to_responses_adap
     assert result == {"ok": True}
     mock_opencode.assert_awaited_once()
     mock_create_pass_through_route.assert_not_called()
-    assert mock_opencode.await_args.kwargs["adapter_model"] == "qwen3.6-plus-free"
+    assert mock_opencode.await_args.kwargs["adapter_model"] == "mimo-v2.5-free"
     assert mock_opencode.await_args.kwargs["prepared_request_body"] is body
 
 
@@ -15110,6 +15124,62 @@ def test_opencode_zen_target_family_is_distinct_from_openai():
         headers={"authorization": "Bearer opencode-test-key"},
         credential_family="opencode",
         expected_target_family="opencode",
+    )
+
+
+def test_opencode_zen_responses_stream_is_parsed_as_openai_compatible():
+    url_route = "https://opencode.ai/zen/v1/responses"
+    assert HttpPassThroughEndpointHelpers.get_endpoint_type(url_route) == EndpointType.OPENAI
+    assert OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route) is True
+    assert "opencode/deepseek-v4-flash-free" in (
+        OpenAIPassthroughLoggingHandler._candidate_model_price_keys(
+            "deepseek-v4-flash-free",
+            "opencode_zen",
+        )
+    )
+
+    handler = OpenAIPassthroughLoggingHandler()
+    model_response = handler._build_complete_streaming_response(
+        all_chunks=[
+            "event: response.output_text.delta",
+            (
+                'data: {"type":"response.output_text.delta","item_id":"msg_1",'
+                '"output_index":0,"content_index":0,"delta":"ok"}'
+            ),
+            "event: response.completed",
+            (
+                'data: {"type":"response.completed","response":{"id":"resp_opencode",'
+                '"object":"response","created_at":1770000000,'
+                '"model":"deepseek-v4-flash","status":"completed",'
+                '"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}'
+            ),
+        ],
+        litellm_logging_obj=MagicMock(),
+        model="deepseek-v4-flash-free",
+        url_route=url_route,
+        request_body={"model": "deepseek-v4-flash-free"},
+        litellm_params={},
+    )
+
+    assert model_response is not None
+    assert model_response.model == "deepseek-v4-flash"
+    assert model_response.usage.prompt_tokens == 12
+    assert model_response.usage.completion_tokens == 3
+    assert model_response.usage.total_tokens == 15
+
+
+def test_opencode_zen_messages_route_uses_anthropic_stream_parser():
+    assert (
+        HttpPassThroughEndpointHelpers.get_endpoint_type(
+            "https://opencode.ai/zen/v1/messages"
+        )
+        == EndpointType.ANTHROPIC
+    )
+    assert (
+        HttpPassThroughEndpointHelpers.get_endpoint_type(
+            "https://opencode.ai/zen/v1/chat/completions"
+        )
+        == EndpointType.OPENAI
     )
 
 
