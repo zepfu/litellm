@@ -2,6 +2,8 @@
 .venv
 .venv_policy_test
 .env
+.env*
+!.env.example
 .claude
 .newenv
 newenv/*
