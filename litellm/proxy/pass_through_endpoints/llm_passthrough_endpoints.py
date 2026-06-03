@@ -168,6 +168,44 @@ _ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST = frozenset(
     }
 )
 
+_OPENCODE_ZEN_DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
+_OPENCODE_ZEN_PROVIDER = "opencode_zen"
+_OPENCODE_ZEN_AUTH_FILE_ENV_VARS = (
+    "LITELLM_OPENCODE_AUTH_FILE",
+    "OPENCODE_AUTH_FILE",
+)
+_OPENCODE_ZEN_API_KEY_ENV_VARS = (
+    "LITELLM_OPENCODE_API_KEY",
+    "OPENCODE_API_KEY",
+)
+_OPENCODE_ZEN_DEFAULT_AUTH_PATHS = (
+    "/home/zepfu/.local/share/opencode/auth.json",
+    "~/.local/share/opencode/auth.json",
+)
+_OPENCODE_ZEN_FREE_MODELS = frozenset(
+    {
+        "big-pickle",
+        "deepseek-v4-flash-free",
+        "glm-4.7-free",
+        "glm-5-free",
+        "grok-code",
+        "hy3-preview-free",
+        "kimi-k2.5-free",
+        "ling-2.6-flash-free",
+        "mimo-v2-flash-free",
+        "mimo-v2-omni-free",
+        "mimo-v2-pro-free",
+        "mimo-v2.5-free",
+        "minimax-m2.1-free",
+        "minimax-m2.5-free",
+        "minimax-m3-free",
+        "nemotron-3-super-free",
+        "qwen3.6-plus-free",
+        "ring-2.6-1t-free",
+        "trinity-large-preview-free",
+    }
+)
+
 _GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com"
 
 _GROK_CLI_FORWARD_HEADER_ALLOWLIST = frozenset(
@@ -1149,10 +1187,21 @@ def _split_anthropic_adapter_provider_prefix(model: Any) -> tuple[Optional[str],
         "gemini": "google",
         "google-antigravity": "antigravity",
         "nvidia_nim": "nvidia",
+        "opencode": _OPENCODE_ZEN_PROVIDER,
+        "opencode-zen": _OPENCODE_ZEN_PROVIDER,
+        "zen": _OPENCODE_ZEN_PROVIDER,
     }.get(
         prefix,
         prefix
-        if prefix in ("openai", "google", "openrouter", "nvidia", "antigravity")
+        if prefix
+        in (
+            "openai",
+            "google",
+            "openrouter",
+            "nvidia",
+            "antigravity",
+            _OPENCODE_ZEN_PROVIDER,
+        )
         else None,
     )
     if provider is None:
@@ -1247,6 +1296,16 @@ def _normalize_anthropic_openrouter_adapter_model_name(
     return normalized_candidate or None
 
 
+def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider != _OPENCODE_ZEN_PROVIDER or candidate is None:
+        return None
+    normalized_candidate = candidate.strip()
+    if normalized_candidate in _OPENCODE_ZEN_FREE_MODELS:
+        return normalized_candidate
+    return None
+
+
 def _normalize_anthropic_google_completion_adapter_model_name(
     model: Any,
 ) -> Optional[str]:
@@ -1308,6 +1367,28 @@ def _normalize_codex_google_code_assist_adapter_model_name(
         _CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES
     ):
         return normalized_candidate
+    return None
+
+
+def _resolve_codex_opencode_zen_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    return _normalize_opencode_zen_adapter_model_name(request_body.get("model"))
+
+
+def _resolve_anthropic_opencode_zen_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_opencode_zen_adapter_model_name(candidate)
+        if normalized_model is not None:
+            return normalized_model
     return None
 
 
@@ -7544,6 +7625,472 @@ def _get_anthropic_adapter_openrouter_target_base() -> str:
     return _get_openrouter_target_base()
 
 
+def _get_opencode_zen_target_base() -> str:
+    cleaned = (
+        _clean_secret_string(get_secret_str("OPENCODE_ZEN_API_BASE"))
+        or _clean_secret_string(get_secret_str("AAWM_OPENCODE_ZEN_API_BASE"))
+        or _clean_secret_string(os.getenv("OPENCODE_ZEN_API_BASE"))
+        or _clean_secret_string(os.getenv("AAWM_OPENCODE_ZEN_API_BASE"))
+        or _OPENCODE_ZEN_DEFAULT_BASE_URL
+    ).rstrip("/")
+    if cleaned.endswith("/v1"):
+        return cleaned[: -len("/v1")]
+    return cleaned
+
+
+def _get_opencode_zen_auth_file_path() -> Optional[Path]:
+    for env_name in _OPENCODE_ZEN_AUTH_FILE_ENV_VARS:
+        value = _clean_secret_string(os.getenv(env_name))
+        if value:
+            candidate = Path(value).expanduser()
+            if candidate.is_file():
+                return candidate
+
+    for candidate_str in _OPENCODE_ZEN_DEFAULT_AUTH_PATHS:
+        candidate = Path(candidate_str).expanduser()
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+async def _load_local_opencode_zen_api_key() -> str:
+    explicit_key = _get_first_secret_value(_OPENCODE_ZEN_API_KEY_ENV_VARS)
+    if explicit_key is not None:
+        return explicit_key
+
+    auth_path = _get_opencode_zen_auth_file_path()
+    if auth_path is None:
+        raise FileNotFoundError(
+            "OpenCode Zen auth file not found. Expected "
+            "'~/.local/share/opencode/auth.json' or set 'LITELLM_OPENCODE_AUTH_FILE'."
+        )
+
+    try:
+        auth_data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Unable to read OpenCode Zen auth file at {auth_path}") from exc
+
+    provider_auth = auth_data.get("opencode") if isinstance(auth_data, dict) else None
+    api_key = (
+        _clean_secret_string(provider_auth.get("key"))
+        if isinstance(provider_auth, dict)
+        else None
+    )
+    auth_type = (
+        _clean_secret_string(provider_auth.get("type"))
+        if isinstance(provider_auth, dict)
+        else None
+    )
+    if api_key is None or auth_type not in {None, "api"}:
+        raise ValueError(
+            "OpenCode Zen auth file must contain provider 'opencode' with API-key auth."
+        )
+    return api_key
+
+
+async def _build_opencode_zen_headers(request: Request) -> dict[str, str]:
+    api_key = await _load_local_opencode_zen_api_key()
+    return BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=api_key,
+        request=request,
+    )
+
+
+def _add_opencode_zen_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    route_family: str,
+    tag_prefix: str,
+    requested_model: Any,
+    adapter_model: Optional[str] = None,
+    input_shape: Optional[str] = None,
+    output_shape: Optional[str] = None,
+    client_name: Optional[str] = None,
+) -> dict[str, Any]:
+    extra_fields: dict[str, Any] = {
+        "opencode_zen": True,
+        "opencode_zen_requested_model": requested_model,
+    }
+    if client_name is not None:
+        extra_fields["client_name"] = client_name
+    if adapter_model is not None:
+        extra_fields["opencode_zen_adapter_model"] = adapter_model
+    if input_shape is not None:
+        extra_fields["codex_adapter_input_shape"] = input_shape
+    if output_shape is not None:
+        extra_fields["codex_adapter_output_shape"] = output_shape
+
+    tags = [tag_prefix, "opencode-zen"]
+    if adapter_model is not None:
+        tags.append(f"opencode-zen-model:{adapter_model}")
+
+    return _merge_litellm_metadata(
+        _add_route_family_logging_metadata(request_body, route_family),
+        tags_to_add=tags,
+        extra_fields=extra_fields,
+    )
+
+
+def _get_opencode_zen_responses_tool_name(tool: Any) -> Optional[str]:
+    if not isinstance(tool, dict):
+        return None
+    name = _clean_secret_string(tool.get("name"))
+    if name:
+        return name
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return _clean_secret_string(function.get("name"))
+    return None
+
+
+def _ordered_unique_str_values(values: list[Optional[str]]) -> list[str]:
+    unique_values: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        if value not in unique_values:
+            unique_values.append(value)
+    return unique_values
+
+
+def _strip_opencode_zen_unsupported_responses_tools(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return request_body
+
+    supported_tools: list[Any] = []
+    removed_tool_types: list[Optional[str]] = []
+    removed_tool_names: list[Optional[str]] = []
+    for tool in tools:
+        tool_type = tool.get("type") if isinstance(tool, dict) else None
+        if tool_type == "function":
+            supported_tools.append(tool)
+            continue
+        removed_tool_types.append(str(tool_type) if tool_type is not None else "unknown")
+        removed_tool_names.append(_get_opencode_zen_responses_tool_name(tool))
+
+    removed_count = len(tools) - len(supported_tools)
+    if removed_count <= 0:
+        return request_body
+
+    updated_body = dict(request_body)
+    if supported_tools:
+        updated_body["tools"] = supported_tools
+    else:
+        updated_body.pop("tools", None)
+
+    return _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=["opencode-zen-unsupported-tools-stripped"],
+        extra_fields={
+            "opencode_zen_removed_unsupported_tool_count": removed_count,
+            "opencode_zen_removed_unsupported_tool_types": _ordered_unique_str_values(
+                removed_tool_types
+            ),
+            "opencode_zen_removed_unsupported_tool_names": _ordered_unique_str_values(
+                removed_tool_names
+            ),
+        },
+    )
+
+
+def _opencode_zen_responses_sse_event(event_type: str, payload: dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+
+def _opencode_zen_response_payload_for_stream(
+    *,
+    response_id: str,
+    model: str,
+    status: str,
+    output: Optional[list[dict[str, Any]]] = None,
+    usage: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": status,
+        "model": model,
+    }
+    if output is not None:
+        payload["output"] = output
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
+
+
+def _opencode_zen_message_item_for_stream(
+    *,
+    message_id: str,
+    status: str,
+    output_text: str = "",
+) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+    if status == "completed":
+        content.append(
+            {
+                "type": "output_text",
+                "text": output_text,
+                "annotations": [],
+            }
+        )
+    return {
+        "id": message_id,
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": content,
+    }
+
+
+def _opencode_zen_completed_response_for_stream(
+    *,
+    response_event: dict[str, Any],
+    response_id: str,
+    model: str,
+    message_id: Optional[str],
+    output_text: str,
+) -> dict[str, Any]:
+    response_payload = response_event.get("response")
+    response_dict = dict(response_payload) if isinstance(response_payload, dict) else {}
+    response_dict.setdefault("id", response_id)
+    response_dict.setdefault("object", "response")
+    response_dict.setdefault("created_at", int(time.time()))
+    response_dict.setdefault("status", "completed")
+    response_dict.setdefault("model", model)
+    output = response_dict.get("output")
+    if (
+        message_id is not None
+        and isinstance(output_text, str)
+        and output_text
+        and not (
+            isinstance(output, list)
+            and any(_responses_output_item_has_meaningful_content(item) for item in output)
+        )
+    ):
+        response_dict["output"] = [
+            _opencode_zen_message_item_for_stream(
+                message_id=message_id,
+                status="completed",
+                output_text=output_text,
+            )
+        ]
+    return response_dict
+
+
+async def _normalize_opencode_zen_responses_stream_for_codex(
+    response: StreamingResponse,
+    *,
+    adapter_model: str,
+) -> Any:
+    response_id: Optional[str] = None
+    message_id: Optional[str] = None
+    response_created_sent = False
+    message_started = False
+    output_text_parts: list[str] = []
+
+    async for event in _iterate_responses_sse_events(response.body_iterator):
+        event_dict = _coerce_namespace_to_mapping(event)
+        if not isinstance(event_dict, dict):
+            continue
+        event_type = event_dict.get("type")
+        if not isinstance(event_type, str) or not event_type:
+            continue
+
+        if event_type == "response.output_text.delta":
+            response_payload = (
+                event_dict.get("response")
+                if isinstance(event_dict.get("response"), dict)
+                else {}
+            )
+            response_id = (
+                _clean_secret_string(event_dict.get("response_id"))
+                or _clean_secret_string(event_dict.get("id"))
+                or _clean_secret_string(response_payload.get("id"))
+                or response_id
+                or f"resp_{uuid4().hex}"
+            )
+            response_model = (
+                _clean_secret_string(response_payload.get("model"))
+                or _clean_secret_string(event_dict.get("model"))
+                or adapter_model
+            )
+            if not response_created_sent:
+                yield _opencode_zen_responses_sse_event(
+                    "response.created",
+                    {
+                        "type": "response.created",
+                        "response": _opencode_zen_response_payload_for_stream(
+                            response_id=response_id,
+                            model=response_model,
+                            status="in_progress",
+                            output=[],
+                        ),
+                    },
+                )
+                response_created_sent = True
+
+            message_id = (
+                _clean_secret_string(event_dict.get("item_id"))
+                or message_id
+                or f"msg_{uuid4().hex[:24]}"
+            )
+            if not message_started:
+                yield _opencode_zen_responses_sse_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": _opencode_zen_message_item_for_stream(
+                            message_id=message_id,
+                            status="in_progress",
+                        ),
+                    },
+                )
+                yield _opencode_zen_responses_sse_event(
+                    "response.content_part.added",
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    },
+                )
+                message_started = True
+
+            delta = event_dict.get("delta")
+            if isinstance(delta, str):
+                output_text_parts.append(delta)
+            event_dict["item_id"] = message_id
+            event_dict.setdefault("output_index", 0)
+            event_dict.setdefault("content_index", 0)
+            yield _opencode_zen_responses_sse_event(event_type, event_dict)
+            continue
+
+        if event_type == "response.completed":
+            response_payload = (
+                event_dict.get("response")
+                if isinstance(event_dict.get("response"), dict)
+                else {}
+            )
+            response_id = (
+                _clean_secret_string(response_payload.get("id"))
+                or _clean_secret_string(event_dict.get("id"))
+                or response_id
+                or f"resp_{uuid4().hex}"
+            )
+            response_model = (
+                _clean_secret_string(response_payload.get("model"))
+                or _clean_secret_string(event_dict.get("model"))
+                or adapter_model
+            )
+            if not response_created_sent:
+                yield _opencode_zen_responses_sse_event(
+                    "response.created",
+                    {
+                        "type": "response.created",
+                        "response": _opencode_zen_response_payload_for_stream(
+                            response_id=response_id,
+                            model=response_model,
+                            status="in_progress",
+                            output=[],
+                        ),
+                    },
+                )
+                response_created_sent = True
+
+            output_text = "".join(output_text_parts)
+            if message_started and message_id is not None:
+                yield _opencode_zen_responses_sse_event(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": output_text,
+                    },
+                )
+                yield _opencode_zen_responses_sse_event(
+                    "response.content_part.done",
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": output_text,
+                            "annotations": [],
+                        },
+                    },
+                )
+                yield _opencode_zen_responses_sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": _opencode_zen_message_item_for_stream(
+                            message_id=message_id,
+                            status="completed",
+                            output_text=output_text,
+                        ),
+                    },
+                )
+
+            event_dict["response"] = _opencode_zen_completed_response_for_stream(
+                response_event=event_dict,
+                response_id=response_id,
+                model=response_model,
+                message_id=message_id,
+                output_text=output_text,
+            )
+            yield _opencode_zen_responses_sse_event(event_type, event_dict)
+            continue
+
+        yield _opencode_zen_responses_sse_event(event_type, event_dict)
+
+    yield "data: [DONE]\n\n"
+
+
+def _build_codex_opencode_zen_streaming_response(
+    response: StreamingResponse,
+    *,
+    adapter_model: str,
+) -> StreamingResponse:
+    return StreamingResponse(
+        _normalize_opencode_zen_responses_stream_for_codex(
+            response,
+            adapter_model=adapter_model,
+        ),
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type="text/event-stream",
+    )
+
+
+def _join_opencode_zen_passthrough_url(base_target_url: str, endpoint: str) -> str:
+    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
+        endpoint=endpoint,
+        base_target_url=base_target_url,
+    )
+    return str(
+        BaseOpenAIPassThroughHandler._join_url_paths(
+            httpx.URL(base_target_url),
+            normalized_endpoint,
+            _OPENCODE_ZEN_PROVIDER,
+        )
+    )
+
+
 def _build_openrouter_default_headers() -> dict[str, str]:
     headers = {
         "HTTP-Referer": _clean_secret_string(get_secret_str("OR_SITE_URL")) or "https://litellm.ai",
@@ -10566,6 +11113,130 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
         reject_empty_success=True,
         diagnostic_context={
             "adapter": "openrouter_responses",
+            "adapter_model": adapter_model,
+            "request_model": translated_request_body.get("model"),
+            "request_stream": translated_request_body.get("stream"),
+        },
+    )
+    _copy_translated_anthropic_adapter_response_headers(
+        translated_response=translated_response,
+        upstream_response=upstream_response,
+    )
+    translated_response.status_code = upstream_response.status_code
+    return translated_response
+
+
+async def _handle_anthropic_opencode_zen_responses_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    translated_request_body = _build_anthropic_responses_adapter_request_body(
+        prepared_request_body,
+        adapter_model=adapter_model,
+        route_family="anthropic_opencode_zen_responses_adapter",
+        tag_prefix="anthropic-opencode-zen-responses-adapter",
+        span_name="anthropic.opencode_zen_responses_adapter",
+        target_endpoint="opencode_zen:/v1/responses",
+    )
+    translated_request_body = _add_opencode_zen_logging_metadata(
+        translated_request_body,
+        route_family="anthropic_opencode_zen_responses_adapter",
+        tag_prefix="anthropic-opencode-zen-responses-adapter",
+        requested_model=prepared_request_body.get("model"),
+        adapter_model=adapter_model,
+        input_shape="anthropic_messages",
+        output_shape="anthropic_messages",
+    )
+    (
+        translated_request_body,
+        openrouter_parallel_instruction_policy_changes,
+    ) = _apply_openrouter_adapter_parallel_instruction_policy(translated_request_body)
+    if openrouter_parallel_instruction_policy_changes:
+        verbose_proxy_logger.debug(
+            "Applied OpenCode Zen adapter parallel instruction policy; tools=%s",
+            openrouter_parallel_instruction_policy_changes.get(
+                "openrouter_adapter_parallel_instruction_tool_names"
+            ),
+        )
+    if _responses_request_contains_mcp_tools(translated_request_body):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Anthropic adapter does not currently support raw MCP server/toolset "
+                "requests (`mcp_servers` / `mcp_toolset`). Use Claude Code-exposed tools "
+                "such as `mcp__...` or call the native OpenAI Responses API directly."
+            ),
+        )
+
+    target_base_url = _get_opencode_zen_target_base()
+    target_url = _join_opencode_zen_passthrough_url(
+        base_target_url=target_base_url,
+        endpoint="/v1/responses",
+    )
+    custom_headers = await _build_opencode_zen_headers(request)
+
+    upstream_response = await pass_through_request(
+        request=request,
+        target=target_url,
+        custom_headers=custom_headers,
+        user_api_key_dict=user_api_key_dict,
+        custom_body=translated_request_body,
+        forward_headers=False,
+        allowed_forward_headers=[],
+        allowed_pass_through_prefixed_headers=[],
+        stream=bool(translated_request_body.get("stream")),
+        custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
+        egress_credential_family="opencode",
+        expected_target_family="opencode",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+
+    if isinstance(upstream_response, StreamingResponse):
+        if not client_requested_stream:
+            response_body = await _collect_responses_response_from_stream(
+                upstream_response
+            )
+            translated_response = _build_anthropic_response_from_responses_response(
+                response_body,
+                reject_empty_success=True,
+                diagnostic_context={
+                    "adapter": "opencode_zen_responses",
+                    "adapter_model": adapter_model,
+                    "request_model": translated_request_body.get("model"),
+                    "request_stream": translated_request_body.get("stream"),
+                },
+            )
+            _copy_translated_anthropic_adapter_response_headers(
+                translated_response=translated_response,
+                upstream_response=upstream_response,
+            )
+            translated_response.status_code = upstream_response.status_code
+            return translated_response
+        return _build_anthropic_streaming_response_from_responses_stream(
+            upstream_response,
+            model=adapter_model,
+            request_body=translated_request_body,
+            reject_empty_success=True,
+        )
+
+    if not isinstance(upstream_response, Response):
+        raise HTTPException(
+            status_code=502,
+            detail="Unexpected upstream response type from OpenCode Zen Responses passthrough.",
+        )
+
+    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    translated_response = _build_anthropic_response_from_responses_response(
+        response_body,
+        reject_empty_success=True,
+        diagnostic_context={
+            "adapter": "opencode_zen_responses",
             "adapter_model": adapter_model,
             "request_model": translated_request_body.get("model"),
             "request_stream": translated_request_body.get("stream"),
@@ -14922,6 +15593,86 @@ async def gemini_proxy_route(
 
 
 @router.api_route(
+    "/opencode/{endpoint:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    tags=["OpenCode Zen Pass-through", "pass-through"],
+)
+async def opencode_zen_proxy_route(
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+):
+    """
+    Native OpenCode Zen pass-through.
+
+    OpenCode stores a provider-scoped API credential at
+    `~/.local/share/opencode/auth.json`. LiteLLM auth should be supplied
+    separately with `x-litellm-api-key` or a `key` query parameter.
+    """
+    user_api_key_dict = await user_api_key_auth(
+        request=request,
+        api_key=_get_antigravity_litellm_auth_header(request),
+    )
+
+    target_url = _join_opencode_zen_passthrough_url(
+        base_target_url=_get_opencode_zen_target_base(),
+        endpoint=endpoint,
+    )
+    query_params = {
+        key: value
+        for key, value in dict(request.query_params).items()
+        if str(key).lower() != "key"
+    }
+
+    custom_body: Optional[dict[str, Any]] = None
+    stream = False
+    passthrough_logging_metadata: dict[str, Any] = {
+        "client_name": "opencode-zen",
+        "opencode_zen": True,
+        "passthrough_route_family": "opencode_zen",
+        "tags": ["route:opencode_zen", "opencode-zen"],
+    }
+    if request.method in {"POST", "PUT", "PATCH"}:
+        request_body = await get_request_body(request)
+        if isinstance(request_body, dict):
+            custom_body = _add_opencode_zen_logging_metadata(
+                request_body,
+                route_family="opencode_zen",
+                tag_prefix="opencode-zen",
+                requested_model=request_body.get("model"),
+                client_name="opencode-zen",
+            )
+            custom_body = _prepare_request_body_for_passthrough_observability(
+                request=request,
+                request_body=custom_body,
+            )
+            if custom_body is not request_body:
+                _safe_set_request_parsed_body(request, custom_body)
+            stream = bool(custom_body.get("stream"))
+            custom_metadata = custom_body.get("litellm_metadata")
+            if isinstance(custom_metadata, dict):
+                passthrough_logging_metadata = dict(custom_metadata)
+
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    return await pass_through_request(
+        request=request,
+        target=target_url,
+        custom_headers=await _build_opencode_zen_headers(request),
+        user_api_key_dict=user_api_key_dict,
+        custom_body=custom_body,
+        forward_headers=False,
+        query_params=query_params,
+        stream=stream,
+        custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
+        egress_credential_family="opencode",
+        expected_target_family="opencode",
+        allowed_forward_headers=[],
+        allowed_pass_through_prefixed_headers=[],
+        passthrough_logging_metadata=passthrough_logging_metadata,
+    )
+
+
+@router.api_route(
     "/antigravity/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     tags=["Antigravity Code Assist Pass-through", "pass-through"],
@@ -15694,6 +16445,20 @@ async def anthropic_proxy_route(
                 prepared_request_body=prepared_request_body,
                 adapter_model=antigravity_adapter_model,
                 adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+            )
+
+        opencode_zen_adapter_model = _resolve_anthropic_opencode_zen_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
+        )
+        if opencode_zen_adapter_model is not None:
+            return await _handle_anthropic_opencode_zen_responses_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=opencode_zen_adapter_model,
             )
 
         google_adapter_model = _resolve_anthropic_google_completion_adapter_model(
@@ -17255,6 +18020,71 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     return response
 
 
+async def _handle_codex_opencode_zen_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+) -> Response:
+    _ = fastapi_response
+    requested_model = prepared_request_body.get("model")
+    request_body = copy.deepcopy(prepared_request_body)
+    request_body["model"] = adapter_model
+    request_body = _strip_opencode_zen_unsupported_responses_tools(request_body)
+    request_body = _add_opencode_zen_logging_metadata(
+        request_body,
+        route_family="codex_opencode_zen_adapter",
+        tag_prefix="codex-opencode-zen-adapter",
+        requested_model=requested_model,
+        adapter_model=adapter_model,
+        input_shape="openai_responses",
+        output_shape="openai_responses",
+    )
+    request_body = _merge_litellm_metadata(
+        request_body,
+        tags_to_add=[
+            f"codex-adapter-model:{adapter_model}",
+            "codex-adapter-target:opencode_zen:/v1/responses",
+        ],
+        extra_fields={
+            "codex_adapter_model": adapter_model,
+            "codex_adapter_original_model": requested_model,
+            "codex_adapter_provider": _OPENCODE_ZEN_PROVIDER,
+            "codex_adapter_target_endpoint": "opencode_zen:/v1/responses",
+        },
+    )
+
+    target_base_url = _get_opencode_zen_target_base()
+    target_url = _join_opencode_zen_passthrough_url(
+        base_target_url=target_base_url,
+        endpoint="/v1/responses",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    response = await pass_through_request(
+        request=request,
+        target=target_url,
+        custom_headers=await _build_opencode_zen_headers(request),
+        user_api_key_dict=user_api_key_dict,
+        custom_body=request_body,
+        forward_headers=False,
+        allowed_forward_headers=[],
+        allowed_pass_through_prefixed_headers=[],
+        stream=bool(request_body.get("stream")),
+        custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
+        egress_credential_family="opencode",
+        expected_target_family="opencode",
+    )
+    if isinstance(response, StreamingResponse):
+        return _build_codex_opencode_zen_streaming_response(
+            response,
+            adapter_model=adapter_model,
+        )
+    return response
+
+
 async def _perform_codex_auto_agent_openrouter_completion_request(
     *,
     request: Request,
@@ -17748,6 +18578,25 @@ class BaseOpenAIPassThroughHandler:
                             target_url=str(updated_url),
                             api_key=api_key,
                             forward_headers=forward_headers,
+                        )
+                    opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
+                    )
+                    if opencode_zen_adapter_model is not None:
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
+                        )
+                        if prepared_request_body is not request_body:
+                            _safe_set_request_parsed_body(request, prepared_request_body)
+                        return await _handle_codex_opencode_zen_adapter_route(
+                            endpoint=endpoint,
+                            request=request,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            prepared_request_body=prepared_request_body,
+                            adapter_model=opencode_zen_adapter_model,
                         )
                     antigravity_adapter_model = _resolve_codex_antigravity_code_assist_adapter_model(
                         prepared_request_body,

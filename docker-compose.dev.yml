@@ -75,6 +75,8 @@ services:
       - /home/zepfu/projects/aawm/agents:/home/zepfu/.claude/agents:ro
       # Codex OAuth tokens for Anthropic->Codex adapter testing
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
+      # OpenCode Zen auth for native OpenCode and Codex/Claude adapter testing
+      - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
       # Gemini OAuth tokens for Anthropic->Google adapter testing
       - /home/zepfu/.gemini:/home/zepfu/.gemini:ro
       # Grok CLI OAuth tokens for native Grok OIDC passthrough testing
@@ -130,6 +132,7 @@ services:
       - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
       - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
       - LITELLM_CODEX_AUTH_FILE=${LITELLM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}
+      - LITELLM_OPENCODE_AUTH_FILE=${LITELLM_OPENCODE_AUTH_FILE:-/home/zepfu/.local/share/opencode/auth.json}
       - LITELLM_GEMINI_AUTH_FILE=${LITELLM_GEMINI_AUTH_FILE:-/home/zepfu/.gemini/oauth_creds.json}
       - LITELLM_GEMINI_OAUTH_CLIENT_ID=${LITELLM_GEMINI_OAUTH_CLIENT_ID:-}
       - LITELLM_GEMINI_OAUTH_CLIENT_SECRET=${LITELLM_GEMINI_OAUTH_CLIENT_SECRET:-}
