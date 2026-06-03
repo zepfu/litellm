@@ -4845,6 +4845,7 @@ def _infer_rate_limit_client_family(
     credential_family = str(metadata.get("credential_family") or "").lower()
     if (
         provider == "antigravity"
+        or source_lower.startswith("antigravity_")
         or "antigravity" in route_family
         or metadata.get("aawm_stream_logging_custom_llm_provider") == "antigravity"
         or str(metadata.get("custom_llm_provider") or "").lower() == "antigravity"
@@ -6639,7 +6640,9 @@ def _extract_google_quota_observations(
             quota_source,
         )
         is_antigravity_quota = (
-            provider == "antigravity" or client_family == "antigravity_code_assist"
+            provider == "antigravity"
+            or client_family == "antigravity_code_assist"
+            or str(quota_source or "").lower().startswith("antigravity_")
         )
         if is_antigravity_quota and provider_resets_at is None:
             continue
@@ -6669,8 +6672,10 @@ def _extract_google_quota_observations(
             )
             limit_id = "antigravity_code_assist"
             stored_model = None
-            quota_type = str(token_type or "wtus").strip().lower()
+            quota_type = "wtus"
             model_tier = None
+            provider = "antigravity"
+            client_family = "antigravity_code_assist"
         else:
             limit_scope = (
                 "model_requests"
@@ -6697,9 +6702,12 @@ def _extract_google_quota_observations(
                     "source": quota_source,
                     "provider": provider,
                     "client_family": client_family,
-                    "limit_id": _clean_non_empty_string(candidate.get("quotaId"))
-                    or limit_id,
-                    "limit_name": _clean_non_empty_string(candidate.get("quotaName"))
+                    "limit_id": limit_id
+                    if is_antigravity_quota
+                    else _clean_non_empty_string(candidate.get("quotaId")) or limit_id,
+                    "limit_name": limit_name
+                    if is_antigravity_quota
+                    else _clean_non_empty_string(candidate.get("quotaName"))
                     or limit_name,
                     "limit_scope": limit_scope,
                     "window_minutes": window_minutes,
@@ -15053,7 +15061,11 @@ def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
     provider = _clean_non_empty_string(record.get("provider")) or "unknown"
     source = str(record.get("source") or "").lower()
     client_family = str(record.get("client_family") or "").lower()
-    if provider == "antigravity" or client_family == "antigravity_code_assist":
+    if (
+        provider == "antigravity"
+        or client_family == "antigravity_code_assist"
+        or source.startswith("antigravity_")
+    ):
         return "antigravity"
     if (
         provider in {"gemini", "google_code_assist"}

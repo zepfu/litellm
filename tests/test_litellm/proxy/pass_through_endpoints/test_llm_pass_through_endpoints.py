@@ -65,6 +65,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_openai_passthrough_route_family,
     _google_adapter_rate_limit_until_monotonic_by_key,
     _antigravity_oauth_access_token_cache,
+    _ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
     _google_code_assist_project_cache,
     _google_code_assist_prime_quota_by_key,
     _google_code_assist_prime_until_monotonic_by_key,
@@ -5419,6 +5420,56 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert (
             _resolve_anthropic_antigravity_code_assist_adapter_model(
                 {"model": "antigravity/gemini-3.1-flash-image"},
+                endpoint="/v1/messages",
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "model_id",
+        sorted(_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS),
+    )
+    def test_resolve_antigravity_code_assist_adapter_all_user_selectable_models(
+        self,
+        model_id,
+    ):
+        assert (
+            _resolve_codex_antigravity_code_assist_adapter_model(
+                {"model": f"antigravity/{model_id}"},
+                endpoint="/v1/responses",
+            )
+            == model_id
+        )
+        assert (
+            _resolve_anthropic_antigravity_code_assist_adapter_model(
+                {"model": f"google-antigravity/{model_id}"},
+                endpoint="/v1/messages",
+            )
+            == model_id
+        )
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "gemini-3.1-flash-image",
+            "models/proactive-observer",
+            "unknown-antigravity-model",
+        ],
+    )
+    def test_resolve_antigravity_code_assist_adapter_rejects_specialized_models(
+        self,
+        model_id,
+    ):
+        assert (
+            _resolve_codex_antigravity_code_assist_adapter_model(
+                {"model": f"antigravity/{model_id}"},
+                endpoint="/v1/responses",
+            )
+            is None
+        )
+        assert (
+            _resolve_anthropic_antigravity_code_assist_adapter_model(
+                {"model": f"google-antigravity/{model_id}"},
                 endpoint="/v1/messages",
             )
             is None
