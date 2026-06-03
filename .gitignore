@@ -118,3 +118,7 @@ cache/
 .analysis/
 .scenario.md
 .aawm-scripts/
+.claude/
+.grok/
+.env.*
+!.env.example
