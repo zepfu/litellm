@@ -7538,6 +7538,79 @@ def test_build_rate_limit_observations_preserves_antigravity_quota_identity() ->
     assert db_payload[8] == "wtus"
 
 
+def test_build_rate_limit_observations_pools_antigravity_quota_ids() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "antigravity/gpt-oss-120b-medium"
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["litellm_call_id"] = "call-antigravity-provider-quota-ids"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-antigravity-provider-quota-ids",
+            "passthrough_route_family": "codex_google_code_assist_adapter",
+            "google_retrieve_user_quota": {
+                "source": "antigravity_retrieve_user_quota",
+                "buckets": {
+                    "items": [
+                        {
+                            "quotaId": (
+                                "antigravity_code_assist_requests_"
+                                "gpt-oss-120b-medium"
+                            ),
+                            "quotaName": "Antigravity GPT-OSS requests",
+                            "modelId": "gpt-oss-120b-medium",
+                            "tokenType": "REQUESTS",
+                            "remainingFraction": 1,
+                            "resetTime": "2026-06-03T21:11:43Z",
+                        },
+                        {
+                            "quotaId": (
+                                "antigravity_code_assist_requests_"
+                                "gemini-3.5-flash-low"
+                            ),
+                            "quotaName": "Antigravity Gemini requests",
+                            "modelId": "gemini-3.5-flash-low",
+                            "tokenType": "REQUESTS",
+                            "remainingFraction": 1,
+                            "resetTime": "2026-06-03T17:31:26Z",
+                        },
+                    ]
+                },
+            },
+        }
+    )
+    end_time = datetime(2026, 6, 3, 16, 11, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 2
+    by_scope = {observation["limit_scope"]: observation for observation in observations}
+    assert set(by_scope) == {"gemini_pool", "vertex_pool"}
+    for observation in observations:
+        assert observation["source"] == "antigravity_retrieve_user_quota"
+        assert observation["provider"] == "antigravity"
+        assert observation["client_family"] == "antigravity_code_assist"
+        assert observation["model"] is None
+        assert observation["limit_id"] == "antigravity_code_assist"
+        assert observation["quota_period"] == "five_hour"
+        assert observation["quota_type"] == "wtus"
+
+        db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+            observation
+        )
+        assert db_payload[4] == "antigravity"
+        assert db_payload[5] is None
+        assert db_payload[6] in {
+            "antigravity_code_assist:gemini_pool",
+            "antigravity_code_assist:vertex_pool",
+        }
+        assert ":model_requests" not in db_payload[6]
+
+
 def test_build_rate_limit_observations_normalizes_google_quota_period_windows() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "google-antigravity/claude-opus-4-6-thinking"
