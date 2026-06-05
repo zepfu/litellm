@@ -12763,6 +12763,242 @@ def _add_passthrough_trace_context_metadata(
     return updated_body
 
 
+_AAWM_TOOL_DEFINITION_CAPTURE_VERSION = "v1"
+_AAWM_TOOL_DEFINITION_MAX_TOOLS = 64
+_AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS = 128
+_AAWM_TOOL_DEFINITION_MAX_STRING_CHARS = 4096
+_AAWM_TOOL_DEFINITION_MAX_DEPTH = 20
+_AAWM_TOOL_DEFINITION_REDACTED = "redacted-by-litellm"
+_AAWM_TOOL_DEFINITION_SECRET_KEY_RE = re.compile(
+    r"("
+    r"authorization|api[_-]?key|bearer|credential|password|secret|^token$"
+    r"|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token"
+    r")",
+    re.IGNORECASE,
+)
+_AAWM_TOOL_DEFINITION_SECRET_VALUE_RES = (
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{6,}", re.IGNORECASE),
+    re.compile(r"\b(?:sk|pk)-[A-Za-z0-9._-]{8,}\b", re.IGNORECASE),
+)
+
+
+def _truncate_tool_definition_string(value: str) -> tuple[str, bool]:
+    if len(value) <= _AAWM_TOOL_DEFINITION_MAX_STRING_CHARS:
+        return value, False
+    return value[:_AAWM_TOOL_DEFINITION_MAX_STRING_CHARS], True
+
+
+def _redact_tool_definition_string(value: str) -> str:
+    redacted = value
+    for pattern in _AAWM_TOOL_DEFINITION_SECRET_VALUE_RES:
+        redacted = pattern.sub(_AAWM_TOOL_DEFINITION_REDACTED, redacted)
+    return redacted
+
+
+def _sanitize_tool_definition_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    key_hint: Optional[str] = None,
+) -> tuple[Any, bool]:
+    if depth > _AAWM_TOOL_DEFINITION_MAX_DEPTH:
+        return {"__truncated__": "max_depth"}, True
+    if key_hint and _AAWM_TOOL_DEFINITION_SECRET_KEY_RE.search(key_hint):
+        return _AAWM_TOOL_DEFINITION_REDACTED, False
+    if isinstance(value, str):
+        return _truncate_tool_definition_string(_redact_tool_definition_string(value))
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    if isinstance(value, list):
+        truncated = len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
+        sanitized_items: list[Any] = []
+        for item in value[:_AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS]:
+            sanitized_item, item_truncated = _sanitize_tool_definition_value(
+                item,
+                depth=depth + 1,
+                key_hint=key_hint,
+            )
+            truncated = truncated or item_truncated
+            sanitized_items.append(sanitized_item)
+        if len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
+            sanitized_items.append(
+                {"__truncated_items__": len(value) - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS}
+            )
+        return sanitized_items, truncated
+    if isinstance(value, dict):
+        truncated = len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
+        sanitized_dict: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
+                break
+            sanitized_item, item_truncated = _sanitize_tool_definition_value(
+                item,
+                depth=depth + 1,
+                key_hint=str(key),
+            )
+            truncated = truncated or item_truncated
+            sanitized_dict[str(key)] = sanitized_item
+        if len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
+            sanitized_dict["__truncated_keys__"] = (
+                len(value) - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
+            )
+        return sanitized_dict, truncated
+    return str(value), False
+
+
+def _tool_definition_name(tool: dict[str, Any]) -> Optional[str]:
+    function_definition = tool.get("function")
+    for candidate in (
+        tool.get("name"),
+        function_definition.get("name")
+        if isinstance(function_definition, dict)
+        else None,
+        tool.get("tool_name"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _tool_definition_description(tool: dict[str, Any]) -> Optional[str]:
+    function_definition = tool.get("function")
+    for candidate in (
+        tool.get("description"),
+        function_definition.get("description")
+        if isinstance(function_definition, dict)
+        else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _tool_definition_parameters(tool: dict[str, Any]) -> Any:
+    function_definition = tool.get("function")
+    if isinstance(function_definition, dict) and "parameters" in function_definition:
+        return function_definition.get("parameters")
+    for key in ("parameters", "input_schema", "schema", "json_schema"):
+        if key in tool:
+            return tool.get(key)
+    return None
+
+
+def _build_tool_definition_snapshot_entry(
+    *,
+    source: str,
+    index: int,
+    tool: Any,
+) -> tuple[Optional[dict[str, Any]], bool]:
+    if not isinstance(tool, dict):
+        return None, False
+
+    sanitized_definition, definition_truncated = _sanitize_tool_definition_value(tool)
+    sanitized_parameters, parameters_truncated = _sanitize_tool_definition_value(
+        _tool_definition_parameters(tool)
+    )
+    description, description_truncated = _truncate_tool_definition_string(
+        _redact_tool_definition_string(_tool_definition_description(tool) or "")
+    )
+    entry = {
+        "source": source,
+        "index": index,
+        "type": tool.get("type"),
+        "name": _tool_definition_name(tool),
+        "description": description,
+        "parameters": sanitized_parameters,
+        "definition": sanitized_definition,
+    }
+    return entry, bool(
+        definition_truncated or parameters_truncated or description_truncated
+    )
+
+
+def _tool_definition_snapshot_hash(snapshot: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_passthrough_tool_definition_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    tool_sources: tuple[tuple[str, Any], ...] = (
+        ("tools", request_body.get("tools")),
+        ("functions", request_body.get("functions")),
+    )
+    snapshot: list[dict[str, Any]] = []
+    available_count = 0
+    truncated = False
+    source_names: list[str] = []
+
+    for source, tools in tool_sources:
+        if not isinstance(tools, list):
+            continue
+        source_names.append(source)
+        available_count += len(tools)
+        for index, tool in enumerate(tools):
+            if len(snapshot) >= _AAWM_TOOL_DEFINITION_MAX_TOOLS:
+                truncated = True
+                break
+            entry, entry_truncated = _build_tool_definition_snapshot_entry(
+                source=source,
+                index=index,
+                tool=tool,
+            )
+            if entry is None:
+                continue
+            snapshot.append(entry)
+            truncated = truncated or entry_truncated
+
+    if not snapshot:
+        return {}
+
+    names = [
+        entry["name"]
+        for entry in snapshot
+        if isinstance(entry.get("name"), str) and entry.get("name")
+    ]
+    tool_types = [
+        entry["type"]
+        for entry in snapshot
+        if isinstance(entry.get("type"), str) and entry.get("type")
+    ]
+    return {
+        "aawm_tool_definition_capture_version": (
+            _AAWM_TOOL_DEFINITION_CAPTURE_VERSION
+        ),
+        "aawm_tool_definition_capture_source": "passthrough_request_body",
+        "aawm_tool_definition_count": available_count,
+        "aawm_tool_definition_captured_count": len(snapshot),
+        "aawm_tool_definition_sources": source_names,
+        "aawm_tool_definition_names": names,
+        "aawm_tool_definition_types": tool_types,
+        "aawm_tool_definition_snapshot": snapshot,
+        "aawm_tool_definition_snapshot_hash": (
+            _tool_definition_snapshot_hash(snapshot)
+        ),
+        "aawm_tool_definition_snapshot_truncated": truncated
+        or available_count > len(snapshot),
+    }
+
+
+def _add_passthrough_tool_definition_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    tool_definition_metadata = _build_passthrough_tool_definition_metadata(request_body)
+    if not tool_definition_metadata:
+        return request_body
+    return _merge_litellm_metadata(
+        request_body,
+        extra_fields=tool_definition_metadata,
+    )
+
+
 def _prepare_request_body_for_passthrough_observability(
     request: Request, request_body: dict[str, Any]
 ) -> dict[str, Any]:
@@ -12773,12 +13009,13 @@ def _prepare_request_body_for_passthrough_observability(
         request=request, request_body=request_body
     )
     trace_environment = _get_passthrough_trace_environment()
-    return _add_passthrough_trace_context_metadata(
+    prepared_body = _add_passthrough_trace_context_metadata(
         request_body,
         session_id=session_id,
         trace_environment=trace_environment,
         repository=repository,
     )
+    return _add_passthrough_tool_definition_metadata(prepared_body)
 
 
 def _add_route_family_logging_metadata(
