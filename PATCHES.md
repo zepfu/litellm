@@ -2330,6 +2330,40 @@ persisted exact D1-206 session-history row `1150506` for session
 
 ---
 
+### aawm.69 — Tiered auto-agent alias fallback hardening
+
+**Status:** AAWM local release candidate.
+
+**What changed:** Codex/OpenAI and Anthropic auto-agent alias probes now treat
+Antigravity OAuth refresh failures and Grok native/xAI OAuth credential-prep
+failures as retryable candidate-unavailable conditions instead of terminal
+500s. Codex/OpenAI OpenRouter Responses candidates now pre-validate streamed
+Responses payloads before returning them to Codex; a stream with no
+`response.completed` event or an empty successful payload raises the existing
+`aawm_codex_auto_agent_empty_success` marker so `aawm-low` can cool that
+candidate and continue to OpenCode or the final Codex fallback. Successful
+OpenRouter streams are replayed unchanged after validation.
+
+**Why:** D1-207 live smokes showed `aawm-code` could get past Antigravity only
+to stop on stale Grok credentials, and `aawm-low` could receive an OpenRouter
+stream without a usable `response.completed`, causing the client to fail before
+the alias selector could try the next candidate. These are candidate
+availability failures for fresh alias dispatches, not reasons to abandon the
+ordered model-selection policy.
+
+**Why not upstream:** The tiered aliases, candidate ordering, per-candidate
+cooldown semantics, and local credential families are AAWM-specific
+Codex/Claude routing policy.
+
+**Validation status:** Focused tests cover Antigravity `invalid_client`
+rollover, Grok native `invalid_grant` rollover for Codex and Anthropic alias
+probes, OpenRouter streamed empty/no-completed rollover, and the broader
+auto-agent/Grok/OpenCode/Antigravity selection surface. Live dev smokes on
+2026-06-05 proved `aawm-sota`, `aawm-code`, and `aawm-low` return sentinels and
+persist selected target/attempt metadata in `public.session_history`.
+
+---
+
 ### cb-v0.0.42 — Callback overlay parity for Antigravity/OpenCode attribution
 
 **Status:** AAWM callback overlay release candidate.
