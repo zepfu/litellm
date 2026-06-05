@@ -13736,6 +13736,48 @@ async def test_anthropic_proxy_route_routes_grok_native_models_to_responses_adap
 
 
 @pytest.mark.asyncio
+async def test_anthropic_grok_native_alias_probe_invalid_grant_is_candidate_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "http://localhost:4001/grok/v1",
+    )
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-grok-session"},
+    }
+    grok_refresh_error = ValueError(
+        "xAI OAuth credential refresh failed (invalid_grant). Reseed or relogin "
+        "the managed xAI OAuth credential."
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(side_effect=grok_refresh_error),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="grok-composer-2.5-fast",
+                use_alias_candidate_probe=True,
+            )
+
+    assert str(exc_info.value.code) == "429"
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+
+
+@pytest.mark.asyncio
 async def test_anthropic_xai_oauth_completion_adapter_uses_managed_oauth(
     monkeypatch,
 ):
@@ -14251,6 +14293,147 @@ async def test_codex_auto_agent_alias_code_falls_back_to_spark_after_antigravity
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_invalid_client(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    antigravity_refresh_error = HTTPException(
+        status_code=500,
+        detail=(
+            "Failed to refresh Antigravity OAuth access token: "
+            '{"error":"invalid_client"}'
+        ),
+    )
+    spark_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        new=AsyncMock(side_effect=antigravity_refresh_error),
+    ) as mock_load_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=spark_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is spark_success
+    mock_load_antigravity.assert_awaited_once()
+    mock_pass_through.assert_awaited_once()
+    spark_body = mock_pass_through.await_args.kwargs["custom_body"]
+    metadata = spark_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code"
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    assert metadata["codex_auto_agent_attempts"][0]["provider"] == "antigravity"
+    assert metadata["codex_auto_agent_attempts"][0]["status"] == "cooldown_set"
+    assert (
+        "aawm_codex_auto_agent_candidate_unavailable"
+        in metadata["codex_auto_agent_attempts"][0]["error_tokens"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_falls_back_after_grok_invalid_grant(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    antigravity_error = ProxyException(
+        message="antigravity unavailable",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    antigravity_error.detail = {
+        "error": {
+            "message": "Antigravity credential unavailable",
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    spark_error = ProxyException(
+        message="spark usage limit",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    spark_error.detail = {
+        "error": {
+            "message": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        }
+    }
+    grok_refresh_error = ValueError(
+        "xAI OAuth credential refresh failed (invalid_grant). Reseed or relogin "
+        "the managed xAI OAuth credential."
+    )
+    codex_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=[spark_error, codex_success]),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(side_effect=grok_refresh_error),
+    ) as mock_grok_token:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is codex_success
+    assert mock_pass_through.await_count == 2
+    mock_grok_token.assert_awaited_once()
+    final_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
+    metadata = final_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex"
+    assert [attempt["provider"] for attempt in metadata["codex_auto_agent_attempts"]] == [
+        "antigravity",
+        "openai",
+        "xai",
+        "openai",
+    ]
+    assert (
+        "aawm_codex_auto_agent_candidate_unavailable"
+        in metadata["codex_auto_agent_attempts"][2]["error_tokens"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     monkeypatch,
 ):
@@ -14309,6 +14492,86 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
         for attempt in opencode_attempts
     )
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata["codex_auto_agent_skipped_candidates"]
+    }
+    assert "google/gemma-4-31b-it:free" in skipped_models
+    assert "deepseek-v4-flash-free" in skipped_models
+    assert "big-pickle" in skipped_models
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_openrouter_stream_without_completed_reaches_mini(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": True,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "opencode_zen:deepseek-v4-flash-free:opencode_zen",
+        60.0,
+    )
+    await _set_codex_auto_agent_cooldown(
+        "opencode_zen:big-pickle:opencode_zen",
+        60.0,
+    )
+
+    async def _openrouter_stream_without_completed():
+        yield (
+            b'event: response.created\ndata: {"type":"response.created",'
+            b'"response":{"id":"resp_empty","model":"google/gemma-4-31b-it:free",'
+            b'"status":"in_progress"}}\n\n'
+        )
+        yield (
+            b'event: response.output_text.delta\n'
+            b'data: {"type":"response.output_text.delta","item_id":"msg_1",'
+            b'"output_index":0,"delta":""}\n\n'
+        )
+
+    mini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_adapter_pass_through_request",
+        new=AsyncMock(
+            return_value=StreamingResponse(
+                _openrouter_stream_without_completed(),
+                media_type="text/event-stream",
+            )
+        ),
+    ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=mini_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is mini_success
+    mock_openrouter.assert_awaited_once()
+    mock_pass_through.assert_awaited_once()
+    mini_body = mock_pass_through.await_args.kwargs["custom_body"]
+    assert mini_body["model"] == "gpt-5.4-mini"
+    metadata = mini_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_last_resort"] is True
+    openrouter_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert openrouter_attempt["provider"] == "openrouter"
+    assert openrouter_attempt["status"] == "cooldown_set"
+    assert "RATE_LIMIT_EXCEEDED" in openrouter_attempt["error_tokens"]
     skipped_models = {
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
