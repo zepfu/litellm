@@ -2212,6 +2212,44 @@ session-history proof.
 
 ---
 
+### cb-v0.0.42 — Callback overlay parity for Antigravity/OpenCode attribution
+
+**Status:** AAWM callback overlay release candidate.
+
+**What changed:** The callback wheel source under
+`.wheel-build/aawm_litellm_callbacks/agent_identity.py` is synced back to the
+in-repo callback at `litellm/integrations/aawm_agent_identity.py`. This carries
+the Antigravity session-history and provider-rate-limit attribution fixes from
+the source tree into the production callback overlay, including
+`provider=antigravity` preservation for Codex/OpenAI and Claude/Anthropic
+adapter traffic, Antigravity pool-level quota rows with
+`client_family=antigravity_code_assist`, and the OpenCode Zen attribution
+metadata added for the aawm.65 Responses bridge. A focused regression test now
+asserts source/overlay parity so future callback behavior cannot silently drift
+between `litellm-dev` and the production-style installed wheel path.
+
+**Why:** `litellm-dev` imports the source-tree callback, while the production
+`aawm-litellm` image imports the installed
+`aawm_litellm_callbacks.agent_identity` wheel module. Antigravity source fixes
+had landed in the fork, but production reporting could still store
+Antigravity traffic under upstream-shaped `openai`, `gemini`, or Google Code
+Assist dimensions if the callback overlay wheel stayed on the older source.
+
+**Why not upstream:** This is specific to AAWM's callback overlay release line,
+`aawm_tristore` reporting schema, Antigravity/OpenCode pass-through metadata,
+and production image packaging.
+
+**Validation status:** Focused callback tests cover source/overlay parity,
+Antigravity quota-pool attribution, Antigravity over Google API-base
+normalization, exact Codex/OpenAI `provider=openai` masking, exact
+Claude/Anthropic `provider=gemini` masking, and OpenCode Zen identity
+preservation. The callback wheel builds successfully from `.wheel-build/`.
+Promotion still requires merging to `main` so artifact autobump publishes the
+next `cb-v*` release, rebuilding/restarting `aawm-litellm`, then running dev and
+prod persisted `session_history` / `rate_limit_observations` proof.
+
+---
+
 
 ## Dropped Patches
 

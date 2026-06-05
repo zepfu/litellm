@@ -1,6 +1,7 @@
 import inspect
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,6 +26,14 @@ from litellm.integrations.aawm_agent_identity import (
     _persist_session_history_record,
 )
 from litellm.integrations.langfuse.langfuse import LangFuseLogger
+
+
+def test_aawm_agent_identity_callback_overlay_matches_source() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    source = repo_root / "litellm/integrations/aawm_agent_identity.py"
+    overlay = repo_root / ".wheel-build/aawm_litellm_callbacks/agent_identity.py"
+
+    assert overlay.read_text() == source.read_text()
 
 
 class _FakePoolAcquire:
@@ -10601,6 +10610,126 @@ def test_build_session_history_record_preserves_antigravity_provider_over_google
     assert record["input_tokens"] == 10
     assert record["output_tokens"] == 3
     assert record["total_tokens"] == 13
+
+
+def test_build_session_history_record_recovers_codex_antigravity_over_openai_provider() -> None:
+    kwargs = _base_kwargs("codex")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-antigravity-codex-openai",
+            "passthrough_route_family": "codex_antigravity_code_assist_adapter",
+            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            "codex_adapter_original_model": "antigravity/gemini-3.1-pro-low",
+            "codex_adapter_model": "gemini-3.1-pro-low",
+            "aawm_stream_logging_custom_llm_provider": "antigravity",
+            "usage_object": {
+                "input_tokens": 16,
+                "output_tokens": 5,
+                "total_tokens": 21,
+            },
+        }
+    )
+    kwargs["standard_logging_object"]["metadata"] = dict(
+        kwargs["litellm_params"]["metadata"]
+    )
+    kwargs["standard_logging_object"]["api_base"] = (
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+    )
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["model"] = "gemini-3.1-pro-low"
+    result = {
+        "id": "provider-response-antigravity-codex",
+        "model": "gemini-3.1-pro-low",
+        "usage": {
+            "prompt_tokens": 16,
+            "completion_tokens": 5,
+            "total_tokens": 21,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "antigravity codex result",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-03T12:40:20Z",
+        end_time="2026-06-03T12:40:22Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "antigravity"
+    assert record["model"] == "gemini-3.1-pro-low"
+    assert record["metadata"]["codex_adapter_original_model"] == (
+        "antigravity/gemini-3.1-pro-low"
+    )
+    assert _build_session_history_db_payload(record)[4] == "antigravity"
+
+
+def test_build_session_history_record_recovers_anthropic_antigravity_over_gemini_provider() -> None:
+    kwargs = _base_kwargs("claude-code")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-antigravity-anthropic-gemini",
+            "passthrough_route_family": "anthropic_antigravity_completion_adapter",
+            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            "anthropic_adapter_original_model": (
+                "google-antigravity/claude-sonnet-4-6"
+            ),
+            "anthropic_adapter_model": "claude-sonnet-4-6",
+            "aawm_stream_logging_custom_llm_provider": "antigravity",
+            "usage_object": {
+                "input_tokens": 18,
+                "output_tokens": 6,
+                "total_tokens": 24,
+            },
+        }
+    )
+    kwargs["standard_logging_object"]["metadata"] = dict(
+        kwargs["litellm_params"]["metadata"]
+    )
+    kwargs["standard_logging_object"]["api_base"] = (
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+    )
+    kwargs["custom_llm_provider"] = "gemini"
+    kwargs["model"] = "claude-sonnet-4-6"
+    result = {
+        "id": "provider-response-antigravity-anthropic",
+        "model": "claude-sonnet-4-6",
+        "usage": {
+            "prompt_tokens": 18,
+            "completion_tokens": 6,
+            "total_tokens": 24,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "antigravity anthropic result",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-03T12:45:20Z",
+        end_time="2026-06-03T12:45:22Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "antigravity"
+    assert record["model"] == "claude-sonnet-4-6"
+    assert record["metadata"]["anthropic_adapter_original_model"] == (
+        "google-antigravity/claude-sonnet-4-6"
+    )
+    assert _build_session_history_db_payload(record)[4] == "antigravity"
 
 
 def test_build_session_history_record_preserves_opencode_zen_provider_identity() -> None:
