@@ -2286,10 +2286,47 @@ policy.
 
 **Validation status:** Focused tests cover passthrough metadata capture,
 snapshot hashing/truncation fields, credential redaction, and preservation of
-the new metadata through the AAWM session-history record builder. Live
-acceptance still requires a controlled Codex/OpenAI Responses request with
-advertised tools against a refreshed runtime, followed by exact
-`public.session_history` and/or Langfuse proof for the generated session.
+the new metadata through the AAWM session-history record builder. Live dev proof
+on 2026-06-05 used exact session
+`d1-206-spawn-tool-20260605T0112Z` and response id
+`resp_0b38de761f6182ed006a2256b669b4819184f512bd46218574`.
+`public.session_history` row `1150506` and ClickHouse observation
+`time-04-55-18-144748_resp_0b38de761f6182ed006a2256b669b4819184f512bd46218574`
+recorded `aawm_tool_definition_names=["spawn_agent"]`, the callable parameter
+schema including lower-case `model`, the `multi_agent_v1.spawn_agent`
+description text, snapshot hash
+`5b2b552cacfb16cdc82286196bf62ce1e3472873f02ecb8e73d02cf1d521deb9`, and
+`aawm_tool_definition_snapshot_truncated=false`.
+
+---
+
+### aawm.68 — Resilient AAWM session-history flush diagnostics and timeout
+
+**Status:** AAWM local release candidate.
+
+**What changed:** The AAWM session-history callback now logs flush failures with
+`verbose_logger.exception()` and formats empty-string exceptions as
+`TypeName: repr(...)`, making async persistence failures actionable in runtime
+logs. The asyncpg command timeout used by both direct session-history
+connections and pooled writer connections is now configurable through
+`AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS` and defaults to 60 seconds.
+The callback wheel overlay is synced to the source callback so production-style
+installed-wheel runtimes use the same writer behavior.
+
+**Why:** Large Codex/OpenAI passthrough records carrying full request context and
+tool-definition snapshots can exceed the previous hard-coded 10 second asyncpg
+command timeout. Before this patch, the failure could appear as an empty warning
+message, leaving no useful root cause in dev/prod logs.
+
+**Why not upstream:** The callback, environment variable, and
+`aawm_tristore.public.session_history` persistence path are AAWM-specific
+observability infrastructure.
+
+**Validation status:** Focused tests cover the parsed/default command timeout,
+pool wiring, empty-message overflow-thread warning formatting, and
+empty-message batch flush exception logging. Live dev proof after restart
+persisted exact D1-206 session-history row `1150506` for session
+`d1-206-spawn-tool-20260605T0112Z`.
 
 ---
 
