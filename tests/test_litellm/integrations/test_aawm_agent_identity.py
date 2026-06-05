@@ -61,6 +61,21 @@ class _FakePool:
         return acquire_context
 
 
+def _assert_no_postgres_nul_bytes(value) -> None:
+    if isinstance(value, str):
+        assert "\x00" not in value
+        assert "\\u0000" not in value
+        return
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            _assert_no_postgres_nul_bytes(key)
+            _assert_no_postgres_nul_bytes(nested_value)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_no_postgres_nul_bytes(item)
+
+
 def _base_kwargs(trace_name: str = "claude-code") -> dict:
     return {
         "litellm_params": {"metadata": {"trace_name": trace_name}},
@@ -8743,6 +8758,93 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_persist_session_history_record_strips_postgres_nul_bytes(
+    monkeypatch,
+) -> None:
+    record = {
+        "litellm_call_id": "call-\x00nul",
+        "session_id": "session-\x00nul",
+        "trace_id": "trace-\x00nul",
+        "provider_response_id": "resp-\x00nul",
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "model_group": "claude-opus-4-8",
+        "agent_name": "claude-\x00code",
+        "tenant_id": "litellm-\x00repo",
+        "call_type": "pass_through_endpoint",
+        "start_time": None,
+        "end_time": None,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "reasoning_tokens_reported": None,
+        "reasoning_tokens_estimated": None,
+        "reasoning_tokens_source": "not_applicable",
+        "reasoning_present": False,
+        "thinking_signature_present": False,
+        "tool_call_count": 1,
+        "invalid_tool_call_count": 0,
+        "tool_names": ["Read\x00"],
+        "file_read_count": 1,
+        "file_modified_count": 0,
+        "git_commit_count": 0,
+        "git_push_count": 0,
+        "tool_activity": [
+            {
+                "tool_index": 0,
+                "tool_call_id": "tool-\x00nul",
+                "tool_name": "Read\x00",
+                "tool_kind": "read\x00",
+                "file_paths_read": ["src/\x00file.py"],
+                "file_paths_modified": [],
+                "git_commit_count": 0,
+                "git_push_count": 0,
+                "command_text": "cat src/\x00file.py",
+                "arguments": {"path": "src/\x00file.py"},
+                "metadata": {"source\x00": "message.tool_calls\x00"},
+            }
+        ],
+        "response_cost_usd": 0.0,
+        "metadata": {
+            "requested_model_alias": "aawm-sota-anthropic\x00",
+            "anthropic_auto_agent_selected_model": "claude-opus-4-8\x00",
+            "raw_response": {"text": "contains\x00nul"},
+        },
+    }
+
+    mock_conn = AsyncMock()
+    fake_pool = _FakePool(mock_conn)
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+
+    await _persist_session_history_record(record)
+
+    executed_args = mock_conn.execute.await_args_list[0].args
+    assert "INSERT INTO public.session_history" in executed_args[0]
+    _assert_no_postgres_nul_bytes(executed_args[1:])
+    assert json.loads(executed_args[31]) == ["Read"]
+    metadata_payload = json.loads(executed_args[51])
+    assert metadata_payload["requested_model_alias"] == "aawm-sota-anthropic"
+    assert metadata_payload["raw_response"] == {"text": "containsnul"}
+
+    tool_args = mock_conn.executemany.await_args.args
+    assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
+    _assert_no_postgres_nul_bytes(tool_args[1])
+    tool_payload = tool_args[1][0]
+    assert json.loads(tool_payload[10]) == ["src/file.py"]
+    assert json.loads(tool_payload[15]) == {"path": "src/file.py"}
+    assert json.loads(tool_payload[16]) == {"source": "message.tool_calls"}
+
+
+@pytest.mark.asyncio
 async def test_persist_session_history_record_writes_openrouter_free_daily_meter(
     monkeypatch,
 ) -> None:
@@ -11519,6 +11621,105 @@ def test_session_history_payload_preserves_unknown_sensitive_config_flags() -> N
     )
 
     assert payload[33:37] == (None, None, None, None)
+
+
+def test_session_history_db_payload_strips_postgres_nul_bytes() -> None:
+    payload = _build_session_history_db_payload(
+        {
+            "litellm_call_id": "call-\x00nul",
+            "session_id": "session-\x00nul",
+            "trace_id": "trace-\x00nul",
+            "provider_response_id": "response-\x00nul",
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "model_group": "claude-opus-4-8",
+            "agent_name": "claude-\x00code",
+            "tenant_id": "tenant-\x00nul",
+            "call_type": "messages",
+            "start_time": None,
+            "end_time": None,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens_reported": None,
+            "reasoning_tokens_estimated": None,
+            "reasoning_tokens_source": "not_applicable",
+            "reasoning_present": False,
+            "thinking_signature_present": False,
+            "tool_call_count": 1,
+            "invalid_tool_call_count": 0,
+            "tool_names": ["Read\x00"],
+            "file_read_count": 0,
+            "file_modified_count": 0,
+            "git_commit_count": 0,
+            "git_push_count": 0,
+            "response_cost_usd": None,
+            "litellm_wheel_versions": {"wheel\x00name": "1.\x000"},
+            "client_name": "claude\x00",
+            "client_version": "1.\x000",
+            "client_user_agent": "Claude-Code/\x001.0",
+            "metadata": {
+                "nul\x00key": {"nested": "value\x00with-nul"},
+                "items": ["one\x00", {"two": "three\x00"}],
+            },
+            "repository": "repo-\x00nul",
+            "agent_score_reasons": {"reason\x00": "ok\x00"},
+        }
+    )
+
+    string_values = [value for value in payload if isinstance(value, str)]
+    assert all("\x00" not in value for value in string_values)
+    assert json.loads(payload[30]) == ["Read"]
+    assert json.loads(payload[43]) == {"wheelname": "1.0"}
+    metadata_payload = json.loads(payload[50])
+    assert metadata_payload["nulkey"] == {"nested": "valuewith-nul"}
+    assert metadata_payload["items"] == ["one", {"two": "three"}]
+    assert "\\u0000" not in payload[30]
+    assert "\\u0000" not in payload[43]
+    assert "\\u0000" not in payload[50]
+
+
+def test_tool_activity_db_payload_strips_postgres_nul_bytes() -> None:
+    payloads = aawm_agent_identity._build_tool_activity_db_payloads(
+        {
+            "litellm_call_id": "call-\x00nul",
+            "session_id": "session-\x00nul",
+            "trace_id": "trace-\x00nul",
+            "provider": "anthropic\x00",
+            "model": "claude-opus-4-8\x00",
+            "agent_name": "claude-code\x00",
+            "tool_activity": [
+                {
+                    "tool_index": 0,
+                    "tool_call_id": "tool-\x00nul",
+                    "tool_name": "Read\x00",
+                    "tool_kind": "read\x00",
+                    "file_paths_read": ["src/\x00file.py"],
+                    "file_paths_modified": ["dst/\x00file.py"],
+                    "git_commit_count": 0,
+                    "git_push_count": 0,
+                    "command_text": "cat src/\x00file.py",
+                    "arguments": {"path": "src/\x00file.py"},
+                    "metadata": {"source\x00": "message.tool_calls\x00"},
+                }
+            ],
+        }
+    )
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    string_values = [value for value in payload if isinstance(value, str)]
+    assert all("\x00" not in value for value in string_values)
+    assert json.loads(payload[10]) == ["src/file.py"]
+    assert json.loads(payload[11]) == ["dst/file.py"]
+    assert json.loads(payload[15]) == {"path": "src/file.py"}
+    assert json.loads(payload[16]) == {"source": "message.tool_calls"}
+    assert "\\u0000" not in payload[10]
+    assert "\\u0000" not in payload[11]
+    assert "\\u0000" not in payload[15]
+    assert "\\u0000" not in payload[16]
 
 
 def test_tool_activity_upsert_sql_guards_scalar_file_paths() -> None:

@@ -2252,8 +2252,8 @@ paths. Focused callback tests cover source/overlay parity plus Codex and
 Anthropic auto-agent selected-provider/model attribution. Active
 `~/.codex` catalog/cache entries and live prod/dev smokes for the six public
 aliases remain separate acceptance gates. The direct Anthropic SOTA candidate
-currently uses the configured direct Opus slug `claude-opus-4-6`; update the
-policy/catalog together when a verified direct Opus 4.8 slug is available.
+was updated to the verified direct Opus slug `claude-opus-4-8` in the D1-208
+completion patch; see `aawm.70` for the live proof and session-history rows.
 
 ---
 
@@ -2361,6 +2361,49 @@ probes, OpenRouter streamed empty/no-completed rollover, and the broader
 auto-agent/Grok/OpenCode/Antigravity selection surface. Live dev smokes on
 2026-06-05 proved `aawm-sota`, `aawm-code`, and `aawm-low` return sentinels and
 persist selected target/attempt metadata in `public.session_history`.
+
+---
+
+### aawm.70 — Anthropic tiered alias Opus 4.8 completion and NUL-safe callback payloads
+
+**Status:** AAWM local release candidate.
+
+**What changed:** `aawm-sota-anthropic` now targets direct Anthropic
+`claude-opus-4-8`, with matching model-cost entries in the primary and bundled
+fallback cost maps. The AAWM session-history callback strips PostgreSQL NUL
+bytes from text and JSON payloads at the final DB payload boundary for both
+`public.session_history` and `public.session_history_tool_activity`, and the
+callback wheel overlay is synced to the source callback.
+
+**Why:** D1-208 requested Opus 4.8 for the SOTA Anthropic tier. Live Claude
+smoke validation also exposed asyncpg JSONB persistence failures when callback
+payloads contained `\x00`; PostgreSQL cannot store NUL bytes in text/jsonb
+values, so the writer must scrub them before insertion.
+
+**Why not upstream:** The alias names, Opus 4.8 routing policy, local model-cost
+entry, callback overlay, and `aawm_tristore.public.session_history`
+observability contract are AAWM-specific.
+
+**Validation status:** Focused route tests covered Anthropic alias ordering,
+Grok/Antigravity rollover, OpenCode/OpenRouter adapter selection, and the SOTA
+Opus 4.8 target. Focused callback tests covered source/overlay parity,
+session-history selected-target attribution, builder-level NUL scrubbing, and
+the async persistence flush path. Live dev proof on 2026-06-05 after restarting
+`litellm-dev` used route hash
+`f96d6f72395318ba39385aba679bc3f43f82d841f80394d60a5830b1de7097fa` and
+callback hash
+`138386c93f4d69ec7e3d8e61c1cabd5f43f3212b73c3bddc70e9e55f5c151d21`.
+`aawm-low-anthropic` returned `D1 208 Low Anthropic routing is ready.` and
+persisted row `1154404` selecting `openrouter|google/gemma-4-31b-it:free`.
+`aawm-code-anthropic` returned `D1 208 Code Anthropic routing is ready.` and
+persisted row `1154444` selecting `openai|gpt-5.3-codex-spark` after
+Antigravity `invalid_client` cooled as candidate-unavailable. A credentialed
+Claude CLI smoke for `aawm-sota-anthropic` returned model output and persisted
+row `1154487` selecting `anthropic|claude-opus-4-8`. Rate-limit observations
+were recorded for the three live rows: OpenRouter daily request meter `132049`,
+Codex token pools `132061`-`132064`, and Anthropic response-header token pools
+`132075`-`132076`. A post-smoke log scan after 2026-06-05 02:10 EDT found no
+`unsupported Unicode`, `\u0000`, or `failed to flush` callback errors.
 
 ---
 
