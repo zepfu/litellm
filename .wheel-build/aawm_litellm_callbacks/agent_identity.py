@@ -14924,7 +14924,7 @@ async def _ensure_session_history_schema(conn: Any) -> None:
 
 
 def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    record = _normalize_session_history_record(dict(record))
+    record = _strip_postgres_nul_bytes(_normalize_session_history_record(dict(record)))
     return (
         record["litellm_call_id"],
         record["session_id"],
@@ -15054,7 +15054,23 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
     )
 
 
+def _strip_postgres_nul_bytes(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_postgres_nul_bytes(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_postgres_nul_bytes(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _strip_postgres_nul_bytes(key): _strip_postgres_nul_bytes(nested_value)
+            for key, nested_value in value.items()
+        }
+    return value
+
+
 def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, ...]]:
+    record = _strip_postgres_nul_bytes(record)
     tool_activity = record.get("tool_activity") or []
     if not isinstance(tool_activity, list):
         return []

@@ -12970,7 +12970,7 @@ async def test_anthropic_auto_agent_alias_sota_selects_direct_opus_first():
         )
 
     assert selection["candidate"]["provider"] == "anthropic"
-    assert selection["candidate"]["model"] == "claude-opus-4-6"
+    assert selection["candidate"]["model"] == "claude-opus-4-8"
     assert selection["selection_reason"] == "first_available"
     assert selection["skipped"] == []
 
