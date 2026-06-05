@@ -18035,10 +18035,15 @@ async def _handle_codex_opencode_zen_adapter_route(
     prepared_request_body: dict[str, Any],
     adapter_model: str,
 ) -> Response:
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
     _ = fastapi_response
     requested_model = prepared_request_body.get("model")
     request_body = copy.deepcopy(prepared_request_body)
     request_body["model"] = adapter_model
+    removed_format = request_body.pop("format", None)
     request_body = _strip_opencode_zen_unsupported_responses_tools(request_body)
     request_body = _add_opencode_zen_logging_metadata(
         request_body,
@@ -18049,46 +18054,104 @@ async def _handle_codex_opencode_zen_adapter_route(
         input_shape="openai_responses",
         output_shape="openai_responses",
     )
+    target_endpoint = "opencode_zen:/v1/chat/completions"
+    tags_to_add = [
+        f"codex-adapter-model:{adapter_model}",
+        f"codex-adapter-target:{target_endpoint}",
+    ]
+    extra_fields: dict[str, Any] = {
+        "codex_adapter_model": adapter_model,
+        "codex_adapter_original_model": requested_model,
+        "codex_adapter_provider": _OPENCODE_ZEN_PROVIDER,
+        "codex_adapter_target_endpoint": target_endpoint,
+    }
+    if removed_format is not None:
+        tags_to_add.append("opencode-zen-unsupported-format-stripped")
+        extra_fields["opencode_zen_removed_unsupported_format"] = removed_format
     request_body = _merge_litellm_metadata(
         request_body,
-        tags_to_add=[
-            f"codex-adapter-model:{adapter_model}",
-            "codex-adapter-target:opencode_zen:/v1/responses",
-        ],
-        extra_fields={
-            "codex_adapter_model": adapter_model,
-            "codex_adapter_original_model": requested_model,
-            "codex_adapter_provider": _OPENCODE_ZEN_PROVIDER,
-            "codex_adapter_target_endpoint": "opencode_zen:/v1/responses",
-        },
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
     )
+    request_input = request_body.get("input") or ""
+    responses_api_request = {
+        key: value
+        for key, value in request_body.items()
+        if key not in {"input", "model", "litellm_metadata"}
+    }
+    litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model=adapter_model,
+        input=request_input,
+        responses_api_request=responses_api_request,
+        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        stream=bool(request_body.get("stream")),
+        metadata=litellm_metadata,
+    )
+    completion_kwargs["metadata"] = litellm_metadata
 
     target_base_url = _get_opencode_zen_target_base()
     target_url = _join_opencode_zen_passthrough_url(
         base_target_url=target_base_url,
-        endpoint="/v1/responses",
+        endpoint="/v1/chat/completions",
     )
-    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
-    response = await pass_through_request(
+    api_key = await _load_local_opencode_zen_api_key()
+    custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=api_key,
         request=request,
-        target=target_url,
-        custom_headers=await _build_opencode_zen_headers(request),
-        user_api_key_dict=user_api_key_dict,
-        custom_body=request_body,
-        forward_headers=False,
-        allowed_forward_headers=[],
-        allowed_pass_through_prefixed_headers=[],
-        stream=bool(request_body.get("stream")),
-        custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
-        egress_credential_family="opencode",
+    )
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=target_url,
+        headers=custom_headers,
+        credential_family="opencode",
         expected_target_family="opencode",
     )
-    if isinstance(response, StreamingResponse):
-        return _build_codex_opencode_zen_streaming_response(
-            response,
-            adapter_model=adapter_model,
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    completion_response = await litellm.acompletion(
+        **completion_kwargs,
+        api_key=api_key,
+        api_base=f"{target_base_url.rstrip('/')}/v1",
+        litellm_metadata=litellm_metadata,
+        proxy_server_request={
+            "headers": dict(request.headers),
+            "body": request_body,
+        },
+    )
+    if bool(request_body.get("stream")):
+        from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+            LiteLLMCompletionStreamingIterator,
         )
-    return response
+
+        return StreamingResponse(
+            _responses_sse_from_iterator(
+                LiteLLMCompletionStreamingIterator(
+                    model=adapter_model,
+                    litellm_custom_stream_wrapper=completion_response,
+                    request_input=request_input,
+                    responses_api_request=responses_api_request,
+                    custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+                    litellm_metadata=litellm_metadata,
+                )
+            ),
+            media_type="text/event-stream",
+        )
+
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        chat_completion_response=completion_response,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+    )
+    response_body = json.loads(
+        _serialize_responses_adapter_response(responses_api_response)
+    )
+    if _is_codex_auto_agent_empty_success_responses_body(response_body):
+        _raise_codex_auto_agent_empty_success_response(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter="codex_opencode_zen_completion_adapter",
+            adapter_label="OpenCode Zen chat-completions",
+        )
+    return _build_responses_response_from_adapter_response(responses_api_response)
 
 
 async def _perform_codex_auto_agent_openrouter_completion_request(

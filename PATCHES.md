@@ -2172,6 +2172,46 @@ built-image inspection, and prod validation after the container restart.
 
 ---
 
+### aawm.65 — OpenCode Zen Codex Responses adapter chat-completions bridge
+
+**Status:** AAWM local release candidate.
+
+**What changed:** Codex/OpenAI Responses traffic for OpenCode Zen free models,
+including `opencode/big-pickle`, now adapts the inbound Responses request into a
+chat-completions call against OpenCode Zen `/v1/chat/completions` through
+`litellm.acompletion`. The adapter strips OpenCode's unsupported top-level
+Responses `format` parameter, preserves supported function tools, removes
+unsupported Codex tool advertisements, and converts the chat completion result
+back into an OpenAI Responses response for Codex. Route metadata now records the
+public model, adapter model, OpenCode provider family, and
+`codex_adapter_target_endpoint=opencode_zen:/v1/chat/completions`.
+
+**Why:** OpenCode Zen accepts `big-pickle` through its chat-completions shape but
+rejects the prior direct `/v1/responses` passthrough for Codex/OpenAI-format
+requests with `401 ModelError: Model big-pickle is not supported for format
+openai`. The existing route reached OpenCode, but the endpoint/format pairing
+was unusable for Codex CLI.
+
+**Why not upstream:** This depends on the AAWM local OpenCode saved credential,
+the AAWM OpenCode model aliases, Codex-native request markers, and
+`aawm_tristore` session-history metadata used to prove adapter attribution.
+
+**Validation status:** Focused unit coverage verifies saved OpenCode auth,
+egress validation, format stripping, supported function-tool conversion,
+Responses response reconstruction, streaming iterator wiring, and the
+OpenAI-passthrough route selection. Dev runtime smoke
+`d1-203-dev-opencode-bigpickle-20260604T2058` returned
+`OPENCODE BIG PICKLE DEV OK`, and `public.session_history` row `1133308`
+stored `provider=opencode_zen`, `model=big-pickle`, `client_name=codex_exec`,
+token counts `16660/32/16692`, route family
+`codex_opencode_zen_adapter`, and
+`codex_adapter_target_endpoint=opencode_zen:/v1/chat/completions`. Prod
+promotion still requires publishing the `v1.82.3-aawm.65` fork image,
+rebuilding/restarting `aawm-litellm`, then running the prod Codex smoke and
+session-history proof.
+
+---
+
 
 ## Dropped Patches
 

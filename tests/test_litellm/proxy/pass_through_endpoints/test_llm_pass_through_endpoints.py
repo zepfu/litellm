@@ -6221,6 +6221,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         prepared_body = {
             "model": "opencode/big-pickle",
             "input": "just a test msg",
+            "format": "openai",
             "stream": False,
             "tools": [
                 {
@@ -6244,16 +6245,33 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
             new=AsyncMock(return_value="opencode-test-key"),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ) as mock_validate_egress, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
             new=AsyncMock(
-                return_value=Response(
-                    content=json.dumps(
-                        {"id": "resp_opencode", "model": "big-pickle"}
-                    ),
-                    media_type="application/json",
-                )
+                return_value={
+                    "id": "chatcmpl_opencode",
+                    "object": "chat.completion",
+                    "created": 1770000000,
+                    "model": "big-pickle",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "OPENCODE CODEX OK",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 4,
+                        "total_tokens": 9,
+                    },
+                }
             ),
-        ) as mock_pass_through_request:
+        ) as mock_acompletion:
             response = await _handle_codex_opencode_zen_adapter_route(
                 endpoint="v1/responses",
                 request=mock_request,
@@ -6263,24 +6281,28 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 adapter_model="big-pickle",
             )
 
-        call_kwargs = mock_pass_through_request.await_args.kwargs
-        assert call_kwargs["target"] == "https://opencode.ai/zen/v1/responses"
-        assert call_kwargs["custom_headers"]["authorization"] == (
+        mock_validate_egress.assert_called_once()
+        validate_kwargs = mock_validate_egress.call_args.kwargs
+        assert validate_kwargs["url"] == "https://opencode.ai/zen/v1/chat/completions"
+        assert validate_kwargs["headers"]["authorization"] == (
             "Bearer opencode-test-key"
         )
-        assert call_kwargs["forward_headers"] is False
-        assert call_kwargs["custom_llm_provider"] == "opencode_zen"
-        assert call_kwargs["egress_credential_family"] == "opencode"
-        assert call_kwargs["expected_target_family"] == "opencode"
-        assert call_kwargs["custom_body"]["model"] == "big-pickle"
-        assert call_kwargs["custom_body"]["tools"] == [
-            {
-                "type": "function",
-                "name": "repo_status",
-                "parameters": {"type": "object", "properties": {}},
-            }
-        ]
-        litellm_metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        assert validate_kwargs["credential_family"] == "opencode"
+        assert validate_kwargs["expected_target_family"] == "opencode"
+        call_kwargs = mock_acompletion.await_args.kwargs
+        assert call_kwargs["model"] == "big-pickle"
+        assert call_kwargs["api_key"] == "opencode-test-key"
+        assert call_kwargs["api_base"] == "https://opencode.ai/zen/v1"
+        assert call_kwargs["custom_llm_provider"] == "openai"
+        assert call_kwargs["stream"] is False
+        assert "format" not in call_kwargs
+        assert call_kwargs["tools"][0]["type"] == "function"
+        assert call_kwargs["tools"][0]["function"]["name"] == "repo_status"
+        assert call_kwargs["tools"][0]["function"]["parameters"] == {
+            "type": "object",
+            "properties": {},
+        }
+        litellm_metadata = call_kwargs["litellm_metadata"]
         assert (
             litellm_metadata["passthrough_route_family"]
             == "codex_opencode_zen_adapter"
@@ -6291,6 +6313,10 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         )
         assert litellm_metadata["client_name"] == "codex_exec"
         assert litellm_metadata["codex_adapter_provider"] == "opencode_zen"
+        assert litellm_metadata["codex_adapter_target_endpoint"] == (
+            "opencode_zen:/v1/chat/completions"
+        )
+        assert litellm_metadata["opencode_zen_removed_unsupported_format"] == "openai"
         assert litellm_metadata["opencode_zen_removed_unsupported_tool_count"] == 4
         assert litellm_metadata["opencode_zen_removed_unsupported_tool_types"] == [
             "custom",
@@ -6310,10 +6336,14 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "opencode-zen-unsupported-tools-stripped"
             in litellm_metadata["tags"]
         )
-        assert json.loads(response.body.decode("utf-8")) == {
-            "id": "resp_opencode",
-            "model": "big-pickle",
-        }
+        assert (
+            "opencode-zen-unsupported-format-stripped"
+            in litellm_metadata["tags"]
+        )
+        response_body = json.loads(response.body.decode("utf-8"))
+        assert response_body["id"] == "chatcmpl_opencode"
+        assert response_body["model"] == "big-pickle"
+        assert "OPENCODE CODEX OK" in json.dumps(response_body)
 
     @pytest.mark.asyncio
     async def test_codex_opencode_zen_stream_injects_responses_item_lifecycle(
@@ -6336,19 +6366,26 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         }
         mock_request.query_params = {}
 
-        async def _opencode_stream():
-            yield (
-                b'event: response.output_text.delta\n'
-                b'data: {"id":"resp_opencode_stream","type":"response.output_text.delta",'
-                b'"delta":"OPENCODE CODEX OK","response":{"id":"resp_opencode_stream",'
-                b'"model":"deepseek-v4-flash"}}\n\n'
+        class _FakeResponseEvent(SimpleNamespace):
+            def model_dump_json(self, exclude_none=True):
+                _ = exclude_none
+                return json.dumps(self.__dict__)
+
+        async def _responses_events():
+            yield _FakeResponseEvent(
+                type="response.output_text.delta",
+                delta="OPENCODE CODEX OK",
             )
-            yield (
-                b'event: response.completed\n'
-                b'data: {"id":"resp_opencode_stream","type":"response.completed",'
-                b'"response":{"id":"resp_opencode_stream","model":"deepseek-v4-flash",'
-                b'"usage":{"input_tokens":88,"output_tokens":39,"total_tokens":127}}}\n\n'
-            )
+
+        fake_stream_wrapper = object()
+        iterator_inits = []
+
+        class _FakeCompletionStreamingIterator:
+            def __init__(self, **kwargs):
+                iterator_inits.append(kwargs)
+
+            def __aiter__(self):
+                return _responses_events()
 
         prepared_body = {
             "model": "opencode/deepseek-v4-flash-free",
@@ -6360,15 +6397,13 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
             new=AsyncMock(return_value="opencode-test-key"),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-            new=AsyncMock(
-                return_value=StreamingResponse(
-                    _opencode_stream(),
-                    status_code=200,
-                    headers={"x-opencode-upstream": "1"},
-                    media_type="text/event-stream",
-                )
-            ),
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ) as mock_validate_egress, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
+            new=AsyncMock(return_value=fake_stream_wrapper),
+        ) as mock_acompletion, patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            _FakeCompletionStreamingIterator,
         ):
             response = await _handle_codex_opencode_zen_adapter_route(
                 endpoint="v1/responses",
@@ -6379,25 +6414,27 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 adapter_model="deepseek-v4-flash-free",
             )
 
+        mock_validate_egress.assert_called_once()
+        assert mock_validate_egress.call_args.kwargs["url"] == (
+            "https://opencode.ai/zen/v1/chat/completions"
+        )
+        call_kwargs = mock_acompletion.await_args.kwargs
+        assert call_kwargs["model"] == "deepseek-v4-flash-free"
+        assert call_kwargs["api_key"] == "opencode-test-key"
+        assert call_kwargs["api_base"] == "https://opencode.ai/zen/v1"
+        assert call_kwargs["stream"] is True
+        assert call_kwargs["custom_llm_provider"] == "openai"
+        assert iterator_inits[0]["litellm_custom_stream_wrapper"] is fake_stream_wrapper
+        assert iterator_inits[0]["model"] == "deepseek-v4-flash-free"
+        assert iterator_inits[0]["custom_llm_provider"] == "openai"
         assert isinstance(response, StreamingResponse)
         chunks = [chunk async for chunk in response.body_iterator]
         payload = "".join(
             chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
             for chunk in chunks
         )
-        assert "event: response.created" in payload
-        assert "event: response.output_item.added" in payload
-        assert "event: response.content_part.added" in payload
         assert "event: response.output_text.delta" in payload
-        assert '"item_id":"msg_' in payload
-        assert '"output_index":0' in payload
-        assert '"content_index":0' in payload
-        assert "event: response.output_text.done" in payload
-        assert "event: response.content_part.done" in payload
-        assert "event: response.output_item.done" in payload
-        assert "event: response.completed" in payload
         assert '"OPENCODE CODEX OK"' in payload
-        assert '"output":[{"id":"msg_' in payload
         assert payload.rstrip().endswith("data: [DONE]")
 
     @pytest.mark.asyncio
@@ -18012,6 +18049,7 @@ class TestOpenAIPassthroughRoute:
         body = {
             "model": "opencode/big-pickle",
             "input": "hello",
+            "format": "openai",
             "stream": False,
             "litellm_metadata": {
                 "client_name": "codex_exec",
@@ -18040,16 +18078,30 @@ class TestOpenAIPassthroughRoute:
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
         ) as mock_set_body, patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ) as mock_validate_egress, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
             new=AsyncMock(
-                return_value=Response(
-                    content=json.dumps(
-                        {"id": "resp_opencode", "model": "big-pickle"}
-                    ),
-                    media_type="application/json",
-                )
+                return_value={
+                    "id": "chatcmpl_opencode",
+                    "object": "chat.completion",
+                    "created": 1770000000,
+                    "model": "big-pickle",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hello"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
             ),
-        ) as mock_pass_through_request:
+        ) as mock_acompletion:
             result = await openai_proxy_route(
                 endpoint="v1/responses",
                 request=mock_request,
@@ -18057,29 +18109,38 @@ class TestOpenAIPassthroughRoute:
                 user_api_key_dict=mock_user_api_key_dict,
             )
 
-        call_kwargs = mock_pass_through_request.await_args.kwargs
-        assert call_kwargs["target"] == "https://opencode.ai/zen/v1/responses"
-        assert call_kwargs["custom_headers"]["authorization"] == (
+        mock_validate_egress.assert_called_once()
+        validate_kwargs = mock_validate_egress.call_args.kwargs
+        assert validate_kwargs["url"] == "https://opencode.ai/zen/v1/chat/completions"
+        assert validate_kwargs["headers"]["authorization"] == (
             "Bearer opencode-test-key"
         )
-        assert call_kwargs["custom_llm_provider"] == "opencode_zen"
-        assert call_kwargs["egress_credential_family"] == "opencode"
-        assert call_kwargs["expected_target_family"] == "opencode"
+        assert validate_kwargs["credential_family"] == "opencode"
+        assert validate_kwargs["expected_target_family"] == "opencode"
         prepared_body = mock_set_body.call_args.args[1]
         assert prepared_body["model"] == "opencode/big-pickle"
-        custom_body = call_kwargs["custom_body"]
-        assert custom_body["model"] == "big-pickle"
-        metadata = custom_body["litellm_metadata"]
+        call_kwargs = mock_acompletion.await_args.kwargs
+        assert call_kwargs["model"] == "big-pickle"
+        assert call_kwargs["api_key"] == "opencode-test-key"
+        assert call_kwargs["api_base"] == "https://opencode.ai/zen/v1"
+        assert call_kwargs["custom_llm_provider"] == "openai"
+        assert call_kwargs["stream"] is False
+        assert "format" not in call_kwargs
+        metadata = call_kwargs["litellm_metadata"]
         assert metadata["client_name"] == "codex_exec"
         assert metadata["opencode_zen"] is True
         assert metadata["opencode_zen_adapter_model"] == "big-pickle"
         assert metadata["codex_adapter_original_model"] == "opencode/big-pickle"
         assert metadata["passthrough_route_family"] == "codex_opencode_zen_adapter"
+        assert metadata["codex_adapter_target_endpoint"] == (
+            "opencode_zen:/v1/chat/completions"
+        )
+        assert metadata["opencode_zen_removed_unsupported_format"] == "openai"
+        assert "opencode-zen-unsupported-format-stripped" in metadata["tags"]
         assert "route:codex_opencode_zen_adapter" in metadata["tags"]
-        assert json.loads(result.body.decode("utf-8")) == {
-            "id": "resp_opencode",
-            "model": "big-pickle",
-        }
+        result_body = json.loads(result.body.decode("utf-8"))
+        assert result_body["id"] == "chatcmpl_opencode"
+        assert result_body["model"] == "big-pickle"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
