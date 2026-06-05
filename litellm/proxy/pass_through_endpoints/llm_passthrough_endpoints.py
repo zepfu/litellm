@@ -8012,6 +8012,78 @@ def _raise_opencode_zen_auto_agent_candidate_unavailable(exc: Exception) -> None
     raise proxy_exc from exc
 
 
+def _antigravity_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
+    if not isinstance(exc, HTTPException):
+        return None
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        detail_text = json.dumps(detail, sort_keys=True, default=str)
+    else:
+        detail_text = str(detail or exc)
+    normalized = detail_text.lower()
+    if "antigravity oauth" not in normalized and "antigravity cli" not in normalized:
+        return None
+    return detail_text
+
+
+def _raise_antigravity_auto_agent_candidate_unavailable(exc: Exception) -> None:
+    detail = _antigravity_candidate_unavailable_detail(exc) or str(exc)
+    proxy_exc = ProxyException(
+        message=(
+            "Antigravity auto-agent candidate requires a valid Antigravity OAuth "
+            f"credential: {detail}"
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    proxy_exc.detail = {
+        "error": {
+            "message": proxy_exc.message,
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    raise proxy_exc from exc
+
+
+def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        detail_text = json.dumps(detail, sort_keys=True, default=str)
+    elif detail is not None:
+        detail_text = str(detail)
+    else:
+        detail_text = str(exc)
+    normalized = detail_text.lower()
+    if (
+        "xai oauth credential" not in normalized
+        and "grok oidc credential" not in normalized
+        and "grok native" not in normalized
+    ):
+        return None
+    return detail_text
+
+
+def _raise_grok_native_auto_agent_candidate_unavailable(exc: Exception) -> None:
+    detail = _grok_native_candidate_unavailable_detail(exc) or str(exc)
+    proxy_exc = ProxyException(
+        message=(
+            "Grok native auto-agent candidate requires a valid managed xAI/Grok "
+            f"credential: {detail}"
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    proxy_exc.detail = {
+        "error": {
+            "message": proxy_exc.message,
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    raise proxy_exc from exc
+
+
 async def _load_opencode_zen_api_key_for_candidate(
     *,
     use_alias_candidate_probe: bool = False,
@@ -10382,12 +10454,21 @@ async def _handle_anthropic_google_completion_adapter_route(
     adapter_provider: str = litellm.LlmProviders.GEMINI.value,
     use_alias_candidate_probe: bool = False,
 ) -> Response:
-    adapter_request = await _prepare_anthropic_google_completion_adapter_request(
-        request=request,
-        prepared_request_body=prepared_request_body,
-        adapter_model=adapter_model,
-        adapter_provider=adapter_provider,
-    )
+    try:
+        adapter_request = await _prepare_anthropic_google_completion_adapter_request(
+            request=request,
+            prepared_request_body=prepared_request_body,
+            adapter_model=adapter_model,
+            adapter_provider=adapter_provider,
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
+            and _antigravity_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_antigravity_auto_agent_candidate_unavailable(exc)
+        raise
     return await _perform_anthropic_google_completion_adapter_request(
         request=request,
         user_api_key_dict=user_api_key_dict,
@@ -10538,12 +10619,21 @@ async def _handle_codex_google_code_assist_adapter_route(
     adapter_provider: str = litellm.LlmProviders.GEMINI.value,
     use_alias_candidate_probe: bool = False,
 ) -> Response:
-    adapter_request = await _prepare_codex_google_code_assist_adapter_request(
-        request=request,
-        prepared_request_body=prepared_request_body,
-        adapter_model=adapter_model,
-        adapter_provider=adapter_provider,
-    )
+    try:
+        adapter_request = await _prepare_codex_google_code_assist_adapter_request(
+            request=request,
+            prepared_request_body=prepared_request_body,
+            adapter_model=adapter_model,
+            adapter_provider=adapter_provider,
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
+            and _antigravity_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_antigravity_auto_agent_candidate_unavailable(exc)
+        raise
     return await _perform_codex_google_code_assist_adapter_request(
         request=request,
         user_api_key_dict=user_api_key_dict,
@@ -10836,6 +10926,7 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
     translated_request_body = _build_anthropic_responses_adapter_request_body(
@@ -10869,25 +10960,40 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
         )
     )
 
-    (
-        prepared_grok_native,
-        target_base_url,
-        grok_headers,
-        translated_request_body,
-    ) = await _prepare_grok_native_oauth_passthrough_request(
-        translated_request_body,
-        request=request,
-        tags_to_add=[
-            "anthropic-grok-native-responses-adapter-entrypoint",
-        ],
-        extra_fields={
-            "anthropic_grok_native_requested_model": prepared_request_body.get("model"),
-            "anthropic_grok_native_adapter_model": adapter_model,
-            "anthropic_adapter_target_endpoint": "xai:/v1/responses",
-            "grok_native_entrypoint": "anthropic_messages",
-        },
-    )
+    try:
+        (
+            prepared_grok_native,
+            target_base_url,
+            grok_headers,
+            translated_request_body,
+        ) = await _prepare_grok_native_oauth_passthrough_request(
+            translated_request_body,
+            request=request,
+            tags_to_add=[
+                "anthropic-grok-native-responses-adapter-entrypoint",
+            ],
+            extra_fields={
+                "anthropic_grok_native_requested_model": prepared_request_body.get("model"),
+                "anthropic_grok_native_adapter_model": adapter_model,
+                "anthropic_adapter_target_endpoint": "xai:/v1/responses",
+                "grok_native_entrypoint": "anthropic_messages",
+            },
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _grok_native_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_grok_native_auto_agent_candidate_unavailable(exc)
+        raise
     if not prepared_grok_native or target_base_url is None:
+        if use_alias_candidate_probe:
+            _raise_grok_native_auto_agent_candidate_unavailable(
+                Exception(
+                    "Anthropic adapter requests for Grok native OAuth models "
+                    "require a Grok OIDC credential."
+                )
+            )
         raise Exception(
             "Anthropic adapter requests for Grok native OAuth models require a Grok OIDC credential."
         )
@@ -18603,28 +18709,24 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     user_api_key_dict: UserAPIKeyAuth,
     request_body: dict[str, Any],
 ) -> Response:
-    grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
-        endpoint=endpoint,
-        request=request,
-        request_body=request_body,
-        extra_headers={},
-    )
-    if grok_context is None:
-        exc = ProxyException(
-            message=(
-                "Grok native Codex auto-agent candidate requires a managed Grok OIDC credential."
-            ),
-            type="rate_limit_error",
-            param="model",
-            code=429,
+    try:
+        grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
+            endpoint=endpoint,
+            request=request,
+            request_body=request_body,
+            extra_headers={},
         )
-        exc.detail = {
-            "error": {
-                "message": exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        }
-        raise exc
+    except Exception as exc:
+        if _grok_native_candidate_unavailable_detail(exc) is not None:
+            _raise_grok_native_auto_agent_candidate_unavailable(exc)
+        raise
+    if grok_context is None:
+        _raise_grok_native_auto_agent_candidate_unavailable(
+            Exception(
+                "Grok native Codex auto-agent candidate requires a managed "
+                "Grok OIDC credential."
+            )
+        )
     _, grok_headers, grok_prepared_body, updated_url = grok_context
     return await pass_through_request(
         request=request,
@@ -18638,6 +18740,65 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         egress_credential_family="xai",
         expected_target_family="xai",
         retryable_upstream_status_codes=[429],
+    )
+
+
+async def _validate_codex_auto_agent_openrouter_responses_stream(
+    response: StreamingResponse,
+    *,
+    adapter_model: str,
+) -> StreamingResponse:
+    buffered_chunks: list[Any] = []
+    event_summaries: list[dict[str, Any]] = []
+
+    async def _recording_iterator() -> Any:
+        async for raw_chunk in response.body_iterator:
+            buffered_chunks.append(raw_chunk)
+            yield raw_chunk
+
+    recording_response = StreamingResponse(
+        _recording_iterator(),
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type=response.media_type or "text/event-stream",
+    )
+    try:
+        response_body = await _collect_responses_response_from_stream(
+            recording_response,
+            event_summaries=event_summaries,
+        )
+    except HTTPException as exc:
+        if (
+            exc.status_code == 502
+            and str(exc.detail)
+            == "OpenAI Responses stream completed without a response payload."
+        ):
+            _raise_codex_auto_agent_empty_success_response(
+                response_body={
+                    "model": adapter_model,
+                    "status": "completed",
+                    "output": [],
+                },
+                adapter_model=adapter_model,
+                stream_event_summaries=event_summaries,
+            )
+        raise
+    if _is_codex_auto_agent_empty_success_responses_body(response_body):
+        _raise_codex_auto_agent_empty_success_response(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            stream_event_summaries=event_summaries,
+        )
+
+    async def _replay_iterator() -> Any:
+        for raw_chunk in buffered_chunks:
+            yield raw_chunk
+
+    return StreamingResponse(
+        _replay_iterator(),
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type=response.media_type or "text/event-stream",
     )
 
 
@@ -18700,6 +18861,11 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
         egress_credential_family="openrouter",
         expected_target_family="openrouter",
     )
+    if isinstance(response, StreamingResponse):
+        return await _validate_codex_auto_agent_openrouter_responses_stream(
+            response,
+            adapter_model=adapter_model,
+        )
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
         try:
             response_body = json.loads(response.body.decode("utf-8"))
