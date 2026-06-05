@@ -5,7 +5,6 @@ import json
 import os
 import sys
 import time
-import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,6 @@ import httpx
 import pytest
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
-from fastapi.testclient import TestClient
 
 sys.path.insert(
     0, os.path.abspath("../../../..")
@@ -26,7 +24,6 @@ sys.path.insert(
 import litellm
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
-    RouteChecks,
     _add_anthropic_auto_agent_alias_metadata,
     _add_codex_auto_agent_alias_metadata,
     antigravity_proxy_route,
@@ -77,7 +74,6 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _google_code_assist_prime_until_monotonic_by_key,
     _google_oauth_access_token_cache,
     _get_google_adapter_semaphore,
-    _get_openrouter_adapter_hidden_retry_budget_seconds,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION,
@@ -133,13 +129,12 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _wrap_streaming_response_with_release_callback,
     anthropic_proxy_route,
     bedrock_llm_proxy_route,
-    create_pass_through_route,
     cursor_proxy_route,
     gemini_proxy_route,
     grok_proxy_route,
     llm_passthrough_factory_proxy_route,
-    opencode_zen_proxy_route,
     milvus_proxy_route,
+    opencode_zen_proxy_route,
     openai_proxy_route,
     vertex_discovery_proxy_route,
     vertex_proxy_route,
@@ -187,6 +182,14 @@ _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION = (
     "Agent-role guidance below only helps choose which agent to use after "
     "spawning is already authorized; it never authorizes spawning by itself."
 )
+
+
+def _build_test_jwt(payload: dict[str, Any]) -> str:
+    def encode_part(value: dict[str, Any]) -> str:
+        encoded = base64.urlsafe_b64encode(json.dumps(value).encode("utf-8"))
+        return encoded.rstrip(b"=").decode("ascii")
+
+    return f"{encode_part({'alg': 'none'})}.{encode_part(payload)}.sig"
 
 
 @pytest.mark.parametrize(
@@ -4769,15 +4772,12 @@ class TestOpenRouterAdapterRetry:
 
 class TestBaseOpenAIPassThroughHandler:
     def test_join_url_paths(self):
-        print("\nTesting _join_url_paths method...")
-
         # Test joining base URL with no path and a path
         base_url = httpx.URL("https://api.example.com")
         path = "/v1/chat/completions"
         result = BaseOpenAIPassThroughHandler._join_url_paths(
             base_url, path, litellm.LlmProviders.OPENAI.value
         )
-        print(f"Base URL with no path: '{base_url}' + '{path}' → '{result}'")
         assert str(result) == "https://api.example.com/v1/chat/completions"
 
         # Test joining base URL with path and another path
@@ -4786,7 +4786,6 @@ class TestBaseOpenAIPassThroughHandler:
         result = BaseOpenAIPassThroughHandler._join_url_paths(
             base_url, path, litellm.LlmProviders.OPENAI.value
         )
-        print(f"Base URL with path: '{base_url}' + '{path}' → '{result}'")
         assert str(result) == "https://api.example.com/v1/chat/completions"
 
         # Test with path not starting with slash
@@ -4795,7 +4794,6 @@ class TestBaseOpenAIPassThroughHandler:
         result = BaseOpenAIPassThroughHandler._join_url_paths(
             base_url, path, litellm.LlmProviders.OPENAI.value
         )
-        print(f"Path without leading slash: '{base_url}' + '{path}' → '{result}'")
         assert str(result) == "https://api.example.com/v1/chat/completions"
 
         # Test with base URL having trailing slash
@@ -4804,7 +4802,6 @@ class TestBaseOpenAIPassThroughHandler:
         result = BaseOpenAIPassThroughHandler._join_url_paths(
             base_url, path, litellm.LlmProviders.OPENAI.value
         )
-        print(f"Base URL with trailing slash: '{base_url}' + '{path}' → '{result}'")
         assert str(result) == "https://api.example.com/v1/chat/completions"
 
 
@@ -4852,6 +4849,265 @@ def test_build_completion_adapter_metadata_overrides_adapter_owned_keys() -> Non
         "caller-tag",
         "shared-tag",
         "anthropic-nvidia-completion-adapter",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_local_codex_auth_headers_refreshes_nested_auth_file(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _load_local_codex_auth_headers,
+    )
+
+    auth_path = tmp_path / "auth.json"
+    expired_access_token = _build_test_jwt({"exp": int(time.time()) - 60})
+    refreshed_access_token = _build_test_jwt(
+        {
+            "exp": int(time.time()) + 3600,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_refreshed"
+            },
+        }
+    )
+    refreshed_id_token = _build_test_jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_refreshed"
+            }
+        }
+    )
+    auth_path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "last_refresh": "2026-01-01T00:00:00+00:00",
+                "tokens": {
+                    "access_token": expired_access_token,
+                    "refresh_token": "codex-refresh-token",
+                    "id_token": "old-id-token",
+                    "account_id": "acct_old",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_path.chmod(0o600)
+    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, json):
+            captured["url"] = url
+            captured["json"] = json
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": refreshed_access_token,
+                    "refresh_token": "codex-refresh-token-new",
+                    "id_token": refreshed_id_token,
+                },
+            )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {"session_id": "codex-session-123"}
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        FakeClient,
+    ):
+        headers = await _load_local_codex_auth_headers(mock_request)
+
+    persisted = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert headers is not None
+    assert headers["Authorization"] == f"Bearer {refreshed_access_token}"
+    assert headers["ChatGPT-Account-Id"] == "acct_refreshed"
+    assert captured["json"]["refresh_token"] == "codex-refresh-token"
+    assert persisted["auth_mode"] == "chatgpt"
+    assert persisted["tokens"]["access_token"] == refreshed_access_token
+    assert persisted["tokens"]["refresh_token"] == "codex-refresh-token-new"
+    assert persisted["tokens"]["account_id"] == "acct_refreshed"
+    assert isinstance(persisted["tokens"]["expires_at"], int)
+    assert persisted["last_refresh"] != "2026-01-01T00:00:00+00:00"
+    assert auth_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_load_local_codex_auth_headers_requires_refresh_token(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _load_local_codex_auth_headers,
+    )
+
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt(
+                        {"exp": int(time.time()) - 60}
+                    )
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+
+    with pytest.raises(HTTPException, match="refresh_token"):
+        await _load_local_codex_auth_headers(mock_request)
+
+
+@pytest.mark.asyncio
+async def test_load_local_codex_auth_headers_redacts_refresh_failure(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _load_local_codex_auth_headers,
+    )
+
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt(
+                        {"exp": int(time.time()) - 60}
+                    ),
+                    "refresh_token": "codex-refresh-token",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, json):
+            return httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "do not leak codex-refresh-token",
+                },
+            )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        FakeClient,
+    ), pytest.raises(HTTPException) as exc_info:
+        await _load_local_codex_auth_headers(mock_request)
+
+    detail = str(exc_info.value.detail)
+    assert "invalid_grant" in detail
+    assert "codex-refresh-token" not in detail
+
+
+@pytest.mark.asyncio
+async def test_load_local_codex_auth_headers_serializes_concurrent_refresh(
+    tmp_path, monkeypatch
+):
+    from litellm.llms.chatgpt.common_utils import (
+        CHATGPT_CLIENT_ID,
+        CHATGPT_OAUTH_TOKEN_URL,
+    )
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _load_local_codex_auth_headers,
+    )
+
+    refreshed_access_token = _build_test_jwt(
+        {
+            "exp": int(time.time()) + 3600,
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct_refreshed"},
+        }
+    )
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt({"exp": int(time.time()) - 60}),
+                    "refresh_token": "codex-refresh-token",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
+    post_calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, json):
+            post_calls.append((url, json))
+            await asyncio.sleep(0.01)
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": refreshed_access_token,
+                    "refresh_token": "codex-refresh-token-new",
+                },
+            )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {"session_id": "codex-session-123"}
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        FakeClient,
+    ):
+        headers = await asyncio.gather(
+            _load_local_codex_auth_headers(mock_request),
+            _load_local_codex_auth_headers(mock_request),
+        )
+
+    assert post_calls == [
+        (
+            CHATGPT_OAUTH_TOKEN_URL,
+            {
+                "client_id": CHATGPT_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": "codex-refresh-token",
+                "scope": "openid profile email",
+            },
+        )
+    ]
+    assert [header["Authorization"] for header in headers if header is not None] == [
+        f"Bearer {refreshed_access_token}",
+        f"Bearer {refreshed_access_token}",
     ]
 
 
@@ -10799,6 +11055,7 @@ class TestClaudePersistedOutputExpansion:
         assert second_metadata["aawm_dynamic_injection_cache_hits"] == 1
         assert second_metadata["aawm_dynamic_injection_cache_misses"] == 0
         assert second_metadata["aawm_dynamic_injection_cache_statuses"] == ["hit"]
+        assert mock_get_agent_memories.await_count == 1
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_expands_plaintext_aawm_dynamic_injection(
@@ -10840,6 +11097,7 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["resolved"]
         assert "aawm-dynamic-injection" in litellm_metadata["tags"]
         assert "aawm-proc:get_agent_memories" in litellm_metadata["tags"]
+        mock_get_agent_memories.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_ignores_non_directive_aawm_text(
@@ -10924,6 +11182,7 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["aawm_dynamic_injection_statuses"] == ["resolved"]
         assert "aawm-dynamic-injection" in litellm_metadata["tags"]
         assert "aawm-proc:get_agent_memories" in litellm_metadata["tags"]
+        mock_get_agent_memories.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_call_aawm_context_grab_uses_tristore_search_exact_scope(
@@ -11959,8 +12218,6 @@ class TestClaudePersistedOutputExpansion:
             )
 
     def test_append_openai_beta_header(self):
-        print("\nTesting _append_openai_beta_header method...")
-
         # Create mock requests with different paths
         assistants_request = MagicMock(spec=Request)
         assistants_request.url = MagicMock()
@@ -11976,7 +12233,6 @@ class TestClaudePersistedOutputExpansion:
         result = BaseOpenAIPassThroughHandler._append_openai_beta_header(
             headers, assistants_request
         )
-        print(f"Assistants API request: Added header: {result}")
         assert result["OpenAI-Beta"] == "assistants=v2"
 
         # Test with non-assistants API request
@@ -11984,7 +12240,6 @@ class TestClaudePersistedOutputExpansion:
         result = BaseOpenAIPassThroughHandler._append_openai_beta_header(
             headers, non_assistants_request
         )
-        print(f"Non-assistants API request: Headers: {result}")
         assert "OpenAI-Beta" not in result
 
         # Test with assistant in the path
@@ -11996,7 +12251,6 @@ class TestClaudePersistedOutputExpansion:
         result = BaseOpenAIPassThroughHandler._append_openai_beta_header(
             headers, assistant_request
         )
-        print(f"Assistant API request: Added header: {result}")
         assert result["OpenAI-Beta"] == "assistants=v2"
 
 
@@ -15833,6 +16087,50 @@ def test_load_antigravity_oauth_client_values_from_local_cli_binary(
     assert client_secret == "GOCSPX-test-client-secret"
 
 
+def test_get_antigravity_oauth_client_value_candidates_does_not_mix_env_and_token_pairs(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _get_antigravity_oauth_client_value_candidates,
+    )
+
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID", "env-client-id")
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", raising=False)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_antigravity_oauth_client_value_candidates_from_local_cli_binary",
+        return_value=[],
+    ):
+        assert (
+            _get_antigravity_oauth_client_value_candidates(
+                {"client_secret": "token-client-secret"}
+            )
+            == []
+        )
+
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+        "env-client-secret",
+    )
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_antigravity_oauth_client_value_candidates_from_local_cli_binary",
+        return_value=[],
+    ):
+        candidates = _get_antigravity_oauth_client_value_candidates(
+            {
+                "client_id": "token-client-id",
+                "client_secret": "token-client-secret",
+            }
+        )
+
+    assert candidates == [
+        ("env-client-id", "env-client-secret"),
+        ("token-client-id", "token-client-secret"),
+    ]
+    assert ("env-client-id", "token-client-secret") not in candidates
+    assert ("token-client-id", "env-client-secret") not in candidates
+
+
 @pytest.mark.asyncio
 async def test_refresh_local_antigravity_oauth_token_data_uses_cli_binary_client_values(
     tmp_path, monkeypatch
@@ -15886,6 +16184,417 @@ async def test_refresh_local_antigravity_oauth_token_data_uses_cli_binary_client
 
 
 @pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_retries_cli_client_pairs(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    cli_path = tmp_path / "agy"
+    cli_path.write_bytes(
+        b"111111111111-wrong.apps.googleusercontent.com"
+        b"\x00GOCSPX-wrong-secret\x00"
+        b"222222222222-right.apps.googleusercontent.com"
+        b"\x00GOCSPX-right-secret\x00"
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", raising=False)
+    attempts = []
+
+    async def post(_url, data, headers):
+        attempts.append(data)
+        if data == {
+            "client_id": "222222222222-right.apps.googleusercontent.com",
+            "client_secret": "GOCSPX-right-secret",
+            "refresh_token": "refresh-token-123",
+            "grant_type": "refresh_token",
+        }:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "ya29.refreshed-antigravity",
+                    "expires_in": 3600,
+                },
+            )
+        return httpx.Response(400, json={"error": "invalid_client"})
+
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = post
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ):
+        refreshed = await _refresh_local_antigravity_oauth_token_data(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+
+    assert refreshed["token"]["access_token"] == "ya29.refreshed-antigravity"
+    assert attempts[-1]["client_id"] == "222222222222-right.apps.googleusercontent.com"
+    assert len(attempts) > 1
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_persists_refresh(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    token_path = tmp_path / "antigravity-oauth-token"
+    token_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    token_path.chmod(0o600)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        200,
+        json={"access_token": "ya29.refreshed-antigravity", "expires_in": 3600},
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ):
+        token = await _load_valid_local_antigravity_access_token()
+
+    persisted = json.loads(token_path.read_text(encoding="utf-8"))
+    assert token == "ya29.refreshed-antigravity"
+    assert persisted["auth_method"] == "consumer"
+    assert persisted["token"]["access_token"] == "ya29.refreshed-antigravity"
+    assert persisted["token"]["refresh_token"] == "refresh-token-123"
+    assert persisted["token"]["token_type"] == "Bearer"
+    assert isinstance(persisted["token"]["expiry"], str)
+    assert token_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallback(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    home_path = tmp_path / "home"
+    token_path = (
+        home_path
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    token_path.chmod(0o600)
+    cli_path = tmp_path / "agy"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        401,
+        json={"error": "invalid_client"},
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+    subprocess_calls = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            refreshed = json.loads(token_path.read_text(encoding="utf-8"))
+            refreshed["token"]["access_token"] = "ya29.refreshed-via-agy"
+            refreshed["token"]["expiry"] = (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat()
+            token_path.write_text(json.dumps(refreshed), encoding="utf-8")
+            return b"", b""
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        subprocess_calls.append((args, kwargs))
+        assert args[-1] == "models"
+        assert kwargs["env"]["HOME"] == str(home_path)
+        return FakeProcess()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.create_subprocess_exec",
+        new=fake_create_subprocess_exec,
+    ):
+        token = await _load_valid_local_antigravity_access_token()
+
+    persisted = json.loads(token_path.read_text(encoding="utf-8"))
+    assert token == "ya29.refreshed-via-agy"
+    assert persisted["token"]["access_token"] == "ya29.refreshed-via-agy"
+    assert persisted["token"]["refresh_token"] == "refresh-token-123"
+    assert subprocess_calls
+
+
+@pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_passed_auth_path(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    target_home = tmp_path / "target-home"
+    target_path = (
+        target_home
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    target_path.parent.mkdir(parents=True)
+    target_token_data = {
+        "auth_method": "consumer",
+        "token": {
+            "access_token": "ya29.target-expired",
+            "expiry": "2026-01-01T00:00:00Z",
+            "refresh_token": "target-refresh-token",
+            "token_type": "Bearer",
+        },
+    }
+    target_path.write_text(json.dumps(target_token_data), encoding="utf-8")
+
+    env_home = tmp_path / "env-home"
+    env_path = (
+        env_home
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.env-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "env-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cli_path = tmp_path / "agy"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(env_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        401,
+        json={"error": "invalid_client"},
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            refreshed = json.loads(target_path.read_text(encoding="utf-8"))
+            refreshed["token"]["access_token"] = "ya29.refreshed-target"
+            refreshed["token"]["expiry"] = (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat()
+            target_path.write_text(json.dumps(refreshed), encoding="utf-8")
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        assert args[-1] == "models"
+        assert kwargs["env"]["HOME"] == str(target_home)
+        return FakeProcess()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.create_subprocess_exec",
+        new=fake_create_subprocess_exec,
+    ):
+        refreshed = await _refresh_local_antigravity_oauth_token_data(
+            target_token_data,
+            target_path,
+        )
+
+    assert refreshed["token"]["access_token"] == "ya29.refreshed-target"
+    assert json.loads(env_path.read_text(encoding="utf-8"))["token"][
+        "access_token"
+    ] == "ya29.env-token"
+
+
+@pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_requires_refresh_token():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    with pytest.raises(HTTPException, match="refresh_token"):
+        await _refresh_local_antigravity_oauth_token_data(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_rejects_invalid_response(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(200, json={"expires_in": 3600})
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ), pytest.raises(HTTPException, match="access_token"):
+        await _refresh_local_antigravity_oauth_token_data(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_redacts_failure_detail(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        400,
+        json={
+            "error": "invalid_client",
+            "error_description": (
+                "do not leak refresh-token-123 or GOCSPX-secret in errors"
+            ),
+        },
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ), pytest.raises(HTTPException) as exc_info:
+        await _refresh_local_antigravity_oauth_token_data(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+
+    detail = str(exc_info.value.detail)
+    assert "invalid_client" in detail
+    assert "refresh-token-123" not in detail
+    assert "GOCSPX-secret" not in detail
+    assert "ya29.expired-antigravity" not in detail
+
+
+@pytest.mark.asyncio
 async def test_load_valid_local_antigravity_access_token_caches_concurrent_refresh(
     tmp_path, monkeypatch
 ):
@@ -15907,7 +16616,7 @@ async def test_load_valid_local_antigravity_access_token_caches_concurrent_refre
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
     future_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
 
-    async def refresh_token_data(_token_data):
+    async def refresh_token_data(_token_data, _auth_path=None):
         await asyncio.sleep(0.01)
         return {
             "auth_method": "consumer",
@@ -15971,7 +16680,21 @@ async def test_antigravity_proxy_route_uses_local_oauth_token_and_client_headers
     mock_user_api_key_dict = MagicMock()
     request_body = {
         "model": "gemini-3.1-pro-low",
+        "project": "test-antigravity-project",
         "request": {"session_id": "agy-session-123"},
+    }
+    quota_observation = {
+        "source": "antigravity_retrieve_user_quota",
+        "buckets": {
+            "items": [
+                {
+                    "modelId": "gemini-3.1-pro-low",
+                    "remainingFraction": 0.75,
+                    "tokenType": "REQUESTS",
+                    "resetTime": "2099-01-01T00:00:00Z",
+                }
+            ]
+        },
     }
 
     with patch(
@@ -15981,6 +16704,9 @@ async def test_antigravity_proxy_route_uses_local_oauth_token_and_client_headers
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
         AsyncMock(return_value="agy-oauth-token"),
     ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
+        AsyncMock(return_value=quota_observation),
+    ) as mock_prime_quota, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         AsyncMock(return_value=request_body),
     ), patch(
@@ -15997,6 +16723,11 @@ async def test_antigravity_proxy_route_uses_local_oauth_token_and_client_headers
 
     assert result == {"ok": True}
     assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-test-key"
+    mock_prime_quota.assert_awaited_once_with(
+        "agy-oauth-token",
+        "test-antigravity-project",
+        adapter_provider="antigravity",
+    )
     mock_set_parsed_body.assert_called_once()
 
     call_kwargs = mock_pass_through.await_args.kwargs
@@ -16029,6 +16760,7 @@ async def test_antigravity_proxy_route_uses_local_oauth_token_and_client_headers
     assert metadata["session_id"] == "agy-session-123"
     assert metadata["trace_environment"] == "dev"
     assert metadata["repository"] == "zepfu/litellm"
+    assert metadata["google_retrieve_user_quota"] == quota_observation
     assert "route:antigravity_code_assist" in metadata["tags"]
     assert call_kwargs["passthrough_logging_metadata"] == metadata
 
@@ -16232,7 +16964,7 @@ def test_opencode_zen_messages_route_uses_anthropic_stream_parser():
 
 
 @pytest.mark.asyncio
-async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch):
+async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch):  # noqa: PLR0915
     monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
     body = (
         b'{"model":"gemini-3-flash-preview","request":{"session_id":"gemini-session-123"},'
@@ -16298,8 +17030,6 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
     assert "gemini-tools-present" in litellm_metadata["tags"]
 
     def test_assemble_headers(self):
-        print("\nTesting _assemble_headers method...")
-
         # Mock request
         mock_request = MagicMock(spec=Request)
         api_key = "test_api_key"
@@ -16317,7 +17047,6 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
             result = BaseOpenAIPassThroughHandler._assemble_headers(
                 api_key, mock_request
             )
-            print(f"Assembled headers: {result}")
             assert result["authorization"] == "Bearer test_api_key"
             assert result["api-key"] == "test_api_key"
             assert result["test-header"] == "value"
@@ -16326,8 +17055,6 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
     )
     async def test_base_openai_pass_through_handler(self, mock_create_pass_through):
-        print("\nTesting _base_openai_pass_through_handler method...")
-
         # Mock dependencies
         mock_request = MagicMock(spec=Request)
         mock_request.query_params = {"model": "gpt-4"}
@@ -16338,7 +17065,6 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
         mock_endpoint_func = AsyncMock(return_value={"result": "success"})
         mock_create_pass_through.return_value = mock_endpoint_func
 
-        print("Testing standard endpoint pass-through...")
         # Test with standard endpoint
         result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
             endpoint="/chat/completions",
@@ -16351,20 +17077,14 @@ async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch
         )
 
         # Verify the result
-        print(f"Result from handler: {result}")
         assert result == {"result": "success"}
 
         # Verify create_pass_through_route was called with correct parameters
         call_args = mock_create_pass_through.call_args[1]
-        print(
-            f"create_pass_through_route called with endpoint: {call_args['endpoint']}"
-        )
-        print(f"create_pass_through_route called with target: {call_args['target']}")
         assert call_args["endpoint"] == "/chat/completions"
         assert call_args["target"] == "https://api.openai.com/v1/chat/completions"
 
         # Verify endpoint_func was called with correct parameters
-        print("Verifying endpoint_func call parameters...")
         mock_endpoint_func.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -16609,16 +17329,13 @@ class TestVertexAIPassThroughHandler:
             mock_endpoint_func = AsyncMock(return_value={"status": "success"})
             mock_create_route.return_value = mock_endpoint_func
 
-            # Call the route
-            try:
-                result = await vertex_proxy_route(
-                    endpoint=endpoint,
-                    request=mock_request,
-                    fastapi_response=mock_response,
-                    user_api_key_dict={"api_key": "test-key"},
-                )
-            except Exception as e:
-                print(f"Error: {e}")
+            result = await vertex_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict={"api_key": "test-key"},
+            )
+            assert result == {"status": "success"}
 
             # Verify create_pass_through_route was called with correct arguments
             mock_create_route.assert_called_once_with(
@@ -16709,16 +17426,13 @@ class TestVertexAIPassThroughHandler:
             mock_endpoint_func = AsyncMock(return_value={"status": "success"})
             mock_create_route.return_value = mock_endpoint_func
 
-            # Call the route
-            try:
-                result = await vertex_proxy_route(
-                    endpoint=endpoint,
-                    request=mock_request,
-                    fastapi_response=mock_response,
-                    user_api_key_dict={"api_key": "test-key"},
-                )
-            except Exception as e:
-                print(f"Error: {e}")
+            result = await vertex_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict={"api_key": "test-key"},
+            )
+            assert result == {"status": "success"}
 
             # Verify create_pass_through_route was called with correct arguments
             mock_create_route.assert_called_once_with(
@@ -16807,15 +17521,11 @@ class TestVertexAIPassThroughHandler:
             mock_endpoint_func = AsyncMock(return_value={"status": "success"})
             mock_create_route.return_value = mock_endpoint_func
 
-            try:
-                await vertex_proxy_route(
-                    endpoint=endpoint,
-                    request=mock_request,
-                    fastapi_response=mock_response,
-                )
-            except Exception as e:
-                traceback.print_exc()
-                print(f"Error: {e}")
+            await vertex_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
 
             # Verify default credentials were used
             mock_create_route.assert_called_once_with(
@@ -16890,15 +17600,11 @@ class TestVertexAIPassThroughHandler:
             mock_auth.return_value = MagicMock()
 
             # Call the route
-            try:
-                await vertex_proxy_route(
-                    endpoint=endpoint,
-                    request=mock_request,
-                    fastapi_response=mock_response,
-                )
-            except Exception as e:
-                traceback.print_exc()
-                print(f"Error: {e}")
+            await vertex_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
 
             # Verify create_pass_through_route was called with correct arguments
             mock_create_route.assert_called_once_with(
@@ -16934,7 +17640,7 @@ class TestVertexAIPassThroughHandler:
                 )
 
                 # Call the function
-                result = await vertex_proxy_route(
+                await vertex_proxy_route(
                     endpoint="v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
                     request=mock_request,
                     fastapi_response=mock_response,
@@ -17293,7 +17999,7 @@ class TestVertexAIDiscoveryPassThroughHandler:
             mock_create_route.return_value = mock_endpoint_func
 
             # Call the route
-            result = await vertex_discovery_proxy_route(
+            await vertex_discovery_proxy_route(
                 endpoint=endpoint,
                 request=mock_request,
                 fastapi_response=mock_response,
@@ -17335,7 +18041,7 @@ class TestVertexAIDiscoveryPassThroughHandler:
                 )
 
                 # Call the function
-                result = await vertex_discovery_proxy_route(
+                await vertex_discovery_proxy_route(
                     endpoint="v1/projects/test-project/locations/us-central1/dataStores/default/servingConfigs/default:search",
                     request=mock_request,
                     fastapi_response=mock_response,
@@ -17526,7 +18232,7 @@ class TestBedrockLLMProxyRoute:
             )
 
     @pytest.mark.asyncio
-    async def test_bedrock_passthrough_uses_model_specific_credentials(self):
+    async def test_bedrock_passthrough_uses_model_specific_credentials(self):  # noqa: PLR0915
         """
         Test that Bedrock passthrough endpoints use credentials from model configuration
         instead of environment variables when a router model is used.
@@ -17875,7 +18581,7 @@ class TestForwardHeaders:
             mock_logging_obj.post_call_failure_hook = AsyncMock()
 
             # Call pass_through_request with forward_headers=True
-            result = await pass_through_request(
+            await pass_through_request(
                 request=mock_request,
                 target=target_url,
                 custom_headers=custom_headers,
@@ -17969,7 +18675,7 @@ class TestForwardHeaders:
             mock_logging_obj.post_call_failure_hook = AsyncMock()
 
             # Call pass_through_request with forward_headers=False (default)
-            result = await pass_through_request(
+            await pass_through_request(
                 request=mock_request,
                 target=target_url,
                 custom_headers=custom_headers,
@@ -18069,7 +18775,7 @@ class TestForwardHeaders:
                 mock_endpoint_func = AsyncMock(return_value="success")
                 mock_create_route.return_value = mock_endpoint_func
 
-                result = await llm_passthrough_factory_proxy_route(
+                await llm_passthrough_factory_proxy_route(
                     custom_llm_provider=LlmProviders.OPENAI,
                     endpoint="/chat/completions",
                     request=mock_request,
@@ -18079,9 +18785,6 @@ class TestForwardHeaders:
 
                 # Verify create_pass_through_route was called
                 mock_create_route.assert_called_once()
-                
-                # Get the call arguments to verify _forward_headers parameter
-                call_kwargs = mock_create_route.call_args[1]
                 
                 # Note: The current implementation doesn't explicitly pass _forward_headers
                 # This test documents the current behavior. If _forward_headers should be
@@ -18447,9 +19150,6 @@ class TestMilvusProxyRoute:
         """
         Test successful Milvus proxy route with valid managed vector store index
         """
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         collection_name = "dall-e-6"
         vector_store_name = "milvus-store-1"
@@ -18556,9 +19256,6 @@ class TestMilvusProxyRoute:
         """
         from fastapi import HTTPException
 
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         mock_request = MagicMock(spec=Request)
         mock_response = MagicMock(spec=Response)
@@ -18590,9 +19287,6 @@ class TestMilvusProxyRoute:
         """
         from fastapi import HTTPException
 
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         mock_request = MagicMock(spec=Request)
         mock_response = MagicMock(spec=Response)
@@ -18622,9 +19316,6 @@ class TestMilvusProxyRoute:
         """
         from fastapi import HTTPException
 
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         collection_name = "test-collection"
 
@@ -18662,9 +19353,6 @@ class TestMilvusProxyRoute:
         """
         from fastapi import HTTPException
 
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         collection_name = "unmanaged-collection"
 
@@ -18704,9 +19392,6 @@ class TestMilvusProxyRoute:
         """
         Test that missing vector store raises Exception
         """
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         collection_name = "test-collection"
         vector_store_name = "missing-store"
@@ -18760,9 +19445,6 @@ class TestMilvusProxyRoute:
         """
         Test that missing api_base raises Exception
         """
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         collection_name = "test-collection"
         vector_store_name = "milvus-store-1"
@@ -18823,9 +19505,6 @@ class TestMilvusProxyRoute:
         """
         Test that endpoint without leading slash is handled correctly
         """
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            milvus_proxy_route,
-        )
 
         collection_name = "test-collection"
         vector_store_name = "milvus-store-1"
@@ -19940,6 +20619,7 @@ class TestCursorProxyRoute:
                 fastapi_response=mock_response,
                 user_api_key_dict=mock_user_api_key_dict,
             )
+            assert result == {"models": []}
 
             call_args = mock_create_route.call_args[1]
             assert call_args["target"] == "https://api.cursor.com/v0/models"
