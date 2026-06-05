@@ -489,7 +489,7 @@ _ANTHROPIC_AAWM_LOW_ALIAS = "aawm-low-anthropic"
 _ANTHROPIC_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
-        "model": "claude-opus-4-6",
+        "model": "claude-opus-4-8",
         "route_family": "anthropic_messages",
         "last_resort": False,
     },
