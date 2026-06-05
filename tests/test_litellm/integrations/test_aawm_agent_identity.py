@@ -10005,6 +10005,90 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_tool_
     assert record["reasoning_tokens_source"] == "provider_reported"
 
 
+def test_build_session_history_record_from_langfuse_trace_observation_preserves_tool_definition_metadata() -> None:
+    tool_snapshot = [
+        {
+            "source": "tools",
+            "index": 0,
+            "type": "function",
+            "name": "spawn_agent",
+            "description": "Spawn a read-only subagent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "required": ["message"],
+            },
+            "definition": {
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "description": "Spawn a read-only subagent.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "model": {"type": "string"},
+                            "message": {"type": "string"},
+                        },
+                        "required": ["message"],
+                    },
+                },
+            },
+        }
+    ]
+    trace = {
+        "id": "trace-tool-definition",
+        "name": "codex",
+        "sessionId": "session-tool-definition",
+        "input": {},
+    }
+    observation = {
+        "id": "call-tool-definition",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.5",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "output": {},
+        "metadata": {
+            "passthrough_route_family": "codex_responses",
+            "aawm_tool_definition_capture_version": "v1",
+            "aawm_tool_definition_capture_source": "passthrough_request_body",
+            "aawm_tool_definition_count": 1,
+            "aawm_tool_definition_captured_count": 1,
+            "aawm_tool_definition_sources": ["tools"],
+            "aawm_tool_definition_names": ["spawn_agent"],
+            "aawm_tool_definition_types": ["function"],
+            "aawm_tool_definition_snapshot": tool_snapshot,
+            "aawm_tool_definition_snapshot_hash": "hash-tool-definition",
+            "aawm_tool_definition_snapshot_truncated": False,
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-tool-definition",
+    )
+
+    assert record is not None
+    assert record["metadata"]["aawm_tool_definition_capture_version"] == "v1"
+    assert record["metadata"]["aawm_tool_definition_count"] == 1
+    assert record["metadata"]["aawm_tool_definition_captured_count"] == 1
+    assert record["metadata"]["aawm_tool_definition_names"] == ["spawn_agent"]
+    assert record["metadata"]["aawm_tool_definition_types"] == ["function"]
+    assert record["metadata"]["aawm_tool_definition_snapshot"] == tool_snapshot
+    assert (
+        record["metadata"]["aawm_tool_definition_snapshot_hash"]
+        == "hash-tool-definition"
+    )
+    assert record["metadata"]["aawm_tool_definition_snapshot_truncated"] is False
+    assert "secret-token" not in json.dumps(record["metadata"])
+
+
 def test_build_session_history_record_from_langfuse_trace_observation_uses_metadata_usage_object_for_gemini() -> None:
     trace = {
         "id": "trace-gemini-1",

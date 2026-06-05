@@ -2257,6 +2257,42 @@ policy/catalog together when a verified direct Opus 4.8 slug is available.
 
 ---
 
+### aawm.67 — Sanitized passthrough tool-definition observability snapshots
+
+**Status:** AAWM local release candidate.
+
+**What changed:** OpenAI Responses/Codex passthrough observability now captures a
+bounded, sanitized snapshot of advertised tool definitions in `litellm_metadata`.
+The snapshot records source list, total and captured tool counts, tool names,
+tool types, description text, callable parameter schema, a sanitized full
+definition copy, a stable snapshot hash, and whether capture was truncated.
+
+The capture path redacts secret-like keys and values before metadata is handed
+to logging surfaces. It covers common credential shapes such as API keys,
+authorization headers, bearer tokens, passwords, secrets, and `sk-...` /
+`pk-...` values while preserving non-secret schema structure for auditability.
+The AAWM session-history callback allowlists the new
+`aawm_tool_definition_*` metadata fields so operators can prove which tool
+definitions were advertised without scanning raw request bodies.
+
+**Why:** Operators need to distinguish natural-language tool descriptions from
+the actual callable JSON schema that reached LiteLLM, especially for subagent
+tool dispatch and model-selection debugging. Prior evidence surfaces could show
+tool use after the fact, but not the request-time advertised tool contract.
+
+**Why not upstream:** The persisted metadata names, session-history allowlist,
+and AAWM `session_history` proof workflow are fork-specific observability
+policy.
+
+**Validation status:** Focused tests cover passthrough metadata capture,
+snapshot hashing/truncation fields, credential redaction, and preservation of
+the new metadata through the AAWM session-history record builder. Live
+acceptance still requires a controlled Codex/OpenAI Responses request with
+advertised tools against a refreshed runtime, followed by exact
+`public.session_history` and/or Langfuse proof for the generated session.
+
+---
+
 ### cb-v0.0.42 — Callback overlay parity for Antigravity/OpenCode attribution
 
 **Status:** AAWM callback overlay release candidate.

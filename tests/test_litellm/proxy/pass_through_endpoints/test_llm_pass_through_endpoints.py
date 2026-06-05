@@ -11604,6 +11604,101 @@ class TestClaudePersistedOutputExpansion:
         assert litellm_metadata["trace_environment"] == "dev"
         assert litellm_metadata["source_trace_environment"] == "prod"
 
+    def test_prepare_request_body_for_passthrough_observability_captures_tool_definitions(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-tools-session"}
+        request_body = {
+            "model": "gpt-5.5",
+            "input": "use a tool",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "description": (
+                            "Spawn a read-only subagent with Bearer secret-token-123."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "model": {"type": "string"},
+                                "message": {"type": "string"},
+                                "api_key": {
+                                    "type": "string",
+                                    "default": "sk-secret-token-123456",
+                                },
+                            },
+                            "required": ["message"],
+                        },
+                    },
+                }
+            ],
+        }
+
+        updated_body = _prepare_request_body_for_passthrough_observability(
+            mock_request,
+            request_body,
+        )
+
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["aawm_tool_definition_capture_version"] == "v1"
+        assert (
+            litellm_metadata["aawm_tool_definition_capture_source"]
+            == "passthrough_request_body"
+        )
+        assert litellm_metadata["aawm_tool_definition_count"] == 1
+        assert litellm_metadata["aawm_tool_definition_captured_count"] == 1
+        assert litellm_metadata["aawm_tool_definition_names"] == ["spawn_agent"]
+        assert litellm_metadata["aawm_tool_definition_types"] == ["function"]
+        assert litellm_metadata["aawm_tool_definition_sources"] == ["tools"]
+        assert litellm_metadata["aawm_tool_definition_snapshot_truncated"] is False
+        assert isinstance(
+            litellm_metadata["aawm_tool_definition_snapshot_hash"], str
+        )
+        snapshot = litellm_metadata["aawm_tool_definition_snapshot"]
+        assert snapshot == [
+            {
+                "source": "tools",
+                "index": 0,
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Spawn a read-only subagent with redacted-by-litellm",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "model": {"type": "string"},
+                        "message": {"type": "string"},
+                        "api_key": "redacted-by-litellm",
+                    },
+                    "required": ["message"],
+                },
+                "definition": {
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "description": (
+                            "Spawn a read-only subagent with redacted-by-litellm"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "model": {"type": "string"},
+                                "message": {"type": "string"},
+                                "api_key": "redacted-by-litellm",
+                            },
+                            "required": ["message"],
+                        },
+                    },
+                },
+            }
+        ]
+        assert "authorization" not in json.dumps(litellm_metadata)
+        assert "secret-token" not in json.dumps(litellm_metadata)
+        assert "sk-secret-token" not in json.dumps(litellm_metadata)
+
     def test_prepare_request_body_for_passthrough_observability_infers_codex_workspace_repository(
         self, monkeypatch
     ):
