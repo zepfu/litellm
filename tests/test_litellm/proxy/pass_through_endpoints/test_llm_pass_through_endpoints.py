@@ -13250,6 +13250,61 @@ async def test_anthropic_auto_agent_alias_code_selects_antigravity_first():
     assert selection["skipped"] == []
 
 
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    expected_candidates = [
+        (
+            "antigravity",
+            "claude-sonnet-4-6",
+            "anthropic_antigravity_completion_adapter",
+            False,
+        ),
+        (
+            "openai",
+            "gpt-5.3-codex-spark",
+            "anthropic_openai_responses_adapter",
+            False,
+        ),
+        (
+            "xai",
+            "grok-composer-2.5-fast",
+            "anthropic_grok_native_responses_adapter",
+            False,
+        ),
+        ("xai", "oa_xai/grok-build", "anthropic_xai_oauth_responses_adapter", False),
+        ("anthropic", "claude-sonnet-4-6", "anthropic_messages", True),
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ):
+        for index, (provider, model, route_family, last_resort) in enumerate(
+            expected_candidates
+        ):
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+            candidate = selection["candidate"]
+            assert candidate["provider"] == provider
+            assert candidate["model"] == model
+            assert candidate["route_family"] == route_family
+            assert candidate["last_resort"] is last_resort
+            if last_resort:
+                assert selection["selection_reason"] == "last_resort"
+            else:
+                assert selection["selection_reason"] == "first_available"
+            if index < len(expected_candidates) - 1:
+                await _set_anthropic_auto_agent_cooldown(
+                    selection["cooldown_key"],
+                    60.0,
+                )
+
+
 def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
@@ -13549,6 +13604,104 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
         "antigravity"
     )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_unavailable(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    antigravity_error = ProxyException(
+        message="antigravity unavailable",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    antigravity_error.detail = {
+        "error": {
+            "message": "Antigravity credential unavailable",
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    spark_error = ProxyException(
+        message="spark usage limit",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    spark_error.detail = {
+        "error": {
+            "message": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        }
+    }
+    grok_error = ProxyException(
+        message="grok native credential unavailable",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    grok_error.detail = {
+        "error": {
+            "message": "Grok native credential unavailable",
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    managed_xai_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=spark_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=grok_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=managed_xai_success),
+    ) as mock_xai_oauth:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is managed_xai_success
+    mock_grok_native.assert_awaited_once()
+    mock_xai_oauth.assert_awaited_once()
+    assert mock_xai_oauth.await_args.kwargs["adapter_model"] == "oa_xai/grok-build"
+    assert mock_xai_oauth.await_args.kwargs["use_alias_candidate_probe"] is True
+    xai_body = mock_xai_oauth.await_args.kwargs["prepared_request_body"]
+    metadata = xai_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
+    assert metadata["anthropic_auto_agent_selected_route_family"] == (
+        "anthropic_xai_oauth_responses_adapter"
+    )
+    assert [
+        attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]
+    ] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+    ]
+    assert metadata["anthropic_auto_agent_attempts"][2]["status"] == "cooldown_set"
 
 
 @pytest.mark.asyncio
@@ -13869,6 +14022,7 @@ async def test_anthropic_proxy_route_uses_auto_alias_only_on_anthropic_messages(
         "oa_xai/grok-4.20-0309-reasoning",
         "oa_xai/grok-4.20-0309-non-reasoning",
         "oa_xai/grok-4.20-multi-agent-0309",
+        "oa_xai/grok-build",
     ],
 )
 async def test_anthropic_proxy_route_routes_all_oa_xai_models_to_responses_adapter(
@@ -14094,6 +14248,7 @@ async def test_anthropic_xai_oauth_completion_adapter_uses_managed_oauth(
         ("oa_xai/grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning"),
         ("oa_xai/grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning"),
         ("oa_xai/grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309"),
+        ("oa_xai/grok-build", "grok-build"),
     ],
 )
 async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
@@ -14386,6 +14541,58 @@ async def test_codex_auto_agent_alias_code_falls_through_from_antigravity_to_spa
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    expected_candidates = [
+        (
+            "antigravity",
+            "claude-sonnet-4-6",
+            "codex_antigravity_code_assist_adapter",
+            False,
+        ),
+        ("openai", "gpt-5.3-codex-spark", "codex_responses", False),
+        (
+            "xai",
+            "grok-composer-2.5-fast",
+            "codex_grok_native_responses_adapter",
+            False,
+        ),
+        ("xai", "oa_xai/grok-build", "codex_xai_oauth_responses_adapter", False),
+        ("openai", "gpt-5.3-codex", "codex_responses", True),
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ):
+        for index, (provider, model, route_family, last_resort) in enumerate(
+            expected_candidates
+        ):
+            selection = await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+            candidate = selection["candidate"]
+            assert candidate["provider"] == provider
+            assert candidate["model"] == model
+            assert candidate["route_family"] == route_family
+            assert candidate["last_resort"] is last_resort
+            if last_resort:
+                assert selection["selection_reason"] == "last_resort"
+            else:
+                assert selection["selection_reason"] == "first_available"
+            if index < len(expected_candidates) - 1:
+                await _set_codex_auto_agent_cooldown(
+                    selection["cooldown_key"],
+                    60.0,
+                )
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates():
     request = _build_codex_auto_agent_request()
     body = {
@@ -14604,9 +14811,10 @@ async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_invalid_
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_back_after_grok_invalid_grant(
+async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invalid_grant(
     monkeypatch,
 ):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-code",
@@ -14642,7 +14850,9 @@ async def test_codex_auto_agent_alias_code_falls_back_after_grok_invalid_grant(
         "xAI OAuth credential refresh failed (invalid_grant). Reseed or relogin "
         "the managed xAI OAuth credential."
     )
-    codex_success = Response(content='{"ok": true}', media_type="application/json")
+    managed_xai_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
@@ -14652,11 +14862,14 @@ async def test_codex_auto_agent_alias_code_falls_back_after_grok_invalid_grant(
         new=AsyncMock(side_effect=antigravity_error),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=[spark_error, codex_success]),
+        new=AsyncMock(side_effect=[spark_error, managed_xai_success]),
     ) as mock_pass_through, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
         new=AsyncMock(side_effect=grok_refresh_error),
-    ) as mock_grok_token:
+    ) as mock_grok_token, patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ) as mock_xai_token:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -14668,18 +14881,40 @@ async def test_codex_auto_agent_alias_code_falls_back_after_grok_invalid_grant(
             forward_headers=True,
         )
 
-    assert response is codex_success
+    assert response is managed_xai_success
     assert mock_pass_through.await_count == 2
     mock_grok_token.assert_awaited_once()
-    final_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
+    mock_xai_token.assert_awaited_once()
+    managed_call = mock_pass_through.await_args_list[1].kwargs
+    assert managed_call["target"] == "https://api.x.ai/v1/responses"
+    assert managed_call["custom_headers"]["authorization"] == (
+        "Bearer xai-oauth-token"
+    )
+    assert managed_call["forward_headers"] is False
+    assert managed_call["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+    assert managed_call["egress_credential_family"] == "xai"
+    assert managed_call["expected_target_family"] == "xai"
+    final_body = managed_call["custom_body"]
+    assert final_body["model"] == "grok-build"
     metadata = final_body["litellm_metadata"]
-    assert metadata["codex_auto_agent_selected_provider"] == "openai"
-    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex"
+    assert metadata["codex_auto_agent_selected_provider"] == "xai"
+    assert metadata["codex_auto_agent_selected_model"] == "oa_xai/grok-build"
+    assert metadata["codex_auto_agent_selected_route_family"] == (
+        "codex_xai_oauth_responses_adapter"
+    )
+    assert metadata["xai_oauth_public_model"] == "oa_xai/grok-build"
+    assert metadata["xai_oauth_upstream_model"] == "xai/grok-build"
+    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+    ]
     assert [attempt["provider"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "antigravity",
         "openai",
         "xai",
-        "openai",
+        "xai",
     ]
     assert (
         "aawm_codex_auto_agent_candidate_unavailable"
@@ -19840,6 +20075,7 @@ class TestOpenAIPassthroughRoute:
             ("oa_xai/grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning"),
             ("oa_xai/grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning"),
             ("oa_xai/grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309"),
+            ("oa_xai/grok-build", "grok-build"),
         ],
     )
     async def test_openai_passthrough_oa_xai_models_use_responses(
