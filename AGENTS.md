@@ -29,6 +29,42 @@ LiteLLM is a unified interface for 100+ LLMs that:
 
 ## ORCHESTRATOR PROMPT GUIDANCE
 
+### Investigation Ownership For AAWM Alias Flows
+
+This fork owns the AAWM model aliases and the LiteLLM-side routing,
+system-prompt, tool-advertisement, and observability behavior that shape how
+subagents behave. When investigating `investigate-codex-*.md` files, do not stop
+at "not a LiteLLM implementation defect" if the failure involves a model alias
+or provider route managed here.
+
+For every investigation file, explicitly evaluate whether LiteLLM can improve
+the end-to-end workflow by changing any of:
+
+- alias system prompting or injected instructions, including
+  `aawm-codex-agent-auto` and sibling tiered aliases;
+- tool advertisement shape, tool descriptions, parameter schema visibility, or
+  tool filtering/patching;
+- read-only task contracts, final-answer contracts, required attestations, and
+  "describe the patch only" behavior;
+- null/empty completion handling, setup-only response detection, unrelated-task
+  drift detection, and retry/fallback classification;
+- session-history, Langfuse, or provider metadata that would make failure modes
+  easier to diagnose;
+- redispatch accounting, capacity/error surfacing, and fallback guidance.
+
+Capacity-only 429/high-demand failures may not be fixable with prompting, but
+they can still reveal gaps in retry telemetry, cooldown policy, redispatch
+threshold handling, or operator-facing failure logs. Read-only violations,
+null completions, missing required final phrases, setup-only completions, and
+unrelated output should usually produce at least one concrete prompt,
+tool-shape, validation, or telemetry proposal unless there is already an
+active TODO covering the same class.
+
+Any follow-up action should be added under
+`.analysis/todo.md` `Proposals (Pending Operator Feedback)` until approved. The
+investigation disposition should name the proposal ID instead of recording
+`Proposal IDs: none` for an actionable alias-flow improvement.
+
 ### Broad Discovery Subtasks
 
 When delegating broad discovery work to a subagent, put the discovery contract in
