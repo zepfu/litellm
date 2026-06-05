@@ -27,6 +27,8 @@ import litellm
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     RouteChecks,
+    _add_anthropic_auto_agent_alias_metadata,
+    _add_codex_auto_agent_alias_metadata,
     antigravity_proxy_route,
     _drop_unsupported_codex_hosted_tools_from_request_body,
     _drop_unsupported_codex_input_items_from_request_body,
@@ -6344,6 +6346,45 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert response_body["id"] == "chatcmpl_opencode"
         assert response_body["model"] == "big-pickle"
         assert "OPENCODE CODEX OK" in json.dumps(response_body)
+
+    @pytest.mark.asyncio
+    async def test_codex_opencode_zen_direct_route_keeps_missing_auth_error(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-opencode-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+            new=AsyncMock(side_effect=FileNotFoundError("missing opencode auth")),
+        ):
+            with pytest.raises(FileNotFoundError, match="missing opencode auth"):
+                await _handle_codex_opencode_zen_adapter_route(
+                    endpoint="v1/responses",
+                    request=mock_request,
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=MagicMock(),
+                    prepared_request_body={
+                        "model": "opencode/big-pickle",
+                        "input": "just a test msg",
+                        "stream": False,
+                    },
+                    adapter_model="big-pickle",
+                )
 
     @pytest.mark.asyncio
     async def test_codex_opencode_zen_stream_injects_responses_item_lifecycle(
@@ -12685,21 +12726,40 @@ def clear_codex_auto_agent_alias_state():
     _anthropic_auto_agent_session_affinity_by_key.clear()
 
 
-def test_resolve_codex_auto_agent_alias_model_only_for_responses():
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "aawm-codex-agent-auto",
+        "aawm-sota",
+        "aawm-code",
+        "aawm-low",
+    ],
+)
+def test_resolve_codex_auto_agent_alias_model_only_for_responses(alias):
     assert (
         _resolve_codex_auto_agent_alias_model(
-            {"model": "aawm-codex-agent-auto"},
+            {"model": alias},
             endpoint="/v1/responses",
         )
-        == "aawm-codex-agent-auto"
+        == alias
     )
     assert (
         _resolve_codex_auto_agent_alias_model(
-            {"model": "aawm-codex-agent-auto"},
+            {"model": alias},
             endpoint="/v1/chat/completions",
         )
         is None
     )
+    assert (
+        _resolve_anthropic_auto_agent_alias_model(
+            {"model": alias},
+            endpoint="/v1/messages",
+        )
+        is None
+    )
+
+
+def test_resolve_codex_auto_agent_alias_model_ignores_non_aliases():
     assert (
         _resolve_codex_auto_agent_alias_model(
             {"model": "gemini-3.1-flash-lite-preview"},
@@ -12736,21 +12796,40 @@ def _build_anthropic_auto_agent_body(session_id: str = "claude-session"):
     }
 
 
-def test_resolve_anthropic_auto_agent_alias_model_only_for_messages():
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "aawm-anthropic-agent-auto",
+        "aawm-sota-anthropic",
+        "aawm-code-anthropic",
+        "aawm-low-anthropic",
+    ],
+)
+def test_resolve_anthropic_auto_agent_alias_model_only_for_messages(alias):
     assert (
         _resolve_anthropic_auto_agent_alias_model(
-            {"model": "aawm-anthropic-agent-auto"},
+            {"model": alias},
             endpoint="/v1/messages",
         )
-        == "aawm-anthropic-agent-auto"
+        == alias
     )
     assert (
         _resolve_anthropic_auto_agent_alias_model(
-            {"model": "aawm-anthropic-agent-auto"},
+            {"model": alias},
             endpoint="/v1/complete",
         )
         is None
     )
+    assert (
+        _resolve_codex_auto_agent_alias_model(
+            {"model": alias},
+            endpoint="/v1/responses",
+        )
+        is None
+    )
+
+
+def test_resolve_anthropic_auto_agent_alias_model_ignores_non_aliases():
     assert (
         _resolve_anthropic_auto_agent_alias_model(
             {"model": "gpt-5.3-codex-spark"},
@@ -12778,6 +12857,103 @@ async def test_anthropic_auto_agent_alias_selects_spark_first(monkeypatch):
     assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["selection_reason"] == "first_available"
     assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_sota_selects_direct_opus_first():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-sota-anthropic"
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "anthropic"
+    assert selection["candidate"]["model"] == "claude-opus-4-6"
+    assert selection["selection_reason"] == "first_available"
+    assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_selects_antigravity_first():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "antigravity"
+    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["selection_reason"] == "first_available"
+    assert selection["skipped"] == []
+
+
+def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    updated_body = _add_anthropic_auto_agent_alias_metadata(
+        body,
+        selection={
+            "candidate": {
+                "provider": "antigravity",
+                "model": "claude-sonnet-4-6",
+                "route_family": "anthropic_antigravity_code_assist_adapter",
+                "last_resort": False,
+            },
+            "selection_reason": "first_available",
+            "lane_key": "antigravity-lane",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_fresh_dispatch_ignores_session_affinity(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "antigravity"
+    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["selection_reason"] == "first_available"
 
 
 @pytest.mark.asyncio
@@ -12874,6 +13050,42 @@ async def test_anthropic_auto_agent_alias_uses_haiku_only_as_last_resort(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+    expected_candidates = [
+        ("openrouter", "google/gemma-4-31b-it:free", False),
+        ("opencode_zen", "deepseek-v4-flash-free", False),
+        ("opencode_zen", "big-pickle", False),
+        ("anthropic", "claude-haiku-4-5-20251001", True),
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        for index, (provider, model, last_resort) in enumerate(expected_candidates):
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+            candidate = selection["candidate"]
+            assert candidate["provider"] == provider
+            assert candidate["model"] == model
+            assert candidate["last_resort"] is last_resort
+            if last_resort:
+                assert selection["selection_reason"] == "last_resort"
+            else:
+                assert selection["selection_reason"] == "first_available"
+            if index < len(expected_candidates) - 1:
+                await _set_anthropic_auto_agent_cooldown(
+                    selection["cooldown_key"],
+                    60.0,
+                )
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_falls_back_to_gemini_after_spark_429(
     monkeypatch,
 ):
@@ -12926,6 +13138,135 @@ async def test_anthropic_auto_agent_alias_falls_back_to_gemini_after_spark_429(
     assert metadata["requested_model_alias"] == "aawm-anthropic-agent-auto"
     assert metadata["anthropic_auto_agent_selected_provider"] == "google_code_assist"
     assert metadata["anthropic_auto_agent_attempts"][0]["status"] == "cooldown_set"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigravity_429(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    antigravity_error = ProxyException(
+        message="antigravity quota exhausted",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    antigravity_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+    spark_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ) as mock_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(return_value=spark_success),
+    ) as mock_spark:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is spark_success
+    mock_antigravity.assert_awaited_once()
+    mock_spark.assert_awaited_once()
+    assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
+    assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
+    assert mock_spark.await_args.kwargs["adapter_model"] == "gpt-5.3-codex-spark"
+    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
+    metadata = spark_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
+    assert metadata["anthropic_auto_agent_selected_route_family"] == (
+        "anthropic_openai_responses_adapter"
+    )
+    assert metadata["anthropic_auto_agent_attempts"][0]["status"] == "cooldown_set"
+    assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
+        "antigravity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haiku(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+    await _set_anthropic_auto_agent_cooldown(
+        "openrouter:google/gemma-4-31b-it:free:openrouter",
+        60.0,
+    )
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+        new=AsyncMock(side_effect=FileNotFoundError("missing opencode auth")),
+    ) as mock_load_opencode_key, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body",
+    ) as mock_set_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
+        new=AsyncMock(return_value=success),
+    ) as mock_native:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    assert mock_load_opencode_key.await_count == 2
+    mock_native.assert_awaited_once()
+    candidate_body = mock_set_body.call_args.args[1]
+    assert candidate_body["model"] == "claude-haiku-4-5-20251001"
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "anthropic"
+    assert metadata["anthropic_auto_agent_selected_last_resort"] is True
+    assert metadata["anthropic_auto_agent_attempts"][-1]["model"] == (
+        "claude-haiku-4-5-20251001"
+    )
+    opencode_attempts = [
+        attempt
+        for attempt in metadata["anthropic_auto_agent_attempts"]
+        if attempt["provider"] == "opencode_zen"
+    ]
+    assert [attempt["model"] for attempt in opencode_attempts] == [
+        "deepseek-v4-flash-free",
+        "big-pickle",
+    ]
+    assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
+    assert all(
+        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
+        for attempt in opencode_attempts
+    )
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata["anthropic_auto_agent_skipped_candidates"]
+    }
+    assert "google/gemma-4-31b-it:free" in skipped_models
+    assert "deepseek-v4-flash-free" in skipped_models
+    assert "big-pickle" in skipped_models
 
 
 @pytest.mark.asyncio
@@ -13093,7 +13434,7 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
         new=AsyncMock(),
     ) as mock_native:
-        with pytest.raises(ProxyException) as exc_info:
+        with pytest.raises(HTTPException) as exc_info:
             await _handle_anthropic_auto_agent_alias_route(
                 endpoint="/v1/messages",
                 request=request,
@@ -13104,7 +13445,36 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
                 custom_headers={"x-api-key": "anthropic-key"},
             )
 
-    assert exc_info.value is gemini_error
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_redispatch_required"
+    )
+    assert "Do not continue this child agent" in exc_info.value.detail["error"][
+        "message"
+    ]
+    assert "Redispatch a fresh subagent" in exc_info.value.detail["error"]["message"]
+    assert exc_info.value.detail["redispatch_model"] == "aawm-anthropic-agent-auto"
+    assert (
+        exc_info.value.detail["redispatch_reason"]
+        == "in_flight_retryable_provider_exhaustion"
+    )
+    assert exc_info.value.detail["selected_provider"] == "google_code_assist"
+    assert (
+        exc_info.value.detail["selected_model"] == "gemini-3.1-flash-lite-preview"
+    )
+    assert (
+        exc_info.value.detail["selected_route_family"]
+        == "anthropic_google_completion_adapter"
+    )
+    assert exc_info.value.detail["cooldown_seconds"] > 0
+    assert exc_info.value.detail["retry_after_seconds"] > 0
+    assert "RESOURCE_EXHAUSTED" in exc_info.value.detail["error_tokens"]
+    assert exc_info.value.detail["candidate"]["model"] == (
+        "gemini-3.1-flash-lite-preview"
+    )
+    assert exc_info.value.headers["Retry-After"] == str(
+        exc_info.value.detail["retry_after_seconds"]
+    )
     mock_gemini.assert_awaited_once()
     mock_spark.assert_not_called()
     mock_native.assert_not_called()
@@ -13568,6 +13938,289 @@ async def test_codex_auto_agent_alias_selects_spark_first(monkeypatch):
     assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["selection_reason"] == "first_available"
     assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_sota_selects_gpt55_first():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.5"
+    assert selection["selection_reason"] == "first_available"
+    assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_falls_through_from_antigravity_to_spark():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        await _set_codex_auto_agent_cooldown(selection["cooldown_key"], 60.0)
+        fallback_selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "antigravity"
+    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert fallback_selection["candidate"]["provider"] == "openai"
+    assert fallback_selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert fallback_selection["selection_reason"] == "first_available"
+    assert fallback_selection["skipped"][0]["provider"] == "antigravity"
+    assert fallback_selection["skipped"][0]["model"] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    expected_candidates = [
+        ("openrouter", "google/gemma-4-31b-it:free", False),
+        ("opencode_zen", "deepseek-v4-flash-free", False),
+        ("opencode_zen", "big-pickle", False),
+        ("openai", "gpt-5.4-mini", True),
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        for index, (provider, model, last_resort) in enumerate(expected_candidates):
+            selection = await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+            candidate = selection["candidate"]
+            assert candidate["provider"] == provider
+            assert candidate["model"] == model
+            assert candidate["last_resort"] is last_resort
+            if last_resort:
+                assert selection["selection_reason"] == "last_resort"
+            else:
+                assert selection["selection_reason"] == "first_available"
+            if index < len(expected_candidates) - 1:
+                await _set_codex_auto_agent_cooldown(
+                    selection["cooldown_key"],
+                    60.0,
+                )
+
+
+def test_codex_auto_agent_alias_metadata_uses_requested_alias():
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        selection={
+            "candidate": {
+                "provider": "openrouter",
+                "model": "google/gemma-4-31b-it:free",
+                "route_family": "codex_openrouter_responses_adapter",
+                "last_resort": False,
+            },
+            "selection_reason": "first_available",
+            "lane_key": "openrouter",
+            "skipped": [
+                {
+                    "provider": "opencode_zen",
+                    "model": "deepseek-v4-flash-free",
+                    "route_family": "codex_opencode_zen_adapter",
+                    "last_resort": False,
+                    "lane_key": "opencode_zen",
+                    "cooldown_seconds": 60.0,
+                    "reason": "cooldown",
+                }
+            ],
+        },
+        attempts=[
+            {
+                "provider": "openrouter",
+                "model": "google/gemma-4-31b-it:free",
+                "route_family": "codex_openrouter_responses_adapter",
+                "last_resort": False,
+                "lane_key": "openrouter",
+                "reason": "first_available",
+            }
+        ],
+    )
+
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["codex_auto_agent_alias"] == "aawm-low"
+    assert metadata["codex_auto_agent_selected_provider"] == "openrouter"
+    assert metadata["codex_auto_agent_selected_model"] == "google/gemma-4-31b-it:free"
+    assert metadata["codex_auto_agent_selected_route_family"] == (
+        "codex_openrouter_responses_adapter"
+    )
+    assert metadata["codex_auto_agent_selection_reason"] == "first_available"
+    assert metadata["codex_auto_agent_lane_key"] == "openrouter"
+    assert metadata["codex_auto_agent_attempts"][0]["provider"] == "openrouter"
+    assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == (
+        "opencode_zen"
+    )
+    assert "codex-auto-agent-alias:aawm-low" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_falls_back_to_spark_after_antigravity_429(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    antigravity_error = ProxyException(
+        message="antigravity quota exhausted",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    antigravity_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+    spark_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ) as mock_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=spark_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is spark_success
+    mock_antigravity.assert_awaited_once()
+    mock_pass_through.assert_awaited_once()
+    assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
+    assert mock_antigravity.await_args.kwargs["adapter_model"] == "claude-sonnet-4-6"
+    assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
+    spark_body = mock_pass_through.await_args.kwargs["custom_body"]
+    metadata = spark_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code"
+    assert metadata["codex_auto_agent_alias"] == "aawm-code"
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    assert metadata["codex_auto_agent_selected_route_family"] == "codex_responses"
+    assert metadata["codex_auto_agent_attempts"][0]["status"] == "cooldown_set"
+    assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == (
+        "antigravity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openrouter:google/gemma-4-31b-it:free:openrouter",
+        60.0,
+    )
+    mini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+        new=AsyncMock(side_effect=FileNotFoundError("missing opencode auth")),
+    ) as mock_load_opencode_key, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=mini_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is mini_success
+    assert mock_load_opencode_key.await_count == 2
+    mock_pass_through.assert_awaited_once()
+    candidate_body = mock_pass_through.await_args.kwargs["custom_body"]
+    assert candidate_body["model"] == "gpt-5.4-mini"
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
+    assert metadata["codex_auto_agent_selected_last_resort"] is True
+    opencode_attempts = [
+        attempt
+        for attempt in metadata["codex_auto_agent_attempts"]
+        if attempt["provider"] == "opencode_zen"
+    ]
+    assert [attempt["model"] for attempt in opencode_attempts] == [
+        "deepseek-v4-flash-free",
+        "big-pickle",
+    ]
+    assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
+    assert all(
+        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
+        for attempt in opencode_attempts
+    )
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata["codex_auto_agent_skipped_candidates"]
+    }
+    assert "google/gemma-4-31b-it:free" in skipped_models
+    assert "deepseek-v4-flash-free" in skipped_models
+    assert "big-pickle" in skipped_models
 
 
 @pytest.mark.asyncio

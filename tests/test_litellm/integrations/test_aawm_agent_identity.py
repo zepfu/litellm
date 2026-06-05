@@ -4468,6 +4468,48 @@ def test_build_session_history_record_routes_auto_agent_alias_to_selected_provid
     assert record["model_group"] == "deepseek/deepseek-v4-flash:free"
 
 
+def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selected_provider() -> None:
+    kwargs = _base_kwargs(trace_name="claude")
+    kwargs["model"] = "aawm-code-anthropic"
+    kwargs["custom_llm_provider"] = "litellm"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-auto-agent-anthropic-selected"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-auto-agent-anthropic-selected",
+            "model_group": "aawm-code-anthropic",
+            "requested_model_alias": "aawm-code-anthropic",
+            "anthropic_auto_agent_alias": "aawm-code-anthropic",
+            "anthropic_auto_agent_selected_provider": "antigravity",
+            "anthropic_auto_agent_selected_model": "claude-sonnet-4-6",
+        }
+    )
+
+    result = {
+        "id": "auto-agent-anthropic-response-1",
+        "model": "claude-sonnet-4-6",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 8,
+            "total_tokens": 108,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["provider"] == "antigravity"
+    assert record["model"] == "claude-sonnet-4-6"
+    assert record["model_group"] == "claude-sonnet-4-6"
+
+
 def test_build_session_history_record_routes_openai_compatible_openrouter_model() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "inclusionai/ling-2.6-flash"
