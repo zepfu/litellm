@@ -328,8 +328,13 @@ _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
 )
 _CODEX_AUTO_AGENT_NATIVE_PROVIDER = "openai"
 _CODEX_AUTO_AGENT_GOOGLE_PROVIDER = "google_code_assist"
+_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER = "antigravity"
 _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = "openrouter"
+_CODEX_AUTO_AGENT_XAI_PROVIDER = "xai"
+_CODEX_AUTO_AGENT_OPENCODE_PROVIDER = _OPENCODE_ZEN_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
+_CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
+_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _OPENCODE_ZEN_PROVIDER
 _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -368,6 +373,75 @@ _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
+_CODEX_AAWM_SOTA_ALIAS = "aawm-sota"
+_CODEX_AAWM_CODE_ALIAS = "aawm-code"
+_CODEX_AAWM_LOW_ALIAS = "aawm-low"
+_CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.5",
+        "route_family": "codex_responses",
+        "last_resort": False,
+    },
+)
+_CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
+        "model": "claude-sonnet-4-6",
+        "route_family": "codex_antigravity_code_assist_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "codex_responses",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "grok-composer-2.5-fast",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.3-codex",
+        "route_family": "codex_responses",
+        "last_resort": True,
+    },
+)
+_CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "google/gemma-4-31b-it:free",
+        "route_family": "codex_openrouter_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+        "model": "deepseek-v4-flash-free",
+        "route_family": "codex_opencode_zen_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+        "model": "big-pickle",
+        "route_family": "codex_opencode_zen_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.4-mini",
+        "route_family": "codex_responses",
+        "last_resort": True,
+    },
+)
+_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {
+    _CODEX_AUTO_AGENT_MODEL_ALIAS: _CODEX_AUTO_AGENT_CANDIDATES,
+    _CODEX_AAWM_SOTA_ALIAS: _CODEX_AAWM_SOTA_CANDIDATES,
+    _CODEX_AAWM_CODE_ALIAS: _CODEX_AAWM_CODE_CANDIDATES,
+    _CODEX_AAWM_LOW_ALIAS: _CODEX_AAWM_LOW_CANDIDATES,
+}
 _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = "aawm-anthropic-agent-auto"
 _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = "anthropic"
 _ANTHROPIC_AUTO_AGENT_HAIKU_MODEL = "claude-haiku-4-5-20251001"
@@ -409,6 +483,77 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
+_ANTHROPIC_AAWM_SOTA_ALIAS = "aawm-sota-anthropic"
+_ANTHROPIC_AAWM_CODE_ALIAS = "aawm-code-anthropic"
+_ANTHROPIC_AAWM_LOW_ALIAS = "aawm-low-anthropic"
+_ANTHROPIC_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "claude-opus-4-6",
+        "route_family": "anthropic_messages",
+        "last_resort": False,
+    },
+)
+_ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
+        "model": "claude-sonnet-4-6",
+        "route_family": "anthropic_antigravity_completion_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "grok-composer-2.5-fast",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "claude-sonnet-4-6",
+        "route_family": "anthropic_messages",
+        "last_resort": True,
+    },
+)
+_ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "google/gemma-4-31b-it:free",
+        "route_family": "anthropic_openrouter_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+        "model": "deepseek-v4-flash-free",
+        "route_family": "anthropic_opencode_zen_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+        "model": "big-pickle",
+        "route_family": "anthropic_opencode_zen_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": _ANTHROPIC_AUTO_AGENT_HAIKU_MODEL,
+        "route_family": "anthropic_messages",
+        "last_resort": True,
+    },
+)
+_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[
+    str, tuple[dict[str, Any], ...]
+] = {
+    _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS: _ANTHROPIC_AUTO_AGENT_CANDIDATES,
+    _ANTHROPIC_AAWM_SOTA_ALIAS: _ANTHROPIC_AAWM_SOTA_CANDIDATES,
+    _ANTHROPIC_AAWM_CODE_ALIAS: _ANTHROPIC_AAWM_CODE_CANDIDATES,
+    _ANTHROPIC_AAWM_LOW_ALIAS: _ANTHROPIC_AAWM_LOW_CANDIDATES,
+}
 _codex_auto_agent_cooldown_until_monotonic_by_key: dict[str, float] = {}
 _codex_auto_agent_session_affinity_by_key: dict[str, dict[str, Any]] = {}
 _codex_auto_agent_lock = asyncio.Lock()
@@ -1409,11 +1554,18 @@ def _resolve_codex_antigravity_code_assist_adapter_model(
     )
 
 
+def _normalize_codex_auto_agent_alias_model(model: Any) -> Optional[str]:
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip().lower()
+    for alias in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS:
+        if normalized == alias.lower():
+            return alias
+    return None
+
+
 def _is_codex_auto_agent_alias_model(model: Any) -> bool:
-    return (
-        isinstance(model, str)
-        and model.strip().lower() == _CODEX_AUTO_AGENT_MODEL_ALIAS
-    )
+    return _normalize_codex_auto_agent_alias_model(model) is not None
 
 
 def _resolve_codex_auto_agent_alias_model(
@@ -1422,9 +1574,7 @@ def _resolve_codex_auto_agent_alias_model(
 ) -> Optional[str]:
     if not _is_openai_responses_endpoint(endpoint):
         return None
-    if _is_codex_auto_agent_alias_model(request_body.get("model")):
-        return _CODEX_AUTO_AGENT_MODEL_ALIAS
-    return None
+    return _normalize_codex_auto_agent_alias_model(request_body.get("model"))
 
 
 def _get_codex_auto_agent_header(
@@ -1479,9 +1629,33 @@ async def _resolve_codex_auto_agent_google_lane_key() -> str:
         return "__default__"
 
 
+async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
+    try:
+        antigravity_access_token = await _load_valid_local_antigravity_access_token()
+        antigravity_project = await _get_or_load_google_code_assist_project(
+            antigravity_access_token,
+            adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+        )
+        return "antigravity:{}".format(
+            _get_google_adapter_rate_limit_key(
+                None,
+                access_token=antigravity_access_token,
+                companion_project=antigravity_project,
+            )
+        )
+    except Exception:
+        verbose_proxy_logger.warning(
+            "Codex auto-agent alias could not resolve Antigravity Code Assist lane; using default lane",
+            exc_info=True,
+        )
+        return "__default__"
+
+
 def _resolve_codex_auto_agent_session_key(
     request: Request,
     request_body: dict[str, Any],
+    *,
+    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[str]:
     metadata = request_body.get("litellm_metadata")
     metadata_session_id = (
@@ -1496,7 +1670,12 @@ def _resolve_codex_auto_agent_session_key(
         )
     if session_id is None:
         return None
-    return f"{session_id}:{_resolve_codex_auto_agent_openai_lane_key(request)}"
+    if alias_model == _CODEX_AUTO_AGENT_MODEL_ALIAS:
+        return f"{session_id}:{_resolve_codex_auto_agent_openai_lane_key(request)}"
+    return (
+        f"{alias_model}:{session_id}:"
+        f"{_resolve_codex_auto_agent_openai_lane_key(request)}"
+    )
 
 
 def _codex_auto_agent_candidate_key(
@@ -1618,6 +1797,7 @@ def _raise_codex_auto_agent_redispatch_required(
     lane_key: Optional[str],
     cooldown_seconds: float,
     error_tokens: set[str],
+    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
 ) -> None:
     retry_after_seconds = int(max(1.0, cooldown_seconds))
     shaped_candidate = _codex_auto_agent_candidate_public_shape(
@@ -1633,13 +1813,13 @@ def _raise_codex_auto_agent_redispatch_required(
                 "message": (
                     "Codex auto-agent alias target hit retryable provider exhaustion "
                     "for an in-flight session. Do not continue this child agent. "
-                    f"Redispatch a fresh subagent using model {_CODEX_AUTO_AGENT_MODEL_ALIAS} "
+                    f"Redispatch a fresh subagent using model {alias_model} "
                     "so the auto selector can choose the next available candidate."
                 ),
                 "type": "rate_limit_error",
                 "code": "aawm_codex_auto_agent_redispatch_required",
             },
-            "redispatch_model": _CODEX_AUTO_AGENT_MODEL_ALIAS,
+            "redispatch_model": alias_model,
             "redispatch_reason": "in_flight_retryable_provider_exhaustion",
             "selected_provider": candidate.get("provider"),
             "selected_model": candidate.get("model"),
@@ -1719,8 +1899,12 @@ async def _set_codex_auto_agent_session_affinity(
 def _find_codex_auto_agent_candidate(
     provider: Any,
     model: Any,
+    *,
+    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[dict[str, Any]]:
-    for candidate in _CODEX_AUTO_AGENT_CANDIDATES:
+    for candidate in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+        alias_model, _CODEX_AUTO_AGENT_CANDIDATES
+    ):
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
@@ -1728,18 +1912,33 @@ def _find_codex_auto_agent_candidate(
 
 async def _build_codex_auto_agent_candidate_states(
     request: Request,
+    *,
+    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_lane_key(request)
     google_lane_key: Optional[str] = None
+    antigravity_lane_key: Optional[str] = None
     states: list[dict[str, Any]] = []
-    for candidate_template in _CODEX_AUTO_AGENT_CANDIDATES:
+    for candidate_template in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+        alias_model, _CODEX_AUTO_AGENT_CANDIDATES
+    ):
         candidate = dict(candidate_template)
         if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
             if google_lane_key is None:
                 google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
             lane_key = google_lane_key
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
+            if antigravity_lane_key is None:
+                antigravity_lane_key = (
+                    await _resolve_codex_auto_agent_antigravity_lane_key()
+                )
+            lane_key = antigravity_lane_key
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
+            lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
+            lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
         else:
             lane_key = openai_lane_key
         cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
@@ -1762,11 +1961,22 @@ async def _select_codex_auto_agent_candidate(
     request: Request,
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
-    session_key = _resolve_codex_auto_agent_session_key(request, request_body)
+    alias_model = (
+        _normalize_codex_auto_agent_alias_model(request_body.get("model"))
+        or _CODEX_AUTO_AGENT_MODEL_ALIAS
+    )
+    session_key = _resolve_codex_auto_agent_session_key(
+        request,
+        request_body,
+        alias_model=alias_model,
+    )
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(
         request_body
     )
-    states = await _build_codex_auto_agent_candidate_states(request)
+    states = await _build_codex_auto_agent_candidate_states(
+        request,
+        alias_model=alias_model,
+    )
     skipped = [
         _codex_auto_agent_candidate_public_shape(
             state["candidate"],
@@ -1785,6 +1995,7 @@ async def _select_codex_auto_agent_candidate(
         affinity_candidate = _find_codex_auto_agent_candidate(
             affinity.get("provider"),
             affinity.get("model"),
+            alias_model=alias_model,
         )
         if affinity_candidate is not None:
             affinity_state = next(
@@ -1815,6 +2026,7 @@ async def _select_codex_auto_agent_candidate(
                 else:
                     return {
                         **affinity_state,
+                        "alias_model": alias_model,
                         "session_key": session_key,
                         "selection_reason": "session_affinity",
                         "skipped": skipped,
@@ -1835,6 +2047,7 @@ async def _select_codex_auto_agent_candidate(
             ):
                 return {
                     **affinity_state,
+                    "alias_model": alias_model,
                     "session_key": session_key,
                     "selection_reason": "session_affinity",
                     "skipped": skipped,
@@ -1845,6 +2058,7 @@ async def _select_codex_auto_agent_candidate(
             continue
         return {
             **state,
+            "alias_model": alias_model,
             "session_key": session_key,
             "selection_reason": "first_available",
             "skipped": skipped,
@@ -1855,6 +2069,7 @@ async def _select_codex_auto_agent_candidate(
             continue
         return {
             **state,
+            "alias_model": alias_model,
             "session_key": session_key,
             "selection_reason": "last_resort",
             "skipped": skipped,
@@ -1941,6 +2156,8 @@ def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
         tokens.add("MODEL_CAPACITY_EXHAUSTED")
     if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
         tokens.add("RATE_LIMIT_EXCEEDED")
+    if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
+        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
     return tokens
 
 
@@ -1959,6 +2176,7 @@ def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
             "MODEL_CAPACITY_EXHAUSTED",
             "RATE_LIMIT_EXCEEDED",
             "rate_limit_exceeded",
+            "aawm_codex_auto_agent_candidate_unavailable",
         }
     )
 
@@ -2034,6 +2252,11 @@ def _add_codex_auto_agent_alias_metadata(
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
     candidate = selection["candidate"]
+    alias_model = (
+        selection.get("alias_model")
+        or _normalize_codex_auto_agent_alias_model(request_body.get("model"))
+        or _CODEX_AUTO_AGENT_MODEL_ALIAS
+    )
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
@@ -2049,10 +2272,11 @@ def _add_codex_auto_agent_alias_metadata(
                 if candidate.get("last_resort")
                 else []
             ),
+            f"codex-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
-            "requested_model_alias": _CODEX_AUTO_AGENT_MODEL_ALIAS,
-            "codex_auto_agent_alias": _CODEX_AUTO_AGENT_MODEL_ALIAS,
+            "requested_model_alias": alias_model,
+            "codex_auto_agent_alias": alias_model,
             "codex_auto_agent_selected_provider": candidate["provider"],
             "codex_auto_agent_selected_model": target_model,
             "codex_auto_agent_selected_route_family": candidate["route_family"],
@@ -2066,11 +2290,18 @@ def _add_codex_auto_agent_alias_metadata(
         },
     )
 
+def _normalize_anthropic_auto_agent_alias_model(model: Any) -> Optional[str]:
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip().lower()
+    for alias in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS:
+        if normalized == alias.lower():
+            return alias
+    return None
+
+
 def _is_anthropic_auto_agent_alias_model(model: Any) -> bool:
-    return (
-        isinstance(model, str)
-        and model.strip().lower() == _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-    )
+    return _normalize_anthropic_auto_agent_alias_model(model) is not None
 
 
 def _resolve_anthropic_auto_agent_alias_model(
@@ -2079,9 +2310,7 @@ def _resolve_anthropic_auto_agent_alias_model(
 ) -> Optional[str]:
     if not _has_anthropic_responses_adapter_endpoint(endpoint):
         return None
-    if _is_anthropic_auto_agent_alias_model(request_body.get("model")):
-        return _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-    return None
+    return _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
 
 
 def _resolve_anthropic_auto_agent_native_lane_key(request: Request) -> str:
@@ -2103,6 +2332,8 @@ def _resolve_anthropic_auto_agent_native_lane_key(request: Request) -> str:
 def _resolve_anthropic_auto_agent_session_key(
     request: Request,
     request_body: dict[str, Any],
+    *,
+    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[str]:
     metadata = request_body.get("litellm_metadata")
     metadata_session_id = (
@@ -2118,7 +2349,12 @@ def _resolve_anthropic_auto_agent_session_key(
         )
     if session_id is None:
         return None
-    return f"{session_id}:{_resolve_anthropic_auto_agent_native_lane_key(request)}"
+    if alias_model == _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS:
+        return f"{session_id}:{_resolve_anthropic_auto_agent_native_lane_key(request)}"
+    return (
+        f"{alias_model}:{session_id}:"
+        f"{_resolve_anthropic_auto_agent_native_lane_key(request)}"
+    )
 
 
 async def _get_anthropic_auto_agent_active_cooldown_seconds(
@@ -2187,8 +2423,12 @@ async def _set_anthropic_auto_agent_session_affinity(
 def _find_anthropic_auto_agent_candidate(
     provider: Any,
     model: Any,
+    *,
+    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[dict[str, Any]]:
-    for candidate in _ANTHROPIC_AUTO_AGENT_CANDIDATES:
+    for candidate in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+        alias_model, _ANTHROPIC_AUTO_AGENT_CANDIDATES
+    ):
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
@@ -2196,19 +2436,34 @@ def _find_anthropic_auto_agent_candidate(
 
 async def _build_anthropic_auto_agent_candidate_states(
     request: Request,
+    *,
+    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_lane_key(request)
     anthropic_lane_key = _resolve_anthropic_auto_agent_native_lane_key(request)
     google_lane_key: Optional[str] = None
+    antigravity_lane_key: Optional[str] = None
     states: list[dict[str, Any]] = []
-    for candidate_template in _ANTHROPIC_AUTO_AGENT_CANDIDATES:
+    for candidate_template in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+        alias_model, _ANTHROPIC_AUTO_AGENT_CANDIDATES
+    ):
         candidate = dict(candidate_template)
         if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
             if google_lane_key is None:
                 google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
             lane_key = google_lane_key
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
+            if antigravity_lane_key is None:
+                antigravity_lane_key = (
+                    await _resolve_codex_auto_agent_antigravity_lane_key()
+                )
+            lane_key = antigravity_lane_key
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
+            lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
+        elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
+            lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
         elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
             lane_key = anthropic_lane_key
         else:
@@ -2259,16 +2514,69 @@ def _raise_anthropic_auto_agent_in_flight_cooldown(
     )
 
 
+def _raise_anthropic_auto_agent_redispatch_required(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    error_tokens: set[str],
+    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+) -> None:
+    retry_after_seconds = int(max(1.0, cooldown_seconds))
+    shaped_candidate = _codex_auto_agent_candidate_public_shape(
+        candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        reason="in_flight_retryable_provider_exhaustion",
+    )
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": (
+                    "Anthropic auto-agent alias target hit retryable provider "
+                    "exhaustion for an in-flight session. Do not continue this "
+                    f"child agent. Redispatch a fresh subagent using model {alias_model} "
+                    "so the auto selector can choose the next available candidate."
+                ),
+                "type": "rate_limit_error",
+                "code": "aawm_anthropic_auto_agent_redispatch_required",
+            },
+            "redispatch_model": alias_model,
+            "redispatch_reason": "in_flight_retryable_provider_exhaustion",
+            "selected_provider": candidate.get("provider"),
+            "selected_model": candidate.get("model"),
+            "selected_route_family": candidate.get("route_family"),
+            "cooldown_seconds": round(float(cooldown_seconds), 3),
+            "retry_after_seconds": retry_after_seconds,
+            "error_tokens": sorted(error_tokens),
+            "candidate": shaped_candidate,
+        },
+        headers={"Retry-After": str(retry_after_seconds)},
+    )
+
+
 async def _select_anthropic_auto_agent_candidate(
     *,
     request: Request,
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
-    session_key = _resolve_anthropic_auto_agent_session_key(request, request_body)
+    alias_model = (
+        _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
+        or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+    )
+    session_key = _resolve_anthropic_auto_agent_session_key(
+        request,
+        request_body,
+        alias_model=alias_model,
+    )
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(
         request_body
     )
-    states = await _build_anthropic_auto_agent_candidate_states(request)
+    states = await _build_anthropic_auto_agent_candidate_states(
+        request,
+        alias_model=alias_model,
+    )
     skipped = [
         _codex_auto_agent_candidate_public_shape(
             state["candidate"],
@@ -2281,10 +2589,13 @@ async def _select_anthropic_auto_agent_candidate(
     ]
 
     affinity = await _get_anthropic_auto_agent_session_affinity(session_key)
+    if affinity is not None and not has_continuation_state:
+        affinity = None
     if affinity is not None:
         affinity_candidate = _find_anthropic_auto_agent_candidate(
             affinity.get("provider"),
             affinity.get("model"),
+            alias_model=alias_model,
         )
         if affinity_candidate is not None:
             affinity_state = next(
@@ -2315,6 +2626,7 @@ async def _select_anthropic_auto_agent_candidate(
                 else:
                     return {
                         **affinity_state,
+                        "alias_model": alias_model,
                         "session_key": session_key,
                         "selection_reason": "session_affinity",
                         "skipped": skipped,
@@ -2326,6 +2638,7 @@ async def _select_anthropic_auto_agent_candidate(
             continue
         return {
             **state,
+            "alias_model": alias_model,
             "session_key": session_key,
             "selection_reason": "first_available",
             "skipped": skipped,
@@ -2337,6 +2650,7 @@ async def _select_anthropic_auto_agent_candidate(
             continue
         return {
             **state,
+            "alias_model": alias_model,
             "session_key": session_key,
             "selection_reason": "last_resort",
             "skipped": skipped,
@@ -2365,6 +2679,11 @@ def _add_anthropic_auto_agent_alias_metadata(
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
     candidate = selection["candidate"]
+    alias_model = (
+        selection.get("alias_model")
+        or _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
+        or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+    )
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
@@ -2380,10 +2699,11 @@ def _add_anthropic_auto_agent_alias_metadata(
                 if candidate.get("last_resort")
                 else []
             ),
+            f"anthropic-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
-            "requested_model_alias": _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-            "anthropic_auto_agent_alias": _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+            "requested_model_alias": alias_model,
+            "anthropic_auto_agent_alias": alias_model,
             "anthropic_auto_agent_selected_provider": candidate["provider"],
             "anthropic_auto_agent_selected_model": target_model,
             "anthropic_auto_agent_selected_route_family": candidate["route_family"],
@@ -7673,8 +7993,45 @@ async def _load_local_opencode_zen_api_key() -> str:
     return api_key
 
 
-async def _build_opencode_zen_headers(request: Request) -> dict[str, str]:
-    api_key = await _load_local_opencode_zen_api_key()
+def _raise_opencode_zen_auto_agent_candidate_unavailable(exc: Exception) -> None:
+    proxy_exc = ProxyException(
+        message=(
+            "OpenCode Zen auto-agent candidate requires a valid OpenCode API-key "
+            f"credential: {exc}"
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    proxy_exc.detail = {
+        "error": {
+            "message": proxy_exc.message,
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    raise proxy_exc from exc
+
+
+async def _load_opencode_zen_api_key_for_candidate(
+    *,
+    use_alias_candidate_probe: bool = False,
+) -> str:
+    try:
+        return await _load_local_opencode_zen_api_key()
+    except (FileNotFoundError, ValueError) as exc:
+        if use_alias_candidate_probe:
+            _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
+        raise
+
+
+async def _build_opencode_zen_headers(
+    request: Request,
+    *,
+    use_alias_candidate_probe: bool = False,
+) -> dict[str, str]:
+    api_key = await _load_opencode_zen_api_key_for_candidate(
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
     return BaseOpenAIPassThroughHandler._assemble_headers(
         api_key=api_key,
         request=request,
@@ -11119,6 +11476,7 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
     translated_request_body = _build_anthropic_responses_adapter_request_body(
@@ -11164,7 +11522,10 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
         base_target_url=target_base_url,
         endpoint="/v1/responses",
     )
-    custom_headers = await _build_opencode_zen_headers(request)
+    custom_headers = await _build_opencode_zen_headers(
+        request,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
 
     upstream_response = await pass_through_request(
         request=request,
@@ -16171,8 +16532,18 @@ async def _handle_anthropic_auto_agent_alias_route(
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(
         prepared_request_body
     )
+    alias_model = (
+        _normalize_anthropic_auto_agent_alias_model(prepared_request_body.get("model"))
+        or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+    )
 
-    for _attempt_number in range(len(_ANTHROPIC_AUTO_AGENT_CANDIDATES)):
+    for _attempt_number in range(
+        len(
+            _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+                alias_model, _ANTHROPIC_AUTO_AGENT_CANDIDATES
+            )
+        )
+    ):
         selection = await _select_anthropic_auto_agent_candidate(
             request=request,
             request_body=prepared_request_body,
@@ -16199,6 +16570,17 @@ async def _handle_anthropic_auto_agent_alias_route(
                     user_api_key_dict=user_api_key_dict,
                     prepared_request_body=candidate_body,
                     adapter_model=candidate["model"],
+                )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
+                response = await _handle_anthropic_google_completion_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+                    use_alias_candidate_probe=True,
                 )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
                 response = await _handle_anthropic_google_completion_adapter_route(
@@ -16232,6 +16614,26 @@ async def _handle_anthropic_auto_agent_alias_route(
                         prepared_request_body=candidate_body,
                         adapter_model=candidate["model"],
                     )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
+                response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
+                )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
+                response = await _handle_anthropic_opencode_zen_responses_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
+                )
             else:
                 _safe_set_request_parsed_body(request, candidate_body)
                 response = await _perform_anthropic_native_passthrough_request(
@@ -16273,7 +16675,13 @@ async def _handle_anthropic_auto_agent_alias_route(
                     candidate["provider"],
                     candidate["model"],
                 )
-                raise
+                _raise_anthropic_auto_agent_redispatch_required(
+                    candidate=candidate,
+                    lane_key=selection.get("lane_key"),
+                    cooldown_seconds=cooldown_seconds,
+                    error_tokens=set(attempt_record.get("error_tokens") or []),
+                    alias_model=alias_model,
+                )
             verbose_proxy_logger.warning(
                 "Anthropic auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",
                 candidate["provider"],
@@ -17951,6 +18359,51 @@ async def _perform_codex_auto_agent_native_openai_request(
     )
 
 
+async def _perform_codex_auto_agent_grok_native_responses_request(
+    *,
+    endpoint: str,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth,
+    request_body: dict[str, Any],
+) -> Response:
+    grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
+        endpoint=endpoint,
+        request=request,
+        request_body=request_body,
+        extra_headers={},
+    )
+    if grok_context is None:
+        exc = ProxyException(
+            message=(
+                "Grok native Codex auto-agent candidate requires a managed Grok OIDC credential."
+            ),
+            type="rate_limit_error",
+            param="model",
+            code=429,
+        )
+        exc.detail = {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        }
+        raise exc
+    _, grok_headers, grok_prepared_body, updated_url = grok_context
+    return await pass_through_request(
+        request=request,
+        target=updated_url,
+        custom_headers=grok_headers,
+        user_api_key_dict=user_api_key_dict,
+        forward_headers=False,
+        stream=bool(grok_prepared_body.get("stream")),
+        custom_body=grok_prepared_body,
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        egress_credential_family="xai",
+        expected_target_family="xai",
+        retryable_upstream_status_codes=[429],
+    )
+
+
 async def _perform_codex_auto_agent_openrouter_responses_request(
     *,
     request: Request,
@@ -18034,6 +18487,7 @@ async def _handle_codex_opencode_zen_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
@@ -18095,7 +18549,9 @@ async def _handle_codex_opencode_zen_adapter_route(
         base_target_url=target_base_url,
         endpoint="/v1/chat/completions",
     )
-    api_key = await _load_local_opencode_zen_api_key()
+    api_key = await _load_opencode_zen_api_key_for_candidate(
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
     custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
         api_key=api_key,
         request=request,
@@ -18308,8 +18764,18 @@ async def _handle_codex_auto_agent_alias_route(
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(
         prepared_request_body
     )
+    alias_model = (
+        _normalize_codex_auto_agent_alias_model(prepared_request_body.get("model"))
+        or _CODEX_AUTO_AGENT_MODEL_ALIAS
+    )
 
-    for _attempt_number in range(len(_CODEX_AUTO_AGENT_CANDIDATES)):
+    for _attempt_number in range(
+        len(
+            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+                alias_model, _CODEX_AUTO_AGENT_CANDIDATES
+            )
+        )
+    ):
         selection = await _select_codex_auto_agent_candidate(
             request=request,
             request_body=prepared_request_body,
@@ -18338,6 +18804,17 @@ async def _handle_codex_auto_agent_alias_route(
                     adapter_model=candidate["model"],
                     use_alias_candidate_probe=True,
                 )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
+                response = await _handle_codex_google_code_assist_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+                    use_alias_candidate_probe=True,
+                )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
                 if (
                     candidate.get("route_family")
@@ -18356,6 +18833,23 @@ async def _handle_codex_auto_agent_alias_route(
                         adapter_model=candidate["model"],
                         request_body=candidate_body,
                     )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
+                response = await _perform_codex_auto_agent_grok_native_responses_request(
+                    endpoint=endpoint,
+                    request=request,
+                    user_api_key_dict=user_api_key_dict,
+                    request_body=candidate_body,
+                )
+            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
+                response = await _handle_codex_opencode_zen_adapter_route(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    prepared_request_body=candidate_body,
+                    adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
+                )
             else:
                 response = await _perform_codex_auto_agent_native_openai_request(
                     request=request,
@@ -18405,6 +18899,7 @@ async def _handle_codex_auto_agent_alias_route(
                     lane_key=selection.get("lane_key"),
                     cooldown_seconds=cooldown_seconds,
                     error_tokens=error_tokens,
+                    alias_model=alias_model,
                 )
             verbose_proxy_logger.warning(
                 "Codex auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",

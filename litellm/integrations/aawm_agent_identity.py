@@ -1972,6 +1972,15 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_auto_agent_lane_key",
     "codex_auto_agent_attempts",
     "codex_auto_agent_skipped_candidates",
+    "anthropic_auto_agent_alias",
+    "anthropic_auto_agent_selected_provider",
+    "anthropic_auto_agent_selected_model",
+    "anthropic_auto_agent_selected_route_family",
+    "anthropic_auto_agent_selected_last_resort",
+    "anthropic_auto_agent_selection_reason",
+    "anthropic_auto_agent_lane_key",
+    "anthropic_auto_agent_attempts",
+    "anthropic_auto_agent_skipped_candidates",
     "codex_google_code_assist_dropped_response_tool_types",
     "google_retrieve_user_quota",
     "usage_tool_call_count",
@@ -7785,6 +7794,7 @@ def _session_history_metadata_model(metadata: Dict[str, Any]) -> Optional[str]:
     hidden_params = metadata.get("hidden_params")
     return _first_known_model_string(
         metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("anthropic_auto_agent_selected_model"),
         metadata.get("codex_adapter_model"),
         metadata.get("litellm_model"),
         _session_history_model_from_request_tags(metadata),
@@ -8308,6 +8318,11 @@ def _session_history_auto_agent_selected_provider(
 ) -> Optional[str]:
     selected_provider = _normalize_session_history_provider_name(
         metadata.get("codex_auto_agent_selected_provider")
+    )
+    if selected_provider is not None:
+        return selected_provider
+    selected_provider = _normalize_session_history_provider_name(
+        metadata.get("anthropic_auto_agent_selected_provider")
     )
     if selected_provider is not None:
         return selected_provider
@@ -13548,6 +13563,7 @@ def _build_session_history_record_from_langfuse_trace_observation(
     )
     explicit_openrouter_model = _first_explicit_openrouter_model_string(
         metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("anthropic_auto_agent_selected_model"),
         metadata.get("aawm_auto_agent_selected_model"),
         metadata.get("anthropic_adapter_original_model"),
         metadata.get("codex_adapter_original_model"),
@@ -14030,14 +14046,44 @@ def _normalize_session_history_model_group(
     if normalized_group is None:
         return None
     group_lower = normalized_group.lower()
-    auto_alias = _first_non_empty_string(
-        metadata.get("codex_auto_agent_alias"),
-        metadata.get("aawm_auto_agent_alias"),
-        "aawm-codex-agent-auto"
-        if "aawm-codex-agent-auto" in group_lower
-        else None,
+
+    auto_agent_aliases: Tuple[Tuple[Optional[str], Tuple[Any, ...]], ...] = (
+        (
+            _clean_non_empty_string(metadata.get("codex_auto_agent_alias")),
+            (
+                metadata.get("codex_auto_agent_selected_model"),
+                metadata.get("aawm_auto_agent_selected_model"),
+            ),
+        ),
+        (
+            _clean_non_empty_string(metadata.get("anthropic_auto_agent_alias")),
+            (
+                metadata.get("anthropic_auto_agent_selected_model"),
+                metadata.get("aawm_auto_agent_selected_model"),
+            ),
+        ),
+        (
+            _clean_non_empty_string(metadata.get("aawm_auto_agent_alias")),
+            (
+                metadata.get("aawm_auto_agent_selected_model"),
+                metadata.get("codex_auto_agent_selected_model"),
+                metadata.get("anthropic_auto_agent_selected_model"),
+            ),
+        ),
+        (
+            _clean_non_empty_string(metadata.get("requested_model_alias")),
+            (
+                metadata.get("codex_auto_agent_selected_model"),
+                metadata.get("anthropic_auto_agent_selected_model"),
+                metadata.get("aawm_auto_agent_selected_model"),
+            ),
+        ),
     )
-    if auto_alias and group_lower == auto_alias.lower():
+    for auto_alias, selected_model_candidates in auto_agent_aliases:
+        if auto_alias and group_lower == auto_alias.lower():
+            return _first_non_empty_string(*selected_model_candidates, resolved_model)
+
+    if group_lower == "aawm-codex-agent-auto":
         return _first_non_empty_string(
             metadata.get("codex_auto_agent_selected_model"),
             metadata.get("aawm_auto_agent_selected_model"),
@@ -14253,6 +14299,7 @@ def _resolve_session_history_model(
 
     explicit_openrouter_model = _first_explicit_openrouter_model_string(
         metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("anthropic_auto_agent_selected_model"),
         metadata.get("aawm_auto_agent_selected_model"),
         metadata.get("anthropic_adapter_original_model"),
         metadata.get("codex_adapter_original_model"),
@@ -14304,6 +14351,7 @@ def _resolve_session_history_model(
     )
     candidates = (
         metadata.get("codex_auto_agent_selected_model"),
+        metadata.get("anthropic_auto_agent_selected_model"),
         metadata.get("aawm_auto_agent_selected_model"),
         kwargs.get("model"),
         standard_logging_object.get("model"),

@@ -2212,6 +2212,51 @@ session-history proof.
 
 ---
 
+### aawm.66 — AAWM tiered auto-agent aliases for Codex and Anthropic clients
+
+**Status:** AAWM local release candidate.
+
+**What changed:** The auto-agent selectors now support alias-keyed policy maps
+instead of one hard-coded candidate list per client family. New Codex/OpenAI
+Responses aliases are `aawm-sota`, `aawm-code`, and `aawm-low`; new
+Anthropic/Messages aliases are `aawm-sota-anthropic`,
+`aawm-code-anthropic`, and `aawm-low-anthropic`. Legacy
+`aawm-codex-agent-auto` and `aawm-anthropic-agent-auto` behavior is preserved.
+
+The selector keeps cooldowns scoped to provider/model/lane, scopes new session
+affinity keys by requested alias, and dispatches selected candidates through
+existing native OpenAI, direct Anthropic, Antigravity Code Assist, Grok native
+OAuth, OpenRouter, and OpenCode Zen adapter paths. Request metadata records the
+actual requested alias, selected provider/model/route family, selection reason,
+attempt history, skipped cooldown candidates, lane key, and last-resort status.
+OpenCode Zen auth/config misses remain hard failures for direct OpenCode
+requests, but are converted to candidate-unavailable cooldowns inside auto-agent
+low-tier selection so later candidates can be tried.
+The AAWM callback source and production wheel overlay allowlist the new
+Anthropic auto-agent metadata and normalize session-history
+provider/model/model-group to the selected target.
+
+**Why:** New user-facing AAWM model aliases need the same ordered fallback,
+cooldown, continuation, and observability contract as `aawm-codex-agent-auto`.
+Static model labels would hide candidate selection and would not provide
+bounded retry/fallback behavior for transient 429, capacity, or empty-success
+failures.
+
+**Why not upstream:** The aliases, candidate order, saved credentials, and
+session-history metadata are AAWM-specific operational policy.
+
+**Validation status:** Focused pass-through tests cover resolver gating,
+candidate ordering, cooldown fallthrough, continuation terminal behavior,
+dynamic alias metadata, and cross-provider adapter dispatch for the auto-agent
+paths. Focused callback tests cover source/overlay parity plus Codex and
+Anthropic auto-agent selected-provider/model attribution. Active
+`~/.codex` catalog/cache entries and live prod/dev smokes for the six public
+aliases remain separate acceptance gates. The direct Anthropic SOTA candidate
+currently uses the configured direct Opus slug `claude-opus-4-6`; update the
+policy/catalog together when a verified direct Opus 4.8 slug is available.
+
+---
+
 ### cb-v0.0.42 — Callback overlay parity for Antigravity/OpenCode attribution
 
 **Status:** AAWM callback overlay release candidate.
