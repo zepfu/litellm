@@ -2316,6 +2316,7 @@ _AAWM_SESSION_HISTORY_BATCH_SIZE = 32
 _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
 _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS = 0.1
 _AAWM_SESSION_HISTORY_POOL_MAX_SIZE = 2
+_AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS = 60.0
 _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
 _aawm_session_history_schema_ready = False
 _aawm_session_history_schema_lock = threading.Lock()
@@ -2357,6 +2358,15 @@ def _get_session_history_pool_max_size() -> int:
     return max(1, parsed_value)
 
 
+def _get_session_history_command_timeout_seconds() -> float:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS") or ""
+    try:
+        parsed_value = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS
+    return max(1.0, parsed_value)
+
+
 async def _close_aawm_session_history_pools_for_current_loop() -> None:
     loop = asyncio.get_running_loop()
     pools_to_close: List[Any] = []
@@ -2393,10 +2403,10 @@ def _flush_session_history_batch(
         else:
             loop.run_until_complete(_persist_session_history_records(records))
     except Exception as exc:
-        verbose_logger.warning(
+        verbose_logger.exception(
             "AawmAgentIdentity: failed to flush %d session_history records: %s",
             len(records),
-            exc,
+            _format_exception_for_warning(exc),
         )
         return
 
@@ -2492,6 +2502,12 @@ def _shutdown_session_history_worker() -> None:
     worker.join(timeout=1.0)
 
 
+def _format_exception_for_warning(exc: Exception) -> str:
+    message = str(exc)
+    if message:
+        return message
+    return f"{type(exc).__name__}: {exc!r}"
+
 
 def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
     _ensure_session_history_worker_started()
@@ -2529,7 +2545,7 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity: failed to start session_history overflow flusher; flushing inline: %s",
-                exc,
+                _format_exception_for_warning(exc),
             )
             try:
                 _flush_session_history_batch([record])
@@ -14850,7 +14866,10 @@ async def _open_aawm_session_history_connection() -> Any:
             "AAWM session history requires asyncpg to be installed"
         ) from exc
 
-    return await asyncpg.connect(dsn=dsn, command_timeout=10)
+    return await asyncpg.connect(
+        dsn=dsn,
+        command_timeout=_get_session_history_command_timeout_seconds(),
+    )
 
 
 async def _get_aawm_session_history_pool() -> Any:
@@ -14876,7 +14895,7 @@ async def _get_aawm_session_history_pool() -> Any:
         dsn=dsn,
         min_size=0,
         max_size=_get_session_history_pool_max_size(),
-        command_timeout=10,
+        command_timeout=_get_session_history_command_timeout_seconds(),
     )
     with _aawm_session_history_pool_lock:
         existing_pool = _aawm_session_history_pools.get(pool_key)
