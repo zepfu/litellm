@@ -10,6 +10,7 @@ import ast
 import asyncio
 import base64
 import codecs
+import contextlib
 import copy
 import glob
 import importlib
@@ -44,7 +45,12 @@ from litellm.constants import (
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
 )
-from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
+from litellm.llms.chatgpt.common_utils import (
+    CHATGPT_API_BASE,
+    CHATGPT_CLIENT_ID,
+    CHATGPT_OAUTH_TOKEN_URL,
+    get_chatgpt_default_headers,
+)
 from litellm.llms.xai.oauth import (
     build_grok_native_oauth_metadata,
     get_grok_native_oauth_access_token,
@@ -94,7 +100,7 @@ except ImportError:
 
     async def _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
         request_body: dict[str, Any],
-        billing_header_fields: dict[str, str] | None = None,
+        billing_header_fields: dict[str, str],
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         return request_body, [], []
 
@@ -107,6 +113,7 @@ from litellm.proxy.vector_store_endpoints.utils import (
     is_allowed_to_call_vector_store_endpoint,
 )
 from litellm.secret_managers.main import get_secret_str
+from litellm.types.llms.openai import AllMessageValues, ResponsesAPIOptionalRequestParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 
@@ -118,6 +125,11 @@ router = APIRouter()
 default_vertex_config = None
 
 passthrough_endpoint_router = PassthroughEndpointRouter()
+
+
+def _decode_http_response_body(body: Any) -> str:
+    return bytes(body).decode("utf-8")
+
 
 _GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST = frozenset(
     {
@@ -962,6 +974,7 @@ _google_oauth_access_token_cache: dict[str, tuple[str, int]] = {}
 _google_oauth_access_token_lock = asyncio.Lock()
 _antigravity_oauth_access_token_cache: dict[str, tuple[str, int]] = {}
 _antigravity_oauth_access_token_lock = asyncio.Lock()
+_codex_oauth_auth_file_lock = asyncio.Lock()
 _google_code_assist_project_cache: dict[str, str] = {}
 _google_code_assist_project_lock = asyncio.Lock()
 _google_code_assist_prime_until_monotonic_by_key: dict[str, float] = {}
@@ -2943,7 +2956,7 @@ async def _load_local_google_oauth_credentials() -> tuple[dict[str, Any], Path]:
 
     try:
         auth_data = json.loads(auth_path.read_text())
-    except Exception as exc:
+    except (OSError, TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to read Gemini OAuth credentials from {auth_path}: {exc}",
@@ -5218,7 +5231,7 @@ def _merge_google_code_assist_schema_annotations(
             target[key] = copy.deepcopy(source[key])
 
 
-def _simplify_google_code_assist_union_schema(schema_node: dict[str, Any]) -> int:
+def _simplify_google_code_assist_union_schema(schema_node: dict[str, Any]) -> int:  # noqa: PLR0915
     fix_count = 0
     for union_key in ("anyOf", "oneOf", "allOf"):
         variants = schema_node.get(union_key)
@@ -6066,7 +6079,7 @@ def _ensure_codex_google_code_assist_tool_results_have_calls(
     return updated_kwargs, changes
 
 
-async def _build_google_code_assist_request_from_completion_kwargs(
+async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR0915
     *,
     completion_kwargs: dict[str, Any],
     adapter_model: str,
@@ -6315,25 +6328,31 @@ def _build_codex_google_code_assist_completion_kwargs(
     prepared_request_body: dict[str, Any],
     *,
     adapter_model: str,
-) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+) -> tuple[dict[str, Any], Any, ResponsesAPIOptionalRequestParams]:
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
 
     request_input = prepared_request_body.get("input") or ""
-    responses_api_request = {
-        key: value
-        for key, value in prepared_request_body.items()
-        if key not in {"input", "model", "litellm_metadata"}
-    }
+    responses_api_request = cast(
+        ResponsesAPIOptionalRequestParams,
+        {
+            key: value
+            for key, value in prepared_request_body.items()
+            if key not in {"input", "model", "litellm_metadata"}
+        },
+    )
     litellm_metadata = dict(prepared_request_body.get("litellm_metadata") or {})
-    completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
-        model=adapter_model,
-        input=request_input,
-        responses_api_request=responses_api_request,
-        custom_llm_provider=litellm.LlmProviders.GEMINI.value,
-        stream=bool(prepared_request_body.get("stream")),
-        metadata=litellm_metadata,
+    completion_kwargs = cast(
+        dict[str, Any],
+        LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model=adapter_model,
+            input=request_input,
+            responses_api_request=responses_api_request,
+            custom_llm_provider=litellm.LlmProviders.GEMINI.value,
+            stream=bool(prepared_request_body.get("stream")),
+            metadata=litellm_metadata,
+        ),
     )
     completion_kwargs["metadata"] = litellm_metadata
     if not completion_kwargs.get("max_tokens"):
@@ -6546,6 +6565,9 @@ def _apply_google_code_assist_alias_to_function_block(
     tool_name_mapping: dict[str, str],
 ) -> tuple[dict[str, Any], Optional[str]]:
     original_name = function_block.get("name")
+    if not isinstance(original_name, str) or not original_name:
+        return function_block, None
+
     alias_name = aliases.get(original_name)
     if not isinstance(alias_name, str) or not alias_name:
         return function_block, None
@@ -7047,7 +7069,7 @@ def _normalize_google_code_assist_httpx_payload(value: Any) -> Any:
         return value
     normalized: dict[str, Any] = {}
     for key, item in value.items():
-        normalized_key = key_mapping.get(key, key)
+        normalized_key = key_mapping.get(key, key) if isinstance(key, str) else str(key)
         normalized[normalized_key] = _normalize_google_code_assist_httpx_payload(item)
     return normalized
 
@@ -7200,8 +7222,9 @@ def _summarize_google_code_assist_content_preview_entry(
             ]
             if keys:
                 part_kinds.extend(keys)
-            if text_preview is None and isinstance(part.get("text"), str):
-                text_preview = part.get("text")[:120].replace("\n", "\\n")
+            text_value = part.get("text")
+            if text_preview is None and isinstance(text_value, str):
+                text_preview = text_value[:120].replace("\n", "\\n")
             function_response = part.get("functionResponse")
             if isinstance(function_response, dict):
                 response_payload = function_response.get("response")
@@ -7210,11 +7233,9 @@ def _summarize_google_code_assist_content_preview_entry(
                     part_kinds.append(
                         f"functionResponseKeys:{','.join(response_keys)}"
                     )
-                    if text_preview is None and isinstance(
-                        response_payload.get("content"),
-                        str,
-                    ):
-                        text_preview = response_payload.get("content")[:120].replace("\n", "\\n")
+                    content_value = response_payload.get("content")
+                    if text_preview is None and isinstance(content_value, str):
+                        text_preview = content_value[:120].replace("\n", "\\n")
     return {
         "role": role,
         "part_count": preview_parts,
@@ -7373,7 +7394,7 @@ async def _translate_google_code_assist_response_to_anthropic(
     from litellm.utils import ModelResponse
 
     try:
-        outer_payload = json.loads(response.body.decode("utf-8"))
+        outer_payload = json.loads(_decode_http_response_body(response.body))
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -7398,7 +7419,7 @@ async def _translate_google_code_assist_response_to_anthropic(
         model_response=ModelResponse(),
         logging_obj=logging_obj,
         request_data=unwrapped_payload,
-        messages=completion_messages,
+        messages=cast(list[AllMessageValues], completion_messages),
         optional_params=gemini_optional_params,
         litellm_params=litellm_params,
         encoding=_get_encoding(),
@@ -7420,6 +7441,9 @@ async def _iterate_google_code_assist_unwrapped_stream(
     rate_limit_key: Optional[str] = None,
 ) -> Any:
     from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
+
+    debug_logged = False
+    post_tool_cooldown_armed = False
 
     async def _iter_event_block_lines(event_block: str):
         nonlocal debug_logged, post_tool_cooldown_armed
@@ -7462,8 +7486,6 @@ async def _iterate_google_code_assist_unwrapped_stream(
                     )
             yield f"data: {json.dumps(unwrapped)}\n\n"
 
-    debug_logged = False
-    post_tool_cooldown_armed = False
     buffer = ""
     async for raw_chunk in body_iterator:
         if isinstance(raw_chunk, bytes):
@@ -7496,7 +7518,10 @@ def _build_anthropic_streaming_response_from_google_code_assist_stream(
         ModelResponseIterator,
     )
 
-    logging_obj = SimpleNamespace(optional_params=gemini_optional_params, post_call=lambda **_: None)
+    logging_obj: Any = SimpleNamespace(
+        optional_params=gemini_optional_params,
+        post_call=lambda **_: None,
+    )
     completion_stream = ModelResponseIterator(
         streaming_response=_iterate_google_code_assist_unwrapped_stream(
             response.body_iterator,
@@ -8003,12 +8028,16 @@ def _raise_opencode_zen_auto_agent_candidate_unavailable(exc: Exception) -> None
         param="model",
         code=429,
     )
-    proxy_exc.detail = {
-        "error": {
-            "message": proxy_exc.message,
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": proxy_exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
     raise proxy_exc from exc
 
 
@@ -8037,12 +8066,16 @@ def _raise_antigravity_auto_agent_candidate_unavailable(exc: Exception) -> None:
         param="model",
         code=429,
     )
-    proxy_exc.detail = {
-        "error": {
-            "message": proxy_exc.message,
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": proxy_exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
     raise proxy_exc from exc
 
 
@@ -8075,12 +8108,16 @@ def _raise_grok_native_auto_agent_candidate_unavailable(exc: Exception) -> None:
         param="model",
         code=429,
     )
-    proxy_exc.detail = {
-        "error": {
-            "message": proxy_exc.message,
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": proxy_exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
     raise proxy_exc from exc
 
 
@@ -8315,10 +8352,9 @@ async def _normalize_opencode_zen_responses_stream_for_codex(
             continue
 
         if event_type == "response.output_text.delta":
+            raw_response_payload = event_dict.get("response")
             response_payload = (
-                event_dict.get("response")
-                if isinstance(event_dict.get("response"), dict)
-                else {}
+                raw_response_payload if isinstance(raw_response_payload, dict) else {}
             )
             response_id = (
                 _clean_secret_string(event_dict.get("response_id"))
@@ -8390,10 +8426,9 @@ async def _normalize_opencode_zen_responses_stream_for_codex(
             continue
 
         if event_type == "response.completed":
+            raw_response_payload = event_dict.get("response")
             response_payload = (
-                event_dict.get("response")
-                if isinstance(event_dict.get("response"), dict)
-                else {}
+                raw_response_payload if isinstance(raw_response_payload, dict) else {}
             )
             response_id = (
                 _clean_secret_string(response_payload.get("id"))
@@ -8647,6 +8682,14 @@ def _clean_codex_auth_value(value: Any) -> Optional[str]:
     return cleaned or None
 
 
+CodexAuthData = dict[str, object]
+CodexTokenData = dict[str, object]
+OAuthJsonData = dict[str, object]
+AntigravityOAuthTokenData = dict[str, object]
+AntigravityPassthroughRequestBody = dict[str, object]
+PassthroughLoggingMetadata = dict[str, object]
+
+
 def _build_google_debug_header_summary(headers: dict[str, Any]) -> dict[str, Any]:
     interesting_keys = (
         "authorization",
@@ -8750,29 +8793,171 @@ def _extract_codex_account_id_from_token(token: Optional[str]) -> Optional[str]:
     return None
 
 
-def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str, str]]:
+def _get_codex_auth_token_data(auth_data: CodexAuthData) -> CodexTokenData:
+    token_data = auth_data.get("tokens")
+    if isinstance(token_data, dict):
+        return dict(token_data)
+    return auth_data
+
+
+def _get_codex_auth_token_expiry(access_token: str) -> Optional[int]:
+    claims = _decode_jwt_claims_without_validation(access_token)
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        return int(exp)
+    return None
+
+
+def _codex_auth_access_token_is_valid(token_data: CodexTokenData) -> bool:
+    access_token = _clean_codex_auth_value(token_data.get("access_token"))
+    if access_token is None:
+        return False
+    expires_at = token_data.get("expires_at")
+    if not isinstance(expires_at, (int, float)):
+        expires_at = _get_codex_auth_token_expiry(access_token)
+    if not isinstance(expires_at, (int, float)):
+        return True
+    return time.time() < float(expires_at) - 60
+
+
+def _write_json_file_atomic(
+    path: Path,
+    data: OAuthJsonData,
+    *,
+    failure_label: str,
+) -> None:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    try:
+        payload = json.dumps(data, indent=2) + "\n"
+        tmp_path.write_text(payload, encoding="utf-8")
+        try:
+            current_mode = path.stat().st_mode & 0o777
+            os.chmod(tmp_path, current_mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+    except (OSError, TypeError, ValueError) as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to persist refreshed {failure_label} auth data to {path}: {exc}",
+        ) from exc
+
+
+async def _refresh_local_codex_auth_data(auth_data: CodexAuthData) -> CodexAuthData:
+    token_data = _get_codex_auth_token_data(auth_data)
+    refresh_token = _clean_codex_auth_value(token_data.get("refresh_token"))
+    if refresh_token is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Codex local auth file access token is expired and does not "
+                "contain a refresh_token. Re-authenticate Codex before using "
+                "the local Codex auth fallback."
+            ),
+        )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            CHATGPT_OAUTH_TOKEN_URL,
+            json={
+                "client_id": CHATGPT_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": "openid profile email",
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=_format_oauth_refresh_failure_detail(
+                provider_label="Codex",
+                response=response,
+            ),
+        )
+
+    refreshed = response.json()
+    refreshed_access_token = _clean_codex_auth_value(refreshed.get("access_token"))
+    if refreshed_access_token is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Codex OAuth refresh response did not contain an access_token.",
+        )
+
+    refreshed_id_token = _clean_codex_auth_value(refreshed.get("id_token"))
+    updated_token_data = dict(token_data)
+    updated_token_data["access_token"] = refreshed_access_token
+    updated_token_data["refresh_token"] = (
+        _clean_codex_auth_value(refreshed.get("refresh_token")) or refresh_token
+    )
+    if refreshed_id_token is not None:
+        updated_token_data["id_token"] = refreshed_id_token
+    expires_at = _get_codex_auth_token_expiry(refreshed_access_token)
+    if expires_at is not None:
+        updated_token_data["expires_at"] = expires_at
+    account_id = _extract_codex_account_id_from_token(
+        refreshed_id_token or refreshed_access_token
+    )
+    if account_id is not None:
+        updated_token_data["account_id"] = account_id
+
+    updated_auth_data = dict(auth_data)
+    if isinstance(auth_data.get("tokens"), dict):
+        updated_auth_data["tokens"] = updated_token_data
+    else:
+        updated_auth_data.update(updated_token_data)
+    updated_auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
+    return updated_auth_data
+
+
+async def _load_codex_auth_data_from_path(auth_path: Path) -> Optional[CodexAuthData]:
+    try:
+        auth_data = json.loads(auth_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(auth_data, dict):
+        return None
+    return auth_data
+
+
+async def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str, str]]:
     auth_path = _get_anthropic_adapter_codex_auth_file_path()
     if auth_path is None:
         return None
 
-    try:
-        auth_data = json.loads(auth_path.read_text())
-    except Exception:
+    auth_data = await _load_codex_auth_data_from_path(auth_path)
+    if auth_data is None:
         return None
 
-    token_data = auth_data.get("tokens")
-    if not isinstance(token_data, dict):
-        token_data = auth_data
-
+    token_data = _get_codex_auth_token_data(auth_data)
     access_token = _clean_codex_auth_value(token_data.get("access_token"))
     if access_token is None:
         return None
+    if not _codex_auth_access_token_is_valid(token_data):
+        async with _codex_oauth_auth_file_lock:
+            auth_data = await _load_codex_auth_data_from_path(auth_path)
+            if auth_data is None:
+                return None
+            token_data = _get_codex_auth_token_data(auth_data)
+            if not _codex_auth_access_token_is_valid(token_data):
+                auth_data = await _refresh_local_codex_auth_data(auth_data)
+                _write_json_file_atomic(
+                    auth_path,
+                    auth_data,
+                    failure_label="Codex",
+                )
+        token_data = _get_codex_auth_token_data(auth_data)
+        access_token = _clean_codex_auth_value(token_data.get("access_token"))
+        if access_token is None:
+            return None
 
     account_id = _clean_codex_auth_value(token_data.get("account_id")) or _extract_codex_account_id_from_token(
         _clean_codex_auth_value(token_data.get("id_token")) or access_token
     )
-
-    from litellm.llms.chatgpt.common_utils import get_chatgpt_default_headers
 
     headers = _safe_get_request_headers(request)
     session_id = (
@@ -8851,8 +9036,9 @@ def _build_anthropic_responses_adapter_request_body(
         if field_name in request_body:
             request_fields[field_name] = request_body[field_name]
 
-    anthropic_request = AnthropicMessagesRequest(
-        **{k: v for k, v in request_fields.items() if v is not None}
+    anthropic_request = cast(
+        AnthropicMessagesRequest,
+        {k: v for k, v in request_fields.items() if v is not None},
     )
     translation_provider = litellm.LlmProviders.OPENAI.value
     translated_body = adapter.translate_request(
@@ -9096,10 +9282,11 @@ def _build_anthropic_response_from_responses_response(
         ResponsesAPIResponse(**response_body),
         use_codex_native_tools=use_codex_native_tools,
     )
-    if hasattr(translated_response, "model_dump_json"):
-        serialized_response = translated_response.model_dump_json(exclude_none=True)
-    elif hasattr(translated_response, "json"):
-        serialized_response = translated_response.json(exclude_none=True)
+    translated_response_any = cast(Any, translated_response)
+    if hasattr(translated_response_any, "model_dump_json"):
+        serialized_response = translated_response_any.model_dump_json(exclude_none=True)
+    elif hasattr(translated_response_any, "json"):
+        serialized_response = translated_response_any.json(exclude_none=True)
     else:
         serialized_response = json.dumps(translated_response)
     return Response(
@@ -9636,15 +9823,19 @@ def _raise_codex_auto_agent_empty_success_response(
         param="model",
         code=429,
     )
-    exc.detail = {
-        "error": {
-            "message": exc.message,
-            "code": "aawm_codex_auto_agent_empty_success",
-            "status": "RATE_LIMIT_EXCEEDED",
-            "type": "rate_limit_error",
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_codex_auto_agent_empty_success",
+                "status": "RATE_LIMIT_EXCEEDED",
+                "type": "rate_limit_error",
+            },
+            "diagnostic": diagnostic,
         },
-        "diagnostic": diagnostic,
-    }
+    )
     raise exc
 
 
@@ -10656,7 +10847,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
     has_client_auth = _anthropic_adapter_request_has_openai_client_auth(request)
     uses_codex_native_auth = _anthropic_adapter_request_uses_codex_native_auth(request)
     if not has_client_auth:
-        local_codex_headers = _load_local_codex_auth_headers(request)
+        local_codex_headers = await _load_local_codex_auth_headers(request)
 
     use_chatgpt_codex_defaults = uses_codex_native_auth or local_codex_headers is not None
     (
@@ -10788,7 +10979,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
             detail="Unexpected upstream response type from OpenAI Responses passthrough.",
         )
 
-    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    response_body = json.loads(_decode_http_response_body(upstream_response.body))
     translated_response = _build_anthropic_response_from_responses_response(
         response_body,
         use_codex_native_tools=use_chatgpt_codex_defaults,
@@ -10906,7 +11097,7 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
             detail="Unexpected upstream response type from xAI Responses passthrough.",
         )
 
-    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    response_body = json.loads(_decode_http_response_body(upstream_response.body))
     translated_response = _build_anthropic_response_from_responses_response(
         response_body
     )
@@ -11043,7 +11234,7 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
             detail="Unexpected upstream response type from Grok native Responses passthrough.",
         )
 
-    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    response_body = json.loads(_decode_http_response_body(upstream_response.body))
     translated_response = _build_anthropic_response_from_responses_response(
         response_body
     )
@@ -11555,7 +11746,7 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
             detail="Unexpected upstream response type from OpenRouter Responses passthrough.",
         )
 
-    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    response_body = json.loads(_decode_http_response_body(upstream_response.body))
     translated_response = _build_anthropic_response_from_responses_response(
         response_body,
         reject_empty_success=True,
@@ -11683,7 +11874,7 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
             detail="Unexpected upstream response type from OpenCode Zen Responses passthrough.",
         )
 
-    response_body = json.loads(upstream_response.body.decode("utf-8"))
+    response_body = json.loads(_decode_http_response_body(upstream_response.body))
     translated_response = _build_anthropic_response_from_responses_response(
         response_body,
         reject_empty_success=True,
@@ -12172,8 +12363,8 @@ def _compact_google_adapter_persisted_output_value(
     if isinstance(value, list):
         updated_list: list[Any] = value
         compacted_count = 0
-        hooks: set[str] = set()
-        metadata_items: list[dict[str, Any]] = []
+        list_hooks: set[str] = set()
+        list_metadata_items: list[dict[str, Any]] = []
         changed = False
 
         if any(
@@ -12190,8 +12381,8 @@ def _compact_google_adapter_persisted_output_value(
                 sequence_changed,
             ) = _compact_google_adapter_text_part_sequence(value)
             compacted_count += sequence_count
-            hooks.update(sequence_hooks)
-            metadata_items.extend(sequence_metadata)
+            list_hooks.update(sequence_hooks)
+            list_metadata_items.extend(sequence_metadata)
             changed = changed or sequence_changed
 
         recursively_updated_list = []
@@ -12201,12 +12392,17 @@ def _compact_google_adapter_persisted_output_value(
             )
             recursively_updated_list.append(updated_child)
             compacted_count += child_count
-            hooks.update(child_hooks)
-            metadata_items.extend(child_metadata)
+            list_hooks.update(child_hooks)
+            list_metadata_items.extend(child_metadata)
             changed = changed or updated_child is not child
         if changed:
-            return recursively_updated_list, compacted_count, hooks, metadata_items
-        return value, compacted_count, hooks, metadata_items
+            return (
+                recursively_updated_list,
+                compacted_count,
+                list_hooks,
+                list_metadata_items,
+            )
+        return value, compacted_count, list_hooks, list_metadata_items
 
     return value, 0, set(), []
 
@@ -12357,8 +12553,8 @@ def _compact_openai_adapter_claude_context_value(
     if isinstance(value, list):
         updated_list: list[Any] = []
         compacted_count = 0
-        markers: set[str] = set()
-        metadata_items: list[dict[str, Any]] = []
+        list_markers: set[str] = set()
+        list_metadata_items: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_count, child_markers, child_metadata = (
@@ -12366,12 +12562,12 @@ def _compact_openai_adapter_claude_context_value(
             )
             updated_list.append(updated_child)
             compacted_count += child_count
-            markers.update(child_markers)
-            metadata_items.extend(child_metadata)
+            list_markers.update(child_markers)
+            list_metadata_items.extend(child_metadata)
             changed = changed or updated_child != child
         if changed:
-            return updated_list, compacted_count, markers, metadata_items
-        return value, compacted_count, markers, metadata_items
+            return updated_list, compacted_count, list_markers, list_metadata_items
+        return value, compacted_count, list_markers, list_metadata_items
 
     return value, 0, set(), []
 
@@ -12569,8 +12765,8 @@ def _expand_claude_persisted_output_value(
     if isinstance(value, list):
         updated_list = []
         expanded_count = 0
-        hooks: set[str] = set()
-        source_metadata_items: list[dict[str, Any]] = []
+        list_hooks: set[str] = set()
+        list_source_metadata_items: list[dict[str, Any]] = []
         changed = False
         for child in value:
             (
@@ -12581,15 +12777,15 @@ def _expand_claude_persisted_output_value(
             ) = _expand_claude_persisted_output_value(child)
             updated_list.append(updated_child)
             expanded_count += child_expanded_count
-            hooks.update(child_hooks)
-            source_metadata_items.extend(child_source_metadata_items)
+            list_hooks.update(child_hooks)
+            list_source_metadata_items.extend(child_source_metadata_items)
             if updated_child is not child:
                 changed = True
         return (
             updated_list if changed else value,
             expanded_count,
-            hooks,
-            source_metadata_items,
+            list_hooks,
+            list_source_metadata_items,
         )
 
     return value, 0, set(), []
@@ -13757,14 +13953,14 @@ def _drop_unsupported_codex_request_params_from_request_body(
 
         if isinstance(value, list):
             updated_list: list[Any] = []
-            removed: list[str] = []
+            list_removed: list[str] = []
             changed = False
             for item in value:
                 updated_item, item_removed, item_changed = _drop_from_value(item)
                 updated_list.append(updated_item)
-                removed.extend(item_removed)
+                list_removed.extend(item_removed)
                 changed = changed or item_changed
-            return (updated_list if changed else value), removed, changed
+            return (updated_list if changed else value), list_removed, changed
 
         return value, [], False
 
@@ -14467,7 +14663,7 @@ def _replace_claude_system_prompt_override_in_value(
 
     if isinstance(value, list):
         updated_list = []
-        combined_events: list[dict[str, Any]] = []
+        list_combined_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_events = _replace_claude_system_prompt_override_in_value(
@@ -14475,10 +14671,10 @@ def _replace_claude_system_prompt_override_in_value(
                 cc_version,
             )
             updated_list.append(updated_child)
-            combined_events.extend(child_events)
+            list_combined_events.extend(child_events)
             if updated_child is not child:
                 changed = True
-        return (updated_list if changed else value), combined_events
+        return (updated_list if changed else value), list_combined_events
 
     return value, []
 
@@ -14563,6 +14759,8 @@ def _replace_claude_system_prompt_in_anthropic_request_body(
     request_body: dict[str, Any], billing_header_fields: dict[str, str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     cc_version = billing_header_fields.get("cc_version")
+    if not isinstance(cc_version, str) or not cc_version:
+        return request_body, []
     template_path = _resolve_claude_auto_memory_template_path(cc_version)
     if template_path is None or "system" not in request_body:
         return request_body, []
@@ -14672,7 +14870,7 @@ def _replace_claude_prompt_patches_in_value(
 
     if isinstance(value, list):
         updated_list = []
-        combined_events: list[dict[str, Any]] = []
+        list_combined_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_events = _replace_claude_prompt_patches_in_value(
@@ -14680,10 +14878,10 @@ def _replace_claude_prompt_patches_in_value(
                 cc_version,
             )
             updated_list.append(updated_child)
-            combined_events.extend(child_events)
+            list_combined_events.extend(child_events)
             if updated_child is not child:
                 changed = True
-        return (updated_list if changed else value), combined_events
+        return (updated_list if changed else value), list_combined_events
 
     return value, []
 
@@ -15262,7 +15460,7 @@ async def _expand_aawm_dynamic_directives_in_value(
 
     if isinstance(value, list):
         updated_list = []
-        combined_events: list[dict[str, Any]] = []
+        list_combined_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_events = await _expand_aawm_dynamic_directives_in_value(
@@ -15270,9 +15468,9 @@ async def _expand_aawm_dynamic_directives_in_value(
                 available_context,
             )
             updated_list.append(updated_child)
-            combined_events.extend(child_events)
+            list_combined_events.extend(child_events)
             if updated_child is not child:
-                return (updated_list if changed else value), combined_events
+                return (updated_list if changed else value), list_combined_events
 
     return value, []
 
@@ -15511,21 +15709,12 @@ def _get_antigravity_auth_file_path() -> Optional[Path]:
     return None
 
 
-async def _load_local_antigravity_oauth_token_data() -> tuple[dict[str, Any], Path]:
-    auth_path = _get_antigravity_auth_file_path()
-    if auth_path is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Antigravity passthrough requires local OAuth token data at "
-                "'~/.gemini/antigravity-cli/antigravity-oauth-token' or "
-                "'LITELLM_ANTIGRAVITY_AUTH_FILE'."
-            ),
-        )
-
+async def _load_antigravity_oauth_token_data_from_path(
+    auth_path: Path,
+) -> AntigravityOAuthTokenData:
     try:
         token_data = json.loads(auth_path.read_text())
-    except Exception as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to read Antigravity OAuth token data from {auth_path}: {exc}",
@@ -15537,7 +15726,22 @@ async def _load_local_antigravity_oauth_token_data() -> tuple[dict[str, Any], Pa
             detail=f"Antigravity OAuth token data at {auth_path} is not a JSON object.",
         )
 
-    return token_data, auth_path
+    return token_data
+
+
+async def _load_local_antigravity_oauth_token_data() -> tuple[AntigravityOAuthTokenData, Path]:
+    auth_path = _get_antigravity_auth_file_path()
+    if auth_path is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Antigravity passthrough requires local OAuth token data at "
+                "'~/.gemini/antigravity-cli/antigravity-oauth-token' or "
+                "'LITELLM_ANTIGRAVITY_AUTH_FILE'."
+            ),
+        )
+
+    return await _load_antigravity_oauth_token_data_from_path(auth_path), auth_path
 
 
 def _parse_antigravity_token_expiry(expiry: Any) -> Optional[datetime]:
@@ -15613,6 +15817,32 @@ def _iter_antigravity_cli_binary_candidates() -> list[Path]:
 def _extract_antigravity_oauth_client_values_from_cli_text(
     cli_text: str,
 ) -> tuple[Optional[str], Optional[str]]:
+    candidates = _extract_antigravity_oauth_client_value_candidates_from_cli_text(
+        cli_text
+    )
+    if not candidates:
+        return None, None
+    return candidates[0]
+
+
+def _add_antigravity_oauth_client_candidate(
+    candidates: list[tuple[str, str]],
+    seen: set[tuple[str, str]],
+    client_id: Optional[str],
+    client_secret: Optional[str],
+) -> None:
+    if not client_id or not client_secret:
+        return
+    candidate = (client_id, client_secret)
+    if candidate in seen:
+        return
+    seen.add(candidate)
+    candidates.append(candidate)
+
+
+def _extract_antigravity_oauth_client_value_candidates_from_cli_text(
+    cli_text: str,
+) -> list[tuple[str, str]]:
     client_secret_matches = list(
         _ANTIGRAVITY_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN.finditer(cli_text)
     )
@@ -15620,37 +15850,248 @@ def _extract_antigravity_oauth_client_values_from_cli_text(
         _ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN.finditer(cli_text)
     )
     if not client_secret_matches or not client_id_matches:
-        return None, None
+        return []
 
-    client_secret_match = client_secret_matches[0]
-    client_id_match = min(
-        client_id_matches,
-        key=lambda match: abs(match.start() - client_secret_match.start()),
-    )
-    return (
-        _clean_codex_auth_value(client_id_match.group("value")),
-        _clean_codex_auth_value(client_secret_match.group("value")),
-    )
+    candidates: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for client_secret_match in client_secret_matches:
+        client_secret = _clean_codex_auth_value(
+            client_secret_match.group("value")
+        )
+        for client_id_match in sorted(
+            client_id_matches,
+            key=lambda match: abs(match.start() - client_secret_match.start()),
+        ):
+            _add_antigravity_oauth_client_candidate(
+                candidates,
+                seen,
+                _clean_codex_auth_value(client_id_match.group("value")),
+                client_secret,
+            )
+    return candidates
 
 
 def _load_antigravity_oauth_client_values_from_local_cli_binary(
 ) -> tuple[Optional[str], Optional[str]]:
+    candidates = _load_antigravity_oauth_client_value_candidates_from_local_cli_binary()
+    if not candidates:
+        return None, None
+    return candidates[0]
+
+
+def _load_antigravity_oauth_client_value_candidates_from_local_cli_binary(
+) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for candidate in _iter_antigravity_cli_binary_candidates():
         try:
             cli_text = candidate.read_bytes().decode("latin1", errors="ignore")
         except OSError:
             continue
-        client_id, client_secret = _extract_antigravity_oauth_client_values_from_cli_text(
-            cli_text
+        client_value_candidates = (
+            _extract_antigravity_oauth_client_value_candidates_from_cli_text(cli_text)
         )
-        if client_id and client_secret:
-            return client_id, client_secret
-    return None, None
+        for client_id, client_secret in client_value_candidates:
+            _add_antigravity_oauth_client_candidate(
+                candidates,
+                seen,
+                client_id,
+                client_secret,
+            )
+    return candidates
+
+
+def _get_antigravity_oauth_client_value_from_token_data(
+    token_data: AntigravityOAuthTokenData,
+    candidate_keys: tuple[str, ...],
+) -> Optional[str]:
+    for key in candidate_keys:
+        value = _clean_codex_auth_value(token_data.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _get_antigravity_oauth_client_value_candidates(
+    token_data: AntigravityOAuthTokenData,
+) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    env_client_id = _get_first_secret_value(_ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS)
+    env_client_secret = _get_first_secret_value(
+        _ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS
+    )
+    token_client_id = _get_antigravity_oauth_client_value_from_token_data(
+        token_data,
+        ("client_id", "clientId"),
+    )
+    token_client_secret = _get_antigravity_oauth_client_value_from_token_data(
+        token_data,
+        ("client_secret", "clientSecret"),
+    )
+    _add_antigravity_oauth_client_candidate(
+        candidates,
+        seen,
+        env_client_id,
+        env_client_secret,
+    )
+    _add_antigravity_oauth_client_candidate(
+        candidates,
+        seen,
+        token_client_id,
+        token_client_secret,
+    )
+    for client_id, client_secret in (
+        _load_antigravity_oauth_client_value_candidates_from_local_cli_binary()
+    ):
+        _add_antigravity_oauth_client_candidate(
+            candidates,
+            seen,
+            client_id,
+            client_secret,
+        )
+    return candidates
+
+
+def _get_oauth_token_error_code(response: httpx.Response) -> Optional[str]:
+    try:
+        response_body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(response_body, dict):
+        return None
+    return _clean_codex_auth_value(response_body.get("error"))
+
+
+def _format_oauth_refresh_failure_detail(
+    *,
+    provider_label: str,
+    response: httpx.Response,
+) -> str:
+    error_code = _get_oauth_token_error_code(response)
+    suffix = (
+        f"status={response.status_code}, error={error_code}"
+        if error_code
+        else f"status={response.status_code}"
+    )
+    return (
+        f"Failed to refresh {provider_label} OAuth access token ({suffix}). "
+        f"Re-authenticate {provider_label} CLI or configure valid OAuth client "
+        "environment overrides."
+    )
+
+
+def _write_antigravity_oauth_token_data_atomic(
+    auth_path: Path,
+    token_data: AntigravityOAuthTokenData,
+) -> None:
+    _write_json_file_atomic(
+        auth_path,
+        token_data,
+        failure_label="Antigravity OAuth token",
+    )
+
+
+def _get_antigravity_cli_refresh_home(auth_path: Path) -> Optional[Path]:
+    parts = auth_path.expanduser().parts
+    if len(parts) < 4:
+        return None
+    if parts[-3:] != (
+        ".gemini",
+        "antigravity-cli",
+        "antigravity-oauth-token",
+    ):
+        return None
+    return auth_path.expanduser().parents[2]
+
+
+def _get_antigravity_cli_refresh_timeout_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_ANTIGRAVITY_CLI_REFRESH_TIMEOUT_SECONDS")
+    )
+    if raw_value is None:
+        return 30.0
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        return 30.0
+    return max(parsed, 1.0)
+
+
+async def _refresh_local_antigravity_oauth_token_data_via_cli(
+    auth_path: Path,
+) -> AntigravityOAuthTokenData:
+    refresh_home = _get_antigravity_cli_refresh_home(auth_path)
+    cli_candidates = _iter_antigravity_cli_binary_candidates()
+    if refresh_home is None or not cli_candidates:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Antigravity OAuth direct refresh failed and AGY CLI silent "
+                "refresh is unavailable for this auth-file path."
+            ),
+        )
+
+    log_path = Path(os.getenv("TMPDIR") or "/tmp") / (
+        f"litellm-antigravity-refresh-{os.getpid()}-{time.monotonic_ns()}.log"
+    )
+    env = dict(os.environ)
+    env["HOME"] = str(refresh_home)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(cli_candidates[0]),
+            "--log-file",
+            str(log_path),
+            "models",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        await asyncio.wait_for(
+            process.communicate(),
+            timeout=_get_antigravity_cli_refresh_timeout_seconds(),
+        )
+    except asyncio.TimeoutError as exc:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        with contextlib.suppress(OSError, RuntimeError):
+            await process.wait()
+        raise HTTPException(
+            status_code=500,
+            detail="AGY CLI silent auth refresh timed out.",
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AGY CLI silent auth refresh failed ({type(exc).__name__}).",
+        ) from exc
+    finally:
+        with contextlib.suppress(OSError):
+            log_path.unlink()
+
+    if process.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "AGY CLI silent auth refresh failed. Re-authenticate "
+                "Antigravity CLI before using Antigravity passthrough."
+            ),
+        )
+
+    refreshed_token_data = await _load_antigravity_oauth_token_data_from_path(auth_path)
+    if not _antigravity_access_token_is_valid(refreshed_token_data):
+        raise HTTPException(
+            status_code=500,
+            detail="AGY CLI silent auth refresh did not produce a valid token.",
+        )
+    return refreshed_token_data
 
 
 async def _refresh_local_antigravity_oauth_token_data(
-    token_data: dict[str, Any],
-) -> dict[str, Any]:
+    token_data: AntigravityOAuthTokenData,
+    auth_path: Optional[Path] = None,
+) -> AntigravityOAuthTokenData:
     token_block = token_data.get("token")
     if not isinstance(token_block, dict):
         raise HTTPException(
@@ -15669,24 +16110,8 @@ async def _refresh_local_antigravity_oauth_token_data(
             ),
         )
 
-    client_id = _get_google_oauth_client_value(
-        token_data,
-        ("client_id", "clientId"),
-        _ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS,
-    )
-    client_secret = _get_google_oauth_client_value(
-        token_data,
-        ("client_secret", "clientSecret"),
-        _ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS,
-    )
-    if client_id is None or client_secret is None:
-        (
-            binary_client_id,
-            binary_client_secret,
-        ) = _load_antigravity_oauth_client_values_from_local_cli_binary()
-        client_id = client_id or binary_client_id
-        client_secret = client_secret or binary_client_secret
-    if client_id is None or client_secret is None:
+    client_candidates = _get_antigravity_oauth_client_value_candidates(token_data)
+    if not client_candidates:
         raise HTTPException(
             status_code=500,
             detail=(
@@ -15695,38 +16120,71 @@ async def _refresh_local_antigravity_oauth_token_data(
             ),
         )
 
+    response: Optional[httpx.Response] = None
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            _ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL,
-            data={
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        for client_id, client_secret in client_candidates:
+            response = await client.post(
+                _ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL,
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if response.status_code == 200:
+                break
+            error_code = _get_oauth_token_error_code(response)
+            if error_code not in {
+                "invalid_client",
+                "invalid_grant",
+                "unauthorized_client",
+            }:
+                break
 
-    if response.status_code != 200:
+    if response is None or response.status_code != 200:
+        if (
+            response is not None
+            and auth_path is not None
+            and _get_oauth_token_error_code(response)
+            in {"invalid_client", "invalid_grant", "unauthorized_client"}
+        ):
+            return await _refresh_local_antigravity_oauth_token_data_via_cli(
+                auth_path
+            )
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Failed to refresh Antigravity OAuth access token: "
-                f"{response.text}"
-            ),
+            detail=_format_oauth_refresh_failure_detail(
+                provider_label="Antigravity",
+                response=response,
+            )
+            if response is not None
+            else "Failed to refresh Antigravity OAuth access token.",
         )
 
     refreshed = response.json()
+    refreshed_access_token = _clean_codex_auth_value(refreshed.get("access_token"))
+    if refreshed_access_token is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Antigravity OAuth refresh response did not contain an access_token."
+            ),
+        )
     expires_in = refreshed.get("expires_in")
-    expiry: Optional[datetime] = None
-    if isinstance(expires_in, (int, float)):
-        expiry = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+    if not isinstance(expires_in, (int, float)):
+        raise HTTPException(
+            status_code=500,
+            detail="Antigravity OAuth refresh response did not contain expires_in.",
+        )
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
 
     updated_token_block = dict(token_block)
     updated_token_block.update(refreshed)
+    updated_token_block["access_token"] = refreshed_access_token
     updated_token_block["refresh_token"] = refresh_token
-    if expiry is not None:
-        updated_token_block["expiry"] = expiry.isoformat()
+    updated_token_block["expiry"] = expiry.isoformat()
 
     updated_token_data = dict(token_data)
     updated_token_data["token"] = updated_token_block
@@ -15751,7 +16209,11 @@ async def _load_valid_local_antigravity_access_token() -> str:
 
         token_data, auth_path = await _load_local_antigravity_oauth_token_data()
         if not _antigravity_access_token_is_valid(token_data):
-            token_data = await _refresh_local_antigravity_oauth_token_data(token_data)
+            token_data = await _refresh_local_antigravity_oauth_token_data(
+                token_data,
+                auth_path,
+            )
+            _write_antigravity_oauth_token_data_atomic(auth_path, token_data)
 
     token_block = token_data.get("token")
     if not isinstance(token_block, dict):
@@ -15840,7 +16302,15 @@ def _prepare_antigravity_request_body_for_passthrough(
     )
 
 
-def _get_antigravity_passthrough_logging_metadata(request: Request) -> dict[str, Any]:
+def _get_antigravity_request_project(
+    request_body: AntigravityPassthroughRequestBody,
+) -> Optional[str]:
+    return _clean_codex_auth_value(request_body.get("project"))
+
+
+def _get_antigravity_passthrough_logging_metadata(
+    request: Request,
+) -> PassthroughLoggingMetadata:
     logging_body = _prepare_antigravity_request_body_for_passthrough(
         request=request,
         request_body={},
@@ -16403,13 +16873,15 @@ async def antigravity_proxy_route(
     )
 
     has_google_oauth_bearer = _request_has_google_oauth_bearer(request)
+    local_antigravity_access_token: Optional[str] = None
     custom_headers: dict[str, str]
     if has_google_oauth_bearer:
         custom_headers = {}
     else:
-        custom_headers = _build_antigravity_native_headers(
+        local_antigravity_access_token = (
             await _load_valid_local_antigravity_access_token()
         )
+        custom_headers = _build_antigravity_native_headers(local_antigravity_access_token)
 
     target_url = _join_antigravity_passthrough_url(
         base_target_url=_get_antigravity_passthrough_target_base(),
@@ -16432,6 +16904,25 @@ async def antigravity_proxy_route(
                 request=request,
                 request_body=request_body,
             )
+            request_project = _get_antigravity_request_project(request_body)
+            if (
+                local_antigravity_access_token is not None
+                and request_project is not None
+            ):
+                google_quota_observation = await _prime_google_code_assist_session(
+                    local_antigravity_access_token,
+                    request_project,
+                    adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+                )
+                if google_quota_observation:
+                    litellm_metadata = custom_body.setdefault(
+                        "litellm_metadata",
+                        {},
+                    )
+                    if isinstance(litellm_metadata, dict):
+                        litellm_metadata["google_retrieve_user_quota"] = (
+                            google_quota_observation
+                        )
             if custom_body is not request_body:
                 _safe_set_request_parsed_body(request, custom_body)
             custom_metadata = custom_body.get("litellm_metadata")
@@ -17683,9 +18174,9 @@ async def bedrock_proxy_route(
     create_request_copy(request)
 
     try:
-        from botocore.auth import SigV4Auth
-        from botocore.awsrequest import AWSRequest
-        from botocore.credentials import Credentials
+        from botocore.auth import SigV4Auth  # type: ignore[import-untyped]
+        from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
+        from botocore.credentials import Credentials  # type: ignore[import-untyped]
     except ImportError:
         raise ImportError("Missing boto3 to call bedrock. Run 'pip install boto3'.")
 
@@ -18727,6 +19218,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
                 "Grok OIDC credential."
             )
         )
+    assert grok_context is not None
     _, grok_headers, grok_prepared_body, updated_url = grok_context
     return await pass_through_request(
         request=request,
@@ -18821,12 +19313,16 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
             param="model",
             code=429,
         )
-        exc.detail = {
-            "error": {
-                "message": exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        }
+        setattr(
+            exc,
+            "detail",
+            {
+                "error": {
+                    "message": exc.message,
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                }
+            },
+        )
         raise exc
 
     target_base_url = _get_openrouter_target_base()
@@ -18868,7 +19364,7 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
         )
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
         try:
-            response_body = json.loads(response.body.decode("utf-8"))
+            response_body = json.loads(_decode_http_response_body(response.body))
         except Exception:
             return response
         if (
@@ -18931,11 +19427,14 @@ async def _handle_codex_opencode_zen_adapter_route(
         extra_fields=extra_fields,
     )
     request_input = request_body.get("input") or ""
-    responses_api_request = {
-        key: value
-        for key, value in request_body.items()
-        if key not in {"input", "model", "litellm_metadata"}
-    }
+    responses_api_request = cast(
+        ResponsesAPIOptionalRequestParams,
+        {
+            key: value
+            for key, value in request_body.items()
+            if key not in {"input", "model", "litellm_metadata"}
+        },
+    )
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
         model=adapter_model,
@@ -19034,12 +19533,16 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             param="model",
             code=429,
         )
-        exc.detail = {
-            "error": {
-                "message": exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        }
+        setattr(
+            exc,
+            "detail",
+            {
+                "error": {
+                    "message": exc.message,
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                }
+            },
+        )
         raise exc
 
     requested_model = request_body.get("model")
@@ -19070,11 +19573,14 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         },
     )
     request_input = request_body.get("input") or ""
-    responses_api_request = {
-        key: value
-        for key, value in request_body.items()
-        if key not in {"input", "model", "litellm_metadata"}
-    }
+    responses_api_request = cast(
+        ResponsesAPIOptionalRequestParams,
+        {
+            key: value
+            for key, value in request_body.items()
+            if key not in {"input", "model", "litellm_metadata"}
+        },
+    )
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
         model=adapter_model,
@@ -19417,7 +19923,7 @@ class BaseOpenAIPassThroughHandler:
         )
 
     @staticmethod
-    async def _base_openai_pass_through_handler(
+    async def _base_openai_pass_through_handler(  # noqa: PLR0915
         endpoint: str,
         request: Request,
         fastapi_response: Response,
@@ -19672,7 +20178,9 @@ class BaseOpenAIPassThroughHandler:
 
     @staticmethod
     def _join_url_paths(
-        base_url: httpx.URL, path: str, custom_llm_provider: litellm.LlmProviders
+        base_url: httpx.URL,
+        path: str,
+        custom_llm_provider: Union[litellm.LlmProviders, str],
     ) -> str:
         """
         Properly joins a base URL with a path, preserving any existing path in the base URL.
