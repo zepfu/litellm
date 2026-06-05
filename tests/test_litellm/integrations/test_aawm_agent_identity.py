@@ -8404,6 +8404,11 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
     )
     monkeypatch.setattr(aawm_agent_identity, "_get_session_history_pool_max_size", lambda: 3)
     monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_command_timeout_seconds",
+        lambda: 42.0,
+    )
+    monkeypatch.setattr(
         aawm_agent_identity.importlib,
         "import_module",
         lambda name: FakeAsyncpg() if name == "asyncpg" else None,
@@ -8416,9 +8421,28 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
     assert second_pool is created_pool
     assert len(create_pool_calls) == 1
     assert create_pool_calls[0]["max_size"] == 3
+    assert create_pool_calls[0]["command_timeout"] == 42.0
 
     await aawm_agent_identity._close_aawm_session_history_pools_for_current_loop()
     created_pool.close.assert_awaited_once()
+
+
+def test_session_history_command_timeout_should_default_and_parse_secret(monkeypatch) -> None:
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", lambda key: None)
+
+    assert aawm_agent_identity._get_session_history_command_timeout_seconds() == 60.0
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: (
+            "90.5"
+            if key == "AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS"
+            else None
+        ),
+    )
+
+    assert aawm_agent_identity._get_session_history_command_timeout_seconds() == 90.5
 
 
 def test_enqueue_session_history_record_should_bound_overflow_flushers(monkeypatch) -> None:
@@ -8494,6 +8518,85 @@ def test_enqueue_session_history_record_releases_overflow_semaphore_when_thread_
 
     assert flushed_records == [[record]]
     assert semaphore.acquire(blocking=False) is True
+
+
+def test_enqueue_session_history_record_logs_exception_type_when_thread_start_failure_message_is_empty(
+    monkeypatch,
+) -> None:
+    class AlwaysFullQueue:
+        def put(self, record, timeout):
+            raise aawm_agent_identity.queue.Full
+
+    class EmptyMessageError(Exception):
+        def __str__(self):
+            return ""
+
+    warning_mock = MagicMock()
+    semaphore = aawm_agent_identity.threading.BoundedSemaphore(value=1)
+
+    def failing_thread(*args, **kwargs):
+        raise EmptyMessageError()
+
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_overflow_flush_semaphore",
+        semaphore,
+    )
+    monkeypatch.setattr(aawm_agent_identity.threading, "Thread", failing_thread)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda records: None,
+    )
+
+    aawm_agent_identity._enqueue_session_history_record({"litellm_call_id": "call-1"})
+
+    warning_mock.assert_any_call(
+        "AawmAgentIdentity: failed to start session_history overflow flusher; "
+        "flushing inline: %s",
+        "EmptyMessageError: EmptyMessageError()",
+    )
+    assert semaphore.acquire(blocking=False) is True
+
+
+def test_flush_session_history_batch_logs_exception_type_when_message_is_empty(
+    monkeypatch,
+) -> None:
+    class EmptyMessageError(Exception):
+        def __str__(self):
+            return ""
+
+    async def failing_persist(records):
+        raise EmptyMessageError()
+
+    exception_mock = MagicMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        failing_persist,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+
+    aawm_agent_identity._flush_session_history_batch(
+        [{"litellm_call_id": "call-empty-message"}]
+    )
+
+    exception_mock.assert_called_once()
+    assert exception_mock.call_args.args[0] == (
+        "AawmAgentIdentity: failed to flush %d session_history records: %s"
+    )
+    assert exception_mock.call_args.args[1] == 1
+    assert exception_mock.call_args.args[2] == (
+        "EmptyMessageError: EmptyMessageError()"
+    )
 
 
 def test_enqueue_session_history_record_retries_queue_when_overflow_busy(monkeypatch) -> None:
