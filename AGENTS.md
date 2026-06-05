@@ -37,6 +37,14 @@ subagents behave. When investigating `investigate-codex-*.md` files, do not stop
 at "not a LiteLLM implementation defect" if the failure involves a model alias
 or provider route managed here.
 
+Treat each investigation as an input to the whole alias workflow, not just as a
+bug report against the final provider call. The expected question is always:
+what could this fork do to make the next dispatch smoother, clearer, easier to
+debug, or less likely to require operator correction? That includes massaging
+system prompts, changing alias-level injected guidance, adjusting tool
+advertisement/schema shape, recording better attempt metadata, or creating a
+handoff when the fix belongs in an orchestrator or sibling surface.
+
 For every investigation file, explicitly evaluate whether LiteLLM can improve
 the end-to-end workflow by changing any of:
 
@@ -64,6 +72,11 @@ Any follow-up action should be added under
 `.analysis/todo.md` `Proposals (Pending Operator Feedback)` until approved. The
 investigation disposition should name the proposal ID instead of recording
 `Proposal IDs: none` for an actionable alias-flow improvement.
+
+If the improvement belongs outside this repository, write a precise handoff
+document instead of silently dropping it. Creating the handoff is part of this
+repo's process ownership and does not require separate operator approval;
+implementing the sibling-repo change still does.
 
 ### Broad Discovery Subtasks
 
