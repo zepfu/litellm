@@ -416,6 +416,12 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": False,
     },
     {
+        "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "oa_xai/grok-build",
+        "route_family": "codex_xai_oauth_responses_adapter",
+        "last_resort": False,
+    },
+    {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "gpt-5.3-codex",
         "route_family": "codex_responses",
@@ -523,6 +529,12 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
         "model": "grok-composer-2.5-fast",
         "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "oa_xai/grok-build",
+        "route_family": "anthropic_xai_oauth_responses_adapter",
         "last_resort": False,
     },
     {
@@ -1077,11 +1089,21 @@ def _load_local_model_metadata() -> dict[str, Any]:
 def _get_model_metadata_entry(model: Any) -> Optional[dict[str, Any]]:
     if not isinstance(model, str):
         return None
-    model_info = litellm.model_cost.get(model)
-    if isinstance(model_info, dict):
-        return model_info
-    local_model_info = _load_local_model_metadata().get(model)
-    return local_model_info if isinstance(local_model_info, dict) else None
+    candidate_models = [model]
+    if is_oa_xai_model(model):
+        try:
+            candidate_models.append(resolve_oa_xai_upstream_model(model))
+        except Exception:
+            pass
+    local_model_metadata = _load_local_model_metadata()
+    for candidate_model in candidate_models:
+        model_info = litellm.model_cost.get(candidate_model)
+        if isinstance(model_info, dict):
+            return model_info
+        local_model_info = local_model_metadata.get(candidate_model)
+        if isinstance(local_model_info, dict):
+            return local_model_info
+    return None
 
 
 def _is_oa_xai_responses_model(model: Any) -> bool:
@@ -8097,6 +8119,52 @@ def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     return detail_text
 
 
+def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        detail_text = json.dumps(detail, sort_keys=True, default=str)
+    elif detail is not None:
+        detail_text = str(detail)
+    else:
+        detail_text = str(exc)
+    normalized = detail_text.lower()
+    if not any(
+        marker in normalized
+        for marker in (
+            "xai oauth credential",
+            "xai oauth-managed",
+            "managed xai oauth",
+            "litellm_xai_oauth_auth_file",
+        )
+    ):
+        return None
+    return detail_text
+
+
+def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> None:
+    detail = _xai_oauth_candidate_unavailable_detail(exc) or str(exc)
+    proxy_exc = ProxyException(
+        message=(
+            "xAI OAuth auto-agent candidate requires a valid managed xAI OAuth "
+            f"credential: {detail}"
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": proxy_exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
+    raise proxy_exc from exc
+
+
 def _raise_grok_native_auto_agent_candidate_unavailable(exc: Exception) -> None:
     detail = _grok_native_candidate_unavailable_detail(exc) or str(exc)
     proxy_exc = ProxyException(
@@ -10999,6 +11067,7 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
     translated_request_body = _build_anthropic_responses_adapter_request_body(
@@ -11032,13 +11101,26 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
         )
     )
 
-    prepared_oa_xai, target_base_url, xai_api_key = (
-        await _prepare_oa_xai_passthrough_request(translated_request_body)
-    )
+    try:
+        prepared_oa_xai, target_base_url, xai_api_key = (
+            await _prepare_oa_xai_passthrough_request(translated_request_body)
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _xai_oauth_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
+        raise
     if not prepared_oa_xai or target_base_url is None or xai_api_key is None:
-        raise Exception(
+        missing_credential_error = Exception(
             "Anthropic adapter requests for xAI OAuth models require a managed xAI OAuth credential."
         )
+        if use_alias_candidate_probe:
+            _raise_xai_oauth_auto_agent_candidate_unavailable(
+                missing_credential_error
+            )
+        raise missing_credential_error
     translated_request_body["model"] = _to_xai_native_passthrough_model(
         translated_request_body.get("model")
     )
@@ -13716,6 +13798,17 @@ def _get_codex_tool_policy_model_cost_candidates(model: Any) -> list[str]:
                 f"xai/{grok_native_model.lower()}",
             ]
         )
+    if is_oa_xai_model(model_name):
+        try:
+            xai_oauth_upstream_model = resolve_oa_xai_upstream_model(model_name)
+            candidates.extend(
+                [
+                    xai_oauth_upstream_model,
+                    xai_oauth_upstream_model.lower(),
+                ]
+            )
+        except Exception:
+            pass
 
     unique_candidates: list[str] = []
     for candidate in candidates:
@@ -17449,15 +17542,29 @@ async def _handle_anthropic_auto_agent_alias_route(
                         adapter_model=candidate["model"],
                     )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-                response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    use_alias_candidate_probe=True,
-                )
+                if (
+                    candidate.get("route_family")
+                    == "anthropic_xai_oauth_responses_adapter"
+                ):
+                    response = await _handle_anthropic_xai_oauth_responses_adapter_route(
+                        endpoint=endpoint,
+                        request=request,
+                        fastapi_response=fastapi_response,
+                        user_api_key_dict=user_api_key_dict,
+                        prepared_request_body=candidate_body,
+                        adapter_model=candidate["model"],
+                        use_alias_candidate_probe=True,
+                    )
+                else:
+                    response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                        endpoint=endpoint,
+                        request=request,
+                        fastapi_response=fastapi_response,
+                        user_api_key_dict=user_api_key_dict,
+                        prepared_request_body=candidate_body,
+                        adapter_model=candidate["model"],
+                        use_alias_candidate_probe=True,
+                    )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
                 response = await _handle_anthropic_opencode_zen_responses_adapter_route(
                     endpoint=endpoint,
@@ -19235,6 +19342,51 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     )
 
 
+async def _perform_codex_auto_agent_oa_xai_responses_request(
+    *,
+    endpoint: str,
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth,
+    request_body: dict[str, Any],
+) -> Response:
+    try:
+        oa_xai_context = (
+            await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
+                endpoint=endpoint,
+                request_body=request_body,
+            )
+        )
+    except Exception as exc:
+        if _xai_oauth_candidate_unavailable_detail(exc) is not None:
+            _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
+        raise
+    if oa_xai_context is None:
+        _raise_xai_oauth_auto_agent_candidate_unavailable(
+            Exception(
+                "Codex auto-agent xAI OAuth candidate requires a managed xAI "
+                "OAuth credential."
+            )
+        )
+    assert oa_xai_context is not None
+    _, oa_xai_api_key, oa_xai_prepared_body, updated_url = oa_xai_context
+    return await pass_through_request(
+        request=request,
+        target=updated_url,
+        custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+            api_key=oa_xai_api_key,
+            request=request,
+        ),
+        user_api_key_dict=user_api_key_dict,
+        forward_headers=False,
+        stream=bool(oa_xai_prepared_body.get("stream")),
+        custom_body=oa_xai_prepared_body,
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        egress_credential_family="xai",
+        expected_target_family="xai",
+        retryable_upstream_status_codes=[429],
+    )
+
+
 async def _validate_codex_auto_agent_openrouter_responses_stream(
     response: StreamingResponse,
     *,
@@ -19743,12 +19895,23 @@ async def _handle_codex_auto_agent_alias_route(
                         request_body=candidate_body,
                     )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-                response = await _perform_codex_auto_agent_grok_native_responses_request(
-                    endpoint=endpoint,
-                    request=request,
-                    user_api_key_dict=user_api_key_dict,
-                    request_body=candidate_body,
-                )
+                if (
+                    candidate.get("route_family")
+                    == "codex_xai_oauth_responses_adapter"
+                ):
+                    response = await _perform_codex_auto_agent_oa_xai_responses_request(
+                        endpoint=endpoint,
+                        request=request,
+                        user_api_key_dict=user_api_key_dict,
+                        request_body=candidate_body,
+                    )
+                else:
+                    response = await _perform_codex_auto_agent_grok_native_responses_request(
+                        endpoint=endpoint,
+                        request=request,
+                        user_api_key_dict=user_api_key_dict,
+                        request_body=candidate_body,
+                    )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
                 response = await _handle_codex_opencode_zen_adapter_route(
                     endpoint=endpoint,
