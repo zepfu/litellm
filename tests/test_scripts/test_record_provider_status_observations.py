@@ -9,6 +9,74 @@ from scripts import record_provider_status_observations as probes
 from scripts import run_provider_status_observations_loop as loop
 
 
+def _provider_status_row() -> dict:
+    return {
+        "observed_at": datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc),
+        "environment": "dev",
+        "provider": "control",
+        "endpoint_key": "control:google.com",
+        "probe_type": "dns",
+        "success": True,
+        "status_code": None,
+        "address_family": "ipv4",
+        "resolved_ip": "172.217.215.101",
+        "packet_loss_pct": None,
+        "icmp_rtt_min_ms": None,
+        "icmp_rtt_avg_ms": None,
+        "icmp_rtt_max_ms": None,
+        "icmp_rtt_mdev_ms": None,
+        "dns_ms": 12.3,
+        "tcp_ms": None,
+        "tls_ms": None,
+        "ttfb_ms": None,
+        "total_ms": 12.3,
+        "status_summary": None,
+        "error_class": None,
+        "error_message": None,
+        "metadata": {"address_count": 1},
+    }
+
+
+class _FakeProviderStatusCursor:
+    def __init__(self) -> None:
+        self.execute_calls = []
+        self.executemany_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def execute(self, statement, params=None) -> None:
+        self.execute_calls.append((statement, params))
+
+    def executemany(self, statement, payloads) -> None:
+        self.executemany_calls.append((statement, payloads))
+
+
+class _FakeProviderStatusConnection:
+    def __init__(self) -> None:
+        self.cursor_instance = _FakeProviderStatusCursor()
+        self.commit_count = 0
+        self.rollback_count = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def cursor(self):
+        return self.cursor_instance
+
+    def commit(self) -> None:
+        self.commit_count += 1
+
+    def rollback(self) -> None:
+        self.rollback_count += 1
+
+
 def test_build_dsn_prefers_component_config_over_ambient_url(monkeypatch) -> None:
     monkeypatch.setenv("AAWM_DATABASE_URL", "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore")
     monkeypatch.setenv("AAWM_DB_HOST", "127.0.0.1")
@@ -142,6 +210,60 @@ def test_provider_status_schema_matches_callback_schema() -> None:
     )
 
 
+def test_setup_schema_executes_provider_status_ddl_with_timeouts(monkeypatch) -> None:
+    fake_conn = _FakeProviderStatusConnection()
+    monkeypatch.setattr(probes.psycopg, "connect", lambda _dsn: fake_conn)
+
+    probes.setup_schema(
+        "postgresql://example/db",
+        lock_timeout_ms=123,
+        statement_timeout_ms=456,
+    )
+
+    execute_calls = fake_conn.cursor_instance.execute_calls
+    assert execute_calls[0] == (
+        "SELECT set_config('lock_timeout', %s, true)",
+        ("123ms",),
+    )
+    assert execute_calls[1] == (
+        "SELECT set_config('statement_timeout', %s, true)",
+        ("456ms",),
+    )
+    ddl_statements = [statement for statement, _params in execute_calls[2:]]
+    assert probes.PROVIDER_STATUS_TABLE_SQL in ddl_statements
+    for statement in probes.PROVIDER_STATUS_ALTER_STATEMENTS:
+        assert statement in ddl_statements
+    for statement in probes.PROVIDER_STATUS_INDEX_STATEMENTS:
+        assert statement in ddl_statements
+    assert fake_conn.cursor_instance.executemany_calls == []
+    assert fake_conn.commit_count == 1
+    assert fake_conn.rollback_count == 0
+
+
+def test_insert_observations_does_not_execute_provider_status_ddl(monkeypatch) -> None:
+    fake_conn = _FakeProviderStatusConnection()
+    monkeypatch.setattr(probes.psycopg, "connect", lambda _dsn: fake_conn)
+
+    probes.insert_observations(
+        "postgresql://example/db",
+        [_provider_status_row()],
+        lock_timeout_ms=321,
+        statement_timeout_ms=654,
+    )
+
+    execute_calls = fake_conn.cursor_instance.execute_calls
+    assert execute_calls == [
+        ("SELECT set_config('lock_timeout', %s, true)", ("321ms",)),
+        ("SELECT set_config('statement_timeout', %s, true)", ("654ms",)),
+    ]
+    assert fake_conn.cursor_instance.executemany_calls
+    insert_sql, payloads = fake_conn.cursor_instance.executemany_calls[0]
+    assert insert_sql == probes.PROVIDER_STATUS_INSERT_SQL
+    assert payloads[0][2] == "control"
+    assert fake_conn.commit_count == 1
+    assert fake_conn.rollback_count == 0
+
+
 def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     for env_name in (
         "AAWM_LITELLM_ENVIRONMENT",
@@ -152,6 +274,9 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_PROVIDER_STATUS_PING_TIMEOUT",
         "AAWM_PROVIDER_STATUS_SKIP_ICMP",
         "AAWM_PROVIDER_STATUS_ONCE",
+        "AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START",
+        "AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS",
+        "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS",
     ):
         monkeypatch.delenv(env_name, raising=False)
 
@@ -165,6 +290,9 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.ping_timeout == 2
     assert config.skip_icmp is False
     assert config.once is False
+    assert config.setup_schema is True
+    assert config.db_lock_timeout_ms == 1000
+    assert config.db_statement_timeout_ms == 5000
 
 
 def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
@@ -178,6 +306,9 @@ def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
         ping_timeout=2,
         skip_icmp=False,
         once=True,
+        setup_schema=True,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
     )
     rows = [
         {"provider": "control", "probe_type": "dns", "success": True},
@@ -196,20 +327,39 @@ def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
         }
         return rows
 
-    def fake_insert_observations(dsn, payload_rows):
+    def fake_insert_observations(
+        dsn,
+        payload_rows,
+        *,
+        lock_timeout_ms,
+        statement_timeout_ms,
+    ):
         inserted["dsn"] = dsn
         inserted["rows"] = payload_rows
+        inserted["lock_timeout_ms"] = lock_timeout_ms
+        inserted["statement_timeout_ms"] = statement_timeout_ms
 
     monkeypatch.setattr(loop.probes, "collect_observations", fake_collect_observations)
     monkeypatch.setattr(loop.probes, "_build_dsn", lambda _args: "postgresql://example/db")
     monkeypatch.setattr(loop.probes, "insert_observations", fake_insert_observations)
+    monkeypatch.setattr(
+        loop.probes,
+        "setup_schema",
+        lambda *_args, **_kwargs: pytest.fail("run_cycle must not run schema setup"),
+    )
 
     summary = loop.run_cycle(config)
 
-    assert inserted == {"dsn": "postgresql://example/db", "rows": rows}
+    assert inserted == {
+        "dsn": "postgresql://example/db",
+        "rows": rows,
+        "lock_timeout_ms": 1000,
+        "statement_timeout_ms": 5000,
+    }
     assert summary["event"] == "provider_status_observations_cycle"
     assert summary["apply"] is True
     assert summary["inserted"] is True
+    assert summary["skipped"] is False
     assert summary["environment"] == "dev"
     assert summary["row_count"] == 2
     assert summary["success_count"] == 1
@@ -227,6 +377,9 @@ def test_run_cycle_requires_dsn_when_apply_enabled(monkeypatch) -> None:
         ping_timeout=2,
         skip_icmp=False,
         once=True,
+        setup_schema=True,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
     )
 
     monkeypatch.setattr(loop.probes, "collect_observations", lambda *_args, **_kwargs: [])
@@ -234,3 +387,113 @@ def test_run_cycle_requires_dsn_when_apply_enabled(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="No database DSN found"):
         loop.run_cycle(config)
+
+
+def test_run_cycle_skips_database_timeout_without_raising(monkeypatch) -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=True,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+    )
+    rows = [{"provider": "control", "probe_type": "dns", "success": True}]
+
+    def fake_insert_observations(*_args, **_kwargs):
+        raise probes.ProviderStatusDatabaseWriteSkipped(
+            error_class="LockNotAvailable",
+            message="canceling statement due to lock timeout",
+        )
+
+    monkeypatch.setattr(loop.probes, "collect_observations", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(loop.probes, "_build_dsn", lambda _args: "postgresql://example/db")
+    monkeypatch.setattr(loop.probes, "insert_observations", fake_insert_observations)
+
+    summary = loop.run_cycle(config)
+
+    assert summary["event"] == "provider_status_observations_cycle"
+    assert summary["inserted"] is False
+    assert summary["skipped"] is True
+    assert summary["skip_error_class"] == "LockNotAvailable"
+    assert "lock timeout" in summary["skip_reason"]
+
+
+def test_setup_schema_once_returns_ready_summary(monkeypatch) -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=True,
+        db_lock_timeout_ms=111,
+        db_statement_timeout_ms=222,
+    )
+    called = {}
+
+    def fake_setup_schema(
+        dsn,
+        *,
+        lock_timeout_ms,
+        statement_timeout_ms,
+    ):
+        called["dsn"] = dsn
+        called["lock_timeout_ms"] = lock_timeout_ms
+        called["statement_timeout_ms"] = statement_timeout_ms
+
+    monkeypatch.setattr(loop.probes, "_build_dsn", lambda _args: "postgresql://example/db")
+    monkeypatch.setattr(loop.probes, "setup_schema", fake_setup_schema)
+
+    summary = loop.setup_schema_once(config)
+
+    assert called == {
+        "dsn": "postgresql://example/db",
+        "lock_timeout_ms": 111,
+        "statement_timeout_ms": 222,
+    }
+    assert summary["event"] == "provider_status_observations_schema_ready"
+    assert summary["environment"] == "dev"
+
+
+def test_setup_schema_once_reports_skipped_lock_timeout(monkeypatch) -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=True,
+        db_lock_timeout_ms=111,
+        db_statement_timeout_ms=222,
+    )
+
+    def fake_setup_schema(*_args, **_kwargs):
+        raise probes.ProviderStatusDatabaseWriteSkipped(
+            error_class="QueryCanceled",
+            message="canceling statement due to statement timeout",
+        )
+
+    monkeypatch.setattr(loop.probes, "_build_dsn", lambda _args: "postgresql://example/db")
+    monkeypatch.setattr(loop.probes, "setup_schema", fake_setup_schema)
+
+    summary = loop.setup_schema_once(config)
+
+    assert summary["event"] == "provider_status_observations_schema_skipped"
+    assert summary["environment"] == "dev"
+    assert summary["error_class"] == "QueryCanceled"
+    assert "statement timeout" in summary["error_message"]

@@ -25,6 +25,9 @@ from urllib.parse import quote, urlencode
 
 import psycopg
 
+DEFAULT_DB_LOCK_TIMEOUT_MS = 1000
+DEFAULT_DB_STATEMENT_TIMEOUT_MS = 5000
+
 
 PING_STATS_RE = re.compile(
     r"(?P<sent>\d+)\s+packets transmitted,\s+"
@@ -133,6 +136,12 @@ PROVIDER_STATUS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS provider_status_observations_endpoint_time_idx ON public.provider_status_observations (provider, endpoint_key, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS provider_status_observations_probe_time_idx ON public.provider_status_observations (probe_type, observed_at DESC)",
 )
+
+
+class ProviderStatusDatabaseWriteSkipped(RuntimeError):
+    def __init__(self, *, error_class: str, message: str) -> None:
+        super().__init__(message)
+        self.error_class = error_class
 
 
 def _build_dsn(args: argparse.Namespace) -> Optional[str]:
@@ -255,7 +264,7 @@ def _resolve_host(
             "metadata": {"address_count": len(results)},
         }
     )
-    return observation, resolved_ip, family
+    return observation, str(resolved_ip), int(family)
 
 
 def _tcp_probe(
@@ -508,15 +517,75 @@ def _db_payload(row: Dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def insert_observations(dsn: str, rows: List[Dict[str, Any]]) -> None:
+def _set_database_timeouts(
+    cur: Any,
+    *,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+) -> None:
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{statement_timeout_ms}ms",),
+    )
+
+
+def setup_schema(
+    dsn: str,
+    *,
+    lock_timeout_ms: int = DEFAULT_DB_LOCK_TIMEOUT_MS,
+    statement_timeout_ms: int = DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+) -> None:
     with psycopg.connect(dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(PROVIDER_STATUS_TABLE_SQL)
-            for statement in PROVIDER_STATUS_ALTER_STATEMENTS:
-                cur.execute(statement)
-            for statement in PROVIDER_STATUS_INDEX_STATEMENTS:
-                cur.execute(statement)
-            cur.executemany(PROVIDER_STATUS_INSERT_SQL, [_db_payload(row) for row in rows])
+        try:
+            with conn.cursor() as cur:
+                _set_database_timeouts(
+                    cur,
+                    lock_timeout_ms=lock_timeout_ms,
+                    statement_timeout_ms=statement_timeout_ms,
+                )
+                cur.execute(PROVIDER_STATUS_TABLE_SQL)
+                for statement in PROVIDER_STATUS_ALTER_STATEMENTS:
+                    cur.execute(statement)
+                for statement in PROVIDER_STATUS_INDEX_STATEMENTS:
+                    cur.execute(statement)
+        except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
+            conn.rollback()
+            raise ProviderStatusDatabaseWriteSkipped(
+                error_class=exc.__class__.__name__,
+                message=str(exc),
+            ) from exc
+        conn.commit()
+
+
+def insert_observations(
+    dsn: str,
+    rows: List[Dict[str, Any]],
+    *,
+    lock_timeout_ms: int = DEFAULT_DB_LOCK_TIMEOUT_MS,
+    statement_timeout_ms: int = DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+) -> None:
+    if not rows:
+        return
+
+    with psycopg.connect(dsn) as conn:
+        try:
+            with conn.cursor() as cur:
+                _set_database_timeouts(
+                    cur,
+                    lock_timeout_ms=lock_timeout_ms,
+                    statement_timeout_ms=statement_timeout_ms,
+                )
+                cur.executemany(
+                    PROVIDER_STATUS_INSERT_SQL,
+                    [_db_payload(row) for row in rows],
+                )
+        except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
+            conn.rollback()
+            raise ProviderStatusDatabaseWriteSkipped(
+                error_class=exc.__class__.__name__,
+                message=str(exc),
+            ) from exc
         conn.commit()
 
 
@@ -528,6 +597,11 @@ def _json_default(value: Any) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--setup-schema",
+        action="store_true",
+        help="Run provider-status schema setup. Without --apply, setup and exit.",
+    )
     parser.add_argument("--apply", action="store_true", help="Insert rows into Postgres.")
     parser.add_argument("--dsn", help="PostgreSQL DSN. Defaults to AAWM_DB_* env vars.")
     parser.add_argument("--environment", default=os.getenv("AAWM_LITELLM_ENVIRONMENT", "unknown"))
@@ -535,6 +609,26 @@ def main() -> int:
     parser.add_argument("--ping-count", type=int, default=3)
     parser.add_argument("--ping-timeout", type=int, default=2)
     parser.add_argument("--skip-icmp", action="store_true")
+    parser.add_argument(
+        "--db-lock-timeout-ms",
+        type=int,
+        default=int(
+            os.getenv(
+                "AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS",
+                str(DEFAULT_DB_LOCK_TIMEOUT_MS),
+            )
+        ),
+    )
+    parser.add_argument(
+        "--db-statement-timeout-ms",
+        type=int,
+        default=int(
+            os.getenv(
+                "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS",
+                str(DEFAULT_DB_STATEMENT_TIMEOUT_MS),
+            )
+        ),
+    )
     parser.add_argument("--pg-host")
     parser.add_argument("--pg-port")
     parser.add_argument("--pg-database")
@@ -542,6 +636,24 @@ def main() -> int:
     parser.add_argument("--pg-password")
     parser.add_argument("--pg-sslmode")
     args = parser.parse_args()
+    dsn: Optional[str] = None
+    if args.db_lock_timeout_ms <= 0:
+        raise SystemExit("--db-lock-timeout-ms must be greater than 0")
+    if args.db_statement_timeout_ms <= 0:
+        raise SystemExit("--db-statement-timeout-ms must be greater than 0")
+
+    if args.setup_schema or args.apply:
+        dsn = _build_dsn(args)
+        if not dsn:
+            raise SystemExit("No database DSN found. Set AAWM_DB_* or pass --dsn.")
+        if args.setup_schema:
+            setup_schema(
+                dsn,
+                lock_timeout_ms=args.db_lock_timeout_ms,
+                statement_timeout_ms=args.db_statement_timeout_ms,
+            )
+            if not args.apply:
+                return 0
 
     rows = collect_observations(
         DEFAULT_ENDPOINTS,
@@ -552,10 +664,14 @@ def main() -> int:
         skip_icmp=args.skip_icmp,
     )
     if args.apply:
-        dsn = _build_dsn(args)
-        if not dsn:
+        if dsn is None:
             raise SystemExit("No database DSN found. Set AAWM_DB_* or pass --dsn.")
-        insert_observations(dsn, rows)
+        insert_observations(
+            dsn,
+            rows,
+            lock_timeout_ms=args.db_lock_timeout_ms,
+            statement_timeout_ms=args.db_statement_timeout_ms,
+        )
 
     sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True, default=_json_default))
     sys.stdout.write("\n")
