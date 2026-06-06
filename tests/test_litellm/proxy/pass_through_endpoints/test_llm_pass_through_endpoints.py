@@ -13608,6 +13608,7 @@ async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(
     assert selection["selection_reason"] == "first_available"
     updated_body = _add_anthropic_auto_agent_alias_metadata(
         body,
+        request=request,
         selection=selection,
         attempts=[
             {
@@ -13628,6 +13629,16 @@ async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(
     assert metadata["anthropic_auto_agent_selected_route_family"] == (
         "anthropic_openai_responses_adapter"
     )
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    assert audit_events == metadata["anthropic_auto_agent_audit_events"]
+    assert audit_events[0]["alias_family"] == "anthropic_auto_agent"
+    assert audit_events[0]["alias_model"] == "aawm-read-anthropic"
+    assert audit_events[0]["session_id"] == "claude-session"
+    assert audit_events[0]["provider"] == "openai"
+    assert audit_events[0]["model"] == "gpt-5.3-codex-spark"
+    assert audit_events[0]["event_type"] == "candidate_selected"
+    assert audit_events[0]["selected"] is True
+    assert audit_events[0]["attempt_number"] == 1
     assert "anthropic-auto-agent-alias:aawm-read-anthropic" in metadata["tags"]
 
 
@@ -13729,10 +13740,12 @@ async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates(
 
 
 def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
+    request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
     updated_body = _add_anthropic_auto_agent_alias_metadata(
         body,
+        request=request,
         selection={
             "candidate": {
                 "provider": "antigravity",
@@ -13750,6 +13763,11 @@ def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
     metadata = updated_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
     assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    assert len(audit_events) == 1
+    assert audit_events[0]["event_type"] == "candidate_selected"
+    assert audit_events[0]["provider"] == "antigravity"
+    assert audit_events[0]["model"] == "claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio
@@ -13965,6 +13983,20 @@ async def test_anthropic_auto_agent_alias_falls_back_to_gemini_after_spark_429(
     assert metadata["requested_model_alias"] == "aawm-anthropic-agent-auto"
     assert metadata["anthropic_auto_agent_selected_provider"] == "google_code_assist"
     assert metadata["anthropic_auto_agent_attempts"][0]["status"] == "cooldown_set"
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    retryable_event = next(
+        event
+        for event in audit_events
+        if event["event_type"] == "candidate_retryable_failure"
+    )
+    assert retryable_event["provider"] == "openai"
+    assert retryable_event["model"] == "gpt-5.3-codex-spark"
+    assert retryable_event["failure_class"] == "usage_limit_reached"
+    assert retryable_event["error_status_code"] == 429
+    selected_event = audit_events[-1]
+    assert selected_event["event_type"] == "candidate_selected"
+    assert selected_event["provider"] == "google_code_assist"
+    assert selected_event["model"] == "gemini-3.1-flash-lite-preview"
 
 
 @pytest.mark.asyncio
@@ -15033,6 +15065,7 @@ async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypa
     assert selection["selection_reason"] == "first_available"
     updated_body = _add_codex_auto_agent_alias_metadata(
         body,
+        request=request,
         selection=selection,
         attempts=[
             {
@@ -15051,6 +15084,17 @@ async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypa
     assert metadata["codex_auto_agent_alias"] == "aawm-read"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_route_family"] == "codex_responses"
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    assert audit_events == metadata["codex_auto_agent_audit_events"]
+    assert audit_events[0]["alias_family"] == "codex_auto_agent"
+    assert audit_events[0]["alias_model"] == "aawm-read"
+    assert audit_events[0]["session_id"] == "codex-session"
+    assert audit_events[0]["provider"] == "openai"
+    assert audit_events[0]["model"] == "gpt-5.3-codex-spark"
+    assert audit_events[0]["route_family"] == "codex_responses"
+    assert audit_events[0]["event_type"] == "candidate_selected"
+    assert audit_events[0]["candidate_status"] == "selected"
+    assert audit_events[0]["selected"] is True
     assert "codex-auto-agent-alias:aawm-read" in metadata["tags"]
 
 
@@ -15199,12 +15243,14 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates():
 
 
 def test_codex_auto_agent_alias_metadata_uses_requested_alias():
+    request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-low",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     updated_body = _add_codex_auto_agent_alias_metadata(
         body,
+        request=request,
         selection={
             "candidate": {
                 "provider": "openrouter",
@@ -15252,6 +15298,20 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
     assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == (
         "opencode_zen"
     )
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    assert [event["event_type"] for event in audit_events] == [
+        "candidate_skipped_cooldown",
+        "candidate_selected",
+    ]
+    skipped_event = audit_events[0]
+    assert skipped_event["alias_model"] == "aawm-low"
+    assert skipped_event["provider"] == "opencode_zen"
+    assert skipped_event["model"] == "deepseek-v4-flash-free"
+    assert skipped_event["cooldown_key"] == (
+        "opencode_zen:deepseek-v4-flash-free:opencode_zen"
+    )
+    assert skipped_event["cooldown_seconds"] == 60.0
+    assert skipped_event["skipped"] is True
     assert "codex-auto-agent-alias:aawm-low" in metadata["tags"]
 
 
@@ -16068,6 +16128,26 @@ async def test_codex_auto_agent_alias_falls_back_to_gemini_after_native_429(monk
     assert gemini_body["litellm_metadata"]["codex_auto_agent_attempts"][0][
         "status"
     ] == "cooldown_set"
+    audit_events = gemini_body["litellm_metadata"]["aawm_alias_routing_audit_events"]
+    retryable_event = next(
+        event
+        for event in audit_events
+        if event["event_type"] == "candidate_retryable_failure"
+    )
+    assert retryable_event["provider"] == "openai"
+    assert retryable_event["model"] == "gpt-5.3-codex-spark"
+    assert retryable_event["failure_class"] == "usage_limit_reached"
+    assert retryable_event["error_status_code"] == 429
+    skipped_event = next(
+        event
+        for event in audit_events
+        if event["event_type"] == "candidate_skipped_cooldown"
+    )
+    assert skipped_event["cooldown_key"] == (
+        "openai:gpt-5.3-codex-spark:session:codex-session"
+    )
+    assert audit_events[-1]["event_type"] == "candidate_selected"
+    assert audit_events[-1]["provider"] == "google_code_assist"
 
 
 @pytest.mark.asyncio
