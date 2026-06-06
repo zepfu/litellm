@@ -454,10 +454,6 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
-_CODEX_AAWM_SOTA_CANDIDATES = (
-    *_CODEX_AAWM_SOTA_CANDIDATES,
-    *_CODEX_AAWM_CODE_CANDIDATES,
-)
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
@@ -575,10 +571,6 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "route_family": "anthropic_messages",
         "last_resort": True,
     },
-)
-_ANTHROPIC_AAWM_SOTA_CANDIDATES = (
-    *_ANTHROPIC_AAWM_SOTA_CANDIDATES,
-    *_ANTHROPIC_AAWM_CODE_CANDIDATES,
 )
 _ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
@@ -1713,7 +1705,11 @@ def _hash_codex_auto_agent_lane_value(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
-def _resolve_codex_auto_agent_openai_lane_key(request: Request) -> str:
+def _resolve_codex_auto_agent_openai_lane_key(
+    request: Request,
+    *,
+    include_session_fallback: bool = True,
+) -> str:
     headers = _safe_get_request_headers(request)
     account_id = _get_codex_auto_agent_header(headers, "chatgpt-account-id")
     if account_id is not None:
@@ -1721,13 +1717,21 @@ def _resolve_codex_auto_agent_openai_lane_key(request: Request) -> str:
     authorization = _get_codex_auto_agent_header(headers, "authorization")
     if authorization is not None:
         return f"auth:{_hash_codex_auto_agent_lane_value(authorization)}"
-    session_header = (
-        _get_codex_auto_agent_header(headers, "session_id")
-        or _get_codex_auto_agent_header(headers, "session-id")
-    )
-    if session_header is not None:
-        return f"session:{session_header}"
+    if include_session_fallback:
+        session_header = (
+            _get_codex_auto_agent_header(headers, "session_id")
+            or _get_codex_auto_agent_header(headers, "session-id")
+        )
+        if session_header is not None:
+            return f"session:{session_header}"
     return "__default__"
+
+
+def _resolve_codex_auto_agent_openai_cooldown_lane_key(request: Request) -> str:
+    return _resolve_codex_auto_agent_openai_lane_key(
+        request,
+        include_session_fallback=False,
+    )
 
 
 async def _resolve_codex_auto_agent_google_lane_key() -> str:
@@ -2241,7 +2245,7 @@ async def _build_codex_auto_agent_candidate_states(
     *,
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
 ) -> list[dict[str, Any]]:
-    openai_lane_key = _resolve_codex_auto_agent_openai_lane_key(request)
+    openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     google_lane_key: Optional[str] = None
     antigravity_lane_key: Optional[str] = None
     states: list[dict[str, Any]] = []
@@ -2708,20 +2712,32 @@ def _resolve_anthropic_auto_agent_alias_model(
     return _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
 
 
-def _resolve_anthropic_auto_agent_native_lane_key(request: Request) -> str:
+def _resolve_anthropic_auto_agent_native_lane_key(
+    request: Request,
+    *,
+    include_session_fallback: bool = True,
+) -> str:
     headers = _safe_get_request_headers(request)
     for header_name in ("x-api-key", "authorization"):
         header_value = _get_codex_auto_agent_header(headers, header_name)
         if header_value is not None:
             return f"{header_name}:{_hash_codex_auto_agent_lane_value(header_value)}"
-    session_header = (
-        _get_codex_auto_agent_header(headers, "session_id")
-        or _get_codex_auto_agent_header(headers, "session-id")
-        or _get_codex_auto_agent_header(headers, "x-session-id")
-    )
-    if session_header is not None:
-        return f"session:{session_header}"
+    if include_session_fallback:
+        session_header = (
+            _get_codex_auto_agent_header(headers, "session_id")
+            or _get_codex_auto_agent_header(headers, "session-id")
+            or _get_codex_auto_agent_header(headers, "x-session-id")
+        )
+        if session_header is not None:
+            return f"session:{session_header}"
     return "__default__"
+
+
+def _resolve_anthropic_auto_agent_native_cooldown_lane_key(request: Request) -> str:
+    return _resolve_anthropic_auto_agent_native_lane_key(
+        request,
+        include_session_fallback=False,
+    )
 
 
 def _resolve_anthropic_auto_agent_session_key(
@@ -2834,8 +2850,10 @@ async def _build_anthropic_auto_agent_candidate_states(
     *,
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
 ) -> list[dict[str, Any]]:
-    openai_lane_key = _resolve_codex_auto_agent_openai_lane_key(request)
-    anthropic_lane_key = _resolve_anthropic_auto_agent_native_lane_key(request)
+    openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
+    anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(
+        request
+    )
     google_lane_key: Optional[str] = None
     antigravity_lane_key: Optional[str] = None
     states: list[dict[str, Any]] = []
