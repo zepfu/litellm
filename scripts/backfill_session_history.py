@@ -21,12 +21,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.client import RemoteDisconnected
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -285,7 +285,7 @@ async def _iter_spend_logs(
     where: Dict[str, Any],
     batch_size: int,
     limit: Optional[int],
-) -> Iterable[List[Dict[str, Any]]]:
+) -> AsyncGenerator[List[Dict[str, Any]], None]:
     fetched = 0
     skip = 0
 
@@ -330,9 +330,54 @@ async def _get_existing_call_ids(call_ids: Sequence[str]) -> Set[str]:
     }
 
 
+def _session_history_created_at_updates(
+    records: Sequence[Dict[str, Any]],
+) -> List[Tuple[datetime, str]]:
+    updates: List[Tuple[datetime, str]] = []
+    seen_call_ids: Set[str] = set()
+    for record in records:
+        call_id = record.get("litellm_call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            continue
+        call_id = call_id.strip()
+        if call_id in seen_call_ids:
+            continue
+        event_time = record.get("start_time") or record.get("end_time")
+        if not isinstance(event_time, datetime):
+            continue
+        normalized_event_time = _as_utc_aware_datetime(event_time)
+        if normalized_event_time is None:
+            continue
+        updates.append((normalized_event_time, call_id))
+        seen_call_ids.add(call_id)
+    return updates
+
+
+async def _align_session_history_created_at_to_event_time(
+    records: Sequence[Dict[str, Any]],
+) -> int:
+    updates = _session_history_created_at_updates(records)
+    if not updates:
+        return 0
+
+    pool = await _get_session_history_pool()
+    await _ensure_session_history_schema_with_pool(pool)
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            UPDATE public.session_history
+            SET created_at = $1
+            WHERE litellm_call_id = $2
+              AND created_at IS DISTINCT FROM $1
+            """,
+            updates,
+        )
+    return len(updates)
+
+
 class LangfuseTraceTagBackfiller:
     def __init__(self, *, host: str, public_key: str, secret_key: str) -> None:
-        from langfuse import Langfuse
+        from langfuse import Langfuse  # type: ignore[import-untyped]
 
         normalized_host = _normalize_langfuse_host(host)
 
@@ -1039,12 +1084,27 @@ class BackfillStats:
     updated_rows: int = 0
     existing_rows: int = 0
     skipped_rows: int = 0
+    created_at_aligned_rows: int = 0
     trace_tag_candidates: int = 0
     traces_patched: int = 0
     traces_unchanged: int = 0
     traces_missing: int = 0
     trace_tags_added: int = 0
     trace_write_errors: int = 0
+
+
+def _record_trace_tag_patch_result(
+    stats: BackfillStats,
+    result: Dict[str, Any],
+) -> None:
+    status = result["status"]
+    if status == "patched":
+        stats.traces_patched += 1
+        stats.trace_tags_added += int(result["added"])
+    elif status == "unchanged":
+        stats.traces_unchanged += 1
+    elif status == "missing_trace":
+        stats.traces_missing += 1
 
 
 async def _create_source_prisma_client(database_url: str) -> PrismaClient:
@@ -1104,7 +1164,7 @@ def _record_matches_filters(record: Dict[str, Any], args: argparse.Namespace) ->
     return True
 
 
-async def _run_spend_log_backfill(
+async def _run_spend_log_backfill(  # noqa: PLR0915
     args: argparse.Namespace,
     *,
     source_database_url: str,
@@ -1176,29 +1236,25 @@ async def _run_spend_log_backfill(
 
             if args.apply and records:
                 await _persist_session_history_records(records)
+                stats.created_at_aligned_rows += (
+                    await _align_session_history_created_at_to_event_time(records)
+                )
                 stats.inserted_rows += len(new_records)
                 stats.updated_rows += len(existing_records)
 
             stats.trace_tag_candidates += len(trace_tag_map)
             if langfuse_backfiller is not None and args.apply:
-                for trace_id, trace_tags in trace_tag_map.items():
-                    if not trace_tags:
+                for trace_id, tag_set in trace_tag_map.items():
+                    if not tag_set:
                         continue
                     try:
                         result = langfuse_backfiller.patch_tags(
-                            trace_id, sorted(trace_tags)
+                            trace_id, sorted(tag_set)
                         )
                     except Exception:
                         stats.trace_write_errors += 1
                         continue
-                    status = result["status"]
-                    if status == "patched":
-                        stats.traces_patched += 1
-                        stats.trace_tags_added += int(result["added"])
-                    elif status == "unchanged":
-                        stats.traces_unchanged += 1
-                    elif status == "missing_trace":
-                        stats.traces_missing += 1
+                    _record_trace_tag_patch_result(stats, result)
     finally:
         await prisma_client.disconnect()
 
@@ -1216,6 +1272,7 @@ async def _run_spend_log_backfill(
             "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
+            "created_at_aligned_rows": stats.created_at_aligned_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
             "traces_patched": stats.traces_patched,
             "traces_unchanged": stats.traces_unchanged,
@@ -1228,7 +1285,7 @@ async def _run_spend_log_backfill(
     }
 
 
-async def _run_langfuse_trace_backfill(
+async def _run_langfuse_trace_backfill(  # noqa: PLR0915
     args: argparse.Namespace,
     *,
     langfuse_source: LangfuseTraceSource,
@@ -1376,29 +1433,23 @@ async def _run_langfuse_trace_backfill(
 
         if args.apply and records:
             await _persist_session_history_records(records)
+            stats.created_at_aligned_rows += (
+                await _align_session_history_created_at_to_event_time(records)
+            )
             stats.inserted_rows += len(new_records)
             stats.updated_rows += len(existing_records)
 
         stats.trace_tag_candidates += len(trace_tag_map)
         if langfuse_backfiller is not None and args.apply:
-                for trace_id, trace_tags in trace_tag_map.items():
-                    if not trace_tags:
-                        continue
-                    try:
-                        result = langfuse_backfiller.patch_tags(
-                            trace_id, sorted(trace_tags)
-                        )
-                    except Exception:
-                        stats.trace_write_errors += 1
-                        continue
-                    status = result["status"]
-                if status == "patched":
-                    stats.traces_patched += 1
-                    stats.trace_tags_added += int(result["added"])
-                elif status == "unchanged":
-                    stats.traces_unchanged += 1
-                elif status == "missing_trace":
-                    stats.traces_missing += 1
+            for trace_id, tag_set in trace_tag_map.items():
+                if not tag_set:
+                    continue
+                try:
+                    result = langfuse_backfiller.patch_tags(trace_id, sorted(tag_set))
+                except Exception:
+                    stats.trace_write_errors += 1
+                    continue
+                _record_trace_tag_patch_result(stats, result)
 
         if args.limit is not None and processed_records >= args.limit:
             break
@@ -1429,6 +1480,7 @@ async def _run_langfuse_trace_backfill(
             "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
+            "created_at_aligned_rows": stats.created_at_aligned_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
             "traces_patched": stats.traces_patched,
             "traces_unchanged": stats.traces_unchanged,
@@ -1441,7 +1493,7 @@ async def _run_langfuse_trace_backfill(
     }
 
 
-async def _run_langfuse_db_backfill(
+async def _run_langfuse_db_backfill(  # noqa: PLR0915
     args: argparse.Namespace,
     *,
     langfuse_database_url: str,
@@ -1535,29 +1587,25 @@ async def _run_langfuse_db_backfill(
 
             if args.apply and records:
                 await _persist_session_history_records(records)
+                stats.created_at_aligned_rows += (
+                    await _align_session_history_created_at_to_event_time(records)
+                )
                 stats.inserted_rows += len(new_records)
                 stats.updated_rows += len(existing_records)
 
             stats.trace_tag_candidates += len(trace_tag_map)
             if args.apply and args.patch_langfuse_tags:
-                for trace_id, trace_tags in trace_tag_map.items():
-                    if not trace_tags:
+                for trace_id, tag_set in trace_tag_map.items():
+                    if not tag_set:
                         continue
                     try:
                         result = await langfuse_source.patch_tags(
-                            trace_id, sorted(trace_tags)
+                            trace_id, sorted(tag_set)
                         )
                     except Exception:
                         stats.trace_write_errors += 1
                         continue
-                    status = result["status"]
-                    if status == "patched":
-                        stats.traces_patched += 1
-                        stats.trace_tags_added += int(result["added"])
-                    elif status == "unchanged":
-                        stats.traces_unchanged += 1
-                    elif status == "missing_trace":
-                        stats.traces_missing += 1
+                    _record_trace_tag_patch_result(stats, result)
 
             if args.limit is not None and processed_records >= args.limit:
                 break
@@ -1591,6 +1639,7 @@ async def _run_langfuse_db_backfill(
             "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
+            "created_at_aligned_rows": stats.created_at_aligned_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
             "traces_patched": stats.traces_patched,
             "traces_unchanged": stats.traces_unchanged,
@@ -1603,7 +1652,7 @@ async def _run_langfuse_db_backfill(
     }
 
 
-async def _run_langfuse_clickhouse_backfill(
+async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
     args: argparse.Namespace,
     *,
     clickhouse_config: Dict[str, str],
@@ -1699,27 +1748,23 @@ async def _run_langfuse_clickhouse_backfill(
 
         if args.apply and records:
             await _persist_session_history_records(records)
+            stats.created_at_aligned_rows += (
+                await _align_session_history_created_at_to_event_time(records)
+            )
             stats.inserted_rows += len(new_records)
             stats.updated_rows += len(existing_records)
 
         stats.trace_tag_candidates += len(trace_tag_map)
         if langfuse_backfiller is not None and args.apply:
-            for trace_id, trace_tags in trace_tag_map.items():
-                if not trace_tags:
+            for trace_id, tag_set in trace_tag_map.items():
+                if not tag_set:
                     continue
                 try:
-                    result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
+                    result = langfuse_backfiller.patch_tags(trace_id, sorted(tag_set))
                 except Exception:
                     stats.trace_write_errors += 1
                     continue
-                status = result["status"]
-                if status == "patched":
-                    stats.traces_patched += 1
-                    stats.trace_tags_added += int(result["added"])
-                elif status == "unchanged":
-                    stats.traces_unchanged += 1
-                elif status == "missing_trace":
-                    stats.traces_missing += 1
+                _record_trace_tag_patch_result(stats, result)
 
         if args.limit is not None and processed_records >= args.limit:
             break
@@ -1756,6 +1801,7 @@ async def _run_langfuse_clickhouse_backfill(
             "updated_rows": stats.updated_rows,
             "existing_rows": stats.existing_rows,
             "skipped_rows": stats.skipped_rows,
+            "created_at_aligned_rows": stats.created_at_aligned_rows,
             "trace_tag_candidates": stats.trace_tag_candidates,
             "traces_patched": stats.traces_patched,
             "traces_unchanged": stats.traces_unchanged,
@@ -1821,22 +1867,15 @@ async def _run_trace_tag_writeback_from_session_history(
     if args.apply:
         if langfuse_backfiller is None:
             raise RuntimeError("Langfuse tag writeback requires Langfuse API credentials")
-        for trace_id, trace_tags in trace_tag_map.items():
-            if not trace_tags:
+        for trace_id, tag_set in trace_tag_map.items():
+            if not tag_set:
                 continue
             try:
-                result = langfuse_backfiller.patch_tags(trace_id, sorted(trace_tags))
+                result = langfuse_backfiller.patch_tags(trace_id, sorted(tag_set))
             except Exception:
                 stats.trace_write_errors += 1
                 continue
-            status = result["status"]
-            if status == "patched":
-                stats.traces_patched += 1
-                stats.trace_tags_added += int(result["added"])
-            elif status == "unchanged":
-                stats.traces_unchanged += 1
-            elif status == "missing_trace":
-                stats.traces_missing += 1
+            _record_trace_tag_patch_result(stats, result)
         langfuse_backfiller.flush()
 
     return {
@@ -1986,15 +2025,15 @@ def _extract_gemini_control_plane_method(value: Any) -> Optional[str]:
         return None
     if isinstance(value, dict):
         for nested_value in value.values():
-            method = _extract_gemini_control_plane_method(nested_value)
-            if method is not None:
-                return method
+            nested_method = _extract_gemini_control_plane_method(nested_value)
+            if nested_method is not None:
+                return nested_method
         return None
     if isinstance(value, list):
         for nested_value in value:
-            method = _extract_gemini_control_plane_method(nested_value)
-            if method is not None:
-                return method
+            nested_method = _extract_gemini_control_plane_method(nested_value)
+            if nested_method is not None:
+                return nested_method
     return None
 
 
@@ -2140,11 +2179,13 @@ async def _run_gemini_control_plane_session_history_repair(  # noqa: PLR0915
                 break
             scanned_rows += 1
             row_dict = dict(row)
-            is_match, method = _is_gemini_control_plane_session_history_row(row_dict)
-            if not is_match or method is None:
+            is_match, control_plane_method = (
+                _is_gemini_control_plane_session_history_row(row_dict)
+            )
+            if not is_match or control_plane_method is None:
                 continue
             matched_rows += 1
-            matched_methods[method] += 1
+            matched_methods[control_plane_method] += 1
 
             if not args.apply:
                 continue
@@ -2234,7 +2275,7 @@ async def _run_gemini_control_plane_session_history_repair(  # noqa: PLR0915
     }
 
 
-async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any]:
+async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any]:  # noqa: PLR0915
     if args.repair_gemini_control_plane:
         return await _run_gemini_control_plane_session_history_repair(args)
 
@@ -2487,6 +2528,8 @@ async def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
             run_id=run_id,
         )
     elif source_mode == "langfuse":
+        if langfuse_creds is None:
+            raise RuntimeError("Langfuse API credentials are missing")
         langfuse_source = LangfuseTraceSource(
             host=langfuse_creds["host"],
             public_key=langfuse_creds["public_key"],
@@ -2624,7 +2667,7 @@ def main() -> None:
             "or --repair-tenant-ids"
         )
     result = asyncio.run(_run_backfill(args))
-    print(json.dumps(result, indent=2, default=str))
+    sys.stdout.write(json.dumps(result, indent=2, default=str) + "\n")
 
 
 if __name__ == "__main__":

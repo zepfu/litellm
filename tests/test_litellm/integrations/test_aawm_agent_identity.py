@@ -2466,7 +2466,7 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
     assert payload[121:125] == (False, None, None, None)
 
 
-def test_build_session_history_record_persists_agent_score_metadata() -> None:
+def test_build_session_history_record_persists_agent_score_metadata() -> None:  # noqa: PLR0915
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"
     kwargs["custom_llm_provider"] = "openai"
@@ -8600,18 +8600,20 @@ def test_flush_session_history_batch_logs_exception_type_when_message_is_empty(
     )
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
 
-    aawm_agent_identity._flush_session_history_batch(
+    flushed = aawm_agent_identity._flush_session_history_batch(
         [{"litellm_call_id": "call-empty-message"}]
     )
 
+    assert flushed is False
     exception_mock.assert_called_once()
     assert exception_mock.call_args.args[0] == (
-        "AawmAgentIdentity: failed to flush %d session_history records: %s"
+        "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)"
     )
     assert exception_mock.call_args.args[1] == 1
     assert exception_mock.call_args.args[2] == (
         "EmptyMessageError: EmptyMessageError()"
     )
+    assert exception_mock.call_args.args[3].startswith("queue_depth=")
 
 
 def test_enqueue_session_history_record_retries_queue_when_overflow_busy(monkeypatch) -> None:
@@ -11270,6 +11272,91 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert fake_pool.acquire_contexts[0].enter_count == 1
     assert fake_pool.acquire_contexts[0].exit_count == 1
     mock_conn.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_session_history_records_keeps_history_when_rate_limit_side_write_fails(
+    monkeypatch,
+) -> None:
+    records = [
+        {
+            "litellm_call_id": "call-side-write-fails",
+            "session_id": "session-side-write-fails",
+            "trace_id": "trace-side-write-fails",
+            "provider_response_id": "resp-side-write-fails",
+            "provider": "anthropic",
+            "model": "anthropic/claude-sonnet-4-6",
+            "model_group": "claude-sonnet-4-6",
+            "agent_name": "eyes",
+            "tenant_id": "litellm",
+            "call_type": "pass_through_endpoint",
+            "start_time": datetime(2026, 6, 5, 19, 12, tzinfo=timezone.utc),
+            "end_time": datetime(2026, 6, 5, 19, 13, tzinfo=timezone.utc),
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens_reported": None,
+            "reasoning_tokens_estimated": None,
+            "reasoning_tokens_source": "not_applicable",
+            "reasoning_present": False,
+            "thinking_signature_present": False,
+            "tool_call_count": 0,
+            "tool_names": [],
+            "response_cost_usd": 0.01,
+            "metadata": {},
+            "rate_limit_observations": [
+                {
+                    "observed_at": datetime(2026, 6, 5, 19, 13, tzinfo=timezone.utc),
+                    "source": "test_rate_limit_side_write",
+                    "provider": "anthropic",
+                    "limit_key": "side-write-test",
+                }
+            ],
+        }
+    ]
+
+    mock_conn = AsyncMock()
+    fake_pool = _FakePool(mock_conn)
+    exception_mock = MagicMock()
+    rate_limit_observation = records[0]["rate_limit_observations"][0]
+    mock_conn.executemany.side_effect = [
+        None,
+        RuntimeError("rate-limit insert unavailable"),
+    ]
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._build_openrouter_free_daily_observations_for_records",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._filter_meaningful_rate_limit_observations",
+        AsyncMock(return_value=([rate_limit_observation], {})),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._derive_rate_limit_transitions",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+
+    await _persist_session_history_records(records)
+
+    history_args = mock_conn.executemany.await_args_list[0].args
+    assert "INSERT INTO public.session_history" in history_args[0]
+    assert history_args[1][0][0] == "call-side-write-fails"
+    side_write_args = mock_conn.executemany.await_args_list[1].args
+    assert "INSERT INTO public.rate_limit_observations" in side_write_args[0]
+    assert mock_conn.execute.await_count == 1
+    exception_mock.assert_called_once()
+    assert "best-effort rate-limit observations" in exception_mock.call_args.args[0]
 
 
 @pytest.mark.asyncio
