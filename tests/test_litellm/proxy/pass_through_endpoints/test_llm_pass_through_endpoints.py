@@ -12260,6 +12260,7 @@ class TestClaudePersistedOutputExpansion:
                             "type": "object",
                             "properties": {
                                 "model": {"type": "string"},
+                                "fork_context": {"type": "boolean"},
                                 "message": {"type": "string"},
                                 "api_key": {
                                     "type": "string",
@@ -12303,11 +12304,12 @@ class TestClaudePersistedOutputExpansion:
                 "description": "Spawn a read-only subagent with redacted-by-litellm",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "model": {"type": "string"},
-                        "message": {"type": "string"},
-                        "api_key": "redacted-by-litellm",
-                    },
+                        "properties": {
+                            "model": {"type": "string"},
+                            "fork_context": {"type": "boolean"},
+                            "message": {"type": "string"},
+                            "api_key": "redacted-by-litellm",
+                        },
                     "required": ["message"],
                 },
                 "definition": {
@@ -12321,6 +12323,7 @@ class TestClaudePersistedOutputExpansion:
                             "type": "object",
                             "properties": {
                                 "model": {"type": "string"},
+                                "fork_context": {"type": "boolean"},
                                 "message": {"type": "string"},
                                 "api_key": "redacted-by-litellm",
                             },
@@ -13135,16 +13138,34 @@ def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
         request_body
     )
 
-    assert len(patch_events) == 1
+    assert len(patch_events) == 2
     assert patch_events[0]["id"] == "spawn-agent-fanout-policy"
     assert patch_events[0]["path"] == "tools.0.description"
+    assert patch_events[1] == {
+        "id": "spawn-agent-payload-schema",
+        "status": "applied",
+        "tool_name": "spawn_agent",
+        "path": "tools.0.parameters",
+        "fields_added": ["model", "fork_context", "message"],
+        "occurrences": 0,
+    }
     patched_description = updated_body["tools"][0]["description"]
     assert "Use subagents to parallelize independent work" in patched_description
+    assert "aawm-codex-agent-auto" in patched_description
+    assert "fork_context=false" in patched_description
+    assert "read-only payload does not apply" in patched_description
     assert "latest frontier model" in patched_description
     assert "latest Codex model" in patched_description
     assert "mini-class agents" in patched_description
     assert "GPT-5.5" not in patched_description
     assert "Only use `spawn_agent` if and only if" not in patched_description
+    spawn_agent_parameters = updated_body["tools"][0]["parameters"]
+    assert spawn_agent_parameters["type"] == "object"
+    spawn_agent_properties = spawn_agent_parameters["properties"]
+    assert list(spawn_agent_properties) == ["model", "fork_context", "message"]
+    assert spawn_agent_properties["model"]["type"] == "string"
+    assert spawn_agent_properties["fork_context"]["type"] == "boolean"
+    assert spawn_agent_properties["message"]["type"] == "string"
     assert updated_body["tools"][1] == request_body["tools"][1]
 
     litellm_metadata = updated_body["litellm_metadata"]
@@ -13154,14 +13175,61 @@ def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
         "codex-tool-description-patch:spawn-agent-fanout-policy"
         in litellm_metadata["tags"]
     )
-    assert litellm_metadata["codex_tool_description_patch_count"] == 1
+    assert litellm_metadata["codex_tool_description_patch_count"] == 2
     assert litellm_metadata["codex_tool_description_patch_replacement_count"] == 1
     assert litellm_metadata["codex_tool_description_patch_ids"] == [
-        "spawn-agent-fanout-policy"
+        "spawn-agent-fanout-policy",
+        "spawn-agent-payload-schema",
     ]
     assert litellm_metadata["langfuse_spans"][0]["name"] == (
         "codex.tool_description_patch"
     )
+
+
+def test_codex_spawn_agent_tool_patch_adds_function_payload_schema_fields():
+    request_body = {
+        "model": "gpt-5.4-mini",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Existing prompt field.",
+                            }
+                        },
+                    },
+                },
+            }
+        ],
+    }
+
+    updated_body, patch_events = _apply_codex_tool_description_patches_to_request_body(
+        request_body
+    )
+
+    schema_event = next(
+        event
+        for event in patch_events
+        if event["id"] == "spawn-agent-payload-schema"
+    )
+    assert schema_event["path"] == "tools.0.function.parameters"
+    assert schema_event["fields_added"] == ["model", "fork_context"]
+
+    function = updated_body["tools"][0]["function"]
+    assert "aawm-codex-agent-auto" in function["description"]
+    properties = function["parameters"]["properties"]
+    assert properties["model"]["type"] == "string"
+    assert properties["fork_context"]["type"] == "boolean"
+    assert properties["message"] == {
+        "type": "string",
+        "description": "Existing prompt field.",
+    }
 
 
 def test_codex_spawn_agent_tool_description_patch_ignores_other_tools():
@@ -16795,6 +16863,14 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
                 "parallel_tool_calls": True,
                 "include": ["reasoning.encrypted_content"],
                 "prompt_cache_key": "prompt-cache-key-123",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
             }
         ),
     ), patch(
@@ -16822,6 +16898,32 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     assert litellm_metadata["repository"] == "zepfu/litellm"
     assert litellm_metadata["passthrough_route_family"] == "codex_responses"
     assert "route:codex_responses" in litellm_metadata["tags"]
+    assert "codex-tool-description-patch" in litellm_metadata["tags"]
+    assert (
+        "codex-tool-description-patch:spawn-agent-fanout-policy"
+        in litellm_metadata["tags"]
+    )
+    assert (
+        "codex-tool-description-patch:spawn-agent-payload-schema"
+        in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["codex_tool_description_patch_count"] == 2
+    assert "aawm-codex-agent-auto" in prepared_body["tools"][0]["description"]
+    assert "fork_context=false" in prepared_body["tools"][0]["description"]
+    spawn_agent_parameters = prepared_body["tools"][0]["parameters"]
+    assert set(spawn_agent_parameters["properties"]) == {
+        "model",
+        "fork_context",
+        "message",
+    }
+    snapshot_parameters = litellm_metadata[
+        "aawm_tool_definition_snapshot"
+    ][0]["parameters"]
+    assert set(snapshot_parameters["properties"]) == {
+        "model",
+        "fork_context",
+        "message",
+    }
 
 
 @pytest.mark.asyncio

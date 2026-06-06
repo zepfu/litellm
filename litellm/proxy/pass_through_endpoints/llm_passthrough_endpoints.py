@@ -1038,22 +1038,63 @@ _openrouter_adapter_rate_limit_until_monotonic_by_key: dict[str, float] = {}
 _openrouter_adapter_failure_circuit_until_monotonic_by_key: dict[str, float] = {}
 _CODEX_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID = "spawn-agent-fanout-policy"
+_CODEX_SPAWN_AGENT_PAYLOAD_SCHEMA_PATCH_ID = "spawn-agent-payload-schema"
 _CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD = "unsupported_hosted_tools"
 _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params"
 _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
-    "on the critical path. Do not duplicate the same task across agents.\n\n"
+    "on the critical path. Follow the current operator and project instructions "
+    "that authorize fanout; do not treat generic depth or investigation wording "
+    "as permission to launch unrelated autonomous fanout. Do not duplicate the "
+    "same task across agents.\n\n"
+    "For read-only or exploration workers, call multi_agent_v1.spawn_agent with "
+    'lower-case payload fields: model="aawm-codex-agent-auto", '
+    "fork_context=false unless context sharing is explicitly needed, and message "
+    "containing the read-only boundary plus the audit task. If a fix is needed, "
+    "the worker should describe the patch only.\n\n"
+    "For coding workers, this read-only payload does not apply. Include the "
+    "selected coding model from the configured coding-model priority order, "
+    "assign a clear disjoint write set, and tell workers they are not alone in "
+    "the codebase. They must not revert unrelated edits.\n\n"
     "Use the latest frontier model for cross-document architecture, migration-risk "
     "review, and high-stakes database safety reasoning. Use the latest Codex model "
     "for bounded implementation tasks with clear, disjoint write ownership. Use "
     "mini-class agents for narrow grep/read-only scans, documentation consistency "
-    "checks, test inventory, and quick QA passes.\n\n"
-    "For coding fanout, assign disjoint write sets and tell workers they are not "
-    "alone in the codebase. They must not revert unrelated edits. For database "
-    "or migration work, prefer read-only explorer subagents; the main owner "
-    "should run live database commands so target verification and credential "
-    "handling stay in one place."
+    "checks, test inventory, and quick QA passes. For database or migration "
+    "work, prefer read-only explorer subagents; the main owner should run live "
+    "database commands so target verification and credential handling stay in "
+    "one place."
+)
+_CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
+    "model": {
+        "type": "string",
+        "description": (
+            "Optional lower-case model override accepted by the orchestrator. "
+            "Use aawm-codex-agent-auto for read-only/exploration workers; use "
+            "the selected coding model for coding workers."
+        ),
+    },
+    "fork_context": {
+        "type": "boolean",
+        "description": (
+            "Whether to fork the current conversation context into the worker. "
+            "Use false for isolated read-only audits unless context sharing is "
+            "explicitly required."
+        ),
+    },
+    "message": {
+        "type": "string",
+        "description": (
+            "Plain-text task prompt for the worker, including read-only or "
+            "coding scope, file boundaries, and final-answer requirements."
+        ),
+    },
+}
+_CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER = (
+    "model",
+    "fork_context",
+    "message",
 )
 _CODEX_SPAWN_AGENT_RESTRICTIVE_DESCRIPTION_PATTERNS = (
     re.compile(
@@ -14191,6 +14232,43 @@ def _patch_codex_spawn_agent_description_text(description: str) -> tuple[str, in
     return updated_description, replacement_count
 
 
+def _patch_codex_spawn_agent_payload_parameters(
+    parameters: Any,
+) -> tuple[Any, list[str]]:
+    if parameters is None:
+        updated_parameters: dict[str, Any] = {
+            "type": "object",
+            "properties": {},
+        }
+    elif isinstance(parameters, dict):
+        updated_parameters = copy.deepcopy(parameters)
+        if "type" not in updated_parameters:
+            updated_parameters["type"] = "object"
+    else:
+        return parameters, []
+
+    properties = updated_parameters.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    else:
+        properties = dict(properties)
+
+    added_fields: list[str] = []
+    for field_name in _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER:
+        if field_name in properties:
+            continue
+        properties[field_name] = copy.deepcopy(
+            _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS[field_name]
+        )
+        added_fields.append(field_name)
+
+    if not added_fields:
+        return parameters, []
+
+    updated_parameters["properties"] = properties
+    return updated_parameters, added_fields
+
+
 def _get_openai_tool_name(tool: dict[str, Any]) -> Optional[str]:
     name = tool.get("name")
     if isinstance(name, str) and name.strip():
@@ -14719,6 +14797,54 @@ def _patch_codex_spawn_agent_tool_description(
                 "tool_name": _CODEX_SPAWN_AGENT_TOOL_NAME,
                 "path": path,
                 "occurrences": replacement_count,
+            }
+        )
+
+    parameter_targets: list[tuple[str, str]] = []
+    function = updated_tool.get("function")
+    if isinstance(function, dict):
+        parameter_targets.append(
+            ("function", f"tools.{tool_index}.function.parameters")
+        )
+    if "parameters" in updated_tool or not parameter_targets:
+        parameter_targets.append(("tool", f"tools.{tool_index}.parameters"))
+
+    for target_kind, path in parameter_targets:
+        if target_kind == "function":
+            current_function = updated_tool.get("function")
+            if not isinstance(current_function, dict):
+                continue
+            parameters = current_function.get("parameters")
+        else:
+            parameters = updated_tool.get("parameters")
+
+        updated_parameters, added_fields = (
+            _patch_codex_spawn_agent_payload_parameters(parameters)
+        )
+        if not added_fields or updated_parameters is parameters:
+            continue
+
+        if updated_tool is tool:
+            updated_tool = dict(tool)
+
+        if target_kind == "function":
+            current_function = updated_tool.get("function")
+            if not isinstance(current_function, dict):
+                continue
+            updated_function = dict(current_function)
+            updated_function["parameters"] = updated_parameters
+            updated_tool["function"] = updated_function
+        else:
+            updated_tool["parameters"] = updated_parameters
+
+        patch_events.append(
+            {
+                "id": _CODEX_SPAWN_AGENT_PAYLOAD_SCHEMA_PATCH_ID,
+                "status": "applied",
+                "tool_name": _CODEX_SPAWN_AGENT_TOOL_NAME,
+                "path": path,
+                "fields_added": added_fields,
+                "occurrences": 0,
             }
         )
 
