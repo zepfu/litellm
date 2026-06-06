@@ -99,7 +99,8 @@ services:
       - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=${LITELLM_LANGFUSE_TRACE_ENVIRONMENT:-dev}
       - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
       - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
-      # AAWM dynamic injection database access
+      # AAWM dynamic injection database access. Keep defaults direct until the
+      # shared PgBouncer endpoint is live and verified for this repo.
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-postgres18}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-5432}
       - AAWM_DB_NAME=${LITELLM_AAWM_DB_NAME:-aawm_tristore}
@@ -110,6 +111,9 @@ services:
       - AAWM_DB_SSL=${LITELLM_AAWM_DB_SSL:-}
       - AAWM_DB_URL=${LITELLM_AAWM_DB_URL:-}
       - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
+      - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
+      - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=${LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME:-aawm-litellm-session-history}
+      - AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE=${LITELLM_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE:-0}
       - AAWM_POSTGRES_SERVER=${LITELLM_AAWM_POSTGRES_SERVER:-}
       - AAWM_POSTGRES_PORT=${LITELLM_AAWM_POSTGRES_PORT:-}
       - AAWM_POSTGRES_DATABASE=${LITELLM_AAWM_POSTGRES_DATABASE:-}
@@ -182,6 +186,8 @@ services:
       - AAWM_DB_SSL=${LITELLM_AAWM_DB_SSL:-}
       - AAWM_DB_URL=${LITELLM_AAWM_DB_URL:-}
       - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
+      - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
+      - AAWM_PROVIDER_STATUS_DB_APPLICATION_NAME=${LITELLM_AAWM_PROVIDER_STATUS_DB_APPLICATION_NAME:-aawm-provider-status-observations}
       - AAWM_POSTGRES_SERVER=${LITELLM_AAWM_POSTGRES_SERVER:-}
       - AAWM_POSTGRES_PORT=${LITELLM_AAWM_POSTGRES_PORT:-}
       - AAWM_POSTGRES_DATABASE=${LITELLM_AAWM_POSTGRES_DATABASE:-}

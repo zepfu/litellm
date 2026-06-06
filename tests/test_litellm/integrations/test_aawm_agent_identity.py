@@ -8424,6 +8424,11 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
         lambda: 42.0,
     )
     monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_statement_cache_size",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
         aawm_agent_identity.importlib,
         "import_module",
         lambda name: FakeAsyncpg() if name == "asyncpg" else None,
@@ -8437,6 +8442,7 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
     assert len(create_pool_calls) == 1
     assert create_pool_calls[0]["max_size"] == 3
     assert create_pool_calls[0]["command_timeout"] == 42.0
+    assert create_pool_calls[0]["statement_cache_size"] == 0
 
     await aawm_agent_identity._close_aawm_session_history_pools_for_current_loop()
     created_pool.close.assert_awaited_once()
@@ -8458,6 +8464,62 @@ def test_session_history_command_timeout_should_default_and_parse_secret(monkeyp
     )
 
     assert aawm_agent_identity._get_session_history_command_timeout_seconds() == 90.5
+
+
+def test_session_history_dsn_should_append_application_name(monkeypatch) -> None:
+    values = {
+        "AAWM_DATABASE_URL": (
+            "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
+            "?sslmode=disable"
+        ),
+        "AAWM_SESSION_HISTORY_DB_APPLICATION_NAME": "aawm-litellm-test",
+    }
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: values.get(key),
+    )
+
+    assert aawm_agent_identity._build_session_history_dsn() == (
+        "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
+        "?sslmode=disable&application_name=aawm-litellm-test"
+    )
+
+
+def test_session_history_dsn_should_preserve_existing_application_name(monkeypatch) -> None:
+    values = {
+        "AAWM_DATABASE_URL": (
+            "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
+            "?application_name=custom-app"
+        ),
+        "AAWM_SESSION_HISTORY_DB_APPLICATION_NAME": "ignored-app",
+    }
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: values.get(key),
+    )
+
+    assert aawm_agent_identity._build_session_history_dsn() == (
+        "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
+        "?application_name=custom-app"
+    )
+
+
+def test_session_history_statement_cache_size_should_default_and_parse_secret(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", lambda key: None)
+
+    assert aawm_agent_identity._get_session_history_statement_cache_size() == 0
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: "8" if key == "AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE" else None,
+    )
+
+    assert aawm_agent_identity._get_session_history_statement_cache_size() == 8
 
 
 def test_enqueue_session_history_record_should_bound_overflow_flushers(monkeypatch) -> None:

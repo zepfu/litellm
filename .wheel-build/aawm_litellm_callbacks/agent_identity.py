@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union, cast
-from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
 try:
@@ -120,6 +120,12 @@ _AAWM_DB_URL_ENV_VARS = (
     "AAWM_DB_URL",
     "AAWM_DATABASE_URL",
     "AAWM_POSTGRES_URL",
+)
+_AAWM_DB_APPLICATION_NAME_ENV_VARS = (
+    "AAWM_SESSION_HISTORY_DB_APPLICATION_NAME",
+    "AAWM_DB_APPLICATION_NAME",
+    "AAWM_POSTGRES_APPLICATION_NAME",
+    "PGAPPNAME",
 )
 _AAWM_LITELLM_ENVIRONMENT_ENV_VARS = (
     "AAWM_LITELLM_ENVIRONMENT",
@@ -2325,6 +2331,8 @@ _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
 _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS = 0.1
 _AAWM_SESSION_HISTORY_POOL_MAX_SIZE = 2
 _AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS = 60.0
+_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE = 0
+_AAWM_SESSION_HISTORY_APPLICATION_NAME = "aawm-litellm-session-history"
 _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
 _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS = 1.0
 _aawm_session_history_schema_ready = False
@@ -2374,6 +2382,15 @@ def _get_session_history_command_timeout_seconds() -> float:
     except (TypeError, ValueError):
         parsed_value = _AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS
     return max(1.0, parsed_value)
+
+
+def _get_session_history_statement_cache_size() -> int:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE") or ""
+    try:
+        parsed_value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE
+    return max(0, parsed_value)
 
 
 def _get_session_history_failed_flush_retry_seconds() -> float:
@@ -2689,6 +2706,49 @@ def _build_aawm_dsn() -> Optional[str]:
         return dsn
 
     return _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
+
+
+def _append_aawm_dsn_query_params(
+    dsn: str,
+    params: Dict[str, Optional[str]],
+) -> str:
+    parsed = urlsplit(dsn)
+    if not parsed.scheme:
+        return dsn
+
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    existing_keys = {key for key, _value in query_items}
+    for key, value in params.items():
+        cleaned_value = _clean_secret_string(value)
+        if cleaned_value and key not in existing_keys:
+            query_items.append((key, cleaned_value))
+            existing_keys.add(key)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(query_items),
+            parsed.fragment,
+        )
+    )
+
+
+def _get_session_history_application_name() -> str:
+    return (
+        _get_first_secret_value(_AAWM_DB_APPLICATION_NAME_ENV_VARS)
+        or _AAWM_SESSION_HISTORY_APPLICATION_NAME
+    )
+
+
+def _build_session_history_dsn() -> Optional[str]:
+    dsn = _build_aawm_dsn()
+    if not dsn:
+        return None
+    return _append_aawm_dsn_query_params(
+        dsn,
+        {"application_name": _get_session_history_application_name()},
+    )
 
 
 def _clean_non_empty_string(value: Any) -> Optional[str]:
@@ -14890,7 +14950,7 @@ def _build_session_history_record(  # noqa: PLR0915
 
 
 async def _open_aawm_session_history_connection() -> Any:
-    dsn = _build_aawm_dsn()
+    dsn = _build_session_history_dsn()
     if not dsn:
         raise RuntimeError("AAWM session history database configuration is missing")
 
@@ -14904,11 +14964,12 @@ async def _open_aawm_session_history_connection() -> Any:
     return await asyncpg.connect(
         dsn=dsn,
         command_timeout=_get_session_history_command_timeout_seconds(),
+        statement_cache_size=_get_session_history_statement_cache_size(),
     )
 
 
 async def _get_aawm_session_history_pool() -> Any:
-    dsn = _build_aawm_dsn()
+    dsn = _build_session_history_dsn()
     if not dsn:
         raise RuntimeError("AAWM session history database configuration is missing")
 
@@ -14931,6 +14992,7 @@ async def _get_aawm_session_history_pool() -> Any:
         min_size=0,
         max_size=_get_session_history_pool_max_size(),
         command_timeout=_get_session_history_command_timeout_seconds(),
+        statement_cache_size=_get_session_history_statement_cache_size(),
     )
     with _aawm_session_history_pool_lock:
         existing_pool = _aawm_session_history_pools.get(pool_key)
