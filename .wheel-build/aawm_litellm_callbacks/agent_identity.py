@@ -2058,6 +2058,14 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "usage_terminal_completion_score",
     "usage_discovery_inventory_coverage_score",
     "usage_discovery_inventory_missing_count",
+    "usage_output_contract_required_final_phrase",
+    "usage_output_contract_required_final_phrase_present",
+    "usage_output_contract_required_final_phrase_source",
+    "usage_output_contract_failure_class",
+    "usage_output_contract_failure_count",
+    "usage_output_contract_setup_only_detected",
+    "usage_output_contract_setup_only_markers",
+    "usage_output_contract_final_text_chars",
     "usage_agent_score_reasons",
     "usage_agent_score_source",
     "gemini_user_prompt_id",
@@ -2202,6 +2210,22 @@ _SESSION_HISTORY_AGENT_SCORE_INT_FIELDS = (
     "sleep_wellness_interruption_after_user_pushback_count",
     "sleep_wellness_interruption_repeated_count",
     "discovery_inventory_missing_count",
+)
+_SESSION_HISTORY_OUTPUT_CONTRACT_STRING_FIELDS = (
+    "output_contract_required_final_phrase",
+    "output_contract_required_final_phrase_source",
+    "output_contract_failure_class",
+)
+_SESSION_HISTORY_OUTPUT_CONTRACT_BOOL_FIELDS = (
+    "output_contract_required_final_phrase_present",
+    "output_contract_setup_only_detected",
+)
+_SESSION_HISTORY_OUTPUT_CONTRACT_INT_FIELDS = (
+    "output_contract_failure_count",
+    "output_contract_final_text_chars",
+)
+_SESSION_HISTORY_OUTPUT_CONTRACT_JSON_FIELDS = (
+    "output_contract_setup_only_markers",
 )
 _PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v2"
 _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH = 16
@@ -11389,6 +11413,38 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:  # no
         else:
             metadata[metadata_key] = int_value
 
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_STRING_FIELDS:
+        value = _clean_non_empty_string(record.get(field))
+        metadata_key = f"usage_{field}"
+        if value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = value
+
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_BOOL_FIELDS:
+        bool_value = _optional_metadata_bool(record.get(field))
+        metadata_key = f"usage_{field}"
+        if bool_value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = bool_value
+
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_INT_FIELDS:
+        int_value = _safe_int(record.get(field))
+        metadata_key = f"usage_{field}"
+        if int_value is None:
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = int_value
+
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_JSON_FIELDS:
+        value = record.get(field)
+        metadata_key = f"usage_{field}"
+        if value in (None, [], {}):
+            metadata.pop(metadata_key, None)
+        else:
+            metadata[metadata_key] = _json_safe_rate_limit_value(value)
+
     agent_score_reasons = _normalize_agent_score_reasons(
         record.get("agent_score_reasons")
     )
@@ -11833,6 +11889,35 @@ def _normalize_agent_score_state_on_record(record: Dict[str, Any]) -> None:
             _safe_int(metadata.get(field)),
         )
         record[field] = value if value is not None and value >= 0 else None
+
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_STRING_FIELDS:
+        record[field] = _first_non_empty_string(
+            record.get(field),
+            metadata.get(f"usage_{field}"),
+            metadata.get(field),
+        )
+
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_BOOL_FIELDS:
+        record[field] = _first_non_none(
+            _optional_metadata_bool(record.get(field)),
+            _optional_metadata_bool(metadata.get(f"usage_{field}")),
+            _optional_metadata_bool(metadata.get(field)),
+        )
+
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_INT_FIELDS:
+        value = _first_non_none(
+            _safe_int(record.get(field)),
+            _safe_int(metadata.get(f"usage_{field}")),
+            _safe_int(metadata.get(field)),
+        )
+        record[field] = value if value is not None and value >= 0 else None
+
+    for field in _SESSION_HISTORY_OUTPUT_CONTRACT_JSON_FIELDS:
+        record[field] = _first_non_none(
+            record.get(field),
+            metadata.get(f"usage_{field}"),
+            metadata.get(field),
+        )
 
     metadata_reasons = _normalize_agent_score_reasons(
         _first_non_none(

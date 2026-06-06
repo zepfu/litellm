@@ -62,6 +62,59 @@ _DISCOVERY_ACCOUNTING_MARKERS = (
     "omitted",
     "unavailable",
 )
+_OUTPUT_CONTRACT_TASK_MARKERS = (
+    "read-only task",
+    "read only task",
+    "do not edit files",
+    "do not modify files",
+    "no files were modified",
+    "read-only audit",
+    "readonly audit",
+    "scout",
+    "audit",
+    "inspect",
+)
+_OUTPUT_CONTRACT_SETUP_PREFIXES = (
+    "i will ",
+    "i'll ",
+    "i am going to ",
+    "i'm going to ",
+    "i plan to ",
+    "plan:",
+    "next i will ",
+    "next i'll ",
+)
+_OUTPUT_CONTRACT_SETUP_MARKERS = (
+    "i will inspect",
+    "i'll inspect",
+    "i will review",
+    "i'll review",
+    "i will audit",
+    "i'll audit",
+    "i will check",
+    "i'll check",
+    "i will look",
+    "i'll look",
+    "i am going to inspect",
+    "i'm going to inspect",
+    "i am going to review",
+    "i'm going to review",
+)
+_OUTPUT_CONTRACT_COMPLETION_MARKERS = (
+    "found",
+    "inspected",
+    "verified",
+    "confirmed",
+    "evidence",
+    "recommend",
+    "result",
+    "passed",
+    "failed",
+    "issue",
+    "line ",
+    ".py",
+    ".md",
+)
 _DISCOVERY_PATH_RE = re.compile(
     r"(?<![\w@:/.-])(?:\./|\.\./|/|[A-Za-z0-9_.-]+/)"
     r"[A-Za-z0-9_./{}@%+=,:~#-]*[A-Za-z0-9_./{}@%+=~#-]"
@@ -163,7 +216,10 @@ def _phrase_list(value: Any, *, max_count: int, max_chars: int) -> List[str]:
 def _validate_catalog(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("catalog root must be an object")
-    raw_limits = raw.get("limits") if isinstance(raw.get("limits"), dict) else {}
+    raw_limits_value = raw.get("limits")
+    raw_limits: Dict[str, Any] = (
+        raw_limits_value if isinstance(raw_limits_value, dict) else {}
+    )
     limits = {
         "max_file_bytes": _int_limit(
             raw_limits.get("max_file_bytes"),
@@ -336,6 +392,125 @@ def _joined_text(values: Iterable[str], *, max_bytes: int) -> str:
         if remaining <= 0:
             break
     return "\n".join(parts).lower()
+
+
+def _joined_text_preserve_case(values: Iterable[str], *, max_bytes: int) -> str:
+    parts: List[str] = []
+    remaining = max_bytes
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        clipped = _clip_text(value, remaining)
+        if clipped:
+            parts.append(clipped)
+            remaining -= len(clipped.encode("utf-8", errors="ignore"))
+        if remaining <= 0:
+            break
+    return "\n".join(parts)
+
+
+def _normalize_contract_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _last_non_empty_text(values: Sequence[str]) -> str:
+    for value in reversed(values):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _extract_required_final_phrase(user_text: str) -> Tuple[Optional[str], Optional[str]]:
+    if not user_text:
+        return None, None
+    patterns = (
+        (
+            "final_answer_must_include",
+            r"(?:final answer|final response|final output)[^\n]{0,100}"
+            r"must[^\n]{0,80}include[^\n]{0,30}([\"'`])(?P<phrase>[^\"'`\n]{1,180})\1",
+        ),
+        (
+            "must_include_exact_phrase",
+            r"must[^\n]{0,80}include[^\n]{0,30}(?:exact phrase|phrase)?"
+            r"[^\n]{0,20}([\"'`])(?P<phrase>[^\"'`\n]{1,180})\1",
+        ),
+    )
+    for source, pattern in patterns:
+        match = re.search(pattern, user_text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        phrase = (match.group("phrase") or "").strip()
+        if phrase:
+            return phrase, source
+    return None, None
+
+
+def _contract_phrase_present(final_text: str, phrase: str) -> bool:
+    normalized_final = _normalize_contract_text(final_text)
+    normalized_phrase = _normalize_contract_text(phrase)
+    return bool(normalized_phrase and normalized_phrase in normalized_final)
+
+
+def _setup_only_markers(final_text: str, user_text: str) -> List[str]:
+    normalized_final = _normalize_contract_text(final_text)
+    if not normalized_final or len(normalized_final) > 500:
+        return []
+    normalized_user = _normalize_contract_text(user_text)
+    if not any(marker in normalized_user for marker in _OUTPUT_CONTRACT_TASK_MARKERS):
+        return []
+    if any(marker in normalized_final for marker in _OUTPUT_CONTRACT_COMPLETION_MARKERS):
+        return []
+
+    markers: List[str] = []
+    for prefix in _OUTPUT_CONTRACT_SETUP_PREFIXES:
+        if normalized_final.startswith(prefix):
+            markers.append(prefix.strip())
+    for marker in _OUTPUT_CONTRACT_SETUP_MARKERS:
+        if marker in normalized_final:
+            markers.append(marker)
+    return sorted(set(markers))
+
+
+def _score_output_contract(
+    *,
+    user_text: str,
+    assistant_texts: Sequence[str],
+) -> Dict[str, Any]:
+    final_text = _last_non_empty_text(assistant_texts)
+    required_phrase, required_phrase_source = _extract_required_final_phrase(user_text)
+    required_phrase_present: Optional[bool] = None
+    if required_phrase is not None:
+        required_phrase_present = _contract_phrase_present(final_text, required_phrase)
+
+    setup_markers = _setup_only_markers(final_text, user_text)
+    failure_class: Optional[str] = None
+    if required_phrase_present is False:
+        failure_class = "missing_required_final_phrase"
+    if setup_markers:
+        failure_class = "setup_only_completion"
+
+    contract_observed = required_phrase is not None or bool(setup_markers)
+    compliance_score: Optional[float] = None
+    if contract_observed:
+        compliance_score = 0.0 if failure_class else 1.0
+
+    return {
+        "output_contract_compliance_score": compliance_score,
+        "output_contract_required_final_phrase": required_phrase,
+        "output_contract_required_final_phrase_present": required_phrase_present,
+        "output_contract_required_final_phrase_source": required_phrase_source,
+        "output_contract_failure_class": failure_class,
+        "output_contract_failure_count": (
+            1 if failure_class else 0 if contract_observed else None
+        ),
+        "output_contract_setup_only_detected": (
+            bool(setup_markers) if contract_observed else None
+        ),
+        "output_contract_setup_only_markers": setup_markers,
+        "output_contract_final_text_chars": (
+            len(final_text) if contract_observed else None
+        ),
+    }
 
 
 def _matched_phrases(text: str, phrases: Sequence[str]) -> List[str]:
@@ -850,7 +1025,8 @@ def score_agent_quality_context(
         for command in commands[:max_commands]
         if command.command
     ]
-    user_text = _joined_text(user_texts, max_bytes=max_text_bytes)
+    raw_user_text = _joined_text_preserve_case(user_texts, max_bytes=max_text_bytes)
+    user_text = raw_user_text.lower()
     assistant_text = _joined_text(assistant_texts, max_bytes=max_text_bytes)
     tool_text = _joined_text(tool_result_texts, max_bytes=max_text_bytes)
 
@@ -882,13 +1058,34 @@ def score_agent_quality_context(
         tool_text=tool_text,
         commands=clipped_commands,
     )
+    output_contract = _score_output_contract(
+        user_text=raw_user_text,
+        assistant_texts=assistant_texts,
+    )
     fields: Dict[str, Any] = {}
     fields.update(ignored)
-    fields.update({key: value for key, value in baseline.items() if not key.endswith("_reasons")})
-    fields.update({key: value for key, value in sleep.items() if not key.endswith("_reasons")})
+    fields.update(
+        {
+            key: value
+            for key, value in baseline.items()
+            if not key.endswith("_reasons")
+        }
+    )
+    fields.update(
+        {
+            key: value
+            for key, value in sleep.items()
+            if not key.endswith("_reasons")
+        }
+    )
     fields.update(
         {key: value for key, value in discovery.items() if not key.endswith("_reasons")}
     )
+    fields.update(output_contract)
+    output_contract_reasons: List[str] = []
+    failure_class = output_contract.get("output_contract_failure_class")
+    if isinstance(failure_class, str) and failure_class:
+        output_contract_reasons.append(failure_class)
     reasons = {
         "ignored_path_tracking_policy": (
             ["forced_tracking_ignored_path"]
@@ -908,6 +1105,14 @@ def score_agent_quality_context(
         "discovery_inventory_evidence": discovery[
             "discovery_inventory_evidence"
         ],
+        "output_contract_compliance": output_contract_reasons,
+        "output_contract_evidence": {
+            key: value
+            for key, value in output_contract.items()
+            if value is not None
+            and value != []
+            and key != "output_contract_compliance_score"
+        },
         "agent_quality_rule_catalog_version": catalog.get("version"),
     }
     return AgentQualityRuleResult(fields=fields, reasons=reasons)

@@ -2582,6 +2582,77 @@ def test_build_session_history_record_persists_agent_score_metadata() -> None:  
     }
 
 
+def test_build_session_history_record_persists_output_contract_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-output-contract-metadata"
+    kwargs["litellm_params"]["metadata"].update(
+        {"session_id": "session-output-contract-metadata"}
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
+        {
+            "role": "user",
+            "content": (
+                "Read-only task. Do not edit files.\n\n"
+                'Your final answer must truthfully include: "No files were modified."'
+            ),
+        }
+    ]
+    result = {
+        "id": "resp-output-contract-metadata",
+        "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Inspected the callback path and found the hook.",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["output_contract_compliance_score"] == pytest.approx(0.0)
+    assert (
+        record["output_contract_required_final_phrase"]
+        == "No files were modified."
+    )
+    assert record["output_contract_required_final_phrase_present"] is False
+    assert record["output_contract_failure_class"] == "missing_required_final_phrase"
+    assert record["output_contract_failure_count"] == 1
+    assert record["agent_score_reasons"]["output_contract_compliance"] == [
+        "missing_required_final_phrase"
+    ]
+
+    payload_metadata = record["metadata"]
+    assert (
+        payload_metadata["usage_output_contract_required_final_phrase"]
+        == "No files were modified."
+    )
+    assert (
+        payload_metadata["usage_output_contract_required_final_phrase_present"]
+        is False
+    )
+    assert (
+        payload_metadata["usage_output_contract_failure_class"]
+        == "missing_required_final_phrase"
+    )
+    assert payload_metadata["usage_output_contract_failure_count"] == 1
+    assert (
+        payload_metadata["usage_agent_score_reasons"]["output_contract_compliance"]
+        == ["missing_required_final_phrase"]
+    )
+
+
 def test_build_session_history_record_scores_runtime_ignored_path_tracking() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"
