@@ -31,9 +31,11 @@ import ipaddress
 import importlib
 import json
 import math
+import os
 import queue
 import re
 import shlex
+import tempfile
 import threading
 import time
 import warnings
@@ -2482,6 +2484,10 @@ _AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE = 0
 _AAWM_SESSION_HISTORY_APPLICATION_NAME = "aawm-litellm-session-history"
 _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
 _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS = 1.0
+_AAWM_SESSION_HISTORY_SPOOL_DIR_ENV = "AAWM_SESSION_HISTORY_SPOOL_DIR"
+_AAWM_SESSION_HISTORY_SPOOL_DIR_NAME = "aawm-session-history-spool"
+_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER = "__aawm_datetime__"
+_AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME = "aawm-session-history-spool-drainer"
 _aawm_session_history_schema_ready = False
 _aawm_session_history_schema_lock = threading.Lock()
 _aawm_session_history_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=1024)
@@ -2492,6 +2498,9 @@ _aawm_session_history_pools: Dict[Tuple[Any, str], Any] = {}
 _aawm_session_history_overflow_flush_semaphore = threading.BoundedSemaphore(
     value=_AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS
 )
+_aawm_session_history_spool_drainer: Optional[threading.Thread] = None
+_aawm_session_history_spool_drainer_lock = threading.Lock()
+_aawm_session_history_spool_drain_lock = threading.Lock()
 
 
 def _get_session_history_batch_size() -> int:
@@ -2549,6 +2558,14 @@ def _get_session_history_failed_flush_retry_seconds() -> float:
     return max(0.1, parsed_value)
 
 
+def _get_session_history_spool_dir() -> str:
+    configured = get_secret_str(_AAWM_SESSION_HISTORY_SPOOL_DIR_ENV) or ""
+    configured_path = str(configured).strip()
+    if configured_path:
+        return configured_path
+    return os.path.join(tempfile.gettempdir(), _AAWM_SESSION_HISTORY_SPOOL_DIR_NAME)
+
+
 def _session_history_queue_depth_summary() -> str:
     queue_size: Union[int, str]
     try:
@@ -2557,6 +2574,217 @@ def _session_history_queue_depth_summary() -> str:
         queue_size = "unknown"
     max_size = getattr(_aawm_session_history_queue, "maxsize", "unknown")
     return f"queue_depth={queue_size}/{max_size}"
+
+
+def _session_history_spool_paths() -> List[str]:
+    spool_dir = _get_session_history_spool_dir()
+    try:
+        names = os.listdir(spool_dir)
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        verbose_logger.warning(
+            "AawmAgentIdentity: unable to list session_history spool directory "
+            "%s: %s",
+            spool_dir,
+            _format_exception_for_warning(exc),
+        )
+        return []
+    return sorted(
+        os.path.join(spool_dir, name)
+        for name in names
+        if name.endswith(".json")
+    )
+
+
+def _session_history_spool_summary(paths: Optional[List[str]] = None) -> str:
+    if paths is None:
+        paths = _session_history_spool_paths()
+    if not paths:
+        return "spool_pending=0"
+
+    oldest_mtime: Optional[float] = None
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        oldest_mtime = mtime if oldest_mtime is None else min(oldest_mtime, mtime)
+
+    if oldest_mtime is None:
+        return f"spool_pending={len(paths)}, oldest_pending_age_s=unknown"
+    oldest_age = max(0.0, time.time() - oldest_mtime)
+    return f"spool_pending={len(paths)}, oldest_pending_age_s={oldest_age:.1f}"
+
+
+def _encode_session_history_spool_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return {_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER: value.isoformat()}
+    if isinstance(value, dict):
+        return {
+            str(key): _encode_session_history_spool_value(nested_value)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_encode_session_history_spool_value(item) for item in value]
+    return value
+
+
+def _decode_session_history_spool_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if set(value) == {_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER}:
+            raw_datetime = value.get(_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER)
+            if isinstance(raw_datetime, str):
+                try:
+                    return datetime.fromisoformat(raw_datetime.replace("Z", "+00:00"))
+                except ValueError:
+                    return raw_datetime
+        return {
+            key: _decode_session_history_spool_value(nested_value)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_decode_session_history_spool_value(item) for item in value]
+    return value
+
+
+def _load_session_history_spool_record(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as spool_file:
+        payload = json.load(spool_file)
+    if not isinstance(payload, dict):
+        raise ValueError("session_history spool payload is not a JSON object")
+    record = payload.get("record")
+    if not isinstance(record, dict):
+        raise ValueError("session_history spool payload does not contain a record")
+    return cast(Dict[str, Any], _decode_session_history_spool_value(record))
+
+
+def _session_history_spool_bad_record(path: str, exc: Exception) -> None:
+    bad_path = f"{path}.bad"
+    try:
+        os.replace(path, bad_path)
+    except OSError:
+        pass
+    verbose_logger.exception(
+        "AawmAgentIdentity: moved unreadable session_history spool record to "
+        "%s: %s",
+        bad_path,
+        _format_exception_for_warning(exc),
+    )
+
+
+def _session_history_spool_drainer_main() -> None:
+    if not _aawm_session_history_spool_drain_lock.acquire(blocking=False):
+        return
+    try:
+        batch_size = _get_session_history_batch_size()
+        while True:
+            paths = _session_history_spool_paths()
+            if not paths:
+                return
+
+            batch_paths = paths[:batch_size]
+            batch: List[Dict[str, Any]] = []
+            kept_paths: List[str] = []
+            for path in batch_paths:
+                try:
+                    batch.append(_load_session_history_spool_record(path))
+                    kept_paths.append(path)
+                except Exception as exc:
+                    _session_history_spool_bad_record(path, exc)
+
+            if not batch:
+                continue
+
+            if not _flush_session_history_batch(batch):
+                verbose_logger.warning(
+                    "AawmAgentIdentity: session_history spool drain failed "
+                    "(batch_size=%d, %s)",
+                    len(batch),
+                    _session_history_spool_summary(paths),
+                )
+                return
+
+            removed = 0
+            for path in kept_paths:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    verbose_logger.warning(
+                        "AawmAgentIdentity: failed to remove drained "
+                        "session_history spool record %s: %s",
+                        path,
+                        _format_exception_for_warning(exc),
+                    )
+            verbose_logger.warning(
+                "AawmAgentIdentity: drained %d spooled session_history records "
+                "(%s)",
+                removed,
+                _session_history_spool_summary(),
+            )
+    finally:
+        _aawm_session_history_spool_drain_lock.release()
+
+
+def _ensure_session_history_spool_drainer_started() -> None:
+    global _aawm_session_history_spool_drainer
+
+    if (
+        _aawm_session_history_spool_drainer is not None
+        and _aawm_session_history_spool_drainer.is_alive()
+    ):
+        return
+
+    if not _session_history_spool_paths():
+        return
+
+    with _aawm_session_history_spool_drainer_lock:
+        if (
+            _aawm_session_history_spool_drainer is not None
+            and _aawm_session_history_spool_drainer.is_alive()
+        ):
+            return
+        _aawm_session_history_spool_drainer = threading.Thread(
+            target=_session_history_spool_drainer_main,
+            name=_AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME,
+            daemon=True,
+        )
+        _aawm_session_history_spool_drainer.start()
+
+
+def _spool_session_history_record(record: Dict[str, Any]) -> None:
+    spool_dir = _get_session_history_spool_dir()
+    os.makedirs(spool_dir, exist_ok=True)
+    identity = str(
+        record.get("litellm_call_id")
+        or record.get("session_id")
+        or record.get("trace_id")
+        or "record"
+    )
+    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    filename = f"{time.time_ns()}-{threading.get_ident()}-{digest}.json"
+    final_path = os.path.join(spool_dir, filename)
+    tmp_path = f"{final_path}.tmp"
+    payload = {
+        "spooled_at": datetime.now(timezone.utc),
+        "record": record,
+    }
+    encoded_payload = _encode_session_history_spool_value(payload)
+    with open(tmp_path, "w", encoding="utf-8") as spool_file:
+        json.dump(encoded_payload, spool_file, separators=(",", ":"), sort_keys=True)
+        spool_file.write("\n")
+    os.replace(tmp_path, final_path)
+    verbose_logger.warning(
+        "AawmAgentIdentity: spooled session_history record for retry "
+        "(path=%s, %s, %s)",
+        final_path,
+        _session_history_queue_depth_summary(),
+        _session_history_spool_summary(),
+    )
+    _ensure_session_history_spool_drainer_started()
 
 
 async def _close_aawm_session_history_pools_for_current_loop() -> None:
@@ -2609,6 +2837,8 @@ def _flush_session_history_batch(
         (time.perf_counter() - started_at) * 1000.0,
         _session_history_queue_depth_summary(),
     )
+    if threading.current_thread().name != _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME:
+        _ensure_session_history_spool_drainer_started()
     return True
 
 
@@ -2748,9 +2978,21 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
 
             verbose_logger.warning(
                 "AawmAgentIdentity: session_history queue full and overflow flusher "
-                "busy; dropping overflow record (%s)",
+                "busy; spooling overflow record for retry (%s)",
                 _session_history_queue_depth_summary(),
             )
+            try:
+                _spool_session_history_record(record)
+            except Exception as exc:
+                verbose_logger.exception(
+                    "AawmAgentIdentity: failed to spool session_history overflow "
+                    "record; flushing inline with retry: %s",
+                    _format_exception_for_warning(exc),
+                )
+                _flush_session_history_batch_with_retry(
+                    [record],
+                    retry_message="inline session_history overflow after spool failure",
+                )
             return
 
         verbose_logger.warning(

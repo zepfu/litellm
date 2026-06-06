@@ -8803,6 +8803,7 @@ def test_enqueue_session_history_record_should_bound_overflow_flushers(monkeypat
             raise aawm_agent_identity.queue.Full
 
     started_threads = []
+    spooled_records = []
 
     class FakeThread:
         def __init__(self, target, args, name, daemon):
@@ -8826,12 +8827,18 @@ def test_enqueue_session_history_record_should_bound_overflow_flushers(monkeypat
         aawm_agent_identity.threading.BoundedSemaphore(value=1),
     )
     monkeypatch.setattr(aawm_agent_identity.threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_spool_session_history_record",
+        lambda record: spooled_records.append(record),
+    )
 
     aawm_agent_identity._enqueue_session_history_record({"litellm_call_id": "call-1"})
     aawm_agent_identity._enqueue_session_history_record({"litellm_call_id": "call-2"})
 
     assert len(started_threads) == 1
     assert started_threads[0].name == "aawm-session-history-overflow"
+    assert spooled_records == [{"litellm_call_id": "call-2"}]
 
 
 def test_enqueue_session_history_record_releases_overflow_semaphore_when_thread_start_fails(
@@ -8988,6 +8995,161 @@ def test_enqueue_session_history_record_retries_queue_when_overflow_busy(monkeyp
 
     assert started_threads == []
     assert queue.records[-1][0] == {"litellm_call_id": "call-1"}
+
+
+def test_enqueue_session_history_record_spools_when_queue_and_overflow_are_busy(
+    monkeypatch,
+) -> None:
+    class AlwaysFullQueue:
+        def put(self, record, timeout):
+            raise aawm_agent_identity.queue.Full
+
+    semaphore = aawm_agent_identity.threading.BoundedSemaphore(value=1)
+    semaphore.acquire()
+    spooled_records = []
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_overflow_flush_semaphore",
+        semaphore,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_spool_session_history_record",
+        lambda record: spooled_records.append(record),
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    record = {"litellm_call_id": "call-spooled"}
+    aawm_agent_identity._enqueue_session_history_record(record)
+
+    assert spooled_records == [record]
+    warning_mock.assert_any_call(
+        "AawmAgentIdentity: session_history queue full and overflow flusher "
+        "busy; spooling overflow record for retry (%s)",
+        "queue_depth=unknown/unknown",
+    )
+
+
+def test_session_history_spool_round_trips_event_timestamps_and_quota_only_record(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    start_time = datetime(2026, 6, 6, 16, 1, tzinfo=timezone.utc)
+    observed_at = datetime(2026, 6, 6, 16, 2, tzinfo=timezone.utc)
+    record = {
+        "_skip_session_history": True,
+        "litellm_call_id": "call-quota-only",
+        "session_id": "session-quota-only",
+        "start_time": start_time,
+        "rate_limit_observations": [
+            {
+                "observed_at": observed_at,
+                "provider": "anthropic",
+                "limit_key": "anthropic:claude",
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+
+    aawm_agent_identity._spool_session_history_record(record)
+
+    paths = aawm_agent_identity._session_history_spool_paths()
+    assert len(paths) == 1
+    loaded = aawm_agent_identity._load_session_history_spool_record(paths[0])
+    assert loaded["_skip_session_history"] is True
+    assert loaded["litellm_call_id"] == "call-quota-only"
+    assert loaded["session_id"] == "session-quota-only"
+    assert loaded["start_time"] == start_time
+    assert loaded["rate_limit_observations"][0]["observed_at"] == observed_at
+
+
+def test_session_history_spool_drainer_flushes_and_removes_records(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    record = {
+        "litellm_call_id": "call-spool-drain",
+        "start_time": datetime(2026, 6, 6, 16, 3, tzinfo=timezone.utc),
+    }
+    flushed_batches = []
+
+    def flush_success(batch):
+        flushed_batches.append(batch)
+        return True
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        flush_success,
+    )
+
+    aawm_agent_identity._spool_session_history_record(record)
+    aawm_agent_identity._session_history_spool_drainer_main()
+
+    assert flushed_batches == [[record]]
+    assert aawm_agent_identity._session_history_spool_paths() == []
+
+
+def test_session_history_spool_drainer_keeps_records_when_flush_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    record = {"litellm_call_id": "call-spool-kept"}
+    flush_attempts = []
+
+    def flush_failure(batch):
+        flush_attempts.append(batch)
+        return False
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        flush_failure,
+    )
+
+    aawm_agent_identity._spool_session_history_record(record)
+    aawm_agent_identity._session_history_spool_drainer_main()
+
+    assert flush_attempts == [[record]]
+    assert len(aawm_agent_identity._session_history_spool_paths()) == 1
 
 
 def test_shutdown_session_history_worker_waits_for_queue_space(monkeypatch) -> None:
