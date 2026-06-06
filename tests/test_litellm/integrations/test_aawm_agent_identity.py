@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -59,6 +60,11 @@ class _FakePool:
         acquire_context = _FakePoolAcquire(self.conn)
         self.acquire_contexts.append(acquire_context)
         return acquire_context
+
+
+class _RateLimitError(RuntimeError):
+    status_code: int
+    headers: dict[str, str]
 
 
 def _assert_no_postgres_nul_bytes(value) -> None:
@@ -5204,7 +5210,7 @@ def test_build_session_history_record_tracks_git_global_option_commit_and_push()
 
 
 def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
-    record = {
+    record: dict[str, Any] = {
         "litellm_call_id": "call-zero-reasoning-payload",
         "session_id": "session-zero-reasoning-payload",
         "trace_id": "trace-zero-reasoning-payload",
@@ -6083,7 +6089,7 @@ def test_build_session_history_record_marks_openrouter_provider_cache_miss_from_
 async def test_async_logging_hook_handles_recursive_openrouter_request_body() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
-    request_body = {
+    request_body: dict[str, Any] = {
         "model": "openrouter/inclusionai/ling-2.6-flash",
         "messages": [{"role": "user", "content": "Reply with ok."}],
     }
@@ -6130,7 +6136,7 @@ async def test_async_logging_hook_handles_recursive_openrouter_request_body() ->
 
 def test_build_session_history_record_handles_recursive_openrouter_request_body() -> None:
     kwargs = _base_kwargs()
-    request_body = {
+    request_body: dict[str, Any] = {
         "model": "openrouter/inclusionai/ling-2.6-flash",
         "messages": [{"role": "user", "content": "Reply with ok."}],
     }
@@ -7274,7 +7280,7 @@ def test_build_rate_limit_observations_extracts_anthropic_exception_headers() ->
             "client_name": "claude-cli",
         }
     )
-    result = RuntimeError("anthropic upstream failed")
+    result = _RateLimitError("anthropic upstream failed")
     result.headers = {
         "llm_provider-anthropic-ratelimit-requests-limit": "2000",
         "llm_provider-anthropic-ratelimit-requests-remaining": "1500",
@@ -7977,7 +7983,7 @@ def test_build_rate_limit_observations_extracts_openrouter_free_429() -> None:
         "model": "openrouter/deepseek/deepseek-v4-flash:free",
         "input": "hello",
     }
-    error = RuntimeError("OpenRouter free model daily rate limit reached")
+    error = _RateLimitError("OpenRouter free model daily rate limit reached")
     error.status_code = 429
     error.headers = {"retry-after": "120"}
     end_time = datetime(2026, 5, 17, 23, 58, tzinfo=timezone.utc)
@@ -9749,13 +9755,13 @@ def test_d1_169_backfill_langfuse_marks_codex_compact_and_resume_context() -> No
 
 
 def test_d1_169_backfill_langfuse_marks_gemini_compact_and_verify_context() -> None:
-    trace = {
+    trace: dict[str, Any] = {
         "id": "trace-d1-169-gemini-compact",
         "name": "gemini",
         "sessionId": "4435b6f0-6090-47e6-8a6c-6b01be58fd3c",
         "environment": "prod",
     }
-    base_observation = {
+    base_observation: dict[str, Any] = {
         "traceId": "trace-d1-169-gemini-compact",
         "type": "GENERATION",
         "name": "litellm-pass_through_endpoint",
@@ -11541,6 +11547,8 @@ def test_derive_langfuse_trace_tags_from_langfuse_trace_merges_observation_metad
 
 @pytest.mark.asyncio
 async def test_persist_session_history_records_executes_batch_insert(monkeypatch) -> None:
+    start_time = datetime(2026, 6, 6, 15, 1, 2, tzinfo=timezone.utc)
+    end_time = datetime(2026, 6, 6, 15, 1, 5, tzinfo=timezone.utc)
     records = [
         {
             "litellm_call_id": "call-1",
@@ -11553,8 +11561,8 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
             "agent_name": "eyes",
             "tenant_id": "litellm",
             "call_type": "pass_through_endpoint",
-            "start_time": None,
-            "end_time": None,
+            "start_time": start_time,
+            "end_time": end_time,
             "input_tokens": 10,
             "output_tokens": 5,
             "total_tokens": 15,
@@ -11611,8 +11619,12 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
+    assert "    start_time,\n    created_at,\n    end_time," in history_args[0]
+    assert "$11, COALESCE($11, $12, NOW()), $12" in history_args[0]
     assert len(history_args[1][0]) == 125
     assert history_args[1][0][0] == "call-1"
+    assert history_args[1][0][10] == start_time
+    assert history_args[1][0][11] == end_time
     tool_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
     assert tool_args[1][0][0] == "call-1"
@@ -11625,7 +11637,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 async def test_persist_session_history_records_keeps_history_when_rate_limit_side_write_fails(
     monkeypatch,
 ) -> None:
-    records = [
+    records: list[dict[str, Any]] = [
         {
             "litellm_call_id": "call-side-write-fails",
             "session_id": "session-side-write-fails",
@@ -12026,6 +12038,17 @@ def test_session_history_insert_sql_includes_sensitive_config_change_flags() -> 
     assert "changed_env_file = CASE" in sql
     assert "AND EXCLUDED.changed_env_file IS NULL" in sql
     assert "THEN NULL" in sql
+
+
+def test_session_history_insert_sql_uses_start_time_as_created_at() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
+
+    assert "    start_time,\n    created_at,\n    end_time," in sql
+    assert "$11, COALESCE($11, $12, NOW()), $12" in sql
+    assert (
+        "created_at = LEAST(session_history.created_at, EXCLUDED.created_at)"
+        in sql
+    )
 
 
 def test_session_history_payload_preserves_unknown_sensitive_config_flags() -> None:

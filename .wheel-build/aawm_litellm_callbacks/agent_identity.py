@@ -898,6 +898,7 @@ INSERT INTO public.session_history (
     tenant_id,
     call_type,
     start_time,
+    created_at,
     end_time,
     input_tokens,
     output_tokens,
@@ -1014,7 +1015,7 @@ INSERT INTO public.session_history (
     compact_summary_role
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+    $11, COALESCE($11, $12, NOW()), $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
     $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44::jsonb, $45, $46, $47, $48, $49, $50, $51::jsonb, $52,
     $53, $54, $55, $56, $57, $58, $59, $60, $61,
@@ -1040,6 +1041,7 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history.agent_name),
     tenant_id = COALESCE(NULLIF(EXCLUDED.tenant_id, ''), session_history.tenant_id),
     call_type = COALESCE(NULLIF(EXCLUDED.call_type, ''), session_history.call_type),
+    created_at = LEAST(session_history.created_at, EXCLUDED.created_at),
     start_time = COALESCE(session_history.start_time, EXCLUDED.start_time),
     end_time = COALESCE(EXCLUDED.end_time, session_history.end_time),
     input_tokens = GREATEST(session_history.input_tokens, EXCLUDED.input_tokens),
