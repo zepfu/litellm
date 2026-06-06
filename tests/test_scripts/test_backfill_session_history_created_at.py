@@ -74,6 +74,21 @@ def test_should_record_trace_tag_patch_result_counts() -> None:
     assert stats.traces_missing == 1
 
 
+def test_should_prefer_direct_dsn_for_session_history_backfill(monkeypatch) -> None:
+    values = {
+        "AAWM_DIRECT_DATABASE_URL": "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore",
+        "AAWM_DATABASE_URL": "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
+    }
+    monkeypatch.setattr(backfill, "get_secret_str", lambda key: values.get(key))
+    monkeypatch.setattr(
+        backfill,
+        "_build_aawm_dsn",
+        lambda: values["AAWM_DATABASE_URL"],
+    )
+
+    assert backfill._build_aawm_admin_dsn() == values["AAWM_DIRECT_DATABASE_URL"]
+
+
 @pytest.mark.asyncio
 async def test_should_align_session_history_created_at_to_event_time(monkeypatch) -> None:
     mock_conn = AsyncMock()

@@ -25,7 +25,7 @@ from functools import lru_cache
 from importlib.resources import files
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional, Tuple, Union, cast
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
@@ -994,6 +994,13 @@ _AAWM_DB_URL_ENV_VARS = (
     "AAWM_DATABASE_URL",
     "AAWM_POSTGRES_URL",
 )
+_AAWM_DB_APPLICATION_NAME_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME",
+    "AAWM_DB_APPLICATION_NAME",
+    "AAWM_POSTGRES_APPLICATION_NAME",
+    "PGAPPNAME",
+)
+_AAWM_DYNAMIC_INJECTION_APPLICATION_NAME = "aawm-litellm-dynamic-injection"
 _aawm_dynamic_injection_pool: Optional[Any] = None
 _aawm_dynamic_injection_pool_lock = asyncio.Lock()
 _claude_context_replacement_template_cache: dict[Path, str] = {}
@@ -15399,6 +15406,51 @@ def _build_aawm_dynamic_injection_failure_text(proc_name: str) -> str:
     )
 
 
+def _append_aawm_dynamic_injection_dsn_query_params(
+    dsn: str,
+    params: dict[str, Optional[str]],
+) -> str:
+    parsed = urlsplit(dsn)
+    if not parsed.scheme:
+        return dsn
+
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    existing_keys = {key for key, _value in query_items}
+    for key, value in params.items():
+        cleaned_value = _clean_secret_string(value)
+        if cleaned_value and key not in existing_keys:
+            query_items.append((key, cleaned_value))
+            existing_keys.add(key)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(query_items),
+            parsed.fragment,
+        )
+    )
+
+
+def _get_aawm_dynamic_injection_application_name() -> str:
+    return (
+        _get_first_secret_value(_AAWM_DB_APPLICATION_NAME_ENV_VARS)
+        or _AAWM_DYNAMIC_INJECTION_APPLICATION_NAME
+    )
+
+
+def _get_aawm_dynamic_injection_server_settings() -> dict[str, str]:
+    return {"application_name": _get_aawm_dynamic_injection_application_name()}
+
+
+async def _initialize_aawm_dynamic_injection_connection(conn: Any) -> None:
+    await conn.execute(
+        "select set_config($1, $2, false)",
+        "application_name",
+        _get_aawm_dynamic_injection_application_name(),
+    )
+
+
 def _build_aawm_dynamic_injection_dsn() -> Optional[str]:
     host = _get_first_secret_value(_AAWM_DB_HOST_ENV_VARS)
     port = _get_first_secret_value(_AAWM_DB_PORT_ENV_VARS)
@@ -15424,9 +15476,18 @@ def _build_aawm_dynamic_injection_dsn() -> Optional[str]:
         )
         if sslmode:
             dsn += f"?{urlencode({'sslmode': sslmode})}"
-        return dsn
+        return _append_aawm_dynamic_injection_dsn_query_params(
+            dsn,
+            {"application_name": _get_aawm_dynamic_injection_application_name()},
+        )
 
-    return _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
+    url_dsn = _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
+    if not url_dsn:
+        return None
+    return _append_aawm_dynamic_injection_dsn_query_params(
+        url_dsn,
+        {"application_name": _get_aawm_dynamic_injection_application_name()},
+    )
 
 
 async def _get_aawm_dynamic_injection_pool() -> Any:
@@ -15455,6 +15516,9 @@ async def _get_aawm_dynamic_injection_pool() -> Any:
             min_size=1,
             max_size=4,
             command_timeout=10,
+            statement_cache_size=0,
+            server_settings=_get_aawm_dynamic_injection_server_settings(),
+            init=_initialize_aawm_dynamic_injection_connection,
         )
         return _aawm_dynamic_injection_pool
 

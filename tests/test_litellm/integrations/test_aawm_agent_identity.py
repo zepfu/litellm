@@ -8429,6 +8429,11 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
         lambda: 0,
     )
     monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_application_name",
+        lambda: "aawm-litellm-test",
+    )
+    monkeypatch.setattr(
         aawm_agent_identity.importlib,
         "import_module",
         lambda name: FakeAsyncpg() if name == "asyncpg" else None,
@@ -8443,9 +8448,42 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
     assert create_pool_calls[0]["max_size"] == 3
     assert create_pool_calls[0]["command_timeout"] == 42.0
     assert create_pool_calls[0]["statement_cache_size"] == 0
+    assert create_pool_calls[0]["server_settings"] == {
+        "application_name": "aawm-litellm-test"
+    }
+    assert create_pool_calls[0]["init"] is (
+        aawm_agent_identity._initialize_session_history_connection
+    )
 
     await aawm_agent_identity._close_aawm_session_history_pools_for_current_loop()
     created_pool.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_initialize_session_history_connection_sets_application_name(
+    monkeypatch,
+) -> None:
+    execute_calls = []
+
+    class FakeConnection:
+        async def execute(self, *args):
+            execute_calls.append(args)
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_application_name",
+        lambda: "aawm-litellm-test",
+    )
+
+    await aawm_agent_identity._initialize_session_history_connection(FakeConnection())
+
+    assert execute_calls == [
+        (
+            "select set_config($1, $2, false)",
+            "application_name",
+            "aawm-litellm-test",
+        )
+    ]
 
 
 def test_session_history_command_timeout_should_default_and_parse_secret(monkeypatch) -> None:
@@ -8802,16 +8840,24 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
 
     await _persist_session_history_record(record)
 
-    assert mock_conn.execute.await_count == 2
-    executed_args = mock_conn.execute.await_args_list[0].args
+    assert mock_conn.execute.await_count == 4
+    app_name_args = mock_conn.execute.await_args_list[0].args
+    assert app_name_args[0] == "select set_config($1, $2, false)"
+    assert app_name_args[1] == "application_name"
+    assert app_name_args[2]
+    executed_args = mock_conn.execute.await_args_list[1].args
     assert "INSERT INTO public.session_history" in executed_args[0]
     assert len(executed_args[1:]) == 125
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
-    gap_args = mock_conn.execute.await_args_list[1].args
+    gap_args = mock_conn.execute.await_args_list[2].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-123"]
+    final_app_name_args = mock_conn.execute.await_args_list[3].args
+    assert final_app_name_args[0] == "select set_config($1, $2, false)"
+    assert final_app_name_args[1] == "application_name"
+    assert final_app_name_args[2]
     mock_conn.executemany.assert_awaited_once()
     tool_args = mock_conn.executemany.await_args.args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
@@ -8891,7 +8937,7 @@ async def test_persist_session_history_record_strips_postgres_nul_bytes(
 
     await _persist_session_history_record(record)
 
-    executed_args = mock_conn.execute.await_args_list[0].args
+    executed_args = mock_conn.execute.await_args_list[1].args
     assert "INSERT INTO public.session_history" in executed_args[0]
     _assert_no_postgres_nul_bytes(executed_args[1:])
     assert json.loads(executed_args[31]) == ["Read"]
@@ -11319,10 +11365,18 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 
     await _persist_session_history_records(records)
 
-    assert mock_conn.execute.await_count == 1
-    gap_args = mock_conn.execute.await_args.args
+    assert mock_conn.execute.await_count == 3
+    app_name_args = mock_conn.execute.await_args_list[0].args
+    assert app_name_args[0] == "select set_config($1, $2, false)"
+    assert app_name_args[1] == "application_name"
+    assert app_name_args[2]
+    gap_args = mock_conn.execute.await_args_list[1].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-1"]
+    final_app_name_args = mock_conn.execute.await_args_list[2].args
+    assert final_app_name_args[0] == "select set_config($1, $2, false)"
+    assert final_app_name_args[1] == "application_name"
+    assert final_app_name_args[2]
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
@@ -11416,7 +11470,18 @@ async def test_persist_session_history_records_keeps_history_when_rate_limit_sid
     assert history_args[1][0][0] == "call-side-write-fails"
     side_write_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.rate_limit_observations" in side_write_args[0]
-    assert mock_conn.execute.await_count == 1
+    assert mock_conn.execute.await_count == 3
+    first_app_name_args = mock_conn.execute.await_args_list[0].args
+    assert first_app_name_args[0] == "select set_config($1, $2, false)"
+    assert first_app_name_args[1] == "application_name"
+    assert first_app_name_args[2]
+    gap_args = mock_conn.execute.await_args_list[1].args
+    assert "previous_response_to_current_request_ms" in gap_args[0]
+    assert gap_args[1] == ["call-side-write-fails"]
+    final_app_name_args = mock_conn.execute.await_args_list[2].args
+    assert final_app_name_args[0] == "select set_config($1, $2, false)"
+    assert final_app_name_args[1] == "application_name"
+    assert final_app_name_args[2]
     exception_mock.assert_called_once()
     assert "best-effort rate-limit observations" in exception_mock.call_args.args[0]
 

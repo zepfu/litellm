@@ -519,6 +519,12 @@ def _normalize_clickhouse_url(value: Optional[str]) -> str:
 def _postgres_dsn_from_args(args: argparse.Namespace) -> str:
     if args.pg_dsn:
         return args.pg_dsn
+    has_component_override = any(
+        (args.pg_host, args.pg_port, args.pg_user, args.pg_password)
+    )
+    direct_dsn = os.getenv("AAWM_DIRECT_DATABASE_URL")
+    if not has_component_override and direct_dsn and direct_dsn.strip():
+        return direct_dsn.strip()
     host = args.pg_host or os.getenv("AAWM_DB_HOST") or "127.0.0.1"
     port = args.pg_port or os.getenv("AAWM_DB_PORT") or "5434"
     db_name = args.target_db_name

@@ -110,6 +110,13 @@ def _get_first_secret(names: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _build_aawm_admin_dsn() -> Optional[str]:
+    direct_dsn = _get_first_secret(("AAWM_DIRECT_DATABASE_URL",))
+    if direct_dsn:
+        return direct_dsn
+    return _build_aawm_dsn()
+
+
 def _normalize_clickhouse_url(value: Optional[str]) -> str:
     cleaned = _clean_secret(value) or "http://127.0.0.1:8123"
     normalized = cleaned.rstrip("/")
@@ -632,7 +639,7 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
     )
     if not call_ids and not trace_ids:
         return records
-    target_dsn = _build_aawm_dsn()
+    target_dsn = _build_aawm_admin_dsn()
     if not target_dsn:
         raise RuntimeError("AAWM/tristore database configuration is missing")
     conn = await asyncpg.connect(target_dsn)
@@ -689,7 +696,7 @@ def _configure_target_database_env(args: argparse.Namespace) -> None:
 
 
 async def _verify_target_database(required_database: Optional[str]) -> None:
-    target_dsn = _build_aawm_dsn()
+    target_dsn = _build_aawm_admin_dsn()
     if not target_dsn:
         raise RuntimeError("AAWM/tristore database configuration is missing")
     conn = await asyncpg.connect(target_dsn)
@@ -910,7 +917,7 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         "applied": bool(args.apply),
         "clickhouse_url": clickhouse_config["url"],
         "target_dsn_redacted": (
-            (_build_aawm_dsn() or "unresolved").split("@", 1)[-1]
+            (_build_aawm_admin_dsn() or "unresolved").split("@", 1)[-1]
         ),
         "stats": {
             "scanned_rows": stats.scanned_rows,
