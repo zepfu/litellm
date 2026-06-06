@@ -1879,6 +1879,124 @@ OR NOT EXISTS (
       AND existing.status_code IS NOT DISTINCT FROM $7::integer
 )
 """
+_AAWM_ALIAS_ROUTING_AUDIT_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.aawm_alias_routing_audit (
+    id BIGSERIAL PRIMARY KEY,
+    event_key TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    observed_at TIMESTAMPTZ NOT NULL,
+    session_id TEXT,
+    session_key TEXT,
+    trace_id TEXT,
+    litellm_call_id TEXT,
+    alias_model TEXT NOT NULL,
+    alias_family TEXT NOT NULL,
+    route_family TEXT,
+    provider TEXT,
+    model TEXT,
+    lane_key TEXT,
+    cooldown_key TEXT,
+    attempt_number INTEGER,
+    event_type TEXT NOT NULL,
+    selection_reason TEXT,
+    candidate_status TEXT,
+    failure_class TEXT,
+    error_status_code INTEGER,
+    cooldown_scope TEXT,
+    cooldown_seconds DOUBLE PRECISION,
+    cooldown_until TIMESTAMPTZ,
+    selected BOOLEAN NOT NULL DEFAULT FALSE,
+    skipped BOOLEAN NOT NULL DEFAULT FALSE,
+    last_resort BOOLEAN NOT NULL DEFAULT FALSE,
+    in_flight_session BOOLEAN NOT NULL DEFAULT FALSE,
+    redispatch_required BOOLEAN NOT NULL DEFAULT FALSE,
+    redispatch_threshold_crossed BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+_AAWM_ALIAS_ROUTING_AUDIT_INDEX_STATEMENTS = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS aawm_alias_routing_audit_event_key_idx "
+    "ON public.aawm_alias_routing_audit (event_key) WHERE event_key IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_session_observed_idx "
+    "ON public.aawm_alias_routing_audit (session_id, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_alias_observed_idx "
+    "ON public.aawm_alias_routing_audit (alias_model, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_provider_model_observed_idx "
+    "ON public.aawm_alias_routing_audit (provider, model, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_event_observed_idx "
+    "ON public.aawm_alias_routing_audit (event_type, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_cooldown_observed_idx "
+    "ON public.aawm_alias_routing_audit (cooldown_key, observed_at DESC)",
+)
+_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL = """
+INSERT INTO public.aawm_alias_routing_audit (
+    event_key,
+    observed_at,
+    session_id,
+    session_key,
+    trace_id,
+    litellm_call_id,
+    alias_model,
+    alias_family,
+    route_family,
+    provider,
+    model,
+    lane_key,
+    cooldown_key,
+    attempt_number,
+    event_type,
+    selection_reason,
+    candidate_status,
+    failure_class,
+    error_status_code,
+    cooldown_scope,
+    cooldown_seconds,
+    cooldown_until,
+    selected,
+    skipped,
+    last_resort,
+    in_flight_session,
+    redispatch_required,
+    redispatch_threshold_crossed,
+    metadata
+) VALUES (
+    $1::text, $2::timestamptz, $3::text, $4::text, $5::text,
+    $6::text, $7::text, $8::text, $9::text, $10::text,
+    $11::text, $12::text, $13::text, $14::integer, $15::text,
+    $16::text, $17::text, $18::text, $19::integer, $20::text,
+    $21::double precision, $22::timestamptz, $23::boolean, $24::boolean,
+    $25::boolean, $26::boolean, $27::boolean, $28::boolean, $29::jsonb
+)
+ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO UPDATE SET
+    observed_at = LEAST(aawm_alias_routing_audit.observed_at, EXCLUDED.observed_at),
+    session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), aawm_alias_routing_audit.session_id),
+    session_key = COALESCE(NULLIF(EXCLUDED.session_key, ''), aawm_alias_routing_audit.session_key),
+    trace_id = COALESCE(NULLIF(EXCLUDED.trace_id, ''), aawm_alias_routing_audit.trace_id),
+    litellm_call_id = COALESCE(NULLIF(EXCLUDED.litellm_call_id, ''), aawm_alias_routing_audit.litellm_call_id),
+    alias_model = COALESCE(NULLIF(EXCLUDED.alias_model, ''), aawm_alias_routing_audit.alias_model),
+    alias_family = COALESCE(NULLIF(EXCLUDED.alias_family, ''), aawm_alias_routing_audit.alias_family),
+    route_family = COALESCE(NULLIF(EXCLUDED.route_family, ''), aawm_alias_routing_audit.route_family),
+    provider = COALESCE(NULLIF(EXCLUDED.provider, ''), aawm_alias_routing_audit.provider),
+    model = COALESCE(NULLIF(EXCLUDED.model, ''), aawm_alias_routing_audit.model),
+    lane_key = COALESCE(NULLIF(EXCLUDED.lane_key, ''), aawm_alias_routing_audit.lane_key),
+    cooldown_key = COALESCE(NULLIF(EXCLUDED.cooldown_key, ''), aawm_alias_routing_audit.cooldown_key),
+    attempt_number = COALESCE(EXCLUDED.attempt_number, aawm_alias_routing_audit.attempt_number),
+    event_type = COALESCE(NULLIF(EXCLUDED.event_type, ''), aawm_alias_routing_audit.event_type),
+    selection_reason = COALESCE(NULLIF(EXCLUDED.selection_reason, ''), aawm_alias_routing_audit.selection_reason),
+    candidate_status = COALESCE(NULLIF(EXCLUDED.candidate_status, ''), aawm_alias_routing_audit.candidate_status),
+    failure_class = COALESCE(NULLIF(EXCLUDED.failure_class, ''), aawm_alias_routing_audit.failure_class),
+    error_status_code = COALESCE(EXCLUDED.error_status_code, aawm_alias_routing_audit.error_status_code),
+    cooldown_scope = COALESCE(NULLIF(EXCLUDED.cooldown_scope, ''), aawm_alias_routing_audit.cooldown_scope),
+    cooldown_seconds = COALESCE(EXCLUDED.cooldown_seconds, aawm_alias_routing_audit.cooldown_seconds),
+    cooldown_until = COALESCE(EXCLUDED.cooldown_until, aawm_alias_routing_audit.cooldown_until),
+    selected = aawm_alias_routing_audit.selected OR EXCLUDED.selected,
+    skipped = aawm_alias_routing_audit.skipped OR EXCLUDED.skipped,
+    last_resort = aawm_alias_routing_audit.last_resort OR EXCLUDED.last_resort,
+    in_flight_session = aawm_alias_routing_audit.in_flight_session OR EXCLUDED.in_flight_session,
+    redispatch_required = aawm_alias_routing_audit.redispatch_required OR EXCLUDED.redispatch_required,
+    redispatch_threshold_crossed = aawm_alias_routing_audit.redispatch_threshold_crossed OR EXCLUDED.redispatch_threshold_crossed,
+    metadata = COALESCE(aawm_alias_routing_audit.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+"""
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "tenant_id_source",
     "workload_type",
@@ -1996,6 +2114,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_auto_agent_lane_key",
     "codex_auto_agent_attempts",
     "codex_auto_agent_skipped_candidates",
+    "codex_auto_agent_audit_events",
     "anthropic_auto_agent_alias",
     "anthropic_auto_agent_selected_provider",
     "anthropic_auto_agent_selected_model",
@@ -2005,6 +2124,8 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "anthropic_auto_agent_lane_key",
     "anthropic_auto_agent_attempts",
     "anthropic_auto_agent_skipped_candidates",
+    "anthropic_auto_agent_audit_events",
+    "aawm_alias_routing_audit_events",
     "codex_google_code_assist_dropped_response_tool_types",
     "google_retrieve_user_quota",
     "usage_tool_call_count",
@@ -15562,6 +15683,182 @@ def _build_provider_error_observation_db_payload(record: Dict[str, Any]) -> Tupl
     )
 
 
+def _extract_alias_routing_audit_events(
+    record: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    metadata = record.get("metadata")
+    event_sources: List[Any] = [record.get("aawm_alias_routing_audit_events")]
+    if isinstance(metadata, dict):
+        event_sources.extend(
+            [
+                metadata.get("aawm_alias_routing_audit_events"),
+                metadata.get("codex_auto_agent_audit_events"),
+                metadata.get("anthropic_auto_agent_audit_events"),
+            ]
+        )
+    events: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for source in event_sources:
+        if not isinstance(source, list):
+            continue
+        for event in source:
+            if not isinstance(event, dict):
+                continue
+            try:
+                fingerprint = json.dumps(
+                    _json_safe_rate_limit_value(event),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except Exception:
+                fingerprint = str(id(event))
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            events.append(event)
+    return events
+
+
+def _alias_routing_audit_observed_at(
+    record: Dict[str, Any],
+    event: Dict[str, Any],
+) -> datetime:
+    return (
+        _parse_datetime_value(event.get("observed_at"))
+        or _parse_datetime_value(record.get("start_time"))
+        or _parse_datetime_value(record.get("end_time"))
+        or datetime.now(timezone.utc)
+    )
+
+
+def _alias_routing_audit_event_key(
+    *,
+    record: Dict[str, Any],
+    event: Dict[str, Any],
+    event_index: int,
+) -> Optional[str]:
+    litellm_call_id = _clean_non_empty_string(
+        event.get("litellm_call_id") or record.get("litellm_call_id")
+    )
+    if litellm_call_id is None:
+        return None
+    key_material = [
+        litellm_call_id,
+        event.get("alias_family"),
+        event.get("alias_model"),
+        event.get("event_type"),
+        event.get("provider"),
+        event.get("model"),
+        event.get("attempt_number"),
+        event.get("candidate_status"),
+        event_index,
+    ]
+    digest = hashlib.sha256(
+        json.dumps(key_material, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"{litellm_call_id}:alias-routing:{digest}"
+
+
+def _infer_alias_routing_family(
+    event: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> str:
+    return (
+        _clean_non_empty_string(event.get("alias_family"))
+        or (
+            "codex_auto_agent"
+            if _clean_non_empty_string(metadata.get("codex_auto_agent_alias"))
+            else None
+        )
+        or (
+            "anthropic_auto_agent"
+            if _clean_non_empty_string(metadata.get("anthropic_auto_agent_alias"))
+            else None
+        )
+        or "unknown"
+    )
+
+
+def _build_alias_routing_audit_db_payload(
+    record: Dict[str, Any],
+    event: Dict[str, Any],
+    event_index: int,
+) -> Tuple[Any, ...]:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    event_metadata = dict(event)
+    event_metadata["event_index"] = event_index
+    event_metadata.setdefault("session_history_provider", record.get("provider"))
+    event_metadata.setdefault("session_history_model", record.get("model"))
+    event_metadata.setdefault("session_history_model_group", record.get("model_group"))
+    event_metadata.setdefault("session_history_repository", record.get("repository"))
+    return (
+        _alias_routing_audit_event_key(
+            record=record,
+            event=event,
+            event_index=event_index,
+        ),
+        _alias_routing_audit_observed_at(record, event),
+        _clean_non_empty_string(event.get("session_id"))
+        or _clean_non_empty_string(record.get("session_id")),
+        _clean_non_empty_string(event.get("session_key")),
+        _clean_non_empty_string(event.get("trace_id"))
+        or _clean_non_empty_string(record.get("trace_id")),
+        _clean_non_empty_string(event.get("litellm_call_id"))
+        or _clean_non_empty_string(record.get("litellm_call_id")),
+        _clean_non_empty_string(event.get("alias_model"))
+        or _clean_non_empty_string(metadata.get("requested_model_alias"))
+        or "unknown",
+        _infer_alias_routing_family(event, metadata),
+        _clean_non_empty_string(event.get("route_family")),
+        _clean_non_empty_string(event.get("provider")),
+        _clean_non_empty_string(event.get("model")),
+        _clean_non_empty_string(event.get("lane_key")),
+        _clean_non_empty_string(event.get("cooldown_key")),
+        _safe_int(event.get("attempt_number")),
+        _clean_non_empty_string(event.get("event_type")) or "unknown",
+        _clean_non_empty_string(event.get("selection_reason")),
+        _clean_non_empty_string(event.get("candidate_status")),
+        _clean_non_empty_string(event.get("failure_class")),
+        _safe_int(event.get("error_status_code")),
+        _clean_non_empty_string(event.get("cooldown_scope")),
+        _safe_float(event.get("cooldown_seconds")),
+        _parse_datetime_value(event.get("cooldown_until")),
+        _metadata_bool(event.get("selected")),
+        _metadata_bool(event.get("skipped")),
+        _metadata_bool(event.get("last_resort")),
+        _metadata_bool(event.get("in_flight_session")),
+        _metadata_bool(event.get("redispatch_required")),
+        _metadata_bool(event.get("redispatch_threshold_crossed")),
+        json.dumps(_json_safe_rate_limit_value(event_metadata)),
+    )
+
+
+async def _persist_alias_routing_audit_best_effort(
+    conn: Any,
+    records: List[Dict[str, Any]],
+) -> None:
+    try:
+        payloads: List[Tuple[Any, ...]] = []
+        for record in records:
+            events = _extract_alias_routing_audit_events(record)
+            payloads.extend(
+                _build_alias_routing_audit_db_payload(record, event, index)
+                for index, event in enumerate(events)
+            )
+        if not payloads:
+            return
+        await conn.executemany(_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL, payloads)
+    except Exception as exc:
+        verbose_logger.exception(
+            "AawmAgentIdentity: failed to persist best-effort alias routing "
+            "audit events for %d session_history records: %s",
+            len(records),
+            _format_exception_for_warning(exc),
+        )
+
+
 async def _fetch_previous_rate_limit_observation(
     conn: Any,
     observation: Dict[str, Any],
@@ -15853,6 +16150,7 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
             history_records=history_records,
         )
         await _persist_provider_error_observations_best_effort(conn, [record])
+        await _persist_alias_routing_audit_best_effort(conn, [record])
         await _initialize_session_history_connection(conn)
 
 
@@ -15899,6 +16197,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             records,
             identity_by_session=identity_by_session,
         )
+        await _persist_alias_routing_audit_best_effort(conn, records)
         await _initialize_session_history_connection(conn)
 
 

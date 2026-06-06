@@ -1782,6 +1782,212 @@ def _codex_auto_agent_candidate_public_shape(
     return shaped
 
 
+def _auto_agent_alias_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _auto_agent_alias_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_auto_agent_alias_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _auto_agent_alias_cooldown_until(
+    cooldown_seconds: Optional[float],
+) -> Optional[str]:
+    if cooldown_seconds is None:
+        return None
+    return _format_auto_agent_alias_timestamp(
+        datetime.now(timezone.utc) + timedelta(seconds=max(0.0, cooldown_seconds))
+    )
+
+
+def _extract_auto_agent_alias_session_id(
+    request: Request,
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    metadata = request_body.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        session_id = _clean_codex_auth_value(metadata.get("session_id"))
+        if session_id is not None:
+            return session_id
+    passthrough_session_id = _extract_passthrough_session_id(request, request_body)
+    if passthrough_session_id is not None:
+        return passthrough_session_id
+    headers = _safe_get_request_headers(request)
+    for header_name in ("session_id", "session-id", "x-session-id"):
+        header_value = _get_codex_auto_agent_header(headers, header_name)
+        if header_value is not None:
+            return header_value
+    return None
+
+
+def _build_auto_agent_alias_audit_event(
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    request_body: dict[str, Any],
+    selection: dict[str, Any],
+    candidate: dict[str, Any],
+    event_type: str,
+    candidate_status: str,
+    attempt_number: Optional[int] = None,
+    selected: bool = False,
+    skipped: bool = False,
+    selection_reason: Optional[str] = None,
+    lane_key: Optional[str] = None,
+    cooldown_key: Optional[str] = None,
+    cooldown_seconds: Optional[Any] = None,
+    cooldown_scope: Optional[str] = None,
+    failure_class: Optional[str] = None,
+    error_status_code: Optional[Any] = None,
+    error_tokens: Optional[Any] = None,
+    redispatch_required: bool = False,
+) -> dict[str, Any]:
+    normalized_cooldown_seconds = _auto_agent_alias_float(cooldown_seconds)
+    if lane_key is None:
+        lane_key = selection.get("lane_key")
+    if cooldown_key is None and lane_key is not None:
+        cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
+    event: dict[str, Any] = {
+        "observed_at": _format_auto_agent_alias_timestamp(datetime.now(timezone.utc)),
+        "alias_family": alias_family,
+        "alias_model": alias_model,
+        "session_id": _extract_auto_agent_alias_session_id(request, request_body),
+        "session_key": selection.get("session_key"),
+        "provider": candidate.get("provider"),
+        "model": candidate.get("model"),
+        "route_family": candidate.get("route_family"),
+        "lane_key": lane_key,
+        "cooldown_key": cooldown_key,
+        "attempt_number": attempt_number,
+        "event_type": event_type,
+        "selection_reason": selection_reason,
+        "candidate_status": candidate_status,
+        "failure_class": failure_class,
+        "error_status_code": _auto_agent_alias_int(error_status_code),
+        "cooldown_scope": cooldown_scope,
+        "cooldown_seconds": (
+            round(normalized_cooldown_seconds, 3)
+            if normalized_cooldown_seconds is not None
+            else None
+        ),
+        "cooldown_until": _auto_agent_alias_cooldown_until(
+            normalized_cooldown_seconds
+        ),
+        "selected": selected,
+        "skipped": skipped,
+        "last_resort": bool(candidate.get("last_resort")),
+        "in_flight_session": bool(selection.get("in_flight_session")),
+        "redispatch_required": redispatch_required,
+        "redispatch_threshold_crossed": False,
+    }
+    if isinstance(error_tokens, list):
+        event["error_tokens"] = error_tokens
+    elif isinstance(error_tokens, set):
+        event["error_tokens"] = sorted(error_tokens)
+    return {key: value for key, value in event.items() if value is not None}
+
+
+def _build_auto_agent_alias_audit_events(
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    request_body: dict[str, Any],
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    skipped_candidates = selection.get("skipped")
+    if isinstance(skipped_candidates, list):
+        for skipped_candidate in skipped_candidates:
+            if not isinstance(skipped_candidate, dict):
+                continue
+            reason = str(skipped_candidate.get("reason") or "cooldown")
+            events.append(
+                _build_auto_agent_alias_audit_event(
+                    alias_family=alias_family,
+                    alias_model=alias_model,
+                    request=request,
+                    request_body=request_body,
+                    selection=selection,
+                    candidate=skipped_candidate,
+                    event_type="candidate_skipped_cooldown",
+                    candidate_status=f"skipped_{reason}",
+                    selected=False,
+                    skipped=True,
+                    selection_reason=reason,
+                    lane_key=skipped_candidate.get("lane_key"),
+                    cooldown_seconds=skipped_candidate.get("cooldown_seconds"),
+                )
+            )
+
+    audit_attempts = attempts
+    if not audit_attempts and isinstance(selection.get("candidate"), dict):
+        audit_attempts = [
+            _codex_auto_agent_candidate_public_shape(
+                selection["candidate"],
+                lane_key=selection.get("lane_key"),
+                reason=selection.get("selection_reason"),
+            )
+        ]
+
+    for index, attempt in enumerate(audit_attempts, start=1):
+        if not isinstance(attempt, dict):
+            continue
+        status = str(attempt.get("status") or "").strip()
+        failure_class = attempt.get("error_class")
+        redispatch_required = status == "terminal_in_flight_cooldown_set"
+        if redispatch_required:
+            event_type = "redispatch_required"
+        elif failure_class or status == "cooldown_set":
+            event_type = "candidate_retryable_failure"
+        else:
+            event_type = "candidate_selected"
+        events.append(
+            _build_auto_agent_alias_audit_event(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=request_body,
+                selection=selection,
+                candidate=attempt,
+                event_type=event_type,
+                candidate_status=status or "selected",
+                attempt_number=index,
+                selected=True,
+                skipped=False,
+                selection_reason=attempt.get("reason")
+                or selection.get("selection_reason"),
+                lane_key=attempt.get("lane_key") or selection.get("lane_key"),
+                cooldown_key=selection.get("cooldown_key")
+                if index == len(audit_attempts)
+                else None,
+                cooldown_seconds=attempt.get("cooldown_seconds"),
+                cooldown_scope=attempt.get("cooldown_scope"),
+                failure_class=failure_class,
+                error_status_code=attempt.get("error_status_code"),
+                error_tokens=attempt.get("error_tokens"),
+                redispatch_required=redispatch_required,
+            )
+        )
+    return events
+
+
 def _codex_auto_agent_request_has_continuation_state(
     value: Any,
     _seen: Optional[set[int]] = None,
@@ -2377,6 +2583,7 @@ def _update_codex_auto_agent_retryable_attempt_record(
 def _add_codex_auto_agent_alias_metadata(
     request_body: dict[str, Any],
     *,
+    request: Request,
     selection: dict[str, Any],
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -2390,6 +2597,14 @@ def _add_codex_auto_agent_alias_metadata(
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
     skipped = selection.get("skipped") or []
+    audit_events = _build_auto_agent_alias_audit_events(
+        alias_family="codex_auto_agent",
+        alias_model=alias_model,
+        request=request,
+        request_body=request_body,
+        selection=selection,
+        attempts=attempts,
+    )
     return _merge_litellm_metadata(
         updated_body,
         tags_to_add=[
@@ -2416,6 +2631,8 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_lane_key": selection.get("lane_key"),
             "codex_auto_agent_attempts": attempts,
             "codex_auto_agent_skipped_candidates": skipped,
+            "codex_auto_agent_audit_events": audit_events,
+            "aawm_alias_routing_audit_events": audit_events,
         },
     )
 
@@ -2804,6 +3021,7 @@ async def _select_anthropic_auto_agent_candidate(
 def _add_anthropic_auto_agent_alias_metadata(
     request_body: dict[str, Any],
     *,
+    request: Request,
     selection: dict[str, Any],
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -2817,6 +3035,14 @@ def _add_anthropic_auto_agent_alias_metadata(
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
     skipped = selection.get("skipped") or []
+    audit_events = _build_auto_agent_alias_audit_events(
+        alias_family="anthropic_auto_agent",
+        alias_model=alias_model,
+        request=request,
+        request_body=request_body,
+        selection=selection,
+        attempts=attempts,
+    )
     return _merge_litellm_metadata(
         updated_body,
         tags_to_add=[
@@ -2845,6 +3071,8 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_lane_key": selection.get("lane_key"),
             "anthropic_auto_agent_attempts": attempts,
             "anthropic_auto_agent_skipped_candidates": skipped,
+            "anthropic_auto_agent_audit_events": audit_events,
+            "aawm_alias_routing_audit_events": audit_events,
         },
     )
 
@@ -17763,6 +17991,7 @@ async def _handle_anthropic_auto_agent_alias_route(
         attempts.append(attempt_record)
         candidate_body = _add_anthropic_auto_agent_alias_metadata(
             prepared_request_body,
+            request=request,
             selection=selection,
             attempts=attempts,
         )
@@ -20143,6 +20372,7 @@ async def _handle_codex_auto_agent_alias_route(
         attempts.append(attempt_record)
         candidate_body = _add_codex_auto_agent_alias_metadata(
             prepared_request_body,
+            request=request,
             selection=selection,
             attempts=attempts,
         )
