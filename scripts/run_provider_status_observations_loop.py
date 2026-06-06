@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import signal
@@ -19,7 +20,7 @@ try:
     from scripts import record_provider_status_observations as probes
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import record_provider_status_observations as probes
+    probes = importlib.import_module("record_provider_status_observations")
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -37,6 +38,9 @@ class ProviderStatusLoopConfig:
     ping_timeout: int
     skip_icmp: bool
     once: bool
+    setup_schema: bool
+    db_lock_timeout_ms: int
+    db_statement_timeout_ms: int
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -117,6 +121,36 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_env_bool("AAWM_PROVIDER_STATUS_ONCE", False),
         help="Run exactly one cycle, then exit.",
     )
+    schema_group = parser.add_mutually_exclusive_group()
+    schema_group.add_argument(
+        "--setup-schema",
+        dest="setup_schema",
+        action="store_true",
+        default=_env_bool("AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START", True),
+        help="Run provider-status schema setup once before the loop starts.",
+    )
+    schema_group.add_argument(
+        "--no-setup-schema",
+        dest="setup_schema",
+        action="store_false",
+        help="Skip startup schema setup; steady-state cycles never run DDL.",
+    )
+    parser.add_argument(
+        "--db-lock-timeout-ms",
+        type=int,
+        default=_env_int(
+            "AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS",
+            probes.DEFAULT_DB_LOCK_TIMEOUT_MS,
+        ),
+    )
+    parser.add_argument(
+        "--db-statement-timeout-ms",
+        type=int,
+        default=_env_int(
+            "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS",
+            probes.DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+        ),
+    )
     return parser
 
 
@@ -130,6 +164,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         raise SystemExit("--ping-count must be greater than 0")
     if args.ping_timeout <= 0:
         raise SystemExit("--ping-timeout must be greater than 0")
+    if args.db_lock_timeout_ms <= 0:
+        raise SystemExit("--db-lock-timeout-ms must be greater than 0")
+    if args.db_statement_timeout_ms <= 0:
+        raise SystemExit("--db-statement-timeout-ms must be greater than 0")
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -141,6 +179,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         ping_timeout=args.ping_timeout,
         skip_icmp=args.skip_icmp,
         once=args.once,
+        setup_schema=args.setup_schema,
+        db_lock_timeout_ms=args.db_lock_timeout_ms,
+        db_statement_timeout_ms=args.db_statement_timeout_ms,
     )
 
 
@@ -156,6 +197,39 @@ def _dsn_args(config: ProviderStatusLoopConfig) -> argparse.Namespace:
     )
 
 
+def _resolve_dsn(config: ProviderStatusLoopConfig) -> str:
+    dsn = probes._build_dsn(_dsn_args(config))
+    if not dsn:
+        raise RuntimeError("No database DSN found. Set AAWM_DB_* or AAWM_PROVIDER_STATUS_DSN.")
+    return dsn
+
+
+def setup_schema_once(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
+    started = time.perf_counter()
+    dsn = _resolve_dsn(config)
+    try:
+        probes.setup_schema(
+            dsn,
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return {
+            "event": "provider_status_observations_schema_skipped",
+            "observed_at": _utc_timestamp(),
+            "environment": config.environment,
+            "error_class": exc.error_class,
+            "error_message": str(exc),
+            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        }
+    return {
+        "event": "provider_status_observations_schema_ready",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+    }
+
+
 def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     started = time.perf_counter()
     rows = probes.collect_observations(
@@ -167,12 +241,24 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
         skip_icmp=config.skip_icmp,
     )
     inserted = False
+    skipped = False
+    skip_reason: Optional[str] = None
+    skip_error_class: Optional[str] = None
     if config.apply:
-        dsn = probes._build_dsn(_dsn_args(config))
-        if not dsn:
-            raise RuntimeError("No database DSN found. Set AAWM_DB_* or AAWM_PROVIDER_STATUS_DSN.")
-        probes.insert_observations(dsn, rows)
-        inserted = True
+        dsn = _resolve_dsn(config)
+        try:
+            probes.insert_observations(
+                dsn,
+                rows,
+                lock_timeout_ms=config.db_lock_timeout_ms,
+                statement_timeout_ms=config.db_statement_timeout_ms,
+            )
+        except probes.ProviderStatusDatabaseWriteSkipped as exc:
+            skipped = True
+            skip_reason = str(exc)
+            skip_error_class = exc.error_class
+        else:
+            inserted = True
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
     successes = sum(1 for row in rows if row.get("success"))
@@ -182,6 +268,9 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
         "observed_at": _utc_timestamp(),
         "apply": config.apply,
         "inserted": inserted,
+        "skipped": skipped,
+        "skip_error_class": skip_error_class,
+        "skip_reason": skip_reason,
         "environment": config.environment,
         "row_count": len(rows),
         "success_count": successes,
@@ -210,6 +299,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
+
+    if config.apply and config.setup_schema:
+        try:
+            _emit(setup_schema_once(config))
+        except Exception as exc:
+            _emit(
+                {
+                    "event": "provider_status_observations_schema_error",
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "error_class": exc.__class__.__name__,
+                    "error_message": str(exc),
+                    "traceback": traceback.format_exc(limit=5),
+                }
+            )
+            if config.once:
+                return 1
 
     while not stopping:
         cycle_started = time.monotonic()
