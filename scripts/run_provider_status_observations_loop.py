@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
+from urllib.parse import urlsplit
 
 try:
     from scripts import record_provider_status_observations as probes
@@ -41,6 +42,8 @@ class ProviderStatusLoopConfig:
     setup_schema: bool
     db_lock_timeout_ms: int
     db_statement_timeout_ms: int
+    schema_dsn: Optional[str] = None
+    require_pgbouncer: bool = False
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -87,6 +90,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dsn", default=os.getenv("AAWM_PROVIDER_STATUS_DSN"))
     parser.add_argument(
+        "--schema-dsn",
+        default=(
+            os.getenv("AAWM_PROVIDER_STATUS_SCHEMA_DSN")
+            or os.getenv("AAWM_DIRECT_DATABASE_URL")
+        ),
+        help=(
+            "Direct Postgres DSN for explicit provider-status schema setup. "
+            "Defaults to AAWM_PROVIDER_STATUS_SCHEMA_DSN or AAWM_DIRECT_DATABASE_URL."
+        ),
+    )
+    parser.add_argument(
         "--environment",
         default=os.getenv("AAWM_LITELLM_ENVIRONMENT", "dev"),
     )
@@ -126,8 +140,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--setup-schema",
         dest="setup_schema",
         action="store_true",
-        default=_env_bool("AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START", True),
-        help="Run provider-status schema setup once before the loop starts.",
+        default=_env_bool("AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START", False),
+        help=(
+            "Run provider-status schema setup once before the loop starts. "
+            "Defaults to AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START or false."
+        ),
     )
     schema_group.add_argument(
         "--no-setup-schema",
@@ -149,6 +166,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_env_int(
             "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS",
             probes.DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+        ),
+    )
+    parser.add_argument(
+        "--require-pgbouncer",
+        action="store_true",
+        default=_env_bool("AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER", False),
+        help=(
+            "Fail startup if steady-state writes do not resolve to the "
+            "PgBouncer transaction pool."
         ),
     )
     return parser
@@ -182,6 +208,8 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         setup_schema=args.setup_schema,
         db_lock_timeout_ms=args.db_lock_timeout_ms,
         db_statement_timeout_ms=args.db_statement_timeout_ms,
+        schema_dsn=args.schema_dsn,
+        require_pgbouncer=args.require_pgbouncer,
     )
 
 
@@ -204,9 +232,48 @@ def _resolve_dsn(config: ProviderStatusLoopConfig) -> str:
     return dsn
 
 
+def _resolve_schema_dsn(config: ProviderStatusLoopConfig) -> str:
+    if config.schema_dsn:
+        return probes._append_dsn_query_params(
+            config.schema_dsn,
+            {"application_name": probes._provider_status_db_application_name()},
+        )
+    if config.dsn:
+        return probes._append_dsn_query_params(
+            config.dsn,
+            {"application_name": probes._provider_status_db_application_name()},
+        )
+    raise RuntimeError(
+        "Provider-status schema setup requires AAWM_PROVIDER_STATUS_SCHEMA_DSN, "
+        "AAWM_DIRECT_DATABASE_URL, or explicit --dsn. Steady-state PgBouncer "
+        "DSNs are not used for schema setup by default."
+    )
+
+
+def _dsn_targets_pgbouncer(dsn: str) -> bool:
+    try:
+        parsed = urlsplit(dsn)
+    except ValueError:
+        return False
+    return parsed.hostname == "pgbouncer" and parsed.port == 6432
+
+
+def validate_runtime_guardrails(config: ProviderStatusLoopConfig) -> None:
+    if config.setup_schema:
+        _resolve_schema_dsn(config)
+    if not config.apply or not config.require_pgbouncer:
+        return
+    dsn = _resolve_dsn(config)
+    if not _dsn_targets_pgbouncer(dsn):
+        raise RuntimeError(
+            "Provider-status steady-state writes require "
+            "pgbouncer:6432 when AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER=1"
+        )
+
+
 def setup_schema_once(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     started = time.perf_counter()
-    dsn = _resolve_dsn(config)
+    dsn = _resolve_schema_dsn(config)
     try:
         probes.setup_schema(
             dsn,
@@ -291,6 +358,19 @@ def _utc_timestamp() -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     config = parse_config(argv)
+    try:
+        validate_runtime_guardrails(config)
+    except Exception as exc:
+        _emit(
+            {
+                "event": "provider_status_observations_guardrail_error",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc),
+            }
+        )
+        return 1
     stopping = False
 
     def _stop(_signum: int, _frame: object) -> None:
