@@ -2407,6 +2407,46 @@ Codex token pools `132061`-`132064`, and Anthropic response-header token pools
 
 ---
 
+### aawm.71 — D1-215 production migration base release for persistence, provider status, alias failover, and PgBouncer pooling
+
+**Status:** AAWM local release candidate.
+
+**What changed:** The fork release line now includes the tested D1-211 through
+D1-214 fixes needed for the D1-215 production migration. Session-history
+persistence is retry-backed instead of dropping failed flush batches, side
+writes such as rate-limit/provider-error observations are best-effort after the
+primary `session_history` insert, and outage backfills align `created_at` to
+the source observation time. Provider-status collection no longer performs DDL
+on the steady-state insert path and has explicit lock/statement timeout
+guardrails. AAWM model-alias routing now treats busy/high-demand/capacity
+responses as candidate-unavailable conditions so aliases can cool the failed
+candidate and continue to the next configured model. Runtime Postgres paths now
+use the shared PgBouncer convention while backfill, repair, scoring, and schema
+maintenance paths retain direct database access.
+
+**Why:** Production had recovered through local runtime repair and older overlay
+artifacts, but the durable container path still needed the tested fork code,
+published overlay artifacts, and PgBouncer runtime configuration promoted
+together. Without a new base image, prod could install the latest callback and
+control-plane wheels while still missing base-code changes in passthrough
+routing, stream logging, provider-status collection, and maintenance script
+DSN handling.
+
+**Why not upstream:** The persistence tables, provider-status sidecar, AAWM
+alias ordering/fallback policy, and local PgBouncer topology are AAWM-specific
+operational behavior.
+
+**Validation status:** D1-211 through D1-214 focused tests and live checks
+proved fresh `session_history`, `rate_limit_observations`, and
+`provider_status_observations` rows; no session-history queue overflow/drop
+logs; no provider-status lock waiters; alias failover on observed busy/capacity
+messages; and a live PgBouncer transaction pool on `127.0.0.1:6432`. D1-215
+promotion still requires publishing the `v1.82.3-aawm.71` base image,
+rebuilding/restarting `aawm-litellm`, and running prod smokes including direct
+`gpt5.5` concurrency.
+
+---
+
 ### cb-v0.0.42 — Callback overlay parity for Antigravity/OpenCode attribution
 
 **Status:** AAWM callback overlay release candidate.
