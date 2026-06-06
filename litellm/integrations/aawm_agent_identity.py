@@ -40,14 +40,22 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union, cast
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
-from litellm.integrations.aawm_agent_quality_rules import (
-    AgentQualityCommand,
-    score_agent_quality_context,
-)
+try:
+    from litellm.integrations.aawm_agent_quality_rules import (
+        AgentQualityCommand,
+        score_agent_quality_context,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "litellm.integrations.aawm_agent_quality_rules":
+        raise
+    from aawm_litellm_callbacks.aawm_agent_quality_rules import (  # type: ignore[import-not-found,no-redef]
+        AgentQualityCommand,
+        score_agent_quality_context,
+    )
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.secret_managers.main import get_secret_str
 
@@ -2318,6 +2326,7 @@ _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS = 0.1
 _AAWM_SESSION_HISTORY_POOL_MAX_SIZE = 2
 _AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS = 60.0
 _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
+_AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS = 1.0
 _aawm_session_history_schema_ready = False
 _aawm_session_history_schema_lock = threading.Lock()
 _aawm_session_history_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=1024)
@@ -2367,6 +2376,25 @@ def _get_session_history_command_timeout_seconds() -> float:
     return max(1.0, parsed_value)
 
 
+def _get_session_history_failed_flush_retry_seconds() -> float:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS") or ""
+    try:
+        parsed_value = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS
+    return max(0.1, parsed_value)
+
+
+def _session_history_queue_depth_summary() -> str:
+    queue_size: Union[int, str]
+    try:
+        queue_size = _aawm_session_history_queue.qsize()
+    except Exception:
+        queue_size = "unknown"
+    max_size = getattr(_aawm_session_history_queue, "maxsize", "unknown")
+    return f"queue_depth={queue_size}/{max_size}"
+
+
 async def _close_aawm_session_history_pools_for_current_loop() -> None:
     loop = asyncio.get_running_loop()
     pools_to_close: List[Any] = []
@@ -2383,9 +2411,9 @@ async def _close_aawm_session_history_pools_for_current_loop() -> None:
 def _flush_session_history_batch(
     records: List[Dict[str, Any]],
     loop: Optional[asyncio.AbstractEventLoop] = None,
-) -> None:
+) -> bool:
     if not records:
-        return
+        return True
 
     started_at = time.perf_counter()
     try:
@@ -2404,24 +2432,51 @@ def _flush_session_history_batch(
             loop.run_until_complete(_persist_session_history_records(records))
     except Exception as exc:
         verbose_logger.exception(
-            "AawmAgentIdentity: failed to flush %d session_history records: %s",
+            "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)",
             len(records),
             _format_exception_for_warning(exc),
+            _session_history_queue_depth_summary(),
         )
-        return
+        return False
 
     verbose_logger.debug(
-        "AawmAgentIdentity: flushed %d session_history records in %.2fms",
+        "AawmAgentIdentity: flushed %d session_history records in %.2fms (%s)",
         len(records),
         (time.perf_counter() - started_at) * 1000.0,
+        _session_history_queue_depth_summary(),
     )
+    return True
 
 
 def _flush_session_history_overflow_record(record: Dict[str, Any]) -> None:
     try:
-        _flush_session_history_batch([record])
+        _flush_session_history_batch_with_retry(
+            [record],
+            retry_message="overflow session_history flush",
+        )
     finally:
         _aawm_session_history_overflow_flush_semaphore.release()
+
+
+def _flush_session_history_batch_with_retry(
+    batch: List[Dict[str, Any]],
+    *,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
+    retry_message: str = "session_history batch flush",
+) -> None:
+    retry_seconds = _get_session_history_failed_flush_retry_seconds()
+    retry_count = 0
+    while not _flush_session_history_batch(batch, loop=loop):
+        retry_count += 1
+        verbose_logger.warning(
+            "AawmAgentIdentity: retrying %s after failure "
+            "(retry_count=%d, batch_size=%d, %s)",
+            retry_message,
+            retry_count,
+            len(batch),
+            _session_history_queue_depth_summary(),
+        )
+        time.sleep(retry_seconds)
 
 
 def _session_history_worker_main() -> None:
@@ -2451,11 +2506,11 @@ def _session_history_worker_main() -> None:
                 except queue.Empty:
                     break
                 if next_item is None:
-                    _flush_session_history_batch(batch, loop=loop)
+                    _flush_session_history_batch_with_retry(batch, loop=loop)
                     return
                 batch.append(next_item)
 
-            _flush_session_history_batch(batch, loop=loop)
+            _flush_session_history_batch_with_retry(batch, loop=loop)
     finally:
         loop.run_until_complete(_close_aawm_session_history_pools_for_current_loop())
         loop.close()
@@ -2528,12 +2583,16 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
                 pass
 
             verbose_logger.warning(
-                "AawmAgentIdentity: session_history queue full and overflow flusher busy; dropping overflow record"
+                "AawmAgentIdentity: session_history queue full and overflow flusher "
+                "busy; dropping overflow record (%s)",
+                _session_history_queue_depth_summary(),
             )
             return
 
         verbose_logger.warning(
-            "AawmAgentIdentity: session_history queue full; flushing overflow record in background"
+            "AawmAgentIdentity: session_history queue full; flushing overflow "
+            "record in background (%s)",
+            _session_history_queue_depth_summary(),
         )
         try:
             threading.Thread(
@@ -3881,13 +3940,6 @@ def _extract_claude_permission_check_decision(
     return None
 
 
-def _first_non_empty_string(*values: Any) -> Optional[str]:
-    for value in values:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
 def _extract_claude_permission_check_models(
     kwargs: Dict[str, Any],
     standard_logging_object: Dict[str, Any],
@@ -4496,9 +4548,9 @@ def _parse_provider_timestamp(value: Any) -> Optional[datetime]:
     if parsed is not None:
         return parsed
     if isinstance(value, str):
-        numeric_value = _safe_float(value.strip())
-        if numeric_value is not None:
-            return _parse_provider_timestamp(numeric_value)
+        numeric_string_value = _safe_float(value.strip())
+        if numeric_string_value is not None:
+            return _parse_provider_timestamp(numeric_string_value)
     return None
 
 
@@ -5283,12 +5335,15 @@ def _finalize_rate_limit_observation(
     )
     finalized["model_family"] = finalized.get("model_family") or model_family
     finalized["model_tier"] = finalized.get("model_tier") or model_tier
+    finalized_metadata = finalized.get("metadata")
+    if not isinstance(finalized_metadata, dict):
+        finalized_metadata = {}
     finalized["client_family"] = finalized.get(
         "client_family"
     ) or _infer_rate_limit_client_family(
         finalized.get("provider"),
         str(finalized.get("model") or ""),
-        finalized.get("metadata") if isinstance(finalized.get("metadata"), dict) else {},
+        finalized_metadata,
         finalized.get("source"),
     )
     finalized["limit_key"] = _build_rate_limit_key(
@@ -6140,7 +6195,8 @@ def _extract_xai_oauth_header_rate_limit_observations(
         context
     ):
         return []
-    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    raw_metadata = context.get("metadata")
+    metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
     account_hash = _extract_xai_oauth_account_hash(metadata)
     model = _clean_non_empty_string(metadata.get("xai_oauth_public_model")) or (
         _clean_non_empty_string(context.get("model"))
@@ -6586,7 +6642,7 @@ def _antigravity_quota_pool_for_model(model: Optional[str]) -> Tuple[str, str, s
     )
 
 
-def _extract_google_quota_observations(
+def _extract_google_quota_observations(  # noqa: PLR0915
     kwargs: Dict[str, Any],
     result: Any,
     observed_at: Any,
@@ -6598,7 +6654,8 @@ def _extract_google_quota_observations(
         "google_retrieve_user_quota",
     )
     observations: List[Dict[str, Any]] = []
-    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    raw_metadata = context.get("metadata")
+    metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
     default_quota_source = _clean_non_empty_string(
         _maybe_get(metadata.get("google_retrieve_user_quota"), "source")
     )
@@ -6837,7 +6894,8 @@ def _extract_google_error_observations(
         status_text = _clean_non_empty_string(error.get("status"))
         code = _safe_int(error.get("code"))
         message = _clean_non_empty_string(error.get("message")) or ""
-        details = error.get("details") if isinstance(error.get("details"), list) else []
+        raw_details = error.get("details")
+        details: List[Any] = raw_details if isinstance(raw_details, list) else []
         reasons = [
             _clean_non_empty_string(_maybe_get(detail, "reason"))
             for detail in details
@@ -7049,7 +7107,8 @@ def _extract_provider_error_text(result: Any, dicts: List[Dict[str, Any]]) -> st
             cleaned = _clean_non_empty_string(error.get(key))
             if cleaned:
                 parts.append(cleaned)
-        details = error.get("details") if isinstance(error.get("details"), list) else []
+        raw_details = error.get("details")
+        details: List[Any] = raw_details if isinstance(raw_details, list) else []
         for detail in details:
             if not isinstance(detail, dict):
                 continue
@@ -8775,7 +8834,7 @@ def _structured_output_state_from_format(
         parsed.get("mode"),
         default_mode,
     )
-    mode = raw_mode.lower().replace("-", "_") if raw_mode else None
+    dict_mode = raw_mode.lower().replace("-", "_") if raw_mode else None
     schema = _first_non_none(
         parsed.get("json_schema"),
         parsed.get("schema"),
@@ -8789,14 +8848,18 @@ def _structured_output_state_from_format(
     )
     has_json_mime = bool(mime_type and "json" in mime_type.lower())
     has_json_mode = bool(
-        mode
-        and (mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES or "json" in mode or "schema" in mode)
+        dict_mode
+        and (
+            dict_mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES
+            or "json" in dict_mode
+            or "schema" in dict_mode
+        )
     )
     if schema is None and not has_json_mode and not has_json_mime:
         return state
 
     state["structured_output_attempted"] = True
-    state["structured_output_mode"] = mode or (
+    state["structured_output_mode"] = dict_mode or (
         "response_schema" if schema is not None else "json_mime_type"
     )
     state["structured_output_schema_hash"] = _structured_output_schema_hash(schema)
@@ -9434,7 +9497,7 @@ def _extract_service_tier_hint(
     return None
 
 
-def _compute_provider_cache_miss_cost_state(
+def _compute_provider_cache_miss_cost_state(  # noqa: PLR0915
     *,
     provider_family: Optional[str],
     model: str,
@@ -9530,7 +9593,7 @@ def _compute_provider_cache_miss_cost_state(
             from litellm.litellm_core_utils.llm_cost_calc.utils import (
                 _get_token_base_cost,
             )
-            from litellm.types.utils import Usage
+            from litellm.types.utils import ModelInfo, Usage
             from litellm.utils import get_model_info
 
             usage_for_cost = Usage(
@@ -9539,7 +9602,7 @@ def _compute_provider_cache_miss_cost_state(
                 total_tokens=miss_token_count,
             )
             try:
-                model_info = get_model_info(
+                model_info: Any = get_model_info(
                     model=model,
                     custom_llm_provider=cost_provider_family,
                 )
@@ -9560,6 +9623,7 @@ def _compute_provider_cache_miss_cost_state(
                     result["miss_cost_usd"] = fallback_cost
                     result["miss_cost_basis"] = fallback_basis
                 return result
+            typed_model_info = cast(ModelInfo, model_info)
             (
                 prompt_base_cost,
                 _completion_base_cost,
@@ -9567,7 +9631,7 @@ def _compute_provider_cache_miss_cost_state(
                 _cache_creation_cost_above_1hr,
                 cache_read_cost,
             ) = _get_token_base_cost(
-                model_info=model_info,
+                model_info=typed_model_info,
                 usage=usage_for_cost,
                 service_tier=service_tier,
             )
@@ -9763,7 +9827,7 @@ def _provider_cache_state_from_metadata(
     }
 
 
-def _resolve_provider_cache_state(
+def _resolve_provider_cache_state(  # noqa: PLR0915
     *,
     provider: Any,
     model: str,
@@ -10556,24 +10620,25 @@ def _extract_prompt_overhead_components(
         or "systemInstruction" in request_block
     )
     if is_nested_gemini:
+        nested_request_block = request_block if isinstance(request_block, dict) else {}
         _append_prompt_component(
             components,
             "system",
             path="request.systemInstruction",
-            value=request_block.get("systemInstruction")
-            or request_block.get("system_instruction"),
+            value=nested_request_block.get("systemInstruction")
+            or nested_request_block.get("system_instruction"),
         )
         _append_prompt_component(
             components,
             "tools",
             path="request.tools",
-            value=request_block.get("tools") or request_body.get("tools"),
+            value=nested_request_block.get("tools") or request_body.get("tools"),
         )
         _append_prompt_component(
             components,
             "conversation",
             path="request.contents",
-            value=request_block.get("contents"),
+            value=nested_request_block.get("contents"),
         )
         return components, "gemini_generate_content"
 
@@ -11168,7 +11233,7 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
     record["metadata"] = metadata
 
 
-def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
+def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:  # noqa: PLR0915
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
@@ -11229,28 +11294,28 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
             metadata[field] = value
 
     for field in _SESSION_HISTORY_AGENT_SCORE_FLOAT_FIELDS:
-        value = _safe_float(record.get(field))
+        float_value = _safe_float(record.get(field))
         metadata_key = f"usage_{field}"
-        if value is None:
+        if float_value is None:
             metadata.pop(metadata_key, None)
         else:
-            metadata[metadata_key] = value
+            metadata[metadata_key] = float_value
 
     for field in _SESSION_HISTORY_AGENT_SCORE_BOOL_FIELDS:
-        value = _optional_metadata_bool(record.get(field))
+        bool_value = _optional_metadata_bool(record.get(field))
         metadata_key = f"usage_{field}"
-        if value is None:
+        if bool_value is None:
             metadata.pop(metadata_key, None)
         else:
-            metadata[metadata_key] = value
+            metadata[metadata_key] = bool_value
 
     for field in _SESSION_HISTORY_AGENT_SCORE_INT_FIELDS:
-        value = _safe_int(record.get(field))
+        int_value = _safe_int(record.get(field))
         metadata_key = f"usage_{field}"
-        if value is None:
+        if int_value is None:
             metadata.pop(metadata_key, None)
         else:
-            metadata[metadata_key] = value
+            metadata[metadata_key] = int_value
 
     agent_score_reasons = _normalize_agent_score_reasons(
         record.get("agent_score_reasons")
@@ -11267,7 +11332,7 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:
     )
     cache_status = record.get("provider_cache_status")
     if provider_family is not None and isinstance(cache_status, str) and cache_status.strip():
-        cache_values = {
+        cache_values: Dict[str, Any] = {
             "provider_cache_attempted": bool(record.get("provider_cache_attempted")),
             "provider_cache_status": cache_status,
             "provider_cache_miss": bool(record.get("provider_cache_miss")),
@@ -12555,21 +12620,6 @@ def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
     return 0, []
 
 
-def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
-    """Safely traverse nested dict/object paths."""
-    current = obj
-    for key in keys:
-        if isinstance(current, dict):
-            current = current.get(key, default)
-        elif hasattr(current, key):
-            current = getattr(current, key)
-        else:
-            return default
-        if current is default:
-            return default
-    return current
-
-
 def _extract_response_output_tool_call_info(
     result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
 ) -> Tuple[int, List[str]]:
@@ -12686,21 +12736,6 @@ def _extract_trace_id(kwargs: Dict[str, Any]) -> Optional[str]:
         if candidate is not None and str(candidate).strip():
             return str(candidate)
     return None
-
-
-def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
-    """Safely traverse nested dict/object paths."""
-    current = obj
-    for key in keys:
-        if isinstance(current, dict):
-            current = current.get(key, default)
-        elif hasattr(current, key):
-            current = getattr(current, key)
-        else:
-            return default
-        if current is default:
-            return default
-    return current
 
 
 def _infer_usage_breakout_provider_prefix(
@@ -12820,7 +12855,7 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
     )
 
 
-def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None:
+def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None:  # noqa: PLR0915
     metadata = _ensure_mutable_metadata(kwargs)
     standard_logging_object = kwargs.get("standard_logging_object") or {}
     resolved_model = _resolve_session_history_model(
@@ -13545,7 +13580,7 @@ def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> Lis
     return sorted({tag for tag in normalized_tags if isinstance(tag, str) and tag.strip()})
 
 
-def _build_session_history_record_from_langfuse_trace_observation(
+def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0915
     trace: Dict[str, Any],
     observation: Dict[str, Any],
     *,
@@ -14424,7 +14459,7 @@ def _resolve_xai_grok_model_override(
 
 
 
-def _build_session_history_record(
+def _build_session_history_record(  # noqa: PLR0915
     kwargs: Dict[str, Any],
     result: Any,
     start_time: Any,
@@ -15522,6 +15557,108 @@ def _rate_limit_observation_only_requested(kwargs: Dict[str, Any]) -> bool:
     return bool(metadata.get("aawm_rate_limit_observation_only"))
 
 
+async def _persist_rate_limit_observations_best_effort(
+    conn: Any,
+    records: List[Dict[str, Any]],
+    *,
+    history_records: List[Dict[str, Any]],
+) -> None:
+    try:
+        openrouter_free_daily_observations = (
+            await _build_openrouter_free_daily_observations_for_records(
+                conn,
+                history_records,
+            )
+        )
+        rate_limit_observations: List[Dict[str, Any]] = []
+        for record in records:
+            observations = record.get("rate_limit_observations")
+            if isinstance(observations, list):
+                rate_limit_observations.extend(
+                    observation
+                    for observation in observations
+                    if isinstance(observation, dict)
+                )
+        rate_limit_observations.extend(openrouter_free_daily_observations)
+        if rate_limit_observations:
+            (
+                rate_limit_observations,
+                initial_previous_by_limit_key,
+            ) = await _filter_meaningful_rate_limit_observations(
+                conn,
+                rate_limit_observations,
+            )
+        if not rate_limit_observations:
+            return
+        transitions = await _derive_rate_limit_transitions(
+            conn,
+            rate_limit_observations,
+            initial_previous_by_limit_key,
+        )
+        await conn.executemany(
+            _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+            [
+                _build_rate_limit_observation_db_payload(observation)
+                for observation in rate_limit_observations
+            ],
+        )
+        if transitions:
+            await conn.executemany(
+                _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
+                [
+                    _build_rate_limit_transition_db_payload(transition)
+                    for transition in transitions
+                ],
+            )
+    except Exception as exc:
+        verbose_logger.exception(
+            "AawmAgentIdentity: failed to persist best-effort rate-limit "
+            "observations for %d session_history records: %s",
+            len(records),
+            _format_exception_for_warning(exc),
+        )
+
+
+async def _persist_provider_error_observations_best_effort(
+    conn: Any,
+    records: List[Dict[str, Any]],
+    *,
+    identity_by_session: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
+    try:
+        provider_error_observations: List[Dict[str, Any]] = []
+        for record in records:
+            observations = record.get("provider_error_observations")
+            if isinstance(observations, list):
+                provider_error_observations.extend(
+                    observation
+                    for observation in observations
+                    if isinstance(observation, dict)
+                )
+        if not provider_error_observations:
+            return
+        for observation in provider_error_observations:
+            await _apply_claude_auto_review_parent_identity_from_store(
+                conn,
+                observation,
+                identity_by_session,
+            )
+        await conn.executemany(
+            _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
+            [
+                _build_provider_error_observation_db_payload(observation)
+                for observation in provider_error_observations
+            ],
+        )
+    except Exception as exc:
+        verbose_logger.exception(
+            "AawmAgentIdentity: failed to persist best-effort provider error "
+            "observations for %d session_history records: %s",
+            len(records),
+            _format_exception_for_warning(exc),
+        )
+
+
 async def _persist_session_history_record(record: Dict[str, Any]) -> None:
     pool = await _get_aawm_session_history_pool()
     async with pool.acquire() as conn:
@@ -15540,64 +15677,13 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
                     tool_activity_payloads,
                 )
 
-        openrouter_free_daily_observations = (
-            await _build_openrouter_free_daily_observations_for_records(conn, [record])
+        history_records = [] if record.get("_skip_session_history") else [record]
+        await _persist_rate_limit_observations_best_effort(
+            conn,
+            [record],
+            history_records=history_records,
         )
-        observations = record.get("rate_limit_observations")
-        rate_limit_observations = [
-            observation
-            for observation in observations
-            if isinstance(observation, dict)
-        ] if isinstance(observations, list) else []
-        rate_limit_observations.extend(openrouter_free_daily_observations)
-        if rate_limit_observations:
-            (
-                rate_limit_observations,
-                initial_previous_by_limit_key,
-            ) = await _filter_meaningful_rate_limit_observations(
-                conn,
-                rate_limit_observations,
-            )
-        if rate_limit_observations:
-            transitions = await _derive_rate_limit_transitions(
-                conn,
-                rate_limit_observations,
-                initial_previous_by_limit_key,
-            )
-            await conn.executemany(
-                _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
-                [
-                    _build_rate_limit_observation_db_payload(observation)
-                    for observation in rate_limit_observations
-                ],
-            )
-            if transitions:
-                await conn.executemany(
-                    _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
-                    [
-                        _build_rate_limit_transition_db_payload(transition)
-                        for transition in transitions
-                    ],
-                )
-        provider_error_observations = record.get("provider_error_observations")
-        provider_error_observations = [
-            observation
-            for observation in provider_error_observations
-            if isinstance(observation, dict)
-        ] if isinstance(provider_error_observations, list) else []
-        if provider_error_observations:
-            for observation in provider_error_observations:
-                await _apply_claude_auto_review_parent_identity_from_store(
-                    conn,
-                    observation,
-                )
-            await conn.executemany(
-                _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
-                [
-                    _build_provider_error_observation_db_payload(observation)
-                    for observation in provider_error_observations
-                ],
-            )
+        await _persist_provider_error_observations_best_effort(conn, [record])
 
 
 async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
@@ -15632,74 +15718,16 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
             )
-        openrouter_free_daily_observations = (
-            await _build_openrouter_free_daily_observations_for_records(
-                conn,
-                history_records,
-            )
+        await _persist_rate_limit_observations_best_effort(
+            conn,
+            records,
+            history_records=history_records,
         )
-        rate_limit_observations: List[Dict[str, Any]] = []
-        for record in records:
-            observations = record.get("rate_limit_observations")
-            if isinstance(observations, list):
-                rate_limit_observations.extend(
-                    observation
-                    for observation in observations
-                    if isinstance(observation, dict)
-                )
-        rate_limit_observations.extend(openrouter_free_daily_observations)
-        if rate_limit_observations:
-            (
-                rate_limit_observations,
-                initial_previous_by_limit_key,
-            ) = await _filter_meaningful_rate_limit_observations(
-                conn,
-                rate_limit_observations,
-            )
-        if rate_limit_observations:
-            transitions = await _derive_rate_limit_transitions(
-                conn,
-                rate_limit_observations,
-                initial_previous_by_limit_key,
-            )
-            await conn.executemany(
-                _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
-                [
-                    _build_rate_limit_observation_db_payload(observation)
-                    for observation in rate_limit_observations
-                ],
-            )
-            if transitions:
-                await conn.executemany(
-                    _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
-                    [
-                        _build_rate_limit_transition_db_payload(transition)
-                        for transition in transitions
-                    ],
-                )
-        provider_error_observations: List[Dict[str, Any]] = []
-        for record in records:
-            observations = record.get("provider_error_observations")
-            if isinstance(observations, list):
-                provider_error_observations.extend(
-                    observation
-                    for observation in observations
-                    if isinstance(observation, dict)
-                )
-        if provider_error_observations:
-            for observation in provider_error_observations:
-                await _apply_claude_auto_review_parent_identity_from_store(
-                    conn,
-                    observation,
-                    identity_by_session,
-                )
-            await conn.executemany(
-                _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
-                [
-                    _build_provider_error_observation_db_payload(observation)
-                    for observation in provider_error_observations
-                ],
-            )
+        await _persist_provider_error_observations_best_effort(
+            conn,
+            records,
+            identity_by_session=identity_by_session,
+        )
 
 
 def _get_reasoning_state_tags(
@@ -15919,7 +15947,7 @@ def _extract_gemini_signature_summary(signature: str) -> Dict[str, Any]:
     return summary
 
 
-def _enrich_gemini_thought_signature_metadata(
+def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
     metadata: Dict[str, Any], message: Any
 ) -> None:
     span_started_at = datetime.now(timezone.utc)
