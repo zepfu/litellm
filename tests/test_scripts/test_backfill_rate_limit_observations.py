@@ -6,6 +6,27 @@ from datetime import datetime, timezone
 import scripts.backfill_rate_limit_observations as quota_backfill
 
 
+def test_should_prefer_direct_dsn_for_rate_limit_backfill(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quota_backfill,
+        "_get_first_secret",
+        lambda names: (
+            "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore"
+            if "AAWM_DIRECT_DATABASE_URL" in names
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        quota_backfill,
+        "_build_aawm_dsn",
+        lambda: "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
+    )
+
+    assert quota_backfill._build_aawm_admin_dsn() == (
+        "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore"
+    )
+
+
 def test_should_format_clickhouse_datetime_without_timezone_suffix() -> None:
     assert (
         quota_backfill._format_clickhouse_datetime(

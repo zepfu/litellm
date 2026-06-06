@@ -286,6 +286,56 @@ class PassThroughStreamingHandler:
                 model_call_details[key] = kwargs[key]
 
     @staticmethod
+    def _capture_stream_shape(
+        *,
+        response: httpx.Response,
+        endpoint_type: EndpointType,
+        url_route: str,
+        request_body: dict,
+        raw_bytes: List[bytes],
+        all_chunks: List[str],
+        metadata: Dict[str, Any],
+        custom_llm_provider: Optional[str],
+        litellm_call_id: Optional[str],
+    ) -> None:
+        try:
+            upstream_request = response.request
+        except RuntimeError:
+            upstream_request = None
+        capture_passthrough_stream_shape(
+            provider=custom_llm_provider or endpoint_type.value,
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            request_body=request_body,
+            response=response,
+            upstream_request=upstream_request,
+            all_chunks=all_chunks,
+            raw_bytes=raw_bytes,
+            litellm_call_id=litellm_call_id,
+            extra_metadata={
+                "custom_llm_provider": custom_llm_provider,
+                "is_openai_responses": metadata[
+                    "aawm_stream_logging_is_openai_responses"
+                ],
+            },
+        )
+
+    @staticmethod
+    def _annotate_stream_logging_metadata(
+        metadata: Dict[str, Any],
+        *,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+    ) -> None:
+        metadata["aawm_stream_logging_endpoint_type"] = endpoint_type.value
+        if custom_llm_provider:
+            metadata["aawm_stream_logging_custom_llm_provider"] = custom_llm_provider
+        metadata["aawm_stream_logging_is_openai_responses"] = (
+            OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+        )
+
+    @staticmethod
     async def chunk_processor(
         response: httpx.Response,
         request_body: Optional[dict],
@@ -492,29 +542,23 @@ class PassThroughStreamingHandler:
                 else {}
             )
             metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
-            metadata["aawm_stream_logging_endpoint_type"] = endpoint_type.value
-            if custom_llm_provider:
-                metadata["aawm_stream_logging_custom_llm_provider"] = custom_llm_provider
-            metadata["aawm_stream_logging_is_openai_responses"] = (
-                OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+            PassThroughStreamingHandler._annotate_stream_logging_metadata(
+                metadata,
+                endpoint_type=endpoint_type,
+                url_route=url_route,
+                custom_llm_provider=custom_llm_provider,
             )
-            capture_passthrough_stream_shape(
-                provider=custom_llm_provider or endpoint_type.value,
+            PassThroughStreamingHandler._capture_stream_shape(
+                response=response,
                 endpoint_type=endpoint_type,
                 url_route=url_route,
                 request_body=request_body,
-                response=response,
-                upstream_request=getattr(response, "request", None),
-                all_chunks=all_chunks,
                 raw_bytes=raw_bytes,
+                all_chunks=all_chunks,
+                metadata=metadata,
+                custom_llm_provider=custom_llm_provider,
                 litellm_call_id=kwargs.get("litellm_call_id")
                 or getattr(litellm_logging_obj, "litellm_call_id", None),
-                extra_metadata={
-                    "custom_llm_provider": custom_llm_provider,
-                    "is_openai_responses": metadata[
-                        "aawm_stream_logging_is_openai_responses"
-                    ],
-                },
             )
             if custom_llm_provider in {"gemini", "antigravity"}:
                 if not passthrough_success_handler_obj.is_gemini_route(

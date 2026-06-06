@@ -81,6 +81,7 @@ from litellm.secret_managers.main import get_secret_str
 
 _SOURCE_DB_ENV_VARS = ("DATABASE_URL", "DIRECT_URL")
 _LANGFUSE_DB_ENV_VARS = ("LANGFUSE_DATABASE_URL", "AAWM_LANGFUSE_DATABASE_URL")
+_AAWM_DIRECT_DB_ENV_VARS = ("AAWM_DIRECT_DATABASE_URL",)
 _CLICKHOUSE_URL_ENV_VARS = ("CLICKHOUSE_URL", "LANGFUSE_CLICKHOUSE_URL")
 _CLICKHOUSE_USER_ENV_VARS = ("CLICKHOUSE_USER", "LANGFUSE_CLICKHOUSE_USER")
 _CLICKHOUSE_PASSWORD_ENV_VARS = ("CLICKHOUSE_PASSWORD", "LANGFUSE_CLICKHOUSE_PASSWORD")
@@ -93,6 +94,16 @@ _GEMINI_CONTROL_PLANE_METHODS = frozenset(
         "fetchAdminControls",
     )
 )
+
+
+def _build_aawm_admin_dsn() -> Optional[str]:
+    for env_var in _AAWM_DIRECT_DB_ENV_VARS:
+        value = get_secret_str(env_var)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return _build_aawm_dsn()
+
+
 _GEMINI_CONTROL_PLANE_METHODS_BY_LOWER = {
     method.lower(): method for method in _GEMINI_CONTROL_PLANE_METHODS
 }
@@ -261,7 +272,7 @@ async def _get_session_history_pool() -> asyncpg.Pool:
     if _SESSION_HISTORY_POOL is not None:
         return _SESSION_HISTORY_POOL
 
-    dsn = _build_aawm_dsn()
+    dsn = _build_aawm_admin_dsn()
     if not dsn:
         raise RuntimeError("AAWM/tristore database configuration is missing")
 
@@ -1172,7 +1183,7 @@ async def _run_spend_log_backfill(  # noqa: PLR0915
     run_id: str,
 ) -> Dict[str, Any]:
     prisma_client = await _create_source_prisma_client(source_database_url)
-    target_dsn = _build_aawm_dsn()
+    target_dsn = _build_aawm_admin_dsn()
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
@@ -1292,7 +1303,7 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
     langfuse_backfiller: Optional[LangfuseTraceTagBackfiller],
     run_id: str,
 ) -> Dict[str, Any]:
-    target_dsn = _build_aawm_dsn()
+    target_dsn = _build_aawm_admin_dsn()
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
@@ -1499,7 +1510,7 @@ async def _run_langfuse_db_backfill(  # noqa: PLR0915
     langfuse_database_url: str,
     run_id: str,
 ) -> Dict[str, Any]:
-    target_dsn = _build_aawm_dsn()
+    target_dsn = _build_aawm_admin_dsn()
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
@@ -1659,7 +1670,7 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
     langfuse_backfiller: Optional[LangfuseTraceTagBackfiller],
     run_id: str,
 ) -> Dict[str, Any]:
-    target_dsn = _build_aawm_dsn()
+    target_dsn = _build_aawm_admin_dsn()
     if args.apply:
         if not target_dsn:
             raise RuntimeError("AAWM/tristore database configuration is missing")
@@ -2458,7 +2469,7 @@ async def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
     source_database_url = _clean_secret(args.source_database_url) or _get_first_secret(
         _SOURCE_DB_ENV_VARS
     )
-    target_dsn = _build_aawm_dsn()
+    target_dsn = _build_aawm_admin_dsn()
     langfuse_database_url = _derive_langfuse_database_url(
         getattr(args, "langfuse_database_url", None),
         target_dsn=target_dsn,

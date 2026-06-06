@@ -2741,6 +2741,18 @@ def _get_session_history_application_name() -> str:
     )
 
 
+def _get_session_history_server_settings() -> Dict[str, str]:
+    return {"application_name": _get_session_history_application_name()}
+
+
+async def _initialize_session_history_connection(conn: Any) -> None:
+    await conn.execute(
+        "select set_config($1, $2, false)",
+        "application_name",
+        _get_session_history_application_name(),
+    )
+
+
 def _build_session_history_dsn() -> Optional[str]:
     dsn = _build_aawm_dsn()
     if not dsn:
@@ -7203,9 +7215,9 @@ def _extract_provider_error_code_and_type(
         if not isinstance(error, dict):
             continue
         error_code = error_code or _first_non_empty_string(
-            error.get("code"),
             error.get("status"),
             error.get("reason"),
+            error.get("code"),
         )
         error_type = error_type or _first_non_empty_string(
             error.get("type"),
@@ -14961,11 +14973,18 @@ async def _open_aawm_session_history_connection() -> Any:
             "AAWM session history requires asyncpg to be installed"
         ) from exc
 
-    return await asyncpg.connect(
+    conn = await asyncpg.connect(
         dsn=dsn,
         command_timeout=_get_session_history_command_timeout_seconds(),
         statement_cache_size=_get_session_history_statement_cache_size(),
+        server_settings=_get_session_history_server_settings(),
     )
+    try:
+        await _initialize_session_history_connection(conn)
+    except Exception:
+        await conn.close()
+        raise
+    return conn
 
 
 async def _get_aawm_session_history_pool() -> Any:
@@ -14993,6 +15012,8 @@ async def _get_aawm_session_history_pool() -> Any:
         max_size=_get_session_history_pool_max_size(),
         command_timeout=_get_session_history_command_timeout_seconds(),
         statement_cache_size=_get_session_history_statement_cache_size(),
+        server_settings=_get_session_history_server_settings(),
+        init=_initialize_session_history_connection,
     )
     with _aawm_session_history_pool_lock:
         existing_pool = _aawm_session_history_pools.get(pool_key)
@@ -15724,6 +15745,7 @@ async def _persist_provider_error_observations_best_effort(
 async def _persist_session_history_record(record: Dict[str, Any]) -> None:
     pool = await _get_aawm_session_history_pool()
     async with pool.acquire() as conn:
+        await _initialize_session_history_connection(conn)
         await _ensure_session_history_schema(conn)
 
         if not record.get("_skip_session_history"):
@@ -15746,6 +15768,7 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
             history_records=history_records,
         )
         await _persist_provider_error_observations_best_effort(conn, [record])
+        await _initialize_session_history_connection(conn)
 
 
 async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
@@ -15754,6 +15777,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
 
     pool = await _get_aawm_session_history_pool()
     async with pool.acquire() as conn:
+        await _initialize_session_history_connection(conn)
         await _ensure_session_history_schema(conn)
 
         history_records = [
@@ -15790,6 +15814,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             records,
             identity_by_session=identity_by_session,
         )
+        await _initialize_session_history_connection(conn)
 
 
 def _get_reasoning_state_tags(

@@ -52,6 +52,13 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
 )
 
 
+def _build_aawm_admin_dsn() -> Optional[str]:
+    direct_dsn = os.getenv("AAWM_DIRECT_DATABASE_URL")
+    if direct_dsn and direct_dsn.strip():
+        return direct_dsn.strip()
+    return _build_aawm_dsn()
+
+
 _LATENCY_METADATA_KEYS = (
     "aawm_local_prepare_ms",
     "aawm_upstream_wait_ms",
@@ -327,7 +334,7 @@ def _run_gap_backfill_pass(
 
 
 def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
-    dsn = _build_aawm_dsn()
+    dsn = _build_aawm_admin_dsn()
     if not dsn:
         raise RuntimeError("AAWM/tristore database configuration is missing")
 

@@ -8,6 +8,46 @@ from pathlib import Path
 import scripts.backfill_local_cli_session_history as backfill
 
 
+def test_should_prefer_direct_dsn_when_no_pg_component_override(monkeypatch) -> None:
+    args = backfill.argparse.Namespace(
+        pg_dsn=None,
+        pg_host=None,
+        pg_port=None,
+        pg_user=None,
+        pg_password=None,
+        target_db_name="aawm_tristore",
+    )
+    monkeypatch.setenv(
+        "AAWM_DIRECT_DATABASE_URL",
+        "postgresql://aawm:aawm_dev@127.0.0.1:5434/aawm_tristore",
+    )
+    monkeypatch.setenv("AAWM_DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("AAWM_DB_PORT", "6432")
+
+    assert backfill._postgres_dsn_from_args(args) == (
+        "postgresql://aawm:aawm_dev@127.0.0.1:5434/aawm_tristore"
+    )
+
+
+def test_should_prefer_pg_component_override_over_direct_dsn(monkeypatch) -> None:
+    args = backfill.argparse.Namespace(
+        pg_dsn=None,
+        pg_host="127.0.0.1",
+        pg_port="6432",
+        pg_user="aawm",
+        pg_password="aawm_dev",
+        target_db_name="aawm_tristore",
+    )
+    monkeypatch.setenv(
+        "AAWM_DIRECT_DATABASE_URL",
+        "postgresql://aawm:aawm_dev@127.0.0.1:5434/aawm_tristore",
+    )
+
+    assert backfill._postgres_dsn_from_args(args) == (
+        "postgresql://aawm:aawm_dev@127.0.0.1:6432/aawm_tristore"
+    )
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(

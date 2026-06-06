@@ -263,14 +263,18 @@ def test_setup_schema_executes_provider_status_ddl_with_timeouts(monkeypatch) ->
 
     execute_calls = fake_conn.cursor_instance.execute_calls
     assert execute_calls[0] == (
+        "SELECT set_config('application_name', %s, false)",
+        ("aawm-provider-status-observations",),
+    )
+    assert execute_calls[1] == (
         "SELECT set_config('lock_timeout', %s, true)",
         ("123ms",),
     )
-    assert execute_calls[1] == (
+    assert execute_calls[2] == (
         "SELECT set_config('statement_timeout', %s, true)",
         ("456ms",),
     )
-    ddl_statements = [statement for statement, _params in execute_calls[2:]]
+    ddl_statements = [statement for statement, _params in execute_calls[3:]]
     assert probes.PROVIDER_STATUS_TABLE_SQL in ddl_statements
     for statement in probes.PROVIDER_STATUS_ALTER_STATEMENTS:
         assert statement in ddl_statements
@@ -294,6 +298,10 @@ def test_insert_observations_does_not_execute_provider_status_ddl(monkeypatch) -
 
     execute_calls = fake_conn.cursor_instance.execute_calls
     assert execute_calls == [
+        (
+            "SELECT set_config('application_name', %s, false)",
+            ("aawm-provider-status-observations",),
+        ),
         ("SELECT set_config('lock_timeout', %s, true)", ("321ms",)),
         ("SELECT set_config('statement_timeout', %s, true)", ("654ms",)),
     ]

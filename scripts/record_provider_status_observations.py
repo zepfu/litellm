@@ -565,6 +565,10 @@ def _set_database_timeouts(
     lock_timeout_ms: int,
     statement_timeout_ms: int,
 ) -> None:
+    cur.execute(
+        "SELECT set_config('application_name', %s, false)",
+        (_provider_status_db_application_name(),),
+    )
     cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
     cur.execute(
         "SELECT set_config('statement_timeout', %s, true)",
