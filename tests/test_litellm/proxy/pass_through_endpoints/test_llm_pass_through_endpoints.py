@@ -35,6 +35,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _apply_google_adapter_completion_message_window,
     _apply_google_adapter_request_shape_policy,
     _apply_google_adapter_system_prompt_policy,
+    _apply_aawm_read_agent_guidance_to_request_body,
     _apply_google_code_assist_native_tool_aliases,
     _apply_codex_auto_agent_prevention_guidance_to_request_body,
     _apply_codex_google_code_assist_tool_contract_policy,
@@ -77,6 +78,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _google_oauth_access_token_cache,
     _get_google_adapter_semaphore,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
+    _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME,
+    _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION,
+    _AAWM_READ_AGENT_GUIDANCE_PROMPT,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT,
@@ -721,6 +725,181 @@ class TestResponsesAdapterToolChoice:
 
         assert second_body is updated_body
         assert second_metadata == {}
+
+    def test_applies_aawm_read_agent_guidance_to_codex_read_alias(self):
+        request_body = {
+            "model": "aawm-read",
+            "instructions": "Existing instructions.",
+            "litellm_metadata": {"tags": ["existing-tag"]},
+        }
+
+        updated_body, guidance_metadata = (
+            _apply_aawm_read_agent_guidance_to_request_body(
+                request_body,
+                alias_model="aawm-read",
+                target_field="instructions",
+            )
+        )
+
+        assert updated_body is not request_body
+        assert updated_body["instructions"].startswith("Existing instructions.")
+        assert "Do not edit files" in updated_body["instructions"]
+        assert "No files were modified." in updated_body["instructions"]
+        assert "Return findings, evidence" in updated_body["instructions"]
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert litellm_metadata["tags"] == [
+            "existing-tag",
+            "aawm-read-agent-guidance",
+            (
+                "aawm-read-agent-guidance:"
+                f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}"
+            ),
+            "aawm-read-agent-guidance-alias:aawm-read",
+        ]
+        assert (
+            litellm_metadata["aawm_read_agent_guidance_policy_name"]
+            == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
+        )
+        assert (
+            litellm_metadata["aawm_read_agent_guidance_policy_version"]
+            == _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
+        )
+        assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
+        assert litellm_metadata["aawm_read_agent_guidance_alias"] == "aawm-read"
+        assert (
+            litellm_metadata["aawm_read_agent_guidance_target_field"]
+            == "instructions"
+        )
+        read_guidance_spans = [
+            span
+            for span in litellm_metadata["langfuse_spans"]
+            if span["name"] == "aawm.read_agent_guidance"
+        ]
+        assert len(read_guidance_spans) == 1
+        assert read_guidance_spans[0]["metadata"][
+            "aawm_read_agent_guidance_policy_name"
+        ] == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
+        assert read_guidance_spans[0]["metadata"][
+            "aawm_read_agent_guidance_policy_version"
+        ] == _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
+        assert guidance_metadata == {
+            "aawm_read_agent_guidance_policy_name": (
+                _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
+            ),
+            "aawm_read_agent_guidance_policy_version": (
+                _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
+            ),
+            "aawm_read_agent_guidance_applied": True,
+            "aawm_read_agent_guidance_alias": "aawm-read",
+            "aawm_read_agent_guidance_target_field": "instructions",
+            "aawm_read_agent_guidance_original_chars": len(
+                "Existing instructions."
+            ),
+            "aawm_read_agent_guidance_prompt_chars": len(
+                _AAWM_READ_AGENT_GUIDANCE_PROMPT
+            ),
+        }
+
+        second_body, second_metadata = (
+            _apply_aawm_read_agent_guidance_to_request_body(
+                updated_body,
+                alias_model="aawm-read",
+                target_field="instructions",
+            )
+        )
+        assert second_body is updated_body
+        assert second_metadata == {}
+
+    def test_applies_aawm_read_agent_guidance_to_anthropic_read_alias_system(self):
+        request_body = {
+            "model": "aawm-read-anthropic",
+            "system": "Existing system.",
+            "litellm_metadata": {"tags": ["existing-tag"]},
+        }
+
+        updated_body, guidance_metadata = (
+            _apply_aawm_read_agent_guidance_to_request_body(
+                request_body,
+                alias_model="aawm-read-anthropic",
+                target_field="system",
+            )
+        )
+
+        assert updated_body is not request_body
+        assert updated_body["system"].startswith("Existing system.")
+        assert "Do not edit files" in updated_body["system"]
+        assert "No files were modified." in updated_body["system"]
+        litellm_metadata = updated_body["litellm_metadata"]
+        assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
+        assert (
+            "aawm-read-agent-guidance-alias:aawm-read-anthropic"
+            in litellm_metadata["tags"]
+        )
+        assert (
+            litellm_metadata["aawm_read_agent_guidance_policy_name"]
+            == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
+        )
+        assert (
+            litellm_metadata["aawm_read_agent_guidance_alias"]
+            == "aawm-read-anthropic"
+        )
+        assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "system"
+        assert guidance_metadata["aawm_read_agent_guidance_applied"] is True
+
+    def test_appends_aawm_read_agent_guidance_to_anthropic_system_blocks(self):
+        request_body = {
+            "model": "aawm-read-anthropic",
+            "system": [{"type": "text", "text": "Existing system."}],
+        }
+
+        updated_body, guidance_metadata = (
+            _apply_aawm_read_agent_guidance_to_request_body(
+                request_body,
+                alias_model="aawm-read-anthropic",
+                target_field="system",
+            )
+        )
+
+        assert updated_body["system"] == [
+            {"type": "text", "text": "Existing system."},
+            {"type": "text", "text": _AAWM_READ_AGENT_GUIDANCE_PROMPT},
+        ]
+        assert guidance_metadata["aawm_read_agent_guidance_target_field"] == "system"
+
+    @pytest.mark.parametrize(
+        ("alias_model", "target_field"),
+        [
+            ("aawm-codex-agent-auto", "instructions"),
+            ("aawm-sota", "instructions"),
+            ("aawm-code", "instructions"),
+            ("aawm-low", "instructions"),
+            ("aawm-anthropic-agent-auto", "system"),
+            ("aawm-sota-anthropic", "system"),
+            ("aawm-code-anthropic", "system"),
+            ("aawm-low-anthropic", "system"),
+        ],
+    )
+    def test_skips_aawm_read_agent_guidance_for_non_read_aliases(
+        self,
+        alias_model,
+        target_field,
+    ):
+        request_body = {
+            "model": alias_model,
+            target_field: "Existing guidance.",
+            "litellm_metadata": {"tags": ["existing-tag"]},
+        }
+
+        updated_body, guidance_metadata = (
+            _apply_aawm_read_agent_guidance_to_request_body(
+                request_body,
+                alias_model=alias_model,
+                target_field=target_field,
+            )
+        )
+
+        assert updated_body is request_body
+        assert guidance_metadata == {}
 
     def test_skips_openai_parallel_instruction_policy_when_already_applied(self):
         request_body = {
@@ -13276,6 +13455,7 @@ def clear_codex_auto_agent_alias_state():
     "alias",
     [
         "aawm-codex-agent-auto",
+        "aawm-read",
         "aawm-sota",
         "aawm-code",
         "aawm-low",
@@ -13346,6 +13526,7 @@ def _build_anthropic_auto_agent_body(session_id: str = "claude-session"):
     "alias",
     [
         "aawm-anthropic-agent-auto",
+        "aawm-read-anthropic",
         "aawm-sota-anthropic",
         "aawm-code-anthropic",
         "aawm-low-anthropic",
@@ -13403,6 +13584,51 @@ async def test_anthropic_auto_agent_alias_selects_spark_first(monkeypatch):
     assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["selection_reason"] == "first_available"
     assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-read-anthropic"
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "first_available"
+    updated_body = _add_anthropic_auto_agent_alias_metadata(
+        body,
+        selection=selection,
+        attempts=[
+            {
+                "provider": "openai",
+                "model": "gpt-5.3-codex-spark",
+                "route_family": "anthropic_openai_responses_adapter",
+                "last_resort": False,
+                "lane_key": "session:claude-session",
+                "reason": "first_available",
+            }
+        ],
+    )
+    metadata = updated_body["litellm_metadata"]
+    assert updated_body["model"] == "gpt-5.3-codex-spark"
+    assert metadata["requested_model_alias"] == "aawm-read-anthropic"
+    assert metadata["anthropic_auto_agent_alias"] == "aawm-read-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
+    assert metadata["anthropic_auto_agent_selected_route_family"] == (
+        "anthropic_openai_responses_adapter"
+    )
+    assert "anthropic-auto-agent-alias:aawm-read-anthropic" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -14259,6 +14485,61 @@ async def test_anthropic_proxy_route_uses_auto_alias_only_on_anthropic_messages(
 
 
 @pytest.mark.asyncio
+async def test_anthropic_proxy_route_aawm_read_alias_applies_read_guidance(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-read-anthropic"
+    body["system"] = "Existing system."
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(return_value=body),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        new=AsyncMock(return_value=(body, 0, set(), {})),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_auto_agent_alias_route",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_alias_handler, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+    ) as mock_create_pass_through_route:
+        result = await anthropic_proxy_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+        )
+
+    assert result == {"ok": True}
+    mock_alias_handler.assert_awaited_once()
+    mock_create_pass_through_route.assert_not_called()
+    prepared_body = mock_alias_handler.await_args.kwargs["prepared_request_body"]
+    assert prepared_body is not body
+    assert prepared_body["model"] == "aawm-read-anthropic"
+    assert prepared_body["system"].startswith("Existing system.")
+    assert "Do not edit files" in prepared_body["system"]
+    assert "No files were modified." in prepared_body["system"]
+    litellm_metadata = prepared_body["litellm_metadata"]
+    assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
+    assert (
+        "aawm-read-agent-guidance:"
+        f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}"
+    ) in litellm_metadata["tags"]
+    assert (
+        "aawm-read-agent-guidance-alias:aawm-read-anthropic"
+        in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
+    assert (
+        litellm_metadata["aawm_read_agent_guidance_alias"]
+        == "aawm-read-anthropic"
+    )
+    assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "system"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model",
     [
@@ -14728,6 +15009,49 @@ async def test_codex_auto_agent_alias_selects_spark_first(monkeypatch):
     assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["selection_reason"] == "first_available"
     assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-read",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "first_available"
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        selection=selection,
+        attempts=[
+            {
+                "provider": "openai",
+                "model": "gpt-5.3-codex-spark",
+                "route_family": "codex_responses",
+                "last_resort": False,
+                "lane_key": "session:codex-session",
+                "reason": "first_available",
+            }
+        ],
+    )
+    metadata = updated_body["litellm_metadata"]
+    assert updated_body["model"] == "gpt-5.3-codex-spark"
+    assert metadata["requested_model_alias"] == "aawm-read"
+    assert metadata["codex_auto_agent_alias"] == "aawm-read"
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_route_family"] == "codex_responses"
+    assert "codex-auto-agent-alias:aawm-read" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -16485,13 +16809,90 @@ async def test_openai_passthrough_codex_auto_agent_alias_uses_alias_router(
         f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION}"
     ) in prepared_body["litellm_metadata"]["tags"]
     assert (
+        "aawm-read-agent-guidance"
+        not in prepared_body["litellm_metadata"]["tags"]
+    )
+    assert (
         prepared_body["litellm_metadata"][
             "codex_auto_agent_prevention_guidance_applied"
         ]
         is True
     )
+    assert (
+        "aawm_read_agent_guidance_applied"
+        not in prepared_body["litellm_metadata"]
+    )
     assert mock_alias_handler.await_args.kwargs["target_url"] == (
         "https://chatgpt.com/backend-api/codex/responses"
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
+    monkeypatch,
+):
+    mock_request = _build_codex_auto_agent_request("codex-session-123")
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(
+            return_value={
+                "model": "aawm-read",
+                "input": "hello",
+                "instructions": "Existing instructions.",
+                "litellm_metadata": {"tags": ["existing-tag"]},
+            }
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_auto_agent_alias_route",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_alias_handler, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+    ) as mock_create_pass_through_route:
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://chatgpt.com/backend-api/codex",
+            api_key=None,
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            forward_headers=True,
+        )
+
+    assert result == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    mock_alias_handler.assert_awaited_once()
+    mock_create_pass_through_route.assert_not_called()
+    prepared_body = mock_alias_handler.await_args.kwargs["prepared_request_body"]
+    assert prepared_body["model"] == "aawm-read"
+    assert prepared_body["instructions"].startswith("Existing instructions.")
+    assert "non-empty final answer" in prepared_body["instructions"]
+    assert "Do not edit files" in prepared_body["instructions"]
+    assert "No files were modified." in prepared_body["instructions"]
+    litellm_metadata = prepared_body["litellm_metadata"]
+    assert litellm_metadata["passthrough_route_family"] == "codex_responses"
+    assert "existing-tag" in litellm_metadata["tags"]
+    assert "codex-auto-agent-prevention-guidance" in litellm_metadata["tags"]
+    assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
+    assert (
+        "aawm-read-agent-guidance:"
+        f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}"
+    ) in litellm_metadata["tags"]
+    assert "aawm-read-agent-guidance-alias:aawm-read" in litellm_metadata["tags"]
+    assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
+    assert litellm_metadata["aawm_read_agent_guidance_alias"] == "aawm-read"
+    assert (
+        litellm_metadata["aawm_read_agent_guidance_policy_name"]
+        == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
+    )
+    assert (
+        litellm_metadata["aawm_read_agent_guidance_policy_version"]
+        == _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
     )
 
 
