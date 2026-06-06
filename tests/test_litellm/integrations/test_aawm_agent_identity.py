@@ -8050,6 +8050,166 @@ async def test_ensure_session_history_schema_does_not_execute_runtime_ddl(
     assert aawm_agent_identity._aawm_session_history_schema_ready is True
 
 
+def test_alias_routing_audit_schema_is_migration_owned() -> None:
+    source = inspect.getsource(aawm_agent_identity._ensure_session_history_schema)
+    table_sql = aawm_agent_identity._AAWM_ALIAS_ROUTING_AUDIT_TABLE_SQL
+    index_statements = aawm_agent_identity._AAWM_ALIAS_ROUTING_AUDIT_INDEX_STATEMENTS
+
+    assert "CREATE TABLE IF NOT EXISTS public.aawm_alias_routing_audit" in table_sql
+    assert "event_key TEXT" in table_sql
+    assert "session_id TEXT" in table_sql
+    assert "session_key TEXT" in table_sql
+    assert "alias_model TEXT NOT NULL" in table_sql
+    assert "alias_family TEXT NOT NULL" in table_sql
+    assert "cooldown_key TEXT" in table_sql
+    assert "redispatch_required BOOLEAN NOT NULL DEFAULT FALSE" in table_sql
+    assert "redispatch_threshold_crossed BOOLEAN NOT NULL DEFAULT FALSE" in table_sql
+    assert any("aawm_alias_routing_audit_session_observed_idx" in statement for statement in index_statements)
+    assert any("aawm_alias_routing_audit_provider_model_observed_idx" in statement for statement in index_statements)
+    assert "aawm_alias_routing_audit" not in source
+
+
+def test_build_session_history_record_preserves_alias_routing_audit_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["litellm_call_id"] = "call-alias-audit"
+    kwargs["model"] = "gpt-5.3-codex-spark"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-alias-audit",
+            "requested_model_alias": "aawm-read",
+            "aawm_alias_routing_audit_events": [
+                {
+                    "observed_at": "2026-06-06T12:00:00Z",
+                    "alias_family": "codex_auto_agent",
+                    "alias_model": "aawm-read",
+                    "session_id": "session-alias-audit",
+                    "provider": "openai",
+                    "model": "gpt-5.3-codex-spark",
+                    "route_family": "codex_responses",
+                    "event_type": "candidate_selected",
+                    "candidate_status": "selected",
+                    "attempt_number": 1,
+                    "selected": True,
+                }
+            ],
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={"id": "resp-alias-audit", "usage": {"prompt_tokens": 3}},
+        start_time="2026-06-06T12:00:00Z",
+        end_time="2026-06-06T12:00:01Z",
+    )
+
+    assert record is not None
+    audit_events = record["metadata"]["aawm_alias_routing_audit_events"]
+    assert audit_events[0]["alias_model"] == "aawm-read"
+    assert audit_events[0]["session_id"] == "session-alias-audit"
+    assert audit_events[0]["event_type"] == "candidate_selected"
+
+
+def test_build_alias_routing_audit_db_payload_includes_provider_timeout_state() -> None:
+    record = {
+        "litellm_call_id": "call-alias-timeout",
+        "session_id": "session-alias-timeout",
+        "trace_id": "trace-alias-timeout",
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "model_group": "aawm-read",
+        "repository": "litellm",
+        "start_time": datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc),
+        "metadata": {"requested_model_alias": "aawm-read"},
+    }
+    event = {
+        "observed_at": "2026-06-06T12:00:00Z",
+        "alias_family": "codex_auto_agent",
+        "alias_model": "aawm-read",
+        "session_id": "session-alias-timeout",
+        "session_key": "session-alias-timeout:openai-lane",
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "codex_responses",
+        "lane_key": "openai-lane",
+        "cooldown_key": "openai:gpt-5.3-codex-spark:openai-lane",
+        "attempt_number": 1,
+        "event_type": "candidate_retryable_failure",
+        "candidate_status": "cooldown_set",
+        "failure_class": "rate_limited",
+        "error_status_code": 429,
+        "cooldown_scope": "candidate",
+        "cooldown_seconds": 120.0,
+        "cooldown_until": "2026-06-06T12:02:00Z",
+        "selected": True,
+        "skipped": False,
+        "last_resort": False,
+        "in_flight_session": True,
+        "redispatch_required": True,
+    }
+
+    payload = aawm_agent_identity._build_alias_routing_audit_db_payload(
+        record,
+        event,
+        0,
+    )
+
+    assert payload[0].startswith("call-alias-timeout:alias-routing:")
+    assert payload[2] == "session-alias-timeout"
+    assert payload[3] == "session-alias-timeout:openai-lane"
+    assert payload[6] == "aawm-read"
+    assert payload[7] == "codex_auto_agent"
+    assert payload[8] == "codex_responses"
+    assert payload[9] == "openai"
+    assert payload[10] == "gpt-5.3-codex-spark"
+    assert payload[12] == "openai:gpt-5.3-codex-spark:openai-lane"
+    assert payload[14] == "candidate_retryable_failure"
+    assert payload[17] == "rate_limited"
+    assert payload[18] == 429
+    assert payload[20] == 120.0
+    assert payload[22] is True
+    assert payload[26] is True
+    metadata = json.loads(payload[28])
+    assert metadata["session_history_provider"] == "openai"
+    assert metadata["session_history_repository"] == "litellm"
+
+
+@pytest.mark.asyncio
+async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> None:
+    conn = AsyncMock()
+    record = {
+        "litellm_call_id": "call-alias-insert",
+        "session_id": "session-alias-insert",
+        "start_time": datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc),
+        "metadata": {
+            "aawm_alias_routing_audit_events": [
+                {
+                    "alias_family": "anthropic_auto_agent",
+                    "alias_model": "aawm-code-anthropic",
+                    "provider": "antigravity",
+                    "model": "claude-sonnet-4-6",
+                    "route_family": "anthropic_antigravity_completion_adapter",
+                    "event_type": "candidate_selected",
+                    "candidate_status": "selected",
+                    "selected": True,
+                }
+            ]
+        },
+    }
+
+    await aawm_agent_identity._persist_alias_routing_audit_best_effort(
+        conn,
+        [record],
+    )
+
+    conn.executemany.assert_awaited_once()
+    sql, payloads = conn.executemany.await_args.args
+    assert sql == aawm_agent_identity._AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL
+    assert len(payloads) == 1
+    assert payloads[0][6] == "aawm-code-anthropic"
+    assert payloads[0][9] == "antigravity"
+
+
 def test_provider_status_observations_schema_includes_icmp_fields() -> None:
     sql = aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL
 
