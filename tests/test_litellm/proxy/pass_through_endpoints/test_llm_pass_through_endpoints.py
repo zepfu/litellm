@@ -47,6 +47,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _collect_responses_response_from_stream,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
+    _classify_codex_auto_agent_retryable_exhaustion,
     _codex_auto_agent_request_has_continuation_state,
     _codex_google_code_assist_tool_call_arguments_cache,
     _codex_google_code_assist_tool_call_name_cache,
@@ -115,6 +116,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_google_adapter_error_reason,
     _extract_google_code_assist_function_names,
     _expand_claude_persisted_output_text,
+    _extract_codex_auto_agent_error_tokens,
     _prepare_anthropic_request_body_for_passthrough,
     _prepare_grok_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
@@ -8573,6 +8575,7 @@ class TestClaudePersistedOutputExpansion:
 
         translated_body = json.loads(result.body.decode("utf-8"))
         assert translated_body["model"] == requested_model
+        assert mock_pass_through_request.await_args is not None
         call_kwargs = mock_pass_through_request.await_args.kwargs
         assert call_kwargs["target"] == "https://openrouter.ai/api/v1/responses"
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
@@ -8668,6 +8671,7 @@ class TestClaudePersistedOutputExpansion:
 
         translated_body = json.loads(result.body.decode("utf-8"))
         assert translated_body["model"] == expected_model
+        assert mock_completion_adapter.await_args is not None
         call_kwargs = mock_completion_adapter.await_args.kwargs
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.NVIDIA_NIM.value
         assert call_kwargs["api_key"] == "nvidia-test-key"
@@ -8816,6 +8820,7 @@ class TestClaudePersistedOutputExpansion:
 
         translated_body = json.loads(result.body.decode("utf-8"))
         assert translated_body["model"] == expected_model
+        assert mock_completion_adapter.await_args is not None
         call_kwargs = mock_completion_adapter.await_args.kwargs
         assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.OPENROUTER.value
         assert call_kwargs["api_key"] == "openrouter-test-key"
@@ -9268,10 +9273,10 @@ class TestClaudePersistedOutputExpansion:
                 request=mock_request,
                 fastapi_response=mock_response,
                 user_api_key_dict=mock_user_api_key_dict,
-            )
+        )
 
         assert isinstance(result, Response)
-        translated_body = json.loads(result.body.decode("utf-8"))
+        translated_body = json.loads(bytes(result.body).decode("utf-8"))
         assert translated_body["type"] == "message"
         assert translated_body["model"] == response_model
         assert translated_body["content"][0]["type"] == "text"
@@ -9282,6 +9287,7 @@ class TestClaudePersistedOutputExpansion:
 
         mock_create_route.assert_not_called()
         mock_pass_through_request.assert_awaited_once()
+        assert mock_pass_through_request.await_args is not None
         call_kwargs = mock_pass_through_request.await_args.kwargs
         assert (
             call_kwargs["target"]
@@ -9421,6 +9427,7 @@ class TestClaudePersistedOutputExpansion:
                 user_api_key_dict=mock_user_api_key_dict,
             )
 
+        assert mock_pass_through_request.await_args is not None
         call_kwargs = mock_pass_through_request.await_args.kwargs
         custom_body = call_kwargs["custom_body"]
         assert custom_body["tools"][0]["name"] == expected_tool_name
@@ -13607,6 +13614,53 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_falls_back_after_capacity_text(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    antigravity_error = RuntimeError(
+        "Selected model is at capacity. Please try a different model."
+    )
+    spark_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ) as mock_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(return_value=spark_success),
+    ) as mock_spark:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is spark_success
+    mock_antigravity.assert_awaited_once()
+    mock_spark.assert_awaited_once()
+    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
+    metadata = spark_body["litellm_metadata"]
+    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert attempt["provider"] == "antigravity"
+    assert attempt["model"] == "claude-sonnet-4-6"
+    assert attempt["status"] == "cooldown_set"
+    assert attempt["cooldown_scope"] == "candidate"
+    assert attempt["error_class"] == "capacity_exhausted"
+    assert "MODEL_AT_CAPACITY" in attempt["error_tokens"]
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_unavailable(
     monkeypatch,
 ):
@@ -14751,6 +14805,112 @@ async def test_codex_auto_agent_alias_code_falls_back_to_spark_after_antigravity
     assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == (
         "antigravity"
     )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_token"),
+    [
+        (
+            "We're currently experiencing high demand, which may cause temporary errors.",
+            "HIGH_DEMAND",
+        ),
+        (
+            "Selected model is at capacity. Please try a different model.",
+            "MODEL_AT_CAPACITY",
+        ),
+    ],
+)
+def test_codex_auto_agent_retryable_exhaustion_classifies_capacity_text(
+    message,
+    expected_token,
+):
+    exc = RuntimeError(message)
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "capacity_exhausted"
+    )
+    assert expected_token in _extract_codex_auto_agent_error_tokens(exc)
+
+
+def test_codex_auto_agent_retryable_exhaustion_ignores_tool_shape_text():
+    exc = RuntimeError("Invalid tool schema: missing required property name.")
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
+    assert _extract_codex_auto_agent_error_tokens(exc) == set()
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    antigravity_error = RuntimeError(
+        "We're currently experiencing high demand, which may cause temporary errors."
+    )
+    spark_error = RuntimeError(
+        "Selected model is at capacity. Please try a different model."
+    )
+    grok_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ) as mock_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=spark_error),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(return_value=grok_success),
+    ) as mock_grok_native:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is grok_success
+    mock_antigravity.assert_awaited_once()
+    mock_pass_through.assert_awaited_once()
+    mock_grok_native.assert_awaited_once()
+    grok_body = mock_grok_native.await_args.kwargs["request_body"]
+    metadata = grok_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_provider"] == "xai"
+    assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+    ]
+    antigravity_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert antigravity_attempt["status"] == "cooldown_set"
+    assert antigravity_attempt["cooldown_scope"] == "candidate"
+    assert antigravity_attempt["error_class"] == "capacity_exhausted"
+    assert "HIGH_DEMAND" in antigravity_attempt["error_tokens"]
+    spark_attempt = metadata["codex_auto_agent_attempts"][1]
+    assert spark_attempt["status"] == "cooldown_set"
+    assert spark_attempt["cooldown_scope"] == "candidate"
+    assert spark_attempt["error_class"] == "capacity_exhausted"
+    assert "MODEL_AT_CAPACITY" in spark_attempt["error_tokens"]
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata["codex_auto_agent_skipped_candidates"]
+    }
+    assert "claude-sonnet-4-6" in skipped_models
+    assert "gpt-5.3-codex-spark" in skipped_models
 
 
 @pytest.mark.asyncio
