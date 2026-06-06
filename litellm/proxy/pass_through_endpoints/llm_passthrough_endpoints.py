@@ -338,6 +338,23 @@ _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = (
 _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
     _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
 )
+_CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS = frozenset(
+    {
+        "HIGH_DEMAND",
+        "MODEL_AT_CAPACITY",
+        "MODEL_CAPACITY_EXHAUSTED",
+        "MODEL_OVERLOADED",
+        "UPSTREAM_BUSY",
+    }
+)
+_CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS = frozenset(
+    {
+        "429",
+        "RESOURCE_EXHAUSTED",
+        "RATE_LIMIT_EXCEEDED",
+        "rate_limit_exceeded",
+    }
+)
 _CODEX_AUTO_AGENT_NATIVE_PROVIDER = "openai"
 _CODEX_AUTO_AGENT_GOOGLE_PROVIDER = "google_code_assist"
 _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER = "antigravity"
@@ -2143,6 +2160,44 @@ def _codex_auto_agent_error_text(exc: Any) -> str:
     )
 
 
+def _add_codex_auto_agent_text_error_tokens(
+    tokens: set[str],
+    text_lower: str,
+) -> None:
+    if "usage_limit_reached" in text_lower:
+        tokens.add("usage_limit_reached")
+    if "resource_exhausted" in text_lower or "resource exhausted" in text_lower:
+        tokens.add("RESOURCE_EXHAUSTED")
+    if (
+        "model_capacity_exhausted" in text_lower
+        or "model capacity exhausted" in text_lower
+    ):
+        tokens.add("MODEL_CAPACITY_EXHAUSTED")
+    if (
+        "currently experiencing high demand" in text_lower
+        or "experiencing high demand" in text_lower
+    ):
+        tokens.add("HIGH_DEMAND")
+    if "selected model is at capacity" in text_lower or (
+        "model is at capacity" in text_lower
+        and "try a different model" in text_lower
+    ):
+        tokens.add("MODEL_AT_CAPACITY")
+    if "model is overloaded" in text_lower or "overloaded_error" in text_lower:
+        tokens.add("MODEL_OVERLOADED")
+    if "busy upstream" in text_lower or (
+        "upstream" in text_lower and "busy" in text_lower
+    ):
+        tokens.add("UPSTREAM_BUSY")
+    if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
+        tokens.add("RATE_LIMIT_EXCEEDED")
+    if "too many requests" in text_lower:
+        tokens.add("429")
+        tokens.add("RATE_LIMIT_EXCEEDED")
+    if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
+        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
+
+
 def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
     tokens: set[str] = set()
     for parsed in _extract_google_adapter_error_payloads(exc):
@@ -2180,40 +2235,32 @@ def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
                 if "model_capacity_exhausted" in lowered:
                     tokens.add("MODEL_CAPACITY_EXHAUSTED")
     text_lower = _codex_auto_agent_error_text(exc).lower()
-    if "usage_limit_reached" in text_lower:
-        tokens.add("usage_limit_reached")
-    if "resource_exhausted" in text_lower or "resource exhausted" in text_lower:
-        tokens.add("RESOURCE_EXHAUSTED")
-    if (
-        "model_capacity_exhausted" in text_lower
-        or "model capacity exhausted" in text_lower
-    ):
-        tokens.add("MODEL_CAPACITY_EXHAUSTED")
-    if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
-        tokens.add("RATE_LIMIT_EXCEEDED")
-    if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
-        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
+    _add_codex_auto_agent_text_error_tokens(tokens, text_lower)
     return tokens
 
 
-def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
+def _classify_codex_auto_agent_retryable_exhaustion(
+    exc: Any,
+) -> Optional[str]:
     status_code = _extract_google_adapter_exception_status_code(exc)
-    if status_code in {429, 503, 529}:
-        return True
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    return bool(
-        tokens
-        & {
-            "429",
-            "503",
-            "usage_limit_reached",
-            "RESOURCE_EXHAUSTED",
-            "MODEL_CAPACITY_EXHAUSTED",
-            "RATE_LIMIT_EXCEEDED",
-            "rate_limit_exceeded",
-            "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    )
+    if "aawm_codex_auto_agent_candidate_unavailable" in tokens:
+        return "candidate_unavailable"
+    if "usage_limit_reached" in tokens:
+        return "usage_limit_reached"
+    if tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
+        return "capacity_exhausted"
+    if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
+        return "rate_limited"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code in {503, 529}:
+        return "upstream_overloaded"
+    return None
+
+
+def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
+    return _classify_codex_auto_agent_retryable_exhaustion(exc) is not None
 
 
 def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
@@ -2253,8 +2300,12 @@ def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
     if header_wait is not None:
         return max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
 
+    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if "MODEL_CAPACITY_EXHAUSTED" in tokens:
+    if (
+        error_class in {"capacity_exhausted", "upstream_overloaded"}
+        or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
+    ):
         return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
     if "usage_limit_reached" in tokens:
         return _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
@@ -2278,6 +2329,30 @@ async def _set_codex_auto_agent_candidate_cooldowns(
         cooldown_seconds,
     )
     return "candidate"
+
+
+def _update_codex_auto_agent_retryable_attempt_record(
+    *,
+    attempt_record: dict[str, Any],
+    exc: Any,
+    error_class: str,
+    cooldown_seconds: float,
+    cooldown_scope: Optional[str] = None,
+) -> set[str]:
+    error_tokens = _extract_codex_auto_agent_error_tokens(exc)
+    error_status_code = _extract_google_adapter_exception_status_code(exc)
+    update: dict[str, Any] = {
+        "status": "cooldown_set",
+        "cooldown_seconds": round(float(cooldown_seconds), 3),
+        "error_class": error_class,
+        "error_tokens": sorted(error_tokens),
+    }
+    if cooldown_scope is not None:
+        update["cooldown_scope"] = cooldown_scope
+    if error_status_code is not None:
+        update["error_status_code"] = error_status_code
+    attempt_record.update(update)
+    return error_tokens
 
 
 def _add_codex_auto_agent_alias_metadata(
@@ -17591,7 +17666,8 @@ async def _handle_anthropic_auto_agent_alias_route(
             )
             return response
         except Exception as exc:
-            if not _is_codex_auto_agent_retryable_exhaustion(exc):
+            error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+            if error_class is None:
                 raise
             last_retryable_exc = exc
             cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
@@ -17599,35 +17675,41 @@ async def _handle_anthropic_auto_agent_alias_route(
                 selection["cooldown_key"],
                 cooldown_seconds,
             )
-            attempt_record.update(
-                {
-                    "status": "cooldown_set",
-                    "cooldown_seconds": round(float(cooldown_seconds), 3),
-                    "error_tokens": sorted(
-                        _extract_codex_auto_agent_error_tokens(exc)
-                    ),
-                }
+            error_tokens = _update_codex_auto_agent_retryable_attempt_record(
+                attempt_record=attempt_record,
+                exc=exc,
+                error_class=error_class,
+                cooldown_seconds=cooldown_seconds,
+                cooldown_scope="candidate",
             )
             if has_continuation_state:
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
                 verbose_proxy_logger.warning(
-                    "Anthropic auto-agent alias target %s/%s hit retryable exhaustion "
-                    "for an in-flight session; signaling redispatch",
+                    "Anthropic auto-agent alias %s target %s/%s hit %s "
+                    "for an in-flight session on attempt %s; signaling redispatch",
+                    alias_model,
                     candidate["provider"],
                     candidate["model"],
+                    error_class,
+                    len(attempts),
                 )
                 _raise_anthropic_auto_agent_redispatch_required(
                     candidate=candidate,
                     lane_key=selection.get("lane_key"),
                     cooldown_seconds=cooldown_seconds,
-                    error_tokens=set(attempt_record.get("error_tokens") or []),
+                    error_tokens=error_tokens,
                     alias_model=alias_model,
                 )
             verbose_proxy_logger.warning(
-                "Anthropic auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",
+                "Anthropic auto-agent alias %s target %s/%s hit %s on attempt %s; "
+                "cooldown %.1fs tokens=%s",
+                alias_model,
                 candidate["provider"],
                 candidate["model"],
+                error_class,
+                len(attempts),
                 cooldown_seconds,
+                sorted(error_tokens),
             )
             continue
 
@@ -19938,7 +20020,8 @@ async def _handle_codex_auto_agent_alias_route(
             )
             return response
         except Exception as exc:
-            if not _is_codex_auto_agent_retryable_exhaustion(exc):
+            error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+            if error_class is None:
                 raise
             last_retryable_exc = exc
             cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
@@ -19949,22 +20032,23 @@ async def _handle_codex_auto_agent_alias_route(
                 cooldown_seconds=cooldown_seconds,
                 exc=exc,
             )
-            error_tokens = _extract_codex_auto_agent_error_tokens(exc)
-            attempt_record.update(
-                {
-                    "status": "cooldown_set",
-                    "cooldown_seconds": round(float(cooldown_seconds), 3),
-                    "cooldown_scope": cooldown_scope,
-                    "error_tokens": sorted(error_tokens),
-                }
+            error_tokens = _update_codex_auto_agent_retryable_attempt_record(
+                attempt_record=attempt_record,
+                exc=exc,
+                error_class=error_class,
+                cooldown_seconds=cooldown_seconds,
+                cooldown_scope=cooldown_scope,
             )
             if has_continuation_state:
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
                 verbose_proxy_logger.warning(
-                    "Codex auto-agent alias target %s/%s hit retryable exhaustion "
-                    "for an in-flight session; signaling redispatch",
+                    "Codex auto-agent alias %s target %s/%s hit %s "
+                    "for an in-flight session on attempt %s; signaling redispatch",
+                    alias_model,
                     candidate["provider"],
                     candidate["model"],
+                    error_class,
+                    len(attempts),
                 )
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=candidate,
@@ -19974,10 +20058,16 @@ async def _handle_codex_auto_agent_alias_route(
                     alias_model=alias_model,
                 )
             verbose_proxy_logger.warning(
-                "Codex auto-agent alias target %s/%s hit retryable exhaustion; cooldown %.1fs",
+                "Codex auto-agent alias %s target %s/%s hit %s on attempt %s; "
+                "cooldown %.1fs scope=%s tokens=%s",
+                alias_model,
                 candidate["provider"],
                 candidate["model"],
+                error_class,
+                len(attempts),
                 cooldown_seconds,
+                cooldown_scope,
+                sorted(error_tokens),
             )
             continue
 
