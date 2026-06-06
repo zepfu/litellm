@@ -51,7 +51,6 @@ DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS = [
     'pass_through_endpoint(): Exception occured - 504:',
 ]
 DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS = [
-    'timed out after',
     'runtime logs contained forbidden substring',
     'successful empty',
 ]
@@ -1294,6 +1293,7 @@ def _validate_runtime_postcondition(*, family: str, litellm_base_url: str, check
 def _read_runtime_logs_since(
     *,
     started: Any,
+    until: Any | None = None,
     checks: dict[str, Any],
     runtime_postconditions: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
@@ -1307,14 +1307,23 @@ def _read_runtime_logs_since(
         'docker_container_name': container_name,
         'tail_lines': tail_lines,
         'docker_logs_exit_code': None,
+        'docker_logs_since': None,
+        'docker_logs_until': None,
         'log_excerpt': '',
     }
     if not container_name:
         return summary, ''
 
     since_value = started.isoformat() if hasattr(started, 'isoformat') else str(started)
+    until_value = until.isoformat() if hasattr(until, 'isoformat') else (
+        str(until) if until is not None else None
+    )
+    command = ['docker', 'logs', '--since', since_value]
+    if until_value:
+        command.extend(['--until', until_value])
+    command.extend(['--tail', str(tail_lines), container_name])
     result = subprocess.run(
-        ['docker', 'logs', '--since', since_value, '--tail', str(tail_lines), container_name],
+        command,
         cwd=str(ROOT),
         text=True,
         capture_output=True,
@@ -1324,8 +1333,30 @@ def _read_runtime_logs_since(
         value for value in (result.stdout, result.stderr) if isinstance(value, str) and value
     )
     summary['docker_logs_exit_code'] = result.returncode
+    summary['docker_logs_since'] = since_value
+    summary['docker_logs_until'] = until_value
     summary['log_excerpt'] = log_text[-4000:] if log_text else ''
     return summary, log_text
+
+
+def _runtime_log_match_contexts(
+    *,
+    log_text: str,
+    substrings: list[str],
+    context_chars: int = 500,
+) -> dict[str, str]:
+    contexts: dict[str, str] = {}
+    for substring in substrings:
+        match_index = log_text.find(substring)
+        if match_index < 0:
+            continue
+        start_index = max(0, match_index - context_chars)
+        end_index = min(
+            len(log_text),
+            match_index + len(substring) + context_chars,
+        )
+        contexts[substring] = log_text[start_index:end_index]
+    return contexts
 
 
 def _validate_runtime_logs(
@@ -1359,6 +1390,7 @@ def _validate_runtime_logs(
         'tail_lines': tail_lines,
         'forbidden_substrings': forbidden_substrings,
         'matched_forbidden_substrings': [],
+        'matched_forbidden_contexts': {},
     }
     failures: list[str] = []
     warnings: list[str] = []
@@ -1368,10 +1400,13 @@ def _validate_runtime_logs(
 
     log_summary, log_text = _read_runtime_logs_since(
         started=started,
+        until=RA._utcnow(),
         checks={'docker_container_name': container_name, 'tail_lines': tail_lines},
         runtime_postconditions=runtime_postconditions,
     )
     summary['docker_logs_exit_code'] = log_summary.get('docker_logs_exit_code')
+    summary['docker_logs_since'] = log_summary.get('docker_logs_since')
+    summary['docker_logs_until'] = log_summary.get('docker_logs_until')
     summary['log_excerpt'] = log_summary.get('log_excerpt', '')
 
     if summary['docker_logs_exit_code'] != 0:
@@ -1384,6 +1419,10 @@ def _validate_runtime_logs(
         substring for substring in forbidden_substrings if substring and substring in log_text
     ]
     summary['matched_forbidden_substrings'] = matched
+    summary['matched_forbidden_contexts'] = _runtime_log_match_contexts(
+        log_text=log_text,
+        substrings=matched,
+    )
     for substring in matched:
         failures.append(
             f'{family} runtime logs contained forbidden substring `{substring}`'
@@ -3853,6 +3892,7 @@ def _provider_unavailable_timeout_error_result(
     runtime_postconditions = dict(config.get('runtime_postconditions') or {})
     runtime_logs, log_text = _read_runtime_logs_since(
         started=started,
+        until=RA._utcnow(),
         checks={
             'docker_container_name': (
                 soft_timeout_config.get('docker_container_name')
