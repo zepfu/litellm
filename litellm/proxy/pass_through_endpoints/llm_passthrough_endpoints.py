@@ -454,6 +454,10 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
+_CODEX_AAWM_SOTA_CANDIDATES = (
+    *_CODEX_AAWM_SOTA_CANDIDATES,
+    *_CODEX_AAWM_CODE_CANDIDATES,
+)
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
@@ -571,6 +575,10 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "route_family": "anthropic_messages",
         "last_resort": True,
     },
+)
+_ANTHROPIC_AAWM_SOTA_CANDIDATES = (
+    *_ANTHROPIC_AAWM_SOTA_CANDIDATES,
+    *_ANTHROPIC_AAWM_CODE_CANDIDATES,
 )
 _ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {

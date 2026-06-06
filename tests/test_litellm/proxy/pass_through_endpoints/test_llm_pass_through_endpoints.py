@@ -13732,6 +13732,62 @@ async def test_anthropic_auto_agent_alias_sota_selects_direct_opus_first():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_sota_falls_through_ordered_candidates():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-sota-anthropic"
+    expected_candidates = [
+        ("anthropic", "claude-opus-4-8", "anthropic_messages", False),
+        (
+            "antigravity",
+            "claude-sonnet-4-6",
+            "anthropic_antigravity_completion_adapter",
+            False,
+        ),
+        (
+            "openai",
+            "gpt-5.3-codex-spark",
+            "anthropic_openai_responses_adapter",
+            False,
+        ),
+        (
+            "xai",
+            "grok-composer-2.5-fast",
+            "anthropic_grok_native_responses_adapter",
+            False,
+        ),
+        ("xai", "oa_xai/grok-build", "anthropic_xai_oauth_responses_adapter", False),
+        ("anthropic", "claude-sonnet-4-6", "anthropic_messages", True),
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ):
+        for index, (provider, model, route_family, last_resort) in enumerate(
+            expected_candidates
+        ):
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+            candidate = selection["candidate"]
+            assert candidate["provider"] == provider
+            assert candidate["model"] == model
+            assert candidate["route_family"] == route_family
+            assert candidate["last_resort"] is last_resort
+            if last_resort:
+                assert selection["selection_reason"] == "last_resort"
+            else:
+                assert selection["selection_reason"] == "first_available"
+            if index < len(expected_candidates) - 1:
+                await _set_anthropic_auto_agent_cooldown(
+                    selection["cooldown_key"],
+                    60.0,
+                )
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_code_selects_antigravity_first():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
@@ -14065,6 +14121,117 @@ async def test_anthropic_auto_agent_alias_falls_back_to_gemini_after_spark_429(
     assert selected_event["event_type"] == "candidate_selected"
     assert selected_event["provider"] == "google_code_assist"
     assert selected_event["model"] == "gemini-3.1-flash-lite-preview"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_read_agent_alias_falls_back_after_high_demand(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-read-anthropic"
+    spark_error = RuntimeError(
+        "We're currently experiencing high demand, which may cause temporary errors."
+    )
+    gemini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=spark_error),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(return_value=gemini_success),
+    ) as mock_gemini:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is gemini_success
+    mock_spark.assert_awaited_once()
+    mock_gemini.assert_awaited_once()
+    assert mock_gemini.await_args.kwargs["adapter_model"] == (
+        "gemini-3.1-flash-lite-preview"
+    )
+    gemini_body = mock_gemini.await_args.kwargs["prepared_request_body"]
+    metadata = gemini_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-read-anthropic"
+    assert metadata["anthropic_auto_agent_alias"] == "aawm-read-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == (
+        "google_code_assist"
+    )
+    first_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert first_attempt["status"] == "cooldown_set"
+    assert first_attempt["error_class"] == "capacity_exhausted"
+    assert "HIGH_DEMAND" in first_attempt["error_tokens"]
+    assert metadata["anthropic_auto_agent_skipped_candidates"][0]["model"] == (
+        "gpt-5.3-codex-spark"
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sota_alias_falls_back_after_opus_high_demand(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-sota-anthropic"
+    opus_error = RuntimeError(
+        "We're currently experiencing high demand, which may cause temporary errors."
+    )
+    antigravity_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
+        new=AsyncMock(side_effect=opus_error),
+    ) as mock_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(return_value=antigravity_success),
+    ) as mock_antigravity:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is antigravity_success
+    mock_native.assert_awaited_once()
+    mock_antigravity.assert_awaited_once()
+    assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
+    assert mock_antigravity.await_args.kwargs["adapter_model"] == (
+        "claude-sonnet-4-6"
+    )
+    candidate_body = mock_antigravity.await_args.kwargs["prepared_request_body"]
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-sota-anthropic"
+    assert metadata["anthropic_auto_agent_alias"] == "aawm-sota-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "antigravity"
+    assert metadata["anthropic_auto_agent_selected_model"] == "claude-sonnet-4-6"
+    assert [attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]] == [
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ]
+    assert metadata["anthropic_auto_agent_attempts"][0]["status"] == "cooldown_set"
+    assert "HIGH_DEMAND" in metadata["anthropic_auto_agent_attempts"][0][
+        "error_tokens"
+    ]
 
 
 @pytest.mark.asyncio
@@ -14550,6 +14717,70 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
     mock_gemini.assert_awaited_once()
     mock_spark.assert_not_called()
     mock_native.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_in_flight_redispatch_uses_requested_alias(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-sota-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-sota-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "route_family": "anthropic_messages",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    opus_error = RuntimeError(
+        "Selected model is at capacity. Please try a different model."
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
+        new=AsyncMock(side_effect=opus_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(),
+    ) as mock_antigravity:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_redispatch_required"
+    )
+    assert exc_info.value.detail["redispatch_model"] == "aawm-sota-anthropic"
+    assert exc_info.value.detail["selected_provider"] == "anthropic"
+    assert exc_info.value.detail["selected_model"] == "claude-opus-4-8"
+    assert "MODEL_AT_CAPACITY" in exc_info.value.detail["error_tokens"]
+    mock_antigravity.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -15190,6 +15421,59 @@ async def test_codex_auto_agent_alias_sota_selects_gpt55_first():
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_alias_sota_falls_through_ordered_candidates():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    expected_candidates = [
+        ("openai", "gpt-5.5", "codex_responses", False),
+        (
+            "antigravity",
+            "claude-sonnet-4-6",
+            "codex_antigravity_code_assist_adapter",
+            False,
+        ),
+        ("openai", "gpt-5.3-codex-spark", "codex_responses", False),
+        (
+            "xai",
+            "grok-composer-2.5-fast",
+            "codex_grok_native_responses_adapter",
+            False,
+        ),
+        ("xai", "oa_xai/grok-build", "codex_xai_oauth_responses_adapter", False),
+        ("openai", "gpt-5.3-codex", "codex_responses", True),
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ):
+        for index, (provider, model, route_family, last_resort) in enumerate(
+            expected_candidates
+        ):
+            selection = await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+            candidate = selection["candidate"]
+            assert candidate["provider"] == provider
+            assert candidate["model"] == model
+            assert candidate["route_family"] == route_family
+            assert candidate["last_resort"] is last_resort
+            if last_resort:
+                assert selection["selection_reason"] == "last_resort"
+            else:
+                assert selection["selection_reason"] == "first_available"
+            if index < len(expected_candidates) - 1:
+                await _set_codex_auto_agent_cooldown(
+                    selection["cooldown_key"],
+                    60.0,
+                )
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_code_falls_through_from_antigravity_to_spark():
     request = _build_codex_auto_agent_request()
     body = {
@@ -15479,6 +15763,119 @@ def test_codex_auto_agent_retryable_exhaustion_ignores_tool_shape_text():
 
     assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
     assert _extract_codex_auto_agent_error_tokens(exc) == set()
+
+
+@pytest.mark.asyncio
+async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-read",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    spark_error = RuntimeError(
+        "We're currently experiencing high demand, which may cause temporary errors."
+    )
+    gemini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=spark_error),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(return_value=gemini_success),
+    ) as mock_gemini:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is gemini_success
+    mock_pass_through.assert_awaited_once()
+    mock_gemini.assert_awaited_once()
+    assert mock_gemini.await_args.kwargs["adapter_model"] == (
+        "gemini-3.1-flash-lite-preview"
+    )
+    gemini_body = mock_gemini.await_args.kwargs["prepared_request_body"]
+    metadata = gemini_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-read"
+    assert metadata["codex_auto_agent_alias"] == "aawm-read"
+    assert metadata["codex_auto_agent_selected_provider"] == "google_code_assist"
+    first_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert first_attempt["status"] == "cooldown_set"
+    assert first_attempt["error_class"] == "capacity_exhausted"
+    assert "HIGH_DEMAND" in first_attempt["error_tokens"]
+    assert metadata["codex_auto_agent_skipped_candidates"][0]["model"] == (
+        "gpt-5.3-codex-spark"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_sota_alias_falls_back_after_gpt55_high_demand(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    gpt55_error = RuntimeError(
+        "We're currently experiencing high demand, which may cause temporary errors."
+    )
+    antigravity_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=gpt55_error),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(return_value=antigravity_success),
+    ) as mock_antigravity:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is antigravity_success
+    mock_pass_through.assert_awaited_once()
+    mock_antigravity.assert_awaited_once()
+    assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
+    assert mock_antigravity.await_args.kwargs["adapter_model"] == (
+        "claude-sonnet-4-6"
+    )
+    candidate_body = mock_antigravity.await_args.kwargs["prepared_request_body"]
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-sota"
+    assert metadata["codex_auto_agent_alias"] == "aawm-sota"
+    assert metadata["codex_auto_agent_selected_provider"] == "antigravity"
+    assert metadata["codex_auto_agent_selected_model"] == "claude-sonnet-4-6"
+    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
+        "gpt-5.5",
+        "claude-sonnet-4-6",
+    ]
+    assert metadata["codex_auto_agent_attempts"][0]["status"] == "cooldown_set"
+    assert "HIGH_DEMAND" in metadata["codex_auto_agent_attempts"][0]["error_tokens"]
 
 
 @pytest.mark.asyncio
@@ -16768,6 +17165,70 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
     )
     mock_gemini.assert_awaited_once()
     mock_pass_through.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_in_flight_redispatch_uses_requested_alias(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-sota:codex-session:session:codex-session"
+    ] = {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    gpt55_error = RuntimeError(
+        "Selected model is at capacity. Please try a different model."
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=gpt55_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(),
+    ) as mock_antigravity:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    assert exc_info.value.detail["redispatch_model"] == "aawm-sota"
+    assert exc_info.value.detail["selected_provider"] == "openai"
+    assert exc_info.value.detail["selected_model"] == "gpt-5.5"
+    assert "MODEL_AT_CAPACITY" in exc_info.value.detail["error_tokens"]
+    mock_antigravity.assert_not_called()
 
 
 @pytest.mark.asyncio
