@@ -1,5 +1,6 @@
 from argparse import Namespace
 from datetime import datetime, timezone
+from pathlib import Path
 from subprocess import TimeoutExpired
 
 import pytest
@@ -324,6 +325,9 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_PROVIDER_STATUS_SKIP_ICMP",
         "AAWM_PROVIDER_STATUS_ONCE",
         "AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START",
+        "AAWM_PROVIDER_STATUS_SCHEMA_DSN",
+        "AAWM_DIRECT_DATABASE_URL",
+        "AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER",
         "AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS",
         "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS",
     ):
@@ -339,9 +343,59 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.ping_timeout == 2
     assert config.skip_icmp is False
     assert config.once is False
-    assert config.setup_schema is True
+    assert config.setup_schema is False
     assert config.db_lock_timeout_ms == 1000
     assert config.db_statement_timeout_ms == 5000
+    assert config.schema_dsn is None
+    assert config.require_pgbouncer is False
+
+
+def test_loop_config_uses_explicit_direct_schema_dsn(monkeypatch) -> None:
+    monkeypatch.setenv("AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START", "1")
+    monkeypatch.setenv(
+        "AAWM_DIRECT_DATABASE_URL",
+        "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore",
+    )
+
+    config = loop.parse_config([])
+
+    assert config.setup_schema is True
+    assert (
+        config.schema_dsn
+        == "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore"
+    )
+
+
+def test_provider_status_compose_hardens_sidecar_db_path() -> None:
+    compose_text = (Path(__file__).resolve().parents[2] / "docker-compose.dev.yml").read_text()
+
+    assert "container_name: aawm-provider-status-observations" in compose_text
+    assert "AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}" in compose_text
+    assert "AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}" in compose_text
+    assert (
+        "AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore?application_name=aawm-provider-status-observations}"
+        in compose_text
+    )
+    assert (
+        "AAWM_PROVIDER_STATUS_SCHEMA_DSN=${AAWM_PROVIDER_STATUS_SCHEMA_DSN:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore?application_name=aawm-provider-status-observations-schema}"
+        in compose_text
+    )
+    assert (
+        "AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START=${AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START:-0}"
+        in compose_text
+    )
+    assert (
+        "AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER=${AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS=${AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS:-1000}"
+        in compose_text
+    )
+    assert (
+        "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS=${AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS:-5000}"
+        in compose_text
+    )
 
 
 def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
@@ -488,6 +542,7 @@ def test_setup_schema_once_returns_ready_summary(monkeypatch) -> None:
         setup_schema=True,
         db_lock_timeout_ms=111,
         db_statement_timeout_ms=222,
+        schema_dsn="postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore",
     )
     called = {}
 
@@ -501,13 +556,20 @@ def test_setup_schema_once_returns_ready_summary(monkeypatch) -> None:
         called["lock_timeout_ms"] = lock_timeout_ms
         called["statement_timeout_ms"] = statement_timeout_ms
 
-    monkeypatch.setattr(loop.probes, "_build_dsn", lambda _args: "postgresql://example/db")
+    monkeypatch.setattr(
+        loop.probes,
+        "_build_dsn",
+        lambda _args: pytest.fail("schema setup must not use steady-state DSN"),
+    )
     monkeypatch.setattr(loop.probes, "setup_schema", fake_setup_schema)
 
     summary = loop.setup_schema_once(config)
 
     assert called == {
-        "dsn": "postgresql://example/db",
+        "dsn": (
+            "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore"
+            "?application_name=aawm-provider-status-observations"
+        ),
         "lock_timeout_ms": 111,
         "statement_timeout_ms": 222,
     }
@@ -529,6 +591,7 @@ def test_setup_schema_once_reports_skipped_lock_timeout(monkeypatch) -> None:
         setup_schema=True,
         db_lock_timeout_ms=111,
         db_statement_timeout_ms=222,
+        schema_dsn="postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore",
     )
 
     def fake_setup_schema(*_args, **_kwargs):
@@ -537,7 +600,6 @@ def test_setup_schema_once_reports_skipped_lock_timeout(monkeypatch) -> None:
             message="canceling statement due to statement timeout",
         )
 
-    monkeypatch.setattr(loop.probes, "_build_dsn", lambda _args: "postgresql://example/db")
     monkeypatch.setattr(loop.probes, "setup_schema", fake_setup_schema)
 
     summary = loop.setup_schema_once(config)
@@ -546,3 +608,64 @@ def test_setup_schema_once_reports_skipped_lock_timeout(monkeypatch) -> None:
     assert summary["environment"] == "dev"
     assert summary["error_class"] == "QueryCanceled"
     assert "statement timeout" in summary["error_message"]
+
+
+def test_setup_schema_once_requires_direct_schema_dsn() -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=True,
+        db_lock_timeout_ms=111,
+        db_statement_timeout_ms=222,
+    )
+
+    with pytest.raises(RuntimeError, match="schema setup requires"):
+        loop.setup_schema_once(config)
+
+
+def test_validate_runtime_guardrails_requires_pgbouncer_when_enabled() -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn="postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore",
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=111,
+        db_statement_timeout_ms=222,
+        require_pgbouncer=True,
+    )
+
+    with pytest.raises(RuntimeError, match="pgbouncer:6432"):
+        loop.validate_runtime_guardrails(config)
+
+
+def test_validate_runtime_guardrails_accepts_pgbouncer_when_required() -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn="postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=111,
+        db_statement_timeout_ms=222,
+        require_pgbouncer=True,
+    )
+
+    loop.validate_runtime_guardrails(config)
