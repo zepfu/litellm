@@ -21,12 +21,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import psycopg
 
 DEFAULT_DB_LOCK_TIMEOUT_MS = 1000
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 5000
+DEFAULT_DB_APPLICATION_NAME = "aawm-provider-status-observations"
 
 
 PING_STATS_RE = re.compile(
@@ -144,9 +145,44 @@ class ProviderStatusDatabaseWriteSkipped(RuntimeError):
         self.error_class = error_class
 
 
+def _append_dsn_query_params(dsn: str, params: Dict[str, Optional[str]]) -> str:
+    parsed = urlsplit(dsn)
+    if not parsed.scheme:
+        return dsn
+
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    existing_keys = {key for key, _value in query_items}
+    for key, value in params.items():
+        cleaned_value = value.strip() if isinstance(value, str) else None
+        if cleaned_value and key not in existing_keys:
+            query_items.append((key, cleaned_value))
+            existing_keys.add(key)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(query_items),
+            parsed.fragment,
+        )
+    )
+
+
+def _provider_status_db_application_name() -> str:
+    return (
+        os.getenv("AAWM_PROVIDER_STATUS_DB_APPLICATION_NAME")
+        or os.getenv("AAWM_DB_APPLICATION_NAME")
+        or os.getenv("PGAPPNAME")
+        or DEFAULT_DB_APPLICATION_NAME
+    ).strip() or DEFAULT_DB_APPLICATION_NAME
+
+
 def _build_dsn(args: argparse.Namespace) -> Optional[str]:
     if args.dsn:
-        return args.dsn
+        return _append_dsn_query_params(
+            args.dsn,
+            {"application_name": _provider_status_db_application_name()},
+        )
 
     host = args.pg_host or os.getenv("AAWM_DB_HOST") or os.getenv("PGHOST")
     database = args.pg_database or os.getenv("AAWM_DB_NAME") or os.getenv("PGDATABASE")
@@ -167,12 +203,18 @@ def _build_dsn(args: argparse.Namespace) -> Optional[str]:
         )
         if sslmode:
             dsn += f"?{urlencode({'sslmode': sslmode})}"
-        return dsn
+        return _append_dsn_query_params(
+            dsn,
+            {"application_name": _provider_status_db_application_name()},
+        )
 
     for key in ("AAWM_DB_URL", "AAWM_DATABASE_URL", "AAWM_POSTGRES_URL"):
         value = os.getenv(key)
         if value:
-            return value
+            return _append_dsn_query_params(
+                value,
+                {"application_name": _provider_status_db_application_name()},
+            )
     return None
 
 

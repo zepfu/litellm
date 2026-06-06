@@ -97,6 +97,47 @@ def test_build_dsn_prefers_component_config_over_ambient_url(monkeypatch) -> Non
     assert (
         probes._build_dsn(args)
         == "postgresql://aawm:aawm_dev@127.0.0.1:5434/aawm_tristore"
+        "?application_name=aawm-provider-status-observations"
+    )
+
+
+def test_build_dsn_should_preserve_existing_application_name(monkeypatch) -> None:
+    for key in (
+        "AAWM_DB_HOST",
+        "AAWM_DB_PORT",
+        "AAWM_DB_NAME",
+        "AAWM_DB_USER",
+        "AAWM_DB_PASSWORD",
+        "AAWM_DB_SSLMODE",
+        "PGHOST",
+        "PGPORT",
+        "PGDATABASE",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGSSLMODE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(
+        "AAWM_DATABASE_URL",
+        (
+            "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
+            "?application_name=custom-provider-status"
+        ),
+    )
+    monkeypatch.setenv("AAWM_PROVIDER_STATUS_DB_APPLICATION_NAME", "ignored")
+    args = Namespace(
+        dsn=None,
+        pg_host=None,
+        pg_port=None,
+        pg_database=None,
+        pg_user=None,
+        pg_password=None,
+        pg_sslmode=None,
+    )
+
+    assert probes._build_dsn(args) == (
+        "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
+        "?application_name=custom-provider-status"
     )
 
 
