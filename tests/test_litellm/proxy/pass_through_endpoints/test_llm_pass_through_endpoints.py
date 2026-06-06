@@ -87,6 +87,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _handle_anthropic_grok_native_oauth_responses_adapter_route,
     _handle_anthropic_nvidia_completion_adapter_route,
     _handle_anthropic_opencode_zen_responses_adapter_route,
+    _handle_anthropic_openai_responses_adapter_route,
     _handle_anthropic_xai_oauth_completion_adapter_route,
     _handle_anthropic_xai_oauth_responses_adapter_route,
     _handle_anthropic_auto_agent_alias_route,
@@ -5511,6 +5512,55 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert "route:anthropic_messages" in litellm_metadata["tags"]
         assert "route:anthropic_openai_responses_adapter" in litellm_metadata["tags"]
         assert "anthropic-openai-responses-adapter" in litellm_metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_adapter_marks_429_retryable_for_log_suppression(
+        self,
+    ):
+        request = MagicMock(spec=Request)
+        request.headers = {"x-pass-authorization": "Bearer codex-token"}
+        request.method = "POST"
+        request.url = MagicMock()
+        request.url.path = "/anthropic/v1/messages"
+        request.query_params = {}
+        upstream_response = Response(
+            content='{"id":"resp_test","output":[]}',
+            media_type="application/json",
+        )
+        translated_response = Response(
+            content='{"id":"msg_test","content":[]}',
+            media_type="application/json",
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(return_value=upstream_response),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+            return_value=translated_response,
+        ):
+            response = await _handle_anthropic_openai_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body={
+                    "model": "gpt-5.3-codex-spark",
+                    "max_tokens": 16,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "ping"}],
+                        }
+                    ],
+                },
+                adapter_model="gpt-5.3-codex-spark",
+            )
+
+        assert response is translated_response
+        assert mock_pass_through.await_args.kwargs[
+            "retryable_upstream_status_codes"
+        ] == [429]
 
     @pytest.mark.asyncio
     async def test_openrouter_responses_adapter_preserves_agent_project_litellm_metadata(
