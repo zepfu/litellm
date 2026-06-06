@@ -327,6 +327,14 @@ _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT = """Codex auto-agent completion co
 - If a required tool is unavailable or blocked, state the exact observed tool/platform error and continue with bounded evidence from available context; do not claim tools or filesystem are unavailable unless a tool/platform error proves it.
 - If the user requested code or artifact changes, either make the scoped change or explicitly say no files were modified and why. Do not answer with a generic explanation of the function or file when implementation or verification was requested.
 - If verification could not be run, name the command or check that was not run and why."""
+_AAWM_READ_AGENT_GUIDANCE_POLICY_NAME = "aawm_read_agent_guidance"
+_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION = "2026-06-06.v1"
+_AAWM_READ_AGENT_GUIDANCE_PROMPT = """AAWM read-only agent contract:
+- Treat the delegated task as exploration, audit, review, or investigation unless the prompt explicitly authorizes file edits for this worker.
+- Do not edit files, create files, apply patches, or run commands that modify the worktree.
+- If a fix is needed, describe the patch only. Do not claim the patch was implemented unless the prompt explicitly authorized edits and the files were actually changed.
+- If the delegated prompt requires the exact final phrase `No files were modified.`, include that phrase truthfully in the final answer.
+- Return findings, evidence, coverage gaps, and recommended next steps. Do not return implementation summaries for read-only work."""
 _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS = 6 * 60 * 60
 _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3 * 60 * 60.0
 _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = (
@@ -402,6 +410,7 @@ _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
+_CODEX_AAWM_READ_ALIAS = "aawm-read"
 _CODEX_AAWM_SOTA_ALIAS = "aawm-sota"
 _CODEX_AAWM_CODE_ALIAS = "aawm-code"
 _CODEX_AAWM_LOW_ALIAS = "aawm-low"
@@ -473,6 +482,7 @@ _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
 )
 _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {
     _CODEX_AUTO_AGENT_MODEL_ALIAS: _CODEX_AUTO_AGENT_CANDIDATES,
+    _CODEX_AAWM_READ_ALIAS: _CODEX_AUTO_AGENT_CANDIDATES,
     _CODEX_AAWM_SOTA_ALIAS: _CODEX_AAWM_SOTA_CANDIDATES,
     _CODEX_AAWM_CODE_ALIAS: _CODEX_AAWM_CODE_CANDIDATES,
     _CODEX_AAWM_LOW_ALIAS: _CODEX_AAWM_LOW_CANDIDATES,
@@ -518,6 +528,7 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
+_ANTHROPIC_AAWM_READ_ALIAS = "aawm-read-anthropic"
 _ANTHROPIC_AAWM_SOTA_ALIAS = "aawm-sota-anthropic"
 _ANTHROPIC_AAWM_CODE_ALIAS = "aawm-code-anthropic"
 _ANTHROPIC_AAWM_LOW_ALIAS = "aawm-low-anthropic"
@@ -591,6 +602,7 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[
     str, tuple[dict[str, Any], ...]
 ] = {
     _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS: _ANTHROPIC_AUTO_AGENT_CANDIDATES,
+    _ANTHROPIC_AAWM_READ_ALIAS: _ANTHROPIC_AUTO_AGENT_CANDIDATES,
     _ANTHROPIC_AAWM_SOTA_ALIAS: _ANTHROPIC_AAWM_SOTA_CANDIDATES,
     _ANTHROPIC_AAWM_CODE_ALIAS: _ANTHROPIC_AAWM_CODE_CANDIDATES,
     _ANTHROPIC_AAWM_LOW_ALIAS: _ANTHROPIC_AAWM_LOW_CANDIDATES,
@@ -13511,6 +13523,134 @@ def _append_codex_auto_agent_prevention_guidance_to_instructions(
     )
 
 
+def _is_aawm_read_agent_alias_model(alias_model: Any) -> bool:
+    if not isinstance(alias_model, str):
+        return False
+    return alias_model in {
+        _CODEX_AAWM_READ_ALIAS,
+        _ANTHROPIC_AAWM_READ_ALIAS,
+    }
+
+
+def _append_aawm_read_agent_guidance_to_text(value: Optional[str]) -> str:
+    existing_value = value.strip() if isinstance(value, str) else ""
+    if _AAWM_READ_AGENT_GUIDANCE_PROMPT in existing_value:
+        return existing_value
+    if not existing_value:
+        return _AAWM_READ_AGENT_GUIDANCE_PROMPT
+    return f"{existing_value}\n\n{_AAWM_READ_AGENT_GUIDANCE_PROMPT}"
+
+
+def _append_aawm_read_agent_guidance_to_anthropic_system(
+    system_value: Any,
+) -> tuple[Any, bool, int]:
+    if system_value is None or isinstance(system_value, str):
+        original_chars = len(system_value) if isinstance(system_value, str) else 0
+        updated_system = _append_aawm_read_agent_guidance_to_text(system_value)
+        return updated_system, updated_system != system_value, original_chars
+
+    if not isinstance(system_value, list):
+        return system_value, False, 0
+
+    original_chars = 0
+    for item in system_value:
+        text_value: Optional[str] = None
+        if isinstance(item, str):
+            text_value = item
+        elif isinstance(item, dict) and isinstance(item.get("text"), str):
+            text_value = item["text"]
+        if text_value is None:
+            continue
+        original_chars += len(text_value)
+        if _AAWM_READ_AGENT_GUIDANCE_PROMPT in text_value:
+            return system_value, False, original_chars
+
+    return (
+        [
+            *system_value,
+            {"type": "text", "text": _AAWM_READ_AGENT_GUIDANCE_PROMPT},
+        ],
+        True,
+        original_chars,
+    )
+
+
+def _apply_aawm_read_agent_guidance_to_request_body(
+    request_body: dict[str, Any],
+    *,
+    alias_model: Any,
+    target_field: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not _is_aawm_read_agent_alias_model(alias_model):
+        return request_body, {}
+
+    updated_body = dict(request_body)
+    original_chars = 0
+    if target_field == "instructions":
+        existing_instructions = request_body.get("instructions")
+        if existing_instructions is not None and not isinstance(
+            existing_instructions, str
+        ):
+            return request_body, {}
+        updated_value = _append_aawm_read_agent_guidance_to_text(
+            existing_instructions
+        )
+        if updated_value == existing_instructions:
+            return request_body, {}
+        updated_body["instructions"] = updated_value
+        original_chars = (
+            len(existing_instructions) if isinstance(existing_instructions, str) else 0
+        )
+    elif target_field == "system":
+        updated_system, changed, original_chars = (
+            _append_aawm_read_agent_guidance_to_anthropic_system(
+                request_body.get("system")
+            )
+        )
+        if not changed:
+            return request_body, {}
+        updated_body["system"] = updated_system
+    else:
+        return request_body, {}
+
+    guidance_metadata = {
+        "aawm_read_agent_guidance_policy_name": (
+            _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
+        ),
+        "aawm_read_agent_guidance_policy_version": (
+            _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
+        ),
+        "aawm_read_agent_guidance_applied": True,
+        "aawm_read_agent_guidance_alias": alias_model,
+        "aawm_read_agent_guidance_target_field": target_field,
+        "aawm_read_agent_guidance_original_chars": original_chars,
+        "aawm_read_agent_guidance_prompt_chars": len(
+            _AAWM_READ_AGENT_GUIDANCE_PROMPT
+        ),
+    }
+    updated_body = _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            "aawm-read-agent-guidance",
+            (
+                "aawm-read-agent-guidance:"
+                f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}"
+            ),
+            f"aawm-read-agent-guidance-alias:{alias_model}",
+        ],
+        extra_fields={
+            **guidance_metadata,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="aawm.read_agent_guidance",
+                    metadata=guidance_metadata,
+                )
+            ],
+        },
+    )
+    return updated_body, guidance_metadata
+
+
 def _apply_codex_auto_agent_prevention_guidance_to_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -17872,6 +18012,13 @@ async def anthropic_proxy_route(
             endpoint=encoded_endpoint,
         )
         if anthropic_auto_agent_alias is not None:
+            prepared_request_body, _anthropic_read_guidance_changes = (
+                _apply_aawm_read_agent_guidance_to_request_body(
+                    prepared_request_body,
+                    alias_model=anthropic_auto_agent_alias,
+                    target_field="system",
+                )
+            )
             return await _handle_anthropic_auto_agent_alias_route(
                 endpoint=endpoint,
                 request=request,
@@ -20351,6 +20498,13 @@ class BaseOpenAIPassThroughHandler:
                         prepared_request_body, _codex_auto_agent_guidance_changes = (
                             _apply_codex_auto_agent_prevention_guidance_to_request_body(
                                 prepared_request_body
+                            )
+                        )
+                        prepared_request_body, _codex_read_guidance_changes = (
+                            _apply_aawm_read_agent_guidance_to_request_body(
+                                prepared_request_body,
+                                alias_model=codex_auto_agent_alias,
+                                target_field="instructions",
                             )
                         )
                         prepared_request_body = _prepare_request_body_for_passthrough_observability(
