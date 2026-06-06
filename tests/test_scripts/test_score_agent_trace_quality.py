@@ -1961,6 +1961,117 @@ def test_should_score_malformed_success_output_shape_as_contract_failure() -> No
     ]
 
 
+def test_should_score_missing_required_final_phrase_as_contract_failure() -> None:
+    payload = _payload(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Read-only task. Do not edit files.\n\n"
+                    'Your final answer must truthfully include: "No files were modified."'
+                ),
+            }
+        ],
+        {
+            "role": "assistant",
+            "content": "I inspected the scorer and found the insertion point.",
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_required_final_phrase == "No files were modified."
+    assert evidence.output_contract_required_final_phrase_present is False
+    assert evidence.output_contract_failure_class == "missing_required_final_phrase"
+    assert evidence.output_contract_failure_count == 1
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "missing_required_final_phrase"
+    ]
+    _, score_metadata = scorer._session_history_score_values(evidence)
+    assert (
+        score_metadata["usage_output_contract_required_final_phrase"]
+        == "No files were modified."
+    )
+    assert (
+        score_metadata["usage_output_contract_required_final_phrase_present"] is False
+    )
+    assert (
+        score_metadata["usage_output_contract_failure_class"]
+        == "missing_required_final_phrase"
+    )
+
+
+def test_should_record_required_final_phrase_present() -> None:
+    payload = _payload(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Read-only task. Do not edit files.\n\n"
+                    'Your final answer must truthfully include: "No files were modified."'
+                ),
+            }
+        ],
+        {
+            "role": "assistant",
+            "content": "Inspected the scorer. No files were modified.",
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 1.0
+    assert evidence.output_contract_compliance_score == 1.0
+    assert evidence.output_contract_required_final_phrase == "No files were modified."
+    assert evidence.output_contract_required_final_phrase_present is True
+    assert evidence.output_contract_failure_class is None
+
+
+def test_should_score_setup_only_completion_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Read-only task. Inspect the callback path."}],
+        {
+            "role": "assistant",
+            "content": "I will inspect the callback path now.",
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=9),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.response_meaningfulness_score == 1.0
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_failure_class == "setup_only_completion"
+    assert evidence.output_contract_setup_only_detected is True
+    assert "i will inspect" in evidence.output_contract_setup_only_markers
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "setup_only_completion"
+    ]
+
+
 def test_should_score_scope_control_escape_paths() -> None:
     payload = _payload(
         [

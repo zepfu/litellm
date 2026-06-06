@@ -131,6 +131,22 @@ def _coerce_float_or_none(value: Any) -> Optional[float]:
         return None
 
 
+def _optional_bool(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
 def _parse_optional_datetime(value: Optional[str]) -> Optional[datetime]:
     cleaned = _clean(value)
     if not cleaned:
@@ -259,6 +275,14 @@ class TraceScoreEvidence:
     tool_error_recovery_score: Optional[float]
     stall_risk_score: Optional[float]
     output_contract_compliance_score: Optional[float]
+    output_contract_required_final_phrase: Optional[str]
+    output_contract_required_final_phrase_present: Optional[bool]
+    output_contract_required_final_phrase_source: Optional[str]
+    output_contract_failure_class: Optional[str]
+    output_contract_failure_count: Optional[int]
+    output_contract_setup_only_detected: Optional[bool]
+    output_contract_setup_only_markers: List[str]
+    output_contract_final_text_chars: Optional[int]
     task_progress_score: Optional[float]
     scope_control_score: Optional[float]
     destructive_action_policy_score: Optional[float]
@@ -351,6 +375,26 @@ class TraceScoreEvidence:
             "stall_risk_score": self.stall_risk_score,
             "output_contract_compliance_score": (
                 self.output_contract_compliance_score
+            ),
+            "output_contract_required_final_phrase": (
+                self.output_contract_required_final_phrase
+            ),
+            "output_contract_required_final_phrase_present": (
+                self.output_contract_required_final_phrase_present
+            ),
+            "output_contract_required_final_phrase_source": (
+                self.output_contract_required_final_phrase_source
+            ),
+            "output_contract_failure_class": self.output_contract_failure_class,
+            "output_contract_failure_count": self.output_contract_failure_count,
+            "output_contract_setup_only_detected": (
+                self.output_contract_setup_only_detected
+            ),
+            "output_contract_setup_only_markers": (
+                self.output_contract_setup_only_markers
+            ),
+            "output_contract_final_text_chars": (
+                self.output_contract_final_text_chars
             ),
             "task_progress_score": self.task_progress_score,
             "scope_control_score": self.scope_control_score,
@@ -588,7 +632,10 @@ def _resolve_minio_client(args: argparse.Namespace) -> MinioEventBlobClient:
 def _verify_target_database(conn: psycopg.Connection, required_database: Optional[str]) -> str:
     with conn.cursor() as cur:
         cur.execute("select current_database()")
-        current_database = str(cur.fetchone()[0])
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Unable to determine current database")
+        current_database = str(row[0])
     if required_database and current_database != required_database:
         raise RuntimeError(
             f"Refusing to use database {current_database!r}; expected {required_database!r}"
@@ -712,13 +759,18 @@ def _fetch_provider_error_keys(
     args: argparse.Namespace,
     candidates: Sequence[SessionCandidate],
 ) -> Tuple[set[str], set[str]]:
-    trace_ids = sorted({candidate.trace_id for candidate in candidates if candidate.trace_id})
+    trace_ids = sorted(
+        [candidate.trace_id for candidate in candidates if candidate.trace_id]
+    )
     call_ids = sorted(
-        {
-            candidate.source_observation_id or candidate.litellm_call_id
+        [
+            candidate_id
             for candidate in candidates
-            if candidate.source_observation_id or candidate.litellm_call_id
-        }
+            for candidate_id in [
+                candidate.source_observation_id or candidate.litellm_call_id
+            ]
+            if candidate_id is not None
+        ]
     )
     if not trace_ids and not call_ids:
         return set(), set()
@@ -756,13 +808,18 @@ def _fetch_clickhouse_observations(
     candidates: Sequence[SessionCandidate],
 ) -> Dict[str, ObservationPayload]:
     observation_ids = sorted(
-        {
-            candidate.source_observation_id or candidate.litellm_call_id
+        [
+            candidate_id
             for candidate in candidates
-            if candidate.source_observation_id or candidate.litellm_call_id
-        }
+            for candidate_id in [
+                candidate.source_observation_id or candidate.litellm_call_id
+            ]
+            if candidate_id is not None
+        ]
     )
-    trace_ids = sorted({candidate.trace_id for candidate in candidates if candidate.trace_id})
+    trace_ids = sorted(
+        [candidate.trace_id for candidate in candidates if candidate.trace_id]
+    )
     if not observation_ids and not trace_ids:
         return {}
 
@@ -826,12 +883,24 @@ def _fetch_blob_log_rows(
     *,
     extra_observation_ids: Sequence[str] = (),
 ) -> Dict[str, Dict[str, Any]]:
+    cleaned_extra_observation_ids = [
+        cleaned
+        for value in extra_observation_ids
+        for cleaned in [_clean(value)]
+        if cleaned
+    ]
     observation_ids = sorted(
-        {
-            candidate.source_observation_id or candidate.litellm_call_id
-            for candidate in candidates
-            if candidate.source_observation_id or candidate.litellm_call_id
-        }.union({_clean(value) for value in extra_observation_ids if _clean(value)})
+        [
+            *[
+                candidate_id
+                for candidate in candidates
+                for candidate_id in [
+                    candidate.source_observation_id or candidate.litellm_call_id
+                ]
+                if candidate_id is not None
+            ],
+            *cleaned_extra_observation_ids,
+        ]
     )
     if not observation_ids:
         return {}
@@ -878,7 +947,7 @@ def _body_from_langfuse_blob_payload(blob_payload: Any) -> Optional[Dict[str, An
     return None
 
 
-def _resolve_observation_payloads(
+def _resolve_observation_payloads(  # noqa: PLR0915
     args: argparse.Namespace,
     candidates: Sequence[SessionCandidate],
 ) -> Dict[str, ObservationPayload]:
@@ -1106,7 +1175,7 @@ _CODEX_TRANSCRIPT_UNSUPPORTED_TOOL_NAMES = {
 }
 
 
-def _build_codex_transcript_bundle(
+def _build_codex_transcript_bundle(  # noqa: PLR0915
     transcript: Path,
     *,
     parent_transcript: Optional[Path] = None,
@@ -1122,7 +1191,7 @@ def _build_codex_transcript_bundle(
     )
     if not isinstance(session_meta, dict):
         raise ValueError(f"{transcript} is missing session_meta")
-    turn_context = next(
+    turn_context_payload: Any = next(
         (
             event.get("payload")
             for event in events
@@ -1130,8 +1199,9 @@ def _build_codex_transcript_bundle(
         ),
         {},
     )
-    if not isinstance(turn_context, dict):
-        turn_context = {}
+    turn_context: Dict[str, Any] = (
+        turn_context_payload if isinstance(turn_context_payload, dict) else {}
+    )
 
     session_id = _clean(session_meta.get("id"))
     if not session_id:
@@ -2471,7 +2541,7 @@ def _payload_for_candidate(
     return None
 
 
-def score_candidate(
+def score_candidate(  # noqa: PLR0915
     candidate: SessionCandidate,
     payload: Optional[ObservationPayload],
     *,
@@ -2689,13 +2759,13 @@ def score_candidate(
             else 0.0
         )
     )
-    output_contract_failure = (
+    generic_output_contract_failure = (
         terminal_completion_failure or no_op_response_failure or malformed_output_shape
     )
     output_contract_compliance_score = (
         None
         if not payload_resolved or provider_error_present
-        else (0.0 if output_contract_failure else 1.0)
+        else (0.0 if generic_output_contract_failure else 1.0)
     )
     task_progress_score = (
         None
@@ -2717,6 +2787,56 @@ def score_candidate(
         elapsed_ms=elapsed_ms,
         task_progress=bool(task_progress_score),
     )
+    deterministic_output_contract_score = _coerce_float_or_none(
+        agent_quality_fields.get("output_contract_compliance_score")
+    )
+    if deterministic_output_contract_score is not None and not provider_error_present:
+        if output_contract_compliance_score is None:
+            output_contract_compliance_score = deterministic_output_contract_score
+        else:
+            output_contract_compliance_score = min(
+                output_contract_compliance_score,
+                deterministic_output_contract_score,
+            )
+    output_contract_required_final_phrase = _clean(
+        agent_quality_fields.get("output_contract_required_final_phrase")
+    )
+    output_contract_required_final_phrase_present = _optional_bool(
+        agent_quality_fields.get("output_contract_required_final_phrase_present")
+    )
+    output_contract_required_final_phrase_source = _clean(
+        agent_quality_fields.get("output_contract_required_final_phrase_source")
+    )
+    output_contract_failure_class = _clean(
+        agent_quality_fields.get("output_contract_failure_class")
+    )
+    raw_output_contract_failure_count = agent_quality_fields.get(
+        "output_contract_failure_count"
+    )
+    output_contract_failure_count = (
+        _coerce_int(raw_output_contract_failure_count)
+        if raw_output_contract_failure_count is not None
+        else None
+    )
+    output_contract_setup_only_detected = _optional_bool(
+        agent_quality_fields.get("output_contract_setup_only_detected")
+    )
+    raw_setup_markers = agent_quality_fields.get("output_contract_setup_only_markers")
+    output_contract_setup_only_markers = (
+        [str(value) for value in raw_setup_markers if isinstance(value, str)]
+        if isinstance(raw_setup_markers, list)
+        else []
+    )
+    raw_output_contract_final_text_chars = agent_quality_fields.get(
+        "output_contract_final_text_chars"
+    )
+    output_contract_final_text_chars = (
+        _coerce_int(raw_output_contract_final_text_chars)
+        if raw_output_contract_final_text_chars is not None
+        else None
+    )
+    if output_contract_failure_class:
+        reasons.append(f"output_contract_{output_contract_failure_class}")
     command_only_ignored_count = _coerce_int(
         agent_quality_fields.get("ignored_path_tracking_violation_count")
     )
@@ -2824,6 +2944,19 @@ def score_candidate(
         if not payload_resolved
         else (0.0 if ignored_path_tracking_violation_count else 1.0)
     )
+    output_contract_compliance_reasons: List[str] = []
+    if output_contract_compliance_score == 0.0:
+        if terminal_completion_failure:
+            output_contract_compliance_reasons.append(
+                f"terminal_completion_{terminal_state}"
+            )
+        elif malformed_output_shape:
+            output_contract_compliance_reasons.append("malformed_response_shape")
+        elif generic_output_contract_failure:
+            output_contract_compliance_reasons.append("empty_success_response")
+    for reason in agent_quality_reasons.get("output_contract_compliance", []):
+        if isinstance(reason, str) and reason not in output_contract_compliance_reasons:
+            output_contract_compliance_reasons.append(reason)
     agent_score_reasons = {
         "response_meaningfulness": (
             ["no_meaningful_output"] if response_meaningfulness_score == 0.0 else []
@@ -2857,16 +2990,10 @@ def score_candidate(
             else []
         ),
         "stall_risk": ["long_elapsed_low_output"] if stall_risk_score == 1.0 else [],
-        "output_contract_compliance": (
-            (
-                [f"terminal_completion_{terminal_state}"]
-                if terminal_completion_failure
-                else ["malformed_response_shape"]
-                if malformed_output_shape
-                else ["empty_success_response"]
-            )
-            if output_contract_compliance_score == 0.0
-            else []
+        "output_contract_compliance": output_contract_compliance_reasons,
+        "output_contract_evidence": agent_quality_reasons.get(
+            "output_contract_evidence",
+            {},
         ),
         "task_progress": ["no_task_progress_signal"] if task_progress_score == 0.0 else [],
         "terminal_completion": (
@@ -2917,6 +3044,7 @@ def score_candidate(
         or sleep_wellness_interruption_incident_score == 1.0
         or terminal_completion_score == 0.0
         or discovery_inventory_coverage_score == 0.0
+        or output_contract_compliance_score == 0.0
     )
     return TraceScoreEvidence(
         row_id=candidate.row_id,
@@ -2970,6 +3098,18 @@ def score_candidate(
         tool_error_recovery_score=tool_error_recovery_score,
         stall_risk_score=stall_risk_score,
         output_contract_compliance_score=output_contract_compliance_score,
+        output_contract_required_final_phrase=output_contract_required_final_phrase,
+        output_contract_required_final_phrase_present=(
+            output_contract_required_final_phrase_present
+        ),
+        output_contract_required_final_phrase_source=(
+            output_contract_required_final_phrase_source
+        ),
+        output_contract_failure_class=output_contract_failure_class,
+        output_contract_failure_count=output_contract_failure_count,
+        output_contract_setup_only_detected=output_contract_setup_only_detected,
+        output_contract_setup_only_markers=output_contract_setup_only_markers,
+        output_contract_final_text_chars=output_contract_final_text_chars,
         task_progress_score=task_progress_score,
         scope_control_score=scope_control_score,
         destructive_action_policy_score=destructive_action_policy_score,
@@ -3366,6 +3506,30 @@ def _session_history_score_values(
         "usage_output_contract_compliance_score": (
             evidence.output_contract_compliance_score
         ),
+        "usage_output_contract_required_final_phrase": (
+            evidence.output_contract_required_final_phrase
+        ),
+        "usage_output_contract_required_final_phrase_present": (
+            evidence.output_contract_required_final_phrase_present
+        ),
+        "usage_output_contract_required_final_phrase_source": (
+            evidence.output_contract_required_final_phrase_source
+        ),
+        "usage_output_contract_failure_class": (
+            evidence.output_contract_failure_class
+        ),
+        "usage_output_contract_failure_count": (
+            evidence.output_contract_failure_count
+        ),
+        "usage_output_contract_setup_only_detected": (
+            evidence.output_contract_setup_only_detected
+        ),
+        "usage_output_contract_setup_only_markers": (
+            evidence.output_contract_setup_only_markers
+        ),
+        "usage_output_contract_final_text_chars": (
+            evidence.output_contract_final_text_chars
+        ),
         "usage_task_progress_score": evidence.task_progress_score,
         "usage_scope_control_score": evidence.scope_control_score,
         "usage_destructive_action_policy_score": (
@@ -3437,7 +3601,7 @@ def _session_history_score_values(
     score_metadata = {
         key: value
         for key, value in raw_score_metadata.items()
-        if value is not None and value != {}
+        if value is not None and value not in ({}, [])
     }
     params = {
         "trace_quality_score": trace_quality_score,
@@ -4151,6 +4315,7 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
             transcript_pairs = [
                 (candidate, evidence)
                 for evidence in evidences
+                if evidence.observation_id is not None
                 for candidate in [
                     transcript_candidate_by_call_id.get(evidence.observation_id)
                 ]
