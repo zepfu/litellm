@@ -11405,6 +11405,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
         custom_llm_provider=adapter_provider,
         egress_credential_family="openai" if local_codex_headers is not None else None,
         expected_target_family="openai",
+        retryable_upstream_status_codes=[429],
     )
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 

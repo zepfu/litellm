@@ -78,13 +78,31 @@ def _load_harness_module():
     return module
 
 
-def test_warning_only_timeout_still_fails_hard():
+def test_warning_only_timeout_is_soft_by_default():
     harness = _load_harness_module()
 
     result = harness._warning_only_error_result(
         "warning_only_fixture",
         subprocess.TimeoutExpired(["claude"], 180),
         {"warning_only": True},
+    )
+
+    assert result["passed"] is True
+    assert result["failures"] == []
+    assert result["soft_failures"]
+    assert result["warnings"]
+
+
+def test_warning_only_timeout_can_be_hard_failed_by_config():
+    harness = _load_harness_module()
+
+    result = harness._warning_only_error_result(
+        "warning_only_fixture",
+        subprocess.TimeoutExpired(["claude"], 180),
+        {
+            "warning_only": True,
+            "warning_only_hard_failure_substrings": ["timed out after"],
+        },
     )
 
     assert result["passed"] is False
@@ -531,6 +549,53 @@ def test_runtime_log_defaults_catch_async_and_content_length_errors(monkeypatch)
         "Too little data for declared Content-Length"
         in summary["matched_forbidden_substrings"]
     )
+    assert "KeyError: 'choices'" in summary["matched_forbidden_contexts"]
+    assert "KeyError: 'choices'" in summary["matched_forbidden_contexts"][
+        "KeyError: 'choices'"
+    ]
+
+
+def test_runtime_log_read_is_bounded_by_until(monkeypatch):
+    harness = _load_harness_module()
+    commands = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command, *args, **kwargs):
+        commands.append(command)
+        return Completed()
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+
+    started = dt.datetime(2026, 4, 23, 14, 6, tzinfo=dt.timezone.utc)
+    until = dt.datetime(2026, 4, 23, 14, 7, tzinfo=dt.timezone.utc)
+
+    summary, log_text = harness._read_runtime_logs_since(
+        started=started,
+        until=until,
+        checks={"docker_container_name": "litellm-dev", "tail_lines": 25},
+        runtime_postconditions={},
+    )
+
+    assert log_text == ""
+    assert commands == [
+        [
+            "docker",
+            "logs",
+            "--since",
+            started.isoformat(),
+            "--until",
+            until.isoformat(),
+            "--tail",
+            "25",
+            "litellm-dev",
+        ]
+    ]
+    assert summary["docker_logs_since"] == started.isoformat()
+    assert summary["docker_logs_until"] == until.isoformat()
 
 
 def test_target_profile_sets_session_history_runtime_identity_expectations(monkeypatch):
