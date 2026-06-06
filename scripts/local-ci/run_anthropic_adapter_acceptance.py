@@ -54,6 +54,23 @@ DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS = [
     'runtime logs contained forbidden substring',
     'successful empty',
 ]
+ATTRIBUTION_SCOPED_RUNTIME_LOG_SUBSTRINGS = {
+    *DEFAULT_RUNTIME_LOG_FORBIDDEN_SUBSTRINGS,
+    *DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS,
+}
+UNRELATED_AUTO_AGENT_RUNTIME_LOG_CONTEXT_MARKERS = [
+    '_handle_codex_auto_agent_alias_route',
+    '_perform_codex_auto_agent_openrouter_completion_request',
+    'codex_auto_agent_alias',
+]
+UNRELATED_PASSTHROUGH_RUNTIME_LOG_CONTEXT_MARKERS = [
+    'chatgpt.com/backend-api/codex/responses',
+]
+UNRELATED_RUNTIME_LOG_ERROR_SIGNATURES = [
+    'deepseek/deepseek-v4-flash:free',
+    'reset reason: connection timeout',
+]
+RUNTIME_LOG_MODEL_FIELD_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
 _VALIDATION_DB_CONNECTIONS: dict[tuple[str, int, str, str, str], Any] = {}
 
 
@@ -1343,7 +1360,7 @@ def _runtime_log_match_contexts(
     *,
     log_text: str,
     substrings: list[str],
-    context_chars: int = 500,
+    context_chars: int = 4000,
 ) -> dict[str, str]:
     contexts: dict[str, str] = {}
     for substring in substrings:
@@ -1359,12 +1376,82 @@ def _runtime_log_match_contexts(
     return contexts
 
 
+def _command_model_name(config: dict[str, Any]) -> str | None:
+    command = config.get('command')
+    if not isinstance(command, list):
+        return None
+    for index, value in enumerate(command):
+        if value == '--model' and index + 1 < len(command):
+            model = command[index + 1]
+            return model if isinstance(model, str) and model else None
+    return None
+
+
+def _runtime_log_attribution_substrings(
+    *,
+    family: str,
+    config: dict[str, Any],
+    session_id: str | None,
+) -> list[str]:
+    values: set[str] = {family}
+    if session_id:
+        values.add(session_id)
+
+    command_model = _command_model_name(config)
+    if command_model:
+        values.add(command_model)
+
+    session_history_validation = config.get('session_history_validation')
+    if isinstance(session_history_validation, dict):
+        expected_model = session_history_validation.get('expected_model')
+        if isinstance(expected_model, str) and expected_model:
+            values.add(expected_model)
+
+    for key in ('allowed_generation_routes', 'required_trace_tags'):
+        configured_values = config.get(key)
+        if isinstance(configured_values, list):
+            values.update(
+                value for value in configured_values if isinstance(value, str) and value
+            )
+
+    return sorted(values)
+
+
+def _is_unrelated_runtime_log_match(
+    *,
+    substring: str,
+    context: str,
+    attribution_substrings: list[str],
+) -> bool:
+    if substring not in ATTRIBUTION_SCOPED_RUNTIME_LOG_SUBSTRINGS:
+        return False
+    if not context or not attribution_substrings:
+        return False
+    if any(value in context for value in attribution_substrings):
+        return False
+    if not any(signature in context for signature in UNRELATED_RUNTIME_LOG_ERROR_SIGNATURES):
+        return False
+    if any(
+        marker in context for marker in UNRELATED_AUTO_AGENT_RUNTIME_LOG_CONTEXT_MARKERS
+    ):
+        return True
+    if not any(
+        marker in context for marker in UNRELATED_PASSTHROUGH_RUNTIME_LOG_CONTEXT_MARKERS
+    ):
+        return False
+    return any(
+        model and all(model not in value for value in attribution_substrings)
+        for model in RUNTIME_LOG_MODEL_FIELD_RE.findall(context)
+    )
+
+
 def _validate_runtime_logs(
     *,
     family: str,
     started: Any,
     checks: dict[str, Any],
     runtime_postconditions: dict[str, Any],
+    attribution_substrings: list[str] | None = None,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     container_name = (
         checks.get('docker_container_name')
@@ -1391,6 +1478,9 @@ def _validate_runtime_logs(
         'forbidden_substrings': forbidden_substrings,
         'matched_forbidden_substrings': [],
         'matched_forbidden_contexts': {},
+        'ignored_unattributed_forbidden_substrings': [],
+        'ignored_unattributed_forbidden_contexts': {},
+        'attribution_substrings': attribution_substrings or [],
     }
     failures: list[str] = []
     warnings: list[str] = []
@@ -1418,15 +1508,39 @@ def _validate_runtime_logs(
     matched = [
         substring for substring in forbidden_substrings if substring and substring in log_text
     ]
-    summary['matched_forbidden_substrings'] = matched
-    summary['matched_forbidden_contexts'] = _runtime_log_match_contexts(
+    match_contexts = _runtime_log_match_contexts(
         log_text=log_text,
         substrings=matched,
     )
+    failing_matches: list[str] = []
+    ignored_matches: list[str] = []
+    ignored_contexts: dict[str, str] = {}
     for substring in matched:
+        context = match_contexts.get(substring, '')
+        if _is_unrelated_runtime_log_match(
+            substring=substring,
+            context=context,
+            attribution_substrings=attribution_substrings or [],
+        ):
+            ignored_matches.append(substring)
+            ignored_contexts[substring] = context
+            warnings.append(
+                f'{family} ignored unattributed runtime log match `{substring}` from unrelated concurrent container traffic'
+            )
+            continue
+        failing_matches.append(substring)
         failures.append(
             f'{family} runtime logs contained forbidden substring `{substring}`'
         )
+
+    summary['matched_forbidden_substrings'] = failing_matches
+    summary['matched_forbidden_contexts'] = {
+        substring: match_contexts[substring]
+        for substring in failing_matches
+        if substring in match_contexts
+    }
+    summary['ignored_unattributed_forbidden_substrings'] = ignored_matches
+    summary['ignored_unattributed_forbidden_contexts'] = ignored_contexts
 
     return summary, failures, warnings
 
@@ -3453,6 +3567,11 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         started=started,
         checks=config.get('runtime_log_checks') or {},
         runtime_postconditions=runtime_summary,
+        attribution_substrings=_runtime_log_attribution_substrings(
+            family=name,
+            config=config,
+            session_id=command_session_id,
+        ),
     )
     failures.extend(runtime_log_failures)
     warnings.extend(runtime_log_warnings)
