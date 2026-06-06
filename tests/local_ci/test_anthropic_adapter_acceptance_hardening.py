@@ -598,6 +598,229 @@ def test_runtime_log_read_is_bounded_by_until(monkeypatch):
     assert summary["docker_logs_until"] == until.isoformat()
 
 
+def test_runtime_log_ignores_unattributed_concurrent_auto_agent_traceback(monkeypatch):
+    harness = _load_harness_module()
+
+    class Completed:
+        returncode = 0
+        stdout = (
+            "litellm.exceptions.NotFoundError: OpenrouterException - "
+            '{"error":{"message":"No endpoints found for '
+            'deepseek/deepseek-v4-flash:free."}}\n'
+            "ERROR:    Exception in ASGI application\n"
+            + ("  File \"/app/noise.py\", line 1, in frame\n" * 40)
+            + "  File \"/app/litellm/proxy/pass_through_endpoints/"
+            "llm_passthrough_endpoints.py\", line 20899, in "
+            "_base_openai_pass_through_handler\n"
+            "    return await _handle_codex_auto_agent_alias_route(...)\n"
+            "  File \"/app/litellm/proxy/pass_through_endpoints/"
+            "llm_passthrough_endpoints.py\", line 20436, in "
+            "_perform_codex_auto_agent_openrouter_completion_request\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *args, **kwargs: Completed(),
+    )
+
+    summary, failures, warnings = harness._validate_runtime_logs(
+        family="claude_adapter_gpt54",
+        started="2026-06-06T21:04:15+00:00",
+        checks={},
+        runtime_postconditions={"docker_container_name": "litellm-dev"},
+        attribution_substrings=[
+            "claude_adapter_gpt54",
+            "gpt-5.4",
+            "active-session-id",
+            "/anthropic/v1/messages",
+        ],
+    )
+
+    assert failures == []
+    assert warnings == [
+        "claude_adapter_gpt54 ignored unattributed runtime log match "
+        "`Exception in ASGI application` from unrelated concurrent container traffic"
+    ]
+    assert summary["matched_forbidden_substrings"] == []
+    assert summary["ignored_unattributed_forbidden_substrings"] == [
+        "Exception in ASGI application"
+    ]
+    assert "Exception in ASGI application" in summary[
+        "ignored_unattributed_forbidden_contexts"
+    ]
+    assert (
+        "_perform_codex_auto_agent_openrouter_completion_request"
+        in summary["ignored_unattributed_forbidden_contexts"][
+            "Exception in ASGI application"
+        ]
+    )
+
+
+def test_runtime_log_keeps_attributed_exception_hard(monkeypatch):
+    harness = _load_harness_module()
+
+    class Completed:
+        returncode = 0
+        stdout = (
+            "model=gpt-5.4 session=active-session-id\n"
+            "ERROR:    Exception in ASGI application\n"
+            "Traceback for active request"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *args, **kwargs: Completed(),
+    )
+
+    summary, failures, warnings = harness._validate_runtime_logs(
+        family="claude_adapter_gpt54",
+        started="2026-06-06T21:04:15+00:00",
+        checks={},
+        runtime_postconditions={"docker_container_name": "litellm-dev"},
+        attribution_substrings=["gpt-5.4", "active-session-id"],
+    )
+
+    assert warnings == []
+    assert failures == [
+        "claude_adapter_gpt54 runtime logs contained forbidden substring "
+        "`Exception in ASGI application`"
+    ]
+    assert summary["matched_forbidden_substrings"] == [
+        "Exception in ASGI application"
+    ]
+    assert summary["ignored_unattributed_forbidden_substrings"] == []
+
+
+def test_runtime_log_keeps_auto_agent_traceback_without_unrelated_error_hard(
+    monkeypatch,
+):
+    harness = _load_harness_module()
+
+    class Completed:
+        returncode = 0
+        stdout = (
+            "ERROR:    Exception in ASGI application\n"
+            "  File \"/app/litellm/proxy/pass_through_endpoints/"
+            "llm_passthrough_endpoints.py\", line 20899, in "
+            "_base_openai_pass_through_handler\n"
+            "    return await _handle_codex_auto_agent_alias_route(...)\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *args, **kwargs: Completed(),
+    )
+
+    summary, failures, warnings = harness._validate_runtime_logs(
+        family="claude_adapter_gpt54",
+        started="2026-06-06T21:04:15+00:00",
+        checks={},
+        runtime_postconditions={"docker_container_name": "litellm-dev"},
+        attribution_substrings=["gpt-5.4", "active-session-id"],
+    )
+
+    assert warnings == []
+    assert failures == [
+        "claude_adapter_gpt54 runtime logs contained forbidden substring "
+        "`Exception in ASGI application`"
+    ]
+    assert summary["matched_forbidden_substrings"] == [
+        "Exception in ASGI application"
+    ]
+    assert summary["ignored_unattributed_forbidden_substrings"] == []
+
+
+def test_runtime_log_ignores_unattributed_foreign_model_passthrough_503(
+    monkeypatch,
+):
+    harness = _load_harness_module()
+
+    class Completed:
+        returncode = 0
+        stdout = (
+            'Langfuse warning: {"model": "gpt-5.5"}\n'
+            "pass_through_endpoint(): Exception occured - 503: b'upstream "
+            "connect error or disconnect/reset before headers. reset reason: "
+            "connection timeout'\n"
+            "https://chatgpt.com/backend-api/codex/responses\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *args, **kwargs: Completed(),
+    )
+
+    summary, failures, warnings = harness._validate_runtime_logs(
+        family="claude_adapter_spark",
+        started="2026-06-06T21:45:11+00:00",
+        checks={},
+        runtime_postconditions={"docker_container_name": "litellm-dev"},
+        attribution_substrings=[
+            "claude_adapter_spark",
+            "gpt-5.3-codex-spark",
+            "active-spark-session",
+        ],
+    )
+
+    assert failures == []
+    assert warnings == [
+        "claude_adapter_spark ignored unattributed runtime log match "
+        "`pass_through_endpoint(): Exception occured - 503:` from unrelated "
+        "concurrent container traffic"
+    ]
+    assert summary["matched_forbidden_substrings"] == []
+    assert summary["ignored_unattributed_forbidden_substrings"] == [
+        "pass_through_endpoint(): Exception occured - 503:"
+    ]
+
+
+def test_runtime_log_keeps_current_model_passthrough_503_hard(monkeypatch):
+    harness = _load_harness_module()
+
+    class Completed:
+        returncode = 0
+        stdout = (
+            'Langfuse warning: {"model": "gpt-5.5"}\n'
+            "pass_through_endpoint(): Exception occured - 503: b'upstream "
+            "connect error or disconnect/reset before headers. reset reason: "
+            "connection timeout'\n"
+            "https://chatgpt.com/backend-api/codex/responses\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *args, **kwargs: Completed(),
+    )
+
+    summary, failures, warnings = harness._validate_runtime_logs(
+        family="claude_adapter_gpt55",
+        started="2026-06-06T21:45:11+00:00",
+        checks={},
+        runtime_postconditions={"docker_container_name": "litellm-dev"},
+        attribution_substrings=["claude_adapter_gpt55", "gpt-5.5"],
+    )
+
+    assert warnings == []
+    assert failures == [
+        "claude_adapter_gpt55 runtime logs contained forbidden substring "
+        "`pass_through_endpoint(): Exception occured - 503:`"
+    ]
+    assert summary["matched_forbidden_substrings"] == [
+        "pass_through_endpoint(): Exception occured - 503:"
+    ]
+    assert summary["ignored_unattributed_forbidden_substrings"] == []
+
+
 def test_target_profile_sets_session_history_runtime_identity_expectations(monkeypatch):
     monkeypatch.setenv("AAWM_CLAUDE_HARNESS_USER_ID", "litellm-harness-test")
     harness = _load_harness_module()
