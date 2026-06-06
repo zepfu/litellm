@@ -2445,6 +2445,66 @@ prod persisted `session_history` / `rate_limit_observations` proof.
 
 ---
 
+### cb-v0.0.45 — Callback overlay parity for PgBouncer runtime pooling and persistence recovery
+
+**Status:** AAWM callback overlay release candidate.
+
+**What changed:** The callback wheel source under
+`.wheel-build/aawm_litellm_callbacks/agent_identity.py` remains synced to the
+in-repo callback at `litellm/integrations/aawm_agent_identity.py` and carries
+the D1-211/D1-214 session-history persistence and runtime Postgres changes into
+the production installed-wheel path. This release includes retry-backed
+session-history flush behavior, side-write isolation, callback package fallback
+imports for bundled quality rules, and the shared PgBouncer runtime DSN
+convention while keeping migration/admin scripts on direct database paths.
+
+**Why:** Production imports `aawm_litellm_callbacks.agent_identity` from the
+installed callback wheel, not the in-repo source callback used by `litellm-dev`.
+The previous production container reported `aawm-litellm-callbacks=0.0.42`,
+which predates the D1-211 persistence repair and the D1-214 callback-side
+PgBouncer pooling update. D1-215 therefore needs a new callback wheel before
+the prod migration can be considered durable.
+
+**Why not upstream:** This is specific to AAWM's callback overlay release line,
+`aawm_tristore` session-history persistence, local PgBouncer topology, and
+production image packaging.
+
+**Validation status:** Focused D1-211 and D1-214 tests covered
+session-history flush retry behavior, side-write isolation, source/overlay
+parity, PgBouncer runtime DSN derivation, direct-DSN preservation for backfill
+and repair scripts, and provider-status no-hot-path-DDL behavior. D1-215
+promotion still requires publishing `cb-v0.0.45`, rebuilding/restarting
+`aawm-litellm`, and proving fresh prod `session_history` /
+`rate_limit_observations` rows with no queue overflow/drop logs.
+
+---
+
+### cp-v0.0.8 — Control-plane overlay parity for PgBouncer-aware passthrough runtime paths
+
+**Status:** AAWM control-plane overlay release candidate.
+
+**What changed:** The control-plane wheel source now packages the D1-214
+changes to `litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py`
+so production installed-wheel runtimes use the same PgBouncer-aware runtime
+database convention and metadata behavior as the source tree.
+
+**Why:** Production installs the independent `aawm-litellm-control-plane` wheel
+over the pinned LiteLLM base image. The previous production container reported
+`aawm-litellm-control-plane=0.0.7`, while D1-214 changed the control-plane
+source after that release. D1-215 needs `cp-v0.0.8` published and installed so
+control-plane behavior does not drift from the tested source path.
+
+**Why not upstream:** This is AAWM-specific Claude/Codex control-plane packaging
+and local runtime database topology, not generic LiteLLM provider behavior.
+
+**Validation status:** D1-214 focused tests covered the touched control-plane
+and passthrough paths, including pooled runtime database configuration and
+preserved direct database usage for maintenance paths. D1-215 promotion still
+requires publishing `cp-v0.0.8`, rebuilding/restarting `aawm-litellm`, and
+verifying the prod container reports `aawm-litellm-control-plane=0.0.8`.
+
+---
+
 
 ## Dropped Patches
 
