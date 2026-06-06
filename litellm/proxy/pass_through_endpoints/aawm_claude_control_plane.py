@@ -6,11 +6,7 @@ from datetime import datetime, timezone
 from time import monotonic
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote, urlencode
-
-if False:  # pragma: no cover
-    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
-
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 _REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
     Path(__file__).resolve().parents[3] / "context-replacement" / "claude-code"
@@ -209,10 +205,18 @@ _AAWM_DB_URL_ENV_VARS = (
     "AAWM_DATABASE_URL",
     "AAWM_POSTGRES_URL",
 )
+_AAWM_DB_APPLICATION_NAME_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME",
+    "AAWM_DB_APPLICATION_NAME",
+    "AAWM_POSTGRES_APPLICATION_NAME",
+    "PGAPPNAME",
+)
+_AAWM_DYNAMIC_INJECTION_APPLICATION_NAME = "aawm-litellm-dynamic-injection"
 _AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS = 15.0
 _AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE = 1
 _AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE = 4
 _AAWM_DYNAMIC_INJECTION_COMMAND_TIMEOUT_SECONDS = 10
+_AAWM_DYNAMIC_INJECTION_STATEMENT_CACHE_SIZE = 0
 _aawm_dynamic_injection_pool: Optional[Any] = None
 _aawm_dynamic_injection_pool_lock = asyncio.Lock()
 _aawm_dynamic_injection_cache: dict[tuple[str, str, str, str], tuple[float, Optional[str]]] = {}
@@ -587,7 +591,7 @@ def _replace_claude_system_prompt_override_in_value(
 
     if isinstance(value, list):
         updated_list = []
-        combined_events: list[dict[str, Any]] = []
+        list_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_events = _replace_claude_system_prompt_override_in_value(
@@ -595,10 +599,10 @@ def _replace_claude_system_prompt_override_in_value(
                 cc_version,
             )
             updated_list.append(updated_child)
-            combined_events.extend(child_events)
+            list_events.extend(child_events)
             if updated_child is not child:
                 changed = True
-        return (updated_list if changed else value), combined_events
+        return (updated_list if changed else value), list_events
 
     return value, []
 
@@ -1136,8 +1140,8 @@ async def _rewrite_claude_control_plane_in_value(
 
     if isinstance(value, list):
         updated_list = []
-        combined_override_events: list[dict[str, Any]] = []
-        combined_patch_events: list[dict[str, Any]] = []
+        list_override_events: list[dict[str, Any]] = []
+        list_patch_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_override_events, child_patch_events = await _rewrite_claude_control_plane_in_value(
@@ -1147,14 +1151,14 @@ async def _rewrite_claude_control_plane_in_value(
                 available_context=available_context,
             )
             updated_list.append(updated_child)
-            combined_override_events.extend(child_override_events)
-            combined_patch_events.extend(child_patch_events)
+            list_override_events.extend(child_override_events)
+            list_patch_events.extend(child_patch_events)
             if updated_child is not child:
                 changed = True
         return (
             updated_list if changed else value,
-            combined_override_events,
-            combined_patch_events,
+            list_override_events,
+            list_patch_events,
         )
 
     if isinstance(value, str):
@@ -1245,7 +1249,7 @@ def replace_claude_system_prompt_in_anthropic_request_body(
     lp = _lp()
     cc_version = billing_header_fields.get("cc_version")
     template_path = _resolve_claude_auto_memory_template_path(cc_version)
-    if template_path is None or "system" not in request_body:
+    if template_path is None or not cc_version or "system" not in request_body:
         return request_body, []
 
     span_started_at = datetime.now(timezone.utc)
@@ -1333,7 +1337,7 @@ def _replace_claude_prompt_patches_in_value(
 
     if isinstance(value, list):
         updated_list = []
-        combined_events: list[dict[str, Any]] = []
+        list_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_events = _replace_claude_prompt_patches_in_value(
@@ -1341,10 +1345,10 @@ def _replace_claude_prompt_patches_in_value(
                 cc_version,
             )
             updated_list.append(updated_child)
-            combined_events.extend(child_events)
+            list_events.extend(child_events)
             if updated_child is not child:
                 changed = True
-        return (updated_list if changed else value), combined_events
+        return (updated_list if changed else value), list_events
 
     if isinstance(value, str):
         try:
@@ -1642,6 +1646,51 @@ def _build_aawm_context_grab_failure_text(name: str) -> str:
     return _AAWM_CONTEXT_GRAB_FAILURE_TEMPLATE.format(name=name or "unknown")
 
 
+def _append_aawm_dynamic_injection_dsn_query_params(
+    dsn: str,
+    params: dict[str, Optional[str]],
+) -> str:
+    parsed = urlsplit(dsn)
+    if not parsed.scheme:
+        return dsn
+
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    existing_keys = {key for key, _value in query_items}
+    for key, value in params.items():
+        cleaned_value = _clean_secret_string(value)
+        if cleaned_value and key not in existing_keys:
+            query_items.append((key, cleaned_value))
+            existing_keys.add(key)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(query_items),
+            parsed.fragment,
+        )
+    )
+
+
+def _get_aawm_dynamic_injection_application_name() -> str:
+    return (
+        _get_first_secret_value(_AAWM_DB_APPLICATION_NAME_ENV_VARS)
+        or _AAWM_DYNAMIC_INJECTION_APPLICATION_NAME
+    )
+
+
+def _get_aawm_dynamic_injection_server_settings() -> dict[str, str]:
+    return {"application_name": _get_aawm_dynamic_injection_application_name()}
+
+
+async def _initialize_aawm_dynamic_injection_connection(conn: Any) -> None:
+    await conn.execute(
+        "select set_config($1, $2, false)",
+        "application_name",
+        _get_aawm_dynamic_injection_application_name(),
+    )
+
+
 def _build_aawm_dynamic_injection_dsn() -> Optional[str]:
     host = _get_first_secret_value(_AAWM_DB_HOST_ENV_VARS)
     port = _get_first_secret_value(_AAWM_DB_PORT_ENV_VARS)
@@ -1667,9 +1716,18 @@ def _build_aawm_dynamic_injection_dsn() -> Optional[str]:
         )
         if sslmode:
             dsn += f"?{urlencode({'sslmode': sslmode})}"
-        return dsn
+        return _append_aawm_dynamic_injection_dsn_query_params(
+            dsn,
+            {"application_name": _get_aawm_dynamic_injection_application_name()},
+        )
 
-    return _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
+    url_dsn = _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
+    if not url_dsn:
+        return None
+    return _append_aawm_dynamic_injection_dsn_query_params(
+        url_dsn,
+        {"application_name": _get_aawm_dynamic_injection_application_name()},
+    )
 
 
 async def _get_aawm_dynamic_injection_pool() -> Any:
@@ -1698,6 +1756,9 @@ async def _get_aawm_dynamic_injection_pool() -> Any:
             min_size=_AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE,
             max_size=_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE,
             command_timeout=_AAWM_DYNAMIC_INJECTION_COMMAND_TIMEOUT_SECONDS,
+            statement_cache_size=_AAWM_DYNAMIC_INJECTION_STATEMENT_CACHE_SIZE,
+            server_settings=_get_aawm_dynamic_injection_server_settings(),
+            init=_initialize_aawm_dynamic_injection_connection,
         )
         return _aawm_dynamic_injection_pool
 
@@ -2226,7 +2287,7 @@ async def _expand_aawm_dynamic_directives_in_value(
             return value, []
 
         updated_dict: dict[str, Any] = {}
-        combined_events: list[dict[str, Any]] = []
+        dict_events: list[dict[str, Any]] = []
         changed = False
         for key, child in value.items():
             updated_child, child_events = await _expand_aawm_dynamic_directives_in_value(
@@ -2235,14 +2296,14 @@ async def _expand_aawm_dynamic_directives_in_value(
                 enable_dispatch_backtick_context=enable_dispatch_backtick_context,
             )
             updated_dict[key] = updated_child
-            combined_events.extend(child_events)
+            dict_events.extend(child_events)
             if updated_child is not child:
                 changed = True
-        return (updated_dict if changed else value), combined_events
+        return (updated_dict if changed else value), dict_events
 
     if isinstance(value, list):
         updated_list = []
-        combined_events: list[dict[str, Any]] = []
+        list_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
             updated_child, child_events = await _expand_aawm_dynamic_directives_in_value(
@@ -2251,10 +2312,10 @@ async def _expand_aawm_dynamic_directives_in_value(
                 enable_dispatch_backtick_context=enable_dispatch_backtick_context,
             )
             updated_list.append(updated_child)
-            combined_events.extend(child_events)
+            list_events.extend(child_events)
             if updated_child is not child:
                 changed = True
-        return (updated_list if changed else value), combined_events
+        return (updated_list if changed else value), list_events
 
     return value, []
 

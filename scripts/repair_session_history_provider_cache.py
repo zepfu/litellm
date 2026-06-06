@@ -64,6 +64,13 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
 )
 
 
+def _build_aawm_admin_dsn() -> Optional[str]:
+    direct_dsn = os.getenv("AAWM_DIRECT_DATABASE_URL")
+    if direct_dsn and direct_dsn.strip():
+        return direct_dsn.strip()
+    return _build_aawm_dsn()
+
+
 _REPAIR_UPDATE_SQL = """
 UPDATE public.session_history
 SET
@@ -231,7 +238,7 @@ def _ensure_session_history_schema(conn: psycopg.Connection) -> None:
 
 
 def _run_repair(args: argparse.Namespace) -> Dict[str, Any]:
-    dsn = _build_aawm_dsn()
+    dsn = _build_aawm_admin_dsn()
     if not dsn:
         raise RuntimeError("AAWM/tristore database configuration is missing")
 

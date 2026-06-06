@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 from unittest import mock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -192,6 +193,188 @@ def _build_test_jwt(payload: dict[str, Any]) -> str:
         return encoded.rstrip(b"=").decode("ascii")
 
     return f"{encode_part({'alg': 'none'})}.{encode_part(payload)}.sig"
+
+
+def _patch_aawm_secret_values(
+    monkeypatch,
+    values: dict[str, str],
+) -> None:
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "get_secret_str",
+        lambda name: values.get(name),
+    )
+
+
+def _dsn_query_params(dsn: str) -> dict[str, list[str]]:
+    return parse_qs(urlsplit(dsn).query, keep_blank_values=True)
+
+
+def _assert_aawm_dynamic_injection_dsn_adds_application_name(
+    monkeypatch,
+    module: Any,
+) -> None:
+    _patch_aawm_secret_values(
+        monkeypatch,
+        {
+            "AAWM_DB_HOST": "pgbouncer",
+            "AAWM_DB_PORT": "6432",
+            "AAWM_DB_USER": "aawm",
+            "AAWM_DB_PASSWORD": "aawm dev",
+            "AAWM_DB_NAME": "aawm_tristore",
+            "AAWM_DB_SSLMODE": "disable",
+        },
+    )
+
+    dsn = module._build_aawm_dynamic_injection_dsn()
+
+    assert dsn is not None
+    parsed = urlsplit(dsn)
+    assert parsed.hostname == "pgbouncer"
+    assert parsed.port == 6432
+    assert parsed.path == "/aawm_tristore"
+    assert _dsn_query_params(dsn) == {
+        "sslmode": ["disable"],
+        "application_name": ["aawm-litellm-dynamic-injection"],
+    }
+
+
+def _assert_aawm_dynamic_injection_dsn_preserves_application_name(
+    monkeypatch,
+    module: Any,
+) -> None:
+    _patch_aawm_secret_values(
+        monkeypatch,
+        {
+            "AAWM_DATABASE_URL": (
+                "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
+                "?application_name=custom-dynamic&sslmode=require"
+            ),
+            "AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME": "ignored-dynamic",
+        },
+    )
+
+    dsn = module._build_aawm_dynamic_injection_dsn()
+
+    assert dsn is not None
+    assert _dsn_query_params(dsn) == {
+        "application_name": ["custom-dynamic"],
+        "sslmode": ["require"],
+    }
+
+
+async def _assert_aawm_dynamic_injection_pool_disables_statement_cache(
+    monkeypatch,
+    module: Any,
+) -> None:
+    create_pool_calls: list[dict[str, Any]] = []
+    created_pool = object()
+
+    class FakeAsyncpg:
+        async def create_pool(self, **kwargs):
+            create_pool_calls.append(kwargs)
+            return created_pool
+
+    monkeypatch.setattr(module, "_aawm_dynamic_injection_pool", None)
+    monkeypatch.setattr(
+        module,
+        "_build_aawm_dynamic_injection_dsn",
+        lambda: "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
+    )
+    monkeypatch.setattr(
+        module,
+        "_get_aawm_dynamic_injection_application_name",
+        lambda: "aawm-litellm-test-dynamic",
+    )
+    monkeypatch.setattr(
+        module.importlib,
+        "import_module",
+        lambda name: FakeAsyncpg() if name == "asyncpg" else None,
+    )
+
+    try:
+        pool = await module._get_aawm_dynamic_injection_pool()
+    finally:
+        module._aawm_dynamic_injection_pool = None
+
+    assert pool is created_pool
+    assert create_pool_calls[0]["statement_cache_size"] == 0
+    assert create_pool_calls[0]["server_settings"] == {
+        "application_name": "aawm-litellm-test-dynamic"
+    }
+    assert create_pool_calls[0]["init"] is (
+        module._initialize_aawm_dynamic_injection_connection
+    )
+
+
+def test_llm_passthrough_dynamic_injection_dsn_adds_application_name(
+    monkeypatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    _assert_aawm_dynamic_injection_dsn_adds_application_name(
+        monkeypatch,
+        llm_passthrough_endpoints,
+    )
+
+
+def test_claude_control_plane_dynamic_injection_dsn_adds_application_name(
+    monkeypatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+    _assert_aawm_dynamic_injection_dsn_adds_application_name(
+        monkeypatch,
+        aawm_claude_control_plane,
+    )
+
+
+def test_llm_passthrough_dynamic_injection_dsn_preserves_application_name(
+    monkeypatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    _assert_aawm_dynamic_injection_dsn_preserves_application_name(
+        monkeypatch,
+        llm_passthrough_endpoints,
+    )
+
+
+def test_claude_control_plane_dynamic_injection_dsn_preserves_application_name(
+    monkeypatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+    _assert_aawm_dynamic_injection_dsn_preserves_application_name(
+        monkeypatch,
+        aawm_claude_control_plane,
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_passthrough_dynamic_injection_pool_disables_statement_cache(
+    monkeypatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    await _assert_aawm_dynamic_injection_pool_disables_statement_cache(
+        monkeypatch,
+        llm_passthrough_endpoints,
+    )
+
+
+@pytest.mark.asyncio
+async def test_claude_control_plane_dynamic_injection_pool_disables_statement_cache(
+    monkeypatch,
+) -> None:
+    from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+    await _assert_aawm_dynamic_injection_pool_disables_statement_cache(
+        monkeypatch,
+        aawm_claude_control_plane,
+    )
 
 
 @pytest.mark.parametrize(
@@ -713,7 +896,7 @@ class TestResponsesAdapterToolChoice:
                             {
                                 "type": "thinking",
                                 "thinking": "I should inspect the requested file.",
-                                "signature": "reasoning_1",
+                                "signature": "rs_reasoning_1",
                             },
                             {
                                 "type": "tool_use",
@@ -6873,6 +7056,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
             ),
             adapter_headers={},
+            custom_llm_provider="gemini",
             google_adapter_rate_limit_key="google-lane",
             target_url="https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
             wrapped_request_body={"request": {"contents": []}},
@@ -11068,6 +11252,9 @@ class TestClaudePersistedOutputExpansion:
     async def test_prepare_anthropic_request_body_expands_plaintext_aawm_dynamic_injection(
         self,
     ):
+        from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+        aawm_claude_control_plane._aawm_dynamic_injection_cache.clear()
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {}
         request_body = {
@@ -11153,6 +11340,9 @@ class TestClaudePersistedOutputExpansion:
     async def test_prepare_anthropic_request_body_expands_at_wrapped_aawm_dynamic_injection(
         self,
     ):
+        from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+
+        aawm_claude_control_plane._aawm_dynamic_injection_cache.clear()
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {}
         request_body = {
@@ -17590,6 +17780,10 @@ async def test_openai_passthrough_generic_responses_does_not_patch_spawn_agent_t
             return_value={
                 "model": "gpt-5.4-mini",
                 "input": "hello",
+                "litellm_metadata": {
+                    "passthrough_route_family": "openai_responses",
+                    "tags": ["route:openai_responses"],
+                },
                 "tools": [
                     {
                         "type": "function",
@@ -17993,6 +18187,7 @@ class TestVertexAIPassThroughHandler:
             mock_ensure_token.return_value = ("test-auth-header", test_project)
             mock_get_token.return_value = (test_token, "")
             mock_auth.return_value = MagicMock()
+            mock_create_route.return_value = AsyncMock(return_value={"status": "success"})
 
             # Call the route
             await vertex_proxy_route(

@@ -56,6 +56,13 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
 )
 
 
+def _build_aawm_admin_dsn() -> Optional[str]:
+    direct_dsn = os.getenv("AAWM_DIRECT_DATABASE_URL")
+    if direct_dsn and direct_dsn.strip():
+        return direct_dsn.strip()
+    return _build_aawm_dsn()
+
+
 _VALID_IDENTITY_SQL = r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?( \(memory\))?$"
 _TRANSCRIPT_ARTIFACT_SQL = r"^(rollout-[0-9]{4}(-[A-Za-z0-9_.-]*)?|.*\.jsonl?)( \(memory\))?$"
 _AGENT_IDENTITY_SQL = _AAWM_REPOSITORY_AGENT_ID_RE.pattern
@@ -730,7 +737,7 @@ def _apply_repairs(
 
 
 def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0915
-    dsn = args.dsn or _build_aawm_dsn()
+    dsn = args.dsn or _build_aawm_admin_dsn()
     if not dsn:
         raise SystemExit("No database DSN found. Set AAWM_DB_* or pass --dsn.")
 
