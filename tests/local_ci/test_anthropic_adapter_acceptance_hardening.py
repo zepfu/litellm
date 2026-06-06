@@ -1395,6 +1395,152 @@ def test_sequential_core_tool_prompts_use_neutral_fixture_and_harness_agents():
         )
 
 
+def _assert_required_payload_paths(case_config, expected_paths):
+    required_paths = case_config["request_payload_checks"]["required_paths"]
+    for path in expected_paths:
+        assert path in required_paths
+
+
+def _assert_parallel_read_common_case(
+    *,
+    config,
+    case_name,
+    case_config,
+    agent_name,
+    provider,
+    model,
+    durable_tool_names,
+):
+    command = case_config["command"]
+    prompt = command[2]
+    assert case_name in config["default_excluded_cases"]
+    assert f"Dispatch to the {agent_name} agent" in prompt
+    assert "exactly three tool calls" in prompt
+    assert "must not wait for any tool result" in prompt
+    assert "sequential_core_tools_fixture.txt" in prompt
+    assert "sequential-core-tools-grep" in prompt
+    assert command[command.index("--allowedTools") + 1] == "Agent"
+    assert "--tools" not in command
+
+    assert set(case_config["claude_agents"]) == {agent_name}
+    agent_config = case_config["claude_agents"][agent_name]
+    assert agent_config["tools"] == PARALLEL_READ_TOOLS
+    assert "first assistant message must contain exactly three tool_use blocks" in (
+        agent_config["prompt"]
+    )
+    assert "Do not wait for any tool result" in agent_config["prompt"]
+    assert f"claude-code.{agent_name}" in case_config["required_trace_names"]
+    assert case_config["expected_trace_user_ids_by_name"][
+        f"claude-code.{agent_name}"
+    ] == "adapter-harness-tenant"
+
+    transcript_agent = case_config["transcript_tool_use_validation"][
+        "expected_agents"
+    ][0]
+    assert transcript_agent["agent_type"] == agent_name
+    assert transcript_agent["expected_tool_counts"] == {
+        "Read": 1,
+        "Glob": 1,
+        "Grep": 1,
+    }
+    assert transcript_agent["minimum_tools_in_single_assistant_message"] == 3
+    assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
+    assert "require_tool_result_before_next_tool_use" not in transcript_agent
+
+    durable_rows = [
+        row
+        for row in case_config["tool_activity_validation"]["expected_rows"]
+        if row.get("provider") == provider and row.get("model") == model
+    ]
+    assert {row["tool_name"] for row in durable_rows} == durable_tool_names
+
+
+def _assert_openai_parallel_read_case(case_config):
+    assert "claude-tool-advertisement-compaction" in case_config[
+        "required_trace_tags"
+    ]
+    assert "claude-prompt-patch" in case_config["required_trace_tags"]
+    assert "openai-adapter-claude-context-compacted" in case_config[
+        "required_trace_tags"
+    ]
+    assert "openai-adapter-claude-context:claude-md" in case_config[
+        "required_trace_tags"
+    ]
+    assert "openai-adapter-parallel-instruction-policy" in case_config[
+        "required_trace_tags"
+    ]
+    _assert_required_payload_paths(
+        case_config,
+        (
+            "model",
+            "input",
+            "instructions",
+            "reasoning.effort",
+            "stream",
+            "tools",
+            "litellm_metadata.openai_adapter_claude_context_compacted",
+            "litellm_metadata.openai_adapter_claude_context_compaction_events",
+            "litellm_metadata.openai_adapter_parallel_instruction_policy_applied",
+        ),
+    )
+    required_equals = case_config["request_payload_checks"]["required_equals"]
+    assert required_equals["parallel_tool_calls"] is True
+    assert required_equals[
+        "litellm_metadata.openai_adapter_claude_context_compacted"
+    ] is True
+    assert required_equals[
+        "litellm_metadata.openai_adapter_parallel_instruction_policy_applied"
+    ] is True
+
+
+def _assert_openrouter_parallel_read_case(case_config):
+    assert "route:anthropic_openrouter_responses_adapter" in case_config[
+        "required_trace_tags"
+    ]
+    assert "openrouter-adapter-claude-context-compacted" in case_config[
+        "required_trace_tags"
+    ]
+    assert "openrouter-adapter-parallel-instruction-policy" in case_config[
+        "required_trace_tags"
+    ]
+    _assert_required_payload_paths(
+        case_config,
+        (
+            "model",
+            "input",
+            "instructions",
+            "stream",
+            "tools",
+            "litellm_metadata.openrouter_adapter_claude_context_compacted",
+            "litellm_metadata.openrouter_adapter_claude_context_compaction_events",
+            "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied",
+        ),
+    )
+    required_equals = case_config["request_payload_checks"]["required_equals"]
+    assert required_equals["parallel_tool_calls"] is True
+    assert required_equals[
+        "litellm_metadata.openrouter_adapter_claude_context_compacted"
+    ] is True
+    assert required_equals[
+        "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied"
+    ] is True
+
+
+def _assert_nvidia_parallel_read_case(case_config):
+    assert "route:anthropic_nvidia_completion_adapter" in case_config[
+        "required_trace_tags"
+    ]
+    _assert_required_payload_paths(
+        case_config,
+        (
+            "model",
+            "messages",
+            "max_tokens",
+            "tools",
+        ),
+    )
+
+
 def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
 
@@ -1405,132 +1551,21 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
         durable_tool_names,
     ) in PARALLEL_CASE_AGENTS.items():
         case_config = config["cases"][case_name]
-        command = case_config["command"]
-        prompt = command[2]
-        assert case_name in config["default_excluded_cases"]
-        assert f"Dispatch to the {agent_name} agent" in prompt
-        assert "exactly three tool calls" in prompt
-        assert "must not wait for any tool result" in prompt
-        assert "sequential_core_tools_fixture.txt" in prompt
-        assert "sequential-core-tools-grep" in prompt
-        assert command[command.index("--allowedTools") + 1] == "Agent"
-        assert "--tools" not in command
-
-        assert set(case_config["claude_agents"]) == {agent_name}
-        agent_config = case_config["claude_agents"][agent_name]
-        assert agent_config["tools"] == PARALLEL_READ_TOOLS
-        assert "first assistant message must contain exactly three tool_use blocks" in (
-            agent_config["prompt"]
+        _assert_parallel_read_common_case(
+            config=config,
+            case_name=case_name,
+            case_config=case_config,
+            agent_name=agent_name,
+            provider=provider,
+            model=model,
+            durable_tool_names=durable_tool_names,
         )
-        assert "Do not wait for any tool result" in agent_config["prompt"]
-        assert f"claude-code.{agent_name}" in case_config["required_trace_names"]
-        assert case_config["expected_trace_user_ids_by_name"][
-            f"claude-code.{agent_name}"
-        ] == "adapter-harness-tenant"
-
-        transcript_agent = case_config["transcript_tool_use_validation"][
-            "expected_agents"
-        ][0]
-        assert transcript_agent["agent_type"] == agent_name
-        assert transcript_agent["expected_tool_counts"] == {
-            "Read": 1,
-            "Glob": 1,
-            "Grep": 1,
-        }
-        assert transcript_agent["minimum_tools_in_single_assistant_message"] == 3
-        assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
-        assert "require_tool_result_before_next_tool_use" not in transcript_agent
-
-        durable_rows = [
-            row
-            for row in case_config["tool_activity_validation"]["expected_rows"]
-            if row.get("provider") == provider and row.get("model") == model
-        ]
-        assert {row["tool_name"] for row in durable_rows} == durable_tool_names
-
         if provider == "openai":
-            assert "claude-tool-advertisement-compaction" in case_config[
-                "required_trace_tags"
-            ]
-            assert "claude-prompt-patch" in case_config["required_trace_tags"]
-            assert "openai-adapter-claude-context-compacted" in case_config[
-                "required_trace_tags"
-            ]
-            assert "openai-adapter-claude-context:claude-md" in case_config[
-                "required_trace_tags"
-            ]
-            assert "openai-adapter-parallel-instruction-policy" in case_config[
-                "required_trace_tags"
-            ]
-            required_paths = case_config["request_payload_checks"]["required_paths"]
-            for path in (
-                "model",
-                "input",
-                "instructions",
-                "reasoning.effort",
-                "stream",
-                "tools",
-                "litellm_metadata.openai_adapter_claude_context_compacted",
-                "litellm_metadata.openai_adapter_claude_context_compaction_events",
-                "litellm_metadata.openai_adapter_parallel_instruction_policy_applied",
-            ):
-                assert path in required_paths
-            required_equals = case_config["request_payload_checks"][
-                "required_equals"
-            ]
-            assert required_equals[
-                "parallel_tool_calls"
-            ] is True
-            assert required_equals[
-                "litellm_metadata.openai_adapter_claude_context_compacted"
-            ] is True
-            assert required_equals[
-                "litellm_metadata.openai_adapter_parallel_instruction_policy_applied"
-            ] is True
+            _assert_openai_parallel_read_case(case_config)
         elif provider == "openrouter":
-            assert "route:anthropic_openrouter_responses_adapter" in case_config[
-                "required_trace_tags"
-            ]
-            assert "openrouter-adapter-claude-context-compacted" in case_config[
-                "required_trace_tags"
-            ]
-            assert "openrouter-adapter-parallel-instruction-policy" in case_config[
-                "required_trace_tags"
-            ]
-            required_paths = case_config["request_payload_checks"]["required_paths"]
-            for path in (
-                "model",
-                "input",
-                "instructions",
-                "stream",
-                "tools",
-                "litellm_metadata.openrouter_adapter_claude_context_compacted",
-                "litellm_metadata.openrouter_adapter_claude_context_compaction_events",
-                "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied",
-            ):
-                assert path in required_paths
-            required_equals = case_config["request_payload_checks"][
-                "required_equals"
-            ]
-            assert required_equals["parallel_tool_calls"] is True
-            assert required_equals[
-                "litellm_metadata.openrouter_adapter_claude_context_compacted"
-            ] is True
-            assert required_equals[
-                "litellm_metadata.openrouter_adapter_parallel_instruction_policy_applied"
-            ] is True
+            _assert_openrouter_parallel_read_case(case_config)
         elif provider == "nvidia_nim":
-            assert "route:anthropic_nvidia_completion_adapter" in case_config[
-                "required_trace_tags"
-            ]
-            required_paths = case_config["request_payload_checks"]["required_paths"]
-            for path in (
-                "model",
-                "messages",
-                "max_tokens",
-                "tools",
-            ):
-                assert path in required_paths
+            _assert_nvidia_parallel_read_case(case_config)
 
 
 def test_gemini3_flash_parallel_case_has_code_assist_envelope_gates():
@@ -2838,6 +2873,16 @@ def test_session_history_and_tool_activity_validators_share_db_connection(monkey
     assert len(connections) == 1
     assert len(connections[0][1].executed) == 2
     session_history_query = connections[0][1].executed[0][0]
+    normalized_session_history_query = " ".join(
+        session_history_query.lower().split()
+    )
+    session_history_where_clause = normalized_session_history_query.split(
+        " where ", 1
+    )[1].split(" order by ", 1)[0]
+    assert session_history_where_clause == "session_id = %s"
+    assert " or " not in session_history_where_clause
+    assert "metadata->>" not in session_history_where_clause
+    assert "d1_224_live_smoke" not in normalized_session_history_query
     for column_name in (
         "input_system_tokens_estimated",
         "input_tool_advertisement_tokens_estimated",
