@@ -11121,6 +11121,53 @@ def test_build_session_history_record_from_langfuse_recovers_claude_model_from_e
     assert record["model"] == "claude-opus-4-8"
 
 
+def test_build_session_history_record_from_langfuse_marks_unresolved_anthropic_model() -> None:
+    trace = {
+        "id": "trace-claude-missing-model",
+        "name": "claude-code.orchestrator",
+        "sessionId": "session-claude-missing-model",
+        "environment": "prod",
+    }
+    observation = {
+        "id": "obs-claude-missing-model",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "",
+        "startTime": "2026-06-05T23:18:50Z",
+        "endTime": "2026-06-05T23:18:52Z",
+        "usage": {
+            "input": 0,
+            "output": 0,
+            "total": 0,
+        },
+        "output": {"content": "ack"},
+        "metadata": {
+            "custom_llm_provider": "anthropic",
+            "passthrough_route_family": "anthropic_messages",
+            "request_tags": [
+                "route:anthropic_messages",
+                "provider-cache-hit",
+            ],
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-claude-missing-model",
+    )
+
+    assert record is not None
+    assert record["provider"] == "anthropic"
+    assert record["model"] == "unknown"
+    assert record["metadata"]["session_history_model_unresolved"] is True
+    assert (
+        record["metadata"]["session_history_model_unresolved_reason"]
+        == "missing_source_model_evidence"
+    )
+    assert _build_session_history_db_payload(record)[5] == "unknown"
+
+
 def test_build_session_history_record_from_langfuse_routes_openrouter_api_base() -> None:
     trace = {
         "id": "trace-openrouter-api-base",
@@ -11205,6 +11252,70 @@ def test_build_session_history_record_from_langfuse_routes_local_embedding_api_b
     assert record["model_group"] == "nomic-embed-code"
     assert record["metadata"]["aawm_local_route"] is True
     assert record["metadata"]["aawm_local_route_family"] == "local_embedding"
+
+
+def test_build_session_history_record_routes_local_llm_when_model_equals_group() -> None:
+    kwargs = _base_kwargs("orchestrator")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-local-ministral",
+            "api_base": "http://172.20.0.1:8088/v1/chat/completions",
+            "model_group": "ministral3-3b-adjudicator-q4-k-m",
+            "usage_object": {
+                "prompt_tokens": 12,
+                "completion_tokens": 4,
+                "total_tokens": 16,
+            },
+        }
+    )
+    kwargs["standard_logging_object"]["metadata"] = dict(
+        kwargs["litellm_params"]["metadata"]
+    )
+    kwargs["standard_logging_object"]["api_base"] = (
+        "http://172.20.0.1:8088/v1/chat/completions"
+    )
+    kwargs["standard_logging_object"]["model_group"] = (
+        "ministral3-3b-adjudicator-q4-k-m"
+    )
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "completion"
+    kwargs["model"] = "ministral3-3b-adjudicator-q4-k-m"
+    result = {
+        "id": "provider-response-local-ministral",
+        "model": "ministral3-3b-adjudicator-q4-k-m",
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 4,
+            "total_tokens": 16,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "local ministral result",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-06T17:11:32Z",
+        end_time="2026-06-06T17:11:34Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "local_llm"
+    assert record["model"] == "ministral3-3b-adjudicator-q4-k-m"
+    assert record["model_group"] == "ministral3-3b-adjudicator-q4-k-m"
+    assert record["metadata"]["aawm_local_route"] is True
+    assert record["metadata"]["aawm_local_route_family"] == "local_llm_chat"
+    assert (
+        record["metadata"]["aawm_local_upstream_model"]
+        == "ministral3-3b-adjudicator-q4-k-m"
+    )
+    assert _build_session_history_db_payload(record)[4] == "local_llm"
 
 
 def test_build_session_history_record_from_langfuse_trace_observation_sets_not_applicable_reasoning_source_when_absent() -> None:

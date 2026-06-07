@@ -25,6 +25,7 @@
     "claude_adapter_gemma_26b_a4b",
     "claude_adapter_gpt_oss_20b",
     "claude_adapter_gpt_oss_120b",
+    "claude_adapter_openrouter_free",
     "claude_adapter_openai_output_config_effort",
     "claude_adapter_openai_prompt_cache_two_pass",
     "claude_adapter_gpt55_child_bash_identity",
