@@ -1395,10 +1395,15 @@ def test_openrouter_free_cases_validate_daily_rate_limit_observations():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
 
     for case_name in (
+        "claude_adapter_openrouter_free",
         "native_openrouter_free_daily_meter_chat",
         "claude_adapter_gpt_oss_20b",
     ):
         assert case_name in config["default_excluded_cases"]
+    for case_name in (
+        "native_openrouter_free_daily_meter_chat",
+        "claude_adapter_gpt_oss_20b",
+    ):
         _assert_openrouter_free_daily_rate_limit_validation(
             config["cases"][case_name]
         )

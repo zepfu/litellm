@@ -14170,7 +14170,7 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         output_model,
         _extract_model_from_langfuse_input(observation.get("input")),
         _extract_codex_model_from_response_headers(metadata),
-    ) or ""
+    ) or "unknown"
     model_group = _normalize_session_history_model_group(
         _clean_non_empty_string(metadata.get("model_group")),
         metadata,
@@ -14789,16 +14789,19 @@ def _apply_local_llm_route_metadata(
     ):
         return resolved_provider, resolved_model
 
-    upstream_model = _clean_non_empty_string(resolved_model)
-    if not upstream_model or upstream_model == model_group:
-        return resolved_provider, resolved_model
+    upstream_model = (
+        _clean_non_empty_string(_strip_local_provider_model_prefix(resolved_model))
+        or model_group
+    )
 
     metadata["aawm_local_route"] = True
     metadata["aawm_local_route_family"] = "local_llm_chat"
     metadata["aawm_local_model_group"] = model_group
     metadata["aawm_local_upstream_provider"] = "openai"
     metadata["aawm_local_upstream_model"] = upstream_model
-    metadata["aawm_local_upstream_api_base"] = api_base
+    sanitized_api_base = _sanitize_session_history_api_base(api_base)
+    if sanitized_api_base:
+        metadata["aawm_local_upstream_api_base"] = sanitized_api_base
 
     return "local_llm", model_group
 
