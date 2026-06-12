@@ -116,6 +116,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _resolve_codex_google_code_assist_adapter_model,
     _resolve_codex_opencode_zen_adapter_model,
     _sanitize_google_code_assist_quota_for_logging,
+    _sanitize_opencode_zen_completion_messages_for_chat_completion,
     _set_google_adapter_cooldown,
     _remember_codex_google_code_assist_tool_call_name,
     _wait_for_google_adapter_cooldown_if_needed,
@@ -7017,6 +7018,178 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert response_body["id"] == "chatcmpl_opencode"
         assert response_body["model"] == "big-pickle"
         assert "OPENCODE CODEX OK" in json.dumps(response_body)
+
+    def test_opencode_zen_sanitizer_removes_unmatched_assistant_tool_calls(
+        self,
+    ):
+        completion_kwargs = {
+            "messages": [
+                {"role": "user", "content": "start"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "Bash", "arguments": "{}"},
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "Read", "arguments": "{}"},
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "partial"},
+                {"role": "user", "content": "continue"},
+                {"role": "tool", "tool_call_id": "orphan", "content": "orphan"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_ok",
+                            "type": "function",
+                            "function": {"name": "Grep", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+            ]
+        }
+
+        updated_kwargs, changes = (
+            _sanitize_opencode_zen_completion_messages_for_chat_completion(
+                completion_kwargs
+            )
+        )
+
+        updated_messages = updated_kwargs["messages"]
+        assert updated_messages == [
+            {"role": "user", "content": "start"},
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_ok",
+                        "type": "function",
+                        "function": {"name": "Grep", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+        ]
+        assert changes["opencode_zen_chat_tool_adjacency_sanitized"] is True
+        assert (
+            changes["opencode_zen_chat_tool_adjacency_removed_assistant_count"]
+            == 1
+        )
+        assert (
+            changes["opencode_zen_chat_tool_adjacency_removed_partial_tool_count"]
+            == 1
+        )
+        assert (
+            changes["opencode_zen_chat_tool_adjacency_removed_orphan_tool_count"]
+            == 1
+        )
+        assert changes["opencode_zen_chat_tool_adjacency_messages_from_count"] == 7
+        assert changes["opencode_zen_chat_tool_adjacency_messages_to_count"] == 4
+
+    @pytest.mark.asyncio
+    async def test_codex_opencode_zen_route_sanitizes_unmatched_tool_call_messages(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-opencode-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/v1/responses"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/v1/responses",
+            "query_string": b"",
+        }
+        mock_request.query_params = {}
+        prepared_body = {
+            "model": "opencode/deepseek-v4-flash-free",
+            "input": [
+                {"role": "user", "content": "start"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_missing",
+                    "name": "Bash",
+                    "arguments": "{}",
+                },
+                {"role": "user", "content": "continue"},
+            ],
+            "stream": False,
+            "litellm_metadata": {"client_name": "codex_exec"},
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
+            new=AsyncMock(
+                return_value={
+                    "id": "chatcmpl_opencode",
+                    "object": "chat.completion",
+                    "created": 1770000000,
+                    "model": "deepseek-v4-flash-free",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "OPENCODE CODEX OK",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 4,
+                        "total_tokens": 9,
+                    },
+                }
+            ),
+        ) as mock_acompletion:
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="deepseek-v4-flash-free",
+            )
+
+        call_kwargs = mock_acompletion.await_args.kwargs
+        assert len(call_kwargs["messages"]) == 2
+        assert [
+            message["role"] if isinstance(message, dict) else message.role
+            for message in call_kwargs["messages"]
+        ] == ["user", "user"]
+        litellm_metadata = call_kwargs["litellm_metadata"]
+        assert litellm_metadata["opencode_zen_chat_tool_adjacency_sanitized"] is True
+        assert (
+            litellm_metadata[
+                "opencode_zen_chat_tool_adjacency_removed_assistant_count"
+            ]
+            == 1
+        )
+        assert "opencode-zen-chat-tool-adjacency-sanitized" in litellm_metadata[
+            "tags"
+        ]
+        response_body = json.loads(response.body.decode("utf-8"))
+        assert response_body["id"] == "chatcmpl_opencode"
 
     @pytest.mark.asyncio
     async def test_codex_opencode_zen_direct_route_keeps_missing_auth_error(
@@ -15985,6 +16158,21 @@ def test_codex_auto_agent_retryable_exhaustion_ignores_tool_shape_text():
 
     assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
     assert _extract_codex_auto_agent_error_tokens(exc) == set()
+
+
+def test_codex_auto_agent_retryable_exhaustion_classifies_deepseek_tool_mismatch():
+    exc = RuntimeError(
+        "Error from provider (DeepSeek): An assistant message with 'tool_calls' "
+        "must be followed by tool messages responding to each 'tool_call_id'. "
+        "(insufficient tool messages following tool_calls message)"
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "provider_format_rejected"
+    )
+    assert "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in _extract_codex_auto_agent_error_tokens(
+        exc
+    )
 
 
 @pytest.mark.asyncio

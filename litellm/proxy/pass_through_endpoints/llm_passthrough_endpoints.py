@@ -2605,6 +2605,12 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("RATE_LIMIT_EXCEEDED")
     if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
+    if (
+        "error from provider (deepseek)" in text_lower
+        and "assistant message with 'tool_calls' must be followed by tool messages"
+        in text_lower
+    ) or "insufficient tool messages following tool_calls message" in text_lower:
+        tokens.add("DEEPSEEK_TOOL_MESSAGE_MISMATCH")
 
 
 def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
@@ -2659,6 +2665,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "usage_limit_reached"
     if tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
         return "capacity_exhausted"
+    if "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in tokens:
+        return "provider_format_rejected"
     if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
         return "rate_limited"
     if status_code == 429:
@@ -8833,6 +8841,163 @@ def _strip_opencode_zen_unsupported_responses_tools(
             ),
         },
     )
+
+
+def _opencode_zen_chat_message_role(message: Any) -> Optional[str]:
+    role = (
+        message.get("role")
+        if isinstance(message, dict)
+        else getattr(message, "role", None)
+    )
+    return role if isinstance(role, str) else None
+
+
+def _opencode_zen_chat_tool_call_id(tool_call: Any) -> Optional[str]:
+    tool_call_id = (
+        tool_call.get("id")
+        if isinstance(tool_call, dict)
+        else getattr(tool_call, "id", None)
+    )
+    return tool_call_id if isinstance(tool_call_id, str) and tool_call_id else None
+
+
+def _opencode_zen_chat_message_tool_call_ids(message: Any) -> list[str]:
+    tool_calls = (
+        message.get("tool_calls")
+        if isinstance(message, dict)
+        else getattr(message, "tool_calls", None)
+    )
+    if not isinstance(tool_calls, list):
+        return []
+
+    tool_call_ids: list[str] = []
+    for tool_call in tool_calls:
+        tool_call_id = _opencode_zen_chat_tool_call_id(tool_call)
+        if tool_call_id is not None:
+            tool_call_ids.append(tool_call_id)
+    return tool_call_ids
+
+
+def _opencode_zen_chat_message_tool_result_id(message: Any) -> Optional[str]:
+    tool_call_id = (
+        message.get("tool_call_id")
+        if isinstance(message, dict)
+        else getattr(message, "tool_call_id", None)
+    )
+    return tool_call_id if isinstance(tool_call_id, str) and tool_call_id else None
+
+
+def _collect_opencode_zen_following_tool_block(
+    messages: list[Any],
+    start_index: int,
+) -> tuple[list[Any], list[Optional[str]], int]:
+    tool_block: list[Any] = []
+    tool_block_ids: list[Optional[str]] = []
+    next_index = start_index
+    while next_index < len(messages):
+        next_message = messages[next_index]
+        if _opencode_zen_chat_message_role(next_message) != "tool":
+            break
+        tool_block.append(next_message)
+        tool_block_ids.append(_opencode_zen_chat_message_tool_result_id(next_message))
+        next_index += 1
+    return tool_block, tool_block_ids, next_index
+
+
+def _sanitize_opencode_zen_completion_messages_for_chat_completion(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return completion_kwargs, {}
+
+    updated_messages: list[Any] = []
+    removed_assistant_count = 0
+    removed_orphan_tool_count = 0
+    removed_partial_tool_count = 0
+    removed_extra_tool_count = 0
+
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        role = _opencode_zen_chat_message_role(message)
+
+        if role == "tool":
+            removed_orphan_tool_count += 1
+            index += 1
+            continue
+
+        if role != "assistant":
+            updated_messages.append(message)
+            index += 1
+            continue
+
+        required_tool_call_ids = _opencode_zen_chat_message_tool_call_ids(message)
+        if not required_tool_call_ids:
+            updated_messages.append(message)
+            index += 1
+            continue
+
+        required_tool_call_id_set = set(required_tool_call_ids)
+        tool_block, tool_block_ids, next_index = (
+            _collect_opencode_zen_following_tool_block(messages, index + 1)
+        )
+
+        present_tool_call_ids = {
+            tool_call_id
+            for tool_call_id in tool_block_ids
+            if tool_call_id is not None
+        }
+        if not required_tool_call_id_set.issubset(present_tool_call_ids):
+            removed_assistant_count += 1
+            removed_partial_tool_count += len(tool_block)
+            index = next_index
+            continue
+
+        updated_messages.append(message)
+        retained_tool_call_ids: set[str] = set()
+        for tool_message, tool_call_id in zip(tool_block, tool_block_ids):
+            if (
+                tool_call_id is None
+                or tool_call_id not in required_tool_call_id_set
+                or tool_call_id in retained_tool_call_ids
+            ):
+                removed_extra_tool_count += 1
+                continue
+            updated_messages.append(tool_message)
+            retained_tool_call_ids.add(tool_call_id)
+        index = next_index
+
+    if (
+        removed_assistant_count == 0
+        and removed_orphan_tool_count == 0
+        and removed_partial_tool_count == 0
+        and removed_extra_tool_count == 0
+    ):
+        return completion_kwargs, {}
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["messages"] = updated_messages
+    changes: dict[str, Any] = {
+        "opencode_zen_chat_tool_adjacency_sanitized": True,
+        "opencode_zen_chat_tool_adjacency_removed_assistant_count": (
+            removed_assistant_count
+        ),
+        "opencode_zen_chat_tool_adjacency_removed_orphan_tool_count": (
+            removed_orphan_tool_count
+        ),
+        "opencode_zen_chat_tool_adjacency_removed_partial_tool_count": (
+            removed_partial_tool_count
+        ),
+        "opencode_zen_chat_tool_adjacency_removed_extra_tool_count": (
+            removed_extra_tool_count
+        ),
+        "opencode_zen_chat_tool_adjacency_messages_from_count": len(messages),
+        "opencode_zen_chat_tool_adjacency_messages_to_count": len(
+            updated_messages
+        ),
+    }
+    return updated_kwargs, changes
 
 
 def _opencode_zen_responses_sse_event(event_type: str, payload: dict[str, Any]) -> str:
@@ -20497,6 +20662,34 @@ async def _handle_codex_opencode_zen_adapter_route(
         metadata=litellm_metadata,
     )
     completion_kwargs["metadata"] = litellm_metadata
+    previous_response_id = responses_api_request.get("previous_response_id")
+    if previous_response_id:
+        completion_kwargs = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+            previous_response_id=str(previous_response_id),
+            litellm_completion_request=completion_kwargs,
+        )
+    completion_kwargs, chat_message_sanitization_changes = (
+        _sanitize_opencode_zen_completion_messages_for_chat_completion(
+            completion_kwargs
+        )
+    )
+    if chat_message_sanitization_changes:
+        metadata_body = _merge_litellm_metadata(
+            {"litellm_metadata": litellm_metadata},
+            tags_to_add=["opencode-zen-chat-tool-adjacency-sanitized"],
+            extra_fields={
+                **chat_message_sanitization_changes,
+                "langfuse_spans": [
+                    _build_langfuse_span_descriptor(
+                        name="opencode_zen.chat_tool_adjacency_sanitized",
+                        metadata=chat_message_sanitization_changes,
+                    )
+                ],
+            },
+        )
+        litellm_metadata = dict(metadata_body.get("litellm_metadata") or {})
+        request_body["litellm_metadata"] = litellm_metadata
+        completion_kwargs["metadata"] = litellm_metadata
 
     target_base_url = _get_opencode_zen_target_base()
     target_url = _join_opencode_zen_passthrough_url(
