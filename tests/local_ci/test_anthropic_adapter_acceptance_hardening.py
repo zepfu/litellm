@@ -24,12 +24,6 @@ SEQUENTIAL_CASE_AGENTS = {
     "claude_adapter_gpt55_child_sequential_core_tools": (
         "harness-gpt55-sequential-core-tools"
     ),
-    "claude_adapter_gemini31_pro_child_sequential_core_tools": (
-        "harness-gemini31-pro-sequential-core-tools"
-    ),
-    "claude_adapter_gemini3_flash_child_sequential_core_tools": (
-        "harness-gemini3-flash-sequential-core-tools"
-    ),
 }
 PARALLEL_READ_TOOLS = ["Read", "Glob", "Grep"]
 PARALLEL_CASE_AGENTS = {
@@ -51,18 +45,25 @@ PARALLEL_CASE_AGENTS = {
         "deepseek-ai/deepseek-v3.2",
         {"Read", "Glob", "Grep"},
     ),
-    "claude_adapter_gemini31_pro_child_parallel_read_tools": (
-        "harness-gemini31-pro-parallel-read-tools",
-        "gemini",
-        "gemini-3.1-pro-preview",
-        {"read_file", "glob", "grep_search"},
-    ),
-    "claude_adapter_gemini3_flash_child_parallel_read_tools": (
-        "harness-gemini3-flash-parallel-read-tools",
-        "gemini",
-        "gemini-3-flash-preview",
-        {"read_file", "glob", "grep_search"},
-    ),
+}
+
+REMOVED_GEMINI_HARNESS_CASES = {
+    "native_gemini_passthrough_generate_content",
+    "native_gemini_passthrough_stream_generate_content",
+    "claude_adapter_gemini31_pro_read_tool_id_sanitizer",
+    "claude_adapter_gemini31_pro_bash_then_read_stream_state",
+    "claude_adapter_gemini31_pro_child_sequential_core_tools",
+    "claude_adapter_gemini31_pro_child_parallel_read_tools",
+    "claude_adapter_gemini3_flash_child_sequential_core_tools",
+    "claude_adapter_gemini3_flash_child_parallel_read_tools",
+    "claude_adapter_gemini_output_config_effort",
+    "claude_adapter_gemini_output_config_minimal_effort",
+    "claude_adapter_gemini_output_config_max_effort",
+    "claude_adapter_gemini_output_config_minimal_effort_cache",
+    "claude_adapter_gemini_output_config_max_effort_cache",
+    "claude_adapter_gemini_fanout",
+    "claude_adapter_gemini31_pro",
+    "claude_adapter_gemini31_flash",
 }
 
 
@@ -1100,11 +1101,7 @@ def test_target_profile_adds_native_cli_repository_headers(monkeypatch):
             "native_codex": {
                 "cli_passthrough": "codex",
                 "command": ["codex", "exec", "--json", "hello"],
-            },
-            "native_gemini": {
-                "cli_passthrough": "gemini",
-                "command": ["gemini", "--prompt", "hello"],
-            },
+            }
         }
     }
 
@@ -1124,10 +1121,6 @@ def test_target_profile_adds_native_cli_repository_headers(monkeypatch):
         'model_providers.litellm-dev.http_headers.x-aawm-repository="zepfu/litellm"'
         in codex_command
     )
-    gemini_headers = updated["cases"]["native_gemini"]["env"][
-        "GEMINI_CLI_CUSTOM_HEADERS"
-    ]
-    assert "x-aawm-repository: zepfu/litellm" in gemini_headers
 
 
 def _assert_session_history_validation_loads_provider_record(
@@ -1175,28 +1168,6 @@ def _assert_codex_rate_limit_validation(case_config):
         assert row["maximums"]["remaining_pct"] == 100
         assert "expected_reset_at" in row["required_future_timestamps"]
         assert "expected_reset_at" in row["required_timestamp_after_observed"]
-
-
-def _assert_gemini_rate_limit_validation(case_config):
-    rate_limit_checks = case_config["rate_limit_observations_validation"]
-    assert rate_limit_checks["allow_latest_snapshot_fallback"] is True
-    [expected_row] = rate_limit_checks["expected_rows"]
-    assert expected_row["provider"] == "google"
-    assert expected_row["client"] == "google_code_assist"
-    assert expected_row["model"] == "gemini-2.5-flash"
-    assert expected_row["source"] == "google_retrieve_user_quota"
-    assert (
-        expected_row["quota_key"]
-        == "google_code_assist_requests_gemini-2.5-flash:model_requests"
-    )
-    assert expected_row["quota_type"] == "requests"
-    assert expected_row["required_equals"]["quota_period"] == "daily"
-    assert expected_row["minimums"]["remaining_pct"] == 0
-    assert expected_row["maximums"]["remaining_pct"] == 100
-    assert "expected_reset_at" in expected_row["required_future_timestamps"]
-    assert "expected_reset_at" in expected_row[
-        "required_timestamp_after_observed"
-    ]
 
 
 def _assert_openrouter_free_daily_rate_limit_validation(case_config):
@@ -1369,10 +1340,9 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
         assert session_history_validation["minimums"][column_name] == 1
 
 
-def test_default_suite_keeps_claude_fanout_and_native_anthropic_rate_limit_gate_opt_in():
+def test_default_suite_keeps_peeromega_fanout_and_native_anthropic_rate_limit_gate_opt_in():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
 
-    assert "claude_adapter_gemini_fanout" in config["default_excluded_cases"]
     assert "claude_adapter_peeromega_fanout" in config["default_excluded_cases"]
     assert "native_anthropic_passthrough_claude" in config[
         "default_excluded_cases"
@@ -1389,6 +1359,15 @@ def test_default_suite_keeps_claude_fanout_and_native_anthropic_rate_limit_gate_
     }
     assert "anthropic_unified_5h:5h" in quota_keys
     assert "anthropic_unified_7d:7d" in quota_keys
+
+
+def test_anthropic_adapter_config_removes_gemini_harness_cases():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["cases"])
+    assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["default_excluded_cases"])
+    assert "gemini" not in json.dumps(config["cases"]).lower()
+    assert "google_code_assist" not in json.dumps(config["cases"]).lower()
 
 
 def test_openrouter_free_cases_validate_daily_rate_limit_observations():
@@ -1410,122 +1389,6 @@ def test_openrouter_free_cases_validate_daily_rate_limit_observations():
     assert config["cases"]["native_openrouter_free_daily_meter_chat"][
         "skip_trace_environment_validation"
     ] is True
-
-
-def test_native_gemini_cases_have_code_assist_request_payload_gates():
-    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-
-    for case_name in (
-        "native_gemini_passthrough_generate_content",
-        "native_gemini_passthrough_stream_generate_content",
-    ):
-        case_config = config["cases"][case_name]
-        _assert_session_history_validation_loads_provider_record(
-            case_config,
-            expected_provider="gemini",
-            expected_model="gemini-2.5-flash",
-            expected_client_name="gemini-cli",
-        )
-        _assert_gemini_rate_limit_validation(case_config)
-        assert case_config["cli_passthrough"] == "gemini"
-        assert case_config["allowed_generation_routes"] == [
-            "/gemini/v1internal:streamGenerateContent"
-        ]
-        for metadata_key in (
-            "gemini_project",
-            "gemini_user_prompt_id",
-            "gemini_thinking_config_present",
-            "gemini_tools_present",
-        ):
-            assert metadata_key in case_config["required_generation_metadata_truthy"]
-
-        request_payload_checks = case_config["request_payload_checks"]
-        for path in (
-            "model",
-            "project",
-            "user_prompt_id",
-            "request.contents",
-            "request.session_id",
-            "request.systemInstruction",
-            "request.generationConfig.thinkingConfig",
-            "request.tools",
-        ):
-            assert path in request_payload_checks["required_paths"]
-        assert request_payload_checks["required_equals"]["model"] == "gemini-2.5-flash"
-        assert (
-            request_payload_checks["required_equals"][
-                "request.generationConfig.thinkingConfig.includeThoughts"
-            ]
-            is True
-        )
-        assert (
-            request_payload_checks["required_equals"][
-                "request.generationConfig.thinkingConfig.thinkingBudget"
-            ]
-            == 8192
-        )
-
-
-def test_anthropic_gemini_effort_cases_have_gemini3_thinking_level_gates():
-    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-
-    expected_levels = {
-        "claude_adapter_gemini_output_config_effort": "high",
-        "claude_adapter_gemini_output_config_minimal_effort": "low",
-        "claude_adapter_gemini_output_config_max_effort": "high",
-        "claude_adapter_gemini_output_config_minimal_effort_cache": "low",
-        "claude_adapter_gemini_output_config_max_effort_cache": "high",
-    }
-
-    for case_name, expected_level in expected_levels.items():
-        case_config = config["cases"][case_name]
-        assert case_name in config["default_excluded_cases"]
-        assert (
-            case_config["http_request"]["json"]["model"]
-            == "gemini-3-flash-preview"
-        )
-        assert case_config["allowed_generation_routes"] == [
-            "/anthropic/v1/messages"
-        ]
-        assert "route:anthropic_google_completion_adapter" in case_config[
-            "required_trace_tags"
-        ]
-        assert (
-            "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
-            in case_config["required_trace_tags"]
-        )
-
-        request_payload_checks = case_config["request_payload_checks"]
-        for path in (
-            "model",
-            "project",
-            "user_prompt_id",
-            "request.contents",
-            "request.session_id",
-            "request.systemInstruction",
-            "request.generationConfig.thinkingConfig",
-        ):
-            assert path in request_payload_checks["required_paths"]
-
-        required_equals = request_payload_checks["required_equals"]
-        assert required_equals["model"] == "gemini-3-flash-preview"
-        assert (
-            required_equals[
-                "request.generationConfig.thinkingConfig.thinkingLevel"
-            ]
-            == expected_level
-        )
-        assert (
-            required_equals[
-                "request.generationConfig.thinkingConfig.includeThoughts"
-            ]
-            is True
-        )
-        assert "output_config" in request_payload_checks["forbidden_paths"]
-        assert (
-            "request.generationConfig.thinkingConfig.thinkingBudget"
-            in request_payload_checks["forbidden_paths"]
-        )
 
 
 def test_nvidia_hosted_tool_policy_case_gates_dropped_hosted_tools():
@@ -1591,22 +1454,22 @@ def test_target_profile_appends_case_local_claude_agents(monkeypatch):
 
     config = {
         "cases": {
-            "claude_adapter_gemini3_flash_child_sequential_core_tools": {
+            "claude_adapter_gpt55_child_sequential_core_tools": {
                 "command": [
                     "claude",
                     "-p",
-                    "Dispatch to harness-gemini3-flash-sequential-core-tools.",
+                    "Dispatch to harness-gpt55-sequential-core-tools.",
                     "--allowedTools",
                     "Agent",
                 ],
                 "claude_agents": {
-                    "harness-gemini3-flash-sequential-core-tools": {
-                        "model": "google/gemini-3-flash-preview",
+                    "harness-gpt55-sequential-core-tools": {
+                        "model": "openai/gpt-5.5",
                         "tools": SEQUENTIAL_CORE_TOOLS,
                     }
                 },
                 "env": {"ANTHROPIC_BASE_URL": "placeholder"},
-                "session_history_validation": {"expected_provider": "gemini"},
+                "session_history_validation": {"expected_provider": "openai"},
             }
         }
     }
@@ -1622,21 +1485,19 @@ def test_target_profile_appends_case_local_claude_agents(monkeypatch):
         },
     )
 
-    command = updated["cases"][
-        "claude_adapter_gemini3_flash_child_sequential_core_tools"
-    ]["command"]
+    command = updated["cases"]["claude_adapter_gpt55_child_sequential_core_tools"][
+        "command"
+    ]
     assert command[command.index("--allowedTools") + 1] == "Agent"
     assert "--tools" not in command
     assert command.count("--agents") == 1
     agents = json.loads(command[command.index("--agents") + 1])
-    assert agents["harness-gemini3-flash-sequential-core-tools"]["tools"] == (
+    assert agents["harness-gpt55-sequential-core-tools"]["tools"] == (
         SEQUENTIAL_CORE_TOOLS
     )
     assert not any(
         tool.startswith("mcp__aawm__")
-        for tool in agents["harness-gemini3-flash-sequential-core-tools"][
-            "tools"
-        ]
+        for tool in agents["harness-gpt55-sequential-core-tools"]["tools"]
     )
 
 
@@ -1861,64 +1722,6 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
             _assert_nvidia_parallel_read_case(case_config)
 
 
-def test_gemini3_flash_parallel_case_has_code_assist_envelope_gates():
-    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-    case_config = config["cases"][
-        "claude_adapter_gemini3_flash_child_parallel_read_tools"
-    ]
-
-    assert (
-        "claude_adapter_gemini3_flash_child_parallel_read_tools"
-        in config["default_excluded_cases"]
-    )
-    assert "route:anthropic_google_completion_adapter" in case_config[
-        "required_trace_tags"
-    ]
-    assert (
-        "anthropic-adapter-target:google:/v1internal:streamGenerateContent"
-        in case_config["required_trace_tags"]
-    )
-
-    request_payload_checks = case_config["request_payload_checks"]
-    for path in (
-        "model",
-        "project",
-        "user_prompt_id",
-        "request.contents",
-        "request.session_id",
-        "request.systemInstruction",
-        "request.systemInstruction.parts.text",
-        "request.tools",
-        "request.tools.0.functionDeclarations.0.name",
-        "request.tools.0.functionDeclarations.1.name",
-        "request.tools.0.functionDeclarations.2.name",
-        "request.generationConfig.thinkingConfig",
-    ):
-        assert path in request_payload_checks["required_paths"]
-
-    required_equals = request_payload_checks["required_equals"]
-    assert required_equals["model"] == "gemini-3-flash-preview"
-    assert required_equals["request.tools.0.functionDeclarations.0.name"] == (
-        "read_file"
-    )
-    assert required_equals["request.tools.0.functionDeclarations.1.name"] == "glob"
-    assert required_equals["request.tools.0.functionDeclarations.2.name"] == (
-        "grep_search"
-    )
-    assert (
-        required_equals["request.generationConfig.thinkingConfig.thinkingLevel"]
-        == "high"
-    )
-    assert (
-        required_equals["request.generationConfig.thinkingConfig.includeThoughts"]
-        is True
-    )
-    assert (
-        "request.generationConfig.thinkingConfig.thinkingBudget"
-        in request_payload_checks["forbidden_paths"]
-    )
-
-
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):
     harness = _load_harness_module()
     captured = {}
@@ -1974,28 +1777,28 @@ def test_trace_user_id_validation_can_require_child_trace_users():
     harness = _load_harness_module()
 
     summary, failures = harness._validate_trace_user_ids_by_name(
-        family="gemini fanout",
+        family="mixed fanout",
         traces=[
             {
-                "name": "claude-code.gemini-3-flash-preview",
+                "name": "claude-code.gpt-5-4",
                 "userId": "adapter-harness-tenant",
             },
             {
-                "name": "claude-code.gemini-3-1-pro-preview",
+                "name": "claude-code.gpt-5-3-codex-spark",
                 "userId": "wrong-user",
             },
         ],
         expected={
-            "claude-code.gemini-3-flash-preview": "adapter-harness-tenant",
-            "claude-code.gemini-3-1-pro-preview": "adapter-harness-tenant",
+            "claude-code.gpt-5-4": "adapter-harness-tenant",
+            "claude-code.gpt-5-3-codex-spark": "adapter-harness-tenant",
         },
     )
 
-    assert summary["actual_by_name"]["claude-code.gemini-3-flash-preview"] == [
+    assert summary["actual_by_name"]["claude-code.gpt-5-4"] == [
         "adapter-harness-tenant"
     ]
     assert failures == [
-        "gemini fanout trace claude-code.gemini-3-1-pro-preview missing user id "
+        "mixed fanout trace claude-code.gpt-5-3-codex-spark missing user id "
         "adapter-harness-tenant"
     ]
 
@@ -2508,10 +2311,10 @@ def test_tool_activity_validation_rejects_missing_required_argument_substring(mo
         def fetchall(self):
             return [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
                     "tool_index": 0,
-                    "tool_name": "google_web_search",
+                    "tool_name": "WebSearch",
                     "tool_kind": "read",
                     "command_text": "",
                     "arguments": {"query": "litellm anthropic adapter"},
@@ -2538,9 +2341,9 @@ def test_tool_activity_validation_rejects_missing_required_argument_substring(mo
             "db_password": "pw",
             "expected_rows": [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
-                    "tool_name": "google_web_search",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "tool_name": "WebSearch",
                     "tool_kind": "read",
                     "arguments_required_substring": "IANA example domain",
                 }
@@ -2549,7 +2352,7 @@ def test_tool_activity_validation_rejects_missing_required_argument_substring(mo
     )
 
     assert failures == [
-        "case tool_activity rows for provider='gemini' model='gemini-3-flash-preview' tool_name='google_web_search' did not include arguments containing 'IANA example domain'"
+        "case tool_activity rows for provider='openai' model='gpt-5.5' tool_name='WebSearch' did not include arguments containing 'IANA example domain'"
     ]
 
     harness._close_validation_db_connections()
@@ -2572,10 +2375,10 @@ def test_tool_activity_validation_rejects_too_many_and_forbidden_commands(monkey
         def fetchall(self):
             return [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3.1-pro-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
                     "tool_index": 0,
-                    "tool_name": "run_shell_command",
+                    "tool_name": "Bash",
                     "tool_kind": "command",
                     "command_text": "date -u +%Y-%m-%d",
                     "arguments": {},
@@ -2583,10 +2386,10 @@ def test_tool_activity_validation_rejects_too_many_and_forbidden_commands(monkey
                     "created_at": None,
                 },
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3.1-pro-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
                     "tool_index": 1,
-                    "tool_name": "run_shell_command",
+                    "tool_name": "Bash",
                     "tool_kind": "command",
                     "command_text": "ls docs",
                     "arguments": {},
@@ -2613,9 +2416,9 @@ def test_tool_activity_validation_rejects_too_many_and_forbidden_commands(monkey
             "db_password": "pw",
             "expected_rows": [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3.1-pro-preview",
-                    "tool_name": "run_shell_command",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "tool_name": "Bash",
                     "tool_kind": "command",
                     "minimum_count": 1,
                     "maximum_count": 1,
@@ -2627,8 +2430,8 @@ def test_tool_activity_validation_rejects_too_many_and_forbidden_commands(monkey
     )
 
     assert failures == [
-        "case too many tool_activity rows for provider='gemini' model='gemini-3.1-pro-preview' tool_name='run_shell_command' tool_kind='command'; expected <= 1, got 2",
-        "case tool_activity rows for provider='gemini' model='gemini-3.1-pro-preview' tool_name='run_shell_command' included forbidden command text substring 'ls'",
+        "case too many tool_activity rows for provider='openai' model='gpt-5.5' tool_name='Bash' tool_kind='command'; expected <= 1, got 2",
+        "case tool_activity rows for provider='openai' model='gpt-5.5' tool_name='Bash' included forbidden command text substring 'ls'",
     ]
 
     harness._close_validation_db_connections()
@@ -2937,7 +2740,7 @@ def test_transcript_tool_use_validation_rejects_batched_message(tmp_path):
     subagents_dir.mkdir(parents=True)
     transcript = subagents_dir / "agent-def.jsonl"
     transcript.with_suffix(".meta.json").write_text(
-        json.dumps({"agentType": "gemini-3-1-pro-preview"}),
+        json.dumps({"agentType": "harness-gpt55-sequential-core-tools"}),
         encoding="utf-8",
     )
     transcript.write_text(
@@ -2966,7 +2769,7 @@ def test_transcript_tool_use_validation_rejects_batched_message(tmp_path):
             "claude_projects_root": str(tmp_path),
             "expected_agents": [
                 {
-                    "agent_type": "gemini-3-1-pro-preview",
+                    "agent_type": "harness-gpt55-sequential-core-tools",
                     "expected_tool_counts": {"Read": 1, "Bash": 1},
                     "maximum_tool_uses_per_assistant_message": 1,
                 }
@@ -2975,7 +2778,7 @@ def test_transcript_tool_use_validation_rejects_batched_message(tmp_path):
     )
 
     assert failures == [
-        "case transcript for agent='gemini-3-1-pro-preview' had 2 tool_use blocks in one assistant message; expected <= 1"
+        "case transcript for agent='harness-gpt55-sequential-core-tools' had 2 tool_use blocks in one assistant message; expected <= 1"
     ]
 
 
@@ -3038,7 +2841,7 @@ def test_transcript_tool_use_validation_reports_missing_child_agent(tmp_path):
     subagents_dir.mkdir(parents=True)
     transcript = subagents_dir / "agent-def.jsonl"
     transcript.with_suffix(".meta.json").write_text(
-        json.dumps({"agentType": "gemini-3-flash-preview"}),
+        json.dumps({"agentType": "harness-gpt55-sequential-core-tools"}),
         encoding="utf-8",
     )
     transcript.write_text("", encoding="utf-8")
@@ -3048,18 +2851,18 @@ def test_transcript_tool_use_validation_reports_missing_child_agent(tmp_path):
         session_id="session-1",
         checks={
             "claude_projects_root": str(tmp_path),
-            "expected_agents": [{"agent_type": "gemini-3-1-pro-preview"}],
+            "expected_agents": [{"agent_type": "harness-openrouter-nemotron-parallel-read-tools"}],
         },
     )
 
     assert summary["agents"][0]["candidate_transcripts"] == [
         {
             "path": str(transcript),
-            "agent_type": "gemini-3-flash-preview",
+            "agent_type": "harness-gpt55-sequential-core-tools",
         }
     ]
     assert failures == [
-        "case missing Claude subagent transcript for agent='gemini-3-1-pro-preview' session_id='session-1'"
+        "case missing Claude subagent transcript for agent='harness-openrouter-nemotron-parallel-read-tools' session_id='session-1'"
     ]
 
 
@@ -3217,8 +3020,8 @@ def test_session_history_validation_polls_until_expected_rows_are_visible(monkey
                 return []
             return [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
                     "session_id": "session-1",
                     "tenant_id": "adapter-harness-tenant",
                     "input_tokens": 1,
@@ -3233,9 +3036,9 @@ def test_session_history_validation_polls_until_expected_rows_are_visible(monkey
                     "input_tool_advertisement_tokens_estimated": 22,
                     "input_conversation_tokens_estimated": 6,
                     "metadata": {
-                        "prompt_overhead_counted_shape": "gemini_generate_content",
+                        "prompt_overhead_counted_shape": "openai_responses",
                         "prompt_overhead_component_paths": {
-                            "system": ["request.systemInstruction"]
+                            "system": ["instructions"]
                         },
                     },
                     "start_time": None,
@@ -3265,8 +3068,8 @@ def test_session_history_validation_polls_until_expected_rows_are_visible(monkey
             "poll_interval_seconds": 0.1,
             "expected_rows": [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
                     "minimums": {
                         "input_tokens": 1,
                         "output_tokens": 1,
@@ -3275,7 +3078,7 @@ def test_session_history_validation_polls_until_expected_rows_are_visible(monkey
                         "input_conversation_tokens_estimated": 1,
                     },
                     "metadata_required_equals": {
-                        "prompt_overhead_counted_shape": "gemini_generate_content"
+                        "prompt_overhead_counted_shape": "openai_responses"
                     },
                     "metadata_required_truthy": [
                         "prompt_overhead_component_paths"
@@ -3286,7 +3089,7 @@ def test_session_history_validation_polls_until_expected_rows_are_visible(monkey
     )
 
     assert failures == []
-    assert summary["record"]["model"] == "gemini-3-flash-preview"
+    assert summary["record"]["model"] == "gpt-5.4-mini"
     assert len(attempts) == 2
 
     harness._close_validation_db_connections()
@@ -3309,8 +3112,8 @@ def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeyp
         def fetchall(self):
             return [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
                     "session_id": "session-1",
                     "tenant_id": "litellm",
                     "input_tokens": 10,
@@ -3351,8 +3154,8 @@ def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeyp
             "require_runtime_identity": False,
             "expected_rows": [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
                     "minimums": {
                         "input_tokens": 1,
                         "output_tokens": 1,
@@ -3360,7 +3163,7 @@ def test_session_history_expected_row_failure_reports_candidate_mismatch(monkeyp
                     },
                     "required_equals": {"tenant_id": "adapter-harness-tenant"},
                     "metadata_required_equals": {
-                        "prompt_overhead_counted_shape": "gemini_generate_content"
+                        "prompt_overhead_counted_shape": "openai_responses"
                     },
                 }
             ],
@@ -3458,7 +3261,7 @@ def test_rate_limit_observations_validation_matches_session_rows(monkeypatch):
     harness._close_validation_db_connections()
 
 
-def test_rate_limit_observations_validation_matches_codex_and_google_rows(
+def test_rate_limit_observations_validation_matches_codex_rows(
     monkeypatch,
 ):
     harness = _load_harness_module()
@@ -3483,7 +3286,7 @@ def test_rate_limit_observations_validation_matches_codex_and_google_rows(
                     "created_at": now,
                     "client": "codex",
                     "client_version": "0.130.0",
-                    "account_hash": "acct-openai",
+                    "account_hash": "acct-openai-primary",
                     "provider": "openai",
                     "model": "gpt-5.4-mini",
                     "quota_key": "codex:primary",
@@ -3493,26 +3296,26 @@ def test_rate_limit_observations_validation_matches_codex_and_google_rows(
                     "remaining_pct": 57.0,
                     "source": "codex_response_headers",
                     "session_id": "session-native",
-                    "trace_id": "trace-codex",
-                    "litellm_call_id": "call-codex",
+                    "trace_id": "trace-codex-primary",
+                    "litellm_call_id": "call-codex-primary",
                 },
                 {
                     "observed_at": now,
                     "created_at": now,
-                    "client": "google_code_assist",
-                    "client_version": "0.9.0",
-                    "account_hash": "acct-google",
-                    "provider": "google",
-                    "model": "gemini-2.5-flash",
-                    "quota_key": "google_code_assist_requests_gemini-2.5-flash:model_requests",
-                    "quota_period": "daily",
-                    "quota_type": "requests",
-                    "expected_reset_at": now + dt.timedelta(hours=6),
-                    "remaining_pct": 91.5,
-                    "source": "google_retrieve_user_quota",
+                    "client": "codex",
+                    "client_version": "0.130.0",
+                    "account_hash": "acct-openai-secondary",
+                    "provider": "openai",
+                    "model": "gpt-5.4",
+                    "quota_key": "codex:secondary",
+                    "quota_period": "seven_day",
+                    "quota_type": "tokens",
+                    "expected_reset_at": now + dt.timedelta(days=2),
+                    "remaining_pct": 82.0,
+                    "source": "codex_response_headers",
                     "session_id": "session-native",
-                    "trace_id": "trace-google",
-                    "litellm_call_id": "call-google",
+                    "trace_id": "trace-codex-secondary",
+                    "litellm_call_id": "call-codex-secondary",
                 },
             ]
 
@@ -3547,16 +3350,13 @@ def test_rate_limit_observations_validation_matches_codex_and_google_rows(
                     "required_timestamp_after_observed": ["expected_reset_at"],
                 },
                 {
-                    "provider": "google",
-                    "client": "google_code_assist",
-                    "model": "gemini-2.5-flash",
-                    "source": "google_retrieve_user_quota",
-                    "quota_key": (
-                        "google_code_assist_requests_gemini-2.5-flash:"
-                        "model_requests"
-                    ),
-                    "quota_type": "requests",
-                    "required_equals": {"quota_period": "daily"},
+                    "provider": "openai",
+                    "client": "codex",
+                    "model": "gpt-5.4",
+                    "source": "codex_response_headers",
+                    "quota_key": "codex:secondary",
+                    "quota_type": "tokens",
+                    "required_equals": {"quota_period": "seven_day"},
                     "minimums": {"remaining_pct": 0},
                     "maximums": {"remaining_pct": 100},
                     "required_future_timestamps": ["expected_reset_at"],
@@ -3573,7 +3373,7 @@ def test_rate_limit_observations_validation_matches_codex_and_google_rows(
         row["quota_key"] for row in summary["matched_records"]
     } == {
         "codex:primary",
-        "google_code_assist_requests_gemini-2.5-flash:model_requests",
+        "codex:secondary",
     }
 
     harness._close_validation_db_connections()
@@ -3683,10 +3483,10 @@ def test_tool_activity_validation_polls_until_expected_rows_are_visible(monkeypa
                 return []
             return [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
                     "tool_index": 0,
-                    "tool_name": "run_shell_command",
+                    "tool_name": "Bash",
                     "tool_kind": "command",
                     "command_text": "date -u +%Y-%m-%dT%H:%M:%S.%NZ",
                     "arguments": {},
@@ -3716,9 +3516,9 @@ def test_tool_activity_validation_polls_until_expected_rows_are_visible(monkeypa
             "poll_interval_seconds": 0.1,
             "expected_rows": [
                 {
-                    "provider": "gemini",
-                    "model": "gemini-3-flash-preview",
-                    "tool_name": "run_shell_command",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "tool_name": "Bash",
                     "tool_kind": "command",
                     "command_text_contains": "date -u",
                 }
@@ -3727,7 +3527,7 @@ def test_tool_activity_validation_polls_until_expected_rows_are_visible(monkeypa
     )
 
     assert failures == []
-    assert summary["record"]["tool_name"] == "run_shell_command"
+    assert summary["record"]["tool_name"] == "Bash"
     assert len(attempts) == 2
 
     harness._close_validation_db_connections()

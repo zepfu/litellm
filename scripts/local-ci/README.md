@@ -2,9 +2,9 @@
 
 This bundle contains the standalone local acceptance harness used to validate
 LiteLLM routing, request rewrites, Langfuse traces, and provider-specific
-metadata across Codex, Gemini, and Claude. See `TEST_HARNESS.md` in the main
-repo for the full validation policy and runtime split, and `PROD_RELEASE.md`
-for the production promotion runbook.
+metadata across Claude, Codex, OpenRouter, NVIDIA, and Grok paths. See
+`TEST_HARNESS.md` in the main repo for the full validation policy and runtime
+split, and `PROD_RELEASE.md` for the production promotion runbook.
 
 ## Included Files
 
@@ -73,32 +73,20 @@ Current first-wave adapted coverage:
   - excluded from the default suite until the live native auth path has a
     clean dev/prod proof; run explicitly with
     `--cases native_anthropic_passthrough_claude`
-- Native Codex and Gemini telemetry focused gates:
+- Native Codex telemetry focused gates:
   `native_openai_passthrough_responses_codex`,
-  `native_openai_passthrough_responses_codex_tool_activity`,
-  `native_gemini_passthrough_generate_content`, and
-  `native_gemini_passthrough_stream_generate_content`
+  `native_openai_passthrough_responses_codex_tool_activity`
   - validate `session_history` rows for the native client/provider shape
-  - hard-gate Codex `codex_response_headers` quota rows and Gemini/Google Code
-    Assist `google_retrieve_user_quota` rows in `rate_limit_observations`
+  - hard-gate Codex `codex_response_headers` quota rows in
+    `rate_limit_observations`
   - excluded from the default suite; run explicitly with `--cases`
 - OpenAI/Codex hard gates: `gpt-5.4`, `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`
   through `claude_adapter_gpt54`, `claude_adapter_gpt55`,
   `claude_adapter_gpt54_mini`, `claude_adapter_spark`,
   `claude_adapter_gpt55_read_pages_sanitizer`, and
   `claude_adapter_codex_tool_activity`
-- Gemini fanout opt-in gate: `claude_adapter_gemini_fanout`
-  - isolates the exact multi-Gemini dispatch path on `:4001`
-  - use this before spending time on the full adapter suite when a Gemini
-    fanout regression is suspected
-  - excluded from the default suite; run explicitly with
-    `--cases claude_adapter_gemini_fanout`
-- Mixed fanout opt-in target set: `analyst`, `data`, `gpt-5-3-codex-spark`, `gpt-5-4`, `gemini-3-flash-preview`, `gemini-3-1-pro-preview`, `gemini-3-1-flash-lite-preview`
+- Mixed fanout opt-in target set: `analyst`, `data`, `gpt-5-3-codex-spark`, `gpt-5-4`
   through `claude_adapter_peeromega_fanout`
-- Google Code Assist warning-only canaries: `claude_adapter_gemini31_pro` (`gemini-3.1-pro-preview`) and `claude_adapter_gemini31_flash` (`gemini-3-flash-preview`)
-  - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist on `:4001`
-  - keep the individual canaries warning-only in the harness, but do not treat `429` / `RESOURCE_EXHAUSTED` as authoritative upstream truth without interactive Gemini CLI `/model` corroboration on the same account context
-  - `gemini-3.1-flash-lite-preview` is currently validated through the Gemini fanout cases, not a separate individual warning-only case
 - OpenRouter opt-in edge-lane check: `openai/gpt-oss-120b:free`
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
   - this case remains available by explicit `--cases claude_adapter_gpt_oss_120b`, but is excluded from the default suite because OpenRouter frequently returns provider-unavailable `503 provider=OpenInference raw=no healthy upstream`; it is an opt-in hard gate with only that narrow provider-unavailable soft-fail, not a `warning_only` canary
@@ -129,7 +117,6 @@ Current first-wave adapted coverage:
 
 Preferred Anthropic-adapter model spellings:
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
-- direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
 - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because routing is now provider-first
 
@@ -150,11 +137,11 @@ Target profiles:
 
 Native passthrough checks live in the same harness and are opt-in. HTTP cases
 send direct requests through the provider passthrough routes. CLI cases launch
-the real local provider CLIs (`claude`, `codex`, `gemini`) so they use the same
+the real local provider CLIs (`claude`, `codex`) so they use the same
 authentication state as normal operator traffic. All cases validate Langfuse
 plus `public.session_history` for the actual provider session id emitted or
 derived by that client.
-Codex and Gemini CLI cases also send the current git repository identity via
+Codex CLI cases also send the current git repository identity via
 `x-aawm-repository` and require `public.session_history.repository` to be
 populated. Codex CLI cases inject harness-owned tracing headers via `-c
 model_providers.<profile>.http_headers.*` overrides. Set `AAWM_HARNESS_USER_ID`
@@ -183,8 +170,6 @@ Current native cases:
 - `native_openai_passthrough_responses_codex`
 - `native_openai_passthrough_responses_codex_tool_activity`
 - `native_anthropic_passthrough_claude`
-- `native_gemini_passthrough_generate_content`
-- `native_gemini_passthrough_stream_generate_content`
 
 Provider credentials:
 - OpenAI chat/responses use the proxy runtime OpenAI key.
@@ -193,20 +178,11 @@ Provider credentials:
   the CLI emits.
 - Native Anthropic launches `claude` with the harness settings overlay and
   validates the Claude CLI `session_id`.
-- Native Gemini launches `gemini` with `CODE_ASSIST_ENDPOINT` and
-  `GEMINI_CLI_CUSTOM_HEADERS` injected for the selected target. The Google
-  OAuth token stays owned by the CLI; LiteLLM keeps the harness metadata for
-  logging while forwarding only Google-safe headers upstream. Gemini Code
-  Assist control-plane calls are expected during CLI startup, but only model
-  calls such as `generateContent`, `streamGenerateContent`, and
-  `predictLongRunning` should create `session_history` rows.
 - Use `--litellm-base-url`, `--anthropic-base-url`, `--docker-container-name`, or `--expected-trace-environment` only for explicit one-off overrides.
 
 Important notes:
 - top-level Claude runs without an adapted model are not the acceptance target for this suite.
 - for adapted free models, LiteLLM / `session_history` are the source of truth for cost, not Claude CLI display cost. For OpenRouter free models, mirror the paid counterpart cost when a non-free twin exists; keep legacy manual-only `openrouter/free` at zero because OpenRouter does not publish a paid twin for it.
-- The Google Code Assist lane is warning-only in the harness; the route works, but `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` can all hit real `429` / `RESOURCE_EXHAUSTED` responses from `cloudcode-pa.googleapis.com`.
-- The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. When standalone Gemini CLI use is healthy, treat `claude_adapter_gemini_fanout` failures first as local pacing/serialization bugs, not as authoritative provider-capacity proof.
 - Harness artifacts include `summary.prompt_overhead_cost_share`, an aggregate of
   the `public.session_history` prompt-overhead fields for each validated case.
   The report groups by case, client, route family, counted request shape,
@@ -216,10 +192,9 @@ Important notes:
   `response_cost_usd` by each row's prompt-overhead input-token share; treat
   token shares as the primary signal until `session_history` stores exact input
   cost fields.
-- When explicit Gemini reasoning token counts are absent but thought signatures are present, treat `provider_signature_present` as the expected fallback source in Langfuse generation metadata and `session_history`.
 - For Anthropic rows, `reasoning_tokens_source=provider_reported` is only valid when the provider supplied a positive count; zero placeholders should fall through to estimation or remain unset.
 - `reasoning_tokens_source` should not remain null in repaired or newly written `session_history` rows; use `not_applicable` when no reasoning is present and `not_available` when reasoning is present but no positive provider/estimated count exists.
-- Anthropic/OpenAI/Gemini/OpenRouter `session_history` rows should also carry normalized provider-cache telemetry. Expect `provider_cache_status` to land as `hit`, `write`, `miss`, `unsupported`, or `not_attempted`, with `provider_cache_miss_reason` populated for miss-shaped outcomes. `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` are best-effort and should only appear when the miss token count is explicit enough to price honestly.
+- Anthropic/OpenAI/OpenRouter `session_history` rows should also carry normalized provider-cache telemetry. Expect `provider_cache_status` to land as `hit`, `write`, `miss`, `unsupported`, or `not_attempted`, with `provider_cache_miss_reason` populated for miss-shaped outcomes. `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` are best-effort and should only appear when the miss token count is explicit enough to price honestly.
 - The opt-in fanout suite includes an explicit provider-cache canary through `claude_adapter_peeromega_fanout`: at least one Anthropic child row must show `provider_cache_attempted=true` and `provider_cache_status` of `hit` or `write`.
 - When the original proxy spend-log source is unavailable locally, use [scripts/repair_session_history_provider_cache.py](/home/zepfu/projects/litellm/scripts/repair_session_history_provider_cache.py) to repair session-history observability directly from existing rows before relying on historical aggregates. The repair now covers inferred `provider`, invalid zero-count `provider_reported` reasoning rows, provider-cache state, cache miss token/cost fields, and git commit/push rollups from `session_history_tool_activity`.
 - Keep callback overlay parity in mind: `litellm-dev` imports `litellm.integrations.aawm_agent_identity`, while the port-4000 `aawm-litellm` image imports the installed callback wheel module at `aawm_litellm_callbacks.agent_identity`. Any session-history writer change must be applied to both sources and released through a new callback wheel before rebuilding the production-style image.
@@ -235,9 +210,11 @@ Important notes:
 - `claude_adapter_nvidia_minimax_m27` now uses upstream non-stream plus Anthropic-compatible fake streaming. Keep the exact `nvidia/minimaxai/minimax-m2.7` spelling, and treat it as an explicit opt-in spot check rather than a default-suite canary because MiniMax is materially slower than the other NVIDIA targets.
 - These NVIDIA spot checks validate the Anthropic -> NVIDIA completion adapter on `nvidia:/v1/chat/completions` via `provider=nvidia_nim`.
 - For NVIDIA-adapted runs, expect the same observability parity as the other adapted providers: `session_history.provider=nvidia_nim` with the normalized upstream model and non-zero cost when pricing is mapped, `session_history_tool_activity` rows when tool or agent-dispatch work occurs, Langfuse trace environment matching the selected `--target`, `route:anthropic_nvidia_completion_adapter` / `anthropic-nvidia-completion-adapter` / `anthropic-adapter-target:nvidia:/v1/chat/completions` tags plus the `anthropic.nvidia_completion_adapter` span, and usable cost tracking. If NVIDIA pricing is not available for a target model, fall back to the closest equivalent OpenRouter pricing rather than leaving long-term cost tracking unmapped.
-- For opt-in Gemini fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_gemini_fanout` should persist at least three `Agent` rows, `claude_adapter_peeromega_fanout` should persist at least seven, and `session_history` still hard-gates the expected Gemini provider/model/cost rows for each child model.
+- For opt-in mixed fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_peeromega_fanout` should persist at least four `Agent` rows, and `session_history` still hard-gates the expected non-Gemini provider/model/cost rows for each child model.
 - The harness keeps the OpenRouter GPT-OSS edge cases available as explicit opt-in checks while excluding them from the default suite; the adapter should still persist non-zero estimated usage/cost from streamed output plus checked-in/bundled model-price JSON when those cases are selected. If `gpt-oss-120b` times out or command-fails solely because the overlapping runtime logs show the exact OpenRouter provider-unavailable signature (`503`, `provider=OpenInference`, `raw=no healthy upstream`), the harness soft-fails it as upstream availability without masking local adapter/logging failures.
-- Fanout prompts should continue using the Claude agent names from `~/.claude/agents` such as `gemini-3-flash-preview`; those agent files now carry explicit provider-prefixed `model:` values like `google/gemini-3-flash-preview`.
+- Fanout prompts should continue using the Claude agent names from
+  `~/.claude/agents`; provider-prefixed routing lives in each agent file's
+  `model:` value.
 - `openrouter/free` is a legacy manual-only diagnostic, not a default-suite canary or hard gate; upstream routing, rate limits, or model availability can make it noisy even when the local adapter path is correct.
 - `warning_only` canaries stay non-gating even when the subprocess itself times out; those conditions should surface as `soft_failures` / warnings in the artifact, not as suite-stopping failures.
 - Do not re-add `ling-2-6-flash` as a harness target unless the model is intentionally moved to a currently available paid target and the agent file is restored. Use a replacement OpenRouter model for future release-gating parallel proofs.
