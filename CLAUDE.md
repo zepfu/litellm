@@ -119,16 +119,11 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
       gets rewritten with a tenant/agent-scoped technical-identifier list from
       `ag_catalog.raw_content`; the raw query is temporary and will move to a
       stored procedure later
-  - Gemini fanout hard gate: `claude_adapter_gemini_fanout`
-    - isolates the exact multi-Gemini subagent dispatch path on `:4001`
-    - use it before re-running the full adapter suite when Gemini fanout is the suspected regression
-    - the full suite runs this before `claude_adapter_peeromega_fanout` so the dedicated Gemini gate is not polluted by the mixed fanout's short-window upstream pressure
+  - Mixed fanout opt-in gate: `claude_adapter_peeromega_fanout`
+    - dispatches the non-Gemini child-agent target set on `:4001`
     - stable tool-activity invariant: expect the parent session to persist the
-      delegated `Agent` rows; do not assume every Gemini child model will emit
-      its own command row on every run
-  - Google Code Assist canaries: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
-    - the adapter routes Gemini Anthropic-adapter models directly to Google Code Assist
-    - keep this warning-only in the harness because upstream quota windows produce real `429` responses
+      delegated `Agent` rows; do not assume every child model will emit its own
+      command row on every run
   - OpenRouter GPT-OSS edge cases are explicit opt-in checks, not default hard
     gates. `gpt-oss-120b` may soft-fail only for the documented OpenRouter
     provider-unavailable signature.
@@ -164,10 +159,8 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - `litellm/bundled_model_prices_and_context_window_fallback.json` is the packaged fallback mirror used for `LITELLM_LOCAL_MODEL_COST_MAP=True`.
 - After changing the canonical file, run `make sync-model-cost-map` and avoid hand-editing the packaged fallback directly.
 - For adapted models, treat LiteLLM / `session_history` / Langfuse as the cost source of truth, not Claude CLI display cost.
-- The current Gemini CLI bundle and the Anthropic adapter use the same Code Assist request envelope: `model`, `project`, `user_prompt_id`, and `request` with `session_id` / `contents` / tools / generation config. If standalone Gemini CLI use is healthy but `claude_adapter_gemini_fanout` fails, treat that first as a local pacing/serialization bug rather than authoritative provider-capacity proof.
-- For Google Code Assist adapter work, treat successful real-Claude runs on `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.1-flash-lite-preview` as proof of routing correctness. Do not treat `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED` on their own as authoritative upstream truth; only close those as provider issues after interactive Gemini CLI `/model` corroboration on the same account context.
 - `inclusionai/ling-2.6-flash:free` / `ling-2-6-flash` is retired from active harness targets and adapter aliasing after OpenRouter started returning `404` for the old free alias. Keep the old artifacts as history only; choose a currently available OpenRouter model before adding a replacement parallel proof.
-- `session_history` now also tracks normalized provider-cache state for Anthropic, OpenAI, Gemini, and OpenRouter rows. Use `provider_cache_status` / `provider_cache_miss_reason` when checking whether cache hints were attempted, hit, or missed on adapted calls. When the missed cache token count is explicit, `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` capture the extra write-vs-read cost of that miss.
+- `session_history` now also tracks normalized provider-cache state for Anthropic, OpenAI, and OpenRouter rows. Use `provider_cache_status` / `provider_cache_miss_reason` when checking whether cache hints were attempted, hit, or missed on adapted calls. When the missed cache token count is explicit, `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` capture the extra write-vs-read cost of that miss.
 - `session_history` also tracks estimated prompt-overhead token buckets for
   system/provider-equivalent prompt, tool advertisement, conversation,
   residual/other, and deterministic system classifications. Harness artifacts
@@ -180,7 +173,6 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - Adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may still appear as adapter warning/backoff lines in `litellm-dev`, but they should not emit the generic `pass_through_endpoint(): Exception occured - ...` traceback for the current request path.
 - Preferred Anthropic-adapter model spellings:
   - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
-  - direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
   - direct NVIDIA targets: `nvidia/deepseek-ai/deepseek-v3.2`, `nvidia/deepseek-ai/deepseek-v3.1-terminus`, `nvidia/mistralai/devstral-2-123b-instruct-2512`, `nvidia/z-ai/glm4.7`, `nvidia/minimaxai/minimax-m2.7`
   - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
   - explicit NVIDIA wildcard targets: any normalized `nvidia/*` model may route through the NVIDIA completion adapter for early testing, except known OpenRouter namespace models that intentionally remain on OpenRouter
@@ -192,8 +184,8 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
   - Langfuse tags / metadata / spans should include `route:anthropic_nvidia_completion_adapter`, `anthropic-nvidia-completion-adapter`, `anthropic-adapter-target:nvidia:/v1/chat/completions`, and the `anthropic.nvidia_completion_adapter` span name
   - long-term cost tracking should not stay unmapped; if NVIDIA does not expose usable non-free pricing for a target model, use the closest equivalent OpenRouter pricing as the fallback basis
 - Anthropic fanout prompts should still use the Claude agent `name:` values from
-  `~/.claude/agents` such as `gemini-3-flash-preview` and `gpt-5-4`. The
-  provider-prefixed routing lives in the agent file `model:` value.
+  `~/.claude/agents`. The provider-prefixed routing lives in the agent file
+  `model:` value.
 - Do not re-add `ling-2-6-flash` as a harness target unless the model is intentionally moved to a currently available paid target and the agent file is restored.
 
 ### Runtime performance knobs
