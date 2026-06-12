@@ -1362,7 +1362,12 @@ def _get_grok_native_oauth_session_id(
         if isinstance(session_id, str) and session_id.strip():
             return session_id.strip()
 
-    for header_name in ("x-grok-session-id", "session_id", "x-session-id"):
+    for header_name in (
+        "x-grok-session-id",
+        "session_id",
+        "x-session-id",
+        "x-grok-conv-id",
+    ):
         header_value = _get_case_insensitive_header(
             _safe_get_request_headers(request),
             header_name,
@@ -17286,7 +17291,10 @@ def _prepare_grok_logging_body_for_passthrough(
 ) -> dict[str, Any]:
     headers = _safe_get_request_headers(request)
     model_override = _get_case_insensitive_header(headers, "x-grok-model-override")
-    session_id = _get_case_insensitive_header(headers, "x-grok-session-id")
+    session_id = _get_grok_native_oauth_session_id(
+        request=request,
+        request_body=request_body,
+    )
 
     extra_fields: dict[str, Any] = {
         "client_name": "grok-build",
