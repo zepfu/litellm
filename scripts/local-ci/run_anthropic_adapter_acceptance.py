@@ -4106,7 +4106,6 @@ def _parse_selected_cases(
         'claude_adapter_ctx_marker',
         'claude_adapter_ctx_marker_escaped',
         'claude_adapter_codex_tool_activity',
-        'claude_adapter_gemini_fanout',
         'claude_adapter_peeromega_fanout',
     ]
     if not raw:
