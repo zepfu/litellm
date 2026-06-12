@@ -2029,6 +2029,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "client_user_agent",
     "repository",
     "route_tag",
+    "openai_passthrough_route_family",
     "passthrough_route_family",
     "route_family",
     "auth_mode",
@@ -2039,6 +2040,10 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "xai_quota_family",
     "shared_quota_family",
     "grok_subscription_quota_shared",
+    "xai_responses_request_sanitized",
+    "xai_responses_sanitized_removed_params",
+    "xai_responses_sanitized_tool_count",
+    "xai_responses_sanitized_tool_types",
     "claude_internal_check",
     "claude_internal_check_type",
     "claude_permission_check",
@@ -8959,6 +8964,14 @@ def _normalize_session_history_provider(
     auto_agent_provider = _session_history_auto_agent_selected_provider(metadata)
     if auto_agent_provider is not None:
         return auto_agent_provider
+
+    credential_family = str(metadata.get("credential_family") or "").strip().lower()
+    if (
+        credential_family == "xai_oauth"
+        or metadata.get("xai_oauth_managed") is True
+        or metadata.get("xai_oauth_public_model") is not None
+    ):
+        return "xai"
 
     route_provider = _session_history_provider_from_route_family(
         metadata.get("passthrough_route_family")

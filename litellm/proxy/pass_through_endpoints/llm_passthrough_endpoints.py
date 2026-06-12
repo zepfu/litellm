@@ -60,6 +60,7 @@ from litellm.llms.xai.oauth import (
     prepare_oa_xai_request,
     resolve_oa_xai_upstream_model,
 )
+from litellm.llms.xai.responses.transformation import XAIResponsesAPIConfig
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
 from litellm.proxy.auth.route_checks import RouteChecks
@@ -1206,8 +1207,120 @@ def _to_xai_native_passthrough_model(model: Any) -> Any:
     return model
 
 
+def _xai_responses_sanitized_tool_changes(
+    original_tools: Any,
+    sanitized_tools: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(original_tools, list) or not isinstance(sanitized_tools, list):
+        return []
+
+    tool_changes: list[dict[str, Any]] = []
+    for index, original_tool in enumerate(original_tools):
+        sanitized_tool = (
+            sanitized_tools[index] if index < len(sanitized_tools) else None
+        )
+        if original_tool == sanitized_tool:
+            continue
+
+        change: dict[str, Any] = {"index": index}
+        if isinstance(original_tool, dict):
+            tool_type = _get_openai_tool_type(original_tool)
+            if tool_type:
+                change["type"] = tool_type
+            if isinstance(sanitized_tool, dict):
+                removed_fields = [
+                    key for key in original_tool.keys() if key not in sanitized_tool
+                ]
+                if removed_fields:
+                    change["removed_fields"] = sorted(removed_fields)
+        elif isinstance(original_tool, str):
+            change["type"] = original_tool
+
+        tool_changes.append(change)
+    return tool_changes
+
+
+def _sanitize_xai_responses_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
+    sanitized_body = XAIResponsesAPIConfig().map_openai_params(
+        cast(ResponsesAPIOptionalRequestParams, request_body),
+        model=str(request_body.get("model") or ""),
+        drop_params=True,
+    )
+    removed_params = [
+        key
+        for key in request_body.keys()
+        if key not in sanitized_body and key != "litellm_metadata"
+    ]
+    tool_changes = _xai_responses_sanitized_tool_changes(
+        request_body.get("tools"),
+        sanitized_body.get("tools"),
+    )
+    if not removed_params and not tool_changes:
+        return request_body, [], []
+
+    tool_types = _dedupe_sorted_str_list(
+        [
+            tool_change["type"]
+            for tool_change in tool_changes
+            if isinstance(tool_change.get("type"), str)
+        ]
+    )
+    normalized_removed_params = _dedupe_sorted_str_list(
+        [
+            normalized
+            for param in removed_params
+            if (normalized := _normalize_low_cardinality_tag_value(param))
+        ]
+    )
+    updated_body = _merge_litellm_metadata(
+        sanitized_body,
+        tags_to_add=[
+            "xai-responses-request-sanitized",
+            *(
+                f"xai-responses-removed-param:{param}"
+                for param in normalized_removed_params
+            ),
+            *(f"xai-responses-sanitized-tool:{tool}" for tool in tool_types),
+        ],
+        extra_fields={
+            "xai_responses_request_sanitized": True,
+            "xai_responses_sanitized_removed_params": normalized_removed_params,
+            "xai_responses_sanitized_tool_count": len(tool_changes),
+            "xai_responses_sanitized_tool_types": tool_types,
+            "xai_responses_sanitized_tools": tool_changes,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="xai.responses_request_sanitized",
+                    metadata={
+                        "removed_params": normalized_removed_params,
+                        "tool_count": len(tool_changes),
+                        "tool_types": tool_types,
+                    },
+                )
+            ],
+        },
+    )
+    return updated_body, removed_params, tool_changes
+
+
+def _sanitize_xai_responses_request_body_in_place(
+    request_body: dict[str, Any],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    updated_body, removed_params, tool_changes = _sanitize_xai_responses_request_body(
+        request_body
+    )
+    if updated_body is not request_body:
+        request_body.clear()
+        request_body.update(updated_body)
+    return removed_params, tool_changes
+
+
 async def _prepare_oa_xai_passthrough_request(
     request_body: dict[str, Any],
+    *,
+    sanitize_responses_request: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     if is_oa_xai_model(request_body.get("model")) and not isinstance(
         request_body.get("litellm_metadata"), dict
@@ -1216,6 +1329,9 @@ async def _prepare_oa_xai_passthrough_request(
     prepared = await prepare_oa_xai_request(request_body)
     if not prepared:
         return False, None, None
+
+    if sanitize_responses_request:
+        _sanitize_xai_responses_request_body_in_place(request_body)
 
     api_base = request_body.pop("api_base", None)
     api_key = request_body.pop("api_key", None)
@@ -1346,6 +1462,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
         tags_to_add=tags_to_add,
         extra_fields=extra_fields,
     )
+    _sanitize_xai_responses_request_body_in_place(prepared_body)
     access_token = await get_grok_native_oauth_access_token()
     headers = _build_grok_native_oauth_headers(
         access_token=access_token,
@@ -11493,7 +11610,10 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
 
     try:
         prepared_oa_xai, target_base_url, xai_api_key = (
-            await _prepare_oa_xai_passthrough_request(translated_request_body)
+            await _prepare_oa_xai_passthrough_request(
+                translated_request_body,
+                sanitize_responses_request=True,
+            )
         )
     except Exception as exc:
         if (
@@ -20684,7 +20804,10 @@ class BaseOpenAIPassThroughHandler:
             prepared_oa_xai,
             oa_xai_api_base,
             oa_xai_api_key,
-        ) = await _prepare_oa_xai_passthrough_request(request_body)
+        ) = await _prepare_oa_xai_passthrough_request(
+            request_body,
+            sanitize_responses_request=_is_openai_responses_endpoint(endpoint),
+        )
         if not prepared_oa_xai:
             return None
         if oa_xai_api_base is None or oa_xai_api_key is None:
@@ -20795,6 +20918,7 @@ class BaseOpenAIPassThroughHandler:
         )
         egress_credential_family: Optional[str] = None
         expected_target_family: Optional[str] = None
+        endpoint_custom_body: Optional[dict[str, Any]] = None
 
         if request.method == "POST":
             request_body = await get_request_body(request)
@@ -20976,6 +21100,7 @@ class BaseOpenAIPassThroughHandler:
             )
             if body_was_prepared or prepared_request_body is not request_body:
                 _safe_set_request_parsed_body(request, prepared_request_body)
+                endpoint_custom_body = prepared_request_body
 
         ## check for streaming
         is_streaming_request = "stream" in str(updated_url)
@@ -20999,6 +21124,7 @@ class BaseOpenAIPassThroughHandler:
             request,
             fastapi_response,
             user_api_key_dict,
+            custom_body=endpoint_custom_body,
         )
 
     @staticmethod

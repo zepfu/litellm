@@ -997,6 +997,7 @@ def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
             "session_id": "oa-xai-session-123",
             "auth_mode": "oauth",
             "credential_family": "xai_oauth",
+            "openai_passthrough_route_family": "openai_responses",
             "passthrough_route_family": "xai_oauth_api",
             "route_family": "xai_oauth_api",
             "xai_oauth_managed": True,
@@ -1005,6 +1006,17 @@ def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
             "xai_quota_family": "xai_grok_subscription",
             "shared_quota_family": "xai_grok_subscription",
             "grok_subscription_quota_shared": True,
+            "xai_responses_request_sanitized": True,
+            "xai_responses_sanitized_removed_params": [
+                "instructions",
+                "metadata",
+            ],
+            "xai_responses_sanitized_tool_count": 3,
+            "xai_responses_sanitized_tool_types": [
+                "code_interpreter",
+                "web_search",
+                "x_search",
+            ],
             "model_group": "oa_xai/grok-4.3",
             "tags": ["route:xai_oauth_api", "auth:xai_oauth"],
         }
@@ -1031,12 +1043,86 @@ def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
     metadata = record["metadata"]
     assert metadata["auth_mode"] == "oauth"
     assert metadata["credential_family"] == "xai_oauth"
+    assert metadata["openai_passthrough_route_family"] == "openai_responses"
     assert metadata["passthrough_route_family"] == "xai_oauth_api"
     assert metadata["xai_oauth_public_model"] == "oa_xai/grok-4.3"
     assert metadata["xai_oauth_upstream_model"] == "xai/grok-4.3"
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert metadata["grok_subscription_quota_shared"] is True
+    assert metadata["xai_responses_request_sanitized"] is True
+    assert metadata["xai_responses_sanitized_removed_params"] == [
+        "instructions",
+        "metadata",
+    ]
+    assert metadata["xai_responses_sanitized_tool_count"] == 3
+    assert metadata["xai_responses_sanitized_tool_types"] == [
+        "code_interpreter",
+        "web_search",
+        "x_search",
+    ]
     assert "route:xai_oauth_api" in metadata["request_tags"]
+
+
+def test_build_session_history_record_attributes_codex_oa_xai_passthrough_to_xai() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "unknown"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-oa-xai-passthrough"
+    kwargs["standard_logging_object"]["model"] = "oa_xai/grok-4.3"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "codex-oa-xai-passthrough-session",
+            "client_name": "codex_exec",
+            "credential_family": "xai_oauth",
+            "openai_passthrough_route_family": "openai_responses",
+            "passthrough_route_family": "codex_responses",
+            "route_family": "xai_oauth_api",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "xai_responses_request_sanitized": True,
+            "xai_responses_sanitized_removed_params": [
+                "instructions",
+                "metadata",
+            ],
+            "xai_responses_sanitized_tool_count": 3,
+            "xai_responses_sanitized_tool_types": [
+                "code_interpreter",
+                "web_search",
+                "x_search",
+            ],
+            "model_group": "oa_xai/grok-4.3",
+            "tags": ["route:codex_responses", "provider:xai"],
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "grok-4.3",
+        "input": "hello",
+        "tools": [{"type": "code_interpreter"}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-oa-xai",
+            "model": "grok-4.3",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ack"}]}],
+        },
+        start_time="2026-06-11T23:15:00Z",
+        end_time="2026-06-11T23:15:01Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "xai"
+    assert record["model"] == "oa_xai/grok-4.3"
+    assert record["model_group"] == "oa_xai/grok-4.3"
+    metadata = record["metadata"]
+    assert metadata["passthrough_route_family"] == "codex_responses"
+    assert metadata["route_family"] == "xai_oauth_api"
+    assert metadata["openai_passthrough_route_family"] == "openai_responses"
+    assert metadata["xai_responses_request_sanitized"] is True
 
 
 @pytest.mark.parametrize(
