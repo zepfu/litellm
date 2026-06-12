@@ -1332,6 +1332,12 @@ async def _prepare_oa_xai_passthrough_request(
 
     if sanitize_responses_request:
         _sanitize_xai_responses_request_body_in_place(request_body)
+        updated_body, _removed_tool_choice = (
+            _drop_tool_choice_without_tools_from_request_body(request_body)
+        )
+        if updated_body is not request_body:
+            request_body.clear()
+            request_body.update(updated_body)
 
     api_base = request_body.pop("api_base", None)
     api_key = request_body.pop("api_key", None)
@@ -1468,6 +1474,9 @@ async def _prepare_grok_native_oauth_passthrough_request(
         extra_fields=extra_fields,
     )
     _sanitize_xai_responses_request_body_in_place(prepared_body)
+    prepared_body, _removed_tool_choice = (
+        _drop_tool_choice_without_tools_from_request_body(prepared_body)
+    )
     access_token = await get_grok_native_oauth_access_token()
     headers = _build_grok_native_oauth_headers(
         access_token=access_token,
@@ -14661,6 +14670,70 @@ def _add_codex_unsupported_hosted_tool_logging_metadata(
     )
 
 
+def _request_has_openai_tool_definitions(request_body: dict[str, Any]) -> bool:
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return False
+
+    for tool in tools:
+        if isinstance(tool, dict) and _get_openai_tool_type(tool):
+            return True
+    return False
+
+
+def _add_tool_choice_without_tools_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    removed_tool_choice: Any,
+) -> dict[str, Any]:
+    span_metadata: dict[str, Any] = {
+        "removed_tool_choice": removed_tool_choice,
+        "reason": "missing_tools",
+    }
+    extracted_tool_choice = _extract_openai_passthrough_tool_choice(removed_tool_choice)
+    if extracted_tool_choice:
+        span_metadata["tool_choice"] = extracted_tool_choice
+
+    tags_to_add = ["xai-tool-choice-without-tools-removed"]
+    if extracted_tool_choice:
+        tags_to_add.append(
+            f"xai-tool-choice-without-tools:{extracted_tool_choice}"
+        )
+
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields={
+            "xai_tool_choice_without_tools_removed": removed_tool_choice,
+            "xai_tool_choice_without_tools_removed_reason": "missing_tools",
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="xai.tool_choice_without_tools_removed",
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _drop_tool_choice_without_tools_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], Optional[Any]]:
+    if "tool_choice" not in request_body:
+        return request_body, None
+
+    if _request_has_openai_tool_definitions(request_body):
+        return request_body, None
+
+    updated_body = dict(request_body)
+    removed_tool_choice = updated_body.pop("tool_choice", None)
+    updated_body = _add_tool_choice_without_tools_logging_metadata(
+        updated_body,
+        removed_tool_choice=removed_tool_choice,
+    )
+    return updated_body, removed_tool_choice
+
+
 def _add_codex_unsupported_request_param_logging_metadata(
     request_body: dict[str, Any],
     *,
@@ -17335,10 +17408,14 @@ def _prepare_grok_request_body_for_passthrough(
     request: Request,
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
-    return _prepare_grok_logging_body_for_passthrough(
+    prepared_body = _prepare_grok_logging_body_for_passthrough(
         request=request,
         request_body=request_body,
     )
+    prepared_body, _removed_tool_choice = (
+        _drop_tool_choice_without_tools_from_request_body(prepared_body)
+    )
+    return prepared_body
 
 
 def _get_grok_passthrough_logging_metadata(request: Request) -> dict[str, Any]:
@@ -20981,6 +21058,14 @@ class BaseOpenAIPassThroughHandler:
                         prepared_request_body
                     )
                 )
+                if _is_oa_xai_request_body(
+                    prepared_request_body
+                ) or _is_grok_native_oauth_request_body(prepared_request_body):
+                    prepared_request_body, _codex_removed_empty_tool_choice = (
+                        _drop_tool_choice_without_tools_from_request_body(
+                            prepared_request_body
+                        )
+                    )
                 prepared_request_body = _add_codex_request_breakout_logging_metadata(
                     prepared_request_body
                 )
