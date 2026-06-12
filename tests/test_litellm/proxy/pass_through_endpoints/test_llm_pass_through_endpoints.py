@@ -22300,6 +22300,58 @@ class TestGrokProxyRoute:
         assert call_kwargs["passthrough_logging_metadata"] == metadata
 
     @pytest.mark.asyncio
+    async def test_grok_proxy_route_promotes_body_model_to_override_header(self):
+        """should forward the selected Grok model when the TUI omits the override header"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/responses"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": "0.2.50",
+            "x-grok-session-id": "session_123",
+            "user-agent": "grok-shell/0.2.50 (linux; x86_64)",
+            "content-type": "application/json",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        request_body = {
+            "model": "grok-composer-2.5-fast",
+            "input": "hello",
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        call_kwargs = mock_pass_through.await_args.kwargs
+        assert call_kwargs["custom_headers"] == {
+            "x-grok-model-override": "grok-composer-2.5-fast"
+        }
+        metadata = call_kwargs["custom_body"]["litellm_metadata"]
+        assert metadata["grok_model_override"] == "grok-composer-2.5-fast"
+        assert metadata["model_group"] == "grok-composer-2.5-fast"
+        assert (
+            call_kwargs["passthrough_logging_metadata"]["grok_model_override"]
+            == "grok-composer-2.5-fast"
+        )
+
+    @pytest.mark.asyncio
     async def test_grok_proxy_route_avoids_double_v1_for_custom_upstream_base(self):
         """should not duplicate /v1 when the configured upstream base already includes it"""
         mock_request = MagicMock(spec=Request)

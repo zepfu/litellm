@@ -12430,6 +12430,27 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
         and str(metadata.get("passthrough_route_family") or "").strip().lower()
         == "grok_cli_chat_proxy"
     ):
+        inferred_model = _first_non_empty_string(
+            metadata.get("grok_model_override"),
+            metadata.get("model_group"),
+            record.get("model_group"),
+        )
+        if inferred_model is None or inferred_model.lower() in {
+            "unknown",
+            "null",
+            "none",
+        }:
+            inferred_model = "grok-build"
+            metadata.setdefault("grok_side_channel_model_defaulted", True)
+            metadata.setdefault(
+                "grok_side_channel_model_default_reason",
+                "grok_cli_side_channel_without_request_model",
+            )
+
+        record["model"] = inferred_model
+        if _clean_non_empty_string(record.get("model_group")) is None:
+            record["model_group"] = inferred_model
+        metadata.setdefault("model_group", inferred_model)
         zero_token_class = "grok_cli_side_channel_no_usage"
         zero_token_reason = "grok_side_channel_without_model_usage"
         metadata["session_history_reporting_excluded"] = True

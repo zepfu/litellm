@@ -41,6 +41,15 @@ Native Grok passthrough session identity prefers an explicit
 `x-grok-conv-id` header as the persisted `session_id` so usage-bearing Grok TUI
 rows remain reportable under a stable conversation identifier.
 
+Native Grok passthrough model attribution prefers `x-grok-model-override`.
+When that header is absent but the JSON request body contains a supported
+native Grok model such as `grok-composer-2.5-fast`, LiteLLM promotes that body
+model into passthrough metadata and forwards it as `x-grok-model-override`.
+Zero-token Grok side-channel rows that do not carry a per-request model remain
+excluded from usage reporting, but should still persist a non-`unknown`
+`model`/`model_group`; if no stronger model evidence exists, they are attributed
+to the generic Grok TUI client model `grok-build`.
+
 Sanitization metadata proves request adaptation only. It does not prove tool
 execution, model tool-use quality, or upstream success by itself; combine it
 with status, token, cost, and error fields when building reports.

@@ -986,6 +986,51 @@ def test_build_session_history_record_uses_grok_composer_override_and_cost() -> 
     assert record["response_cost_usd"] == pytest.approx(0.006)
 
 
+def test_build_session_history_record_defaults_grok_side_channel_model() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "unknown"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-side-channel"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "session_id": "grok-side-channel-session-123",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "user-agent": "grok-pager/0.2.50 grok-shell/0.2.50 (linux; x86_64)",
+            "x-grok-session-id": "grok-side-channel-session-123",
+        },
+        "body": {},
+    }
+    kwargs["passthrough_logging_payload"]["request_headers"] = {
+        "user-agent": "grok-pager/0.2.50 grok-shell/0.2.50 (linux; x86_64)",
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {}
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={"id": "grok-side-channel", "model": "unknown"},
+        start_time="2026-06-12T02:00:00Z",
+        end_time="2026-06-12T02:00:01Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "xai"
+    assert record["model"] == "grok-build"
+    assert record["model_group"] == "grok-build"
+    assert record["total_tokens"] == 0
+    assert record["metadata"]["session_history_reporting_excluded"] is True
+    assert (
+        record["metadata"]["session_history_zero_token_class"]
+        == "grok_cli_side_channel_no_usage"
+    )
+    assert record["metadata"]["grok_side_channel_model_defaulted"] is True
+
+
 def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
     kwargs = _base_kwargs(trace_name="oa-xai")
     kwargs["model"] = "xai/grok-4.3"
