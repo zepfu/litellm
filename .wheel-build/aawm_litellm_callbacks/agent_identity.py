@@ -2425,6 +2425,15 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
         r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
         re.IGNORECASE,
     ),
+    re.compile(r"(?P<path>/home/zepfu/projects/[^,\s`'\"<)]+)"),
+)
+_AAWM_REPOSITORY_TEXT_MARKERS = (
+    "<environment_context",
+    "<cwd>",
+    "/home/zepfu/projects/",
+    "agents.md instructions for",
+    "cwd",
+    "workspace directories",
 )
 _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
     "...",
@@ -3455,6 +3464,9 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
 
 
 def _extract_repository_identity_from_text(value: str) -> Optional[str]:
+    normalized_value = value.lower()
+    if not any(marker in normalized_value for marker in _AAWM_REPOSITORY_TEXT_MARKERS):
+        return None
     for pattern in _AAWM_REPOSITORY_TEXT_PATTERNS:
         matches = list(pattern.finditer(value))
         for match in reversed(matches):
