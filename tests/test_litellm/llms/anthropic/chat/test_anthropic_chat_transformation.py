@@ -2769,6 +2769,57 @@ def test_compaction_block_request_transformation():
     assert "I don't have access to real-time data" in text_blocks[0]["text"]
 
 
+def test_anthropic_messages_pt_rejects_tool_result_without_tool_use_id():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        anthropic_messages_pt,
+    )
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_result", "content": "42"}],
+        }
+    ]
+
+    with pytest.raises(Exception, match=r"tool_result\.tool_use_id"):
+        anthropic_messages_pt(
+            messages=messages,
+            model="claude-opus-4-6",
+            llm_provider="anthropic",
+        )
+
+
+def test_anthropic_messages_pt_preserves_valid_tool_result_block():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        anthropic_messages_pt,
+    )
+
+    tool_result_block = {
+        "type": "tool_result",
+        "tool_use_id": "call_abc",
+        "content": "42",
+    }
+    messages = [
+        {
+            "role": "assistant",
+            "content": [tool_result_block],
+        }
+    ]
+
+    result = anthropic_messages_pt(
+        messages=messages,
+        model="claude-opus-4-6",
+        llm_provider="anthropic",
+    )
+
+    assert result == [
+        {
+            "role": "assistant",
+            "content": [tool_result_block],
+        }
+    ]
+
+
 def test_compaction_with_context_management():
     """
     Test that compaction works with context_management parameter.
