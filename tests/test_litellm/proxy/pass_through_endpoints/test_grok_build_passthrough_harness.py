@@ -43,27 +43,32 @@ class GrokBuildPassthroughHarness:
             self.model = model
             self.session_id = f"grok-harness-session-{model.replace('.', '-')}"
 
-    def headers(self, *, content_type: str = "application/json") -> Headers:
-        return Headers(
-            {
-                "authorization": "Bearer oidc-token",
-                "x-litellm-api-key": self.litellm_api_key,
-                "x-xai-token-auth": "xai-grok-cli",
-                "x-grok-agent-id": "agent_harness",
-                "x-grok-client-version": "0.1.210",
-                "x-grok-conv-id": "conv_harness",
-                "x-grok-model-override": self.model,
-                "x-grok-req-id": "req_harness",
-                "x-grok-session-id": self.session_id,
-                "x-grok-turn-idx": "1",
-                "x-grok-user-id": self.user_id,
-                "x-email": "user@example.com",
-                "x-teamid": "team_harness",
-                "x-userid": self.user_id,
-                "user-agent": "grok/0.1.210",
-                "content-type": content_type,
-            }
-        )
+    def headers(
+        self,
+        *,
+        content_type: str = "application/json",
+        include_session_id: bool = True,
+    ) -> Headers:
+        headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": self.litellm_api_key,
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-agent-id": "agent_harness",
+            "x-grok-client-version": "0.1.210",
+            "x-grok-conv-id": "conv_harness",
+            "x-grok-model-override": self.model,
+            "x-grok-req-id": "req_harness",
+            "x-grok-turn-idx": "1",
+            "x-grok-user-id": self.user_id,
+            "x-email": "user@example.com",
+            "x-teamid": "team_harness",
+            "x-userid": self.user_id,
+            "user-agent": "grok/0.1.210",
+            "content-type": content_type,
+        }
+        if include_session_id:
+            headers["x-grok-session-id"] = self.session_id
+        return Headers(headers)
 
     def request(
         self,
@@ -72,11 +77,15 @@ class GrokBuildPassthroughHarness:
         endpoint: str = "v1/responses",
         content_type: str = "application/json",
         query_params: dict[str, str] | None = None,
+        include_session_id: bool = True,
     ) -> MagicMock:
         request = MagicMock(spec=Request)
         request.method = method
         request.url = f"http://localhost:4000/grok/{endpoint}"
-        request.headers = self.headers(content_type=content_type)
+        request.headers = self.headers(
+            content_type=content_type,
+            include_session_id=include_session_id,
+        )
         request.query_params = QueryParams(query_params or {"debug": "1"})
         request.cookies = {}
         return request
@@ -134,11 +143,13 @@ class GrokBuildPassthroughHarness:
         request_body: dict[str, Any] | None = None,
         content_type: str = "application/json",
         query_params: dict[str, str] | None = None,
+        include_session_id: bool = True,
     ) -> tuple[dict[str, Any], AsyncMock, AsyncMock, AsyncMock]:
         request = self.request(
             endpoint=endpoint,
             content_type=content_type,
             query_params=query_params,
+            include_session_id=include_session_id,
         )
         auth_mock = AsyncMock(return_value=MagicMock())
         get_body_mock = AsyncMock(return_value=request_body or self.request_body())
@@ -318,6 +329,76 @@ def test_grok_build_harness_normalizes_final_response_and_session_history_identi
     assert record["response_cost_usd"] is not None
     assert record["response_cost_usd"] > 0
     assert record["metadata"]["passthrough_route_family"] == "grok_cli_chat_proxy"
+
+
+@pytest.mark.asyncio
+async def test_grok_build_harness_uses_conv_id_when_session_header_missing():
+    harness = GrokBuildPassthroughHarness(model="grok-composer-2.5-fast")
+
+    call_kwargs, _, _, _ = await harness.invoke_route(
+        endpoint="v1/responses",
+        request_body=harness.request_body(),
+        include_session_id=False,
+    )
+
+    metadata = call_kwargs["custom_body"]["litellm_metadata"]
+    assert metadata["session_id"] == "conv_harness"
+    assert call_kwargs["passthrough_logging_metadata"] == metadata
+
+    response_body = harness.final_response_body()
+    httpx_response = httpx.Response(
+        200,
+        json=response_body,
+        request=httpx.Request("POST", f"{harness.upstream_base}/v1/responses"),
+    )
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    logging_obj.litellm_call_id = "call-grok-conv-id-final"
+    logging_obj.call_type = "pass_through_endpoint"
+    logging_kwargs = harness.logging_kwargs(
+        litellm_call_id="call-grok-conv-id-final",
+        response_body=response_body,
+    )
+    logging_kwargs["litellm_params"]["metadata"] = metadata
+    logging_kwargs["passthrough_logging_payload"]["request_body"] = call_kwargs[
+        "custom_body"
+    ]
+    logging_kwargs["passthrough_logging_payload"]["request_headers"] = dict(
+        harness.headers(include_session_id=False)
+    )
+    custom_llm_provider = logging_kwargs.pop("custom_llm_provider")
+
+    normalized = PassThroughEndpointLogging().normalize_llm_passthrough_logging_payload(
+        httpx_response=httpx_response,
+        response_body=response_body,
+        request_body=call_kwargs["custom_body"],
+        logging_obj=logging_obj,
+        url_route=f"{harness.upstream_base}/v1/responses",
+        result="",
+        start_time=datetime(2026, 6, 1, 19, 50, tzinfo=timezone.utc),
+        end_time=datetime(2026, 6, 1, 19, 50, 1, tzinfo=timezone.utc),
+        cache_hit=False,
+        custom_llm_provider=custom_llm_provider,
+        **logging_kwargs,
+    )
+
+    result = normalized["standard_logging_response_object"]
+    assert result is not None
+    record = _build_session_history_record(
+        kwargs=normalized["kwargs"],
+        result=result,
+        start_time="2026-06-01T19:50:00Z",
+        end_time="2026-06-01T19:50:01Z",
+    )
+
+    assert record is not None
+    assert record["session_id"] == "conv_harness"
+    assert record["provider"] == "xai"
+    assert record["model"] == "grok-composer-2.5-fast"
+    assert record["model_group"] == "grok-composer-2.5-fast"
+    assert record["total_tokens"] == 13
+    assert record["metadata"]["passthrough_route_family"] == "grok_cli_chat_proxy"
+    assert "session_history_reporting_excluded" not in record["metadata"]
 
 
 @pytest.mark.asyncio
