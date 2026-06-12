@@ -28,6 +28,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _add_anthropic_auto_agent_alias_metadata,
     _add_codex_auto_agent_alias_metadata,
     antigravity_proxy_route,
+    _drop_tool_choice_without_tools_from_request_body,
     _drop_unsupported_codex_hosted_tools_from_request_body,
     _drop_unsupported_codex_input_items_from_request_body,
     _drop_unsupported_codex_request_params_from_request_body,
@@ -13408,6 +13409,69 @@ def test_grok_native_unsupported_custom_tool_is_removed(model):
     ]
 
 
+@pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+@pytest.mark.parametrize("tools", [None, []])
+def test_grok_native_tool_choice_without_tools_is_removed(model, tools):
+    request_body = {
+        "model": model,
+        "input": "compact the session",
+        "tool_choice": {"type": "function", "name": "Bash"},
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+    if tools is not None:
+        request_body["tools"] = tools
+
+    updated_body, removed_tool_choice = (
+        _drop_tool_choice_without_tools_from_request_body(request_body)
+    )
+
+    assert removed_tool_choice == {"type": "function", "name": "Bash"}
+    assert "tool_choice" not in updated_body
+    if tools is not None:
+        assert updated_body["tools"] == []
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert "existing-tag" in litellm_metadata["tags"]
+    assert "xai-tool-choice-without-tools-removed" in litellm_metadata["tags"]
+    assert (
+        "xai-tool-choice-without-tools:function"
+        in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["xai_tool_choice_without_tools_removed"] == {
+        "type": "function",
+        "name": "Bash",
+    }
+    assert (
+        litellm_metadata["xai_tool_choice_without_tools_removed_reason"]
+        == "missing_tools"
+    )
+    assert litellm_metadata["langfuse_spans"][0]["name"] == (
+        "xai.tool_choice_without_tools_removed"
+    )
+
+
+def test_grok_native_tool_choice_with_valid_tools_is_preserved():
+    request_body = {
+        "model": "grok-build",
+        "input": "run a command",
+        "tools": [
+            {
+                "type": "function",
+                "name": "Bash",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        "tool_choice": {"type": "function", "name": "Bash"},
+    }
+
+    updated_body, removed_tool_choice = (
+        _drop_tool_choice_without_tools_from_request_body(request_body)
+    )
+
+    assert updated_body is request_body
+    assert removed_tool_choice is None
+    assert updated_body["tool_choice"] == {"type": "function", "name": "Bash"}
+
+
 @pytest.mark.parametrize(
     "model",
     ["oa_xai/grok-4.3", "grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
@@ -22040,6 +22104,86 @@ class TestOpenAIPassthroughRoute:
         assert "openai-grok-native-responses-adapter" in metadata["tags"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
+    async def test_openai_passthrough_grok_native_drops_tool_choice_without_tools(
+        self,
+        monkeypatch,
+        model,
+    ):
+        monkeypatch.setenv(
+            "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+            "http://localhost:4001/grok/v1",
+        )
+        body = {
+            "model": model,
+            "input": "compact the session",
+            "tool_choice": {"type": "function", "name": "Bash"},
+            "metadata": {"session_id": "codex-grok-compact-session"},
+        }
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer inbound-codex-token",
+            "chatgpt-account-id": "acct_123",
+            "originator": "codex_exec",
+            "session_id": "codex-grok-compact-session",
+            "user-agent": "codex_exec/0.119.0",
+        }
+        mock_request.query_params = {}
+        mock_request.scope = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+            new=AsyncMock(return_value="grok-oidc-token"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials"
+        ) as mock_get_credentials, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_create_route.return_value = AsyncMock(return_value={"ok": True})
+
+            result = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert result == {"ok": True}
+        mock_get_credentials.assert_not_called()
+        call_args = mock_create_route.call_args.kwargs
+        assert call_args["target"] == "http://localhost:4001/grok/v1/responses"
+        assert call_args["custom_headers"]["x-grok-model-override"] == model
+        prepared_body = mock_set_body.call_args.args[1]
+        assert prepared_body["model"] == model
+        assert "tool_choice" not in prepared_body
+        assert "tools" not in prepared_body
+        assert mock_create_route.return_value.await_args.kwargs["custom_body"] == (
+            prepared_body
+        )
+        metadata = prepared_body["litellm_metadata"]
+        assert metadata["xai_tool_choice_without_tools_removed"] == {
+            "type": "function",
+            "name": "Bash",
+        }
+        assert (
+            metadata["xai_tool_choice_without_tools_removed_reason"]
+            == "missing_tools"
+        )
+        assert "xai-tool-choice-without-tools-removed" in metadata["tags"]
+        assert "codex_tool_choice" not in metadata
+        assert metadata["openai_passthrough_route_family"] == "openai_responses"
+        assert metadata["grok_native_entrypoint"] == "openai_responses"
+
+    @pytest.mark.asyncio
     async def test_openai_passthrough_responses_api_preserves_client_auth(self):
         """
         Test that /openai_passthrough preserves inbound client auth for Responses API
@@ -22350,6 +22494,55 @@ class TestGrokProxyRoute:
             call_kwargs["passthrough_logging_metadata"]["grok_model_override"]
             == "grok-composer-2.5-fast"
         )
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_drops_tool_choice_without_tools(self):
+        """should remove invalid tool_choice-only Grok Responses payloads"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/responses"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": "0.2.50",
+            "x-grok-session-id": "session_123",
+            "user-agent": "grok-shell/0.2.50 (linux; x86_64)",
+            "content-type": "application/json",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        request_body = {
+            "model": "grok-build",
+            "input": "compact the session",
+            "tool_choice": "auto",
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        call_kwargs = mock_pass_through.await_args.kwargs
+        prepared_body = call_kwargs["custom_body"]
+        assert "tool_choice" not in prepared_body
+        metadata = prepared_body["litellm_metadata"]
+        assert metadata["xai_tool_choice_without_tools_removed"] == "auto"
+        assert "xai-tool-choice-without-tools-removed" in metadata["tags"]
+        assert call_kwargs["passthrough_logging_metadata"] == metadata
 
     @pytest.mark.asyncio
     async def test_grok_proxy_route_avoids_double_v1_for_custom_upstream_base(self):
