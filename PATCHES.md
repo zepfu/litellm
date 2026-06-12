@@ -2447,6 +2447,51 @@ rebuilding/restarting `aawm-litellm`, and running prod smokes including direct
 
 ---
 
+### aawm.72 — Release-prep base for alias routing audits, session-history durability, passthrough hardening, and harness cleanup
+
+**Status:** AAWM local release candidate.
+
+**What changed:** The fork release line now includes the post-aawm.71 carried
+patches on `develop`: AAWM read-only and coding aliases with routing audit
+persistence, output-contract metadata, spawn-agent contract guidance, durable
+session-history ingestion under pressure, provider-status sidecar guardrails,
+alias high-demand and in-flight redispatch behavior, deployed adapter
+session-history attribution hardening, Anthropic Fable 5 pricing, xAI/Grok
+Responses passthrough session and tool handling, OpenCode Zen DeepSeek tool
+adjacency handling, removal of Gemini-backed Anthropic harness cases, Ling
+OpenRouter retry pacing, Antigravity CLI no-op token acceptance, local
+Anthropic tool-result block validation, bounded Langfuse generation payloads,
+Codex/OpenCode model-exposure limits, and deduplicated Langfuse tool-definition
+snapshots.
+
+**Why:** The production promotion needs a single base fork image tag that
+matches the current `develop` head before the infrastructure image is rebuilt.
+These changes touch the proxy routing path, callback/session-history
+observability, local acceptance harness, model pricing metadata, and release
+operator docs; shipping them behind the previous `1.82.3+aawm.71` fork version
+would make prod image provenance ambiguous and would not distinguish the latest
+alias, passthrough, Langfuse, and harness behavior from the older D1-215 base.
+
+**Why not upstream:** The alias ordering, AAWM routing-audit table,
+`aawm_tristore` session-history contract, local CLI/passthrough harness, and
+OpenCode/Antigravity/Grok operational policy are AAWM-specific fork behavior.
+
+**Additional release-prep fix:** During validation, OpenCode Zen returned an
+account billing/authentication failure (`CreditsError` / `No payment method`) as
+a 401 while `aawm-low` was probing alias candidates. Alias probe mode now treats
+that OpenCode billing/auth state as candidate unavailable so the alias can
+continue to `gpt-5.4-mini`; direct OpenCode routes still surface the upstream
+failure.
+
+**Validation status:** Pre-promotion validation is expected to run against
+`litellm-dev` on `:4001` before main/tag promotion, then stop before the prod
+container restart boundary. The final release evidence should include focused
+tests for changed code paths, the default dev adapter harness artifact,
+overlapping `litellm-dev` log inspection, a clean tracked worktree, and a
+published fork image tag `v1.82.3-aawm.72` from current `main`.
+
+---
+
 ### cb-v0.0.42 — Callback overlay parity for Antigravity/OpenCode attribution
 
 **Status:** AAWM callback overlay release candidate.

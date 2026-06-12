@@ -8592,6 +8592,53 @@ def _raise_opencode_zen_auto_agent_candidate_unavailable(exc: Exception) -> None
     raise proxy_exc from exc
 
 
+def _opencode_zen_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    detail = _extract_google_adapter_exception_detail(exc)
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    else:
+        detail_text = str(detail or exc)
+    detail_text = " ".join(
+        str(part)
+        for part in (
+            getattr(exc, "message", None),
+            getattr(exc, "code", None),
+            detail_text,
+            str(exc),
+        )
+        if part is not None
+    )
+    normalized = detail_text.lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "creditserror",
+            "no payment method",
+            "add a payment method",
+            "billing",
+            "payment required",
+        )
+    ):
+        return detail_text
+    if status_code in {401, 402, 403} and any(
+        marker in normalized
+        for marker in (
+            "authentication",
+            "authorization",
+            "unauthorized",
+            "forbidden",
+            "invalid api key",
+            "api-key",
+            "api key",
+            "credential",
+            "opencode",
+        )
+    ):
+        return detail_text
+    return None
+
+
 def _antigravity_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     if not isinstance(exc, HTTPException):
         return None
@@ -20773,16 +20820,24 @@ async def _handle_codex_opencode_zen_adapter_route(
         expected_target_family="opencode",
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
-    completion_response = await litellm.acompletion(
-        **completion_kwargs,
-        api_key=api_key,
-        api_base=f"{target_base_url.rstrip('/')}/v1",
-        litellm_metadata=litellm_metadata,
-        proxy_server_request={
-            "headers": dict(request.headers),
-            "body": request_body,
-        },
-    )
+    try:
+        completion_response = await litellm.acompletion(
+            **completion_kwargs,
+            api_key=api_key,
+            api_base=f"{target_base_url.rstrip('/')}/v1",
+            litellm_metadata=litellm_metadata,
+            proxy_server_request={
+                "headers": dict(request.headers),
+                "body": request_body,
+            },
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _opencode_zen_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
+        raise
     if bool(request_body.get("stream")):
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,
