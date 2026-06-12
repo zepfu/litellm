@@ -2,6 +2,7 @@ import importlib.util
 import datetime as dt
 import json
 import pathlib
+import re
 import subprocess
 
 
@@ -65,6 +66,10 @@ REMOVED_GEMINI_HARNESS_CASES = {
     "claude_adapter_gemini31_pro",
     "claude_adapter_gemini31_flash",
 }
+DIRECT_ANTHROPIC_MODEL_PATTERN = re.compile(
+    r"(?:^|[/:\s])anthropic(?:[/:\s]|$)|^aawm-.+-anthropic$",
+    re.IGNORECASE,
+)
 
 
 def _load_harness_module():
@@ -1368,6 +1373,73 @@ def test_anthropic_adapter_config_removes_gemini_harness_cases():
     assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["default_excluded_cases"])
     assert "gemini" not in json.dumps(config["cases"]).lower()
     assert "google_code_assist" not in json.dumps(config["cases"]).lower()
+
+
+def _collect_codex_case_model_selectors(case_config):
+    model_selectors = []
+    command = case_config.get("command")
+    if isinstance(command, list):
+        for index, item in enumerate(command[:-1]):
+            if item in {"-m", "--model"} and isinstance(command[index + 1], str):
+                model_selectors.append(("command", command[index + 1]))
+
+    direct_paths = (
+        ("model",),
+        ("target_model",),
+        ("http_request", "json", "model"),
+        ("session_history_validation", "expected_model"),
+        ("command_json_checks", "required_equals", "model"),
+    )
+    for path in direct_paths:
+        current = case_config
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                break
+            current = current[key]
+        else:
+            if isinstance(current, str):
+                model_selectors.append((".".join(path), current))
+
+    tool_activity_validation = case_config.get("tool_activity_validation")
+    if isinstance(tool_activity_validation, dict):
+        for index, expected_row in enumerate(
+            tool_activity_validation.get("expected_rows", [])
+        ):
+            if isinstance(expected_row, dict) and isinstance(
+                expected_row.get("model"), str
+            ):
+                model_selectors.append(
+                    (
+                        f"tool_activity_validation.expected_rows[{index}].model",
+                        expected_row["model"],
+                    )
+                )
+
+    return model_selectors
+
+
+def test_codex_harness_cases_do_not_directly_select_anthropic_models():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    violations = []
+
+    for case_name, case_config in config["cases"].items():
+        if (
+            case_config.get("cli_passthrough") != "codex"
+            and "codex" not in case_name.lower()
+        ):
+            continue
+
+        case_text = json.dumps(case_config).lower()
+        antigravity_mediated = "antigravity" in case_name.lower() or (
+            "antigravity" in case_text
+        )
+        for source, model in _collect_codex_case_model_selectors(case_config):
+            if DIRECT_ANTHROPIC_MODEL_PATTERN.search(model) and not (
+                antigravity_mediated and "antigravity" in model.lower()
+            ):
+                violations.append(f"{case_name}:{source}={model}")
+
+    assert violations == []
 
 
 def test_openrouter_free_cases_validate_daily_rate_limit_observations():

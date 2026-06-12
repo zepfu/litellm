@@ -198,9 +198,10 @@ _OPENCODE_ZEN_DEFAULT_AUTH_PATHS = (
 _OPENCODE_ZEN_FREE_MODELS = frozenset(
     {
         "big-pickle",
-        "deepseek-v4-flash-free",
-        "mimo-v2.5-free",
-        "nemotron-3-super-free",
+        "mini-v2.5",
+        "north-mini-code",
+        "nemotron-3-ultra",
+        "deepseek-v4-flash",
     }
 )
 
@@ -464,7 +465,7 @@ _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
     {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
-        "model": "deepseek-v4-flash-free",
+        "model": "deepseek-v4-flash",
         "route_family": "codex_opencode_zen_adapter",
         "last_resort": False,
     },
@@ -582,7 +583,7 @@ _ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
     {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
-        "model": "deepseek-v4-flash-free",
+        "model": "deepseek-v4-flash",
         "route_family": "anthropic_opencode_zen_responses_adapter",
         "last_resort": False,
     },
