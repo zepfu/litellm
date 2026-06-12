@@ -1249,6 +1249,57 @@ def test_normalize_repository_identity_rejects_metadata_noise(
     assert aawm_agent_identity._normalize_repository_identity(raw_repository) is None
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_repository"),
+    [
+        (
+            "<environment_context><cwd>/home/zepfu/projects/aegis</cwd>"
+            "</environment_context>",
+            "aegis",
+        ),
+        ("<cwd>/home/zepfu/projects/aawm-tap</cwd>", "aawm-tap"),
+        (
+            "# AGENTS.md instructions for /home/zepfu/projects/litellm\n",
+            "litellm",
+        ),
+        ("Repository path: /home/zepfu/projects/litellm", "litellm"),
+        ("cwd: /home/zepfu/projects/dashboard-shell", "dashboard-shell"),
+        (
+            "- **workspace directories:**\n"
+            "  - /home/zepfu/projects/aawm-observe\n",
+            "aawm-observe",
+        ),
+    ],
+)
+def test_extract_repository_identity_from_text_preserves_supported_markers(
+    text: str, expected_repository: str
+) -> None:
+    assert (
+        aawm_agent_identity._extract_repository_identity_from_text(text)
+        == expected_repository
+    )
+
+
+def test_extract_repository_identity_from_text_skips_marker_free_large_text(
+    monkeypatch,
+) -> None:
+    class ExplodingPattern:
+        def finditer(self, _value: str):
+            raise AssertionError("repository regex should not run without markers")
+
+    marker_free_text = "large embedding chunk without workspace hints\n" * 1000
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_AAWM_REPOSITORY_TEXT_PATTERNS",
+        (ExplodingPattern(),),
+    )
+
+    assert (
+        aawm_agent_identity._extract_repository_identity_from_text(marker_free_text)
+        is None
+    )
+
+
 def test_build_session_history_record_uses_repository_header_and_metadata() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"
