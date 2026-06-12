@@ -28,6 +28,34 @@ DEFAULT_ANTHROPIC_API_VERSION = "2023-06-01"
 
 
 class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
+    @staticmethod
+    def _validate_anthropic_tool_result_blocks(messages: List[Dict]) -> None:
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_index, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type != "tool_result" and not (
+                    isinstance(block_type, str) and block_type.endswith("_tool_result")
+                ):
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+                    raise AnthropicError(
+                        message=(
+                            "Invalid Anthropic tool_result block at "
+                            f"messages.{message_index}.content.{content_index}: "
+                            "missing required non-empty string "
+                            f"tool_result.tool_use_id for block type {block_type!r}"
+                        ),
+                        status_code=400,
+                    )
+
     def get_supported_anthropic_messages_params(self, model: str) -> list:
         return [
             "messages",
@@ -215,6 +243,7 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
 
         ####### get required params for all anthropic messages requests ######
         verbose_logger.debug(f"TRANSFORMATION DEBUG - Messages: {messages}")
+        self._validate_anthropic_tool_result_blocks(messages)
         anthropic_messages_request: AnthropicMessagesRequest = AnthropicMessagesRequest(
             messages=messages,
             max_tokens=max_tokens,

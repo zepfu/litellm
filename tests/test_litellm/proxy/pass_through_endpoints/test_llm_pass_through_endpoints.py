@@ -454,6 +454,59 @@ async def _prepare_claude_code_agent_project_request_body(
     return updated_body
 
 
+@pytest.mark.asyncio
+async def test_prepare_anthropic_request_body_rejects_tool_result_without_tool_use_id():
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+    request_body = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 32,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_result", "content": "42"}],
+            }
+        ],
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _prepare_anthropic_request_body_for_passthrough(
+            mock_request,
+            request_body,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "tool_result.tool_use_id" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_prepare_anthropic_request_body_preserves_valid_tool_result_block():
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+    tool_result_block = {
+        "type": "tool_result",
+        "tool_use_id": "call_abc",
+        "content": "42",
+    }
+    request_body = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 32,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [tool_result_block],
+            }
+        ],
+    }
+
+    updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+        mock_request,
+        request_body,
+    )
+
+    assert updated_body["messages"][0]["content"] == [tool_result_block]
+
+
 def _assert_claude_code_agent_project_litellm_metadata(
     litellm_metadata: dict[str, Any],
 ) -> None:

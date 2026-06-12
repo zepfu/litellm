@@ -16704,6 +16704,40 @@ async def _expand_aawm_dynamic_directives_in_anthropic_request_body(
     return updated_body, injection_events
 
 
+def _validate_anthropic_tool_result_blocks_for_passthrough(
+    request_body: dict[str, Any],
+) -> None:
+    messages = request_body.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for content_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type != "tool_result" and not (
+                isinstance(block_type, str) and block_type.endswith("_tool_result")
+            ):
+                continue
+            tool_use_id = block.get("tool_use_id")
+            if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Invalid Anthropic tool_result block at "
+                        f"messages.{message_index}.content.{content_index}: "
+                        "missing required non-empty string "
+                        f"tool_result.tool_use_id for block type {block_type!r}"
+                    ),
+                )
+
+
 async def _prepare_anthropic_request_body_for_passthrough(
     request: Request, request_body: dict[str, Any]
 ) -> Tuple[dict[str, Any], int, set[str], dict[str, str]]:
@@ -16749,6 +16783,7 @@ async def _prepare_anthropic_request_body_for_passthrough(
         request=request,
         request_body=updated_body,
     )
+    _validate_anthropic_tool_result_blocks_for_passthrough(updated_body)
     return updated_body, expanded_count, hooks, billing_header_fields
 
 
