@@ -60,3 +60,26 @@ to the generic Grok TUI client model `grok-build`.
 Sanitization metadata proves request adaptation only. It does not prove tool
 execution, model tool-use quality, or upstream success by itself; combine it
 with status, token, cost, and error fields when building reports.
+
+## OpenCode Zen Codex Tool-Adjacency Sanitization
+
+Codex/OpenAI Responses traffic that is adapted to OpenCode Zen chat completions
+must satisfy OpenAI chat tool-call ordering before egress. If a Responses input
+history contains an assistant `function_call` / chat `tool_calls` item without
+the immediately following `tool` result messages required by DeepSeek-compatible
+chat completion providers, LiteLLM removes the unmatched assistant tool-call
+turn and any orphan tool-result messages before sending the OpenCode request.
+
+Rows and traces affected by this path use
+`passthrough_route_family=codex_opencode_zen_adapter` and should include the
+request tag `opencode-zen-chat-tool-adjacency-sanitized`. Langfuse observations
+also include an `opencode_zen.chat_tool_adjacency_sanitized` span with counts
+for removed assistant, orphan tool, partial tool, and extra tool messages, plus
+the before/after chat message counts. `session_history.metadata` may retain the
+sanitizer tag even when the detailed count fields are only present on the
+Langfuse observation.
+
+Interpret this sanitizer as request-shape repair, not proof of model quality.
+Successful closure still requires the final provider status, token usage, and
+absence of provider error or rate-limit observation rows for the same
+`trace_id`/`session_id`.
