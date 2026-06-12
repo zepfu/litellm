@@ -8,7 +8,7 @@ especially ensuring that encoding_format is not included when not provided.
 import json
 import os
 import sys
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -20,6 +20,7 @@ import litellm
 from litellm.llms.hosted_vllm.embedding.transformation import (
     HostedVLLMEmbeddingConfig,
 )
+from litellm.types.utils import EmbeddingResponse
 
 
 class TestHostedVLLMEmbeddingTransformation:
@@ -288,6 +289,55 @@ class TestHostedVLLMEmbeddingTransformation:
             )
             assert sent_data["model"] == "BAAI/bge-small-en-v1.5"
             assert sent_data["input"] == ["Hello world"]
+
+    @pytest.mark.parametrize(
+        "model_prefix",
+        [
+            "local_embed",
+            "hosted_vllm",
+        ],
+    )
+    def test_transform_embedding_response_preserves_upstream_usage(
+        self, model_prefix: str
+    ):
+        """Test that hosted-vllm aliases keep upstream embedding usage."""
+        response_payload = {
+            "object": "list",
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": [0.1, 0.2, 0.3],
+                }
+            ],
+            "model": "nomic-embed-code.Q8_0.gguf",
+            "usage": {
+                "prompt_tokens": 123,
+                "total_tokens": 123,
+            },
+        }
+        raw_response = Mock()
+        raw_response.text = json.dumps(response_payload)
+        raw_response.json.return_value = response_payload
+        logging_obj = Mock()
+
+        result = self.config.transform_embedding_response(
+            model=f"{model_prefix}/nomic-embed-code.Q8_0.gguf",
+            raw_response=raw_response,
+            model_response=EmbeddingResponse(),
+            logging_obj=logging_obj,
+            api_key=None,
+            request_data={"model": "nomic-embed-code.Q8_0.gguf"},
+            optional_params={},
+            litellm_params={},
+        )
+
+        assert result.usage.prompt_tokens == 123
+        assert result.usage.total_tokens == 123
+        assert result.model == "nomic-embed-code.Q8_0.gguf"
+        logging_obj.post_call.assert_called_once_with(
+            original_response=raw_response.text
+        )
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
