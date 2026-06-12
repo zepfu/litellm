@@ -2044,6 +2044,8 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "xai_responses_sanitized_removed_params",
     "xai_responses_sanitized_tool_count",
     "xai_responses_sanitized_tool_types",
+    "xai_tool_choice_without_tools_removed",
+    "xai_tool_choice_without_tools_removed_reason",
     "claude_internal_check",
     "claude_internal_check_type",
     "claude_permission_check",

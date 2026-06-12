@@ -1062,6 +1062,11 @@ def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
                 "web_search",
                 "x_search",
             ],
+            "xai_tool_choice_without_tools_removed": {
+                "type": "function",
+                "name": "Bash",
+            },
+            "xai_tool_choice_without_tools_removed_reason": "missing_tools",
             "model_group": "oa_xai/grok-4.3",
             "tags": ["route:xai_oauth_api", "auth:xai_oauth"],
         }
@@ -1105,6 +1110,11 @@ def test_build_session_history_record_preserves_oa_xai_oauth_metadata() -> None:
         "web_search",
         "x_search",
     ]
+    assert metadata["xai_tool_choice_without_tools_removed"] == {
+        "type": "function",
+        "name": "Bash",
+    }
+    assert metadata["xai_tool_choice_without_tools_removed_reason"] == "missing_tools"
     assert "route:xai_oauth_api" in metadata["request_tags"]
 
 
@@ -1137,6 +1147,11 @@ def test_build_session_history_record_attributes_codex_oa_xai_passthrough_to_xai
                 "web_search",
                 "x_search",
             ],
+            "xai_tool_choice_without_tools_removed": {
+                "type": "function",
+                "name": "Bash",
+            },
+            "xai_tool_choice_without_tools_removed_reason": "missing_tools",
             "model_group": "oa_xai/grok-4.3",
             "tags": ["route:codex_responses", "provider:xai"],
         }
@@ -1168,6 +1183,11 @@ def test_build_session_history_record_attributes_codex_oa_xai_passthrough_to_xai
     assert metadata["route_family"] == "xai_oauth_api"
     assert metadata["openai_passthrough_route_family"] == "openai_responses"
     assert metadata["xai_responses_request_sanitized"] is True
+    assert metadata["xai_tool_choice_without_tools_removed"] == {
+        "type": "function",
+        "name": "Bash",
+    }
+    assert metadata["xai_tool_choice_without_tools_removed_reason"] == "missing_tools"
 
 
 @pytest.mark.parametrize(

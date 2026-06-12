@@ -10,7 +10,10 @@ treated as public LiteLLM API guarantees.
 LiteLLM sanitizes xAI Responses request bodies for Codex/OpenAI passthrough and
 native Grok Composer passthrough before forwarding to xAI. The sanitizer removes
 unsupported top-level Responses fields and unsupported tool fields while
-preserving bounded metadata that explains the adaptation.
+preserving bounded metadata that explains the adaptation. Native Grok and
+managed xAI Responses requests also drop `tool_choice` when the outgoing payload
+has no usable `tools` definitions, since xAI rejects `tool_choice` without
+tools.
 
 Rows affected by this path may include:
 
@@ -24,6 +27,10 @@ Rows affected by this path may include:
   shape changed, for example `["code_interpreter", "web_search", "x_search"]`.
 - `xai_responses_sanitized_tools`: bounded detail records keyed by tool index,
   type, and removed fields where available.
+- `xai_tool_choice_without_tools_removed`: the removed `tool_choice` value when
+  no typed tool definitions were present in the outgoing payload.
+- `xai_tool_choice_without_tools_removed_reason`: currently `missing_tools`
+  when `tool_choice` was removed because no usable tools survived.
 
 Related route metadata distinguishes Codex and native Grok traffic:
 
