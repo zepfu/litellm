@@ -16888,6 +16888,19 @@ def _antigravity_access_token_is_valid(token_data: dict[str, Any]) -> bool:
     return expiry > datetime.now(timezone.utc) + timedelta(seconds=60)
 
 
+def _antigravity_access_token_is_unexpired(token_data: dict[str, Any]) -> bool:
+    token_block = token_data.get("token")
+    if not isinstance(token_block, dict):
+        return False
+    access_token = _clean_codex_auth_value(token_block.get("access_token"))
+    if access_token is None:
+        return False
+    expiry = _parse_antigravity_token_expiry(token_block.get("expiry"))
+    if expiry is None:
+        return True
+    return expiry > datetime.now(timezone.utc)
+
+
 def _antigravity_oauth_cached_token_is_valid(cached_token: tuple[str, int]) -> bool:
     _access_token, expiry_date = cached_token
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -17137,6 +17150,7 @@ def _get_antigravity_cli_refresh_timeout_seconds() -> float:
 
 async def _refresh_local_antigravity_oauth_token_data_via_cli(
     auth_path: Path,
+    original_token_data: Optional[AntigravityOAuthTokenData] = None,
 ) -> AntigravityOAuthTokenData:
     refresh_home = _get_antigravity_cli_refresh_home(auth_path)
     cli_candidates = _iter_antigravity_cli_binary_candidates()
@@ -17197,6 +17211,12 @@ async def _refresh_local_antigravity_oauth_token_data_via_cli(
 
     refreshed_token_data = await _load_antigravity_oauth_token_data_from_path(auth_path)
     if not _antigravity_access_token_is_valid(refreshed_token_data):
+        if (
+            original_token_data is not None
+            and refreshed_token_data == original_token_data
+            and _antigravity_access_token_is_unexpired(refreshed_token_data)
+        ):
+            return refreshed_token_data
         raise HTTPException(
             status_code=500,
             detail="AGY CLI silent auth refresh did not produce a valid token.",
@@ -17267,7 +17287,8 @@ async def _refresh_local_antigravity_oauth_token_data(
             in {"invalid_client", "invalid_grant", "unauthorized_client"}
         ):
             return await _refresh_local_antigravity_oauth_token_data_via_cli(
-                auth_path
+                auth_path,
+                token_data,
             )
         raise HTTPException(
             status_code=500,

@@ -18576,6 +18576,159 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_p
 
 
 @pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_cli_noop_accepts_unexpired_token(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    target_home = tmp_path / "target-home"
+    target_path = (
+        target_home
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    target_path.parent.mkdir(parents=True)
+    target_token_data = {
+        "auth_method": "consumer",
+        "token": {
+            "access_token": "ya29.near-expiry-antigravity",
+            "expiry": (
+                datetime.now(timezone.utc) + timedelta(seconds=30)
+            ).isoformat(),
+            "refresh_token": "target-refresh-token",
+            "token_type": "Bearer",
+        },
+    }
+    target_path.write_text(json.dumps(target_token_data), encoding="utf-8")
+
+    cli_path = tmp_path / "agy"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        401,
+        json={"error": "invalid_client"},
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+    subprocess_calls = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        subprocess_calls.append((args, kwargs))
+        assert args[-1] == "models"
+        assert kwargs["env"]["HOME"] == str(target_home)
+        return FakeProcess()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.create_subprocess_exec",
+        new=fake_create_subprocess_exec,
+    ):
+        refreshed = await _refresh_local_antigravity_oauth_token_data(
+            target_token_data,
+            target_path,
+        )
+
+    assert refreshed == target_token_data
+    assert json.loads(target_path.read_text(encoding="utf-8")) == target_token_data
+    assert subprocess_calls
+
+
+@pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_cli_noop_rejects_expired_token(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _refresh_local_antigravity_oauth_token_data,
+    )
+
+    target_home = tmp_path / "target-home"
+    target_path = (
+        target_home
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    target_path.parent.mkdir(parents=True)
+    target_token_data = {
+        "auth_method": "consumer",
+        "token": {
+            "access_token": "ya29.expired-antigravity",
+            "expiry": (
+                datetime.now(timezone.utc) - timedelta(seconds=5)
+            ).isoformat(),
+            "refresh_token": "target-refresh-token",
+            "token_type": "Bearer",
+        },
+    }
+    target_path.write_text(json.dumps(target_token_data), encoding="utf-8")
+
+    cli_path = tmp_path / "agy"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        401,
+        json={"error": "invalid_client"},
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        assert args[-1] == "models"
+        assert kwargs["env"]["HOME"] == str(target_home)
+        return FakeProcess()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.create_subprocess_exec",
+        new=fake_create_subprocess_exec,
+    ), pytest.raises(
+        HTTPException,
+        match="AGY CLI silent auth refresh did not produce a valid token.",
+    ):
+        await _refresh_local_antigravity_oauth_token_data(
+            target_token_data,
+            target_path,
+        )
+
+
+@pytest.mark.asyncio
 async def test_refresh_local_antigravity_oauth_token_data_requires_refresh_token():
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
         _refresh_local_antigravity_oauth_token_data,
