@@ -72,3 +72,45 @@ def test_output_format_works_with_bedrock_and_azure():
         headers={}
     )
     assert "output_format" in azure_result
+
+
+def test_anthropic_messages_request_rejects_tool_result_without_tool_use_id():
+    config = AnthropicMessagesConfig()
+
+    with pytest.raises(Exception, match=r"tool_result\.tool_use_id"):
+        config.transform_anthropic_messages_request(
+            model="claude-sonnet-4-5",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_result", "content": "42"}],
+                }
+            ],
+            anthropic_messages_optional_request_params={"max_tokens": 1024},
+            litellm_params={},
+            headers={},
+        )
+
+
+def test_anthropic_messages_request_preserves_valid_tool_result_block():
+    config = AnthropicMessagesConfig()
+    tool_result_block = {
+        "type": "tool_result",
+        "tool_use_id": "call_abc",
+        "content": "42",
+    }
+
+    result = config.transform_anthropic_messages_request(
+        model="claude-sonnet-4-5",
+        messages=[
+            {
+                "role": "assistant",
+                "content": [tool_result_block],
+            }
+        ],
+        anthropic_messages_optional_request_params={"max_tokens": 1024},
+        litellm_params={},
+        headers={},
+    )
+
+    assert result["messages"][0]["content"] == [tool_result_block]

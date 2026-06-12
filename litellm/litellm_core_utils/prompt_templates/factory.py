@@ -2369,6 +2369,41 @@ def anthropic_messages_pt(  # noqa: PLR0915
     5. System messages are a separate param to the Messages API
     6. Ensure we only accept role, content. (message.name is not supported)
     """
+
+    def _validate_anthropic_tool_result_blocks(
+        anthropic_messages: List[
+            Union[
+                AnthropicMessagesUserMessageParam,
+                AnthopicMessagesAssistantMessageParam,
+            ]
+        ],
+    ) -> None:
+        for message_index, message in enumerate(anthropic_messages):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_index, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type != "tool_result" and not (
+                    isinstance(block_type, str)
+                    and block_type.endswith("_tool_result")
+                ):
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+                    raise litellm.BadRequestError(
+                        message=(
+                            "Invalid Anthropic tool_result block at "
+                            f"messages.{message_index}.content.{content_index}: "
+                            "missing required non-empty string "
+                            f"tool_result.tool_use_id for block type {block_type!r}"
+                        ),
+                        model=model,
+                        llm_provider=llm_provider,
+                    )
+
     # Sanitize messages for tool calling issues when modify_params=True
     messages = sanitize_messages_for_tool_calling(messages)
 
@@ -2772,7 +2807,9 @@ def anthropic_messages_pt(  # noqa: PLR0915
                         # handle all *_tool_result blocks (tool_search_tool_result,
                         # web_search_tool_result, bash_code_execution_tool_result, etc.)
                         # Pass through as-is since these are Anthropic-native content types
-                        elif m.get("type", "").endswith("_tool_result"):
+                        elif m.get("type", "") == "tool_result" or m.get(
+                            "type", ""
+                        ).endswith("_tool_result"):
                             assistant_content.append(m)  # type: ignore
                 elif (
                     "content" in assistant_content_block
@@ -2869,6 +2906,8 @@ def anthropic_messages_pt(  # noqa: PLR0915
                     content["text"] = content[
                         "text"
                     ].rstrip()  # no trailing whitespace for final assistant message
+
+    _validate_anthropic_tool_result_blocks(new_messages)
 
     return new_messages
 
