@@ -13523,6 +13523,48 @@ def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
     ]
 
 
+def _assert_xai_responses_body_sanitized(custom_body: dict[str, Any]) -> None:
+    _assert_xai_responses_top_level_fields_sanitized(custom_body)
+
+    tools = custom_body["tools"]
+    assert {"type": "code_interpreter"} in tools
+    assert {
+        "type": "web_search",
+        "filters": {"allowed_domains": ["example.com"]},
+    } in tools
+    assert {
+        "type": "x_search",
+        "allowed_x_handles": ["xai"],
+        "from_date": "2026-06-01",
+        "enable_video_understanding": True,
+    } in tools
+
+    for tool in tools:
+        assert "container" not in tool
+        assert "search_context_size" not in tool
+        assert "unsupported_option" not in tool
+
+    metadata = custom_body["litellm_metadata"]
+    assert metadata["xai_responses_request_sanitized"] is True
+    assert metadata["xai_responses_sanitized_removed_params"] == [
+        "instructions",
+        "metadata",
+    ]
+    assert metadata["xai_responses_sanitized_tool_count"] == 3
+    assert metadata["xai_responses_sanitized_tool_types"] == [
+        "code_interpreter",
+        "web_search",
+        "x_search",
+    ]
+
+
+def _assert_xai_responses_top_level_fields_sanitized(
+    custom_body: dict[str, Any],
+) -> None:
+    assert "instructions" not in custom_body
+    assert "metadata" not in custom_body
+
+
 def test_codex_non_grok_keeps_reasoning_input_item():
     request_body = {
         "model": "gpt-5.3-codex",
@@ -15247,6 +15289,61 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert "route:xai_oauth_api" in metadata["tags"]
     assert "route:anthropic_xai_oauth_responses_adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_xai_oauth_responses_adapter_sanitizes_xai_unsupported_fields(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "oa_xai/grok-4.3",
+        "system": "Use project instructions.",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "metadata": {"session_id": "claude-session"},
+        "litellm_metadata": {"session_id": "claude-session"},
+    }
+    success_response = Response(content='{"ok": true}', media_type="application/json")
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+        return_value=success_response,
+    ):
+        response = await _handle_anthropic_xai_oauth_responses_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model="oa_xai/grok-4.3",
+        )
+
+    assert response is success_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["target"] == "https://api.x.ai/v1/responses"
+    assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+    custom_body = call_kwargs["custom_body"]
+    assert custom_body["model"] == "grok-4.3"
+    _assert_xai_responses_top_level_fields_sanitized(custom_body)
+    metadata = custom_body["litellm_metadata"]
+    assert metadata["session_id"] == "claude-session"
+    assert metadata["passthrough_route_family"] == (
+        "anthropic_xai_oauth_responses_adapter"
+    )
+    assert metadata["xai_oauth_public_model"] == "oa_xai/grok-4.3"
 
 
 @pytest.mark.asyncio
@@ -21664,6 +21761,9 @@ class TestOpenAIPassthroughRoute:
         assert call_args["_forward_headers"] is False
         prepared_body = mock_set_body.call_args.args[1]
         assert prepared_body["model"] == upstream_model
+        assert mock_create_route.return_value.await_args.kwargs["custom_body"] == (
+            prepared_body
+        )
         assert "reasoning" not in prepared_body
         assert prepared_body["input"] == [
             body["input"][0],
@@ -21711,6 +21811,85 @@ class TestOpenAIPassthroughRoute:
         assert "custom_llm_provider" not in prepared_body
 
     @pytest.mark.asyncio
+    async def test_openai_passthrough_oa_xai_responses_sanitizes_xai_unsupported_fields(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+        body = {
+            "model": "oa_xai/grok-4.3",
+            "input": "hello",
+            "instructions": "Use project instructions.",
+            "metadata": {"session_id": "codex-session"},
+            "tools": [
+                {
+                    "type": "code_interpreter",
+                    "container": {"type": "auto"},
+                },
+                {
+                    "type": "web_search",
+                    "search_context_size": "high",
+                    "allowed_domains": ["example.com"],
+                },
+                {
+                    "type": "x_search",
+                    "allowed_x_handles": ["xai"],
+                    "from_date": "2026-06-01",
+                    "enable_video_understanding": True,
+                    "unsupported_option": "drop-me",
+                },
+            ],
+            "litellm_metadata": {"trace_id": "trace-123"},
+        }
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer client-litellm-key",
+            "chatgpt-account-id": "acct_123",
+            "originator": "codex_exec",
+        }
+        mock_request.query_params = {}
+        mock_request.scope = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+            new=AsyncMock(return_value="xai-oauth-token"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_create_route.return_value = AsyncMock(return_value={"ok": True})
+
+            result = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert result == {"ok": True}
+        call_args = mock_create_route.call_args.kwargs
+        assert call_args["target"] == "https://api.x.ai/v1/responses"
+        assert call_args["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+        prepared_body = mock_set_body.call_args.args[1]
+        assert prepared_body["model"] == "grok-4.3"
+        assert mock_create_route.return_value.await_args.kwargs["custom_body"] == (
+            prepared_body
+        )
+        _assert_xai_responses_body_sanitized(prepared_body)
+        assert prepared_body["litellm_metadata"]["trace_id"] == "trace-123"
+        assert prepared_body["litellm_metadata"]["xai_oauth_public_model"] == (
+            "oa_xai/grok-4.3"
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
     )
@@ -21740,12 +21919,26 @@ class TestOpenAIPassthroughRoute:
                 },
             ],
             "reasoning": {"effort": "medium"},
+            "instructions": "Use project instructions.",
             "tools": [
                 {"type": "custom", "name": "exec_command"},
                 {"type": "namespace", "name": "functions"},
                 {"type": "tool_search", "name": "tool_search_tool"},
                 {"type": "image_generation"},
-                {"type": "web_search", "external_web_access": True},
+                {"type": "code_interpreter", "container": {"type": "auto"}},
+                {
+                    "type": "web_search",
+                    "external_web_access": True,
+                    "search_context_size": "high",
+                    "allowed_domains": ["example.com"],
+                },
+                {
+                    "type": "x_search",
+                    "allowed_x_handles": ["xai"],
+                    "from_date": "2026-06-01",
+                    "enable_video_understanding": True,
+                    "unsupported_option": "drop-me",
+                },
             ],
             "tool_choice": {"type": "tool_search", "name": "tool_search_tool"},
             "metadata": {"session_id": "codex-grok-session"},
@@ -21805,13 +21998,16 @@ class TestOpenAIPassthroughRoute:
         assert call_args["expected_target_family"] == "xai"
         prepared_body = mock_set_body.call_args.args[1]
         assert prepared_body["model"] == model
+        assert mock_create_route.return_value.await_args.kwargs["custom_body"] == (
+            prepared_body
+        )
         assert "reasoning" not in prepared_body
         assert prepared_body["input"] == [
             body["input"][0],
             body["input"][2],
             body["input"][3],
         ]
-        assert prepared_body["tools"] == [{"type": "web_search"}]
+        _assert_xai_responses_body_sanitized(prepared_body)
         assert "tool_choice" not in prepared_body
         assert "api_key" not in prepared_body
         assert "api_base" not in prepared_body
