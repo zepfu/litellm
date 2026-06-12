@@ -304,6 +304,11 @@ litellm_settings:
   model_group_settings:
     forward_client_headers_to_llm_api:
       - "claude-sonnet-4-6"
+router_settings:
+  num_retries: 2
+  retry_after: 10
+  allowed_fails: 3
+  cooldown_time: 60
 general_settings:
   pass_through_endpoints:
     - path: "/aawm/local/scispacy"

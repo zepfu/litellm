@@ -170,6 +170,12 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - Dev OpenRouter pacing on `:4001` now uses:
   - short hidden retry budget: `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - longer per-model post-failure cooldown: `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
+  - standard `/v1/chat/completions` router pacing in `litellm-dev-config.yaml`:
+    `num_retries=2`, `retry_after=10`, `allowed_fails=3`, and
+    `cooldown_time=60`
+  - no automatic fallback is configured for
+    `openrouter/inclusionai/ling-2.6-flash`; switching that lane to another
+    model requires an explicit model-quality/cost decision
 - Adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may still appear as adapter warning/backoff lines in `litellm-dev`, but they should not emit the generic `pass_through_endpoint(): Exception occured - ...` traceback for the current request path.
 - Preferred Anthropic-adapter model spellings:
   - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`

@@ -112,6 +112,12 @@ Current first-wave adapted coverage:
 - current dev OpenRouter pacing on `:4001`:
   - `AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=12`
   - `AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=300`
+  - standard `/v1/chat/completions` router pacing in `litellm-dev-config.yaml`:
+    `num_retries=2`, `retry_after=10`, `allowed_fails=3`, and
+    `cooldown_time=60`
+  - no automatic fallback is configured for
+    `openrouter/inclusionai/ling-2.6-flash`; switching that lane to another
+    model requires an explicit model-quality/cost decision
   This is meant to preserve short hidden retries for sporadic free-model recovery while preventing repeated manual retests from re-burning the same ~40s retry window on persistently throttled models.
   Adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may still show up as adapter warning/backoff lines, but they should not produce the generic pass-through exception traceback for the current request path.
 
