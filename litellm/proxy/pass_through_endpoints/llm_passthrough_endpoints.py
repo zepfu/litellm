@@ -17290,7 +17290,12 @@ def _prepare_grok_logging_body_for_passthrough(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
     headers = _safe_get_request_headers(request)
-    model_override = _get_case_insensitive_header(headers, "x-grok-model-override")
+    header_model_override = _get_case_insensitive_header(
+        headers,
+        "x-grok-model-override",
+    )
+    body_model_override = normalize_grok_native_oauth_model(request_body.get("model"))
+    model_override = header_model_override or body_model_override
     session_id = _get_grok_native_oauth_session_id(
         request=request,
         request_body=request_body,
@@ -17304,9 +17309,12 @@ def _prepare_grok_logging_body_for_passthrough(
     }
     tags_to_add = ["grok-build", "route:grok_cli_chat_proxy"]
     if model_override:
-        extra_fields["grok_model_override"] = model_override
-        extra_fields["model_group"] = model_override
-        tags_to_add.append(f"grok-model:{model_override}")
+        normalized_model_override = (
+            normalize_grok_native_oauth_model(model_override) or model_override
+        )
+        extra_fields["grok_model_override"] = normalized_model_override
+        extra_fields["model_group"] = normalized_model_override
+        tags_to_add.append(f"grok-model:{normalized_model_override}")
     if session_id:
         extra_fields["session_id"] = session_id
 
@@ -17868,6 +17876,7 @@ async def grok_proxy_route(
     _log_grok_forward_header_compare(endpoint=endpoint, request=request)
 
     custom_body: Optional[dict[str, Any]] = None
+    custom_headers: dict[str, str] = {}
     passthrough_logging_metadata = _get_grok_passthrough_logging_metadata(request)
     if request.method in {"POST", "PUT", "PATCH"}:
         if not raw_body_passthrough:
@@ -17882,6 +17891,17 @@ async def grok_proxy_route(
                 custom_metadata = custom_body.get("litellm_metadata")
                 if isinstance(custom_metadata, dict):
                     passthrough_logging_metadata = dict(custom_metadata)
+                    grok_model_override = normalize_grok_native_oauth_model(
+                        custom_metadata.get("grok_model_override")
+                    )
+                    if (
+                        grok_model_override is not None
+                        and not _get_case_insensitive_header(
+                            _safe_get_request_headers(request),
+                            "x-grok-model-override",
+                        )
+                    ):
+                        custom_headers["x-grok-model-override"] = grok_model_override
 
     query_params = {
         key: value
@@ -17892,7 +17912,7 @@ async def grok_proxy_route(
     return await pass_through_request(
         request=request,
         target=target_url,
-        custom_headers={},
+        custom_headers=custom_headers,
         user_api_key_dict=user_api_key_dict,
         custom_body=custom_body,
         forward_headers=True,
