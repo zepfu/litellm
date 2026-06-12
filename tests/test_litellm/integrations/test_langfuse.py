@@ -13,7 +13,6 @@ from litellm.integrations.langfuse import langfuse as langfuse_module
 from litellm.integrations.langfuse.langfuse import LangFuseLogger
 
 sys.path.insert(0, os.path.abspath("../.."))
-from litellm.integrations.langfuse.langfuse import LangFuseLogger
 
 # Import LangfuseUsageDetails directly from the module where it's defined
 from litellm.types.integrations.langfuse import *
@@ -288,9 +287,7 @@ class TestLangfuseUsageDetails(unittest.TestCase):
             "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
             side_effect=lambda generation_params, **kwargs: generation_params,
             create=True,
-        ) as mock_add_prompt_params, patch.object(
-            self.logger, "_supports_prompt", return_value=True
-        ):
+        ), patch.object(self.logger, "_supports_prompt", return_value=True):
             # Create a mock response object with usage information containing None values
             response_obj = MagicMock()
             response_obj.usage = MagicMock()
@@ -568,6 +565,83 @@ class TestLangfuseUsageDetails(unittest.TestCase):
                     "total_cost": 0.024437,
                 },
             )
+
+    def test_log_langfuse_v2_drops_tool_definition_snapshot_from_generation_metadata(
+        self,
+    ):
+        response_obj = MagicMock()
+        response_obj.id = "resp-tool-def"
+        response_obj.get = (
+            lambda key, default=None: response_obj.id if key == "id" else default
+        )
+        response_obj.usage = MagicMock()
+        response_obj.usage.prompt_tokens = 10
+        response_obj.usage.completion_tokens = 3
+        response_obj.usage.total_tokens = 13
+        response_obj.usage.get = lambda key, default=None: default
+
+        metadata = {
+            "aawm_tool_definition_capture_version": "v1",
+            "aawm_tool_definition_capture_source": "passthrough_request_body",
+            "aawm_tool_definition_count": 1,
+            "aawm_tool_definition_captured_count": 1,
+            "aawm_tool_definition_sources": ["tools"],
+            "aawm_tool_definition_names": ["spawn_agent"],
+            "aawm_tool_definition_types": ["function"],
+            "aawm_tool_definition_snapshot": [
+                {
+                    "source": "tools",
+                    "index": 0,
+                    "name": "spawn_agent",
+                }
+            ],
+            "aawm_tool_definition_snapshot_hash": "hash-tool-definition",
+            "aawm_tool_definition_snapshot_truncated": False,
+            "requester_metadata": {"some_requester_key": "some_requester_value"},
+        }
+        kwargs = {
+            "model": "gpt-5.5",
+            "call_type": "pass_through_endpoint",
+            "custom_llm_provider": "openai",
+            "litellm_params": {"metadata": metadata},
+            "response_cost": 0.01,
+        }
+
+        with patch.object(self.logger, "_supports_prompt", return_value=False):
+            self.logger._log_langfuse_v2(
+                user_id="test-user",
+                metadata=metadata,
+                litellm_params={"metadata": metadata},
+                output=None,
+                start_time=datetime.datetime(2026, 1, 1, 12, 0, 0),
+                end_time=datetime.datetime(2026, 1, 1, 12, 0, 1),
+                kwargs=kwargs,
+                optional_params={},
+                input={"messages": [{"role": "user", "content": "hello"}]},
+                response_obj=response_obj,
+                level="DEFAULT",
+                litellm_call_id="call-tool-def",
+            )
+
+        generation_call = self.mock_langfuse_trace.generation.call_args
+        assert generation_call is not None
+        generation_kwargs = generation_call.kwargs
+
+        self.assertNotIn(
+            "aawm_tool_definition_snapshot",
+            generation_kwargs["metadata"],
+        )
+        self.assertEqual(
+            generation_kwargs["metadata"]["aawm_tool_definition_capture_version"], "v1"
+        )
+        self.assertEqual(
+            generation_kwargs["metadata"]["aawm_tool_definition_sources"], ["tools"]
+        )
+        self.assertEqual(
+            generation_kwargs["metadata"]["aawm_tool_definition_snapshot_hash"],
+            "hash-tool-definition",
+        )
+        self.assertIn("requester_metadata", generation_kwargs["metadata"])
 
     def _build_standard_logging_payload(self, trace_id: Optional[str] = None):
         payload = {
@@ -1138,7 +1212,7 @@ def test_max_langfuse_clients_limit():
         litellm.initialized_langfuse_clients = 0
 
         # First client should succeed
-        logger1 = LangFuseLogger(
+        LangFuseLogger(
             langfuse_public_key="test_key_1",
             langfuse_secret="test_secret_1",
             langfuse_host="https://test1.langfuse.com",
@@ -1146,7 +1220,7 @@ def test_max_langfuse_clients_limit():
         assert litellm.initialized_langfuse_clients == 1
 
         # Second client should succeed
-        logger2 = LangFuseLogger(
+        LangFuseLogger(
             langfuse_public_key="test_key_2",
             langfuse_secret="test_secret_2",
             langfuse_host="https://test2.langfuse.com",
@@ -1155,7 +1229,7 @@ def test_max_langfuse_clients_limit():
 
         # Third client should fail with exception
         with pytest.raises(Exception) as exc_info:
-            logger3 = LangFuseLogger(
+            LangFuseLogger(
                 langfuse_public_key="test_key_3",
                 langfuse_secret="test_secret_3",
                 langfuse_host="https://test3.langfuse.com",

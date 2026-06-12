@@ -5,6 +5,59 @@ This fork stores AAWM-specific routing and observability details in
 maintainer diagnostics and downstream reporting surfaces. They should not be
 treated as public LiteLLM API guarantees.
 
+## Tool Definition Snapshots
+
+Pass-through requests can advertise large tool definitions. LiteLLM records a
+compact per-generation reference in `session_history.metadata` and stores the
+full sanitized snapshot once per session/hash in
+`aawm_tristore.public.session_history_tool_definition_snapshots`.
+
+Compact metadata may include:
+
+- `aawm_tool_definition_capture_version`: capture contract version, currently
+  `v1`.
+- `aawm_tool_definition_capture_source`: source of the captured definitions,
+  currently `passthrough_request_body`.
+- `aawm_tool_definition_count`: total advertised tool/function definitions
+  seen on the request.
+- `aawm_tool_definition_captured_count`: number of sanitized definitions
+  captured in the bounded snapshot.
+- `aawm_tool_definition_sources`: request fields that contributed definitions,
+  such as `["tools"]` or `["functions"]`.
+- `aawm_tool_definition_names`: bounded list of advertised tool/function names.
+- `aawm_tool_definition_types`: bounded list of advertised tool/function types.
+- `aawm_tool_definition_snapshot_hash`: SHA-256 hash of the sanitized snapshot.
+- `aawm_tool_definition_snapshot_truncated`: `true` when the captured snapshot
+  was bounded or any captured definition was truncated/redacted.
+- `aawm_tool_definition_snapshot_storage`: durable lookup table name,
+  `session_history_tool_definition_snapshots`.
+- `aawm_tool_definition_snapshot_storage_key`: currently
+  `session_id,aawm_tool_definition_snapshot_hash`.
+
+The full snapshot is intentionally not stored in every
+`session_history.metadata` row and is stripped from Langfuse generation
+metadata before SDK enqueue. Consumers that need the full sanitized definition
+payload should join:
+
+```sql
+SELECT s.sanitized_snapshot
+FROM public.session_history h
+JOIN public.session_history_tool_definition_snapshots s
+  ON s.session_id = h.session_id
+ AND s.snapshot_hash = h.metadata->>'aawm_tool_definition_snapshot_hash'
+WHERE h.session_id = $1
+  AND h.metadata ? 'aawm_tool_definition_snapshot_hash';
+```
+
+The durable table stores sanitized/redacted definitions only. It should be used
+for drill-down and attribution evidence, not as proof that any tool was called.
+
+Langfuse-only historical backfills cannot reconstruct a full snapshot once
+generation metadata has been compacted. They preserve the compact hash/reference
+fields when present, but the durable table is populated only by runtime
+session-history ingestion or by older Langfuse rows that still carried the
+inline `aawm_tool_definition_snapshot` value.
+
 ## xAI Responses Sanitization
 
 LiteLLM sanitizes xAI Responses request bodies for Codex/OpenAI passthrough and

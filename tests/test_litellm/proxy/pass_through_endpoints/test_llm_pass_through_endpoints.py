@@ -12611,6 +12611,14 @@ class TestClaudePersistedOutputExpansion:
         assert isinstance(
             litellm_metadata["aawm_tool_definition_snapshot_hash"], str
         )
+        assert (
+            litellm_metadata["aawm_tool_definition_snapshot_storage"]
+            == "session_history_tool_definition_snapshots"
+        )
+        assert (
+            litellm_metadata["aawm_tool_definition_snapshot_storage_key"]
+            == "session_id,aawm_tool_definition_snapshot_hash"
+        )
         snapshot = litellm_metadata["aawm_tool_definition_snapshot"]
         assert snapshot == [
             {
@@ -17919,18 +17927,15 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
         in litellm_metadata["tags"]
     )
     assert litellm_metadata["codex_tool_description_patch_count"] == 2
+    assert litellm_metadata["aawm_tool_definition_names"] == ["spawn_agent"]
+    assert (
+        litellm_metadata["aawm_tool_definition_snapshot_storage"]
+        == "session_history_tool_definition_snapshots"
+    )
     assert "aawm-codex-agent-auto" in prepared_body["tools"][0]["description"]
     assert "fork_context=false" in prepared_body["tools"][0]["description"]
     spawn_agent_parameters = prepared_body["tools"][0]["parameters"]
     assert set(spawn_agent_parameters["properties"]) == {
-        "model",
-        "fork_context",
-        "message",
-    }
-    snapshot_parameters = litellm_metadata[
-        "aawm_tool_definition_snapshot"
-    ][0]["parameters"]
-    assert set(snapshot_parameters["properties"]) == {
         "model",
         "fork_context",
         "message",
