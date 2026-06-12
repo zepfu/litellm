@@ -61,6 +61,7 @@ _LANGFUSE_SIZE_AUDIT_THRESHOLD_RATIO = 0.9
 _LANGFUSE_SIZE_AUDIT_METADATA_KEY_LIMIT = 10
 _LANGFUSE_EVENT_FIT_TARGET_RATIO = 0.95
 _LANGFUSE_INPUT_TRUNCATION_MARKER_TYPE = "litellm_langfuse_input_truncated"
+_AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY = "aawm_tool_definition_snapshot"
 _SENSITIVE_METADATA_KEY_FRAGMENTS = (
     "api_key",
     "apikey",
@@ -1192,11 +1193,18 @@ class LangFuseLogger:
                     )
 
             if debug is True or (isinstance(debug, str) and debug.lower() == "true"):
+                metadata_passed_to_litellm = _strip_langfuse_generation_metadata(
+                    metadata
+                )
                 if "metadata" in trace_params:
                     # log the raw_metadata in the trace
-                    trace_params["metadata"]["metadata_passed_to_litellm"] = metadata
+                    trace_params["metadata"]["metadata_passed_to_litellm"] = (
+                        metadata_passed_to_litellm
+                    )
                 else:
-                    trace_params["metadata"] = {"metadata_passed_to_litellm": metadata}
+                    trace_params["metadata"] = {
+                        "metadata_passed_to_litellm": metadata_passed_to_litellm
+                    }
 
             cost = kwargs.get("response_cost", None)
             verbose_logger.debug(f"trace: {cost}")
@@ -1407,7 +1415,9 @@ class LangFuseLogger:
                 "usage": usage,
                 "usage_details": usage_details,
                 "cost_details": cost_details,
-                "metadata": log_requester_metadata(clean_metadata),
+                "metadata": _strip_langfuse_generation_metadata(
+                    log_requester_metadata(clean_metadata)
+                ),
                 "level": level,
                 "version": clean_metadata.pop("version", None),
             }
@@ -1823,3 +1833,19 @@ def log_requester_metadata(clean_metadata: dict):
     returned_metadata.update({"requester_metadata": requester_metadata})
 
     return returned_metadata
+
+
+def _strip_langfuse_generation_metadata(full_metadata: dict) -> dict:
+    """Return Langfuse generation metadata without durable session-history snapshots."""
+
+    if not isinstance(full_metadata, dict):
+        return {}
+
+    if _AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY not in full_metadata:
+        return full_metadata
+
+    return {
+        k: v
+        for k, v in full_metadata.items()
+        if k != _AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY
+    }

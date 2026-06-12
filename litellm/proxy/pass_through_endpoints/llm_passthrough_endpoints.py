@@ -14058,6 +14058,12 @@ def _build_passthrough_tool_definition_metadata(
         ),
         "aawm_tool_definition_snapshot_truncated": truncated
         or available_count > len(snapshot),
+        "aawm_tool_definition_snapshot_storage": (
+            "session_history_tool_definition_snapshots"
+        ),
+        "aawm_tool_definition_snapshot_storage_key": (
+            "session_id,aawm_tool_definition_snapshot_hash"
+        ),
     }
 
 

@@ -474,6 +474,35 @@ _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS session_history_tool_activity_session_created_idx ON public.session_history_tool_activity (session_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS session_history_tool_activity_tool_name_idx ON public.session_history_tool_activity (tool_name)",
 )
+_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY = "aawm_tool_definition_snapshot"
+_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.session_history_tool_definition_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    session_id TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    capture_version TEXT,
+    capture_source TEXT,
+    tool_definition_count INTEGER,
+    captured_count INTEGER,
+    tool_definition_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+    tool_definition_names JSONB NOT NULL DEFAULT '[]'::jsonb,
+    tool_definition_types JSONB NOT NULL DEFAULT '[]'::jsonb,
+    snapshot_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+    sanitized_snapshot JSONB NOT NULL,
+    first_litellm_call_id TEXT,
+    first_trace_id TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (session_id, snapshot_hash)
+)
+"""
+_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS session_history_tool_definition_snapshots_session_created_idx "
+    "ON public.session_history_tool_definition_snapshots (session_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_tool_definition_snapshots_hash_idx "
+    "ON public.session_history_tool_definition_snapshots (snapshot_hash)",
+)
 _AAWM_RATE_LIMIT_OBSERVATIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.rate_limit_observations (
     id BIGSERIAL PRIMARY KEY,
@@ -1645,6 +1674,86 @@ ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
     arguments = COALESCE(session_history_tool_activity.arguments, '{}'::jsonb) || COALESCE(EXCLUDED.arguments, '{}'::jsonb),
     metadata = COALESCE(session_history_tool_activity.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
+_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL = """
+INSERT INTO public.session_history_tool_definition_snapshots (
+    session_id,
+    snapshot_hash,
+    capture_version,
+    capture_source,
+    tool_definition_count,
+    captured_count,
+    tool_definition_sources,
+    tool_definition_names,
+    tool_definition_types,
+    snapshot_truncated,
+    sanitized_snapshot,
+    first_litellm_call_id,
+    first_trace_id,
+    metadata
+) VALUES (
+    $1::text, $2::text, $3::text, $4::text, $5::integer, $6::integer,
+    $7::jsonb, $8::jsonb, $9::jsonb, $10::boolean, $11::jsonb,
+    $12::text, $13::text, $14::jsonb
+)
+ON CONFLICT (session_id, snapshot_hash) DO UPDATE SET
+    updated_at = NOW(),
+    capture_version = COALESCE(
+        NULLIF(EXCLUDED.capture_version, ''),
+        session_history_tool_definition_snapshots.capture_version
+    ),
+    capture_source = COALESCE(
+        NULLIF(EXCLUDED.capture_source, ''),
+        session_history_tool_definition_snapshots.capture_source
+    ),
+    tool_definition_count = GREATEST(
+        COALESCE(session_history_tool_definition_snapshots.tool_definition_count, 0),
+        COALESCE(EXCLUDED.tool_definition_count, 0)
+    ),
+    captured_count = GREATEST(
+        COALESCE(session_history_tool_definition_snapshots.captured_count, 0),
+        COALESCE(EXCLUDED.captured_count, 0)
+    ),
+    tool_definition_sources = CASE
+        WHEN jsonb_array_length(EXCLUDED.tool_definition_sources)
+             > jsonb_array_length(session_history_tool_definition_snapshots.tool_definition_sources)
+            THEN EXCLUDED.tool_definition_sources
+        ELSE session_history_tool_definition_snapshots.tool_definition_sources
+    END,
+    tool_definition_names = CASE
+        WHEN jsonb_array_length(EXCLUDED.tool_definition_names)
+             > jsonb_array_length(session_history_tool_definition_snapshots.tool_definition_names)
+            THEN EXCLUDED.tool_definition_names
+        ELSE session_history_tool_definition_snapshots.tool_definition_names
+    END,
+    tool_definition_types = CASE
+        WHEN jsonb_array_length(EXCLUDED.tool_definition_types)
+             > jsonb_array_length(session_history_tool_definition_snapshots.tool_definition_types)
+            THEN EXCLUDED.tool_definition_types
+        ELSE session_history_tool_definition_snapshots.tool_definition_types
+    END,
+    snapshot_truncated = (
+        session_history_tool_definition_snapshots.snapshot_truncated
+        OR EXCLUDED.snapshot_truncated
+    ),
+    sanitized_snapshot = CASE
+        WHEN jsonb_typeof(session_history_tool_definition_snapshots.sanitized_snapshot) = 'array'
+             AND jsonb_array_length(session_history_tool_definition_snapshots.sanitized_snapshot) > 0
+            THEN session_history_tool_definition_snapshots.sanitized_snapshot
+        ELSE EXCLUDED.sanitized_snapshot
+    END,
+    first_litellm_call_id = COALESCE(
+        NULLIF(session_history_tool_definition_snapshots.first_litellm_call_id, ''),
+        NULLIF(EXCLUDED.first_litellm_call_id, '')
+    ),
+    first_trace_id = COALESCE(
+        NULLIF(session_history_tool_definition_snapshots.first_trace_id, ''),
+        NULLIF(EXCLUDED.first_trace_id, '')
+    ),
+    metadata = (
+        COALESCE(session_history_tool_definition_snapshots.metadata, '{}'::jsonb)
+        || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+    )
+"""
 _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL = """
 WITH candidate AS (
     SELECT
@@ -2104,9 +2213,10 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "aawm_tool_definition_sources",
     "aawm_tool_definition_names",
     "aawm_tool_definition_types",
-    "aawm_tool_definition_snapshot",
     "aawm_tool_definition_snapshot_hash",
     "aawm_tool_definition_snapshot_truncated",
+    "aawm_tool_definition_snapshot_storage",
+    "aawm_tool_definition_snapshot_storage_key",
     "opencode_zen_removed_unsupported_tool_count",
     "opencode_zen_removed_unsupported_tool_types",
     "opencode_zen_removed_unsupported_tool_names",
@@ -12496,9 +12606,23 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_session_tenant_on_record(record)
     _normalize_session_latency_state_on_record(record)
     _normalize_sensitive_config_change_state_on_record(record)
+    _extract_inline_tool_definition_snapshot_from_metadata(record)
     _classify_zero_token_session_history_record(record)
     _sync_session_history_record_metadata(record)
     return record
+
+
+def _extract_inline_tool_definition_snapshot_from_metadata(
+    record: Dict[str, Any],
+) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        return
+
+    snapshot = metadata.pop(_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY, None)
+    if isinstance(snapshot, list) and snapshot:
+        record.setdefault(_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY, snapshot)
+    record["metadata"] = metadata
 
 
 def _normalize_reporting_exclusion_state_on_record(record: Dict[str, Any]) -> None:
@@ -14455,8 +14579,9 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         litellm_call_id=observation.get("id"),
         trace_id=trace_id,
     )
+    tool_definition_snapshot = _tool_definition_snapshot_from_metadata(metadata)
 
-    return _normalize_session_history_record({
+    record = {
         "litellm_call_id": observation.get("id"),
         "session_id": session_id,
         "trace_id": trace_id,
@@ -14527,7 +14652,10 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         "client_version": runtime_identity["client_version"],
         "client_user_agent": runtime_identity["client_user_agent"],
         "metadata": history_metadata,
-    })
+    }
+    if tool_definition_snapshot is not None:
+        record[_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY] = tool_definition_snapshot
+    return _normalize_session_history_record(record)
 
 
 def _derive_langfuse_trace_tags_from_langfuse_trace(
@@ -15377,6 +15505,7 @@ def _build_session_history_record(  # noqa: PLR0915
         litellm_call_id=kwargs.get("litellm_call_id"),
         trace_id=trace_id,
     )
+    tool_definition_snapshot = _tool_definition_snapshot_from_metadata(metadata)
 
     record = {
         "litellm_call_id": kwargs.get("litellm_call_id"),
@@ -15452,6 +15581,8 @@ def _build_session_history_record(  # noqa: PLR0915
             tenant_id=tenant_id,
         ),
     }
+    if tool_definition_snapshot is not None:
+        record[_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY] = tool_definition_snapshot
     _apply_runtime_agent_quality_scores(
         record=record,
         request_body=request_body,
@@ -15720,6 +15851,111 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
             )
         )
     return payloads
+
+
+def _tool_definition_snapshot_from_metadata(
+    metadata: Dict[str, Any],
+) -> Optional[List[Any]]:
+    snapshot = metadata.get(_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY)
+    if isinstance(snapshot, list) and snapshot:
+        return _json_safe_rate_limit_value(snapshot)
+    return None
+
+
+def _build_tool_definition_snapshot_db_payload(
+    record: Dict[str, Any],
+) -> Optional[Tuple[Any, ...]]:
+    record = _strip_postgres_nul_bytes(record)
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    snapshot = record.get(_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY)
+    if not isinstance(snapshot, list) or not snapshot:
+        snapshot = metadata.get(_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY)
+    if not isinstance(snapshot, list) or not snapshot:
+        return None
+
+    session_id = _clean_non_empty_string(record.get("session_id"))
+    snapshot_hash = _clean_non_empty_string(
+        record.get("aawm_tool_definition_snapshot_hash")
+        or metadata.get("aawm_tool_definition_snapshot_hash")
+    )
+    if not session_id or not snapshot_hash:
+        return None
+
+    durable_metadata = {
+        "storage": "session_history_tool_definition_snapshots",
+        "storage_key": "session_id,aawm_tool_definition_snapshot_hash",
+        "provider": record.get("provider"),
+        "model": record.get("model"),
+        "model_group": record.get("model_group"),
+        "repository": record.get("repository"),
+    }
+    sources = metadata.get("aawm_tool_definition_sources")
+    names = metadata.get("aawm_tool_definition_names")
+    tool_types = metadata.get("aawm_tool_definition_types")
+    return (
+        session_id,
+        snapshot_hash,
+        _clean_non_empty_string(
+            metadata.get("aawm_tool_definition_capture_version")
+        ),
+        _clean_non_empty_string(metadata.get("aawm_tool_definition_capture_source")),
+        _safe_int(metadata.get("aawm_tool_definition_count")),
+        _safe_int(metadata.get("aawm_tool_definition_captured_count")),
+        json.dumps(
+            _json_safe_rate_limit_value(sources if isinstance(sources, list) else [])
+        ),
+        json.dumps(
+            _json_safe_rate_limit_value(names if isinstance(names, list) else [])
+        ),
+        json.dumps(
+            _json_safe_rate_limit_value(
+                tool_types if isinstance(tool_types, list) else []
+            )
+        ),
+        bool(metadata.get("aawm_tool_definition_snapshot_truncated")),
+        json.dumps(_json_safe_rate_limit_value(snapshot)),
+        _clean_non_empty_string(record.get("litellm_call_id")),
+        _clean_non_empty_string(record.get("trace_id")),
+        json.dumps(_json_safe_rate_limit_value(durable_metadata)),
+    )
+
+
+def _build_tool_definition_snapshot_db_payloads(
+    records: List[Dict[str, Any]],
+) -> List[Tuple[Any, ...]]:
+    payloads_by_key: Dict[Tuple[str, str], Tuple[Any, ...]] = {}
+    for record in records:
+        payload = _build_tool_definition_snapshot_db_payload(record)
+        if payload is None:
+            continue
+        key = (str(payload[0]), str(payload[1]))
+        payloads_by_key.setdefault(key, payload)
+    return list(payloads_by_key.values())
+
+
+async def _persist_tool_definition_snapshots_best_effort(
+    conn: Any,
+    records: List[Dict[str, Any]],
+) -> None:
+    snapshot_payloads = _build_tool_definition_snapshot_db_payloads(records)
+    if not snapshot_payloads:
+        return
+
+    try:
+        await conn.executemany(
+            _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
+            snapshot_payloads,
+        )
+    except Exception as exc:
+        verbose_logger.exception(
+            "AawmAgentIdentity: failed to persist best-effort tool-definition "
+            "snapshots for %d session_history records: %s",
+            len(records),
+            _format_exception_for_warning(exc),
+        )
 
 
 async def _lookup_claude_auto_review_parent_identity(
@@ -16439,6 +16675,7 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
                 )
 
         history_records = [] if record.get("_skip_session_history") else [record]
+        await _persist_tool_definition_snapshots_best_effort(conn, history_records)
         await _persist_rate_limit_observations_best_effort(
             conn,
             [record],
@@ -16482,6 +16719,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             await conn.executemany(
                 _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
             )
+        await _persist_tool_definition_snapshots_best_effort(conn, history_records)
         await _persist_rate_limit_observations_best_effort(
             conn,
             records,
