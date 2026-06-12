@@ -8277,6 +8277,33 @@ def test_alias_routing_audit_schema_is_migration_owned() -> None:
     assert "aawm_alias_routing_audit" not in source
 
 
+def test_tool_definition_snapshot_schema_is_migration_owned() -> None:
+    source = inspect.getsource(aawm_agent_identity._ensure_session_history_schema)
+    table_sql = getattr(
+        aawm_agent_identity,
+        "_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_TABLE_SQL",
+    )
+    index_statements = getattr(
+        aawm_agent_identity,
+        "_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_INDEX_STATEMENTS",
+    )
+
+    assert (
+        "CREATE TABLE IF NOT EXISTS "
+        "public.session_history_tool_definition_snapshots"
+    ) in table_sql
+    assert "session_id TEXT NOT NULL" in table_sql
+    assert "snapshot_hash TEXT NOT NULL" in table_sql
+    assert "sanitized_snapshot JSONB NOT NULL" in table_sql
+    assert "UNIQUE (session_id, snapshot_hash)" in table_sql
+    assert any(
+        "session_history_tool_definition_snapshots_session_created_idx"
+        in statement
+        for statement in index_statements
+    )
+    assert "session_history_tool_definition_snapshots" not in source
+
+
 def test_build_session_history_record_preserves_alias_routing_audit_metadata() -> None:
     kwargs = _base_kwargs()
     kwargs["litellm_call_id"] = "call-alias-audit"
@@ -8382,6 +8409,54 @@ def test_build_alias_routing_audit_db_payload_includes_provider_timeout_state() 
     assert metadata["session_history_repository"] == "litellm"
 
 
+def test_build_tool_definition_snapshot_db_payloads_deduplicates_session_hash() -> None:
+    snapshot = [
+        {
+            "source": "tools",
+            "index": 0,
+            "name": "spawn_agent",
+            "parameters": {"type": "object"},
+        }
+    ]
+    base_record = {
+        "session_id": "session-tool-snapshot",
+        "trace_id": "trace-tool-snapshot",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "model_group": "gpt-5.5",
+        "repository": "litellm",
+        "metadata": {
+            "aawm_tool_definition_capture_version": "v1",
+            "aawm_tool_definition_capture_source": "passthrough_request_body",
+            "aawm_tool_definition_count": 1,
+            "aawm_tool_definition_captured_count": 1,
+            "aawm_tool_definition_sources": ["tools"],
+            "aawm_tool_definition_names": ["spawn_agent"],
+            "aawm_tool_definition_types": ["function"],
+            "aawm_tool_definition_snapshot_hash": "hash-snapshot",
+            "aawm_tool_definition_snapshot_truncated": False,
+        },
+        "aawm_tool_definition_snapshot": snapshot,
+    }
+    payloads = aawm_agent_identity._build_tool_definition_snapshot_db_payloads(
+        [
+            {**base_record, "litellm_call_id": "call-tool-snapshot-1"},
+            {**base_record, "litellm_call_id": "call-tool-snapshot-2"},
+        ]
+    )
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload[0] == "session-tool-snapshot"
+    assert payload[1] == "hash-snapshot"
+    assert payload[2] == "v1"
+    assert payload[4] == 1
+    assert json.loads(payload[6]) == ["tools"]
+    assert json.loads(payload[7]) == ["spawn_agent"]
+    assert json.loads(payload[10]) == snapshot
+    assert payload[11] == "call-tool-snapshot-1"
+
+
 @pytest.mark.asyncio
 async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> None:
     conn = AsyncMock()
@@ -8416,6 +8491,51 @@ async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> Non
     assert len(payloads) == 1
     assert payloads[0][6] == "aawm-code-anthropic"
     assert payloads[0][9] == "antigravity"
+
+
+@pytest.mark.asyncio
+async def test_persist_tool_definition_snapshots_best_effort_uses_executemany() -> None:
+    conn = AsyncMock()
+    record = {
+        "litellm_call_id": "call-tool-snapshot",
+        "session_id": "session-tool-snapshot",
+        "trace_id": "trace-tool-snapshot",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "model_group": "gpt-5.5",
+        "metadata": {
+            "aawm_tool_definition_capture_version": "v1",
+            "aawm_tool_definition_capture_source": "passthrough_request_body",
+            "aawm_tool_definition_count": 1,
+            "aawm_tool_definition_captured_count": 1,
+            "aawm_tool_definition_sources": ["tools"],
+            "aawm_tool_definition_names": ["spawn_agent"],
+            "aawm_tool_definition_types": ["function"],
+            "aawm_tool_definition_snapshot_hash": "hash-tool-snapshot",
+            "aawm_tool_definition_snapshot_truncated": False,
+        },
+        "aawm_tool_definition_snapshot": [
+            {"source": "tools", "index": 0, "name": "spawn_agent"}
+        ],
+    }
+
+    await aawm_agent_identity._persist_tool_definition_snapshots_best_effort(
+        conn,
+        [record, {**record, "litellm_call_id": "call-tool-snapshot-duplicate"}],
+    )
+
+    conn.executemany.assert_awaited_once()
+    sql, payloads = conn.executemany.await_args.args
+    assert (
+        sql
+        == aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL
+    )
+    assert len(payloads) == 1
+    assert payloads[0][0] == "session-tool-snapshot"
+    assert payloads[0][1] == "hash-tool-snapshot"
+    assert json.loads(payloads[0][10]) == [
+        {"source": "tools", "index": 0, "name": "spawn_agent"}
+    ]
 
 
 def test_provider_status_observations_schema_includes_icmp_fields() -> None:
@@ -10996,12 +11116,20 @@ def test_build_session_history_record_from_langfuse_trace_observation_preserves_
     assert record["metadata"]["aawm_tool_definition_captured_count"] == 1
     assert record["metadata"]["aawm_tool_definition_names"] == ["spawn_agent"]
     assert record["metadata"]["aawm_tool_definition_types"] == ["function"]
-    assert record["metadata"]["aawm_tool_definition_snapshot"] == tool_snapshot
+    assert "aawm_tool_definition_snapshot" not in record["metadata"]
+    assert record["aawm_tool_definition_snapshot"] == tool_snapshot
     assert (
         record["metadata"]["aawm_tool_definition_snapshot_hash"]
         == "hash-tool-definition"
     )
     assert record["metadata"]["aawm_tool_definition_snapshot_truncated"] is False
+    snapshot_payload = (
+        aawm_agent_identity._build_tool_definition_snapshot_db_payload(record)
+    )
+    assert snapshot_payload is not None
+    assert snapshot_payload[0] == "session-tool-definition"
+    assert snapshot_payload[1] == "hash-tool-definition"
+    assert json.loads(snapshot_payload[10]) == tool_snapshot
     assert "secret-token" not in json.dumps(record["metadata"])
 
 
