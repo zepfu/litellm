@@ -36,6 +36,11 @@ Related route metadata distinguishes Codex and native Grok traffic:
 - Managed `oa_xai/*` traffic should still be reported as provider `xai` while
   preserving the public `oa_xai/*` model/model_group label.
 
+Native Grok passthrough session identity prefers an explicit
+`x-grok-session-id` header. If that header is absent, LiteLLM uses the native
+`x-grok-conv-id` header as the persisted `session_id` so usage-bearing Grok TUI
+rows remain reportable under a stable conversation identifier.
+
 Sanitization metadata proves request adaptation only. It does not prove tool
 execution, model tool-use quality, or upstream success by itself; combine it
 with status, token, cost, and error fields when building reports.
