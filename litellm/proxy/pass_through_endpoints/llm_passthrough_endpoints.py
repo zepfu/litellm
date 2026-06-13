@@ -19813,6 +19813,7 @@ async def _perform_anthropic_native_passthrough_request(
     user_api_key_dict: UserAPIKeyAuth,
     target_url: str,
     custom_headers: dict[str, Any],
+    blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
 ) -> Response:
     is_streaming_request = await is_streaming_request_fn(request)
     endpoint_func = create_pass_through_route(
@@ -19821,6 +19822,7 @@ async def _perform_anthropic_native_passthrough_request(
         custom_headers=custom_headers,
         _forward_headers=True,
         is_streaming_request=is_streaming_request,
+        blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
     )
     received_value = await endpoint_func(
         request,
@@ -19828,6 +19830,98 @@ async def _perform_anthropic_native_passthrough_request(
         user_api_key_dict,
     )
     return received_value
+
+
+_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX = "[1m]"
+_ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
+_ANTHROPIC_BETA_HEADER_NAME = "anthropic-beta"
+_ANTHROPIC_BETA_XPASS_HEADER_NAME = f"x-pass-{_ANTHROPIC_BETA_HEADER_NAME}"
+
+
+def _get_header_value_case_insensitive(
+    headers: Any,
+    header_name: str,
+) -> Optional[str]:
+    header_value = headers.get(header_name)
+    if header_value is not None:
+        return str(header_value)
+
+    lowered_header_name = header_name.lower()
+    for candidate_name, candidate_value in headers.items():
+        if str(candidate_name).lower() == lowered_header_name:
+            return str(candidate_value)
+    return None
+
+
+def _append_anthropic_beta_header_value(
+    headers: dict[str, Any],
+    beta_value: str,
+) -> dict[str, Any]:
+    existing_header_name = next(
+        (
+            header_name
+            for header_name in headers
+            if str(header_name).lower() == _ANTHROPIC_BETA_HEADER_NAME
+        ),
+        None,
+    )
+    existing_beta = (
+        headers.pop(existing_header_name)
+        if existing_header_name is not None
+        else None
+    )
+    if existing_beta is None:
+        headers[_ANTHROPIC_BETA_HEADER_NAME] = beta_value
+        return headers
+
+    existing_values = [
+        value.strip()
+        for value in str(existing_beta).split(",")
+        if value.strip()
+    ]
+    if beta_value not in existing_values:
+        existing_values.append(beta_value)
+    headers[_ANTHROPIC_BETA_HEADER_NAME] = ", ".join(existing_values)
+    return headers
+
+
+def _prepare_anthropic_context_1m_native_passthrough(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+    custom_headers: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    model = request_body.get("model")
+    if not isinstance(model, str):
+        return request_body, custom_headers, False
+
+    stripped_model = model.strip()
+    if not stripped_model.lower().endswith(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX):
+        return request_body, custom_headers, False
+
+    base_model = stripped_model[: -len(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX)].strip()
+    if not base_model:
+        return request_body, custom_headers, False
+
+    updated_body = dict(request_body)
+    updated_body["model"] = base_model
+
+    updated_headers = dict(custom_headers)
+    for beta_header_name in (
+        _ANTHROPIC_BETA_HEADER_NAME,
+        _ANTHROPIC_BETA_XPASS_HEADER_NAME,
+    ):
+        request_beta = _get_header_value_case_insensitive(
+            request.headers,
+            beta_header_name,
+        )
+        if isinstance(request_beta, str) and request_beta.strip():
+            _append_anthropic_beta_header_value(updated_headers, request_beta)
+    _append_anthropic_beta_header_value(
+        updated_headers,
+        _ANTHROPIC_CONTEXT_1M_BETA_HEADER,
+    )
+    return updated_body, updated_headers, True
 
 
 @router.api_route(
@@ -19870,6 +19964,7 @@ async def anthropic_proxy_route(
     ):
         custom_headers["x-api-key"] = "{}".format(anthropic_api_key)
 
+    blocked_pass_through_prefixed_headers: Optional[list[str]] = None
     if request.method == "POST":
         request_body = await get_request_body(request)
         (
@@ -20045,6 +20140,21 @@ async def anthropic_proxy_route(
                 adapter_model=openrouter_adapter_model,
             )
 
+        (
+            prepared_request_body,
+            custom_headers,
+            normalized_context_1m_model,
+        ) = (
+            _prepare_anthropic_context_1m_native_passthrough(
+                request=request,
+                request_body=prepared_request_body,
+                custom_headers=custom_headers,
+            )
+        )
+        if normalized_context_1m_model:
+            blocked_pass_through_prefixed_headers = [_ANTHROPIC_BETA_HEADER_NAME]
+            _safe_set_request_parsed_body(request, prepared_request_body)
+
     return await _perform_anthropic_native_passthrough_request(
         endpoint=endpoint,
         request=request,
@@ -20052,6 +20162,7 @@ async def anthropic_proxy_route(
         user_api_key_dict=user_api_key_dict,
         target_url=str(updated_url),
         custom_headers=custom_headers,
+        blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
     )
 
 

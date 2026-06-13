@@ -42,6 +42,7 @@ class BasePassthroughUtils:
         forward_headers: Optional[bool] = False,
         allowed_forward_headers: Optional[list[str]] = None,
         allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
+        blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     ):
         """
         Helper to forward headers from original request.
@@ -60,6 +61,11 @@ class BasePassthroughUtils:
             if allowed_pass_through_prefixed_headers is not None
             else None
         )
+        normalized_blocked_pass_through_prefixed_headers = (
+            {header.lower() for header in blocked_pass_through_prefixed_headers}
+            if blocked_pass_through_prefixed_headers is not None
+            else set()
+        )
         original_request_headers = dict(request_headers)
 
         if forward_headers is True:
@@ -74,6 +80,13 @@ class BasePassthroughUtils:
                     if header_name.lower() in normalized_allowed_forward_headers
                 }
 
+            custom_header_names = {str(header_name).lower() for header_name in headers}
+            request_headers = {
+                header_name: header_value
+                for header_name, header_value in request_headers.items()
+                if str(header_name).lower() not in custom_header_names
+            }
+
             # Combine request headers with custom headers
             headers = {**request_headers, **headers}
 
@@ -82,6 +95,11 @@ class BasePassthroughUtils:
             if header_name.lower().startswith(PASS_THROUGH_HEADER_PREFIX):
                 # Strip the 'x-pass-' prefix to get the actual header name
                 actual_header_name = header_name[len(PASS_THROUGH_HEADER_PREFIX) :]
+                if (
+                    actual_header_name.lower()
+                    in normalized_blocked_pass_through_prefixed_headers
+                ):
+                    continue
                 if (
                     normalized_allowed_pass_through_prefixed_headers is not None
                     and actual_header_name.lower()

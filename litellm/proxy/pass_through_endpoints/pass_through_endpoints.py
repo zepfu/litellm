@@ -1348,6 +1348,7 @@ async def pass_through_request(  # noqa: PLR0915
     expected_target_family: Optional[str] = None,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
+    blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
@@ -1414,6 +1415,7 @@ async def pass_through_request(  # noqa: PLR0915
             forward_headers=forward_headers,
             allowed_forward_headers=allowed_forward_headers,
             allowed_pass_through_prefixed_headers=allowed_pass_through_prefixed_headers,
+            blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
         )
 
         # Apply default query parameters if provided, regardless of merge_query_params setting
@@ -2076,6 +2078,7 @@ def create_pass_through_route(
     expected_target_family: Optional[str] = None,
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
+    blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
 ):
     # check if target is an adapter.py or a url
     from litellm._uuid import uuid
@@ -2155,6 +2158,7 @@ def create_pass_through_route(
                 "expected_target_family": expected_target_family,
                 "allowed_forward_headers": allowed_forward_headers,
                 "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
+                "blocked_pass_through_prefixed_headers": blocked_pass_through_prefixed_headers,
             }
 
             if passthrough_params is not None:
@@ -2186,6 +2190,10 @@ def create_pass_through_route(
             param_allowed_pass_through_prefixed_headers = target_params.get(
                 "allowed_pass_through_prefixed_headers",
                 allowed_pass_through_prefixed_headers,
+            )
+            param_blocked_pass_through_prefixed_headers = target_params.get(
+                "blocked_pass_through_prefixed_headers",
+                blocked_pass_through_prefixed_headers,
             )
 
             # Construct the full target URL with subpath if needed
@@ -2238,6 +2246,9 @@ def create_pass_through_route(
                 ),
                 allowed_pass_through_prefixed_headers=cast(
                     Optional[list[str]], param_allowed_pass_through_prefixed_headers
+                ),
+                blocked_pass_through_prefixed_headers=cast(
+                    Optional[list[str]], param_blocked_pass_through_prefixed_headers
                 ),
             )
 
