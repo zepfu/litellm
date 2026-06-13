@@ -15762,6 +15762,180 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_tool_bearing_fails_closed_after_antigravity_429(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["tools"] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "description": "Run shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    body["tool_choice"] = {"type": "function", "name": "Bash"}
+    antigravity_error = ProxyException(
+        message="antigravity quota exhausted",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    antigravity_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ) as mock_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
+        new=AsyncMock(),
+    ) as mock_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body",
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    mock_antigravity.assert_awaited_once()
+    mock_spark.assert_not_called()
+    mock_native.assert_not_called()
+    assert exc_info.value.status_code == 429
+    detail = exc_info.value.detail
+    assert detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_no_tool_compatible_candidate"
+    )
+    assert detail["redispatch_model"] == "aawm-code-anthropic"
+    assert detail["redispatch_reason"] == "no_tool_compatible_candidate"
+    assert detail["required_provider"] == "antigravity"
+    candidate_by_provider_model = {
+        (candidate["provider"], candidate["model"]): candidate
+        for candidate in detail["candidates"]
+    }
+    assert (
+        candidate_by_provider_model[("antigravity", "claude-sonnet-4-6")]["reason"]
+        == "cooldown"
+    )
+    assert candidate_by_provider_model[("openai", "gpt-5.3-codex-spark")][
+        "reason"
+    ] == (
+        "tool_schema_incompatible"
+    )
+    assert candidate_by_provider_model[("openai", "gpt-5.3-codex-spark")][
+        "route_family"
+    ] == (
+        "anthropic_openai_responses_adapter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_tool_bearing_fails_closed_after_antigravity_auth_unavailable(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["tools"] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "description": "Run shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    body["tool_choice"] = {"type": "function", "name": "Bash"}
+    antigravity_auth_error = HTTPException(
+        status_code=500,
+        detail=(
+            "Failed to get OAuth token: error getting token source from auth "
+            "provider: You are not logged into Antigravity."
+        ),
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
+        new=AsyncMock(side_effect=antigravity_auth_error),
+    ) as mock_prepare_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
+        new=AsyncMock(),
+    ) as mock_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body",
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    mock_prepare_antigravity.assert_awaited_once()
+    mock_spark.assert_not_called()
+    mock_native.assert_not_called()
+    assert exc_info.value.status_code == 429
+    detail = exc_info.value.detail
+    assert detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_no_tool_compatible_candidate"
+    )
+    candidate_by_provider_model = {
+        (candidate["provider"], candidate["model"]): candidate
+        for candidate in detail["candidates"]
+    }
+    assert (
+        candidate_by_provider_model[("antigravity", "claude-sonnet-4-6")]["reason"]
+        == "cooldown"
+    )
+    assert candidate_by_provider_model[("openai", "gpt-5.3-codex-spark")][
+        "reason"
+    ] == (
+        "tool_schema_incompatible"
+    )
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_code_falls_back_after_antigravity_not_logged_in(
     monkeypatch,
 ):
