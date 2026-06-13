@@ -80,6 +80,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _google_code_assist_prime_until_monotonic_by_key,
     _google_oauth_access_token_cache,
     _get_google_adapter_semaphore,
+    _insert_google_code_assist_missing_claude_function_call_pairs,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
     _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME,
     _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION,
@@ -617,6 +618,48 @@ async def test_prepare_anthropic_request_body_repairs_tool_use_id_from_tool_resu
                     {
                         "type": "tool_result",
                         "tool_use_id": "toolu_read_1",
+                        "content": "alpha",
+                    }
+                ],
+            },
+        ],
+    }
+
+    updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+        mock_request,
+        request_body,
+    )
+
+    assert updated_body["messages"][1]["content"][1]["id"] == "toolu_read_1"
+    assert updated_body["messages"][2]["content"][0]["tool_use_id"] == "toolu_read_1"
+
+
+@pytest.mark.asyncio
+async def test_prepare_anthropic_request_body_repairs_tool_result_id_from_tool_use():
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+    request_body = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "Read a file."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I will read it."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_read_1",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/a.txt"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
                         "content": "alpha",
                     }
                 ],
@@ -3274,7 +3317,7 @@ class TestGoogleAdapterRequestShapePolicy:
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {"session_id": "anthropic-claude-repaired-tool-id"}
 
-        wrapped_request, _, completion_messages, _, _, _ = await _build_google_code_assist_request_from_completion_kwargs(
+        wrapped_request, _, completion_messages, _, _, changes = await _build_google_code_assist_request_from_completion_kwargs(
             completion_kwargs={
                 "max_tokens": 32,
                 "messages": [
@@ -3327,6 +3370,10 @@ class TestGoogleAdapterRequestShapePolicy:
         function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
 
         assert completion_messages[1]["tool_calls"][0]["id"] == "toolu_read_1"
+        assert (
+            changes["google_adapter_repaired_anthropic_native_tool_use_id_count"]
+            == 1
+        )
         assert function_calls == [
             {
                 "name": "read_file",
@@ -3334,6 +3381,461 @@ class TestGoogleAdapterRequestShapePolicy:
                 "id": "toolu_read_1",
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_codex_google_code_assist_builder_repairs_openai_tool_call_id_for_claude(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-openai-tool-call-id"}
+
+        wrapped_request, _, completion_messages, _, _, changes = (
+            await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 32,
+                    "messages": [
+                        {"role": "user", "content": "Run a command."},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "exec_command",
+                                        "arguments": "{\"cmd\":\"pwd\"}",
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_exec",
+                            "content": "done",
+                        },
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "description": "run a command",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"cmd": {"type": "string"}},
+                                    "required": ["cmd"],
+                                },
+                            },
+                        }
+                    ],
+                },
+                adapter_model="claude-sonnet-4-6",
+                project="test-project",
+                request=mock_request,
+                completion_kwargs_are_openai_chat=True,
+            )
+        )
+
+        parts = [
+            part
+            for content in wrapped_request["request"]["contents"]
+            for part in content.get("parts", [])
+            if isinstance(part, dict)
+        ]
+        function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
+        function_responses = [
+            part["functionResponse"] for part in parts if "functionResponse" in part
+        ]
+
+        assistant_messages = [
+            message
+            for message in completion_messages
+            if message.get("role") == "assistant"
+        ]
+        assert assistant_messages[0]["tool_calls"][0]["id"] == "call_exec"
+        assert function_calls == [
+            {"name": "exec_command", "args": {"cmd": "pwd"}, "id": "call_exec"}
+        ]
+        assert function_responses == [
+            {
+                "id": "call_exec",
+                "name": "exec_command",
+                "response": {"output": "done", "tool_use_id": "call_exec"},
+            }
+        ]
+        assert changes["google_adapter_codex_repaired_openai_tool_call_id_count"] == 1
+        assert changes["google_adapter_annotated_claude_tool_response_id_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_codex_google_code_assist_builder_inserts_cached_tool_call_for_claude_tool_result(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-leading-tool-result"}
+        _codex_google_code_assist_tool_call_name_cache.clear()
+        _codex_google_code_assist_tool_call_arguments_cache.clear()
+        _remember_codex_google_code_assist_tool_call_name(
+            "toolu_vrtx_exec",
+            "exec_command",
+            "{\"cmd\":\"pwd\"}",
+        )
+
+        try:
+            wrapped_request, _, completion_messages, _, _, changes = (
+                await _build_google_code_assist_request_from_completion_kwargs(
+                    completion_kwargs={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 32,
+                        "messages": [
+                            {"role": "user", "content": "Run a command."},
+                            {
+                                "role": "tool",
+                                "tool_call_id": "toolu_vrtx_exec",
+                                "content": "done",
+                            },
+                        ],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "exec_command",
+                                    "description": "run a command",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {"cmd": {"type": "string"}},
+                                        "required": ["cmd"],
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    adapter_model="claude-sonnet-4-6",
+                    project="test-project",
+                    request=mock_request,
+                    completion_kwargs_are_openai_chat=True,
+                )
+            )
+        finally:
+            _codex_google_code_assist_tool_call_name_cache.clear()
+            _codex_google_code_assist_tool_call_arguments_cache.clear()
+
+        parts_by_content = [
+            content.get("parts", [])
+            for content in wrapped_request["request"]["contents"]
+        ]
+        function_calls = [
+            part["functionCall"]
+            for parts in parts_by_content
+            for part in parts
+            if "functionCall" in part
+        ]
+        function_responses = [
+            part["functionResponse"]
+            for parts in parts_by_content
+            for part in parts
+            if "functionResponse" in part
+        ]
+        assistant_messages = [
+            message
+            for message in completion_messages
+            if message.get("role") == "assistant"
+        ]
+
+        assert assistant_messages[0]["tool_calls"][0]["id"] == "toolu_vrtx_exec"
+        assert function_calls == [
+            {
+                "name": "exec_command",
+                "args": {"cmd": "pwd"},
+                "id": "toolu_vrtx_exec",
+            }
+        ]
+        assert function_responses == [
+            {
+                "id": "toolu_vrtx_exec",
+                "name": "exec_command",
+                "response": {"output": "done", "tool_use_id": "toolu_vrtx_exec"},
+            }
+        ]
+        assert changes["google_adapter_codex_inserted_missing_tool_call_count"] == 1
+        assert changes["google_adapter_annotated_claude_tool_response_id_count"] == 1
+
+    def test_google_code_assist_native_guard_inserts_claude_function_call_pair(
+        self,
+    ):
+        google_request_dict = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": f"context chunk {index}"} for index in range(7)],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "id": "toolu_vrtx_exec",
+                                "name": "exec_command",
+                                "response": {
+                                    "output": "done",
+                                    "tool_use_id": "toolu_vrtx_exec",
+                                },
+                            }
+                        }
+                    ],
+                },
+            ]
+        }
+        _codex_google_code_assist_tool_call_arguments_cache.clear()
+        _remember_codex_google_code_assist_tool_call_name(
+            "toolu_vrtx_exec",
+            "exec_command",
+            "{\"cmd\":\"pwd\"}",
+        )
+
+        try:
+            changes = _insert_google_code_assist_missing_claude_function_call_pairs(
+                google_request_dict,
+                google_model="claude-sonnet-4-6",
+            )
+        finally:
+            _codex_google_code_assist_tool_call_name_cache.clear()
+            _codex_google_code_assist_tool_call_arguments_cache.clear()
+
+        assert changes == {
+            "google_adapter_inserted_claude_function_call_pair_count": 1
+        }
+        assert [content["role"] for content in google_request_dict["contents"]] == [
+            "user",
+            "model",
+            "user",
+        ]
+        assert google_request_dict["contents"][1]["parts"] == [
+            {
+                "functionCall": {
+                    "name": "exec_command",
+                    "args": {"cmd": "pwd"},
+                    "id": "toolu_vrtx_exec",
+                }
+            }
+        ]
+
+    def test_google_code_assist_window_policy_preserves_claude_function_pair(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_TEXT_CHARS", "1000")
+        payload = {
+            "model": "claude-sonnet-4-6",
+            "request": {
+                "session_id": "claude-tool-pair-window",
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": "x" * 1500}],
+                    },
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "exec_command",
+                                    "args": {"cmd": "pwd"},
+                                    "id": "toolu_vrtx_exec",
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "id": "toolu_vrtx_exec",
+                                    "name": "exec_command",
+                                    "response": {
+                                        "output": "done",
+                                        "tool_use_id": "toolu_vrtx_exec",
+                                    },
+                                }
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+
+        _apply_google_adapter_request_shape_policy(payload)
+
+        contents = payload["request"]["contents"]
+        assert [content["role"] for content in contents] == ["user", "model", "user"]
+        assert contents[1]["parts"][0]["functionCall"]["id"] == "toolu_vrtx_exec"
+        assert contents[2]["parts"][0]["functionResponse"]["id"] == "toolu_vrtx_exec"
+
+    def test_google_code_assist_window_policy_caps_many_function_pairs(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW", "4")
+        payload = {
+            "model": "claude-sonnet-4-6",
+            "request": {
+                "session_id": "claude-tool-pair-overflow",
+                "contents": [
+                    {"role": "user", "parts": [{"text": "start"}]},
+                    *[
+                        {
+                            "role": "model",
+                            "parts": [
+                                {
+                                    "functionCall": {
+                                        "name": "exec_command",
+                                        "args": {"cmd": f"echo {index}"},
+                                        "id": f"toolu_pair_{index}",
+                                    },
+                                }
+                            ],
+                        }
+                        if position == "call"
+                        else {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "functionResponse": {
+                                        "id": f"toolu_pair_{index}",
+                                        "name": "exec_command",
+                                        "response": {
+                                            "output": str(index),
+                                            "tool_use_id": f"toolu_pair_{index}",
+                                        },
+                                    }
+                                }
+                            ],
+                        }
+                        for index in range(3)
+                        for position in ("call", "response")
+                    ],
+                ],
+            },
+        }
+
+        _apply_google_adapter_request_shape_policy(payload)
+
+        contents = payload["request"]["contents"]
+        seen_function_call_ids = set()
+        assert len(contents) <= 4
+        for content in contents:
+            for part in content.get("parts", []):
+                function_call = part.get("functionCall")
+                if isinstance(function_call, dict):
+                    seen_function_call_ids.add(function_call["id"])
+                    continue
+                function_response = part.get("functionResponse")
+                if isinstance(function_response, dict):
+                    assert function_response["id"] in seen_function_call_ids
+        assert contents[-2]["parts"][0]["functionCall"]["id"] == "toolu_pair_2"
+        assert contents[-1]["parts"][0]["functionResponse"]["id"] == "toolu_pair_2"
+
+    @pytest.mark.asyncio
+    async def test_codex_google_code_assist_builder_normalizes_anthropic_tool_replay_for_claude(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-anthropic-tool-replay"}
+
+        wrapped_request, _, completion_messages, _, _, changes = (
+            await _build_google_code_assist_request_from_completion_kwargs(
+                completion_kwargs={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 32,
+                    "messages": [
+                        {"role": "user", "content": "Read a file."},
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": "I will read it."},
+                                {
+                                    "type": "tool_use",
+                                    "name": "Read",
+                                    "input": {"file_path": "/tmp/a.txt"},
+                                },
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_read_1",
+                                    "content": "alpha",
+                                }
+                            ],
+                        },
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "description": "read a file",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file_path": {"type": "string"}
+                                    },
+                                    "required": ["file_path"],
+                                },
+                            },
+                        }
+                    ],
+                },
+                adapter_model="claude-sonnet-4-6",
+                project="test-project",
+                request=mock_request,
+                completion_kwargs_are_openai_chat=True,
+            )
+        )
+
+        parts = [
+            part
+            for content in wrapped_request["request"]["contents"]
+            for part in content.get("parts", [])
+            if isinstance(part, dict)
+        ]
+        function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
+        function_responses = [
+            part["functionResponse"] for part in parts if "functionResponse" in part
+        ]
+
+        assistant_messages = [
+            message
+            for message in completion_messages
+            if message.get("role") == "assistant"
+        ]
+        tool_messages = [
+            message for message in completion_messages if message.get("role") == "tool"
+        ]
+        assert assistant_messages[0]["tool_calls"][0]["id"] == "toolu_read_1"
+        assert tool_messages[0]["tool_call_id"] == "toolu_read_1"
+        assert function_calls == [
+            {
+                "name": "read_file",
+                "args": {"file_path": "/tmp/a.txt"},
+                "id": "toolu_read_1",
+            }
+        ]
+        assert function_responses == [
+            {
+                "id": "toolu_read_1",
+                "name": "read_file",
+                "response": {"output": "alpha", "tool_use_id": "toolu_read_1"},
+            }
+        ]
+        assert changes["google_adapter_codex_repaired_anthropic_tool_replay_id_count"] == 1
+        assert changes["google_adapter_codex_converted_anthropic_tool_use_count"] == 1
+        assert changes["google_adapter_codex_converted_anthropic_tool_result_count"] == 1
+        assert changes["google_adapter_annotated_claude_tool_response_id_count"] == 1
 
     @pytest.mark.asyncio
     async def test_wrap_streaming_response_with_release_callback_releases_after_stream_completion(self):

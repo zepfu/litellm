@@ -605,6 +605,35 @@ class LiteLLMAnthropicMessagesAdapter:
                     continue
                 existing_id = block.get("id")
                 if isinstance(existing_id, str) and existing_id.strip():
+                    existing_id_paired_tool_result: Optional[
+                        Tuple[int, int, Dict[str, Any]]
+                    ] = None
+                    if tool_use_ordinal < len(next_tool_results):
+                        existing_id_paired_tool_result = next_tool_results[
+                            tool_use_ordinal
+                        ]
+                    if existing_id_paired_tool_result is not None:
+                        paired_tool_result_id = existing_id_paired_tool_result[2].get(
+                            "tool_use_id"
+                        )
+                        if not (
+                            isinstance(paired_tool_result_id, str)
+                            and paired_tool_result_id.strip()
+                        ):
+                            result_message_index, result_index, result_block = (
+                                existing_id_paired_tool_result
+                            )
+                            next_message_copy = copy_message_at(result_message_index)
+                            next_content = (
+                                next_message_copy.get("content")
+                                if next_message_copy is not None
+                                else None
+                            )
+                            if isinstance(next_content, list):
+                                repaired_result = dict(result_block)
+                                repaired_result["tool_use_id"] = existing_id.strip()
+                                next_content[result_index] = repaired_result
+                                repaired_count += 1
                     tool_use_ordinal += 1
                     continue
 
