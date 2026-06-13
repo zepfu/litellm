@@ -11475,6 +11475,146 @@ class TestClaudePersistedOutputExpansion:
         mock_create_route.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("extra_request_headers", "expected_beta"),
+        [
+            (
+                {},
+                "context-1m-2025-08-07",
+            ),
+            (
+                {"anthropic-beta": "mcp-client-2025-11-20"},
+                "mcp-client-2025-11-20, context-1m-2025-08-07",
+            ),
+            (
+                {
+                    "anthropic-beta": (
+                        "mcp-client-2025-11-20, context-1m-2025-08-07"
+                    )
+                },
+                "mcp-client-2025-11-20, context-1m-2025-08-07",
+            ),
+            (
+                {"Anthropic-Beta": "mcp-client-2025-11-20"},
+                "mcp-client-2025-11-20, context-1m-2025-08-07",
+            ),
+            (
+                {"x-pass-anthropic-beta": "computer-use-2024-10-22"},
+                "computer-use-2024-10-22, context-1m-2025-08-07",
+            ),
+            (
+                {
+                    "Anthropic-Beta": "mcp-client-2025-11-20",
+                    "x-pass-anthropic-beta": "computer-use-2024-10-22",
+                },
+                (
+                    "mcp-client-2025-11-20, computer-use-2024-10-22, "
+                    "context-1m-2025-08-07"
+                ),
+            ),
+        ],
+    )
+    async def test_anthropic_proxy_route_normalizes_context_1m_native_model(
+        self,
+        extra_request_headers,
+        expected_beta,
+    ):
+        request_body = {
+            "model": "claude-opus-4-8[1m]",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        request_headers = {
+            "content-type": "application/json",
+        }
+        request_headers.update(extra_request_headers)
+        mock_request.headers = request_headers
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value="anthropic-test-key",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(),
+        ) as mock_pass_through_request, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+            new=AsyncMock(),
+        ) as mock_google_adapter, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_auto_agent_alias_route",
+            new=AsyncMock(),
+        ) as mock_auto_agent, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_codex_auth_headers"
+        ) as mock_local_codex_auth_loader, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_create_route.return_value = AsyncMock(return_value={"id": "msg_1m"})
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert result == {"id": "msg_1m"}
+        mock_pass_through_request.assert_not_awaited()
+        mock_google_adapter.assert_not_awaited()
+        mock_auto_agent.assert_not_awaited()
+        mock_local_codex_auth_loader.assert_not_called()
+        mock_create_route.assert_called_once()
+        call_kwargs = mock_create_route.call_args.kwargs
+        assert call_kwargs["target"] == "https://api.anthropic.com/v1/messages"
+        assert call_kwargs["custom_headers"]["x-api-key"] == "anthropic-test-key"
+        assert call_kwargs["custom_headers"]["anthropic-beta"] == expected_beta
+        assert call_kwargs["blocked_pass_through_prefixed_headers"] == [
+            "anthropic-beta"
+        ]
+        mock_set_parsed_body.assert_called_once()
+        normalized_body = mock_set_parsed_body.call_args.args[1]
+        assert normalized_body["model"] == "claude-opus-4-8"
+        assert request_body["model"] == "claude-opus-4-8[1m]"
+
+    def test_anthropic_context_1m_beta_survives_forwarded_header_merge(self):
+        forwarded = HttpPassThroughEndpointHelpers.forward_headers_from_request(
+            request_headers={
+                "Anthropic-Beta": "mcp-client-2025-11-20",
+                "x-pass-anthropic-beta": "computer-use-2024-10-22",
+                "x-pass-extra-header": "extra-value",
+                "content-type": "application/json",
+            },
+            headers={
+                "anthropic-beta": (
+                    "mcp-client-2025-11-20, computer-use-2024-10-22, "
+                    "context-1m-2025-08-07"
+                )
+            },
+            forward_headers=True,
+            blocked_pass_through_prefixed_headers=["anthropic-beta"],
+        )
+
+        assert "Anthropic-Beta" not in forwarded
+        assert forwarded["anthropic-beta"] == (
+            "mcp-client-2025-11-20, computer-use-2024-10-22, "
+            "context-1m-2025-08-07"
+        )
+        assert forwarded["extra-header"] == "extra-value"
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_extracts_billing_header(self):
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {}
