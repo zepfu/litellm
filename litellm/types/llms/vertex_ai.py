@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from typing_extensions import (
+    NotRequired,
     Required,
     TypedDict,
 )
@@ -15,6 +16,7 @@ class FunctionResponse(TypedDict):
 class FunctionCall(TypedDict):
     name: str
     args: Optional[dict]
+    id: NotRequired[str]
 
 
 class FileDataType(TypedDict):
@@ -41,6 +43,7 @@ class PartType(TypedDict, total=False):
 class HttpxFunctionCall(TypedDict):
     name: str
     args: dict
+    id: NotRequired[str]
 
 
 class HttpxExecutableCode(TypedDict):

@@ -514,6 +514,155 @@ class LiteLLMAnthropicMessagesAdapter:
             is_hosted_tool = True
         return is_hosted_tool and self._is_web_search_tool(tool) is False
 
+    @staticmethod
+    def _is_tool_result_content_block(block: Any) -> bool:
+        if not isinstance(block, dict):
+            return False
+        block_type = block.get("type")
+        return block_type == "tool_result" or (
+            isinstance(block_type, str) and block_type.endswith("_tool_result")
+        )
+
+    @staticmethod
+    def _deterministic_repaired_tool_use_id(
+        *,
+        message_index: int,
+        content_index: int,
+        block: Dict[str, Any],
+    ) -> str:
+        try:
+            input_text = json.dumps(
+                block.get("input", {}),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except Exception:
+            input_text = str(block.get("input", ""))
+        seed = "|".join(
+            (
+                "anthropic-tool-use-id-repair",
+                str(message_index),
+                str(content_index),
+                str(block.get("name", "")),
+                input_text,
+            )
+        )
+        return f"call_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:28]}"
+
+    @classmethod
+    def repair_missing_anthropic_tool_use_ids(  # noqa: PLR0915
+        cls,
+        messages: List[Any],
+    ) -> Tuple[List[Any], int]:
+        repaired_messages: List[Any] = list(messages)
+        copied_messages: set[int] = set()
+        repaired_count = 0
+
+        def copy_message_at(index: int) -> Optional[Dict[str, Any]]:
+            message = repaired_messages[index]
+            if not isinstance(message, dict):
+                return None
+            if index not in copied_messages:
+                message = dict(message)
+                content = message.get("content")
+                if isinstance(content, list):
+                    message["content"] = list(content)
+                repaired_messages[index] = message
+                copied_messages.add(index)
+            return cast(Dict[str, Any], message)
+
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+
+            next_tool_results: List[Tuple[int, int, Dict[str, Any]]] = []
+            for next_index in range(message_index + 1, len(messages)):
+                next_message = messages[next_index]
+                if not isinstance(next_message, dict):
+                    continue
+                if next_message.get("role") == "assistant":
+                    break
+                next_content = next_message.get("content")
+                if not isinstance(next_content, list):
+                    continue
+                next_tool_results.extend(
+                    (
+                        next_index,
+                        content_index,
+                        cast(Dict[str, Any], block),
+                    )
+                    for content_index, block in enumerate(next_content)
+                    if cls._is_tool_result_content_block(block)
+                )
+
+            tool_use_ordinal = 0
+            for content_index, block in enumerate(content):
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                existing_id = block.get("id")
+                if isinstance(existing_id, str) and existing_id.strip():
+                    tool_use_ordinal += 1
+                    continue
+
+                paired_tool_result: Optional[Tuple[int, int, Dict[str, Any]]] = None
+                if tool_use_ordinal < len(next_tool_results):
+                    paired_tool_result = next_tool_results[tool_use_ordinal]
+                paired_tool_result_id = (
+                    paired_tool_result[2].get("tool_use_id")
+                    if paired_tool_result is not None
+                    else None
+                )
+                repaired_id = (
+                    paired_tool_result_id.strip()
+                    if isinstance(paired_tool_result_id, str)
+                    and paired_tool_result_id.strip()
+                    else cls._deterministic_repaired_tool_use_id(
+                        message_index=message_index,
+                        content_index=content_index,
+                        block=block,
+                    )
+                )
+
+                message_copy = copy_message_at(message_index)
+                if message_copy is None:
+                    tool_use_ordinal += 1
+                    continue
+                message_content = message_copy.get("content")
+                if isinstance(message_content, list):
+                    repaired_block = dict(block)
+                    repaired_block["id"] = repaired_id
+                    message_content[content_index] = repaired_block
+                    repaired_count += 1
+
+                if (
+                    paired_tool_result is not None
+                    and not (
+                        isinstance(paired_tool_result_id, str)
+                        and paired_tool_result_id.strip()
+                    )
+                ):
+                    result_message_index, result_index, result_block = paired_tool_result
+                    next_message_copy = copy_message_at(result_message_index)
+                    next_content = (
+                        next_message_copy.get("content")
+                        if next_message_copy is not None
+                        else None
+                    )
+                    if isinstance(next_content, list):
+                        repaired_result = dict(result_block)
+                        repaired_result["tool_use_id"] = repaired_id
+                        next_content[result_index] = repaired_result
+
+                tool_use_ordinal += 1
+
+        if repaired_count == 0:
+            return messages, 0
+        return repaired_messages, repaired_count
+
     def translate_anthropic_messages_to_openai(  # noqa: PLR0915
         self,
         messages: List[
@@ -529,6 +678,9 @@ class LiteLLMAnthropicMessagesAdapter:
         preserve_cache_control = self._should_preserve_cache_control_for_target(
             model=model,
             custom_llm_provider=custom_llm_provider,
+        )
+        messages, _repaired_tool_use_id_count = self.repair_missing_anthropic_tool_use_ids(
+            cast(List[Any], messages)
         )
         for m in messages:
             user_message: Optional[ChatCompletionUserMessage] = None
@@ -989,7 +1141,7 @@ class LiteLLMAnthropicMessagesAdapter:
                 new_tools.append(tool)  # type: ignore[arg-type]
                 continue
             
-            original_name = tool["name"]
+            original_name = str(cast(Dict[str, Any], tool).get("name", ""))
             truncated_name = truncate_tool_name(original_name)
 
             # Store mapping if name was truncated
@@ -1152,11 +1304,11 @@ class LiteLLMAnthropicMessagesAdapter:
         }
         ## CONVERT METADATA (user_id)
         if "metadata" in anthropic_message_request:
-            metadata = anthropic_message_request["metadata"]
-            if metadata and "user_id" in metadata:
-                new_kwargs["user"] = metadata["user_id"]
-            if isinstance(metadata, dict):
-                new_kwargs["metadata"] = dict(metadata)
+            anthropic_metadata = anthropic_message_request["metadata"]
+            if anthropic_metadata and "user_id" in anthropic_metadata:
+                new_kwargs["user"] = anthropic_metadata["user_id"]
+            if isinstance(anthropic_metadata, dict):
+                new_kwargs["metadata"] = dict(anthropic_metadata)
 
         # Pass litellm proxy specific metadata
         if "litellm_metadata" in anthropic_message_request:
@@ -1205,19 +1357,19 @@ class LiteLLMAnthropicMessagesAdapter:
 
                 if unsupported_hosted_tools:
                     existing_metadata = new_kwargs.get("metadata")
-                    metadata = (
+                    extension_metadata: Dict[str, Any] = (
                         dict(existing_metadata)
                         if isinstance(existing_metadata, dict)
                         else {}
                     )
-                    metadata["anthropic_adapter_unsupported_hosted_tools"] = [
+                    extension_metadata["anthropic_adapter_unsupported_hosted_tools"] = [
                         {
                             "type": cast(Dict[str, Any], tool).get("type"),
                             "name": cast(Dict[str, Any], tool).get("name"),
                         }
                         for tool in unsupported_hosted_tools
                     ]
-                    new_kwargs["metadata"] = metadata  # type: ignore[typeddict-item]
+                    new_kwargs["metadata"] = extension_metadata  # type: ignore[typeddict-item]
                     if tool_choice and tool_choice.get("type") != "none":
                         unsupported_tool_names = {
                             cast(Dict[str, Any], tool).get("name")
@@ -1228,7 +1380,7 @@ class LiteLLMAnthropicMessagesAdapter:
                             and tool_choice.get("name") in unsupported_tool_names
                         )
                         if not regular_tools or tool_choice_targets_dropped_tool:
-                            metadata[
+                            extension_metadata[
                                 "anthropic_adapter_unsupported_hosted_tool_choice"
                             ] = dict(tool_choice)
                             new_kwargs.pop("tool_choice", None)
@@ -1298,13 +1450,15 @@ class LiteLLMAnthropicMessagesAdapter:
                 and "reasoning_effort" not in new_kwargs
             ):
                 new_kwargs["reasoning_effort"] = normalized_effort.native_value
-            metadata = dict(new_kwargs.get("metadata") or {})
-            metadata.update(normalized_effort.metadata())
-            existing_tags = metadata.get("tags") or []
+            reasoning_metadata: Dict[str, Any] = dict(new_kwargs.get("metadata") or {})
+            reasoning_metadata.update(normalized_effort.metadata())
+            existing_tags = reasoning_metadata.get("tags") or []
             if not isinstance(existing_tags, list):
                 existing_tags = []
-            metadata["tags"] = list(dict.fromkeys([*existing_tags, *normalized_effort.tags()]))
-            new_kwargs["metadata"] = metadata  # type: ignore[typeddict-item]
+            reasoning_metadata["tags"] = list(
+                dict.fromkeys([*existing_tags, *normalized_effort.tags()])
+            )
+            new_kwargs["metadata"] = reasoning_metadata  # type: ignore[typeddict-item]
 
         cache_requested = request_contains_cache_control(anthropic_message_request)
         preserve_cache_control = self._should_preserve_cache_control_for_target(
@@ -1313,15 +1467,15 @@ class LiteLLMAnthropicMessagesAdapter:
         )
         if cache_requested:
             provider_key = "nvidia" if native_provider == "nvidia_nim" else native_provider
-            metadata = dict(new_kwargs.get("metadata") or {})
-            metadata.update(
+            cache_metadata: Dict[str, Any] = dict(new_kwargs.get("metadata") or {})
+            cache_metadata.update(
                 provider_cache_intent_metadata(
                     provider=provider_key,
                     attempted=True,
                     native_supported=preserve_cache_control,
                 )
             )
-            new_kwargs["metadata"] = metadata  # type: ignore[typeddict-item]
+            new_kwargs["metadata"] = cache_metadata  # type: ignore[typeddict-item]
 
         ## CONVERT OUTPUT_FORMAT to RESPONSE_FORMAT
         if "output_format" in anthropic_message_request:
@@ -1436,7 +1590,7 @@ class LiteLLMAnthropicMessagesAdapter:
                 )
             # Handle tool calls (in parallel to text content)
             if has_tool_calls:
-                for tool_call in choice.message.tool_calls:
+                for tool_call in choice.message.tool_calls or []:
                     # Extract signature from provider_specific_fields only
                     signature = self._extract_signature_from_tool_call(tool_call)
 
@@ -1451,10 +1605,15 @@ class LiteLLMAnthropicMessagesAdapter:
                         if tool_name_mapping
                         else truncated_name
                     )
+                    tool_use_id = sanitize_anthropic_tool_use_id(tool_call.id)
+                    if not tool_use_id:
+                        from litellm._uuid import uuid
+
+                        tool_use_id = f"call_{uuid.uuid4().hex[:28]}"
 
                     tool_use_block = AnthropicResponseContentBlockToolUse(
                         type="tool_use",
-                        id=sanitize_anthropic_tool_use_id(tool_call.id),
+                        id=tool_use_id,
                         name=original_name,
                         input=sanitize_anthropic_tool_use_input(
                             tool_name=original_name,

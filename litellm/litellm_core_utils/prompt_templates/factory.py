@@ -1450,6 +1450,10 @@ def convert_to_gemini_tool_call_invoke(
                         function_call_params=tool["function"]
                     )
                     if gemini_function_call is not None:
+                        if model and "claude" in model.lower():
+                            tool_call_id = tool.get("id")
+                            if isinstance(tool_call_id, str) and tool_call_id:
+                                gemini_function_call["id"] = tool_call_id
                         part_dict: VertexPartType = {
                             "function_call": gemini_function_call
                         }
@@ -3338,7 +3342,7 @@ def amazon_titan_pt(
 
 def _load_image_from_url(image_url):
     try:
-        from PIL import Image
+        from PIL import Image  # type: ignore[import-not-found]
     except Exception:
         raise Exception("image conversion failed please run `pip install Pillow`")
     from io import BytesIO
