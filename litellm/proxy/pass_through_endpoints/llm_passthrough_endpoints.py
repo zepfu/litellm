@@ -8648,6 +8648,8 @@ def _antigravity_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     else:
         detail_text = str(detail or exc)
     normalized = detail_text.lower()
+    if "agy cli" in normalized and "auth refresh" in normalized:
+        return detail_text
     if "antigravity oauth" in normalized or "antigravity cli" in normalized:
         return detail_text
     if "antigravity" not in normalized:

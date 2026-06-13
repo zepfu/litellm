@@ -2625,6 +2625,35 @@ upstream `functionCall.id`.
 
 ---
 
+### aawm.D1-245 — Treat Antigravity silent-refresh failures as alias-candidate unavailable
+
+**What changed:** Antigravity alias-probe fallback classification now treats
+`AGY CLI silent auth refresh did not produce a valid token` as an
+Antigravity credential-unavailable condition. In local dev,
+`docker-compose.dev.yml` mounts `/home/zepfu/.gemini` read/write so Gemini and
+Antigravity OAuth refreshes can persist updated token files instead of looping
+on an expired read-only token.
+
+**Why:** After the Vertex `tool_use.id` replay fix was deployed, controlled
+subagent canaries stopped showing the old request-envelope error but repeatedly
+hit Antigravity token refresh warnings before falling into high-demand
+redispatch behavior. The dev container found the Antigravity token under
+`/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`, but the token was
+expired and the `.gemini` mount was read-only, so silent refresh could not
+produce/persist a usable replacement. Alias probes should continue to the next
+candidate when that credential is unavailable, while direct Antigravity routes
+still surface the auth failure.
+
+**Why not upstream:** This is AAWM-specific local Antigravity/Codex alias
+routing and dev-container credential handling.
+
+**Validation status:** Focused tests cover both Anthropic-style
+`aawm-code-anthropic` and Codex-style `aawm-code` fallback after the silent
+refresh no-token error, while existing tests preserve terminal handling for
+Vertex request-envelope 400s.
+
+---
+
 
 ## Dropped Patches
 
