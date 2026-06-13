@@ -8648,7 +8648,26 @@ def _antigravity_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     else:
         detail_text = str(detail or exc)
     normalized = detail_text.lower()
-    if "antigravity oauth" not in normalized and "antigravity cli" not in normalized:
+    if "antigravity oauth" in normalized or "antigravity cli" in normalized:
+        return detail_text
+    if "antigravity" not in normalized:
+        return None
+    if not any(
+        marker in normalized
+        for marker in (
+            "auth provider",
+            "authentication",
+            "authorization",
+            "credential",
+            "credentials",
+            "log in",
+            "login",
+            "not logged in",
+            "not logged into",
+            "oauth",
+            "token source",
+        )
+    ):
         return None
     return detail_text
 
