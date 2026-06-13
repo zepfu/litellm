@@ -78,8 +78,8 @@ services:
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
       # OpenCode Zen auth for native OpenCode and Codex/Claude adapter testing
       - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
-      # Gemini OAuth tokens for Anthropic->Google adapter testing
-      - /home/zepfu/.gemini:/home/zepfu/.gemini:ro
+      # Gemini and Antigravity OAuth tokens for adapter testing; refresh persists updated tokens.
+      - /home/zepfu/.gemini:/home/zepfu/.gemini
       # Grok CLI OAuth tokens for native Grok OIDC passthrough testing
       - /home/zepfu/.grok:/home/zepfu/.grok:ro
       # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.

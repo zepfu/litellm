@@ -14969,6 +14969,18 @@ def test_antigravity_candidate_unavailable_detail_matches_not_logged_in_auth():
     )
 
 
+def test_antigravity_candidate_unavailable_detail_matches_agy_silent_refresh_failure():
+    refresh_error = HTTPException(
+        status_code=500,
+        detail="AGY CLI silent auth refresh did not produce a valid token.",
+    )
+
+    assert (
+        _antigravity_candidate_unavailable_detail(refresh_error)
+        == refresh_error.detail
+    )
+
+
 def test_antigravity_candidate_unavailable_detail_ignores_request_envelope_400():
     request_shape_error = HTTPException(
         status_code=400,
@@ -15164,6 +15176,62 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_antigravity_not_
     first_attempt = metadata["anthropic_auto_agent_attempts"][0]
     assert first_attempt["provider"] == "antigravity"
     assert first_attempt["model"] == "claude-sonnet-4-6"
+    assert first_attempt["status"] == "cooldown_set"
+    assert first_attempt["cooldown_scope"] == "candidate"
+    assert first_attempt["error_class"] == "candidate_unavailable"
+    assert (
+        "aawm_codex_auto_agent_candidate_unavailable"
+        in first_attempt["error_tokens"]
+    )
+    skipped = metadata["anthropic_auto_agent_skipped_candidates"][0]
+    assert skipped["provider"] == "antigravity"
+    assert skipped["model"] == "claude-sonnet-4-6"
+    assert skipped["lane_key"] == "antigravity-lane"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_falls_back_after_antigravity_silent_auth_refresh_no_token(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    antigravity_auth_error = HTTPException(
+        status_code=500,
+        detail="AGY CLI silent auth refresh did not produce a valid token.",
+    )
+    spark_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
+        new=AsyncMock(side_effect=antigravity_auth_error),
+    ) as mock_prepare_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(return_value=spark_success),
+    ) as mock_spark:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is spark_success
+    mock_prepare_antigravity.assert_awaited_once()
+    mock_spark.assert_awaited_once()
+    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
+    metadata = spark_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    first_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert first_attempt["provider"] == "antigravity"
     assert first_attempt["status"] == "cooldown_set"
     assert first_attempt["cooldown_scope"] == "candidate"
     assert first_attempt["error_class"] == "candidate_unavailable"
@@ -16992,6 +17060,63 @@ async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_invalid_
     assert (
         "aawm_codex_auto_agent_candidate_unavailable"
         in metadata["codex_auto_agent_attempts"][0]["error_tokens"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_silent_auth_refresh_no_token(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    antigravity_refresh_error = HTTPException(
+        status_code=500,
+        detail="AGY CLI silent auth refresh did not produce a valid token.",
+    )
+    spark_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        new=AsyncMock(side_effect=antigravity_refresh_error),
+    ) as mock_load_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=spark_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is spark_success
+    mock_load_antigravity.assert_awaited_once()
+    mock_pass_through.assert_awaited_once()
+    spark_body = mock_pass_through.await_args.kwargs["custom_body"]
+    metadata = spark_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code"
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    first_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert first_attempt["provider"] == "antigravity"
+    assert first_attempt["status"] == "cooldown_set"
+    assert first_attempt["cooldown_scope"] == "candidate"
+    assert first_attempt["error_class"] == "candidate_unavailable"
+    assert (
+        "aawm_codex_auto_agent_candidate_unavailable"
+        in first_attempt["error_tokens"]
     )
 
 
