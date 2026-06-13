@@ -660,7 +660,7 @@ def _ensure_cli_harness_context(
     else:
         updated.pop('expected_trace_session_id', None)
     if updated.get('match_trace_session_id_from_stdout') is None:
-        updated['match_trace_session_id_from_stdout'] = True
+        updated['match_trace_session_id_from_stdout'] = cli_kind != 'codex'
     updated.setdefault('require_trace_user_id', True)
     return updated
 

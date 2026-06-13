@@ -150,9 +150,11 @@ derived by that client.
 Codex CLI cases also send the current git repository identity via
 `x-aawm-repository` and require `public.session_history.repository` to be
 populated. Codex CLI cases inject harness-owned tracing headers via `-c
-model_providers.<profile>.http_headers.*` overrides. Set `AAWM_HARNESS_USER_ID`
-for a stable caller identity; pytest-classifier observability maps to
-`pytest-classifier` automatically.
+model_providers.<profile>.http_headers.*` overrides. The harness validates
+Codex telemetry against the injected `session_id` header rather than the Codex
+stdout `thread_id`, since LiteLLM persists the explicit header as the provider
+session. Set `AAWM_HARNESS_USER_ID` for a stable caller identity;
+pytest-classifier observability maps to `pytest-classifier` automatically.
 
 The native Codex Responses case additionally checks the Codex `spawn_agent`
 tool-description rewrite. It requires the
