@@ -1458,8 +1458,15 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                         ] = thought_signature
                     function = cast(ChatCompletionToolCallFunctionChunk, function_dict)
                 else:
+                    raw_function_call_id = part["functionCall"].get("id")
+                    tool_call_id = (
+                        raw_function_call_id.strip()
+                        if isinstance(raw_function_call_id, str)
+                        and raw_function_call_id.strip()
+                        else f"call_{uuid.uuid4().hex[:28]}"
+                    )
                     _tool_response_chunk: ChatCompletionToolCallChunk = {
-                        "id": f"call_{uuid.uuid4().hex[:28]}",
+                        "id": tool_call_id,
                         "type": "function",
                         "function": _function_chunk,
                         "index": cumulative_tool_call_idx,
@@ -2948,7 +2955,7 @@ class ModelResponseIterator:
         self.has_seen_tool_calls: bool = False
         self.pending_model_response_chunks: list[ModelResponseStream] = []
 
-    def chunk_parser(self, chunk: dict) -> Optional["ModelResponseStream"]:
+    def chunk_parser(self, chunk: dict) -> Optional["ModelResponseStream"]:  # noqa: PLR0915
         try:
             verbose_logger.debug(f"RAW GEMINI CHUNK: {chunk}")
             from litellm.types.utils import ModelResponseStream
@@ -3071,7 +3078,7 @@ class ModelResponseIterator:
                     pending_choice.delta.tool_calls = None
                     pending_choice.delta.function_call = None
                     pending_choice.delta.reasoning_content = None
-                    choice.finish_reason = None
+                    setattr(choice, "finish_reason", None)
                     pending_terminal_choices.append(pending_choice)
 
             if pending_terminal_choices:
