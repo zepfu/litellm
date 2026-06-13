@@ -2590,7 +2590,7 @@ verifying the prod container reports `aawm-litellm-control-plane=0.0.8`.
 
 ---
 
-### aawm.D1-246/D1-247 — Repair Claude tool_use ids in Antigravity/Vertex replay
+### aawm.D1-246/D1-248 — Repair Claude tool_use ids in Antigravity/Vertex replay
 
 **What changed:** Anthropic pass-through request preparation now repairs
 assistant `tool_use` content blocks that arrive without a non-empty `id`, using
@@ -2604,24 +2604,41 @@ when converting tool calls back into OpenAI/Anthropic-compatible responses, so
 the first streamed tool-use turn gives Claude clients an id they can replay on
 the follow-up request. The local dev compose file mounts
 `litellm/types/llms/vertex_ai.py` to keep request/response shape types aligned
-with live-mounted serializer code after restart-only validation.
+with live-mounted serializer code after restart-only validation. D1-248 extends
+the repair to the Anthropic-native Google/Antigravity completion-adapter branch,
+annotates Claude `functionResponse` parts with both top-level `id` and nested
+`response.tool_use_id`, reconstructs missing native `model/functionCall` turns
+from cached tool-call context when a compacted follow-up contains only a
+`functionResponse`, and trims Code Assist content windows without orphaning
+function-response turns from their paired function calls.
 
 **Why:** Subagent canaries were dying on their second model request with
 `messages.1.content.1.tool_use.id: Field required` because the replayed first
 assistant turn reached the Vertex/Antigravity serializer without the required
 Claude `tool_use.id`. The initial request-side repair did not cover the
-response-parser leg that feeds ids back to streaming Anthropic clients.
+response-parser leg that feeds ids back to streaming Anthropic clients. Later
+D1-248 canaries showed the follow-up shape could also arrive as a compacted
+native `functionResponse` without the paired prior `functionCall`; once the
+response id was present, Vertex rejected that as an unpaired tool result until
+the native pair was preserved or reconstructed.
 
 **Why not upstream:** This protects AAWM's Anthropic-compatible
 Antigravity/Code Assist adapter flow and its Claude-backed alias candidates.
-Normal Gemini payloads remain unchanged; the `functionCall.id` field is only
-added for Claude-like adapter models.
+Normal Gemini payloads remain unchanged except for pair-preserving content
+window trimming; Claude-specific `functionCall.id` / `functionResponse.id`
+repair is scoped to Claude-like adapter models.
 
 **Validation status:** Focused tests cover proxy repair/preservation,
 Anthropic-to-OpenAI adapter repair, Claude-target builder serialization, normal
 Gemini no-id behavior, non-adjacent `tool_result` pairing, response-side
 fallback id generation, and Vertex/Gemini response transform preservation of
-upstream `functionCall.id`.
+upstream `functionCall.id`. D1-248 adds focused coverage for Anthropic-native
+adapter replay repair, OpenAI-chat Anthropic replay normalization, cached
+missing-tool-call reconstruction, Claude `functionResponse.id` annotation,
+native missing-pair insertion, and content-window trimming that preserves
+valid function-call/function-response pairs without exceeding the configured
+window. A controlled `aawm-code` canary passed its second model request after
+the final runtime recreate.
 
 ---
 

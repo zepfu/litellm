@@ -11,6 +11,7 @@ from typing_extensions import (
 class FunctionResponse(TypedDict):
     name: str
     response: Optional[dict]
+    id: NotRequired[str]
 
 
 class FunctionCall(TypedDict):
