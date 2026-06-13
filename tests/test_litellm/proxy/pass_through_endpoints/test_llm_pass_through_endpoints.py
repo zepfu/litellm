@@ -482,6 +482,48 @@ async def test_prepare_anthropic_request_body_rejects_tool_result_without_tool_u
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_use_id", [None, "", "   "])
+async def test_prepare_anthropic_request_body_repairs_tool_use_without_id(
+    tool_use_id,
+):
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+    tool_use_block = {
+        "type": "tool_use",
+        "name": "Read",
+        "input": {"file_path": "/tmp/a.txt"},
+    }
+    if tool_use_id is not None:
+        tool_use_block["id"] = tool_use_id
+    request_body = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "Read a file."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I will read it."},
+                    tool_use_block,
+                ],
+            },
+        ],
+    }
+
+    updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+        mock_request,
+        request_body,
+    )
+
+    repaired_id = updated_body["messages"][1]["content"][1]["id"]
+    assert isinstance(repaired_id, str)
+    assert repaired_id.startswith("call_")
+    assert updated_body["litellm_metadata"][
+        "anthropic_tool_use_id_repaired_count"
+    ] == 1
+
+
+@pytest.mark.asyncio
 async def test_prepare_anthropic_request_body_preserves_valid_tool_result_block():
     mock_request = MagicMock(spec=Request)
     mock_request.headers = {}
@@ -507,6 +549,88 @@ async def test_prepare_anthropic_request_body_preserves_valid_tool_result_block(
     )
 
     assert updated_body["messages"][0]["content"] == [tool_result_block]
+
+
+@pytest.mark.asyncio
+async def test_prepare_anthropic_request_body_preserves_tool_use_id_in_history():
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+    tool_use_block = {
+        "type": "tool_use",
+        "id": "toolu_read_1",
+        "name": "Read",
+        "input": {"file_path": "/tmp/a.txt"},
+    }
+    tool_result_block = {
+        "type": "tool_result",
+        "tool_use_id": "toolu_read_1",
+        "content": "alpha",
+    }
+    request_body = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "Read a file."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I will read it."},
+                    tool_use_block,
+                ],
+            },
+            {"role": "user", "content": [tool_result_block]},
+        ],
+    }
+
+    updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+        mock_request,
+        request_body,
+    )
+
+    assert updated_body["messages"][1]["content"][1]["id"] == "toolu_read_1"
+    assert updated_body["messages"][2]["content"][0]["tool_use_id"] == "toolu_read_1"
+
+
+@pytest.mark.asyncio
+async def test_prepare_anthropic_request_body_repairs_tool_use_id_from_tool_result():
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {}
+    request_body = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "Read a file."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I will read it."},
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/a.txt"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read_1",
+                        "content": "alpha",
+                    }
+                ],
+            },
+        ],
+    }
+
+    updated_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+        mock_request,
+        request_body,
+    )
+
+    assert updated_body["messages"][1]["content"][1]["id"] == "toolu_read_1"
+    assert updated_body["messages"][2]["content"][0]["tool_use_id"] == "toolu_read_1"
 
 
 def _assert_claude_code_agent_project_litellm_metadata(
@@ -3076,6 +3200,139 @@ class TestGoogleAdapterRequestShapePolicy:
             "grep_search",
             "read_file",
             "run_shell_command",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_builder_preserves_claude_tool_use_id(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "anthropic-claude-tool-id"}
+
+        wrapped_request, _, completion_messages, _, _, _ = await _build_google_code_assist_request_from_completion_kwargs(
+            completion_kwargs={
+                "max_tokens": 32,
+                "messages": [
+                    {"role": "user", "content": "Read a file."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "I will read it."},
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_read_1",
+                                "name": "Read",
+                                "input": {"file_path": "/tmp/a.txt"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_read_1",
+                                "content": "alpha",
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "name": "Read",
+                        "description": "Read file",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                        },
+                    }
+                ],
+            },
+            adapter_model="claude-sonnet-4-6",
+            project="test-project",
+            request=mock_request,
+        )
+
+        parts = [
+            part
+            for content in wrapped_request["request"]["contents"]
+            for part in content.get("parts", [])
+            if isinstance(part, dict)
+        ]
+        function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
+
+        assert completion_messages[1]["tool_calls"][0]["id"] == "toolu_read_1"
+        assert function_calls == [
+            {
+                "name": "read_file",
+                "args": {"file_path": "/tmp/a.txt"},
+                "id": "toolu_read_1",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_builder_repairs_claude_tool_use_id(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "anthropic-claude-repaired-tool-id"}
+
+        wrapped_request, _, completion_messages, _, _, _ = await _build_google_code_assist_request_from_completion_kwargs(
+            completion_kwargs={
+                "max_tokens": 32,
+                "messages": [
+                    {"role": "user", "content": "Read a file."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "I will read it."},
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": "/tmp/a.txt"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_read_1",
+                                "content": "alpha",
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "name": "Read",
+                        "description": "Read file",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                        },
+                    }
+                ],
+            },
+            adapter_model="claude-sonnet-4-6",
+            project="test-project",
+            request=mock_request,
+        )
+
+        parts = [
+            part
+            for content in wrapped_request["request"]["contents"]
+            for part in content.get("parts", [])
+            if isinstance(part, dict)
+        ]
+        function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
+
+        assert completion_messages[1]["tool_calls"][0]["id"] == "toolu_read_1"
+        assert function_calls == [
+            {
+                "name": "read_file",
+                "args": {"file_path": "/tmp/a.txt"},
+                "id": "toolu_read_1",
+            }
         ]
 
     @pytest.mark.asyncio

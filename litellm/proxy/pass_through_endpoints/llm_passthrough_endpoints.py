@@ -16777,7 +16777,7 @@ async def _expand_aawm_dynamic_directives_in_anthropic_request_body(
     return updated_body, injection_events
 
 
-def _validate_anthropic_tool_result_blocks_for_passthrough(
+def _validate_anthropic_tool_blocks_for_passthrough(
     request_body: dict[str, Any],
 ) -> None:
     messages = request_body.get("messages")
@@ -16794,6 +16794,18 @@ def _validate_anthropic_tool_result_blocks_for_passthrough(
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type")
+            if block_type == "tool_use":
+                tool_use_id = block.get("id")
+                if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Invalid Anthropic tool_use block at "
+                            f"messages.{message_index}.content.{content_index}: "
+                            "missing required non-empty string tool_use.id"
+                        ),
+                    )
+                continue
             if block_type != "tool_result" and not (
                 isinstance(block_type, str) and block_type.endswith("_tool_result")
             ):
@@ -16809,6 +16821,32 @@ def _validate_anthropic_tool_result_blocks_for_passthrough(
                         f"tool_result.tool_use_id for block type {block_type!r}"
                     ),
                 )
+
+
+def _repair_anthropic_tool_use_ids_for_passthrough(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    messages = request_body.get("messages")
+    if not isinstance(messages, list):
+        return request_body, 0
+
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        LiteLLMAnthropicMessagesAdapter,
+    )
+
+    repaired_messages, repaired_count = (
+        LiteLLMAnthropicMessagesAdapter.repair_missing_anthropic_tool_use_ids(messages)
+    )
+    if repaired_count == 0:
+        return request_body, 0
+
+    updated_body = dict(request_body)
+    updated_body["messages"] = repaired_messages
+    return _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=["anthropic-tool-use-id-repaired"],
+        extra_fields={"anthropic_tool_use_id_repaired_count": repaired_count},
+    ), repaired_count
 
 
 async def _prepare_anthropic_request_body_for_passthrough(
@@ -16856,7 +16894,10 @@ async def _prepare_anthropic_request_body_for_passthrough(
         request=request,
         request_body=updated_body,
     )
-    _validate_anthropic_tool_result_blocks_for_passthrough(updated_body)
+    updated_body, _repaired_tool_use_id_count = (
+        _repair_anthropic_tool_use_ids_for_passthrough(updated_body)
+    )
+    _validate_anthropic_tool_blocks_for_passthrough(updated_body)
     return updated_body, expanded_count, hooks, billing_header_fields
 
 
