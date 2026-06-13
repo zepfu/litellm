@@ -17942,21 +17942,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     assert "big-pickle" in skipped_models
 
 
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_low_opencode_billing_error_reaches_mini(
-    monkeypatch,
-):
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "aawm-low",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    await _set_codex_auto_agent_cooldown(
-        "openrouter:google/gemma-4-31b-it:free:openrouter",
-        60.0,
-    )
+def _build_opencode_zen_billing_error() -> ProxyException:
     billing_error = ProxyException(
         message=(
             "Error code: 401 - {'type':'error','error':"
@@ -17977,74 +17963,10 @@ async def test_codex_auto_agent_alias_low_opencode_billing_error_reaches_mini(
             ),
         },
     }
-    mini_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
-        new=AsyncMock(return_value="opencode-test-key"),
-    ) as mock_load_opencode_key, patch(
-        "litellm.acompletion",
-        new=AsyncMock(side_effect=billing_error),
-    ) as mock_acompletion, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(return_value=mini_success),
-    ) as mock_pass_through:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    assert response is mini_success
-    assert mock_load_opencode_key.await_count == 2
-    assert mock_acompletion.await_count == 2
-    mock_pass_through.assert_awaited_once()
-    candidate_body = mock_pass_through.await_args.kwargs["custom_body"]
-    assert candidate_body["model"] == "gpt-5.4-mini"
-    metadata = candidate_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low"
-    assert metadata["codex_auto_agent_selected_provider"] == "openai"
-    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
-    assert metadata["codex_auto_agent_selected_last_resort"] is True
-    opencode_attempts = [
-        attempt
-        for attempt in metadata["codex_auto_agent_attempts"]
-        if attempt["provider"] == "opencode_zen"
-    ]
-    assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash",
-        "big-pickle",
-    ]
-    assert all(
-        attempt["error_class"] == "candidate_unavailable"
-        for attempt in opencode_attempts
-    )
-    assert all(
-        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
-        for attempt in opencode_attempts
-    )
+    return billing_error
 
 
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_low_opencode_high_demand_reaches_mini(
-    monkeypatch,
-):
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "aawm-low",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    await _set_codex_auto_agent_cooldown(
-        "openrouter:google/gemma-4-31b-it:free:openrouter",
-        60.0,
-    )
+def _build_opencode_zen_high_demand_error() -> ProxyException:
     high_demand_error = ProxyException(
         message=(
             "We're currently experiencing high demand, which may cause "
@@ -18064,6 +17986,41 @@ async def test_codex_auto_agent_alias_low_opencode_high_demand_reaches_mini(
             "type": "rate_limit_error",
         }
     }
+    return high_demand_error
+
+
+_OPENCODE_ALIAS_FAILOVER_CASES = [
+    pytest.param(
+        "billing_error",
+        _build_opencode_zen_billing_error,
+        "candidate_unavailable",
+        "aawm_codex_auto_agent_candidate_unavailable",
+        id="billing-error",
+    ),
+    pytest.param(
+        "high_demand",
+        _build_opencode_zen_high_demand_error,
+        "capacity_exhausted",
+        "HIGH_DEMAND",
+        id="high-demand",
+    ),
+]
+
+
+async def _run_codex_auto_agent_alias_low_opencode_error_case(
+    opencode_error: ProxyException,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openrouter:google/gemma-4-31b-it:free:openrouter",
+        60.0,
+    )
     mini_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
@@ -18071,7 +18028,7 @@ async def test_codex_auto_agent_alias_low_opencode_high_demand_reaches_mini(
         new=AsyncMock(return_value="opencode-test-key"),
     ) as mock_load_opencode_key, patch(
         "litellm.acompletion",
-        new=AsyncMock(side_effect=high_demand_error),
+        new=AsyncMock(side_effect=opencode_error),
     ) as mock_acompletion, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(return_value=mini_success),
@@ -18107,13 +18064,6 @@ async def test_codex_auto_agent_alias_low_opencode_high_demand_reaches_mini(
         "deepseek-v4-flash",
         "big-pickle",
     ]
-    assert all(
-        attempt["error_class"] == "capacity_exhausted"
-        for attempt in opencode_attempts
-    )
-    assert all(
-        "HIGH_DEMAND" in attempt["error_tokens"] for attempt in opencode_attempts
-    )
     skipped_models = {
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
@@ -18121,6 +18071,39 @@ async def test_codex_auto_agent_alias_low_opencode_high_demand_reaches_mini(
     assert "google/gemma-4-31b-it:free" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
+    return opencode_attempts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "case_name",
+        "error_factory",
+        "expected_error_class",
+        "expected_error_token",
+    ),
+    _OPENCODE_ALIAS_FAILOVER_CASES,
+)
+async def test_codex_auto_agent_alias_low_opencode_error_reaches_mini(
+    monkeypatch,
+    case_name,
+    error_factory,
+    expected_error_class,
+    expected_error_token,
+):
+    opencode_attempts = await _run_codex_auto_agent_alias_low_opencode_error_case(
+        error_factory()
+    )
+    assert case_name in {"billing_error", "high_demand"}
+    assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
+    assert all(
+        attempt["error_class"] == expected_error_class
+        for attempt in opencode_attempts
+    )
+    assert all(
+        expected_error_token in attempt["error_tokens"]
+        for attempt in opencode_attempts
+    )
 
 
 @pytest.mark.asyncio
@@ -18176,15 +18159,7 @@ async def test_codex_opencode_zen_direct_route_keeps_high_demand_error(monkeypat
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    high_demand_error = ProxyException(
-        message=(
-            "We're currently experiencing high demand, which may cause "
-            "temporary errors."
-        ),
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
+    high_demand_error = _build_opencode_zen_high_demand_error()
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
