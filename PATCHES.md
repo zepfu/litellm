@@ -2590,6 +2590,37 @@ verifying the prod container reports `aawm-litellm-control-plane=0.0.8`.
 
 ---
 
+### aawm.D1-244 — Normalize Claude `[1m]` selectors on native Anthropic passthrough
+
+**What changed:** The native `/anthropic/v1/messages` passthrough now accepts
+Claude Code-style 1M model selectors such as `claude-opus-4-8[1m]` at the
+LiteLLM boundary. Before falling through to direct Anthropic egress, the proxy
+strips the bracket suffix from the request body model and appends
+`context-1m-2025-08-07` to the outbound `anthropic-beta` header, preserving and
+deduping any beta values the client already supplied. If the client supplied a
+case-variant beta header or `x-pass-anthropic-beta`, those values are folded
+into the normalized beta header and the prefixed pass-through beta header is
+blocked from overwriting the normalized value during final forwarding.
+
+**Why:** A dev Claude Code request reached direct Anthropic with the literal
+model `claude-opus-4-8[1m]` and received an upstream 404. Claude Code's intended
+wire shape is the base model plus `anthropic-beta: context-1m-2025-08-07`; the
+bracket suffix is a local selector, not an Anthropic model id. This fix makes
+the passthrough tolerant of clients or relays that fail to strip the suffix
+before LiteLLM.
+
+**Why not upstream:** This is an AAWM operational compatibility shim for local
+Claude Code model selectors. It is scoped to the native Anthropic passthrough
+fall-through and does not select or alter Google/Antigravity/OpenRouter adapter
+routes.
+
+**Validation status:** Focused passthrough tests cover direct Anthropic target
+preservation, model normalization, beta-header append/dedupe behavior,
+mixed-case and `x-pass-anthropic-beta` forwarding, and ordinary native model
+passthrough remaining unchanged.
+
+---
+
 ### aawm.D1-246/D1-248 — Repair Claude tool_use ids in Antigravity/Vertex replay
 
 **What changed:** Anthropic pass-through request preparation now repairs
