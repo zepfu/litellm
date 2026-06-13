@@ -2702,6 +2702,33 @@ Vertex request-envelope 400s.
 
 ---
 
+### aawm.D1-250 — Fail closed for tool-bearing Anthropic code-agent aliases
+
+**What changed:** `aawm-code-anthropic` requests that declare tools or carry
+stateful tool/reasoning continuation content now require the Antigravity Claude
+compatibility route. If Antigravity is cooling down or unavailable, the alias
+returns a structured 429 with `redispatch_model=aawm-code-anthropic` and marks
+non-compatible candidates as `tool_schema_incompatible` instead of selecting
+OpenAI, xAI, OpenRouter/OpenCode, or direct native Anthropic fallbacks.
+
+**Why:** A dashboard-shell subagent (`ad13aecd1b0f72e0f`) showed the old policy
+falling through from `aawm-code-anthropic` to `openai/gpt-5.3-codex-spark` via
+`anthropic_openai_responses_adapter`. The Spark-backed session initially made
+valid Bash calls, then degraded into `Bash` tool calls with empty inputs such as
+`call_y67sWAwSpPGbqb8DLmIAx6mT`, causing repeated missing-`command` validation
+errors and an empty final completion. Failing closed is safer than letting a
+tool-driven engineering agent continue on a target that cannot reliably preserve
+the Claude/Codex tool contract.
+
+**Why not upstream:** This is AAWM-specific alias policy for local Codex/Claude
+engineering workers and Antigravity-backed Claude access.
+
+**Validation status:** Focused tests cover Antigravity quota/auth failure for
+tool-bearing `aawm-code-anthropic` requests and prove neither the Spark adapter
+nor direct native Anthropic passthrough is called.
+
+---
+
 
 ## Dropped Patches
 
