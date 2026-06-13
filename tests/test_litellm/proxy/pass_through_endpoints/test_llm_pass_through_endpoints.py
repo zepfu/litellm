@@ -28,6 +28,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     _add_anthropic_auto_agent_alias_metadata,
     _add_codex_auto_agent_alias_metadata,
+    _antigravity_candidate_unavailable_detail,
     antigravity_proxy_route,
     _drop_tool_choice_without_tools_from_request_body,
     _drop_unsupported_codex_hosted_tools_from_request_body,
@@ -14687,6 +14688,106 @@ async def test_anthropic_sota_alias_does_not_fallback_after_opus_high_demand(
     mock_google_lane.assert_not_called()
 
 
+def test_antigravity_candidate_unavailable_detail_matches_not_logged_in_auth():
+    auth_error = HTTPException(
+        status_code=500,
+        detail=(
+            "Failed to get OAuth token: error getting token source from auth "
+            "provider: You are not logged into Antigravity."
+        ),
+    )
+    poll_error = HTTPException(
+        status_code=500,
+        detail={
+            "error": (
+                "Failed to poll ListExperiments: error getting token source: "
+                "You are not logged into Antigravity."
+            )
+        },
+    )
+
+    assert _antigravity_candidate_unavailable_detail(auth_error) == auth_error.detail
+    assert "not logged into Antigravity" in (
+        _antigravity_candidate_unavailable_detail(poll_error) or ""
+    )
+
+
+def test_antigravity_candidate_unavailable_detail_ignores_request_envelope_400():
+    request_shape_error = HTTPException(
+        status_code=400,
+        detail=(
+            "Antigravity adapter failed: INVALID_ARGUMENT "
+            "messages.1.content.1.tool_use.id: Field required"
+        ),
+    )
+
+    assert _antigravity_candidate_unavailable_detail(request_shape_error) is None
+
+
+@pytest.mark.asyncio
+async def test_anthropic_antigravity_completion_adapter_direct_preserves_not_logged_in_error():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "antigravity/claude-sonnet-4-6"
+    antigravity_auth_error = HTTPException(
+        status_code=500,
+        detail=(
+            "Failed to get OAuth token: error getting token source from auth "
+            "provider: You are not logged into Antigravity."
+        ),
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
+        new=AsyncMock(side_effect=antigravity_auth_error),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_google_completion_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="claude-sonnet-4-6",
+                adapter_provider="antigravity",
+                use_alias_candidate_probe=False,
+            )
+
+    assert exc_info.value is antigravity_auth_error
+
+
+@pytest.mark.asyncio
+async def test_anthropic_antigravity_completion_adapter_probe_preserves_request_envelope_400():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "antigravity/claude-sonnet-4-6"
+    request_shape_error = HTTPException(
+        status_code=400,
+        detail=(
+            "Antigravity adapter failed: INVALID_ARGUMENT "
+            "messages.1.content.1.tool_use.id: Field required"
+        ),
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
+        new=AsyncMock(side_effect=request_shape_error),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_google_completion_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="claude-sonnet-4-6",
+                adapter_provider="antigravity",
+                use_alias_candidate_probe=True,
+            )
+
+    assert exc_info.value is request_shape_error
+
+
 @pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigravity_429(
     monkeypatch,
@@ -14747,6 +14848,76 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
         "antigravity"
     )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_falls_back_after_antigravity_not_logged_in(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    antigravity_auth_error = HTTPException(
+        status_code=500,
+        detail=(
+            "Failed to get OAuth token: error getting token source from auth "
+            "provider: You are not logged into Antigravity."
+        ),
+    )
+    spark_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
+        new=AsyncMock(side_effect=antigravity_auth_error),
+    ) as mock_prepare_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(return_value=spark_success),
+    ) as mock_spark:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is spark_success
+    mock_prepare_antigravity.assert_awaited_once()
+    assert mock_prepare_antigravity.await_args.kwargs["adapter_model"] == (
+        "claude-sonnet-4-6"
+    )
+    assert mock_prepare_antigravity.await_args.kwargs["adapter_provider"] == (
+        "antigravity"
+    )
+    mock_spark.assert_awaited_once()
+    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
+    metadata = spark_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    assert metadata["anthropic_auto_agent_selected_route_family"] == (
+        "anthropic_openai_responses_adapter"
+    )
+    first_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert first_attempt["provider"] == "antigravity"
+    assert first_attempt["model"] == "claude-sonnet-4-6"
+    assert first_attempt["status"] == "cooldown_set"
+    assert first_attempt["cooldown_scope"] == "candidate"
+    assert first_attempt["error_class"] == "candidate_unavailable"
+    assert (
+        "aawm_codex_auto_agent_candidate_unavailable"
+        in first_attempt["error_tokens"]
+    )
+    skipped = metadata["anthropic_auto_agent_skipped_candidates"][0]
+    assert skipped["provider"] == "antigravity"
+    assert skipped["model"] == "claude-sonnet-4-6"
+    assert skipped["lane_key"] == "antigravity-lane"
 
 
 @pytest.mark.asyncio
