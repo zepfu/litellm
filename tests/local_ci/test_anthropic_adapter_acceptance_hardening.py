@@ -1037,6 +1037,7 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
         'model_providers.litellm-dev.http_headers.session_id="pytest-classifier.session"'
         in config_values
     )
+    assert case_config["match_trace_session_id_from_stdout"] is False
     assert (
         'model_providers.litellm-dev.http_headers.x-aawm-tenant-id="adapter-harness-tenant"'
         in config_values
@@ -1240,6 +1241,7 @@ def test_codex_tool_activity_parity_cases_have_stream_state_gates():
         in config["default_excluded_cases"]
     )
     assert native_case["cli_passthrough"] == "codex"
+    assert native_case["match_trace_session_id_from_stdout"] is False
     assert "pwd" in native_case["command"][-1]
     assert "responses_stream_tool_call_count" in native_case[
         "required_generation_metadata_minimums"
@@ -1296,6 +1298,7 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
         expected_client_name="codex_exec",
     )
     _assert_codex_rate_limit_validation(case_config)
+    assert case_config["match_trace_session_id_from_stdout"] is False
     assert "codex-tool-description-patch" in case_config["required_trace_tags"]
     assert (
         "codex-tool-description-patch:spawn-agent-fanout-policy"
