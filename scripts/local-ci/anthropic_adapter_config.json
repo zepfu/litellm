@@ -420,6 +420,7 @@
         "Reply with exactly two words: native codex"
       ],
       "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
@@ -569,6 +570,7 @@
         "Use the shell tool exactly once to run pwd. Return only the working directory path."
       ],
       "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": false,
       "require_trace_ids_distinct_from_session_ids": true,
       "post_run_wait_seconds": 2,
       "allowed_generation_routes": [
