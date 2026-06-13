@@ -4160,6 +4160,182 @@ def _google_content_has_text(content_block: Any) -> bool:
     return _estimate_google_content_text_chars(content_block) > 0
 
 
+def _google_content_has_function_exchange(content_block: Any) -> bool:
+    if not isinstance(content_block, dict):
+        return False
+    parts = content_block.get("parts")
+    if not isinstance(parts, list):
+        return False
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if isinstance(part.get("functionCall"), dict) or isinstance(
+            part.get("function_call"), dict
+        ):
+            return True
+        if isinstance(part.get("functionResponse"), dict) or isinstance(
+            part.get("function_response"), dict
+        ):
+            return True
+    return False
+
+
+def _google_content_function_call_ids(content_block: Any) -> set[str]:
+    if not isinstance(content_block, dict):
+        return set()
+    parts = content_block.get("parts")
+    if not isinstance(parts, list):
+        return set()
+    function_call_ids: set[str] = set()
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        function_call = part.get("functionCall")
+        if not isinstance(function_call, dict):
+            function_call = part.get("function_call")
+        if not isinstance(function_call, dict):
+            continue
+        function_call_id = function_call.get("id")
+        if isinstance(function_call_id, str) and function_call_id.strip():
+            function_call_ids.add(function_call_id.strip())
+    return function_call_ids
+
+
+def _google_content_function_response_ids(content_block: Any) -> set[str]:
+    if not isinstance(content_block, dict):
+        return set()
+    parts = content_block.get("parts")
+    if not isinstance(parts, list):
+        return set()
+    function_response_ids: set[str] = set()
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        function_response = part.get("functionResponse")
+        if not isinstance(function_response, dict):
+            function_response = part.get("function_response")
+        if not isinstance(function_response, dict):
+            continue
+        response_payload = function_response.get("response")
+        nested_tool_use_id = (
+            response_payload.get("tool_use_id")
+            if isinstance(response_payload, dict)
+            else None
+        )
+        for candidate in (function_response.get("id"), nested_tool_use_id):
+            if isinstance(candidate, str) and candidate.strip():
+                function_response_ids.add(candidate.strip())
+    return function_response_ids
+
+
+def _selected_google_contents_have_paired_function_responses(
+    contents: list[Any],
+    selected_indices: list[int],
+) -> bool:
+    seen_function_call_ids: set[str] = set()
+    for index in selected_indices:
+        content = contents[index]
+        response_ids = _google_content_function_response_ids(content)
+        if response_ids and not response_ids.issubset(seen_function_call_ids):
+            return False
+        seen_function_call_ids.update(_google_content_function_call_ids(content))
+    return True
+
+
+def _find_prior_google_function_call_content_index(
+    contents: list[Any],
+    *,
+    before_index: int,
+    function_response_id: str,
+) -> Optional[int]:
+    for index in range(before_index - 1, -1, -1):
+        if function_response_id in _google_content_function_call_ids(contents[index]):
+            return index
+    return None
+
+
+def _add_required_google_function_call_pair_indices(
+    contents: list[Any],
+    selected_indices: list[int],
+) -> list[int]:
+    selected_index_set = set(selected_indices)
+    for index in list(selected_indices):
+        for function_response_id in _google_content_function_response_ids(
+            contents[index]
+        ):
+            if any(
+                function_response_id in _google_content_function_call_ids(
+                    contents[prior_index]
+                )
+                for prior_index in selected_indices
+                if prior_index < index
+            ):
+                continue
+            paired_index = _find_prior_google_function_call_content_index(
+                contents,
+                before_index=index,
+                function_response_id=function_response_id,
+            )
+            if paired_index is not None:
+                selected_index_set.add(paired_index)
+    return sorted(selected_index_set)
+
+
+def _trim_google_content_indices_to_window(
+    contents: list[Any],
+    selected_indices: list[int],
+    *,
+    protected_text_indices: set[int],
+    max_window: int,
+) -> list[int]:
+    selected_indices = list(selected_indices)
+    while len(selected_indices) > max_window:
+        removed = False
+        for position, index in enumerate(selected_indices):
+            if index in protected_text_indices:
+                continue
+            trial_indices = (
+                selected_indices[:position] + selected_indices[position + 1 :]
+            )
+            if _selected_google_contents_have_paired_function_responses(
+                contents,
+                trial_indices,
+            ):
+                selected_indices = trial_indices
+                removed = True
+                break
+        if removed:
+            continue
+
+        removable_position = next(
+            (
+                position
+                for position, index in enumerate(selected_indices)
+                if index not in protected_text_indices
+            ),
+            0,
+        )
+        selected_indices.pop(removable_position)
+
+    while not _selected_google_contents_have_paired_function_responses(
+        contents,
+        selected_indices,
+    ):
+        for position, index in enumerate(selected_indices):
+            response_ids = _google_content_function_response_ids(contents[index])
+            if not response_ids:
+                continue
+            prior_call_ids: set[str] = set()
+            for prior_index in selected_indices[:position]:
+                prior_call_ids.update(_google_content_function_call_ids(contents[prior_index]))
+            if not response_ids.issubset(prior_call_ids):
+                selected_indices.pop(position)
+                break
+        else:
+            break
+    return selected_indices
+
+
 def _get_google_adapter_oversized_text_part_char_cap() -> int:
     raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_OVERSIZED_TEXT_PART_CHAR_CAP"))
     if raw_value is None:
@@ -4551,19 +4727,28 @@ def _apply_google_adapter_contents_window_policy(request_block: dict[str, Any]) 
     selected_indices = list(range(max(0, original_count - max_window), original_count))
     text_indices = [idx for idx, item in enumerate(contents) if _google_content_has_text(item)]
     protected_text_indices = text_indices[-2:]
-    if protected_text_indices:
-        selected_indices = sorted(set(protected_text_indices + selected_indices))
-        if len(selected_indices) > max_window:
-            selected_indices = selected_indices[-max_window:]
-            if not set(protected_text_indices).issubset(set(selected_indices)):
-                tail_count = max(0, max_window - len(protected_text_indices))
-                selected_indices = sorted(set(protected_text_indices + selected_indices[-tail_count:]))
-                if len(selected_indices) > max_window:
-                    selected_indices = selected_indices[-max_window:]
+    protected_text_index_set = set(protected_text_indices)
+    selected_indices = _add_required_google_function_call_pair_indices(
+        contents,
+        sorted(set(protected_text_indices + selected_indices)),
+    )
+    protected_indices = sorted(
+        index
+        for index in selected_indices
+        if _google_content_has_function_exchange(contents[index])
+        or index in protected_text_index_set
+    )
+    if protected_indices:
+        selected_indices = _trim_google_content_indices_to_window(
+            contents,
+            selected_indices,
+            protected_text_indices=protected_text_index_set,
+            max_window=max_window,
+        )
 
     trimmed_contents = [contents[idx] for idx in selected_indices]
     protected_positions = {
-        pos for pos, idx in enumerate(selected_indices) if idx in set(protected_text_indices)
+        pos for pos, idx in enumerate(selected_indices) if idx in set(protected_indices)
     }
     trimmed_text_chars = sum(_estimate_google_content_text_chars(item) for item in trimmed_contents)
     while len(trimmed_contents) > 2 and trimmed_text_chars > max_text_chars:
@@ -4593,6 +4778,9 @@ def _apply_google_adapter_contents_window_policy(request_block: dict[str, Any]) 
         "trimmed_contents_max_window": max_window,
         "trimmed_contents_max_text_chars": max_text_chars,
         "trimmed_contents_preserved_text_entries": len(protected_text_indices),
+        "trimmed_contents_preserved_function_exchange_entries": len(
+            [idx for idx in selected_indices if _google_content_has_function_exchange(contents[idx])]
+        ),
     }
 
 
@@ -6352,6 +6540,449 @@ def _normalize_codex_openai_chat_kwargs_for_google_code_assist(
     }
 
 
+def _is_anthropic_tool_use_content_block(block: Any) -> bool:
+    return isinstance(block, dict) and block.get("type") == "tool_use"
+
+
+def _is_anthropic_tool_result_content_block(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    block_type = block.get("type")
+    return block_type == "tool_result" or (
+        isinstance(block_type, str) and block_type.endswith("_tool_result")
+    )
+
+
+def _has_codex_google_code_assist_anthropic_tool_replay_blocks(
+    messages: list[Any],
+) -> bool:
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            _is_anthropic_tool_use_content_block(block)
+            or _is_anthropic_tool_result_content_block(block)
+            for block in content
+        ):
+            return True
+    return False
+
+
+def _codex_google_code_assist_tool_result_content_to_openai_content(
+    content: Any,
+) -> Any:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+                continue
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        if text_parts:
+            return "".join(text_parts)
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except Exception:
+        return str(content)
+
+
+def _codex_google_code_assist_anthropic_tool_use_to_openai_tool_call(
+    *,
+    block: dict[str, Any],
+    message_index: int,
+    content_index: int,
+) -> dict[str, Any]:
+    tool_use_id = block.get("id")
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid Anthropic tool_use block at "
+                f"messages.{message_index}.content.{content_index}: "
+                "missing required non-empty string tool_use.id"
+            ),
+        )
+    tool_input = block.get("input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    return {
+        "id": tool_use_id.strip(),
+        "type": "function",
+        "function": {
+            "name": str(block.get("name") or ""),
+            "arguments": json.dumps(tool_input, ensure_ascii=False),
+        },
+    }
+
+
+def _normalize_codex_google_code_assist_anthropic_assistant_message(
+    *,
+    message: dict[str, Any],
+    message_index: int,
+) -> tuple[dict[str, Any], int]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message, 0
+
+    updated_message = dict(message)
+    existing_tool_calls = updated_message.get("tool_calls")
+    tool_calls = list(existing_tool_calls) if isinstance(existing_tool_calls, list) else []
+    text_parts: list[dict[str, Any]] = []
+    converted_tool_use_count = 0
+    for content_index, block in enumerate(content):
+        if _is_anthropic_tool_use_content_block(block):
+            tool_calls.append(
+                _codex_google_code_assist_anthropic_tool_use_to_openai_tool_call(
+                    block=cast(dict[str, Any], block),
+                    message_index=message_index,
+                    content_index=content_index,
+                )
+            )
+            converted_tool_use_count += 1
+            continue
+        if isinstance(block, dict) and block.get("type") == "text":
+            text_parts.append(
+                {
+                    "type": "text",
+                    "text": str(block.get("text") or ""),
+                }
+            )
+
+    updated_message["tool_calls"] = tool_calls
+    if text_parts:
+        updated_message["content"] = (
+            text_parts[0]["text"] if len(text_parts) == 1 else text_parts
+        )
+    else:
+        updated_message["content"] = None
+    return updated_message, converted_tool_use_count
+
+
+def _codex_google_code_assist_anthropic_tool_result_to_openai_tool_message(
+    *,
+    block: dict[str, Any],
+    message_index: int,
+    content_index: int,
+) -> dict[str, Any]:
+    tool_use_id = block.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid Anthropic tool_result block at "
+                f"messages.{message_index}.content.{content_index}: "
+                "missing required non-empty string tool_result.tool_use_id"
+            ),
+        )
+    tool_message = {
+        "role": "tool",
+        "tool_call_id": tool_use_id.strip(),
+        "content": _codex_google_code_assist_tool_result_content_to_openai_content(
+            block.get("content")
+        ),
+    }
+    cache_control = block.get("cache_control")
+    if cache_control is not None:
+        tool_message["cache_control"] = cache_control
+    return tool_message
+
+
+def _normalize_codex_google_code_assist_anthropic_user_message(
+    *,
+    message: dict[str, Any],
+    message_index: int,
+) -> tuple[list[dict[str, Any]], int]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return [message], 0
+
+    remaining_user_content: list[Any] = []
+    normalized_messages: list[dict[str, Any]] = []
+    converted_tool_result_count = 0
+    for content_index, block in enumerate(content):
+        if not _is_anthropic_tool_result_content_block(block):
+            remaining_user_content.append(block)
+            continue
+        normalized_messages.append(
+            _codex_google_code_assist_anthropic_tool_result_to_openai_tool_message(
+                block=cast(dict[str, Any], block),
+                message_index=message_index,
+                content_index=content_index,
+            )
+        )
+        converted_tool_result_count += 1
+
+    if remaining_user_content:
+        updated_message = dict(message)
+        updated_message["content"] = remaining_user_content
+        normalized_messages.append(updated_message)
+    return normalized_messages, converted_tool_result_count
+
+
+def _build_codex_google_code_assist_anthropic_replay_changes(
+    *,
+    repaired_count: int,
+    converted_tool_use_count: int,
+    converted_tool_result_count: int,
+) -> dict[str, Any]:
+    changes: dict[str, Any] = {}
+    if repaired_count:
+        changes["google_adapter_codex_repaired_anthropic_tool_replay_id_count"] = (
+            repaired_count
+        )
+    if converted_tool_use_count:
+        changes["google_adapter_codex_converted_anthropic_tool_use_count"] = (
+            converted_tool_use_count
+        )
+    if converted_tool_result_count:
+        changes["google_adapter_codex_converted_anthropic_tool_result_count"] = (
+            converted_tool_result_count
+        )
+    return changes
+
+
+def _normalize_codex_google_code_assist_anthropic_tool_replay(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list) or not _has_codex_google_code_assist_anthropic_tool_replay_blocks(
+        messages
+    ):
+        return completion_kwargs, {}
+
+    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+        LiteLLMAnthropicMessagesAdapter,
+    )
+
+    repaired_messages, repaired_count = (
+        LiteLLMAnthropicMessagesAdapter.repair_missing_anthropic_tool_use_ids(
+            messages
+        )
+    )
+
+    normalized_messages: list[Any] = []
+    converted_tool_use_count = 0
+    converted_tool_result_count = 0
+
+    for message_index, message in enumerate(repaired_messages):
+        if not isinstance(message, dict):
+            normalized_messages.append(message)
+            continue
+
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(content, list):
+            normalized_messages.append(message)
+            continue
+
+        if role == "assistant" and any(
+            _is_anthropic_tool_use_content_block(block) for block in content
+        ):
+            updated_message, message_tool_use_count = (
+                _normalize_codex_google_code_assist_anthropic_assistant_message(
+                    message=message,
+                    message_index=message_index,
+                )
+            )
+            converted_tool_use_count += message_tool_use_count
+            normalized_messages.append(updated_message)
+            continue
+
+        if role == "user" and any(
+            _is_anthropic_tool_result_content_block(block) for block in content
+        ):
+            new_messages, message_tool_result_count = (
+                _normalize_codex_google_code_assist_anthropic_user_message(
+                    message=message,
+                    message_index=message_index,
+                )
+            )
+            normalized_messages.extend(new_messages)
+            converted_tool_result_count += message_tool_result_count
+            continue
+
+        normalized_messages.append(message)
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["messages"] = normalized_messages
+    return updated_kwargs, _build_codex_google_code_assist_anthropic_replay_changes(
+        repaired_count=repaired_count,
+        converted_tool_use_count=converted_tool_use_count,
+        converted_tool_result_count=converted_tool_result_count,
+    )
+
+
+def _deterministic_codex_google_code_assist_tool_call_id(
+    *,
+    message_index: int,
+    tool_call_index: int,
+    tool_call: dict[str, Any],
+) -> str:
+    try:
+        seed_payload = json.dumps(tool_call, sort_keys=True, default=str)
+    except Exception:
+        seed_payload = str(tool_call)
+    seed = "|".join(
+        (
+            "codex-google-code-assist-tool-call-id",
+            str(message_index),
+            str(tool_call_index),
+            seed_payload,
+        )
+    )
+    return f"call_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:28]}"
+
+
+def _next_codex_google_code_assist_tool_messages(
+    messages: list[Any],
+    *,
+    message_index: int,
+) -> list[tuple[int, dict[str, Any]]]:
+    next_tool_messages: list[tuple[int, dict[str, Any]]] = []
+    for next_index in range(message_index + 1, len(messages)):
+        next_message = messages[next_index]
+        if not isinstance(next_message, dict):
+            continue
+        if next_message.get("role") == "assistant":
+            break
+        if next_message.get("role") == "tool":
+            next_tool_messages.append((next_index, next_message))
+    return next_tool_messages
+
+
+def _paired_codex_google_code_assist_tool_message(
+    next_tool_messages: list[tuple[int, dict[str, Any]]],
+    *,
+    tool_call_index: int,
+) -> tuple[int, dict[str, Any]] | None:
+    if tool_call_index < len(next_tool_messages):
+        return next_tool_messages[tool_call_index]
+    return None
+
+
+def _repair_codex_google_code_assist_tool_call_id(
+    *,
+    message_index: int,
+    tool_call_index: int,
+    tool_call: dict[str, Any],
+    paired_tool_message: tuple[int, dict[str, Any]] | None,
+    copy_message_at: Callable[[int], Optional[dict[str, Any]]],
+) -> bool:
+    existing_id = tool_call.get("id")
+    if isinstance(existing_id, str) and existing_id.strip():
+        return False
+
+    paired_tool_call_id = (
+        paired_tool_message[1].get("tool_call_id")
+        if paired_tool_message is not None
+        else None
+    )
+    repaired_id = (
+        paired_tool_call_id.strip()
+        if isinstance(paired_tool_call_id, str) and paired_tool_call_id.strip()
+        else _deterministic_codex_google_code_assist_tool_call_id(
+            message_index=message_index,
+            tool_call_index=tool_call_index,
+            tool_call=tool_call,
+        )
+    )
+
+    assistant_copy = copy_message_at(message_index)
+    if assistant_copy is None:
+        return False
+    copied_tool_calls = assistant_copy.get("tool_calls")
+    if not isinstance(copied_tool_calls, list):
+        return False
+    copied_tool_call = copied_tool_calls[tool_call_index]
+    if not isinstance(copied_tool_call, dict):
+        return False
+    copied_tool_call["id"] = repaired_id
+
+    if paired_tool_message is not None and not (
+        isinstance(paired_tool_call_id, str) and paired_tool_call_id.strip()
+    ):
+        tool_message_copy = copy_message_at(paired_tool_message[0])
+        if tool_message_copy is not None:
+            tool_message_copy["tool_call_id"] = repaired_id
+
+    return True
+
+
+def _repair_codex_google_code_assist_openai_tool_call_ids(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return completion_kwargs, {}
+
+    updated_messages = list(messages)
+    copied_messages: set[int] = set()
+    repaired_count = 0
+
+    def copy_message_at(index: int) -> Optional[dict[str, Any]]:
+        message = updated_messages[index]
+        if not isinstance(message, dict):
+            return None
+        if index not in copied_messages:
+            message = dict(message)
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                message["tool_calls"] = [
+                    dict(tool_call) if isinstance(tool_call, dict) else tool_call
+                    for tool_call in tool_calls
+                ]
+            updated_messages[index] = message
+            copied_messages.add(index)
+        return cast(dict[str, Any], message)
+
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+
+        next_tool_messages = _next_codex_google_code_assist_tool_messages(
+            messages,
+            message_index=message_index,
+        )
+
+        for tool_call_index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            repaired = _repair_codex_google_code_assist_tool_call_id(
+                message_index=message_index,
+                tool_call_index=tool_call_index,
+                tool_call=tool_call,
+                paired_tool_message=_paired_codex_google_code_assist_tool_message(
+                    next_tool_messages,
+                    tool_call_index=tool_call_index,
+                ),
+                copy_message_at=copy_message_at,
+            )
+            if repaired:
+                repaired_count += 1
+
+    if repaired_count == 0:
+        return completion_kwargs, {}
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["messages"] = updated_messages
+    return updated_kwargs, {
+        "google_adapter_codex_repaired_openai_tool_call_id_count": repaired_count
+    }
+
+
 def _normalize_codex_google_code_assist_reasoning_effort(
     mappable_params: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -6540,6 +7171,83 @@ def _is_codex_google_code_assist_empty_text_content(content: Any) -> bool:
     return True
 
 
+def _previous_codex_google_code_assist_assistant_index(
+    messages: list[Any],
+    *,
+    before_index: int,
+) -> Optional[int]:
+    for candidate_index in range(before_index - 1, -1, -1):
+        candidate = messages[candidate_index]
+        if isinstance(candidate, dict) and candidate.get("role") == "assistant":
+            return candidate_index
+    return None
+
+
+def _build_codex_google_code_assist_synthetic_tool_call(
+    *,
+    tool_call_id: str,
+    function_name: str,
+    function_arguments: str,
+) -> dict[str, Any]:
+    return {
+        "id": tool_call_id,
+        "type": "function",
+        "function": {
+            "name": function_name,
+            "arguments": function_arguments,
+        },
+    }
+
+
+def _append_codex_google_code_assist_tool_call_to_assistant(
+    *,
+    assistant_message: dict[str, Any],
+    synthetic_tool_call: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    updated_assistant = dict(assistant_message)
+    tool_calls = updated_assistant.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    blank_text_suppressed = False
+    if _is_codex_google_code_assist_empty_text_content(
+        updated_assistant.get("content")
+    ):
+        updated_assistant.pop("content", None)
+        blank_text_suppressed = True
+    updated_assistant["tool_calls"] = [
+        *tool_calls,
+        synthetic_tool_call,
+    ]
+    return updated_assistant, blank_text_suppressed
+
+
+def _build_codex_google_code_assist_tool_pair_repair_changes(
+    *,
+    repaired_count: int,
+    inserted_count: int,
+    blank_text_suppressed_count: int,
+    repaired_names: set[str],
+) -> dict[str, Any]:
+    changes: dict[str, Any] = {
+        "google_adapter_codex_repaired_missing_tool_call_names": sorted(
+            repaired_names
+        ),
+    }
+    if repaired_count:
+        changes["google_adapter_codex_repaired_missing_tool_call_count"] = (
+            repaired_count
+        )
+    if inserted_count:
+        changes["google_adapter_codex_inserted_missing_tool_call_count"] = (
+            inserted_count
+        )
+    if blank_text_suppressed_count:
+        changes[
+            "google_adapter_codex_repaired_blank_tool_call_text_suppressed_count"
+        ] = blank_text_suppressed_count
+    return changes
+
+
 def _ensure_codex_google_code_assist_tool_results_have_calls(
     completion_kwargs: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -6549,85 +7257,92 @@ def _ensure_codex_google_code_assist_tool_results_have_calls(
 
     updated_messages = list(messages)
     repaired_count = 0
+    inserted_count = 0
     blank_text_suppressed_count = 0
     repaired_names: set[str] = set()
     fallback_tool_name = _infer_single_codex_google_code_assist_function_tool_name(
         completion_kwargs.get("tools")
     )
 
-    for index, message in enumerate(updated_messages):
+    index = 0
+    while index < len(updated_messages):
+        message = updated_messages[index]
         if not isinstance(message, dict) or message.get("role") != "tool":
+            index += 1
             continue
         tool_call_id = message.get("tool_call_id")
         if not isinstance(tool_call_id, str) or not tool_call_id:
+            index += 1
             continue
-        previous_assistant_index: Optional[int] = None
-        for candidate_index in range(index - 1, -1, -1):
-            candidate = updated_messages[candidate_index]
-            if isinstance(candidate, dict) and candidate.get("role") == "assistant":
-                previous_assistant_index = candidate_index
-                break
-        if previous_assistant_index is None:
-            continue
-
-        previous_assistant = updated_messages[previous_assistant_index]
-        if not isinstance(previous_assistant, dict):
-            continue
-        existing_tool_call_ids = _completion_message_tool_call_ids(previous_assistant)
-        if tool_call_id in existing_tool_call_ids:
-            continue
+        previous_assistant_index = _previous_codex_google_code_assist_assistant_index(
+            updated_messages,
+            before_index=index,
+        )
 
         function_name = (
             _lookup_codex_google_code_assist_tool_call_name(tool_call_id)
             or fallback_tool_name
         )
         if not function_name:
+            index += 1
             continue
         function_arguments = (
             _lookup_codex_google_code_assist_tool_call_arguments(tool_call_id)
             or "{}"
         )
+        synthetic_tool_call = _build_codex_google_code_assist_synthetic_tool_call(
+            tool_call_id=tool_call_id,
+            function_name=function_name,
+            function_arguments=function_arguments,
+        )
 
-        updated_assistant = dict(previous_assistant)
-        tool_calls = updated_assistant.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            tool_calls = []
-        if _is_codex_google_code_assist_empty_text_content(
-            updated_assistant.get("content")
-        ):
-            updated_assistant.pop("content", None)
-            blank_text_suppressed_count += 1
-        updated_assistant["tool_calls"] = [
-            *tool_calls,
-            {
-                "id": tool_call_id,
-                "type": "function",
-                "function": {
-                    "name": function_name,
-                    "arguments": function_arguments,
+        if previous_assistant_index is None:
+            updated_messages.insert(
+                index,
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [synthetic_tool_call],
                 },
-            },
-        ]
+            )
+            inserted_count += 1
+            repaired_names.add(function_name)
+            index += 2
+            continue
+
+        previous_assistant = updated_messages[previous_assistant_index]
+        if not isinstance(previous_assistant, dict):
+            index += 1
+            continue
+        existing_tool_call_ids = _completion_message_tool_call_ids(previous_assistant)
+        if tool_call_id in existing_tool_call_ids:
+            index += 1
+            continue
+
+        updated_assistant, blank_text_suppressed = (
+            _append_codex_google_code_assist_tool_call_to_assistant(
+                assistant_message=previous_assistant,
+                synthetic_tool_call=synthetic_tool_call,
+            )
+        )
+        if blank_text_suppressed:
+            blank_text_suppressed_count += 1
         updated_messages[previous_assistant_index] = updated_assistant
         repaired_count += 1
         repaired_names.add(function_name)
+        index += 1
 
-    if repaired_count == 0:
+    if repaired_count == 0 and inserted_count == 0:
         return completion_kwargs, {}
 
     updated_kwargs = dict(completion_kwargs)
     updated_kwargs["messages"] = updated_messages
-    changes: dict[str, Any] = {
-        "google_adapter_codex_repaired_missing_tool_call_count": repaired_count,
-        "google_adapter_codex_repaired_missing_tool_call_names": sorted(
-            repaired_names
-        ),
-    }
-    if blank_text_suppressed_count:
-        changes[
-            "google_adapter_codex_repaired_blank_tool_call_text_suppressed_count"
-        ] = blank_text_suppressed_count
-    return updated_kwargs, changes
+    return updated_kwargs, _build_codex_google_code_assist_tool_pair_repair_changes(
+        repaired_count=repaired_count,
+        inserted_count=inserted_count,
+        blank_text_suppressed_count=blank_text_suppressed_count,
+        repaired_names=repaired_names,
+    )
 
 
 async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR0915
@@ -6651,15 +7366,39 @@ async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR
         )
         (
             completion_kwargs,
+            codex_anthropic_tool_replay_changes,
+        ) = _normalize_codex_google_code_assist_anthropic_tool_replay(
+            completion_kwargs
+        )
+        (
+            completion_kwargs,
+            codex_openai_tool_call_id_changes,
+        ) = _repair_codex_google_code_assist_openai_tool_call_ids(
+            completion_kwargs
+        )
+        (
+            completion_kwargs,
             codex_tool_pair_changes,
         ) = _ensure_codex_google_code_assist_tool_results_have_calls(
             completion_kwargs
         )
         tool_name_mapping: dict[str, str] = {}
+        anthropic_native_tool_replay_changes: dict[str, Any] = {}
     else:
         from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
             LiteLLMMessagesToCompletionTransformationHandler,
         )
+
+        (
+            completion_kwargs,
+            anthropic_native_tool_use_id_repaired_count,
+        ) = _repair_anthropic_tool_use_ids_for_passthrough(completion_kwargs)
+        _validate_anthropic_tool_blocks_for_passthrough(completion_kwargs)
+        anthropic_native_tool_replay_changes = {}
+        if anthropic_native_tool_use_id_repaired_count:
+            anthropic_native_tool_replay_changes[
+                "google_adapter_repaired_anthropic_native_tool_use_id_count"
+            ] = anthropic_native_tool_use_id_repaired_count
 
         completion_kwargs, tool_name_mapping = (
             LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
@@ -6693,6 +7432,8 @@ async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR
         )
         openai_chat_shape_changes = {}
         codex_tool_pair_changes = {}
+        codex_anthropic_tool_replay_changes = {}
+        codex_openai_tool_call_id_changes = {}
     completion_kwargs, thinking_max_tokens_changes = _normalize_google_code_assist_thinking_max_tokens(
         completion_kwargs
     )
@@ -6770,6 +7511,19 @@ async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR
         cached_content=None,
     )
     google_request_dict = _normalize_google_code_assist_httpx_payload(dict(google_request))
+    claude_tool_response_id_changes = (
+        _annotate_google_code_assist_claude_tool_response_ids(
+            google_request_dict,
+            completion_messages,
+            google_model=google_model,
+        )
+    )
+    claude_tool_pair_changes = (
+        _insert_google_code_assist_missing_claude_function_call_pairs(
+            google_request_dict,
+            google_model=google_model,
+        )
+    )
     duplicate_tool_response_changes = (
         _annotate_google_code_assist_duplicate_tool_responses(
             google_request_dict,
@@ -6818,10 +7572,15 @@ async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR
     completion_message_window_changes = {
         **completion_message_window_changes,
         **openai_chat_shape_changes,
+        **codex_anthropic_tool_replay_changes,
+        **codex_openai_tool_call_id_changes,
         **codex_tool_pair_changes,
+        **anthropic_native_tool_replay_changes,
         **reasoning_effort_policy_changes,
         **thinking_max_tokens_changes,
         **native_tool_alias_changes,
+        **claude_tool_response_id_changes,
+        **claude_tool_pair_changes,
         **duplicate_tool_response_changes,
         **system_prompt_policy_changes,
         **codex_tool_contract_policy_changes,
@@ -7678,6 +8437,8 @@ def _google_code_assist_duplicate_tool_results_from_completion_messages(
 def _annotate_google_code_assist_duplicate_tool_response_parts(
     contents: list[Any],
     duplicate_tool_results: list[tuple[str, str]],
+    *,
+    annotate_function_response_id: bool = False,
 ) -> int:
     annotated_count = 0
     pending_index = 0
@@ -7702,6 +8463,8 @@ def _annotate_google_code_assist_duplicate_tool_response_parts(
             if not isinstance(response_payload, dict):
                 response_payload = {}
                 function_response["response"] = response_payload
+            if annotate_function_response_id:
+                function_response.setdefault("id", tool_call_id)
             response_payload.setdefault("tool_use_id", tool_call_id)
             annotated_count += 1
             pending_index += 1
@@ -7733,6 +8496,179 @@ def _annotate_google_code_assist_duplicate_tool_responses(
         return {}
     return {
         "google_adapter_annotated_duplicate_tool_response_count": annotated_count,
+    }
+
+
+def _google_code_assist_tool_results_from_completion_messages(
+    completion_messages: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    tool_results: list[tuple[str, str]] = []
+    pending_tool_calls_by_id: dict[str, str] = {}
+
+    for message in completion_messages:
+        role = message.get("role")
+        if role == "assistant":
+            pending_tool_calls_by_id.clear()
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_call_id = tool_call.get("id")
+                function = tool_call.get("function")
+                if not isinstance(tool_call_id, str) or not isinstance(function, dict):
+                    continue
+                function_name = function.get("name")
+                if isinstance(function_name, str) and function_name:
+                    pending_tool_calls_by_id[tool_call_id] = function_name
+            continue
+
+        if role != "tool":
+            pending_tool_calls_by_id.clear()
+            continue
+
+        tool_call_id = message.get("tool_call_id")
+        if not isinstance(tool_call_id, str):
+            continue
+        function_name = pending_tool_calls_by_id.get(tool_call_id)
+        if isinstance(function_name, str) and function_name:
+            tool_results.append((function_name, tool_call_id))
+
+    return tool_results
+
+
+def _annotate_google_code_assist_claude_tool_response_ids(
+    google_request_dict: dict[str, Any],
+    completion_messages: list[dict[str, Any]],
+    *,
+    google_model: str,
+) -> dict[str, Any]:
+    if "claude" not in google_model.lower():
+        return {}
+
+    tool_results = _google_code_assist_tool_results_from_completion_messages(
+        completion_messages
+    )
+    if not tool_results:
+        return {}
+
+    contents = google_request_dict.get("contents")
+    if not isinstance(contents, list):
+        return {}
+
+    annotated_count = _annotate_google_code_assist_duplicate_tool_response_parts(
+        contents,
+        tool_results,
+        annotate_function_response_id=True,
+    )
+    if annotated_count == 0:
+        return {}
+    return {
+        "google_adapter_annotated_claude_tool_response_id_count": annotated_count,
+    }
+
+
+def _google_code_assist_function_response_id(
+    function_response: dict[str, Any],
+) -> Optional[str]:
+    response_payload = function_response.get("response")
+    response_tool_use_id = (
+        response_payload.get("tool_use_id")
+        if isinstance(response_payload, dict)
+        else None
+    )
+    for candidate in (function_response.get("id"), response_tool_use_id):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _google_code_assist_function_call_args_for_id(tool_call_id: str) -> dict[str, Any]:
+    cached_arguments = _lookup_codex_google_code_assist_tool_call_arguments(tool_call_id)
+    if not isinstance(cached_arguments, str) or not cached_arguments.strip():
+        return {}
+    try:
+        parsed_arguments = json.loads(cached_arguments)
+    except Exception:
+        return {}
+    return parsed_arguments if isinstance(parsed_arguments, dict) else {}
+
+
+def _insert_google_code_assist_missing_claude_function_call_pairs(
+    google_request_dict: dict[str, Any],
+    *,
+    google_model: str,
+) -> dict[str, Any]:
+    if "claude" not in google_model.lower():
+        return {}
+
+    contents = google_request_dict.get("contents")
+    if not isinstance(contents, list):
+        return {}
+
+    updated_contents: list[Any] = []
+    seen_function_call_ids: set[str] = set()
+    inserted_count = 0
+
+    for content in contents:
+        if not isinstance(content, dict):
+            updated_contents.append(content)
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            updated_contents.append(content)
+            continue
+
+        missing_function_call_parts: list[dict[str, Any]] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            function_call = part.get("functionCall")
+            if isinstance(function_call, dict):
+                function_call_id = function_call.get("id")
+                if isinstance(function_call_id, str) and function_call_id.strip():
+                    seen_function_call_ids.add(function_call_id.strip())
+                continue
+
+            function_response = part.get("functionResponse")
+            if not isinstance(function_response, dict):
+                continue
+            tool_call_id = _google_code_assist_function_response_id(function_response)
+            function_name = function_response.get("name")
+            if (
+                not isinstance(tool_call_id, str)
+                or not isinstance(function_name, str)
+                or not function_name
+                or tool_call_id in seen_function_call_ids
+            ):
+                continue
+            missing_function_call_parts.append(
+                {
+                    "functionCall": {
+                        "name": function_name,
+                        "args": _google_code_assist_function_call_args_for_id(
+                            tool_call_id
+                        ),
+                        "id": tool_call_id,
+                    }
+                }
+            )
+            seen_function_call_ids.add(tool_call_id)
+            inserted_count += 1
+
+        if missing_function_call_parts:
+            updated_contents.append(
+                {"role": "model", "parts": missing_function_call_parts}
+            )
+        updated_contents.append(content)
+
+    if inserted_count == 0:
+        return {}
+
+    google_request_dict["contents"] = updated_contents
+    return {
+        "google_adapter_inserted_claude_function_call_pair_count": inserted_count
     }
 
 
