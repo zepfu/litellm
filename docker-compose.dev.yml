@@ -33,6 +33,7 @@ services:
       - ./litellm/types/llms/anthropic.py:/app/litellm/types/llms/anthropic.py
       - ./litellm/types/llms/anthropic_messages/anthropic_response.py:/app/litellm/types/llms/anthropic_messages/anthropic_response.py
       - ./litellm/types/llms/openai.py:/app/litellm/types/llms/openai.py
+      - ./litellm/types/llms/vertex_ai.py:/app/litellm/types/llms/vertex_ai.py
       - ./litellm/types/utils.py:/app/litellm/types/utils.py
       - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
       - ./litellm/llms/base_llm/rerank/transformation.py:/app/litellm/llms/base_llm/rerank/transformation.py

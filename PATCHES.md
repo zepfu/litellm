@@ -2590,7 +2590,7 @@ verifying the prod container reports `aawm-litellm-control-plane=0.0.8`.
 
 ---
 
-### aawm.D1-246 — Repair Claude tool_use ids in Antigravity/Vertex replay
+### aawm.D1-246/D1-247 — Repair Claude tool_use ids in Antigravity/Vertex replay
 
 **What changed:** Anthropic pass-through request preparation now repairs
 assistant `tool_use` content blocks that arrive without a non-empty `id`, using
@@ -2598,12 +2598,19 @@ the paired `tool_result.tool_use_id` when present and a deterministic local id
 otherwise. The Anthropic-to-OpenAI adapter applies the same repair before
 Google/Antigravity request construction, and Claude-target Gemini function-call
 parts now carry the repaired id as `functionCall.id` so the Antigravity/Vertex
-Claude backend receives a complete multi-turn tool envelope.
+Claude backend receives a complete multi-turn tool envelope. The reverse
+Gemini/Vertex response transform also preserves upstream `functionCall.id`
+when converting tool calls back into OpenAI/Anthropic-compatible responses, so
+the first streamed tool-use turn gives Claude clients an id they can replay on
+the follow-up request. The local dev compose file mounts
+`litellm/types/llms/vertex_ai.py` to keep request/response shape types aligned
+with live-mounted serializer code after restart-only validation.
 
 **Why:** Subagent canaries were dying on their second model request with
 `messages.1.content.1.tool_use.id: Field required` because the replayed first
 assistant turn reached the Vertex/Antigravity serializer without the required
-Claude `tool_use.id`.
+Claude `tool_use.id`. The initial request-side repair did not cover the
+response-parser leg that feeds ids back to streaming Anthropic clients.
 
 **Why not upstream:** This protects AAWM's Anthropic-compatible
 Antigravity/Code Assist adapter flow and its Claude-backed alias candidates.
@@ -2612,8 +2619,9 @@ added for Claude-like adapter models.
 
 **Validation status:** Focused tests cover proxy repair/preservation,
 Anthropic-to-OpenAI adapter repair, Claude-target builder serialization, normal
-Gemini no-id behavior, non-adjacent `tool_result` pairing, and response-side
-fallback id generation.
+Gemini no-id behavior, non-adjacent `tool_result` pairing, response-side
+fallback id generation, and Vertex/Gemini response transform preservation of
+upstream `functionCall.id`.
 
 ---
 
