@@ -659,6 +659,307 @@ class TestTranslateMessagesToResponsesInput:
         result = _translate_messages(messages)
         assert result == []
 
+    @pytest.mark.parametrize(
+        (
+            "candidate",
+            "tool_name",
+            "tool_call_id",
+            "tool_input",
+            "required_tool_keys",
+            "tool_result_payload",
+            "expected_tool_schema_required",
+            "tool_schema_properties",
+        ),
+        [
+            pytest.param(
+                "gpt-5.1-codex-max",
+                "get_weather",
+                "call_weather_01",
+                {"location": "Boston", "units": "metric", "include_hourly": False},
+                {"location", "include_hourly"},
+                "Sunny, 68F",
+                ["location", "include_hourly"],
+                {
+                    "location": {"type": "string"},
+                    "units": {"type": "string"},
+                    "include_hourly": {"type": "boolean"},
+                },
+                id="openai-gpt5.1-codex-max-tool-roundtrip",
+            ),
+            pytest.param(
+                "xai/grok-2.5-fast",
+                "search_repo",
+                "call_repo_02",
+                {"path": "/tmp", "query": "adapter", "limit": 10},
+                {"path", "query"},
+                "Found 3 matches",
+                ["path", "query", "limit"],
+                {
+                    "path": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                id="xai-grok-2.5-fast-tool-roundtrip",
+            ),
+            pytest.param(
+                "xai/grok-build",
+                "summarize_text",
+                "call_summarize_03",
+                {"text": "Tooling details", "style": "brief", "max_chars": 120},
+                {"text"},
+                "Concise summary ready.",
+                ["text", "style", "max_chars"],
+                {
+                    "text": {"type": "string"},
+                    "style": {"type": "string"},
+                    "max_chars": {"type": "integer"},
+                },
+                id="xai-grok-build-tool-roundtrip",
+            ),
+        ],
+    )
+    def test_tool_use_round_trip_preserves_calls_and_results_generic_responses_path(
+        self,
+        candidate: str,
+        tool_name: str,
+        tool_call_id: str,
+        tool_input: Dict[str, Any],
+        required_tool_keys: set[str],
+        tool_result_payload: str,
+        expected_tool_schema_required: List[str],
+        tool_schema_properties: Dict[str, Dict[str, str]],
+    ):
+        """Tool use/result round-trip is stable for OpenAI/xAI Responses candidates."""
+        request = _make_request(
+            model=candidate,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "input": tool_input,
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": tool_result_payload,
+                        }
+                    ],
+                },
+            ],
+            tools=[
+                {
+                    "name": tool_name,
+                    "description": f"Call {tool_name}.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": tool_schema_properties,
+                        "required": expected_tool_schema_required,
+                    },
+                }
+            ],
+        )
+
+        translated = _ADAPTER.translate_request(request)
+
+        function_calls = [
+            item for item in translated["input"] if item.get("type") == "function_call"
+        ]
+        assert len(function_calls) == 1
+        function_call = function_calls[0]
+        assert function_call["name"] == tool_name
+        assert function_call["call_id"] == tool_call_id
+        assert json.loads(function_call["arguments"]) == tool_input
+
+        call_outputs = [
+            item
+            for item in translated["input"]
+            if item.get("type") == "function_call_output"
+        ]
+        assert len(call_outputs) == 1
+        assert call_outputs[0]["call_id"] == tool_call_id
+        assert call_outputs[0]["output"] == tool_result_payload
+
+        returned = _ADAPTER.translate_response(
+            _make_mock_response(
+                output=[
+                    _make_function_call_item(
+                        tool_call_id,
+                        tool_name,
+                        json.dumps(tool_input),
+                    )
+                ],
+                model=candidate,
+            )
+        )
+        tool_use_blocks = [item for item in returned["content"] if item["type"] == "tool_use"]
+        assert len(tool_use_blocks) == 1
+        tool_use = tool_use_blocks[0]
+        assert tool_use["type"] == "tool_use"
+        assert tool_use["id"] == tool_call_id
+        assert tool_use["name"] == tool_name
+        assert tool_use["input"] == tool_input
+
+        for key in required_tool_keys:
+            assert key in tool_input
+            assert key in tool_use["input"]
+            assert tool_use["input"][key] == tool_input[key]
+
+        # Tools are preserved with their declared required argument lists
+        assert translated["tools"][0]["parameters"]["required"] == expected_tool_schema_required
+
+    @pytest.mark.parametrize(
+        (
+            "candidate",
+            "tool_name",
+            "tool_call_id",
+            "tool_input",
+            "expected_request_arguments",
+            "expected_tool_result",
+            "use_codex_native_tools",
+        ),
+        [
+            pytest.param(
+                "gpt-5.3-codex-spark",
+                "Bash",
+                "toolu_bash_openai_01",
+                {"command": "pwd"},
+                {"cmd": "pwd"},
+                "pwd",
+                True,
+                id="openai-codex-spark-bash-preserves-command",
+            ),
+            pytest.param(
+                "xai/grok-composer-2.5-fast",
+                "Bash",
+                "toolu_bash_xai_01",
+                {"command": "git status"},
+                {"cmd": "git status"},
+                "clean repo",
+                True,
+                id="xai-grok-composer-bash-preserves-command",
+            ),
+            pytest.param(
+                "oa_xai/grok-build",
+                "Bash",
+                "toolu_bash_oa_xai_build_01",
+                {"command": "pytest -q tests/test_litellm"},
+                {"cmd": "pytest -q tests/test_litellm"},
+                "tests passed",
+                True,
+                id="oa-xai-grok-build-bash-preserves-command",
+            ),
+        ],
+    )
+    def test_tool_use_round_trip_preserves_bash_command_for_non_antigravity_candidates(
+        self,
+        candidate: str,
+        tool_name: str,
+        tool_call_id: str,
+        tool_input: Dict[str, str],
+        expected_request_arguments: Dict[str, str],
+        expected_tool_result: str,
+        use_codex_native_tools: bool,
+    ):
+        """Bash command input survives command loop mapping for OpenAI/xAI candidates."""
+        request = _make_request(
+            model=candidate,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "input": tool_input,
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": expected_tool_result,
+                        }
+                    ],
+                },
+            ],
+            tools=[
+                {
+                    "name": tool_name,
+                    "description": "Run a shell command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ],
+        )
+
+        translated = _ADAPTER.translate_request(
+            request,
+            use_codex_native_tools=use_codex_native_tools,
+        )
+
+        function_calls = [
+            item for item in translated["input"] if item.get("type") == "function_call"
+        ]
+        assert len(function_calls) == 1
+        function_call = function_calls[0]
+        assert function_call["call_id"] == tool_call_id
+        if use_codex_native_tools:
+            assert function_call["name"] == "exec_command"
+        else:
+            assert function_call["name"] == tool_name
+        assert json.loads(function_call["arguments"]) == expected_request_arguments
+
+        function_call_outputs = [
+            item
+            for item in translated["input"]
+            if item.get("type") == "function_call_output"
+        ]
+        assert len(function_call_outputs) == 1
+        assert function_call_outputs[0]["call_id"] == tool_call_id
+        assert function_call_outputs[0]["output"] == expected_tool_result
+
+        returned = _ADAPTER.translate_response(
+            _make_mock_response(
+                output=[
+                    _make_function_call_item(
+                        tool_call_id,
+                        "exec_command" if use_codex_native_tools else tool_name,
+                        json.dumps(expected_request_arguments),
+                    )
+                ],
+                model=candidate,
+            ),
+            use_codex_native_tools=use_codex_native_tools,
+        )
+
+        tool_use_blocks = [
+            item for item in returned["content"] if item["type"] == "tool_use"
+        ]
+        assert len(tool_use_blocks) == 1
+        tool_use = tool_use_blocks[0]
+        assert tool_use["id"] == tool_call_id
+        assert tool_use["name"] == tool_name
+        assert tool_use["input"] == tool_input
+
+        # End-to-end Claude Code tool loop markers remain stable.
+        assert translated["tools"][0]["name"] == "exec_command"
+        assert translated["tools"][0]["parameters"]["required"] == ["cmd"]
 
 # ---------------------------------------------------------------------------
 # translate_tools_to_responses_api
