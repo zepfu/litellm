@@ -222,6 +222,13 @@ def default_grok_xai_oauth_auth_path() -> Path:
     return Path(_DEFAULT_GROK_XAI_OAUTH_AUTH_PATH).expanduser()
 
 
+def default_grok_xai_oauth_seed_auth_path() -> Optional[Path]:
+    configured = get_secret_str("LITELLM_XAI_GROK_SEED_AUTH_FILE")
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured.strip()).expanduser()
+    return None
+
+
 def default_grok_xai_oauth_auth_lock_path(credential_path: Path) -> Path:
     configured = get_secret_str("LITELLM_XAI_GROK_AUTH_LOCK_FILE")
     if isinstance(configured, str) and configured.strip():
@@ -458,6 +465,8 @@ async def _get_xai_oauth_access_token_locked(
     is_grok_native_oauth: bool,
 ) -> str:
     with _credential_file_lock(lock_path):
+        if is_grok_native_oauth:
+            _sync_grok_native_oauth_seed_credential(credential_path)
         raw_payload = _read_credential_payload(credential_path)
         credential = _select_credential_record(raw_payload, scope)
         token = _credential_access_token(credential)
@@ -527,6 +536,33 @@ def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("xAI OAuth credential file must contain a JSON object.")
     return payload
+
+
+def _sync_grok_native_oauth_seed_credential(credential_path: Path) -> None:
+    seed_path = default_grok_xai_oauth_seed_auth_path()
+    if seed_path is None or seed_path == credential_path:
+        return
+
+    try:
+        seed_stat = seed_path.stat()
+    except FileNotFoundError:
+        return
+
+    try:
+        credential_stat = credential_path.stat()
+    except FileNotFoundError:
+        should_sync = True
+    else:
+        should_sync = seed_stat.st_mtime_ns > credential_stat.st_mtime_ns
+
+    if not should_sync:
+        return
+
+    seed_payload = _read_json_object(
+        seed_path,
+        description="Grok OIDC seed auth file",
+    )
+    _write_credential_payload(credential_path, seed_payload)
 
 
 def _select_credential_record(
