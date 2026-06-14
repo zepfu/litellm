@@ -211,10 +211,12 @@ Important notes:
 - `reasoning_tokens_source` should not remain null in repaired or newly written `session_history` rows; use `not_applicable` when no reasoning is present and `not_available` when reasoning is present but no positive provider/estimated count exists.
 - Anthropic/OpenAI/OpenRouter `session_history` rows should also carry normalized provider-cache telemetry. Expect `provider_cache_status` to land as `hit`, `write`, `miss`, `unsupported`, or `not_attempted`, with `provider_cache_miss_reason` populated for miss-shaped outcomes. `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` are best-effort and should only appear when the miss token count is explicit enough to price honestly.
 - AAWM alias-routed rows keep concrete provider attribution in
-  `session_history.provider` and `session_history.model`. The inbound alias is
-  exposed as `metadata.model_alias_label` and the generic trace tag
-  `model-alias:<alias>`, alongside compatibility keys such as
-  `requested_model_alias`.
+  `session_history.provider` and `session_history.model`. Use
+  `session_history.inbound_model_alias` as the canonical field for the requested
+  alias (for example `aawm-read`, `aawm-low`, `aawm-code-anthropic`), with
+  `metadata.model_alias_label` and `requested_model_alias` retained for
+  compatibility. The alias is also surfaced as generic trace tag
+  `model-alias:<alias>`.
 - The opt-in fanout suite includes an explicit provider-cache canary through `claude_adapter_peeromega_fanout`: at least one Anthropic child row must show `provider_cache_attempted=true` and `provider_cache_status` of `hit` or `write`.
 - When the original proxy spend-log source is unavailable locally, use [scripts/repair_session_history_provider_cache.py](/home/zepfu/projects/litellm/scripts/repair_session_history_provider_cache.py) to repair session-history observability directly from existing rows before relying on historical aggregates. The repair now covers inferred `provider`, invalid zero-count `provider_reported` reasoning rows, provider-cache state, cache miss token/cost fields, and git commit/push rollups from `session_history_tool_activity`.
 - Keep callback overlay parity in mind: `litellm-dev` imports `litellm.integrations.aawm_agent_identity`, while the port-4000 `aawm-litellm` image imports the installed callback wheel module at `aawm_litellm_callbacks.agent_identity`. Any session-history writer change must be applied to both sources and released through a new callback wheel before rebuilding the production-style image.
