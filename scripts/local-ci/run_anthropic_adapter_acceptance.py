@@ -3458,6 +3458,11 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('stream_tool_call_state_validation') or {},
     )
     failures.extend(stream_tool_call_state_failures)
+    stream_tool_call_state_passed = (
+        not bool(stream_tool_call_state_failures)
+        if config.get('stream_tool_call_state_validation')
+        else True
+    )
 
     aawm_dynamic_injection_summary = None
     aawm_dynamic_injection_config = config.get('aawm_dynamic_injection')
@@ -3519,6 +3524,11 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('session_history_validation') or {},
     )
     failures.extend(session_history_failures)
+    session_history_passed = (
+        not bool(session_history_failures)
+        if config.get('session_history_validation')
+        else True
+    )
     (
         rate_limit_observations_summary,
         rate_limit_observations_failures,
@@ -3536,12 +3546,18 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('tool_activity_validation') or {},
     ) if config.get('tool_activity_validation') else ({'record': None, 'records': []}, [])
     failures.extend(tool_activity_failures)
+    tool_activity_passed = not bool(tool_activity_failures) if config.get('tool_activity_validation') else True
     transcript_tool_use_summary, transcript_tool_use_failures = _validate_transcript_tool_use(
         family=name,
         session_id=command_session_id,
         checks=config.get('transcript_tool_use_validation') or {},
     ) if config.get('transcript_tool_use_validation') else ({'agents': []}, [])
     failures.extend(transcript_tool_use_failures)
+    transcript_tool_use_passed = (
+        not bool(transcript_tool_use_failures)
+        if config.get('transcript_tool_use_validation')
+        else True
+    )
 
     runtime_summary, runtime_failures = _validate_runtime_postcondition(
         family=name,
@@ -3626,9 +3642,13 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         'command_json': command_json_summary,
         'empty_success': empty_success_summary,
         'session_history': session_history_summary,
+        'session_history_passed': session_history_passed,
         'rate_limit_observations': rate_limit_observations_summary,
         'tool_activity': tool_activity_summary,
         'transcript_tool_use': transcript_tool_use_summary,
+        'tool_activity_passed': tool_activity_passed,
+        'transcript_tool_use_passed': transcript_tool_use_passed,
+        'stream_tool_call_state_passed': stream_tool_call_state_passed,
         'runtime_postconditions': runtime_summary,
         'runtime_logs': runtime_log_summary,
         'passed': not hard_failures,
@@ -3936,6 +3956,530 @@ def _build_prompt_overhead_cost_share_report(
     }
 
 
+def _collect_rows_by_key(container: Any, key: str) -> list[dict[str, Any]]:
+    values = container.get(key) if isinstance(container, dict) else None
+    if not isinstance(values, list):
+        return []
+    return [row for row in values if isinstance(row, dict)]
+
+
+def _case_result_check_passed(
+    *,
+    case_config: dict[str, Any],
+    case_result: dict[str, Any],
+    config_key: str,
+    result_key: str,
+) -> bool | None:
+    if not case_config.get(config_key):
+        return None
+    if result_key in case_result:
+        return bool(case_result.get(result_key))
+    return bool(case_result.get('passed'))
+
+
+def _case_command_connectivity_passed(case_result: dict[str, Any]) -> bool | None:
+    if case_result.get('skipped') is True:
+        return None
+    exit_code = case_result.get('exit_code')
+    if exit_code is not None and exit_code != 0:
+        return False
+
+    attempts = [
+        attempt
+        for attempt in case_result.get('command_attempts') or []
+        if isinstance(attempt, dict)
+    ]
+    if attempts:
+        final_attempt = attempts[-1]
+        if isinstance(final_attempt.get('api_error_status'), int):
+            return False
+        if final_attempt.get('is_error') is True:
+            return False
+
+    parsed_stdout = _parse_command_output_json(str(case_result.get('stdout') or ''))
+    if isinstance(parsed_stdout, dict):
+        if parsed_stdout.get('is_error') is True:
+            return False
+        status_code = parsed_stdout.get('status_code')
+        if isinstance(status_code, int) and status_code >= 400:
+            return False
+
+    if exit_code is None and not attempts and parsed_stdout is None:
+        return None
+    return True
+
+
+def _tool_activity_requires_arguments(case_config: dict[str, Any]) -> bool:
+    for expected_row in _collect_rows_by_key(
+        case_config.get('tool_activity_validation') or {},
+        key='expected_rows',
+    ):
+        for key in ('arguments_required_substring', 'arguments_required_substrings'):
+            value = expected_row.get(key)
+            if isinstance(value, str) and value:
+                return True
+            if isinstance(value, list) and any(
+                isinstance(item, str) and item for item in value
+            ):
+                return True
+    return False
+
+
+def _transcript_tool_use_records(case_result: dict[str, Any]) -> list[dict[str, Any]]:
+    transcript_tool_use = case_result.get('transcript_tool_use')
+    if not isinstance(transcript_tool_use, dict):
+        return []
+    records: list[dict[str, Any]] = []
+    for agent in transcript_tool_use.get('agents') or []:
+        if not isinstance(agent, dict):
+            continue
+        records.extend(
+            record
+            for record in agent.get('records') or []
+            if isinstance(record, dict)
+        )
+    return records
+
+
+def _case_tool_use_ids_passed(
+    *,
+    case_config: dict[str, Any],
+    case_result: dict[str, Any],
+    transcript_passed: bool,
+) -> bool | None:
+    if not case_config.get('transcript_tool_use_validation'):
+        return None
+    if not transcript_passed:
+        return False
+    records = _transcript_tool_use_records(case_result)
+    if not records:
+        return False
+    return all(bool(record.get('tool_use_id')) for record in records)
+
+
+def _case_tool_result_replay_passed(
+    *,
+    case_config: dict[str, Any],
+    case_result: dict[str, Any],
+    transcript_passed: bool,
+) -> bool | None:
+    if not _case_requires_multi_turn_tool_results(case_config):
+        return None
+    if not transcript_passed:
+        return False
+    records = _transcript_tool_use_records(case_result)
+    if len(records) < 2:
+        return False
+    return all(bool(record.get('tool_result_line')) for record in records[:-1])
+
+
+def _first_string_value_from_rows(
+    rows: list[dict[str, Any]],
+    key: str,
+) -> str | None:
+    for row in rows:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _candidate_provider_model_from_expected_rows(
+    case_config: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    session_history_validation = case_config.get('session_history_validation')
+    if not isinstance(session_history_validation, dict):
+        session_history_validation = {}
+
+    provider = session_history_validation.get('expected_provider')
+    model = session_history_validation.get('expected_model')
+    if not isinstance(provider, str) or not provider.strip():
+        provider = _first_string_value_from_rows(
+            _collect_rows_by_key(session_history_validation, key='expected_rows'),
+            'provider',
+        )
+    if not isinstance(model, str) or not model.strip():
+        model = _first_string_value_from_rows(
+            _collect_rows_by_key(session_history_validation, key='expected_rows'),
+            'model',
+        )
+
+    tool_activity_rows = _collect_rows_by_key(
+        case_config.get('tool_activity_validation') or {},
+        key='expected_rows',
+    )
+    if not isinstance(provider, str) or not provider.strip():
+        provider = _first_string_value_from_rows(tool_activity_rows, 'provider')
+    if not isinstance(model, str) or not model.strip():
+        model = _first_string_value_from_rows(tool_activity_rows, 'model')
+
+    return (
+        provider.strip() if isinstance(provider, str) and provider.strip() else None,
+        model.strip() if isinstance(model, str) and model.strip() else None,
+    )
+
+
+def _case_result_session_history_record(
+    case_result: dict[str, Any],
+) -> dict[str, Any]:
+    session_history = case_result.get('session_history')
+    if not isinstance(session_history, dict):
+        return {}
+    record = session_history.get('record')
+    if isinstance(record, dict):
+        return record
+    records = session_history.get('records')
+    if isinstance(records, list):
+        for candidate in records:
+            if isinstance(candidate, dict):
+                return candidate
+    return {}
+
+
+def _candidate_provider_model_from_case_result(
+    case_result: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    record = _case_result_session_history_record(case_result)
+    provider = record.get('provider')
+    model = record.get('model')
+    return (
+        provider.strip() if isinstance(provider, str) and provider.strip() else None,
+        model.strip() if isinstance(model, str) and model.strip() else None,
+    )
+
+
+def _candidate_model_from_http_request(case_config: dict[str, Any]) -> str | None:
+    http_request = case_config.get('http_request')
+    if not isinstance(http_request, dict):
+        return None
+    json_payload = http_request.get('json')
+    if not isinstance(json_payload, dict):
+        return None
+    model = json_payload.get('model')
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return None
+
+
+def _candidate_provider_from_trace_tags(case_config: dict[str, Any]) -> str | None:
+    for tag in case_config.get('required_trace_tags', []):
+        if not isinstance(tag, str):
+            continue
+        if tag.startswith('anthropic-adapter-target:'):
+            target = tag.removeprefix('anthropic-adapter-target:').strip()
+            candidate = target.split(':', 1)[0]
+            if candidate:
+                return candidate
+        if tag.startswith('provider:'):
+            value = tag.split(':', 1)[1].strip()
+            if value:
+                return value
+    return None
+
+
+def _candidate_model_provider_from_trace_tags(
+    case_config: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    if not isinstance(case_config.get('required_trace_tags'), list):
+        return None, None
+    for tag in case_config['required_trace_tags']:
+        if not isinstance(tag, str):
+            continue
+        if tag.startswith('anthropic-adapter-model:'):
+            value = tag.split(':', 1)[1].strip()
+            if value:
+                return value, 'anthropic'
+        if tag.startswith('openai-adapter-model:'):
+            value = tag.split(':', 1)[1].strip()
+            if value:
+                return value, 'openai'
+    return None, None
+
+
+def _infer_provider_from_model(model: str | None) -> str | None:
+    if model is None:
+        return None
+    if '/' in model:
+        return model.split('/', 1)[0]
+    if model.startswith(('claude-', 'anthropic-')):
+        return 'anthropic'
+    return None
+
+
+def _extract_case_provider_and_model(
+    case_config: dict[str, Any],
+    case_result: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    provider, model = _candidate_provider_model_from_expected_rows(case_config)
+    if provider is None or model is None:
+        result_provider, result_model = _candidate_provider_model_from_case_result(
+            case_result
+        )
+        provider = provider or result_provider
+        model = model or result_model
+    if model is None:
+        model = _candidate_model_from_http_request(case_config)
+    if provider is None:
+        provider = _candidate_provider_from_trace_tags(case_config)
+    if provider is None:
+        provider = _infer_provider_from_model(model)
+    if model is None:
+        tag_model, tag_provider = _candidate_model_provider_from_trace_tags(case_config)
+        model = tag_model
+        provider = provider or tag_provider
+
+    return provider or None, model or None
+
+
+def _extract_case_route_family(
+    *,
+    case_config: dict[str, Any],
+    result: dict[str, Any],
+) -> str | None:
+    tags = case_config.get('required_trace_tags')
+    if isinstance(tags, list):
+        for tag in tags:
+            if (
+                isinstance(tag, str)
+                and tag.startswith('route:')
+                and tag != 'route:anthropic_messages'
+            ):
+                route_family = tag.removeprefix('route:').strip()
+                if route_family:
+                    return route_family
+
+    observations = result.get('langfuse', {}).get('generation_observations', [])
+    for observation in observations:
+        metadata = observation.get('metadata')
+        if not isinstance(metadata, dict):
+            continue
+        for metadata_key in (
+            'anthropic_auto_agent_selected_route_family',
+            'prompt_overhead_route_family',
+            'passthrough_route_family',
+            'adapter_route_family',
+            'route_family',
+        ):
+            value = metadata.get(metadata_key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    session_history_record = _case_result_session_history_record(result)
+    metadata = session_history_record.get('metadata')
+    if isinstance(metadata, dict):
+        for metadata_key in (
+            'anthropic_auto_agent_selected_route_family',
+            'prompt_overhead_route_family',
+            'passthrough_route_family',
+            'adapter_route_family',
+            'route_family',
+        ):
+            value = metadata.get(metadata_key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, str) and tag.startswith('route:'):
+                route_family = tag.removeprefix('route:').strip()
+                if route_family:
+                    return route_family
+
+    allowed_routes = case_config.get('allowed_generation_routes')
+    if isinstance(allowed_routes, list):
+        for route in allowed_routes:
+            if not isinstance(route, str):
+                continue
+            candidates = RA._route_family_candidates_for_request_route(route)
+            for candidate in sorted(candidates):
+                if candidate == 'anthropic_messages':
+                    continue
+                return candidate
+            if candidates:
+                return next(iter(sorted(candidates)))
+    return None
+
+
+def _extract_case_tool_mode(case_config: dict[str, Any]) -> str:
+    transcript_validation = case_config.get('transcript_tool_use_validation')
+    if isinstance(transcript_validation, dict):
+        expected_agents = transcript_validation.get('expected_agents')
+        if isinstance(expected_agents, list):
+            for expected_agent in expected_agents:
+                if not isinstance(expected_agent, dict):
+                    continue
+                if expected_agent.get('require_tool_result_before_next_tool_use') is True:
+                    return 'sequential'
+                minimum_tools_in_single_message = (
+                    expected_agent.get('minimum_tools_in_single_assistant_message')
+                )
+                if (
+                    isinstance(minimum_tools_in_single_message, int)
+                    and minimum_tools_in_single_message > 1
+                ):
+                    return 'parallel'
+                max_tools = expected_agent.get('maximum_tool_uses_per_assistant_message')
+                if isinstance(max_tools, int) and max_tools > 1:
+                    return 'parallel'
+
+    required_rows = _collect_rows_by_key(
+        case_config.get('tool_activity_validation') or {},
+        'expected_rows',
+    )
+    if not required_rows:
+        return 'unknown'
+
+    distinct_tool_names = {
+        row.get('tool_name')
+        for row in required_rows
+        if isinstance(row.get('tool_name'), str)
+    }
+    if len(distinct_tool_names) > 1:
+        return 'parallel'
+    return 'single'
+
+
+def _case_requires_multi_turn_tool_results(case_config: dict[str, Any]) -> bool:
+    transcript_validation = case_config.get('transcript_tool_use_validation')
+    if not isinstance(transcript_validation, dict):
+        return False
+    for expected_agent in _collect_rows_by_key(transcript_validation, 'expected_agents'):
+        if expected_agent.get('require_tool_result_before_next_tool_use') is True:
+            return True
+    return False
+
+
+def _declared_candidates_for_case(case_config: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = case_config.get('verification_declared_candidates')
+    if not isinstance(candidates, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        row: dict[str, Any] = {}
+        for key in ('candidate_order', 'provider', 'model', 'route_family'):
+            value = candidate.get(key)
+            if value is not None:
+                row[key] = value
+        if row:
+            normalized.append(row)
+    return normalized
+
+
+def _verification_status_for_case(result: dict[str, Any]) -> str:
+    if result.get('skipped') is True:
+        return 'skipped'
+    if not result.get('passed'):
+        return 'failed'
+    if result.get('warning_only'):
+        return 'warning_only'
+    if result.get('soft_failures'):
+        return 'passed_with_soft_failures'
+    return 'passed'
+
+
+def _build_case_verification_matrix_row(
+    *,
+    alias: str,
+    case_name: str | None = None,
+    candidate_order: int,
+    case_config: dict[str, Any],
+    case_result: dict[str, Any],
+) -> dict[str, Any]:
+    provider, model = _extract_case_provider_and_model(case_config, case_result)
+    route_family = _extract_case_route_family(
+        case_config=case_config,
+        result=case_result,
+    )
+    tool_mode = _extract_case_tool_mode(case_config)
+    multi_turn_required = _case_requires_multi_turn_tool_results(case_config)
+
+    transcript_passed = bool(case_result.get('transcript_tool_use_passed', True))
+    tool_activity_passed = bool(case_result.get('tool_activity_passed', True))
+    tool_bearing_configured = bool(
+        case_config.get('tool_activity_validation')
+        or case_config.get('transcript_tool_use_validation')
+    )
+    if tool_bearing_configured:
+        tool_bearing_passed = tool_activity_passed and transcript_passed
+    else:
+        tool_bearing_passed = None
+
+    if not multi_turn_required:
+        multi_turn_tool_result_passed = None
+    elif not isinstance(case_config.get('transcript_tool_use_validation'), dict):
+        multi_turn_tool_result_passed = False
+    else:
+        multi_turn_tool_result_passed = transcript_passed
+
+    session_history_passed = _case_result_check_passed(
+        case_config=case_config,
+        case_result=case_result,
+        config_key='session_history_validation',
+        result_key='session_history_passed',
+    )
+    stream_tool_call_state_passed = _case_result_check_passed(
+        case_config=case_config,
+        case_result=case_result,
+        config_key='stream_tool_call_state_validation',
+        result_key='stream_tool_call_state_passed',
+    )
+    required_tool_arguments_passed = (
+        tool_activity_passed if _tool_activity_requires_arguments(case_config) else None
+    )
+    tool_use_ids_passed = _case_tool_use_ids_passed(
+        case_config=case_config,
+        case_result=case_result,
+        transcript_passed=transcript_passed,
+    )
+    tool_result_replay_passed = _case_tool_result_replay_passed(
+        case_config=case_config,
+        case_result=case_result,
+        transcript_passed=transcript_passed,
+    )
+
+    langfuse = case_result.get('langfuse')
+    if not isinstance(langfuse, dict):
+        langfuse = {}
+    command_attempts = [
+        attempt
+        for attempt in case_result.get('command_attempts') or []
+        if isinstance(attempt, dict)
+    ]
+
+    return {
+        'case_name': case_name or alias,
+        'alias': alias,
+        'candidate_order': candidate_order,
+        'candidate_label': case_config.get('verification_candidate_label'),
+        'declared_candidates': _declared_candidates_for_case(case_config),
+        'provider': provider,
+        'model': model,
+        'route_family': route_family,
+        'connectivity_passed': _case_command_connectivity_passed(case_result),
+        'session_history_metadata_passed': session_history_passed,
+        'stream_tool_call_state_passed': stream_tool_call_state_passed,
+        'tool_mode': tool_mode,
+        'tool_call_emission_passed': tool_bearing_passed,
+        'tool_bearing_passed': tool_bearing_passed,
+        'required_tool_arguments_passed': required_tool_arguments_passed,
+        'tool_use_ids_passed': tool_use_ids_passed,
+        'tool_result_replay_passed': tool_result_replay_passed,
+        'multi_turn_tool_result_passed': multi_turn_tool_result_passed,
+        'status': _verification_status_for_case(case_result),
+        'references': {
+            'command_session_id': langfuse.get('command_session_id'),
+            'command_attempts': command_attempts,
+            'trace_ids': langfuse.get('trace_ids') or [],
+            'filtered_trace_ids': langfuse.get('filtered_trace_ids') or [],
+            'actual_trace_names': langfuse.get('actual_trace_names') or [],
+            'actual_user_ids': langfuse.get('actual_user_ids') or [],
+        },
+    }
+
+
 def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
@@ -4193,12 +4737,13 @@ def main() -> int:
             ),
         },
         'results': {},
+        'verification_matrix': [],
         'summary': {},
     }
     artifact['summary'] = _build_summary(artifact['results'])
     _write_artifact(artifact_path, artifact)
 
-    for case_name in selected_cases:
+    for selected_case_order, case_name in enumerate(selected_cases):
         print(f'[start] {case_name}', file=sys.stderr, flush=True)
         case_started = RA._utcnow()
         try:
@@ -4243,8 +4788,30 @@ def main() -> int:
                 )
         finally:
             artifact['summary'] = _build_summary(artifact['results'])
-            _write_artifact(artifact_path, artifact)
             case_result = artifact['results'].get(case_name, {})
+            verification_alias = str(
+                cases[case_name].get('verification_alias') or case_name
+            )
+            matrix_candidate_order = int(
+                cases[case_name].get(
+                    'verification_candidate_order',
+                    selected_case_order,
+                )
+            )
+            artifact['verification_matrix'] = [
+                row
+                for row in artifact['verification_matrix']
+                if row.get('case_name') != case_name
+            ] + [
+                _build_case_verification_matrix_row(
+                    alias=verification_alias,
+                    case_name=case_name,
+                    candidate_order=matrix_candidate_order,
+                    case_config=cases[case_name],
+                    case_result=case_result,
+                )
+            ]
+            _write_artifact(artifact_path, artifact)
             print(
                 f"[done] {case_name} passed={case_result.get('passed')} "
                 f"skipped={case_result.get('skipped', False)} "
