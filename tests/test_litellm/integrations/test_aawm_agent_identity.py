@@ -82,6 +82,21 @@ def _assert_no_postgres_nul_bytes(value) -> None:
             _assert_no_postgres_nul_bytes(item)
 
 
+@pytest.fixture(autouse=True)
+def reset_session_history_flush_failure_window():
+    with aawm_agent_identity._aawm_session_history_flush_failure_lock:
+        aawm_agent_identity._aawm_session_history_flush_failure_active = False
+        aawm_agent_identity._aawm_session_history_suppressed_flush_failures = 0
+    with aawm_agent_identity._aawm_session_history_spool_startup_lock:
+        aawm_agent_identity._aawm_session_history_spool_startup_bootstrapped = True
+    yield
+    with aawm_agent_identity._aawm_session_history_flush_failure_lock:
+        aawm_agent_identity._aawm_session_history_flush_failure_active = False
+        aawm_agent_identity._aawm_session_history_suppressed_flush_failures = 0
+    with aawm_agent_identity._aawm_session_history_spool_startup_lock:
+        aawm_agent_identity._aawm_session_history_spool_startup_bootstrapped = True
+
+
 def _base_kwargs(trace_name: str = "claude-code") -> dict:
     return {
         "litellm_params": {"metadata": {"trace_name": trace_name}},
@@ -9459,6 +9474,209 @@ def test_session_history_spool_round_trips_event_timestamps_and_quota_only_recor
     assert loaded["rate_limit_observations"][0]["observed_at"] == observed_at
 
 
+def test_session_history_failed_flush_max_retries_defaults_and_parses(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", lambda key: None)
+    assert aawm_agent_identity._get_session_history_failed_flush_max_retries() == 3
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: "7"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
+        else None,
+    )
+    assert aawm_agent_identity._get_session_history_failed_flush_max_retries() == 7
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: "-2"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
+        else None,
+    )
+    assert aawm_agent_identity._get_session_history_failed_flush_max_retries() == 0
+
+
+def test_session_history_spool_dir_defaults_to_local_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", lambda key: None)
+
+    assert (
+        aawm_agent_identity._get_session_history_spool_dir()
+        == "/mnt/e/litellm/session_history"
+    )
+
+
+def test_failed_session_history_batch_spools_after_retry_budget(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    observed_at = datetime(2026, 6, 14, 22, 45, tzinfo=timezone.utc)
+    records = [
+        {
+            "litellm_call_id": "call-failed-batch-1",
+            "trace_id": "trace-d1-267",
+            "start_time": observed_at,
+        },
+        {
+            "litellm_call_id": "call-failed-batch-2",
+            "trace_id": "trace-d1-267",
+            "start_time": observed_at,
+        },
+    ]
+
+    async def failing_persist(batch):
+        raise OSError("pgbouncer unavailable")
+
+    def fake_secret(key: str):
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV:
+            return str(tmp_path)
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES":
+            return "1"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS":
+            return "0.1"
+        return None
+
+    exception_mock = MagicMock()
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", fake_secret)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        failing_persist,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    aawm_agent_identity._flush_session_history_batch_with_retry(records)
+
+    paths = aawm_agent_identity._session_history_spool_paths()
+    assert len(paths) == 1
+    path = Path(paths[0])
+    timestamp_part = path.name.split("-", 1)[0]
+    assert len(timestamp_part) == 14
+    assert timestamp_part.isdigit()
+    assert "trace-d1-267" in path.name
+    assert not list(tmp_path.glob("*.tmp"))
+
+    loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
+    assert loaded_records == records
+    assert loaded_records[0]["start_time"] == observed_at
+    raw_payload = json.loads(Path(paths[0]).read_text())
+    assert raw_payload["failure"] == {"type": "OSError"}
+    assert exception_mock.call_count == 1
+    warning_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert (
+        "AawmAgentIdentity: session_history flush still failing: %s "
+        "(batch_size=%d, %s)"
+    ) in warning_messages
+    assert any("spooled batch for replay" in message for message in warning_messages)
+
+
+def test_failed_session_history_traceback_is_suppressed_across_batches(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    persist_state = {"fail": True}
+    records_1 = [{"litellm_call_id": "call-failed-window-1", "trace_id": "trace-1"}]
+    records_2 = [{"litellm_call_id": "call-failed-window-2", "trace_id": "trace-2"}]
+    recovery_record = [{"litellm_call_id": "call-recovered-window"}]
+    records_3 = [{"litellm_call_id": "call-failed-window-3", "trace_id": "trace-3"}]
+
+    async def maybe_failing_persist(batch):
+        if persist_state["fail"]:
+            raise OSError("pgbouncer unavailable")
+
+    def fake_secret(key: str):
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV:
+            return str(tmp_path)
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES":
+            return "0"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS":
+            return "0.1"
+        return None
+
+    exception_mock = MagicMock()
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", fake_secret)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        maybe_failing_persist,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    aawm_agent_identity._flush_session_history_batch_with_retry(records_1)
+    aawm_agent_identity._flush_session_history_batch_with_retry(records_2)
+
+    assert exception_mock.call_count == 1
+    assert len(aawm_agent_identity._session_history_spool_paths()) == 2
+
+    persist_state["fail"] = False
+    assert aawm_agent_identity._flush_session_history_batch(recovery_record) is True
+
+    recovery_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any("session_history flush recovered" in message for message in recovery_messages)
+
+    persist_state["fail"] = True
+    aawm_agent_identity._flush_session_history_batch_with_retry(records_3)
+
+    assert exception_mock.call_count == 2
+
+
+def test_failed_session_history_batch_keeps_retrying_when_spool_fails(
+    monkeypatch,
+) -> None:
+    records = [{"litellm_call_id": "call-spool-failure"}]
+    attempts = []
+    spool_attempts = []
+
+    def fake_flush(batch, **kwargs):
+        attempts.append((batch, kwargs))
+        failure_callback = kwargs.get("failure_callback")
+        if failure_callback is not None:
+            failure_callback(OSError("pgbouncer unavailable"))
+        return len(attempts) >= 2
+
+    def failing_spool(*args, **kwargs):
+        spool_attempts.append((args, kwargs))
+        raise OSError("spool unwritable")
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: "0"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
+        else None,
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_flush_session_history_batch", fake_flush)
+    monkeypatch.setattr(
+        aawm_agent_identity, "_spool_session_history_records", failing_spool
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", MagicMock())
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", MagicMock())
+
+    aawm_agent_identity._flush_session_history_batch_with_retry(records)
+
+    assert len(attempts) == 2
+    assert len(spool_attempts) == 1
+    assert attempts[0][1]["log_exception"] is True
+    assert attempts[1][1]["log_exception"] is False
+
+
 def test_session_history_spool_drainer_flushes_and_removes_records(
     monkeypatch,
     tmp_path,
@@ -9493,6 +9711,64 @@ def test_session_history_spool_drainer_flushes_and_removes_records(
     aawm_agent_identity._session_history_spool_drainer_main()
 
     assert flushed_batches == [[record]]
+    assert aawm_agent_identity._session_history_spool_paths() == []
+
+
+def test_aawm_agent_identity_bootstraps_existing_spool_drainer_once(monkeypatch) -> None:
+    starts = []
+
+    def fake_start_drainer() -> None:
+        starts.append("start")
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        fake_start_drainer,
+    )
+
+    with aawm_agent_identity._aawm_session_history_spool_startup_lock:
+        aawm_agent_identity._aawm_session_history_spool_startup_bootstrapped = False
+
+    AawmAgentIdentity()
+    AawmAgentIdentity()
+
+    assert starts == ["start"]
+
+
+def test_session_history_spool_drainer_flushes_batch_spool_records(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    records = [
+        {"litellm_call_id": "call-spool-batch-1", "trace_id": "trace-spool-batch"},
+        {"litellm_call_id": "call-spool-batch-2", "trace_id": "trace-spool-batch"},
+    ]
+    flushed_batches = []
+
+    def flush_success(batch):
+        flushed_batches.append(batch)
+        return True
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        flush_success,
+    )
+
+    aawm_agent_identity._spool_session_history_records(records, reason="test batch")
+    aawm_agent_identity._session_history_spool_drainer_main()
+
+    assert flushed_batches == [records]
     assert aawm_agent_identity._session_history_spool_paths() == []
 
 

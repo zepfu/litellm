@@ -26,6 +26,33 @@ for reporting and grouping by requested alias.
 Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
+## Session History Outage Spool
+
+`session_history` rows are normally written directly to
+`aawm_tristore.public.session_history`. If a batch flush keeps failing after the
+configured retry budget, LiteLLM writes the exact batch payload to a local JSON
+spool for later replay instead of logging full tracebacks indefinitely.
+
+The default spool directory is `/mnt/e/litellm/session_history`; override it with
+`AAWM_SESSION_HISTORY_SPOOL_DIR` when a deployment needs a different local
+volume. Failed flushes retry every `AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS`
+seconds, and `AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES` controls how many
+retry attempts happen before the batch is atomically written to the spool.
+
+Spool filenames include a UTC timestamp and a trace/session/call identifier so
+operators can find the affected dataset without printing prompt, tool, or
+metadata payloads into logs. Writes use a same-directory temporary file followed
+by replacement, so completed `.json` files are replayable and partial writes do
+not look like ready datasets.
+
+The in-process drainer checks for existing spool files when the callback starts
+and after successful writes, so records left behind by a prior outage can replay
+without waiting for a new failed batch. Replay is at-least-once. The database
+insert path remains idempotent, so recovery tools and the in-process drainer
+should assume duplicates are possible after a crash or partial outage. The spool
+contains local sensitive session metadata and must stay out of git, shared logs,
+and external artifacts unless it has been reviewed and sanitized.
+
 ## Alias Routing Audit Metadata
 
 AAWM auto-agent aliases attach bounded routing metadata to selected requests so
