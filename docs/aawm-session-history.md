@@ -56,6 +56,29 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
+## Grok Native OIDC Credentials
+
+`xai/grok-composer-2.5-fast`, `xai/grok-build`, and
+`xai/grok-build-0.1` use the Grok native OIDC credential path, not the managed
+`oa_xai/*` OAuth credential file. In `litellm-dev`, `LITELLM_XAI_GROK_AUTH_FILE`
+defaults to `/home/zepfu/.litellm/xai/grok-auth.json`, while the personal Grok
+CLI credential at `/home/zepfu/.grok/auth.json` is mounted read-only and exposed
+only as `LITELLM_XAI_GROK_SEED_AUTH_FILE`.
+
+The Grok native refresh path updates the configured credential by writing a
+temporary file beside it and then atomically replacing the original file. The
+configured refresh target must therefore live on writable LiteLLM-owned storage.
+Mounting the configured target read-only makes Composer and other Grok native
+candidates fail as `candidate_unavailable` during token refresh, which breaks the
+declared alias failover order. Keep `grok-auth.json` separate from the managed
+`oa_xai/*` `oauth-auth.json` file so the two credential families remain
+auditable.
+
+When the read-only Grok CLI seed credential is newer than the LiteLLM-owned
+managed credential, LiteLLM replaces the managed Grok credential from the seed
+before selecting or refreshing an access token. This lets a fresh Grok/OIDC login
+take effect without writing back into `/home/zepfu/.grok`.
+
 ## Access Log Display Semantics
 
 AAWM passthrough route logs emit a compact route line to the LiteLLM proxy logger

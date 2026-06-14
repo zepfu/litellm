@@ -80,7 +80,7 @@ services:
       - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
       # Gemini and Antigravity OAuth tokens for adapter testing; refresh persists updated tokens.
       - /home/zepfu/.gemini:/home/zepfu/.gemini
-      # Grok CLI OAuth tokens for native Grok OIDC passthrough testing
+      # Grok CLI OAuth tokens for native Grok OIDC passthrough seed only.
       - /home/zepfu/.grok:/home/zepfu/.grok:ro
       # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
@@ -153,7 +153,8 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
-      - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
+      - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.litellm/xai/grok-auth.json}
+      - LITELLM_XAI_GROK_SEED_AUTH_FILE=${LITELLM_XAI_GROK_SEED_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - LITELLM_XAI_GROK_AUTH_LOCK_FILE=${LITELLM_XAI_GROK_AUTH_LOCK_FILE:-/tmp/grok-auth.json.lock}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
