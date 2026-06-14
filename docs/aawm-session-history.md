@@ -112,6 +112,25 @@ For pass-through requests that emit this enriched `ROUTE:` line, LiteLLM
 suppresses the matching native Uvicorn/Gunicorn access record for that request.
 Unrelated routes should continue to use the normal server access log.
 
+## Langfuse Event Size Fitting
+
+Before enqueueing a Langfuse generation, LiteLLM estimates the serialized event
+size and tries to fit the whole event below the configured Langfuse event limit.
+The fitter preserves the existing input truncation behavior for prompts, then
+continues through oversized `output`, `metadata`, `model_parameters`,
+`status_message`, `prompt`, and other non-core generation fields until the full
+event fits or all safe fields have been reduced.
+
+Structured metadata and model-parameter fields are replaced with compact
+omission markers instead of partial raw values. Successful fitting that leaves
+the event safely below the warning threshold is debug-only telemetry. Warnings
+are reserved for raw near-limit events, events that remain near the warning
+threshold after fitting, or events that still cannot fit after all safe fields
+have been reduced. Any emitted size summary reports only identifiers, field
+names, byte counts, omission counts, and whether fitting still failed; it must
+not include prompt bodies, response text, tool arguments, credentials, or
+oversized raw metadata values.
+
 ## Tool Definition Snapshots
 
 Pass-through requests can advertise large tool definitions. LiteLLM records a

@@ -198,7 +198,10 @@ def test_langfuse_structured_input_keeps_head_tail_marker_without_mutation() -> 
             assert fitted_params[key] == value
 
 
-def test_langfuse_payload_size_warning_includes_truncation_metadata(caplog) -> None:
+def test_langfuse_payload_size_successful_fit_below_threshold_is_not_warning(
+    caplog, monkeypatch
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "10_000")
     generation_params = {
         "id": "generation-log-fit",
         "name": "aawm.large",
@@ -215,7 +218,7 @@ def test_langfuse_payload_size_warning_includes_truncation_metadata(caplog) -> N
     )
 
     assert truncation_summary is not None
-    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
         _log_langfuse_payload_size_if_needed(
             fitted_params,
             trace_id="trace-log-fit",
@@ -223,8 +226,12 @@ def test_langfuse_payload_size_warning_includes_truncation_metadata(caplog) -> N
             input_truncation_summary=truncation_summary,
         )
 
+    warning_records = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert warning_records == []
     logged_text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "Langfuse event near/exceeds size limit before SDK enqueue" in logged_text
+    assert "Langfuse event size fitting applied before SDK enqueue" in logged_text
     assert "trace-log-fit" in logged_text
     assert "generation-log-fit" in logged_text
     assert "original_input_size_bytes" in logged_text
@@ -234,3 +241,201 @@ def test_langfuse_payload_size_warning_includes_truncation_metadata(caplog) -> N
     assert "raw input should not appear" not in logged_text
     assert "raw output should not appear" not in logged_text
     assert "raw metadata value should not appear" not in logged_text
+
+
+def test_langfuse_payload_size_successful_fit_still_near_limit_warns(
+    caplog, monkeypatch
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "1_000")
+    generation_params = {
+        "id": "generation-near-limit-fit",
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": "small input",
+        "output": "raw output should not appear" + ("x" * 850),
+    }
+    fit_summary = {
+        "event_fit_failed": False,
+        "event_fit_target_bytes": 950,
+        "field_truncations": [
+            {
+                "field": "input",
+                "original_size_bytes": 5_000,
+                "final_size_bytes": 20,
+                "truncated_bytes": 4_980,
+                "omitted_count": 1,
+                "strategy": "truncated",
+            }
+        ],
+        "truncated_fields": ["input"],
+        "omitted_fields": [],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        _log_langfuse_payload_size_if_needed(
+            generation_params,
+            trace_id="trace-near-limit-fit",
+            call_type="completion",
+            input_truncation_summary=fit_summary,
+        )
+
+    logged_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Langfuse event near/exceeds size limit before SDK enqueue" in logged_text
+    assert "trace-near-limit-fit" in logged_text
+    assert "generation-near-limit-fit" in logged_text
+    assert "raw output should not appear" not in logged_text
+
+
+def test_langfuse_oversized_output_is_fit_after_small_input() -> None:
+    original_output = "raw output should not appear in warning " + ("x" * 5_000)
+    generation_params = {
+        "id": "generation-output-fit",
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": "small input",
+        "output": original_output,
+        "metadata": {"route": "aawm-code"},
+    }
+
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        generation_params,
+        max_event_size_bytes=1_000,
+    )
+
+    assert fit_summary is not None
+    assert fitted_params["input"] == "small input"
+    assert fitted_params["output"] != original_output
+    assert _json_size_bytes(fitted_params) <= _langfuse_event_fit_target_bytes(1_000)
+    assert fit_summary["truncated_fields"] == ["output"]
+    assert fit_summary["field_truncations"][0]["field"] == "output"
+    assert fit_summary["field_truncations"][0]["strategy"] == "truncated"
+    assert fit_summary["event_fit_failed"] is False
+
+
+def test_langfuse_oversized_metadata_is_fit_without_log_value_leak(caplog) -> None:
+    generation_params = {
+        "id": "generation-metadata-fit",
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": "small input",
+        "output": "small output",
+        "metadata": {
+            "repository": "litellm",
+            "large_blob": "raw metadata value should not appear" + ("y" * 5_000),
+            "api_key_secret": "secret metadata value should not appear"
+            + ("z" * 2_000),
+        },
+    }
+
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        generation_params,
+        max_event_size_bytes=1_200,
+    )
+
+    assert fit_summary is not None
+    assert _json_size_bytes(fitted_params) <= _langfuse_event_fit_target_bytes(1_200)
+    assert "metadata" in fit_summary["truncated_fields"]
+    assert fit_summary["omitted_fields"] == ["metadata"]
+    assert fitted_params["metadata"]["type"] == "litellm_langfuse_field_omitted"
+    assert fit_summary["event_fit_failed"] is False
+
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
+        _log_langfuse_payload_size_if_needed(
+            fitted_params,
+            trace_id="trace-metadata-fit",
+            call_type="pass_through_endpoint",
+            input_truncation_summary=fit_summary,
+        )
+
+    warning_records = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert warning_records == []
+    logged_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Langfuse event size fitting applied before SDK enqueue" in logged_text
+    assert "metadata" in logged_text
+    assert "field_truncations" in logged_text
+    assert "raw metadata value should not appear" not in logged_text
+    assert "secret metadata value should not appear" not in logged_text
+
+
+def test_langfuse_oversized_model_parameters_are_omitted_safely() -> None:
+    generation_params = {
+        "id": "generation-params-fit",
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": "small input",
+        "output": "small output",
+        "model_parameters": {
+            "temperature": 0,
+            "huge": "raw model parameter value should not survive" + ("p" * 6_000),
+        },
+        "metadata": {"repository": "litellm"},
+    }
+
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        generation_params,
+        max_event_size_bytes=900,
+    )
+
+    assert fit_summary is not None
+    assert _json_size_bytes(fitted_params) <= _langfuse_event_fit_target_bytes(900)
+    assert "model_parameters" in fit_summary["truncated_fields"]
+    assert fitted_params["model_parameters"] != generation_params["model_parameters"]
+    assert "raw model parameter value should not survive" not in str(
+        fitted_params["model_parameters"]
+    )
+
+
+def test_langfuse_combined_oversized_event_continues_past_input() -> None:
+    generation_params = {
+        "id": "generation-combined-fit",
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": "raw input should not appear" + ("i" * 5_000),
+        "output": "raw output should not appear" + ("o" * 5_000),
+        "metadata": {"large_blob": "raw metadata should not appear" + ("m" * 5_000)},
+    }
+
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        generation_params,
+        max_event_size_bytes=1_100,
+    )
+
+    assert fit_summary is not None
+    assert _json_size_bytes(fitted_params) <= _langfuse_event_fit_target_bytes(1_100)
+    assert set(fit_summary["truncated_fields"]) >= {"input", "output"}
+    assert fit_summary["input_truncated"] is True
+    assert fit_summary["event_fit_failed"] is False
+
+
+def test_langfuse_still_too_large_after_fitting_reports_fail_closed(caplog) -> None:
+    generation_params = {
+        "id": "generation-fail-closed-" + ("core" * 2_000),
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": "small input",
+        "metadata": {"route": "aawm-code"},
+    }
+
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        generation_params,
+        max_event_size_bytes=500,
+    )
+
+    assert fit_summary is not None
+    assert fit_summary["event_fit_failed"] is True
+    assert fit_summary["final_total_size_bytes"] > fit_summary["event_fit_target_bytes"]
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        _log_langfuse_payload_size_if_needed(
+            fitted_params,
+            trace_id="trace-fail-closed",
+            call_type="completion",
+            input_truncation_summary=fit_summary,
+        )
+
+    logged_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "event_fit_failed" in logged_text
+    assert "generation-fail-closed-core" not in logged_text
+    assert "small input" not in logged_text

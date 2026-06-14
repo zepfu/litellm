@@ -10,7 +10,11 @@ import pytest
 
 import litellm
 from litellm.integrations.langfuse import langfuse as langfuse_module
-from litellm.integrations.langfuse.langfuse import LangFuseLogger
+from litellm.integrations.langfuse.langfuse import (
+    LangFuseLogger,
+    _json_size_bytes,
+    _langfuse_event_fit_target_bytes,
+)
 
 sys.path.insert(0, os.path.abspath("../.."))
 
@@ -452,6 +456,55 @@ class TestLangfuseUsageDetails(unittest.TestCase):
                 generation_kwargs["cost_details"],
                 {"total": 0.123},
             )
+
+    def test_log_langfuse_v2_fits_trace_params_before_enqueue(self):
+        raw_trace_input = "trace input " + ("x" * 5_000)
+        kwargs = {
+            "model": "gpt-test",
+            "call_type": "pass_through_endpoint",
+            "custom_llm_provider": "openai",
+            "litellm_params": {"metadata": {}},
+            "standard_logging_object": {
+                "metadata": {},
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "response_cost": 0.0,
+                "model": "openai/gpt-test",
+                "trace_id": "trace-fit-caller",
+            },
+            "response_cost": 0.0,
+        }
+
+        with patch.object(self.logger, "_supports_prompt", return_value=False), patch.dict(
+            "os.environ", {"LANGFUSE_MAX_EVENT_SIZE_BYTES": "1_000"}
+        ), self.assertLogs("LiteLLM", level="DEBUG") as captured_logs:
+            self.logger._log_langfuse_v2(
+                user_id=None,
+                metadata={},
+                litellm_params=kwargs["litellm_params"],
+                output="small output",
+                start_time=datetime.datetime(2024, 1, 1, 12, 0, 0),
+                end_time=datetime.datetime(2024, 1, 1, 12, 0, 1),
+                kwargs=kwargs,
+                optional_params={},
+                input=raw_trace_input,
+                response_obj=None,
+                level="DEFAULT",
+                litellm_call_id="call-trace-fit",
+            )
+
+        trace_kwargs = self.last_trace_kwargs
+        self.assertNotEqual(trace_kwargs["input"], raw_trace_input)
+        self.assertIn("litellm_langfuse_input_truncated", trace_kwargs["input"])
+        self.assertLessEqual(
+            _json_size_bytes(trace_kwargs),
+            _langfuse_event_fit_target_bytes(1_000),
+        )
+        log_text = "\n".join(captured_logs.output)
+        self.assertIn("Langfuse event near/exceeds size limit before SDK enqueue", log_text)
+        self.assertIn("pass_through_endpoint.trace", log_text)
+        self.assertNotIn(raw_trace_input, log_text)
 
     def test_log_langfuse_v2_preserves_explicit_openrouter_model(self):
         response_obj = MagicMock()
