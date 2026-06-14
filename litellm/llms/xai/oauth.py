@@ -177,6 +177,7 @@ async def get_xai_oauth_access_token() -> str:
         return await _get_xai_oauth_access_token_locked(
             credential_path=Path(credential_path),
             scope=scope,
+            is_grok_native_oauth=False,
         )
 
 
@@ -194,6 +195,7 @@ async def get_grok_native_oauth_access_token() -> str:
             credential_path=credential_path,
             scope=scope,
             lock_path=default_grok_xai_oauth_auth_lock_path(credential_path),
+            is_grok_native_oauth=True,
         )
 
 
@@ -432,11 +434,28 @@ def _clean_oauth_string(value: Any) -> Optional[str]:
     return None
 
 
+def _oauth_credential_subject(is_grok_native_oauth: bool) -> str:
+    return (
+        "the managed xAI OAuth credential"
+        if not is_grok_native_oauth
+        else "the Grok OIDC credential"
+    )
+
+
+def _oauth_refresh_action(is_grok_native_oauth: bool) -> str:
+    return (
+        "xAI OAuth credential refresh"
+        if not is_grok_native_oauth
+        else "Grok OIDC credential refresh"
+    )
+
+
 async def _get_xai_oauth_access_token_locked(
     *,
     credential_path: Path,
     scope: str,
     lock_path: Optional[Path] = None,
+    is_grok_native_oauth: bool,
 ) -> str:
     with _credential_file_lock(lock_path):
         raw_payload = _read_credential_payload(credential_path)
@@ -445,12 +464,20 @@ async def _get_xai_oauth_access_token_locked(
         if token and not _credential_needs_refresh(credential):
             return token
 
-        refreshed = await _refresh_xai_oauth_credential(credential)
+        refreshed = await _refresh_xai_oauth_credential(
+            credential,
+            is_grok_native_oauth=is_grok_native_oauth,
+        )
         _update_credential_record(credential, refreshed)
         _write_credential_payload(credential_path, raw_payload)
         refreshed_token = _credential_access_token(credential)
         if refreshed_token:
             return refreshed_token
+    if is_grok_native_oauth:
+        raise ValueError(
+            "Grok OIDC credential refresh did not return an access token. "
+            "Reseed or relogin the Grok OIDC credential."
+        )
     raise ValueError(
         "xAI OAuth refresh did not return an access token. Reseed or relogin "
         "the managed xAI OAuth credential before calling oa_xai/*."
@@ -573,11 +600,16 @@ def _refresh_buffer_seconds() -> int:
 
 async def _refresh_xai_oauth_credential(
     credential: Dict[str, Any],
+    *,
+    is_grok_native_oauth: bool,
 ) -> Dict[str, Any]:
     refresh_token = credential.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise ValueError(
-            "xAI OAuth credential is expired or near expiry and has no refresh_token. "
+            "Grok OIDC credential is expired or near expiry and has no refresh_token. "
+            "Reseed or relogin the Grok OIDC credential."
+            if is_grok_native_oauth
+            else "xAI OAuth credential is expired or near expiry and has no refresh_token. "
             "Reseed or relogin the managed xAI OAuth credential."
         )
 
@@ -588,8 +620,13 @@ async def _refresh_xai_oauth_credential(
     )
     if not isinstance(client_id, str) or not client_id.strip():
         raise ValueError(
-            "xAI OAuth credential refresh requires oidc_client_id or "
-            "LITELLM_XAI_OAUTH_CLIENT_ID. Reseed the managed credential."
+            _oauth_refresh_action(is_grok_native_oauth)
+            + " requires oidc_client_id or LITELLM_XAI_OAUTH_CLIENT_ID. "
+            + (
+                f"Reseed {_oauth_credential_subject(is_grok_native_oauth)}."
+                if is_grok_native_oauth
+                else "Reseed the managed credential."
+            )
         )
 
     token_endpoint = (
@@ -598,7 +635,11 @@ async def _refresh_xai_oauth_credential(
         or _DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT
     )
     if not isinstance(token_endpoint, str) or not token_endpoint.strip():
-        raise ValueError("xAI OAuth token endpoint is missing.")
+        raise ValueError(
+            "xAI OAuth token endpoint is missing."
+            if not is_grok_native_oauth
+            else "Grok OIDC token endpoint is missing."
+        )
 
     form_data = {
         "grant_type": "refresh_token",
@@ -620,16 +661,19 @@ async def _refresh_xai_oauth_credential(
             )
     except httpx.HTTPError as exc:
         raise ValueError(
-            "xAI OAuth credential refresh failed while contacting the token "
-            "endpoint. Reseed or relogin the managed xAI OAuth credential."
+            f"{_oauth_refresh_action(is_grok_native_oauth)} failed while contacting "
+            "the token endpoint. "
+            f"Reseed or relogin {_oauth_credential_subject(is_grok_native_oauth)}."
         ) from exc
 
     if response.status_code >= 400:
         error_hint = _extract_oauth_error_hint(response)
         raise ValueError(
-            "xAI OAuth credential refresh failed"
+            f"{_oauth_refresh_action(is_grok_native_oauth)} failed"
             + (f" ({error_hint})" if error_hint else "")
-            + ". Reseed or relogin the managed xAI OAuth credential."
+            + ". Reseed or relogin "
+            + _oauth_credential_subject(is_grok_native_oauth).rstrip(".")
+            + "."
         )
 
     payload = response.json()

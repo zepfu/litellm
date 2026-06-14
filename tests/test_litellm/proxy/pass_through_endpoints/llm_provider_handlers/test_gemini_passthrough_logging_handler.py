@@ -196,6 +196,8 @@ class TestGeminiPassthroughLoggingHandler:
 
         # Verify cost calculation was called
         mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["model"] == "gemini-1.5-flash"
+        assert mock_completion_cost.call_args.kwargs["custom_llm_provider"] == "gemini"
 
         # Verify logging object was updated
         assert mock_logging_obj.model_call_details["response_cost"] == 0.000045
@@ -636,9 +638,10 @@ class TestGeminiPassthroughLoggingHandler:
         ] == 5
 
     @patch("litellm.completion_cost")
-    def test_handle_logging_antigravity_collected_chunks_preserves_usage_without_cost_lookup(
+    def test_handle_logging_antigravity_collected_chunks_preserves_usage_and_cost(
         self, mock_completion_cost
     ):
+        mock_completion_cost.return_value = 0.000027
         mock_logging_obj = self._create_mock_logging_obj()
         chunk = "data: " + json.dumps(
             {
@@ -667,29 +670,35 @@ class TestGeminiPassthroughLoggingHandler:
             litellm_logging_obj=mock_logging_obj,
             passthrough_success_handler_obj=PassThroughEndpointLogging(),
             url_route="https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            request_body={"model": "gemini-3.1-pro-low"},
+            request_body={"model": "claude-sonnet-4-6"},
             endpoint_type=MagicMock(),
             start_time=self.start_time,
             all_chunks=[chunk, "data: [DONE]"],
-            model="gemini-3.1-pro-low",
+            model="claude-sonnet-4-6",
             end_time=self.end_time,
             custom_llm_provider="antigravity",
         )
 
         assert result["result"] is not None
-        assert result["kwargs"]["model"] == "gemini-3.1-pro-low"
+        assert result["kwargs"]["model"] == "claude-sonnet-4-6"
         assert result["kwargs"]["custom_llm_provider"] == "antigravity"
-        assert "response_cost" not in result["kwargs"]
+        assert result["kwargs"]["response_cost"] == 0.000027
         assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
             "totalTokenCount"
         ] == 13
-        assert mock_logging_obj.model_call_details["model"] == "gemini-3.1-pro-low"
+        assert mock_logging_obj.model_call_details["model"] == "claude-sonnet-4-6"
         assert (
             mock_logging_obj.model_call_details["custom_llm_provider"]
             == "antigravity"
         )
-        assert "response_cost" not in mock_logging_obj.model_call_details
-        mock_completion_cost.assert_not_called()
+        assert mock_logging_obj.model_call_details["response_cost"] == 0.000027
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["model"] == (
+            "vertex_ai/claude-sonnet-4-6"
+        )
+        assert mock_completion_cost.call_args.kwargs["custom_llm_provider"] == (
+            "vertex_ai"
+        )
 
     def test_gemini_passthrough_handler_non_gemini_route(self):
         """Test that non-Gemini routes return None"""
