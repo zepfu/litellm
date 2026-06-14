@@ -18230,6 +18230,15 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         "model": "aawm-code",
         "input": "hello",
         "stream": False,
+        "tools": [
+            {"type": "custom", "name": "exec_command"},
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "tool_choice": {"type": "custom", "name": "exec_command"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
     antigravity_error = RuntimeError(
@@ -18240,7 +18249,10 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
     )
     grok_success = Response(content='{"ok": true}', media_type="application/json")
 
-    with patch(
+    with patch.dict(
+        os.environ,
+        {"GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL": "https://api.x.ai/v1"},
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
         new=AsyncMock(return_value="antigravity-lane"),
     ), patch(
@@ -18248,11 +18260,11 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         new=AsyncMock(side_effect=antigravity_error),
     ) as mock_antigravity, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=spark_error),
+        new=AsyncMock(side_effect=[spark_error, grok_success]),
     ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
-        new=AsyncMock(return_value=grok_success),
-    ) as mock_grok_native:
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ):
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -18266,12 +18278,27 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
 
     assert response is grok_success
     mock_antigravity.assert_awaited_once()
-    mock_pass_through.assert_awaited_once()
-    mock_grok_native.assert_awaited_once()
-    grok_body = mock_grok_native.await_args.kwargs["request_body"]
+    assert mock_pass_through.await_count == 2
+    grok_call = mock_pass_through.await_args_list[1].kwargs
+    assert grok_call["target"] == "https://api.x.ai/v1/responses"
+    assert grok_call["custom_headers"]["authorization"] == "Bearer grok-oidc-token"
+    assert grok_call["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+    grok_body = grok_call["custom_body"]
+    assert grok_body["model"] == "grok-composer-2.5-fast"
+    assert grok_body["tools"] == [body["tools"][1]]
+    assert "tool_choice" not in grok_body
     metadata = grok_body["litellm_metadata"]
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
     assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["codex_unsupported_hosted_tool_removed_count"] == 1
+    assert metadata["codex_unsupported_hosted_tool_types_removed"] == ["custom"]
+    assert metadata["codex_unsupported_hosted_tools_removed"] == [
+        {"type": "custom", "index": 0, "name": "exec_command"}
+    ]
+    assert metadata["codex_unsupported_hosted_tool_choice_removed"] == {
+        "type": "custom",
+        "name": "exec_command",
+    }
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
@@ -18436,6 +18463,15 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         "model": "aawm-code",
         "input": "hello",
         "stream": False,
+        "tools": [
+            {"type": "custom", "name": "exec_command"},
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "tool_choice": {"type": "custom", "name": "exec_command"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
     antigravity_error = ProxyException(
@@ -18512,6 +18548,8 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
     assert managed_call["expected_target_family"] == "xai"
     final_body = managed_call["custom_body"]
     assert final_body["model"] == "grok-build"
+    assert final_body["tools"] == [body["tools"][1]]
+    assert "tool_choice" not in final_body
     metadata = final_body["litellm_metadata"]
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
     assert metadata["codex_auto_agent_selected_model"] == "oa_xai/grok-build"
@@ -18520,6 +18558,15 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
     )
     assert metadata["xai_oauth_public_model"] == "oa_xai/grok-build"
     assert metadata["xai_oauth_upstream_model"] == "xai/grok-build"
+    assert metadata["codex_unsupported_hosted_tool_removed_count"] == 1
+    assert metadata["codex_unsupported_hosted_tool_types_removed"] == ["custom"]
+    assert metadata["codex_unsupported_hosted_tools_removed"] == [
+        {"type": "custom", "index": 0, "name": "exec_command"}
+    ]
+    assert metadata["codex_unsupported_hosted_tool_choice_removed"] == {
+        "type": "custom",
+        "name": "exec_command",
+    }
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
