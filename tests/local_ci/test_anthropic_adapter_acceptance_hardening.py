@@ -47,6 +47,135 @@ PARALLEL_CASE_AGENTS = {
         {"Read", "Glob", "Grep"},
     ),
 }
+D1251_PARALLEL_CASE_AGENTS = {
+    "claude_adapter_gpt53_child_parallel_read_tools": (
+        "harness-openai-gpt53-parallel-read-tools",
+        "openai",
+        "gpt-5.3-codex-spark",
+        {"Read", "Glob", "Grep"},
+        "openai/gpt-5.3-codex-spark",
+    ),
+    "claude_adapter_openrouter_deepseek_v4_flash_child_parallel_read_tools": (
+        "harness-openrouter-deepseek-v4-flash-parallel-read-tools",
+        "openrouter",
+        "openrouter/deepseek/deepseek-v4-flash",
+        {"Read", "Glob", "Grep"},
+        "openrouter/deepseek/deepseek-v4-flash",
+    ),
+    "claude_adapter_anthropic_claude_haiku_4_5_20251001_child_parallel_read_tools": (
+        "harness-anthropic-haiku-4-5-parallel-read-tools",
+        "anthropic",
+        "claude-haiku-4-5-20251001",
+        {"Read", "Glob", "Grep"},
+        "claude-haiku-4-5-20251001",
+    ),
+    "claude_adapter_anthropic_claude_opus_4_8_child_parallel_read_tools": (
+        "harness-anthropic-opus-4-8-parallel-read-tools",
+        "anthropic",
+        "claude-opus-4-8",
+        {"Read", "Glob", "Grep"},
+        "claude-opus-4-8",
+    ),
+    "claude_adapter_antigravity_claude_sonnet_4_6_child_sequential_read_tools": (
+        "harness-antigravity-claude-sonnet-4-6-sequential-read-tools",
+        "antigravity",
+        "claude-sonnet-4-6",
+        {"read_file", "glob", "grep_search"},
+        "antigravity/claude-sonnet-4-6",
+    ),
+    "claude_adapter_xai_grok_composer_child_parallel_read_tools": (
+        "harness-xai-grok-composer-parallel-read-tools",
+        "xai",
+        "grok-composer-2.5-fast",
+        {"Read", "Glob", "Grep"},
+        "xai/grok-composer-2.5-fast",
+    ),
+    "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools": (
+        "harness-xai-oa-xai-grok-build-parallel-read-tools",
+        "xai",
+        "oa_xai/grok-build",
+        {"Read", "Glob", "Grep"},
+        "oa_xai/grok-build",
+    ),
+    "claude_adapter_anthropic_claude_sonnet_4_6_child_parallel_read_tools": (
+        "harness-anthropic-sonnet-4-6-parallel-read-tools",
+        "anthropic",
+        "claude-sonnet-4-6",
+        {"Read", "Glob", "Grep"},
+        "claude-sonnet-4-6",
+    ),
+    "claude_adapter_opencode_zen_deepseek_v4_flash_child_parallel_read_tools": (
+        "harness-opencode-zen-deepseek-v4-flash-parallel-read-tools",
+        "opencode_zen",
+        "deepseek-v4-flash",
+        {"Read", "Glob", "Grep"},
+        "opencode_zen/deepseek-v4-flash",
+    ),
+    "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools": (
+        "harness-opencode-zen-big-pickle-parallel-read-tools",
+        "opencode_zen",
+        "big-pickle",
+        {"Read", "Glob", "Grep"},
+        "opencode_zen/big-pickle",
+    ),
+}
+FORBIDDEN_D1251_GEMINI_CASE_MODELS = {
+    "google/gemini-3.1-flash-lite-preview",
+    "google/gemini-3-flash-preview",
+    "google/gemini-3.1-pro-preview",
+}
+FORBIDDEN_D1251_GOOGLE_CHILD_PARALLEL_MODEL_PREFIXES = {
+    "google/gemma",
+    "openrouter/google/gemma",
+}
+
+
+def _is_forbidden_d1251_child_parallel_model(model: str) -> bool:
+    model = model.lower()
+    if model in FORBIDDEN_D1251_GEMINI_CASE_MODELS:
+        return True
+    return any(
+        model.startswith(prefix)
+        for prefix in FORBIDDEN_D1251_GOOGLE_CHILD_PARALLEL_MODEL_PREFIXES
+    )
+
+
+D1251_REQUIRED_TRACE_TAGS = {
+    "openai": {"route:anthropic_openai_responses_adapter"},
+    "openrouter": {"route:anthropic_openrouter_responses_adapter"},
+    "anthropic": {"route:anthropic_messages"},
+    "antigravity": {"route:anthropic_antigravity_completion_adapter"},
+    "xai": {
+        "route:anthropic_grok_native_responses_adapter",
+        "route:anthropic_xai_oauth_responses_adapter",
+    },
+    "opencode_zen": {
+        "route:anthropic_opencode_zen_responses_adapter",
+        "route:anthropic_opencode_zen_completion_adapter",
+    },
+}
+D1251_REQUIRED_TRACE_TAGS_BY_CASE = {
+    "claude_adapter_xai_grok_composer_child_parallel_read_tools": {
+        "route:anthropic_grok_native_responses_adapter",
+    },
+    "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools": {
+        "route:anthropic_xai_oauth_responses_adapter",
+    },
+}
+D1251_DISALLOWED_TRACE_TAGS_BY_CASE = {
+    "claude_adapter_xai_grok_composer_child_parallel_read_tools": {
+        "route:anthropic_xai_oauth_responses_adapter",
+    },
+    "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools": {
+        "route:anthropic_grok_native_responses_adapter",
+    },
+}
+D1251_SEQUENTIAL_TRANSCRIPT_CASES = {
+    "claude_adapter_antigravity_claude_sonnet_4_6_child_sequential_read_tools",
+}
+D1251_OPENCODE_COMPLETION_CASES = {
+    "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools",
+}
 
 REMOVED_GEMINI_HARNESS_CASES = {
     "native_gemini_passthrough_generate_content",
@@ -65,7 +194,27 @@ REMOVED_GEMINI_HARNESS_CASES = {
     "claude_adapter_gemini_fanout",
     "claude_adapter_gemini31_pro",
     "claude_adapter_gemini31_flash",
+    "claude_adapter_gemma_31b",
+    "claude_adapter_gemma_26b_a4b",
 }
+ACTIVE_ANTHROPIC_HARNESS_SURFACES = (
+    HARNESS_PATH,
+    ANTHROPIC_ADAPTER_CONFIG_PATH,
+    ROOT / "scripts" / "local-ci" / "README.md",
+)
+FORBIDDEN_ACTIVE_GEMINI_HARNESS_SNIPPETS = (
+    ".gemini",
+    "@google/gemini-cli",
+    "gemini_oauth",
+    "litellm_gemini",
+    "gemini_cli",
+    '"cli_passthrough": "gemini"',
+    "'cli_passthrough': 'gemini'",
+    '"gemini", "prompt"',
+    "google_code_assist",
+    "google/gemini",
+    "google/gemma",
+)
 DIRECT_ANTHROPIC_MODEL_PATTERN = re.compile(
     r"(?:^|[/:\s])anthropic(?:[/:\s]|$)|^aawm-.+-anthropic$",
     re.IGNORECASE,
@@ -1048,6 +1197,36 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
     )
 
 
+def test_target_profile_ignores_unknown_cli_passthrough():
+    harness = _load_harness_module()
+
+    config = {
+        "cases": {
+            "native_retired_passthrough_removed": {
+                "cli_passthrough": "retired-provider",
+                "command": ["retired-provider", "prompt"],
+            }
+        }
+    }
+
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    case_config = updated["cases"]["native_retired_passthrough_removed"]
+    assert case_config["env"] == {}
+    assert case_config["command"] == ["retired-provider", "prompt"]
+    assert "expected_user_ids" not in case_config
+    assert "expected_trace_session_id" not in case_config
+
+
 def test_target_profile_formats_claude_case_harness_run_id(monkeypatch):
     harness = _load_harness_module()
 
@@ -1374,8 +1553,22 @@ def test_anthropic_adapter_config_removes_gemini_harness_cases():
 
     assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["cases"])
     assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["default_excluded_cases"])
-    assert "gemini" not in json.dumps(config["cases"]).lower()
-    assert "google_code_assist" not in json.dumps(config["cases"]).lower()
+    serialized_cases = json.dumps(config["cases"]).lower()
+    serialized_excluded_cases = json.dumps(config["default_excluded_cases"]).lower()
+    for forbidden_selector in ("gemini", "google/gemma", "google_code_assist"):
+        assert forbidden_selector not in serialized_cases
+        assert forbidden_selector not in serialized_excluded_cases
+
+
+def test_active_anthropic_adapter_harness_surfaces_do_not_include_gemini_paths():
+    violations = []
+    for path in ACTIVE_ANTHROPIC_HARNESS_SURFACES:
+        text = path.read_text(encoding="utf-8").lower()
+        for snippet in FORBIDDEN_ACTIVE_GEMINI_HARNESS_SNIPPETS:
+            if snippet in text:
+                violations.append(f"{path.relative_to(ROOT)} contains {snippet}")
+
+    assert violations == []
 
 
 def _collect_codex_case_model_selectors(case_config):
@@ -1419,6 +1612,21 @@ def _collect_codex_case_model_selectors(case_config):
                 )
 
     return model_selectors
+
+
+def _collect_child_parallel_case_models(case_config):
+    models = set()
+    for row in case_config.get("session_history_validation", {}).get("expected_rows", []):
+        if isinstance(row, dict) and isinstance(row.get("model"), str):
+            models.add(row["model"])
+
+    for _, agent_config in case_config.get("claude_agents", {}).items():
+        if isinstance(agent_config, dict) and isinstance(
+            agent_config.get("model"),
+            str,
+        ):
+            models.add(agent_config["model"])
+    return models
 
 
 def test_codex_harness_cases_do_not_directly_select_anthropic_models():
@@ -1639,13 +1847,18 @@ def _assert_parallel_read_common_case(
     provider,
     model,
     durable_tool_names,
+    transcript_mode="parallel",
 ):
     command = case_config["command"]
     prompt = command[2]
     assert case_name in config["default_excluded_cases"]
     assert f"Dispatch to the {agent_name} agent" in prompt
     assert "exactly three tool calls" in prompt
-    assert "must not wait for any tool result" in prompt
+    if transcript_mode == "parallel":
+        assert "must not wait for any tool result" in prompt
+    else:
+        assert transcript_mode == "sequential"
+        assert "waiting for each tool result before issuing the next tool" in prompt
     assert "sequential_core_tools_fixture.txt" in prompt
     assert "sequential-core-tools-grep" in prompt
     assert command[command.index("--allowedTools") + 1] == "Agent"
@@ -1654,10 +1867,15 @@ def _assert_parallel_read_common_case(
     assert set(case_config["claude_agents"]) == {agent_name}
     agent_config = case_config["claude_agents"][agent_name]
     assert agent_config["tools"] == PARALLEL_READ_TOOLS
-    assert "first assistant message must contain exactly three tool_use blocks" in (
-        agent_config["prompt"]
-    )
-    assert "Do not wait for any tool result" in agent_config["prompt"]
+    if transcript_mode == "parallel":
+        assert "first assistant message must contain exactly three tool_use blocks" in (
+            agent_config["prompt"]
+        )
+        assert "Do not wait for any tool result" in agent_config["prompt"]
+    else:
+        assert "waiting for each tool result before issuing the next tool" in (
+            agent_config["prompt"]
+        )
     assert f"claude-code.{agent_name}" in case_config["required_trace_names"]
     assert case_config["expected_trace_user_ids_by_name"][
         f"claude-code.{agent_name}"
@@ -1672,9 +1890,15 @@ def _assert_parallel_read_common_case(
         "Glob": 1,
         "Grep": 1,
     }
-    assert transcript_agent["minimum_tools_in_single_assistant_message"] == 3
-    assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
-    assert "require_tool_result_before_next_tool_use" not in transcript_agent
+    if transcript_mode == "parallel":
+        assert transcript_agent["minimum_tools_in_single_assistant_message"] == 3
+        assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
+        assert "require_tool_result_before_next_tool_use" not in transcript_agent
+    else:
+        assert transcript_mode == "sequential"
+        assert "minimum_tools_in_single_assistant_message" not in transcript_agent
+        assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 1
+        assert transcript_agent["require_tool_result_before_next_tool_use"] is True
 
     durable_rows = [
         row
@@ -1795,6 +2019,105 @@ def test_parallel_read_tool_prompts_use_harness_agents_and_parallel_gate():
             _assert_openrouter_parallel_read_case(case_config)
         elif provider == "nvidia_nim":
             _assert_nvidia_parallel_read_case(case_config)
+
+
+def test_d1251_parallel_read_cases_cover_expected_aawm_anthropic_target_matrix():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    assert config["cases"].keys() >= D1251_PARALLEL_CASE_AGENTS.keys()
+
+    for case_name, (
+        agent_name,
+        provider,
+        model,
+        durable_tool_names,
+        child_model_selector,
+    ) in D1251_PARALLEL_CASE_AGENTS.items():
+        case_config = config["cases"][case_name]
+        _assert_parallel_read_common_case(
+            config=config,
+            case_name=case_name,
+            case_config=case_config,
+            agent_name=agent_name,
+            provider=provider,
+            model=model,
+            durable_tool_names=durable_tool_names,
+            transcript_mode=(
+                "sequential"
+                if case_name in D1251_SEQUENTIAL_TRANSCRIPT_CASES
+                else "parallel"
+            ),
+        )
+        assert case_config["claude_agents"][agent_name]["model"] == (
+            child_model_selector
+        )
+        command_json_checks = case_config["command_json_checks"]
+        assert command_json_checks["required_equals"] == {"is_error": False}
+        expected_result_substring = command_json_checks["required_contains"][
+            "result"
+        ]
+        assert expected_result_substring in case_config["command"][2]
+        if provider == "xai":
+            required_trace_tags = D1251_REQUIRED_TRACE_TAGS_BY_CASE.get(
+                case_name,
+                D1251_REQUIRED_TRACE_TAGS["xai"],
+            )
+            disallowed_trace_tags = D1251_DISALLOWED_TRACE_TAGS_BY_CASE.get(
+                case_name,
+                set(),
+            )
+        else:
+            required_trace_tags = D1251_REQUIRED_TRACE_TAGS[provider]
+            disallowed_trace_tags = set()
+        assert required_trace_tags.intersection(
+            set(case_config["required_trace_tags"])
+        ), f"{case_name} is missing a D1-251 route tag for {provider}"
+        assert not set(case_config["required_trace_tags"]).intersection(
+            disallowed_trace_tags
+        ), f"{case_name} is using a disallowed D1-251 route tag"
+        if provider == "openrouter":
+            assert case_config["allow_zero_cost"] is True
+        if provider == "xai":
+            request_paths = set(case_config["request_payload_checks"]["required_paths"])
+            assert {"model", "input", "stream", "tools"} <= request_paths
+            assert "instructions" not in request_paths
+        if case_name in D1251_OPENCODE_COMPLETION_CASES:
+            required_tags = set(case_config["required_trace_tags"])
+            assert "route:anthropic_opencode_zen_completion_adapter" in required_tags
+            assert (
+                "anthropic-adapter-target:opencode_zen:/v1/chat/completions"
+                in required_tags
+            )
+            request_paths = set(case_config["request_payload_checks"]["required_paths"])
+            assert {"model", "messages", "stream", "tools"} <= request_paths
+            assert "input" not in request_paths
+            assert "instructions" not in request_paths
+        elif provider == "opencode_zen":
+            required_tags = set(case_config["required_trace_tags"])
+            assert "route:anthropic_opencode_zen_responses_adapter" in required_tags
+            assert (
+                "anthropic-adapter-target:opencode_zen:/v1/responses"
+                in required_tags
+            )
+
+
+def test_d1251_parallel_read_cases_do_not_include_disallowed_gemini_models():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name, (_, _, persisted_model, _, child_model_selector) in (
+        D1251_PARALLEL_CASE_AGENTS.items()
+    ):
+        for model in (persisted_model, child_model_selector):
+            assert not _is_forbidden_d1251_child_parallel_model(model), (
+                f"{case_name} uses forbidden Gemini/Google model {model}"
+            )
+
+    for case_name, case_config in config["cases"].items():
+        if case_name.endswith("_child_parallel_read_tools"):
+            for model in _collect_child_parallel_case_models(case_config):
+                assert not _is_forbidden_d1251_child_parallel_model(model), (
+                    f"{case_name} uses forbidden Gemini/Google model {model}"
+                )
 
 
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):

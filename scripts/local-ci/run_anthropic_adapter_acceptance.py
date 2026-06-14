@@ -221,12 +221,6 @@ def _append_claude_agents_arg(command: list[Any], agents: Any) -> list[Any]:
     ]
 
 
-def _append_comma_headers(existing: str | None, headers: list[tuple[str, str]]) -> str:
-    parts = [existing.strip()] if isinstance(existing, str) and existing.strip() else []
-    parts.extend(f'{key}: {value}' for key, value in headers)
-    return ', '.join(parts)
-
-
 def _docker_status_for_container(container_name: str) -> str:
     result = subprocess.run(
         ['docker', 'ps', '--filter', f'name=^{container_name}$', '--format', '{{.Status}}'],
@@ -583,7 +577,7 @@ def _ensure_cli_harness_context(
 ) -> dict[str, Any]:
     updated = dict(config)
     cli_kind = str(updated.get('cli_passthrough') or '').strip().lower()
-    if cli_kind not in {'codex', 'gemini', 'grok'}:
+    if cli_kind not in {'codex', 'grok'}:
         return updated
 
     tenant_id = str(updated.get('tenant_id') or 'adapter-harness-tenant')
@@ -636,13 +630,6 @@ def _ensure_cli_harness_context(
                 command,
                 context,
             )
-    if cli_kind == 'gemini':
-        env['CODE_ASSIST_ENDPOINT'] = f"{profile['litellm_base_url']}/gemini"
-        env['GOOGLE_GENAI_USE_GCA'] = 'true'
-        env['GEMINI_CLI_CUSTOM_HEADERS'] = _append_comma_headers(
-            env.get('GEMINI_CLI_CUSTOM_HEADERS'),
-            controlled_headers,
-        )
     if cli_kind == 'grok':
         env['GROK_CLI_CHAT_PROXY_BASE_URL'] = (
             f"{profile['litellm_base_url']}/grok/v1"
@@ -1629,7 +1616,7 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
             failures.append(
                 f'{family} session_history row model={row.get("model")!r} has null/empty `provider`'
             )
-        if row_provider in {'anthropic', 'openai', 'openrouter', 'gemini'}:
+        if row_provider in {'anthropic', 'openai', 'openrouter'}:
             cache_status = row.get('provider_cache_status')
             if not isinstance(cache_status, str) or not cache_status.strip():
                 failures.append(
