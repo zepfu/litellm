@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from io import BytesIO
 from types import SimpleNamespace
@@ -20,8 +21,12 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 from litellm._logging import (
+    AawmRouteAccessLogReplacementFilter,
+    clear_aawm_route_access_log_replacements,
     get_egress_guard_alert_state,
+    register_aawm_route_access_log_replacement,
     reset_egress_guard_alert_state,
+    verbose_aawm_route_logger,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import ProxyException
@@ -66,6 +71,36 @@ def _build_aawm_route_log_request(
     return request
 
 
+def _build_uvicorn_access_record(
+    *,
+    client_addr: str = "172.19.0.1:52834",
+    method: str = "POST",
+    full_path: str = "/anthropic/v1/messages?beta=true",
+    http_version: str = "1.1",
+    status_code: int = 200,
+) -> logging.LogRecord:
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(client_addr, method, full_path, http_version, status_code),
+        exc_info=None,
+    )
+
+
+@contextmanager
+def _capture_aawm_route_logs(caplog):
+    logger = logging.getLogger("LiteLLM AAWM Route")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=logger.name):
+            yield
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
 def test_build_aawm_route_access_log_line_includes_available_context() -> None:
     request = _build_aawm_route_log_request(
         url=(
@@ -89,7 +124,7 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
     )
 
     assert line == (
-        "AAWM_ROUTE: W4 engineer@dashboard-shell - "
+        "ROUTE: W4 engineer@dashboard-shell - "
         "grok-composer-2.5-fast(aawm-code) - 172.19.0.1:52834 - "
         "POST /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses HTTP/1.1"
@@ -113,12 +148,35 @@ def test_build_aawm_route_access_log_line_omits_missing_optional_context() -> No
     )
 
     assert line == (
-        "AAWM_ROUTE: 127.0.0.1:44780 - GET /openai_passthrough/responses "
+        "ROUTE: 127.0.0.1:44780 - GET /openai_passthrough/responses "
         "-> api.openai.com/v1/responses HTTP/2"
     )
     assert "secret" not in line
     assert "token" not in line
     assert "None" not in line
+
+
+def test_build_aawm_route_access_log_line_omits_alias_when_same_as_model() -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "aawm-code",
+        "litellm_metadata": {
+            "requested_model_alias": "aawm-code",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body=request_body,
+    )
+
+    assert line == (
+        "ROUTE: aawm-code - 172.19.0.1:52834 - "
+        "POST /anthropic/v1/messages?beta=true -> "
+        "api.anthropic.com/v1/messages HTTP/1.1"
+    )
+    assert "aawm-code(aawm-code)" not in line
 
 
 def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -> None:
@@ -144,7 +202,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
     )
 
     assert line == (
-        "AAWM_ROUTE: gpt-5.5(aawm-code) - 172.19.0.1:52834 - "
+        "ROUTE: gpt-5.5(aawm-code) - 172.19.0.1:52834 - "
         "POST /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses HTTP/1.1"
     )
@@ -168,7 +226,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_headers() ->
     )
 
     assert line == (
-        "AAWM_ROUTE: gpt-5.3-codex-spark - 172.19.0.1:52834 - "
+        "ROUTE: gpt-5.3-codex-spark - 172.19.0.1:52834 - "
         "POST /anthropic/v1/messages?beta=true -> "
         "api.openai.com/v1/responses HTTP/1.1"
     )
@@ -192,7 +250,7 @@ def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
         request_body=request_body,
     )
 
-    assert line.startswith("AAWM_ROUTE: W4 engineer@dashboard-shell -")
+    assert line.startswith("ROUTE: W4 engineer@dashboard-shell -")
     assert "/home/zepfu/projects" not in line
 
 
@@ -212,17 +270,18 @@ def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> N
         request_body=request_body,
     )
 
-    assert line.startswith("AAWM_ROUTE: W4 engineer@zepfu/litellm -")
+    assert line.startswith("ROUTE: W4 engineer@zepfu/litellm -")
 
 
 def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
+    clear_aawm_route_access_log_replacements()
     request = _build_aawm_route_log_request()
     request_body = {
         "model": "claude-sonnet-4-6",
         "metadata": {"model_alias_label": "aawm-code-anthropic"},
     }
 
-    with caplog.at_level(logging.INFO, logger="LiteLLM Proxy"):
+    with _capture_aawm_route_logs(caplog):
         emit_aawm_route_access_log(
             request=request,
             target="https://api.anthropic.com/v1/messages",
@@ -234,22 +293,114 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
             request_body=request_body,
         )
 
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is False
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is True
+    )
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("AAWM_ROUTE:")
+        if record.getMessage().startswith("ROUTE:")
     ]
     assert route_records == [
         (
-            "AAWM_ROUTE: claude-sonnet-4-6(aawm-code-anthropic) - "
+            "ROUTE: claude-sonnet-4-6(aawm-code-anthropic) - "
             "172.19.0.1:52834 - POST /anthropic/v1/messages?beta=true "
             "-> api.anthropic.com/v1/messages HTTP/1.1"
         )
     ]
 
 
+def test_aawm_route_access_log_filter_suppresses_matching_access_record_once() -> None:
+    clear_aawm_route_access_log_replacements()
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    register_aawm_route_access_log_replacement(
+        client_addr="172.19.0.1:52834",
+        method="POST",
+        full_path="/anthropic/v1/messages?beta=true",
+        http_version="1.1",
+    )
+
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                client_addr="172.19.0.1:52835",
+                full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is True
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is False
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is True
+    )
+
+
+def test_aawm_route_access_log_filter_preserves_non_access_records() -> None:
+    clear_aawm_route_access_log_replacements()
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    register_aawm_route_access_log_replacement(
+        client_addr="172.19.0.1:52834",
+        method="POST",
+        full_path="/anthropic/v1/messages?beta=true",
+        http_version="1.1",
+    )
+
+    non_access_record = logging.LogRecord(
+        name="LiteLLM Proxy",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="normal proxy log",
+        args=(),
+        exc_info=None,
+    )
+
+    assert access_filter.filter(non_access_record) is True
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is False
+    )
+
+
+def test_aawm_route_logger_emits_info_level_access_lines() -> None:
+    assert verbose_aawm_route_logger.getEffectiveLevel() <= logging.INFO
+    assert verbose_aawm_route_logger.handlers
+    assert all(handler.level <= logging.INFO for handler in verbose_aawm_route_logger.handlers)
+
+
 @pytest.mark.asyncio
 async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
+    clear_aawm_route_access_log_replacements()
     request = _build_aawm_route_log_request(
         url="http://127.0.0.1:4001/openai_passthrough/responses?stream=false",
         client=("172.19.0.1", 44766),
@@ -303,7 +454,7 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
         ), patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_response_body",
             return_value={"success": True},
-        ), caplog.at_level(logging.INFO, logger="LiteLLM Proxy"):
+        ), _capture_aawm_route_logs(caplog):
             await pass_through_request(
                 request=request,
                 target="https://api.openai.com/v1/responses?api_key=secret",
@@ -313,14 +464,37 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
                 custom_llm_provider="openai",
             )
 
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                client_addr="172.19.0.1:44766",
+                method="POST",
+                full_path="/openai_passthrough/responses?stream=false",
+                http_version="1.1",
+            )
+        )
+        is False
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                client_addr="172.19.0.1:44767",
+                method="POST",
+                full_path="/openai_passthrough/responses?stream=false",
+                http_version="1.1",
+            )
+        )
+        is True
+    )
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("AAWM_ROUTE:")
+        if record.getMessage().startswith("ROUTE:")
     ]
     assert route_records == [
         (
-            "AAWM_ROUTE: W2 tester@litellm - gpt-5.3-codex-spark(aawm-code) - "
+            "ROUTE: W2 tester@litellm - gpt-5.3-codex-spark(aawm-code) - "
             "172.19.0.1:44766 - POST /openai_passthrough/responses?stream=false "
             "-> api.openai.com/v1/responses HTTP/1.1"
         )

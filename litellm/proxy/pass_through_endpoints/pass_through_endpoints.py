@@ -8,7 +8,7 @@ import traceback
 from base64 import b64encode
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
-from urllib.parse import parse_qsl, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 import httpx
 from fastapi import (
@@ -33,7 +33,12 @@ from websockets.exceptions import (
 )
 
 import litellm
-from litellm._logging import trigger_egress_guard_alert, verbose_proxy_logger
+from litellm._logging import (
+    register_aawm_route_access_log_replacement,
+    trigger_egress_guard_alert,
+    verbose_aawm_route_logger,
+    verbose_proxy_logger,
+)
 from litellm._uuid import uuid
 from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG
 from litellm.integrations.custom_logger import CustomLogger
@@ -78,7 +83,8 @@ router = APIRouter()
 pass_through_endpoint_logging = PassThroughEndpointLogging()
 
 _AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY = "aawm_route_access_log_emitted"
-_AAWM_ROUTE_ACCESS_LOGGER_NAME = verbose_proxy_logger.name
+_AAWM_ROUTE_ACCESS_LOGGER_NAME = verbose_aawm_route_logger.name
+_AAWM_ROUTE_ACCESS_LOG_TYPE = "ROUTE"
 _AAWM_ROUTE_LOG_MAX_FIELD_CHARS = 180
 _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS = 96
 _AAWM_ROUTE_LOG_SAFE_QUERY_KEYS = frozenset(
@@ -631,6 +637,49 @@ def _get_aawm_route_protocol_label(request: Request) -> str:
     return f"HTTP/{version}"
 
 
+def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return None
+
+    path = scope.get("path")
+    if not isinstance(path, str):
+        return None
+
+    full_path = quote(path)
+    query_string = scope.get("query_string")
+    if not query_string:
+        return full_path
+
+    try:
+        if isinstance(query_string, bytes):
+            query_label = query_string.decode("ascii")
+        else:
+            query_label = str(query_string)
+    except UnicodeDecodeError:
+        return full_path
+
+    return f"{full_path}?{query_label}"
+
+
+def _register_aawm_route_access_log_replacement(request: Request) -> None:
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return
+
+    client = scope.get("client")
+    client_addr = None
+    if isinstance(client, (list, tuple)) and len(client) >= 2:
+        client_addr = f"{client[0]}:{client[1]}"
+
+    register_aawm_route_access_log_replacement(
+        client_addr=client_addr,
+        method=str(scope.get("method") or getattr(request, "method", "") or ""),
+        full_path=_get_aawm_route_native_access_log_path(request),
+        http_version=str(scope.get("http_version") or ""),
+    )
+
+
 def _get_aawm_route_log_model_label(
     request_body: Optional[dict[str, Any]],
     metadata: dict[str, Any],
@@ -687,7 +736,7 @@ def build_aawm_route_access_log_line(
     outgoing_target = _safe_aawm_route_target_label(target)
     protocol = _get_aawm_route_protocol_label(request)
 
-    segments: list[str] = ["AAWM_ROUTE:"]
+    segments: list[str] = [f"{_AAWM_ROUTE_ACCESS_LOG_TYPE}:"]
     if agent_name and repository:
         segments.append(f"{agent_name}@{repository} -")
     elif agent_name:
@@ -716,14 +765,16 @@ def emit_aawm_route_access_log(
             return
         scope[_AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY] = True
 
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target=target,
+        request_body=request_body,
+        kwargs=kwargs,
+    )
+    _register_aawm_route_access_log_replacement(request)
     logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info(
         "%s",
-        build_aawm_route_access_log_line(
-            request=request,
-            target=target,
-            request_body=request_body,
-            kwargs=kwargs,
-        ),
+        line,
     )
 
 
