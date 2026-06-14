@@ -2176,135 +2176,6 @@ def _codex_auto_agent_request_has_continuation_state(
     return False
 
 
-def _anthropic_auto_agent_request_declares_tool_contract(
-    request_body: dict[str, Any],
-) -> bool:
-    tools = request_body.get("tools")
-    if isinstance(tools, list) and len(tools) > 0:
-        return True
-
-    tool_choice = request_body.get("tool_choice")
-    if isinstance(tool_choice, dict):
-        choice_type = _clean_codex_auth_value(tool_choice.get("type"))
-        if choice_type is not None and choice_type.lower() not in {"auto", "none"}:
-            return True
-    elif isinstance(tool_choice, str) and tool_choice.strip().lower() not in {
-        "",
-        "auto",
-        "none",
-    }:
-        return True
-    return False
-
-
-def _anthropic_auto_agent_requires_antigravity_tool_route(
-    *,
-    alias_model: str,
-    request_body: dict[str, Any],
-) -> bool:
-    if alias_model != _ANTHROPIC_AAWM_CODE_ALIAS:
-        return False
-    return (
-        _anthropic_auto_agent_request_declares_tool_contract(request_body)
-        or _codex_auto_agent_request_has_continuation_state(request_body)
-    )
-
-
-def _anthropic_auto_agent_candidate_is_antigravity_tool_route(
-    candidate: dict[str, Any],
-) -> bool:
-    return (
-        candidate.get("provider") == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER
-        and candidate.get("route_family") == "anthropic_antigravity_completion_adapter"
-    )
-
-
-def _append_anthropic_auto_agent_incompatible_tool_route_skips(
-    *,
-    skipped: list[dict[str, Any]],
-    states: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    existing = {
-        (
-            candidate.get("provider"),
-            candidate.get("model"),
-            candidate.get("reason"),
-        )
-        for candidate in skipped
-    }
-    for state in states:
-        candidate = state["candidate"]
-        if _anthropic_auto_agent_candidate_is_antigravity_tool_route(candidate):
-            continue
-        shape = _codex_auto_agent_candidate_public_shape(
-            candidate,
-            lane_key=state.get("lane_key"),
-            cooldown_seconds=state.get("cooldown_seconds"),
-            reason="tool_schema_incompatible",
-        )
-        key = (shape.get("provider"), shape.get("model"), shape.get("reason"))
-        if key not in existing:
-            skipped.append(shape)
-            existing.add(key)
-    return skipped
-
-
-def _raise_anthropic_auto_agent_no_tool_compatible_candidate(
-    *,
-    alias_model: str,
-    states: list[dict[str, Any]],
-    skipped: list[dict[str, Any]],
-    in_flight_session: bool,
-) -> None:
-    compatible_cooldowns = [
-        float(state["cooldown_seconds"])
-        for state in states
-        if _anthropic_auto_agent_candidate_is_antigravity_tool_route(
-            state["candidate"]
-        )
-        and state["cooldown_seconds"] > 0
-    ]
-    compatible_route_cooldown_seconds = int(
-        max(1.0, min(compatible_cooldowns, default=1.0))
-    )
-    retry_after_seconds = min(
-        compatible_route_cooldown_seconds,
-        _ANTHROPIC_AUTO_AGENT_NO_TOOL_COMPATIBLE_RETRY_AFTER_SECONDS,
-    )
-    candidates = _append_anthropic_auto_agent_incompatible_tool_route_skips(
-        skipped=list(skipped),
-        states=states,
-    )
-    raise HTTPException(
-        status_code=429,
-        detail={
-            "error": {
-                "message": (
-                    "Anthropic code-agent alias requires an Antigravity Claude "
-                    "tool-compatible route for tool-bearing or stateful "
-                    "engineering requests. Do not continue this child agent on "
-                    "a non-Anthropic failover target; redispatch a fresh "
-                    f"subagent using model {alias_model} after the compatible "
-                    "route is available."
-                ),
-                "type": "rate_limit_error",
-                "code": "aawm_anthropic_auto_agent_no_tool_compatible_candidate",
-            },
-            "redispatch_model": alias_model,
-            "redispatch_reason": "no_tool_compatible_candidate",
-            "required_provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
-            "required_route_family": "anthropic_antigravity_completion_adapter",
-            "in_flight_session": in_flight_session,
-            "compatible_candidate_available": False,
-            "candidate_progression_exhausted": True,
-            "compatible_route_cooldown_seconds": compatible_route_cooldown_seconds,
-            "retry_after_seconds": retry_after_seconds,
-            "candidates": candidates,
-        },
-        headers={"Retry-After": str(retry_after_seconds)},
-    )
-
-
 def _raise_codex_auto_agent_in_flight_cooldown(
     *,
     candidate: dict[str, Any],
@@ -3211,12 +3082,6 @@ async def _select_anthropic_auto_agent_candidate(
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(
         request_body
     )
-    requires_antigravity_tool_route = (
-        _anthropic_auto_agent_requires_antigravity_tool_route(
-            alias_model=alias_model,
-            request_body=request_body,
-        )
-    )
     states = await _build_anthropic_auto_agent_candidate_states(
         request,
         alias_model=alias_model,
@@ -3252,25 +3117,6 @@ async def _select_anthropic_auto_agent_candidate(
                 None,
             )
             if affinity_state is not None:
-                if requires_antigravity_tool_route and not (
-                    _anthropic_auto_agent_candidate_is_antigravity_tool_route(
-                        affinity_candidate
-                    )
-                ):
-                    _raise_anthropic_auto_agent_no_tool_compatible_candidate(
-                        alias_model=alias_model,
-                        states=states,
-                        skipped=[
-                            *skipped,
-                            _codex_auto_agent_candidate_public_shape(
-                                affinity_candidate,
-                                lane_key=affinity_state.get("lane_key"),
-                                cooldown_seconds=affinity_state["cooldown_seconds"],
-                                reason="session_affinity_tool_schema_incompatible",
-                            ),
-                        ],
-                        in_flight_session=has_continuation_state,
-                    )
                 if affinity_state["cooldown_seconds"] > 0:
                     if has_continuation_state:
                         _raise_anthropic_auto_agent_in_flight_cooldown(
@@ -3297,12 +3143,6 @@ async def _select_anthropic_auto_agent_candidate(
                     }
 
     for state in states:
-        if requires_antigravity_tool_route and not (
-            _anthropic_auto_agent_candidate_is_antigravity_tool_route(
-                state["candidate"]
-            )
-        ):
-            continue
         if state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
             continue
         return {
@@ -3315,12 +3155,6 @@ async def _select_anthropic_auto_agent_candidate(
         }
 
     for state in states:
-        if requires_antigravity_tool_route and not (
-            _anthropic_auto_agent_candidate_is_antigravity_tool_route(
-                state["candidate"]
-            )
-        ):
-            continue
         if not state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
             continue
         return {
@@ -3331,14 +3165,6 @@ async def _select_anthropic_auto_agent_candidate(
             "skipped": skipped,
             "in_flight_session": has_continuation_state,
         }
-
-    if requires_antigravity_tool_route:
-        _raise_anthropic_auto_agent_no_tool_compatible_candidate(
-            alias_model=alias_model,
-            states=states,
-            skipped=skipped,
-            in_flight_session=has_continuation_state,
-        )
 
     raise HTTPException(
         status_code=429,
@@ -11353,6 +11179,27 @@ def _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
     return {}
 
 
+def _apply_forced_bash_tool_choice_for_responses_adapter(
+    request_body: dict[str, Any],
+    translated_body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    forced_tool_choice_changes = (
+        _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
+            request_body,
+            translated_body,
+        )
+    )
+    if not forced_tool_choice_changes:
+        return translated_body, {}
+    return (
+        _merge_litellm_metadata(
+            translated_body,
+            extra_fields=forced_tool_choice_changes,
+        ),
+        forced_tool_choice_changes,
+    )
+
+
 def _maybe_force_explicit_bash_tool_choice_for_completion_adapter(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
@@ -12780,6 +12627,17 @@ async def _handle_anthropic_openai_responses_adapter_route(
                 "openai_adapter_parallel_instruction_rewritten_chars"
             ),
         )
+    translated_request_body, forced_tool_choice_changes = (
+        _apply_forced_bash_tool_choice_for_responses_adapter(
+            prepared_request_body,
+            translated_request_body,
+        )
+    )
+    if forced_tool_choice_changes:
+        verbose_proxy_logger.debug(
+            "Applied OpenAI adapter explicit Bash tool choice: %s",
+            forced_tool_choice_changes.get("forced_explicit_bash_tool_choice"),
+        )
     if use_chatgpt_codex_defaults:
         translated_request_body = _add_codex_request_breakout_logging_metadata(
             translated_request_body
@@ -12922,6 +12780,17 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
                 "openai_adapter_parallel_instruction_rewritten_chars"
             ),
         )
+    translated_request_body, forced_tool_choice_changes = (
+        _apply_forced_bash_tool_choice_for_responses_adapter(
+            prepared_request_body,
+            translated_request_body,
+        )
+    )
+    if forced_tool_choice_changes:
+        verbose_proxy_logger.debug(
+            "Applied xAI OAuth adapter explicit Bash tool choice: %s",
+            forced_tool_choice_changes.get("forced_explicit_bash_tool_choice"),
+        )
     translated_request_body, _xai_unsupported_request_params = (
         _drop_unsupported_codex_request_params_from_request_body(
             translated_request_body
@@ -13056,6 +12925,17 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
             openai_parallel_instruction_policy_changes.get(
                 "openai_adapter_parallel_instruction_rewritten_chars"
             ),
+        )
+    translated_request_body, forced_tool_choice_changes = (
+        _apply_forced_bash_tool_choice_for_responses_adapter(
+            prepared_request_body,
+            translated_request_body,
+        )
+    )
+    if forced_tool_choice_changes:
+        verbose_proxy_logger.debug(
+            "Applied Grok native adapter explicit Bash tool choice: %s",
+            forced_tool_choice_changes.get("forced_explicit_bash_tool_choice"),
         )
     translated_request_body, _grok_unsupported_request_params = (
         _drop_unsupported_codex_request_params_from_request_body(
@@ -13560,17 +13440,12 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
                 "openrouter_adapter_parallel_instruction_tool_names"
             ),
         )
-    forced_tool_choice_changes = (
-        _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
+    translated_request_body, forced_tool_choice_changes = (
+        _apply_forced_bash_tool_choice_for_responses_adapter(
             prepared_request_body,
             translated_request_body,
         )
     )
-    if forced_tool_choice_changes:
-        translated_request_body = _merge_litellm_metadata(
-            translated_request_body,
-            extra_fields=forced_tool_choice_changes,
-        )
     if _responses_request_contains_mcp_tools(translated_request_body):
         raise HTTPException(
             status_code=400,
@@ -13715,6 +13590,17 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
             openrouter_parallel_instruction_policy_changes.get(
                 "openrouter_adapter_parallel_instruction_tool_names"
             ),
+        )
+    translated_request_body, forced_tool_choice_changes = (
+        _apply_forced_bash_tool_choice_for_responses_adapter(
+            prepared_request_body,
+            translated_request_body,
+        )
+    )
+    if forced_tool_choice_changes:
+        verbose_proxy_logger.debug(
+            "Applied OpenCode Zen adapter explicit Bash tool choice: %s",
+            forced_tool_choice_changes.get("forced_explicit_bash_tool_choice"),
         )
     if _responses_request_contains_mcp_tools(translated_request_body):
         raise HTTPException(

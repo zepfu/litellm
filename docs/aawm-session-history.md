@@ -41,17 +41,20 @@ Common keys include:
   attempts made by the selected alias handler.
 - `codex_auto_agent_skipped_candidates` or
   `anthropic_auto_agent_skipped_candidates`: candidates skipped because of
-  cooldown or compatibility constraints.
+  cooldown or stateful session-affinity cooldown.
 
 For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the
 next configured usable candidate. For tool-bearing or stateful
-`aawm-code-anthropic` requests, non-Antigravity route families are intentionally
-not usable because they do not preserve the Claude Code tool contract. In that
-case the alias fails closed with
-`aawm_anthropic_auto_agent_no_tool_compatible_candidate` once the compatible
-Antigravity route is unavailable, rather than selecting a model that cannot
-execute the engineering tool contract.
+`aawm-code-anthropic` requests, every declared candidate route is treated as a
+Claude Code tool-contract route: if the alias declares Antigravity, OpenAI, xAI,
+native Anthropic, or another provider/model target, that target must preserve
+tool calls, tool-use ids, tool arguments, tool-result replay, and ordered
+failover metadata for engineering-agent traffic. A declared candidate must not
+be skipped as policy-incompatible for the same request class it is meant to
+serve. If a declared candidate mishandles tools, that is an adapter translation
+defect to fix or evidence for removing/reclassifying the candidate; it is not a
+selector-side compatibility decision.
 
 ## Tool Definition Snapshots
 

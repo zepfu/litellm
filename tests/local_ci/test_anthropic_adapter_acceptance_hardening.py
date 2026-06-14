@@ -176,6 +176,17 @@ D1251_SEQUENTIAL_TRANSCRIPT_CASES = {
 D1251_OPENCODE_COMPLETION_CASES = {
     "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools",
 }
+D1256_ALIAS_REPLAY_CASE = (
+    "claude_adapter_aawm_code_anthropic_alias_child_parallel_read_tools"
+)
+D1256_ALIAS_REPLAY_AGENT = "harness-aawm-code-anthropic-alias-parallel-read-tools"
+D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
+    ("antigravity", "claude-sonnet-4-6"),
+    ("openai", "gpt-5.3-codex-spark"),
+    ("xai", "grok-composer-2.5-fast"),
+    ("xai", "oa_xai/grok-build"),
+    ("anthropic", "claude-sonnet-4-6"),
+}
 
 REMOVED_GEMINI_HARNESS_CASES = {
     "native_gemini_passthrough_generate_content",
@@ -1900,11 +1911,22 @@ def _assert_parallel_read_common_case(
         assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 1
         assert transcript_agent["require_tool_result_before_next_tool_use"] is True
 
-    durable_rows = [
-        row
-        for row in case_config["tool_activity_validation"]["expected_rows"]
-        if row.get("provider") == provider and row.get("model") == model
-    ]
+    if provider is None and model is None:
+        durable_rows = [
+            row
+            for row in case_config["tool_activity_validation"]["expected_rows"]
+            if row.get("tool_kind") == "read"
+            and "provider" not in row
+            and "model" not in row
+        ]
+    else:
+        durable_rows = [
+            row
+            for row in case_config["tool_activity_validation"]["expected_rows"]
+            if row.get("provider") == provider
+            and row.get("model") == model
+            and row.get("tool_kind") != "other"
+        ]
     assert {row["tool_name"] for row in durable_rows} == durable_tool_names
 
 
@@ -2099,6 +2121,81 @@ def test_d1251_parallel_read_cases_cover_expected_aawm_anthropic_target_matrix()
                 "anthropic-adapter-target:opencode_zen:/v1/responses"
                 in required_tags
             )
+
+
+def test_d1256_alias_replay_case_uses_aawm_code_anthropic_child_model_and_declared_targets():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][D1256_ALIAS_REPLAY_CASE]
+
+    _assert_parallel_read_common_case(
+        config=config,
+        case_name=D1256_ALIAS_REPLAY_CASE,
+        case_config=case_config,
+        agent_name=D1256_ALIAS_REPLAY_AGENT,
+        provider=None,
+        model=None,
+        durable_tool_names={"Read", "Glob", "Grep"},
+    )
+
+    agent_config = case_config["claude_agents"][D1256_ALIAS_REPLAY_AGENT]
+    assert agent_config["model"] == "aawm-code-anthropic"
+    assert case_config["verification_alias"] == "aawm-code-anthropic"
+    assert case_config["verification_candidate_order"] == -1
+    assert case_config["verification_candidate_label"] == "alias-replay"
+    declared_candidates = case_config["verification_declared_candidates"]
+    assert {
+        (row["provider"], row["model"]) for row in declared_candidates
+    } == D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS
+    assert [row["candidate_order"] for row in declared_candidates] == [0, 1, 2, 3, 4]
+    assert "route:anthropic_messages" in case_config["required_trace_tags"]
+    assert "passthrough_route_family" in case_config[
+        "required_generation_metadata_truthy"
+    ]
+    assert set(case_config["request_payload_checks"]["required_paths"]) == {
+        "model",
+        "messages",
+        "max_tokens",
+        "tools",
+    }
+
+    session_expected_rows = case_config["session_history_validation"][
+        "expected_rows"
+    ]
+    assert len(session_expected_rows) == 1
+    declared_provider_values = set(
+        session_expected_rows[0]["required_one_of"]["provider"]
+    )
+    declared_model_values = set(
+        session_expected_rows[0]["required_one_of"]["model"]
+    )
+    assert session_expected_rows[0]["metadata_required_equals"] == {
+        "model_alias_label": "aawm-code-anthropic",
+        "requested_model_alias": "aawm-code-anthropic",
+        "anthropic_auto_agent_alias": "aawm-code-anthropic",
+    }
+    assert set(session_expected_rows[0]["metadata_required_truthy"]) == {
+        "anthropic_auto_agent_selected_provider",
+        "anthropic_auto_agent_selected_model",
+        "anthropic_auto_agent_selected_route_family",
+        "aawm_alias_routing_audit_events",
+    }
+    assert declared_provider_values == {
+        provider
+        for provider, _ in D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS
+    }
+    assert declared_model_values == {
+        model for _, model in D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS
+    }
+
+    tool_rows = case_config["tool_activity_validation"]["expected_rows"]
+    durable_rows = [
+        row for row in tool_rows if row.get("tool_kind") == "read"
+    ]
+    assert {row["tool_name"] for row in durable_rows} == {"Read", "Glob", "Grep"}
+    assert all("provider" not in row for row in durable_rows)
+    assert all("model" not in row for row in durable_rows)
+    assert all(row["maximum_count"] == 1 for row in durable_rows)
+    assert all(row["minimum_count"] == 1 for row in durable_rows)
 
 
 def test_d1251_parallel_read_cases_do_not_include_disallowed_gemini_models():
@@ -3929,3 +4026,601 @@ def test_tool_activity_validation_polls_until_expected_rows_are_visible(monkeypa
     assert len(attempts) == 2
 
     harness._close_validation_db_connections()
+
+
+def test_run_command_with_retry_records_attempt_metadata_for_retried_api_errors(monkeypatch):
+    harness = _load_harness_module()
+
+    def fake_run_command(command, extra_env=None, timeout_seconds=300):
+        fake_run_command.calls += 1
+        if fake_run_command.calls == 1:
+            return {
+                "command": command,
+                "exit_code": 200,
+                "stdout": '{"status_code":503, "is_error":true}',
+                "stderr": "",
+                "duration_seconds": 0.0,
+            }
+        return {
+            "command": command,
+            "exit_code": 200,
+            "stdout": '{"status_code":200, "is_error":false}',
+            "stderr": "",
+            "duration_seconds": 0.0,
+        }
+
+    fake_run_command.calls = 0
+    monkeypatch.setattr(harness.RA, "_run_command", fake_run_command)
+
+    _, final_run, attempts = harness._run_command_with_retry(
+        config={
+            "command": ["claude", "-p", "hello"],
+            "retry_on_api_error_statuses": [503],
+            "retry_max_attempts": 2,
+            "retry_backoff_seconds": 0,
+        }
+    )
+
+    assert len(attempts) == 2
+    assert attempts[0]["attempt"] == 1
+    assert attempts[0]["api_error_status"] == 503
+    assert attempts[1]["attempt"] == 2
+    assert attempts[1]["api_error_status"] is None
+    assert final_run["exit_code"] == 200
+    assert final_run["stdout"] == '{"status_code":200, "is_error":false}'
+
+
+def test_summarize_transcript_tool_uses_preserves_tool_use_id_tool_result_link(tmp_path):
+    harness = _load_harness_module()
+    transcript = tmp_path / "session-1" / "subagents" / "agent-abc.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-1",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-1",
+                                    "name": "Bash",
+                                    "input": {"command": "pwd"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "agentId": "abc",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-1",
+                                    "content": "ok",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = harness._summarize_transcript_tool_uses([transcript])
+
+    records = summary["records"]
+    assert len(records) == 1
+    assert records[0]["tool_use_id"] == "tool-1"
+    assert records[0]["tool_name"] == "Bash"
+    assert isinstance(records[0].get("tool_result_line"), int)
+
+
+def test_build_case_verification_matrix_row_captures_status_provider_model_and_tool_activity():
+    harness = _load_harness_module()
+
+    case_config = {
+        "session_history_validation": {
+            "expected_provider": "openai",
+            "expected_model": "gpt-5.5",
+        },
+        "required_trace_tags": ["route:anthropic_openai_responses_adapter"],
+        "stream_tool_call_state_validation": {
+            "expected_rows": [
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                }
+            ]
+        },
+        "tool_activity_validation": {
+            "expected_rows": [
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "tool_name": "Bash",
+                    "arguments_required_substring": '"command": "pwd"',
+                }
+            ]
+        },
+        "transcript_tool_use_validation": {
+            "expected_agents": [
+                {
+                    "agent_type": "harness-gpt55",
+                    "require_tool_result_before_next_tool_use": True,
+                }
+            ]
+        },
+    }
+
+    row_passed = harness._build_case_verification_matrix_row(
+        alias="aawm-code-anthropic-openai",
+        candidate_order=0,
+        case_config=case_config,
+        case_result={
+            "passed": True,
+            "exit_code": 0,
+            "command_attempts": [
+                {
+                    "attempt": 1,
+                    "api_error_status": None,
+                    "exit_code": 0,
+                }
+            ],
+            "session_history_passed": True,
+            "stream_tool_call_state_passed": True,
+            "tool_activity_passed": True,
+            "transcript_tool_use_passed": True,
+            "langfuse": {
+                "command_session_id": "session-openai",
+                "trace_ids": ["trace-openai"],
+                "filtered_trace_ids": ["trace-openai"],
+                "actual_trace_names": ["claude-code.aawm-code-anthropic-openai"],
+                "actual_user_ids": ["adapter-harness-tenant"],
+            },
+            "transcript_tool_use": {
+                "agents": [
+                    {
+                        "agent_type": "harness-gpt55",
+                        "records": [
+                            {
+                                "tool_use_id": "tool-openai-1",
+                                "tool_name": "Bash",
+                                "tool_result_line": 12,
+                            },
+                            {
+                                "tool_use_id": "tool-openai-2",
+                                "tool_name": "Read",
+                            },
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+
+    assert row_passed["alias"] == "aawm-code-anthropic-openai"
+    assert row_passed["candidate_order"] == 0
+    assert row_passed["provider"] == "openai"
+    assert row_passed["model"] == "gpt-5.5"
+    assert row_passed["route_family"] == "anthropic_openai_responses_adapter"
+    assert row_passed["connectivity_passed"] is True
+    assert row_passed["session_history_metadata_passed"] is True
+    assert row_passed["stream_tool_call_state_passed"] is True
+    assert row_passed["tool_call_emission_passed"] is True
+    assert row_passed["tool_bearing_passed"] is True
+    assert row_passed["required_tool_arguments_passed"] is True
+    assert row_passed["tool_use_ids_passed"] is True
+    assert row_passed["tool_result_replay_passed"] is True
+    assert row_passed["multi_turn_tool_result_passed"] is True
+    assert row_passed["status"] == "passed"
+    assert row_passed["references"]["command_session_id"] == "session-openai"
+    assert row_passed["references"]["command_attempts"] == [
+        {"attempt": 1, "api_error_status": None, "exit_code": 0}
+    ]
+    assert row_passed["references"]["trace_ids"] == ["trace-openai"]
+
+
+def test_verification_matrix_row_flags_missing_transcript_tool_use_ids_and_replay():
+    harness = _load_harness_module()
+
+    row = harness._build_case_verification_matrix_row(
+        alias="aawm-code-anthropic-openai",
+        candidate_order=1,
+        case_config={
+            "session_history_validation": {
+                "expected_provider": "openai",
+                "expected_model": "gpt-5.3-codex-spark",
+            },
+            "required_trace_tags": ["route:anthropic_openai_responses_adapter"],
+            "tool_activity_validation": {
+                "expected_rows": [
+                    {
+                        "tool_name": "Bash",
+                        "arguments_required_substring": '"command"',
+                    }
+                ]
+            },
+            "transcript_tool_use_validation": {
+                "expected_agents": [
+                    {
+                        "agent_type": "harness-openai",
+                        "require_tool_result_before_next_tool_use": True,
+                    }
+                ]
+            },
+        },
+        case_result={
+            "passed": False,
+            "exit_code": 0,
+            "session_history_passed": True,
+            "tool_activity_passed": False,
+            "transcript_tool_use_passed": True,
+            "langfuse": {},
+            "transcript_tool_use": {
+                "agents": [
+                    {
+                        "agent_type": "harness-openai",
+                        "records": [
+                            {"tool_use_id": "", "tool_name": "Bash"},
+                            {"tool_use_id": "tool-openai-2", "tool_name": "Read"},
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+
+    assert row["provider"] == "openai"
+    assert row["model"] == "gpt-5.3-codex-spark"
+    assert row["candidate_order"] == 1
+    assert row["status"] == "failed"
+    assert row["tool_call_emission_passed"] is False
+    assert row["required_tool_arguments_passed"] is False
+    assert row["tool_use_ids_passed"] is False
+    assert row["tool_result_replay_passed"] is False
+    assert row["multi_turn_tool_result_passed"] is True
+
+
+def test_verification_matrix_row_uses_runtime_session_history_for_alias_replay():
+    harness = _load_harness_module()
+
+    row = harness._build_case_verification_matrix_row(
+        alias="aawm-code-anthropic",
+        case_name=D1256_ALIAS_REPLAY_CASE,
+        candidate_order=-1,
+        case_config={
+            "verification_candidate_label": "alias-replay",
+            "verification_declared_candidates": [
+                {
+                    "candidate_order": 2,
+                    "provider": "xai",
+                    "model": "grok-composer-2.5-fast",
+                    "route_family": "anthropic_grok_native_responses_adapter",
+                },
+                {
+                    "candidate_order": 3,
+                    "provider": "xai",
+                    "model": "oa_xai/grok-build",
+                    "route_family": "anthropic_xai_oauth_responses_adapter",
+                },
+            ],
+            "session_history_validation": {
+                "expected_rows": [
+                    {
+                        "required_one_of": {
+                            "provider": ["xai", "anthropic"],
+                            "model": ["oa_xai/grok-build", "claude-sonnet-4-6"],
+                        }
+                    }
+                ]
+            },
+            "required_trace_tags": ["route:anthropic_messages"],
+            "tool_activity_validation": {
+                "expected_rows": [
+                    {
+                        "tool_name": "Read",
+                        "arguments_required_substring": "fixture",
+                    }
+                ]
+            },
+            "transcript_tool_use_validation": {
+                "expected_agents": [
+                    {
+                        "agent_type": D1256_ALIAS_REPLAY_AGENT,
+                    }
+                ]
+            },
+        },
+        case_result={
+            "passed": True,
+            "exit_code": 0,
+            "session_history_passed": True,
+            "tool_activity_passed": True,
+            "transcript_tool_use_passed": True,
+            "session_history": {
+                "record": {
+                    "provider": "xai",
+                    "model": "oa_xai/grok-build",
+                    "metadata": {
+                        "passthrough_route_family": (
+                            "grok_cli_chat_proxy"
+                        ),
+                        "anthropic_auto_agent_selected_route_family": (
+                            "anthropic_xai_oauth_responses_adapter"
+                        )
+                    },
+                }
+            },
+            "langfuse": {},
+            "transcript_tool_use": {
+                "agents": [
+                    {
+                        "agent_type": D1256_ALIAS_REPLAY_AGENT,
+                        "records": [{"tool_use_id": "tool-1", "tool_name": "Read"}],
+                    }
+                ]
+            },
+        },
+    )
+
+    assert row["alias"] == "aawm-code-anthropic"
+    assert row["case_name"] == D1256_ALIAS_REPLAY_CASE
+    assert row["candidate_order"] == -1
+    assert row["candidate_label"] == "alias-replay"
+    assert row["declared_candidates"] == [
+        {
+            "candidate_order": 2,
+            "provider": "xai",
+            "model": "grok-composer-2.5-fast",
+            "route_family": "anthropic_grok_native_responses_adapter",
+        },
+        {
+            "candidate_order": 3,
+            "provider": "xai",
+            "model": "oa_xai/grok-build",
+            "route_family": "anthropic_xai_oauth_responses_adapter",
+        },
+    ]
+    assert row["provider"] == "xai"
+    assert row["model"] == "oa_xai/grok-build"
+    assert row["route_family"] == "anthropic_xai_oauth_responses_adapter"
+    assert row["tool_bearing_passed"] is True
+    assert row["required_tool_arguments_passed"] is True
+    assert row["tool_use_ids_passed"] is True
+
+
+def test_verification_matrix_row_status_encodes_warning_soft_and_skip_states():
+    harness = _load_harness_module()
+
+    case_config = {
+        "session_history_validation": {
+            "expected_provider": "anthropic",
+            "expected_model": "claude-opus-4-6",
+        },
+    }
+
+    assert harness._build_case_verification_matrix_row(
+        alias="candidate",
+        candidate_order=1,
+        case_config=case_config,
+        case_result={"passed": True, "soft_failures": ["warn"], "langfuse": {}},
+    )["status"] == "passed_with_soft_failures"
+
+    assert harness._build_case_verification_matrix_row(
+        alias="candidate",
+        candidate_order=1,
+        case_config=case_config,
+        case_result={"passed": True, "skipped": True, "langfuse": {}},
+    )["status"] == "skipped"
+
+    assert harness._build_case_verification_matrix_row(
+        alias="candidate",
+        candidate_order=1,
+        case_config=case_config,
+        case_result={"passed": False, "langfuse": {}},
+    )["status"] == "failed"
+
+
+def test_main_writes_verification_matrix_and_outcome_records_by_candidate_order(tmp_path, monkeypatch):
+    harness = _load_harness_module()
+
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
+
+    config_path = tmp_path / "anthropic_adapter_config.json"
+    artifact_path = tmp_path / "anthropic_adapter_results.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "suite_version": 1,
+                "cases": {
+                    "aawm_code_anthropic_candidate_openai": {
+                        "command": ["claude", "-p", "identity"],
+                        "session_history_validation": {
+                            "expected_provider": "openai",
+                            "expected_model": "gpt-5.5",
+                        },
+                        "required_trace_tags": [
+                            "route:anthropic_openai_responses_adapter"
+                        ],
+                    },
+                    "aawm_code_anthropic_candidate_anthropic": {
+                        "command": ["claude", "-p", "identity"],
+                        "session_history_validation": {
+                            "expected_provider": "anthropic",
+                            "expected_model": "claude-opus-4-6",
+                        },
+                        "required_trace_tags": ["route:anthropic_messages"],
+                    },
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_validate_case(name, config, query_url, public_key, secret_key, litellm_base_url):
+        if name == "aawm_code_anthropic_candidate_openai":
+            return {
+                "passed": True,
+                "skipped": False,
+                "warning_only": False,
+                "failures": [],
+                "soft_failures": [],
+                "warnings": [],
+                "command_attempts": [
+                    {
+                        "attempt": 1,
+                        "api_error_status": None,
+                        "exit_code": 0,
+                    }
+                ],
+                "tool_activity_passed": True,
+                "transcript_tool_use_passed": True,
+                "langfuse": {
+                    "command_session_id": "session-openai",
+                    "trace_ids": ["trace-openai"],
+                    "filtered_trace_ids": ["trace-openai"],
+                    "actual_trace_names": ["claude-code.aawm_code_anthropic_candidate_openai"],
+                    "actual_user_ids": ["adapter-harness-tenant"],
+                },
+                "session_history": {
+                    "record": {
+                        "provider": "openai",
+                        "model": "gpt-5.5",
+                        "metadata": {
+                            "provider": "openai",
+                            "route_family": "anthropic_openai_responses_adapter",
+                            "litellm_environment": "dev",
+                        },
+                    }
+                },
+                "tool_activity": {
+                    "record": {
+                        "provider": "openai",
+                        "model": "gpt-5.5",
+                        "tool_name": "Bash",
+                        "tool_kind": "command",
+                        "command_text": "pwd",
+                        "arguments": {"command": "pwd"},
+                    }
+                },
+                "transcript_tool_use": {
+                    "agents": [
+                        {
+                            "agent_type": "harness-anthropic-openai",
+                            "records": [
+                                {
+                                    "tool_use_id": "tool-openai-1",
+                                    "tool_result_line": 12,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+
+        return {
+            "passed": False,
+            "skipped": False,
+            "warning_only": False,
+            "failures": ["downstream candidate failed"],
+            "soft_failures": [],
+            "warnings": [],
+            "command_attempts": [
+                {
+                    "attempt": 1,
+                    "api_error_status": 503,
+                    "exit_code": 0,
+                },
+                {
+                    "attempt": 2,
+                    "api_error_status": None,
+                    "exit_code": 1,
+                },
+            ],
+            "tool_activity_passed": False,
+            "transcript_tool_use_passed": False,
+            "langfuse": {
+                "command_session_id": "session-anthropic",
+                "trace_ids": [],
+                "filtered_trace_ids": [],
+                "actual_trace_names": [],
+                "actual_user_ids": [],
+            },
+            "session_history": {
+                "record": {
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-6",
+                    "metadata": {
+                        "provider": "anthropic",
+                        "route_family": "anthropic_messages",
+                        "litellm_environment": "dev",
+                    },
+                }
+            },
+            "tool_activity": {"record": None},
+            "transcript_tool_use": {"agents": []},
+        }
+
+    monkeypatch.setattr(harness, "_validate_case", fake_validate_case)
+    monkeypatch.setattr(
+        harness,
+        "_docker_status_for_container",
+        lambda container_name: "Up",
+    )
+    monkeypatch.setattr(
+        harness.RA,
+        "_git_value",
+        lambda *args: "test",
+    )
+    monkeypatch.setattr(
+        harness.sys,
+        "argv",
+        [
+            "run-anthropic-adapter-acceptance",
+            "--config",
+            str(config_path),
+            "--write-artifact",
+            str(artifact_path),
+            "--cases",
+            "aawm_code_anthropic_candidate_openai,aawm_code_anthropic_candidate_anthropic",
+        ],
+    )
+
+    assert harness.main() == 1
+
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    matrix = artifact["verification_matrix"]
+    assert [row["alias"] for row in matrix] == [
+        "aawm_code_anthropic_candidate_openai",
+        "aawm_code_anthropic_candidate_anthropic",
+    ]
+    assert [row["candidate_order"] for row in matrix] == [0, 1]
+    assert matrix[0]["provider"] == "openai"
+    assert matrix[1]["provider"] == "anthropic"
+    assert matrix[0]["status"] == "passed"
+    assert matrix[1]["status"] == "failed"
+
+    openai_result = artifact["results"]["aawm_code_anthropic_candidate_openai"]
+    assert openai_result["command_attempts"] == [{"attempt": 1, "api_error_status": None, "exit_code": 0}]
+    assert openai_result["session_history"]["record"]["metadata"]["litellm_environment"] == "dev"
+    assert openai_result["tool_activity"]["record"]["tool_name"] == "Bash"
+    assert openai_result["transcript_tool_use"]["agents"][0]["records"][0]["tool_result_line"] == 12
+
+    anthropic_result = artifact["results"]["aawm_code_anthropic_candidate_anthropic"]
+    assert anthropic_result["passed"] is False
+    assert anthropic_result["command_attempts"][1]["attempt"] == 2
+    assert anthropic_result["session_history"]["record"]["model"] == "claude-opus-4-6"
+    assert artifact["summary"]["passed"] is False

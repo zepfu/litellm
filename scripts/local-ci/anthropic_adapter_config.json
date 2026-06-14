@@ -38,6 +38,7 @@
     "claude_adapter_xai_grok_composer_child_parallel_read_tools",
     "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools",
     "claude_adapter_anthropic_claude_sonnet_4_6_child_parallel_read_tools",
+    "claude_adapter_aawm_code_anthropic_alias_child_parallel_read_tools",
     "claude_adapter_opencode_zen_deepseek_v4_flash_child_parallel_read_tools",
     "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools",
     "claude_adapter_peeromega_fanout",
@@ -1884,6 +1885,8 @@
       "langfuse_poll_timeout_seconds": 90
     },
     "claude_adapter_gpt53_child_parallel_read_tools": {
+      "verification_alias": "aawm-code-anthropic",
+      "verification_candidate_order": 1,
       "command": [
         "claude",
         "-p",
@@ -2540,6 +2543,8 @@
       ]
     },
     "claude_adapter_antigravity_claude_sonnet_4_6_child_sequential_read_tools": {
+      "verification_alias": "aawm-code-anthropic",
+      "verification_candidate_order": 0,
       "command": [
         "claude",
         "-p",
@@ -2699,6 +2704,8 @@
       ]
     },
     "claude_adapter_xai_grok_composer_child_parallel_read_tools": {
+      "verification_alias": "aawm-code-anthropic",
+      "verification_candidate_order": 2,
       "command": [
         "claude",
         "-p",
@@ -2873,6 +2880,8 @@
       }
     },
     "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools": {
+      "verification_alias": "aawm-code-anthropic",
+      "verification_candidate_order": 3,
       "command": [
         "claude",
         "-p",
@@ -3046,6 +3055,8 @@
       }
     },
     "claude_adapter_anthropic_claude_sonnet_4_6_child_parallel_read_tools": {
+      "verification_alias": "aawm-code-anthropic",
+      "verification_candidate_order": 4,
       "command": [
         "claude",
         "-p",
@@ -3196,6 +3207,218 @@
       "required_generation_metadata_truthy": [
         "passthrough_route_family"
       ]
+    },
+    "claude_adapter_aawm_code_anthropic_alias_child_parallel_read_tools": {
+      "verification_alias": "aawm-code-anthropic",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "alias-replay",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "antigravity",
+          "model": "claude-sonnet-4-6",
+          "route_family": "anthropic_antigravity_completion_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "openai",
+          "model": "gpt-5.3-codex-spark",
+          "route_family": "anthropic_openai_responses_adapter"
+        },
+        {
+          "candidate_order": 2,
+          "provider": "xai",
+          "model": "grok-composer-2.5-fast",
+          "route_family": "anthropic_grok_native_responses_adapter"
+        },
+        {
+          "candidate_order": 3,
+          "provider": "xai",
+          "model": "oa_xai/grok-build",
+          "route_family": "anthropic_xai_oauth_responses_adapter"
+        },
+        {
+          "candidate_order": 4,
+          "provider": "anthropic",
+          "model": "claude-sonnet-4-6",
+          "route_family": "anthropic_messages"
+        }
+      ],
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the harness-aawm-code-anthropic-alias-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read /home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from /home/zepfu/projects/litellm, and Grep pattern exactly `sequential-core-tools-grep` with path exactly `/home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: AAWM CODE ANTHROPIC ALIAS PARALLEL TOOLS PASSED",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "harness-aawm-code-anthropic-alias-parallel-read-tools": {
+          "description": "Acceptance harness child for aawm-code-anthropic alias-level failover parallel read-tool proof.",
+          "model": "aawm-code-anthropic",
+          "effort": "high",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, return only the caller's exact final line."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.harness-aawm-code-anthropic-alias-parallel-read-tools"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.harness-aawm-code-anthropic-alias-parallel-read-tools": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_contains": {
+          "result": "AAWM CODE ANTHROPIC ALIAS PARALLEL TOOLS PASSED"
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "antigravity",
+                "openai",
+                "xai",
+                "anthropic"
+              ],
+              "model": [
+                "claude-sonnet-4-6",
+                "gpt-5.3-codex-spark",
+                "grok-composer-2.5-fast",
+                "oa_xai/grok-build"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-code-anthropic",
+              "requested_model_alias": "aawm-code-anthropic",
+              "anthropic_auto_agent_alias": "aawm-code-anthropic"
+            },
+            "metadata_required_truthy": [
+              "anthropic_auto_agent_selected_provider",
+              "anthropic_auto_agent_selected_model",
+              "anthropic_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1
+          },
+          {
+            "tool_name": "Read",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential_core_tools_fixture.txt"
+          },
+          {
+            "tool_name": "Glob",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "scripts/local-ci/sequential_core_tools_fixture.txt"
+          },
+          {
+            "tool_name": "Grep",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential-core-tools-grep"
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "harness-aawm-code-anthropic-alias-parallel-read-tools",
+            "expected_tool_counts": {
+              "Read": 1,
+              "Glob": 1,
+              "Grep": 1
+            },
+            "minimum_total_tool_uses": 3,
+            "maximum_total_tool_uses": 3,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 90,
+      "required_trace_tags": [
+        "route:anthropic_messages"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "max_tokens",
+          "tools"
+        ]
+      }
     },
     "claude_adapter_opencode_zen_deepseek_v4_flash_child_parallel_read_tools": {
       "command": [
