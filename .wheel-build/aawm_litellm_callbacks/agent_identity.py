@@ -35,14 +35,24 @@ import os
 import queue
 import re
 import shlex
-import tempfile
 import threading
 import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
@@ -2618,8 +2628,9 @@ _AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE = 0
 _AAWM_SESSION_HISTORY_APPLICATION_NAME = "aawm-litellm-session-history"
 _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
 _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS = 1.0
+_AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES = 3
 _AAWM_SESSION_HISTORY_SPOOL_DIR_ENV = "AAWM_SESSION_HISTORY_SPOOL_DIR"
-_AAWM_SESSION_HISTORY_SPOOL_DIR_NAME = "aawm-session-history-spool"
+_AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT = "/mnt/e/litellm/session_history"
 _AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER = "__aawm_datetime__"
 _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME = "aawm-session-history-spool-drainer"
 _aawm_session_history_schema_ready = False
@@ -2635,6 +2646,11 @@ _aawm_session_history_overflow_flush_semaphore = threading.BoundedSemaphore(
 _aawm_session_history_spool_drainer: Optional[threading.Thread] = None
 _aawm_session_history_spool_drainer_lock = threading.Lock()
 _aawm_session_history_spool_drain_lock = threading.Lock()
+_aawm_session_history_spool_startup_lock = threading.Lock()
+_aawm_session_history_spool_startup_bootstrapped = False
+_aawm_session_history_flush_failure_lock = threading.Lock()
+_aawm_session_history_flush_failure_active = False
+_aawm_session_history_suppressed_flush_failures = 0
 
 
 def _get_session_history_batch_size() -> int:
@@ -2692,12 +2708,21 @@ def _get_session_history_failed_flush_retry_seconds() -> float:
     return max(0.1, parsed_value)
 
 
+def _get_session_history_failed_flush_max_retries() -> int:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES") or ""
+    try:
+        parsed_value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES
+    return max(0, parsed_value)
+
+
 def _get_session_history_spool_dir() -> str:
     configured = get_secret_str(_AAWM_SESSION_HISTORY_SPOOL_DIR_ENV) or ""
     configured_path = str(configured).strip()
     if configured_path:
         return configured_path
-    return os.path.join(tempfile.gettempdir(), _AAWM_SESSION_HISTORY_SPOOL_DIR_NAME)
+    return _AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT
 
 
 def _session_history_queue_depth_summary() -> str:
@@ -2708,6 +2733,32 @@ def _session_history_queue_depth_summary() -> str:
         queue_size = "unknown"
     max_size = getattr(_aawm_session_history_queue, "maxsize", "unknown")
     return f"queue_depth={queue_size}/{max_size}"
+
+
+def _mark_session_history_flush_failure_for_logging() -> bool:
+    global _aawm_session_history_flush_failure_active
+    global _aawm_session_history_suppressed_flush_failures
+
+    with _aawm_session_history_flush_failure_lock:
+        if not _aawm_session_history_flush_failure_active:
+            _aawm_session_history_flush_failure_active = True
+            _aawm_session_history_suppressed_flush_failures = 0
+            return True
+        _aawm_session_history_suppressed_flush_failures += 1
+        return False
+
+
+def _reset_session_history_flush_failure_window() -> Optional[int]:
+    global _aawm_session_history_flush_failure_active
+    global _aawm_session_history_suppressed_flush_failures
+
+    with _aawm_session_history_flush_failure_lock:
+        if not _aawm_session_history_flush_failure_active:
+            return None
+        suppressed_failures = _aawm_session_history_suppressed_flush_failures
+        _aawm_session_history_flush_failure_active = False
+        _aawm_session_history_suppressed_flush_failures = 0
+        return suppressed_failures
 
 
 def _session_history_spool_paths() -> List[str]:
@@ -2782,15 +2833,30 @@ def _decode_session_history_spool_value(value: Any) -> Any:
     return value
 
 
-def _load_session_history_spool_record(path: str) -> Dict[str, Any]:
+def _load_session_history_spool_records(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as spool_file:
         payload = json.load(spool_file)
     if not isinstance(payload, dict):
         raise ValueError("session_history spool payload is not a JSON object")
+    records = payload.get("records")
+    if isinstance(records, list):
+        decoded_records = _decode_session_history_spool_value(records)
+        if not all(isinstance(record, dict) for record in decoded_records):
+            raise ValueError(
+                "session_history spool payload contains a non-object record"
+            )
+        return cast(List[Dict[str, Any]], decoded_records)
     record = payload.get("record")
-    if not isinstance(record, dict):
-        raise ValueError("session_history spool payload does not contain a record")
-    return cast(Dict[str, Any], _decode_session_history_spool_value(record))
+    if isinstance(record, dict):
+        return [cast(Dict[str, Any], _decode_session_history_spool_value(record))]
+    raise ValueError("session_history spool payload does not contain records")
+
+
+def _load_session_history_spool_record(path: str) -> Dict[str, Any]:
+    records = _load_session_history_spool_records(path)
+    if not records:
+        raise ValueError("session_history spool payload does not contain records")
+    return records[0]
 
 
 def _session_history_spool_bad_record(path: str, exc: Exception) -> None:
@@ -2822,7 +2888,7 @@ def _session_history_spool_drainer_main() -> None:
             kept_paths: List[str] = []
             for path in batch_paths:
                 try:
-                    batch.append(_load_session_history_spool_record(path))
+                    batch.extend(_load_session_history_spool_records(path))
                     kept_paths.append(path)
                 except Exception as exc:
                     _session_history_spool_bad_record(path, exc)
@@ -2839,6 +2905,7 @@ def _session_history_spool_drainer_main() -> None:
                 )
                 return
 
+            drained_record_count = len(batch)
             removed = 0
             for path in kept_paths:
                 try:
@@ -2855,7 +2922,8 @@ def _session_history_spool_drainer_main() -> None:
                     )
             verbose_logger.warning(
                 "AawmAgentIdentity: drained %d spooled session_history records "
-                "(%s)",
+                "from %d files (%s)",
+                drained_record_count,
                 removed,
                 _session_history_spool_summary(),
             )
@@ -2889,36 +2957,102 @@ def _ensure_session_history_spool_drainer_started() -> None:
         _aawm_session_history_spool_drainer.start()
 
 
+def _bootstrap_session_history_spool_drainer_once() -> None:
+    global _aawm_session_history_spool_startup_bootstrapped
+
+    if _aawm_session_history_spool_startup_bootstrapped:
+        return
+
+    with _aawm_session_history_spool_startup_lock:
+        if _aawm_session_history_spool_startup_bootstrapped:
+            return
+        _aawm_session_history_spool_startup_bootstrapped = True
+        try:
+            _ensure_session_history_spool_drainer_started()
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity: failed to bootstrap session_history spool "
+                "drainer: %s",
+                _format_exception_for_warning(exc),
+            )
+
+
 def _spool_session_history_record(record: Dict[str, Any]) -> None:
+    _spool_session_history_records([record], reason="record")
+
+
+def _session_history_spool_identity(records: List[Dict[str, Any]]) -> str:
+    for field_name in ("trace_id", "session_id", "litellm_call_id"):
+        for record in records:
+            value = _clean_non_empty_string(record.get(field_name))
+            if value:
+                return value
+    return "session-history"
+
+
+def _sanitize_session_history_spool_filename_component(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+    return sanitized[:96] or "session-history"
+
+
+def _session_history_spool_filename(records: List[Dict[str, Any]]) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    identity = _sanitize_session_history_spool_filename_component(
+        _session_history_spool_identity(records)
+    )
+    digest_input = {
+        "time_ns": time.time_ns(),
+        "thread_id": threading.get_ident(),
+        "identity": identity,
+        "count": len(records),
+    }
+    digest = hashlib.sha256(
+        json.dumps(digest_input, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{timestamp}-{identity}-{digest}.json"
+
+
+def _spool_session_history_records(
+    records: List[Dict[str, Any]],
+    *,
+    reason: str,
+    retry_count: Optional[int] = None,
+    failure: Optional[Exception] = None,
+) -> str:
+    if not records:
+        raise ValueError("session_history spool requires at least one record")
     spool_dir = _get_session_history_spool_dir()
     os.makedirs(spool_dir, exist_ok=True)
-    identity = str(
-        record.get("litellm_call_id")
-        or record.get("session_id")
-        or record.get("trace_id")
-        or "record"
-    )
-    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()[:12]
-    filename = f"{time.time_ns()}-{threading.get_ident()}-{digest}.json"
+    filename = _session_history_spool_filename(records)
     final_path = os.path.join(spool_dir, filename)
-    tmp_path = f"{final_path}.tmp"
+    tmp_path = f"{final_path}.{time.time_ns()}.{threading.get_ident()}.tmp"
     payload = {
         "spooled_at": datetime.now(timezone.utc),
-        "record": record,
+        "reason": reason,
+        "retry_count": retry_count,
+        "record_count": len(records),
+        "records": records,
     }
+    if failure is not None:
+        payload["failure"] = {
+            "type": type(failure).__name__,
+        }
     encoded_payload = _encode_session_history_spool_value(payload)
     with open(tmp_path, "w", encoding="utf-8") as spool_file:
         json.dump(encoded_payload, spool_file, separators=(",", ":"), sort_keys=True)
         spool_file.write("\n")
     os.replace(tmp_path, final_path)
     verbose_logger.warning(
-        "AawmAgentIdentity: spooled session_history record for retry "
-        "(path=%s, %s, %s)",
+        "AawmAgentIdentity: spooled %d session_history records for retry "
+        "(path=%s, reason=%s, %s, %s)",
+        len(records),
         final_path,
+        reason,
         _session_history_queue_depth_summary(),
         _session_history_spool_summary(),
     )
     _ensure_session_history_spool_drainer_started()
+    return final_path
 
 
 async def _close_aawm_session_history_pools_for_current_loop() -> None:
@@ -2937,6 +3071,9 @@ async def _close_aawm_session_history_pools_for_current_loop() -> None:
 def _flush_session_history_batch(
     records: List[Dict[str, Any]],
     loop: Optional[asyncio.AbstractEventLoop] = None,
+    *,
+    log_exception: bool = True,
+    failure_callback: Optional[Callable[[Exception], None]] = None,
 ) -> bool:
     if not records:
         return True
@@ -2957,14 +3094,33 @@ def _flush_session_history_batch(
         else:
             loop.run_until_complete(_persist_session_history_records(records))
     except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)",
-            len(records),
-            _format_exception_for_warning(exc),
-            _session_history_queue_depth_summary(),
-        )
+        if failure_callback is not None:
+            failure_callback(exc)
+        if log_exception and _mark_session_history_flush_failure_for_logging():
+            verbose_logger.exception(
+                "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)",
+                len(records),
+                _format_exception_for_warning(exc),
+                _session_history_queue_depth_summary(),
+            )
+        else:
+            verbose_logger.warning(
+                "AawmAgentIdentity: session_history flush still failing: %s "
+                "(batch_size=%d, %s)",
+                _format_exception_for_warning(exc),
+                len(records),
+                _session_history_queue_depth_summary(),
+            )
         return False
 
+    suppressed_failures = _reset_session_history_flush_failure_window()
+    if suppressed_failures is not None:
+        verbose_logger.warning(
+            "AawmAgentIdentity: session_history flush recovered "
+            "(suppressed_full_tracebacks=%d, %s)",
+            suppressed_failures,
+            _session_history_queue_depth_summary(),
+        )
     verbose_logger.debug(
         "AawmAgentIdentity: flushed %d session_history records in %.2fms (%s)",
         len(records),
@@ -2993,8 +3149,47 @@ def _flush_session_history_batch_with_retry(
     retry_message: str = "session_history batch flush",
 ) -> None:
     retry_seconds = _get_session_history_failed_flush_retry_seconds()
+    max_retries = _get_session_history_failed_flush_max_retries()
     retry_count = 0
-    while not _flush_session_history_batch(batch, loop=loop):
+    last_failure: Optional[Exception] = None
+
+    def _capture_failure(exc: Exception) -> None:
+        nonlocal last_failure
+        last_failure = exc
+
+    while not _flush_session_history_batch(
+        batch,
+        loop=loop,
+        log_exception=retry_count == 0,
+        failure_callback=_capture_failure,
+    ):
+        if retry_count >= max_retries:
+            try:
+                spool_path = _spool_session_history_records(
+                    batch,
+                    reason=f"{retry_message} failed",
+                    retry_count=retry_count,
+                    failure=last_failure,
+                )
+                verbose_logger.warning(
+                    "AawmAgentIdentity: %s failed after %d retries; "
+                    "spooled batch for replay (path=%s, batch_size=%d, %s)",
+                    retry_message,
+                    retry_count,
+                    spool_path,
+                    len(batch),
+                    _session_history_spool_summary(),
+                )
+                return
+            except Exception as spool_exc:
+                verbose_logger.exception(
+                    "AawmAgentIdentity: failed to spool %s after %d retries; "
+                    "continuing inline retry to avoid dropping records: %s",
+                    retry_message,
+                    retry_count,
+                    _format_exception_for_warning(spool_exc),
+                )
+
         retry_count += 1
         verbose_logger.warning(
             "AawmAgentIdentity: retrying %s after failure "
@@ -17274,6 +17469,10 @@ class AawmAgentIdentity(CustomLogger):
     - Sync: pass-through endpoints run Langfuse in sync success_handler (thread pool)
     - Async: standard LLM calls run Langfuse in async_success_handler
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        _bootstrap_session_history_spool_drainer_once()
 
     def logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
