@@ -64,7 +64,7 @@ known.
 The display shape is:
 
 ```text
-AAWM_ROUTE: [agent@repository -] [model(alias) -] [ip:port -] METHOD incoming -> outgoing PROTOCOL
+ROUTE: [agent@repository -] [model(alias) -] [ip:port -] METHOD incoming -> outgoing PROTOCOL
 ```
 
 Agent, repository, model alias, and client address segments are omitted when
@@ -84,6 +84,10 @@ Route logs must not include API keys, authorization headers, full request or
 response bodies, prompt content, tool arguments, or arbitrary query strings.
 Incoming endpoints preserve only known-safe routing query markers, and outgoing
 targets are logged as host plus path.
+
+For pass-through requests that emit this enriched `ROUTE:` line, LiteLLM
+suppresses the matching native Uvicorn/Gunicorn access record for that request.
+Unrelated routes should continue to use the normal server access log.
 
 ## Tool Definition Snapshots
 
