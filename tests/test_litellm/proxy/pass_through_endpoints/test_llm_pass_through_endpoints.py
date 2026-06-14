@@ -118,6 +118,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_openrouter_adapter_pass_through_request,
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
+    _prepare_oa_xai_passthrough_request,
     _resolve_google_adapter_session_id,
     _resolve_codex_google_code_assist_adapter_model,
     _resolve_codex_opencode_zen_adapter_model,
@@ -14804,9 +14805,11 @@ def test_grok_responses_unsupported_external_web_access_param_is_removed(model):
 @pytest.mark.parametrize(
     "model",
     [
+        "oa_xai/grok-build",
         "oa_xai/grok-4.20-0309-reasoning",
         "grok-build",
         "grok-build-0.1",
+        "grok-composer-2.5-fast",
     ],
 )
 def test_grok_responses_unsupported_reasoning_request_params_are_removed(model):
@@ -14816,19 +14819,123 @@ def test_grok_responses_unsupported_reasoning_request_params_are_removed(model):
         "reasoning": {"effort": "medium"},
         "reasoning_effort": "medium",
         "reasoningEffort": "medium",
+        "output_config": {"effort": "medium", "verbosity": "low"},
     }
 
     updated_body, removed_params = (
         _drop_unsupported_codex_request_params_from_request_body(request_body)
     )
 
-    assert removed_params == ["reasoning", "reasoning_effort", "reasoningEffort"]
+    expected_removed_params = [
+        "reasoning",
+        "reasoning_effort",
+        "reasoningEffort",
+    ]
+    if model in {
+        "oa_xai/grok-build",
+        "grok-build",
+        "grok-build-0.1",
+        "grok-composer-2.5-fast",
+    }:
+        expected_removed_params.append("output_config.effort")
+        assert updated_body["output_config"] == {"verbosity": "low"}
+    else:
+        assert updated_body["output_config"] == request_body["output_config"]
+
+    assert removed_params == expected_removed_params
     assert "reasoning" not in updated_body
     assert "reasoning_effort" not in updated_body
     assert "reasoningEffort" not in updated_body
     litellm_metadata = updated_body["litellm_metadata"]
-    assert litellm_metadata["codex_unsupported_request_param_removed_count"] == 3
-    assert litellm_metadata["codex_unsupported_request_params_removed"] == [
+    assert litellm_metadata["codex_unsupported_request_param_removed_count"] == len(
+        expected_removed_params
+    )
+    expected_normalized_removed_params = [
+        "reasoning",
+        "reasoning_effort",
+        "reasoningeffort",
+    ]
+    if "output_config.effort" in expected_removed_params:
+        expected_normalized_removed_params.insert(0, "output_config.effort")
+    assert litellm_metadata["codex_unsupported_request_params_removed"] == (
+        expected_normalized_removed_params
+    )
+
+
+def test_grok_direct_passthrough_removes_unsupported_reasoning_request_params():
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+        "reasoning": {"effort": "medium"},
+        "reasoning_effort": "medium",
+        "reasoningEffort": "medium",
+        "output_config": {"effort": "medium", "verbosity": "low"},
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+    request = MagicMock(spec=Request)
+    request.headers = {
+        "content-type": "application/json",
+        "x-grok-model-override": "grok-composer-2.5-fast",
+    }
+    request.query_params = {}
+    request.scope = {}
+
+    prepared_body = _prepare_grok_request_body_for_passthrough(
+        request=request,
+        request_body=request_body,
+    )
+
+    assert "reasoning" not in prepared_body
+    assert "reasoning_effort" not in prepared_body
+    assert "reasoningEffort" not in prepared_body
+    assert prepared_body["output_config"] == {"verbosity": "low"}
+    metadata = prepared_body["litellm_metadata"]
+    assert "existing-tag" in metadata["tags"]
+    assert metadata["codex_unsupported_request_param_removed_count"] == 4
+    assert metadata["codex_unsupported_request_params_removed"] == [
+        "output_config.effort",
+        "reasoning",
+        "reasoning_effort",
+        "reasoningeffort",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_params(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+    request_body = {
+        "model": "oa_xai/grok-build",
+        "input": "hello",
+        "reasoning": {"effort": "medium"},
+        "reasoning_effort": "medium",
+        "reasoningEffort": "medium",
+        "output_config": {"effort": "medium", "verbosity": "low"},
+    }
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ):
+        prepared, target_base, api_key = await _prepare_oa_xai_passthrough_request(
+            request_body,
+            sanitize_responses_request=True,
+        )
+
+    assert prepared is True
+    assert target_base == "https://api.x.ai/v1"
+    assert api_key == "xai-oauth-token"
+    assert request_body["model"] == "xai/grok-build"
+    assert "reasoning" not in request_body
+    assert "reasoning_effort" not in request_body
+    assert "reasoningEffort" not in request_body
+    if "output_config" in request_body:
+        assert request_body["output_config"] == {"verbosity": "low"}
+    metadata = request_body["litellm_metadata"]
+    assert metadata["codex_unsupported_request_param_removed_count"] == 4
+    assert metadata["codex_unsupported_request_params_removed"] == [
+        "output_config.effort",
         "reasoning",
         "reasoning_effort",
         "reasoningeffort",
@@ -14931,6 +15038,26 @@ def _assert_xai_responses_top_level_fields_sanitized(
 ) -> None:
     assert "instructions" not in custom_body
     assert "metadata" not in custom_body
+
+
+def _assert_grok_build_reasoning_request_params_removed(
+    custom_body: dict[str, Any],
+) -> None:
+    assert "reasoning" not in custom_body
+    assert "reasoning_effort" not in custom_body
+    assert "reasoningEffort" not in custom_body
+    if "output_config" in custom_body:
+        assert custom_body["output_config"] == {"verbosity": "low"}
+
+    metadata = custom_body["litellm_metadata"]
+    assert metadata["codex_unsupported_request_param_removed_count"] == 5
+    assert metadata["codex_unsupported_request_params_removed"] == [
+        "external_web_access",
+        "output_config.effort",
+        "reasoning",
+        "reasoning_effort",
+        "reasoningeffort",
+    ]
 
 
 def test_codex_non_grok_keeps_reasoning_input_item():
@@ -17222,6 +17349,55 @@ async def test_anthropic_grok_native_alias_probe_invalid_grant_is_candidate_unav
 
 
 @pytest.mark.asyncio
+async def test_anthropic_grok_native_alias_probe_reasoning_effort_400_is_candidate_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "http://localhost:4001/grok/v1",
+    )
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-grok-session"},
+    }
+    upstream_error = HTTPException(
+        status_code=400,
+        detail=(
+            b'{"code":"invalid-argument","error":"Model '
+            b'grok-composer-2.5-fast has unsupported parameter reasoningEffort."}'
+        ),
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=upstream_error),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="grok-composer-2.5-fast",
+                use_alias_candidate_probe=True,
+            )
+
+    assert str(exc_info.value.code) == "429"
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    assert "reasoningEffort" in exc_info.value.message
+
+
+@pytest.mark.asyncio
 async def test_anthropic_xai_oauth_completion_adapter_uses_managed_oauth(
     monkeypatch,
 ):
@@ -17354,6 +17530,52 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert "route:xai_oauth_api" in metadata["tags"]
     assert "route:anthropic_xai_oauth_responses_adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_xai_oauth_alias_probe_reasoning_effort_400_is_candidate_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-xai-session"},
+    }
+    upstream_error = HTTPException(
+        status_code=400,
+        detail=(
+            b'{"code":"invalid-argument","error":"Model grok-build does not '
+            b'support parameter reasoningEffort."}'
+        ),
+    )
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=upstream_error),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_anthropic_xai_oauth_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="oa_xai/grok-build",
+                use_alias_candidate_probe=True,
+            )
+
+    assert str(exc_info.value.code) == "429"
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    assert "reasoningEffort" in exc_info.value.message
 
 
 @pytest.mark.asyncio
@@ -24654,6 +24876,9 @@ class TestOpenAIPassthroughRoute:
                 },
             ],
             "reasoning": {"effort": "medium"},
+            "reasoning_effort": "medium",
+            "reasoningEffort": "medium",
+            "output_config": {"effort": "medium", "verbosity": "low"},
             "instructions": "Use project instructions.",
             "tools": [
                 {"type": "custom", "name": "exec_command"},
@@ -24736,7 +24961,7 @@ class TestOpenAIPassthroughRoute:
         assert mock_create_route.return_value.await_args.kwargs["custom_body"] == (
             prepared_body
         )
-        assert "reasoning" not in prepared_body
+        _assert_grok_build_reasoning_request_params_removed(prepared_body)
         assert prepared_body["input"] == [
             body["input"][0],
             body["input"][2],
@@ -24761,11 +24986,6 @@ class TestOpenAIPassthroughRoute:
             "image_generation",
             "namespace",
             "tool_search",
-        ]
-        assert metadata["codex_unsupported_request_param_removed_count"] == 2
-        assert metadata["codex_unsupported_request_params_removed"] == [
-            "external_web_access",
-            "reasoning",
         ]
         assert metadata["codex_unsupported_input_item_removed_count"] == 1
         assert metadata["codex_unsupported_input_item_types_removed"] == [

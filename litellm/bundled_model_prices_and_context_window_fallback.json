@@ -33290,7 +33290,8 @@
             "external_web_access",
             "reasoning",
             "reasoning_effort",
-            "reasoningEffort"
+            "reasoningEffort",
+            "output_config.effort"
         ],
         "unsupported_input_item_types": [
             "reasoning"
@@ -33319,7 +33320,8 @@
             "external_web_access",
             "reasoning",
             "reasoning_effort",
-            "reasoningEffort"
+            "reasoningEffort",
+            "output_config.effort"
         ],
         "unsupported_input_item_types": [
             "reasoning"
@@ -33345,7 +33347,8 @@
             "external_web_access",
             "reasoning",
             "reasoning_effort",
-            "reasoningEffort"
+            "reasoningEffort",
+            "output_config.effort"
         ],
         "unsupported_input_item_types": [
             "reasoning"
