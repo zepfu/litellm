@@ -1,4 +1,5 @@
 import ast
+from collections import deque
 import logging
 import os
 import re
@@ -6,7 +7,7 @@ import sys
 import threading
 from datetime import datetime
 from logging import Formatter
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
@@ -174,6 +175,95 @@ class EgressGuardAlertFilter(logging.Filter):
 
 
 _egress_guard_alert_filter = EgressGuardAlertFilter()
+
+_AawmRouteAccessLogReplacementKey = Tuple[str, str, str, str]
+_AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_LIMIT = 1024
+_aawm_route_access_log_replacement_lock = threading.Lock()
+_aawm_route_access_log_replacements: Set[_AawmRouteAccessLogReplacementKey] = set()
+_aawm_route_access_log_replacement_order: Deque[
+    _AawmRouteAccessLogReplacementKey
+] = deque()
+
+
+def clear_aawm_route_access_log_replacements() -> None:
+    with _aawm_route_access_log_replacement_lock:
+        _aawm_route_access_log_replacements.clear()
+        _aawm_route_access_log_replacement_order.clear()
+
+
+def register_aawm_route_access_log_replacement(
+    *,
+    client_addr: Optional[str],
+    method: Optional[str],
+    full_path: Optional[str],
+    http_version: Optional[str],
+) -> None:
+    if not client_addr or not method or not full_path or not http_version:
+        return
+
+    key = (
+        str(client_addr),
+        str(method),
+        str(full_path),
+        str(http_version),
+    )
+    with _aawm_route_access_log_replacement_lock:
+        if key not in _aawm_route_access_log_replacements:
+            _aawm_route_access_log_replacements.add(key)
+            _aawm_route_access_log_replacement_order.append(key)
+
+        while (
+            len(_aawm_route_access_log_replacement_order)
+            > _AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_LIMIT
+        ):
+            stale_key = _aawm_route_access_log_replacement_order.popleft()
+            _aawm_route_access_log_replacements.discard(stale_key)
+
+
+def _aawm_route_access_log_key_from_record(
+    record: logging.LogRecord,
+) -> Optional[_AawmRouteAccessLogReplacementKey]:
+    args = record.args
+    if not isinstance(args, (list, tuple)) or len(args) < 4:
+        return None
+
+    client_addr, method, full_path, http_version = args[:4]
+    if (
+        client_addr is None
+        or method is None
+        or full_path is None
+        or http_version is None
+    ):
+        return None
+    return (str(client_addr), str(method), str(full_path), str(http_version))
+
+
+def _consume_aawm_route_access_log_replacement(
+    record: logging.LogRecord,
+) -> bool:
+    key = _aawm_route_access_log_key_from_record(record)
+    if key is None:
+        return False
+
+    with _aawm_route_access_log_replacement_lock:
+        if key not in _aawm_route_access_log_replacements:
+            return False
+        _aawm_route_access_log_replacements.remove(key)
+        try:
+            _aawm_route_access_log_replacement_order.remove(key)
+        except ValueError:
+            pass
+        return True
+
+
+class AawmRouteAccessLogReplacementFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name not in {"uvicorn.access", "gunicorn.access"}:
+            return True
+        return not _consume_aawm_route_access_log_replacement(record)
+
+
+_aawm_route_access_log_replacement_filter = AawmRouteAccessLogReplacementFilter()
 
 
 json_logs = bool(os.getenv("JSON_LOGS", False))
@@ -348,11 +438,24 @@ else:
 verbose_proxy_logger = logging.getLogger("LiteLLM Proxy")
 verbose_router_logger = logging.getLogger("LiteLLM Router")
 verbose_logger = logging.getLogger("LiteLLM")
+verbose_aawm_route_logger = logging.getLogger("LiteLLM AAWM Route")
+verbose_aawm_route_logger.setLevel(logging.INFO)
+
+_aawm_route_handler = logging.StreamHandler()
+_aawm_route_handler.setLevel(logging.INFO)
+_aawm_route_handler.addFilter(_secret_filter)
+_aawm_route_handler.addFilter(_egress_guard_alert_filter)
+if json_logs:
+    _aawm_route_handler.setFormatter(JsonFormatter())
+else:
+    _aawm_route_handler.setFormatter(logging.Formatter("%(message)s"))
 
 # Add the handler to the logger
 verbose_router_logger.addHandler(handler)
 verbose_proxy_logger.addHandler(handler)
 verbose_logger.addHandler(handler)
+verbose_aawm_route_logger.addHandler(_aawm_route_handler)
+verbose_aawm_route_logger.propagate = False
 
 
 def _suppress_loggers():
@@ -376,9 +479,11 @@ ALL_LOGGERS = [
     verbose_logger,
     verbose_router_logger,
     verbose_proxy_logger,
+    verbose_aawm_route_logger,
     logging.getLogger("uvicorn"),
     logging.getLogger("uvicorn.error"),
     logging.getLogger("uvicorn.access"),
+    logging.getLogger("gunicorn.access"),
 ]
 
 
@@ -390,6 +495,15 @@ def _ensure_filter_on_logger(logger: logging.Logger, log_filter: logging.Filter)
 
 for _logger in ALL_LOGGERS:
     _ensure_filter_on_logger(_logger, _egress_guard_alert_filter)
+
+_ensure_filter_on_logger(
+    logging.getLogger("uvicorn.access"),
+    _aawm_route_access_log_replacement_filter,
+)
+_ensure_filter_on_logger(
+    logging.getLogger("gunicorn.access"),
+    _aawm_route_access_log_replacement_filter,
+)
 
 
 def _get_loggers_to_initialize():
@@ -454,6 +568,11 @@ def _get_uvicorn_json_log_config():
                 "()": json_formatter_class,
             },
         },
+        "filters": {
+            "aawm_route_access_replacement": {
+                "()": "litellm._logging.AawmRouteAccessLogReplacementFilter",
+            },
+        },
         "handlers": {
             "default": {
                 "formatter": "json",
@@ -479,6 +598,7 @@ def _get_uvicorn_json_log_config():
             },
             "uvicorn.access": {
                 "handlers": ["access"],
+                "filters": ["aawm_route_access_replacement"],
                 "level": uvicorn_log_level,
                 "propagate": False,
             },
