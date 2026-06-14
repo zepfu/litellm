@@ -109,6 +109,35 @@ fields when present, but the durable table is populated only by runtime
 session-history ingestion or by older Langfuse rows that still carried the
 inline `aawm_tool_definition_snapshot` value.
 
+## Codex Tool-Description Patches
+
+AAWM Codex and Claude Code adapter paths may patch advertised tool descriptions
+before provider egress when the route needs guidance that survives provider
+transforms which can drop top-level instructions or metadata. These patches are
+request-shape guidance only: they do not prove that a model called a tool
+correctly.
+
+Rows and traces affected by this path include the request tag
+`codex-tool-description-patch` plus one tag per applied patch, for example
+`codex-tool-description-patch:spawn-agent-fanout-policy` or
+`codex-tool-description-patch:core-tool-guidance-edit`. Metadata may include:
+
+- `codex_tool_description_patch_count`: number of applied tool-description
+  patch events.
+- `codex_tool_description_patch_replacement_count`: number of text replacements
+  made by replacement-style patches.
+- `codex_tool_description_patch_ids`: stable patch identifiers applied to the
+  request.
+- `codex_tool_description_patch_events`: bounded per-tool patch records with
+  tool name, path, and patch id.
+
+Core-tool guidance patches currently target Claude Code/Codex tools such as
+`Bash`, `Edit`, `Read`, and `Write`. The intent is to make declared fallback
+models, including xAI/Grok routes, receive the same operational cautions about
+structured edits, stale `old_string` retries, bounded reads, and reading before
+overwriting existing files even when the provider adapter removes unsupported
+top-level fields.
+
 ## xAI Responses Sanitization
 
 LiteLLM sanitizes xAI Responses request bodies for Codex/OpenAI passthrough and
