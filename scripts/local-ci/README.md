@@ -95,17 +95,24 @@ Current first-wave adapted coverage:
   - hard-gates `session_history` plus the local OpenRouter free daily request snapshot in `public.rate_limit_observations`
   - expects `provider=openrouter`, `client=openrouter`, `source=openrouter_free_daily_local_meter`, `quota_key=openrouter_free_daily_requests:requests`, `quota_type=requests`, and `quota_period=daily`
   - allows latest-snapshot fallback because duplicate unchanged snapshots are intentionally suppressed by the observation insert
-- OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+- OpenRouter preferred free target under active validation: `nvidia/nemotron-3-super-120b-a12b:free`
+- OpenRouter paid child-agent proof target under active validation: `deepseek/deepseek-v4-flash`
+- xAI auth split (hard-gated in D1-251):
+  - `claude_adapter_xai_grok_composer_child_parallel_read_tools` validates
+    `xai/grok-composer-2.5-fast` through the native OIDC adapter route
+    `route:anthropic_grok_native_responses_adapter`
+  - `claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools` remains the OAuth
+    case for `oa_xai/grok-build` and continues to validate
+    `route:anthropic_xai_oauth_responses_adapter`; it is not the Composer unblock path
 - OpenRouter focused replacement parallel proof: `claude_adapter_openrouter_nemotron_child_parallel_read_tools`
   - uses `nvidia/nemotron-3-super-120b-a12b:free`
   - hard-gates OpenRouter Responses routing, `session_history`, persisted tool activity, and the one-message parallel `Read` / `Glob` / `Grep` transcript shape
-- OpenRouter warning-only canaries: `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+- OpenRouter warning-only canaries: `openai/gpt-oss-20b:free`, `nvidia/nemotron-3-super-120b-a12b:free`
   - `openrouter/free` remains a legacy manual-only diagnostic and is excluded from the default suite; do not use it for release or deployed-container validation because provider selection is intentionally ambiguous.
   - `openai/gpt-oss-20b:free` remains available in config but is excluded from the default full suite because it is an edge OpenRouter target with noisy upstream availability
   - `claude_adapter_gpt_oss_20b` also validates the OpenRouter free daily request row, but failures remain warning-only with the rest of that canary
-  - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain available in config but are excluded from the default full suite
   - run them only by explicit selection, for example:
-    `--cases claude_adapter_gpt_oss_20b,claude_adapter_gemma_31b,claude_adapter_gemma_26b_a4b,claude_adapter_nemotron_super`
+    `--cases claude_adapter_gpt_oss_20b,claude_adapter_nemotron_super`
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
 - `inclusionai/ling-2.6-flash:free` / `ling-2-6-flash` is retired from active harness targets after OpenRouter started returning `404` for the old free alias. Keep the historical artifacts as breadcrumbs only; the replacement parallel proof is `claude_adapter_openrouter_nemotron_child_parallel_read_tools`.
 - `poolside/laguna-m.1:free` is currently listed by OpenRouter as a free tool-capable model, but Claude Code rejected it as unavailable/inaccessible when used as a child-agent model, so do not use it for the parallel proof without a separate model-resolution fix.
@@ -123,7 +130,7 @@ Current first-wave adapted coverage:
 
 Preferred Anthropic-adapter model spellings:
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
-- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
+- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/deepseek/deepseek-v4-flash`, `openrouter/nvidia/nemotron-3-super-120b-a12b:free`
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because routing is now provider-first
 
 Run it with repo env loaded so Langfuse and DB credentials are available:
@@ -218,7 +225,7 @@ Important notes:
 - `claude_adapter_nvidia_minimax_m27` now uses upstream non-stream plus Anthropic-compatible fake streaming. Keep the exact `nvidia/minimaxai/minimax-m2.7` spelling, and treat it as an explicit opt-in spot check rather than a default-suite canary because MiniMax is materially slower than the other NVIDIA targets.
 - These NVIDIA spot checks validate the Anthropic -> NVIDIA completion adapter on `nvidia:/v1/chat/completions` via `provider=nvidia_nim`.
 - For NVIDIA-adapted runs, expect the same observability parity as the other adapted providers: `session_history.provider=nvidia_nim` with the normalized upstream model and non-zero cost when pricing is mapped, `session_history_tool_activity` rows when tool or agent-dispatch work occurs, Langfuse trace environment matching the selected `--target`, `route:anthropic_nvidia_completion_adapter` / `anthropic-nvidia-completion-adapter` / `anthropic-adapter-target:nvidia:/v1/chat/completions` tags plus the `anthropic.nvidia_completion_adapter` span, and usable cost tracking. If NVIDIA pricing is not available for a target model, fall back to the closest equivalent OpenRouter pricing rather than leaving long-term cost tracking unmapped.
-- For opt-in mixed fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_peeromega_fanout` should persist at least four `Agent` rows, and `session_history` still hard-gates the expected non-Gemini provider/model/cost rows for each child model.
+- For opt-in mixed fanout, the stable tool-activity invariant is the parent session’s delegated `Agent` rows, not child-model command rows. `claude_adapter_peeromega_fanout` should persist at least four `Agent` rows, and `session_history` still hard-gates the expected provider/model/cost rows for each child model.
 - The harness keeps the OpenRouter GPT-OSS edge cases available as explicit opt-in checks while excluding them from the default suite; the adapter should still persist non-zero estimated usage/cost from streamed output plus checked-in/bundled model-price JSON when those cases are selected. If `gpt-oss-120b` times out or command-fails solely because the overlapping runtime logs show the exact OpenRouter provider-unavailable signature (`503`, `provider=OpenInference`, `raw=no healthy upstream`), the harness soft-fails it as upstream availability without masking local adapter/logging failures.
 - Fanout prompts should continue using the Claude agent names from
   `~/.claude/agents`; provider-prefixed routing lives in each agent file's

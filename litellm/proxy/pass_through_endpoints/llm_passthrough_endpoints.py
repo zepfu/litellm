@@ -204,6 +204,7 @@ _OPENCODE_ZEN_FREE_MODELS = frozenset(
         "deepseek-v4-flash",
     }
 )
+_OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS = frozenset({"big-pickle"})
 
 _GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com"
 
@@ -382,26 +383,8 @@ _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": False,
     },
     {
-        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-        "model": "gemini-3.1-flash-lite-preview",
-        "route_family": "codex_google_code_assist_adapter",
-        "last_resort": False,
-    },
-    {
-        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-        "model": "gemini-3-flash-preview",
-        "route_family": "codex_google_code_assist_adapter",
-        "last_resort": False,
-    },
-    {
-        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-        "model": "gemini-3.1-pro-preview",
-        "route_family": "codex_google_code_assist_adapter",
-        "last_resort": False,
-    },
-    {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
-        "model": "deepseek/deepseek-v4-flash:free",
+        "model": "deepseek/deepseek-v4-flash",
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     },
@@ -458,12 +441,6 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
 )
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
-        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
-        "model": "google/gemma-4-31b-it:free",
-        "route_family": "codex_openrouter_responses_adapter",
-        "last_resort": False,
-    },
-    {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
         "model": "deepseek-v4-flash",
         "route_family": "codex_opencode_zen_adapter",
@@ -500,26 +477,8 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": False,
     },
     {
-        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-        "model": "gemini-3.1-flash-lite-preview",
-        "route_family": "anthropic_google_completion_adapter",
-        "last_resort": False,
-    },
-    {
-        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-        "model": "gemini-3-flash-preview",
-        "route_family": "anthropic_google_completion_adapter",
-        "last_resort": False,
-    },
-    {
-        "provider": _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-        "model": "gemini-3.1-pro-preview",
-        "route_family": "anthropic_google_completion_adapter",
-        "last_resort": False,
-    },
-    {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
-        "model": "deepseek/deepseek-v4-flash:free",
+        "model": "deepseek/deepseek-v4-flash",
         "route_family": "anthropic_openrouter_completion_adapter",
         "last_resort": False,
     },
@@ -576,12 +535,6 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
 )
 _ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
-        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
-        "model": "google/gemma-4-31b-it:free",
-        "route_family": "anthropic_openrouter_responses_adapter",
-        "last_resort": False,
-    },
-    {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
         "model": "deepseek-v4-flash",
         "route_family": "anthropic_opencode_zen_responses_adapter",
@@ -590,7 +543,7 @@ _ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
         "model": "big-pickle",
-        "route_family": "anthropic_opencode_zen_responses_adapter",
+        "route_family": "anthropic_opencode_zen_completion_adapter",
         "last_resort": False,
     },
     {
@@ -9714,6 +9667,8 @@ def _opencode_zen_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     if any(
         marker in normalized
         for marker in (
+            "freeusagelimiterror",
+            "free usage limit",
             "creditserror",
             "no payment method",
             "add a payment method",
@@ -9721,6 +9676,8 @@ def _opencode_zen_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
             "payment required",
         )
     ):
+        return detail_text
+    if "not supported for format openai" in normalized:
         return detail_text
     if status_code in {401, 402, 403} and any(
         marker in normalized
@@ -13765,20 +13722,28 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
 
-    upstream_response = await pass_through_request(
-        request=request,
-        target=target_url,
-        custom_headers=custom_headers,
-        user_api_key_dict=user_api_key_dict,
-        custom_body=translated_request_body,
-        forward_headers=False,
-        allowed_forward_headers=[],
-        allowed_pass_through_prefixed_headers=[],
-        stream=bool(translated_request_body.get("stream")),
-        custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
-        egress_credential_family="opencode",
-        expected_target_family="opencode",
-    )
+    try:
+        upstream_response = await pass_through_request(
+            request=request,
+            target=target_url,
+            custom_headers=custom_headers,
+            user_api_key_dict=user_api_key_dict,
+            custom_body=translated_request_body,
+            forward_headers=False,
+            allowed_forward_headers=[],
+            allowed_pass_through_prefixed_headers=[],
+            stream=bool(translated_request_body.get("stream")),
+            custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
+            egress_credential_family="opencode",
+            expected_target_family="opencode",
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _opencode_zen_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
+        raise
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
 
     if isinstance(upstream_response, StreamingResponse):
@@ -13832,6 +13797,160 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
     )
     translated_response.status_code = upstream_response.status_code
     return translated_response
+
+
+async def _handle_anthropic_opencode_zen_completion_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler,
+    )
+
+    _ = endpoint, fastapi_response, user_api_key_dict
+    client_requested_stream = bool(prepared_request_body.get("stream"))
+    requested_model = prepared_request_body.get("model")
+    route_family = "anthropic_opencode_zen_completion_adapter"
+    target_endpoint_label = "opencode_zen:/v1/chat/completions"
+
+    prepared_request_body = _add_opencode_zen_logging_metadata(
+        prepared_request_body,
+        route_family=route_family,
+        tag_prefix="anthropic-opencode-zen-completion-adapter",
+        requested_model=requested_model,
+        adapter_model=adapter_model,
+        input_shape="anthropic_messages",
+        output_shape="anthropic_messages",
+    )
+    prepared_request_body = _merge_litellm_metadata(
+        prepared_request_body,
+        tags_to_add=[
+            f"anthropic-adapter-model:{adapter_model}",
+            f"anthropic-adapter-target:{target_endpoint_label}",
+        ],
+        extra_fields={
+            "anthropic_adapter_model": adapter_model,
+            "anthropic_adapter_original_model": requested_model,
+            "anthropic_adapter_target_endpoint": target_endpoint_label,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="anthropic.opencode_zen_completion_adapter",
+                    metadata={
+                        "requested_model": requested_model,
+                        "adapter_model": adapter_model,
+                        "stream": client_requested_stream,
+                    },
+                )
+            ],
+        },
+    )
+    forced_tool_choice_changes = _maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+        prepared_request_body,
+    )
+    if forced_tool_choice_changes:
+        prepared_request_body = _merge_litellm_metadata(
+            prepared_request_body,
+            extra_fields=forced_tool_choice_changes,
+        )
+
+    target_base_url = _get_opencode_zen_target_base()
+    target_url = _join_opencode_zen_passthrough_url(
+        base_target_url=target_base_url,
+        endpoint="/v1/chat/completions",
+    )
+    api_key = await _load_opencode_zen_api_key_for_candidate(
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+    custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=api_key,
+        request=request,
+    )
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=target_url,
+        headers=custom_headers,
+        credential_family="opencode",
+        expected_target_family="opencode",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+
+    try:
+        completion_response = await LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
+            max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
+            messages=prepared_request_body.get("messages") or [],
+            model=adapter_model,
+            metadata=_build_completion_adapter_metadata(prepared_request_body),
+            stop_sequences=prepared_request_body.get("stop_sequences"),
+            stream=client_requested_stream,
+            system=prepared_request_body.get("system"),
+            temperature=prepared_request_body.get("temperature"),
+            thinking=prepared_request_body.get("thinking"),
+            tool_choice=prepared_request_body.get("tool_choice"),
+            tools=prepared_request_body.get("tools"),
+            top_k=prepared_request_body.get("top_k"),
+            top_p=prepared_request_body.get("top_p"),
+            output_format=prepared_request_body.get("output_format"),
+            output_config=prepared_request_body.get("output_config"),
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            api_key=api_key,
+            api_base=f"{target_base_url.rstrip('/')}/v1",
+            litellm_metadata=prepared_request_body.get("litellm_metadata") or {},
+            proxy_server_request={
+                "headers": dict(request.headers),
+                "body": prepared_request_body,
+            },
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _opencode_zen_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
+        raise
+
+    if client_requested_stream:
+        return _build_anthropic_streaming_response_from_completion_adapter_stream(
+            completion_response,
+        )
+    return _build_anthropic_response_from_completion_adapter_response(
+        completion_response,
+    )
+
+
+async def _handle_anthropic_opencode_zen_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    if adapter_model in _OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS:
+        return await _handle_anthropic_opencode_zen_completion_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=prepared_request_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    return await _handle_anthropic_opencode_zen_responses_adapter_route(
+        endpoint=endpoint,
+        request=request,
+        fastapi_response=fastapi_response,
+        user_api_key_dict=user_api_key_dict,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
 
 
 def _clean_secret_string(value: Optional[str]) -> Optional[str]:
@@ -19890,7 +20009,7 @@ async def _handle_anthropic_auto_agent_alias_route(
                         use_alias_candidate_probe=True,
                     )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
-                response = await _handle_anthropic_opencode_zen_responses_adapter_route(
+                response = await _handle_anthropic_opencode_zen_adapter_route(
                     endpoint=endpoint,
                     request=request,
                     fastapi_response=fastapi_response,
@@ -20240,7 +20359,7 @@ async def anthropic_proxy_route(
             endpoint=encoded_endpoint,
         )
         if opencode_zen_adapter_model is not None:
-            return await _handle_anthropic_opencode_zen_responses_adapter_route(
+            return await _handle_anthropic_opencode_zen_adapter_route(
                 endpoint=endpoint,
                 request=request,
                 fastapi_response=fastapi_response,

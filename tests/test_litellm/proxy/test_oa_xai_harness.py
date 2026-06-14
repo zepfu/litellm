@@ -376,6 +376,51 @@ async def test_oa_xai_harness_returns_reseed_errors_for_missing_or_terminal_cred
 
 
 @pytest.mark.asyncio
+async def test_grok_native_oauth_invalid_grant_uses_oidc_reseed_wording(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    grok_home = tmp_path / ".grok"
+    grok_home.mkdir()
+    credential_path = grok_home / "auth.json"
+    credential_path.write_text(
+        json.dumps(
+            harness.credential_payload(
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+                scoped=True,
+            )
+        ),
+        encoding="utf-8",
+    )
+    credential_path.chmod(0o600)
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(credential_path))
+
+    class FailingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, data, headers):
+            return httpx.Response(400, json={"error": "invalid_grant"})
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FailingAsyncClient):
+        with pytest.raises(ValueError) as exc_info:
+            await oauth.get_grok_native_oauth_access_token()
+
+    message = str(exc_info.value)
+    assert "Grok OIDC credential refresh failed (invalid_grant)" in message
+    assert "the Grok OIDC credential" in message
+    assert "managed xAI OAuth credential" not in message
+    assert "oa_xai/*" not in message
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "public_model,upstream_model", OaXaiHarness.public_to_upstream.items()
 )
