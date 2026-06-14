@@ -15738,6 +15738,29 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
         "antigravity"
     )
+    assert [attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+    ]
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    retryable_index = next(
+        index
+        for index, event in enumerate(audit_events)
+        if event["event_type"] == "candidate_retryable_failure"
+    )
+    selected_index = next(
+        index
+        for index, event in enumerate(audit_events)
+        if event["event_type"] == "candidate_selected"
+    )
+    assert retryable_index < selected_index
+    retryable_event = audit_events[retryable_index]
+    assert retryable_event["provider"] == "antigravity"
+    assert retryable_event["model"] == "claude-sonnet-4-6"
+    assert retryable_event["failure_class"]
+    selected_event = audit_events[selected_index]
+    assert selected_event["provider"] == "openai"
+    assert selected_event["model"] == "gpt-5.3-codex-spark"
 
 
 @pytest.mark.asyncio
@@ -17863,6 +17886,29 @@ async def test_codex_auto_agent_alias_code_falls_back_to_spark_after_antigravity
     assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == (
         "antigravity"
     )
+    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+    ]
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    retryable_index = next(
+        index
+        for index, event in enumerate(audit_events)
+        if event["event_type"] == "candidate_retryable_failure"
+    )
+    selected_index = next(
+        index
+        for index, event in enumerate(audit_events)
+        if event["event_type"] == "candidate_selected"
+    )
+    assert retryable_index < selected_index
+    retryable_event = audit_events[retryable_index]
+    assert retryable_event["provider"] == "antigravity"
+    assert retryable_event["model"] == "claude-sonnet-4-6"
+    assert retryable_event["failure_class"]
+    selected_event = audit_events[selected_index]
+    assert selected_event["provider"] == "openai"
+    assert selected_event["model"] == "gpt-5.3-codex-spark"
 
 
 @pytest.mark.parametrize(
@@ -18134,6 +18180,23 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
     }
     assert "claude-sonnet-4-6" in skipped_models
     assert "gpt-5.3-codex-spark" in skipped_models
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    progression_events = [
+        event
+        for event in audit_events
+        if event["event_type"]
+        in {"candidate_retryable_failure", "candidate_selected"}
+    ]
+    assert [event["model"] for event in progression_events] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+    ]
+    assert [event["event_type"] for event in progression_events] == [
+        "candidate_retryable_failure",
+        "candidate_retryable_failure",
+        "candidate_selected",
+    ]
 
 
 @pytest.mark.asyncio
