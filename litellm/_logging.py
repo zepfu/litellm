@@ -98,6 +98,89 @@ class SecretRedactionFilter(logging.Filter):
 
 _secret_filter = SecretRedactionFilter()
 
+_AAWM_ERROR_LOG_HANDLER_NAME = "aawm_error_log_file_handler"
+_AAWM_ERROR_LOG_LOCK = threading.Lock()
+
+
+def _env_truthy(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sanitize_aawm_error_log_env_name(value: Optional[str]) -> str:
+    cleaned = (value or "").strip().lower()
+    sanitized = re.sub(r"[^a-z0-9_.-]+", "-", cleaned).strip(".-")
+    return sanitized[:64] or "unknown"
+
+
+def _get_aawm_error_log_environment() -> str:
+    return _sanitize_aawm_error_log_env_name(
+        os.getenv("LITELLM_AAWM_ERROR_LOG_ENV")
+        or os.getenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT")
+        or os.getenv("LITELLM_ENV")
+        or os.getenv("ENVIRONMENT")
+    )
+
+
+def _get_aawm_error_log_dir() -> Optional[str]:
+    configured_dir = os.getenv("LITELLM_AAWM_ERROR_LOG_DIR", "").strip()
+    if configured_dir:
+        return configured_dir
+
+    if not _env_truthy(os.getenv("LITELLM_AAWM_ERROR_LOG_ENABLED")):
+        return None
+
+    return os.path.join(os.getcwd(), ".analysis")
+
+
+def _get_aawm_error_log_path() -> Optional[str]:
+    log_dir = _get_aawm_error_log_dir()
+    if not log_dir:
+        return None
+    return os.path.join(log_dir, f"{_get_aawm_error_log_environment()}-error.log")
+
+
+class AawmErrorLogFileHandler(logging.Handler):
+    """Append sanitized LiteLLM ERROR records to the local .analysis intake log."""
+
+    _formatter = logging.Formatter(
+        "%(asctime)s - %(name)s:%(levelname)s: %(filename)s:%(lineno)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _emit_state = threading.local()
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.name = _AAWM_ERROR_LOG_HANDLER_NAME
+        self.addFilter(_secret_filter)
+        self.setFormatter(self._formatter)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(self._emit_state, "active", False):
+            return
+        if record.levelno > logging.ERROR and record.exc_info is None:
+            return
+
+        log_path = _get_aawm_error_log_path()
+        if not log_path:
+            return
+
+        self._emit_state.active = True
+        try:
+            message = self.format(record)
+            with _AAWM_ERROR_LOG_LOCK:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, "a", encoding="utf-8") as error_log:
+                    error_log.write(message)
+                    if not message.endswith("\n"):
+                        error_log.write("\n")
+        except Exception:
+            # Never let local error-intake logging break application logging.
+            return
+        finally:
+            self._emit_state.active = False
+
 _EGRESS_GUARD_ALERT_LOCK = threading.Lock()
 _EGRESS_GUARD_ALERT_STATE: Dict[str, Any] = {
     "trigger_count": 0,
@@ -381,6 +464,7 @@ def _setup_json_exception_handlers(formatter):
     error_handler.setFormatter(formatter)
     error_handler.addFilter(_secret_filter)
     error_handler.addFilter(_egress_guard_alert_filter)
+    aawm_error_handler = AawmErrorLogFileHandler()
 
     # Setup excepthook for uncaught exceptions
     def json_excepthook(exc_type, exc_value, exc_traceback):
@@ -394,6 +478,7 @@ def _setup_json_exception_handlers(formatter):
             exc_info=(exc_type, exc_value, exc_traceback),
         )
         error_handler.handle(record)
+        aawm_error_handler.handle(record)
 
     sys.excepthook = json_excepthook
 
@@ -415,6 +500,7 @@ def _setup_json_exception_handlers(formatter):
                     exc_info=(exc_type, exception, exception.__traceback__),
                 )
                 error_handler.handle(record)
+                aawm_error_handler.handle(record)
             else:
                 loop.default_exception_handler(context)
 
@@ -506,6 +592,29 @@ _ensure_filter_on_logger(
 )
 
 
+def _ensure_aawm_error_log_handler_on_logger(logger: logging.Logger) -> None:
+    for existing_handler in logger.handlers:
+        if getattr(existing_handler, "name", None) == _AAWM_ERROR_LOG_HANDLER_NAME:
+            return
+    logger.addHandler(AawmErrorLogFileHandler())
+
+
+def _configure_aawm_error_log_handlers() -> None:
+    if _get_aawm_error_log_path() is None:
+        return
+
+    for logger in (
+        verbose_logger,
+        verbose_proxy_logger,
+        verbose_router_logger,
+        logging.getLogger("uvicorn.error"),
+    ):
+        _ensure_aawm_error_log_handler_on_logger(logger)
+
+
+_configure_aawm_error_log_handlers()
+
+
 def _get_loggers_to_initialize():
     """
     Get all loggers that should be initialized with the JSON handler.
@@ -540,6 +649,7 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
         _ensure_filter_on_logger(lg, _egress_guard_alert_filter)
         lg.addHandler(handler)  # add JSON formatter handler
         lg.propagate = False  # prevent bubbling to parent/root
+    _configure_aawm_error_log_handlers()
 
 
 def _get_uvicorn_json_log_config():

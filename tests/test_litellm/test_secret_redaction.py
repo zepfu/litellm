@@ -6,7 +6,9 @@ from unittest.mock import patch
 import pytest
 
 from litellm._logging import (
+    AawmErrorLogFileHandler,
     JsonFormatter,
+    _get_aawm_error_log_path,
     _redact_string,
     _secret_filter,
     _setup_json_exception_handlers,
@@ -211,5 +213,95 @@ def test_json_excepthook_redacts_traceback_secrets():
     )
     _secret_filter.filter(record)
     output = h.formatter.format(record)
+    assert SECRET not in output
+    assert "REDACTED" in output
+
+
+def test_aawm_error_log_handler_writes_redacted_traceback(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    handler = AawmErrorLogFileHandler()
+    logger = logging.getLogger("test-aawm-error-log-handler")
+    saved_handlers = logger.handlers[:]
+    saved_level = logger.level
+    saved_propagate = logger.propagate
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+
+    try:
+        try:
+            raise RuntimeError(f"failed with key {SECRET}")
+        except RuntimeError:
+            logger.exception("managed error api_key=%s", SECRET)
+    finally:
+        logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            logger.addHandler(saved_handler)
+        logger.setLevel(saved_level)
+        logger.propagate = saved_propagate
+
+    error_log = tmp_path / "dev-error.log"
+    output = error_log.read_text(encoding="utf-8")
+    assert "test-aawm-error-log-handler:ERROR" in output
+    assert "Traceback (most recent call last)" in output
+    assert "RuntimeError" in output
+    assert SECRET not in output
+    assert "REDACTED" in output
+
+
+def test_aawm_error_log_path_uses_sanitized_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "Dev Env/With Spaces")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    assert _get_aawm_error_log_path() == str(tmp_path / "dev-env-with-spaces-error.log")
+
+
+def test_aawm_error_log_handler_ignores_non_exception_critical_notice(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    handler = AawmErrorLogFileHandler()
+    record = logging.LogRecord(
+        name="LiteLLM Proxy",
+        level=logging.CRITICAL,
+        pathname="",
+        lineno=0,
+        msg="LITELLM_MASTER_KEY is not set",
+        args=(),
+        exc_info=None,
+    )
+
+    handler.handle(record)
+
+    assert not (tmp_path / "dev-error.log").exists()
+
+
+def test_json_exception_hook_writes_aawm_error_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    original_excepthook = sys.excepthook
+    try:
+        _setup_json_exception_handlers(JsonFormatter())
+        try:
+            raise RuntimeError(f"uncaught path key {SECRET}")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+        sys.excepthook(*exc_info)
+    finally:
+        sys.excepthook = original_excepthook
+
+    output = (tmp_path / "dev-error.log").read_text(encoding="utf-8")
+    assert "uncaught path key" in output
+    assert "Traceback (most recent call last)" in output
     assert SECRET not in output
     assert "REDACTED" in output

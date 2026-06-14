@@ -78,6 +78,23 @@ document instead of silently dropping it. Creating the handoff is part of this
 repo's process ownership and does not require separate operator approval;
 implementing the sibling-repo change still does.
 
+### Runtime Error Log Intake
+
+At the start of TODO-driven work, inspect `.analysis/*-error.log` files in
+addition to `investigate-*`, `handoff-*`, and request-style intake files. Treat
+these files as error intake, not as the durable work queue.
+
+For every active error-log file, add or update an entry in `.analysis/todo.md`
+for the underlying resolution. The TODO entry should capture the environment
+name, error detail, traceback context, intended fix, acceptance evidence, and a
+specific requirement to clean up the source `*-error.log` file when the error is
+resolved.
+
+Do not mark an error-log-driven item complete until the underlying error is
+fixed, verification evidence is recorded, and the corresponding active
+`.analysis/*-error.log` file has been deleted or archived out of active intake.
+Keep `.analysis/todo.md` as the source of truth for active work.
+
 ### Broad Discovery Subtasks
 
 When delegating broad discovery work to a subagent, put the discovery contract in
