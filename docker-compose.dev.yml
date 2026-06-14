@@ -70,6 +70,8 @@ services:
       - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
       - ./context-replacement:/app/context-replacement
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
+      # Repo-local error intake for managed LiteLLM runtime errors.
+      - ./.analysis:/app/.analysis
       # Claude persisted-output files for local expansion
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
       # Claude agent specs for subagent model resolution
@@ -98,6 +100,9 @@ services:
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
       - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
       - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=${LITELLM_LANGFUSE_TRACE_ENVIRONMENT:-dev}
+      - LITELLM_AAWM_ERROR_LOG_ENABLED=${LITELLM_AAWM_ERROR_LOG_ENABLED:-1}
+      - LITELLM_AAWM_ERROR_LOG_ENV=${LITELLM_AAWM_ERROR_LOG_ENV:-dev}
+      - LITELLM_AAWM_ERROR_LOG_DIR=${LITELLM_AAWM_ERROR_LOG_DIR:-/app/.analysis}
       - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
       - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
       # AAWM runtime database access goes through shared PgBouncer. Keep
