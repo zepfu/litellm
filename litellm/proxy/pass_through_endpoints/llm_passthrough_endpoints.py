@@ -1322,6 +1322,12 @@ async def _prepare_oa_xai_passthrough_request(
         if updated_body is not request_body:
             request_body.clear()
             request_body.update(updated_body)
+        updated_body, _xai_unsupported_request_params = (
+            _drop_unsupported_codex_request_params_from_request_body(request_body)
+        )
+        if updated_body is not request_body:
+            request_body.clear()
+            request_body.update(updated_body)
         _sanitize_xai_responses_request_body_in_place(request_body)
         updated_body, _removed_tool_choice = (
             _drop_tool_choice_without_tools_from_request_body(request_body)
@@ -1466,6 +1472,9 @@ async def _prepare_grok_native_oauth_passthrough_request(
     )
     prepared_body, _grok_unsupported_hosted_tools = (
         _drop_unsupported_codex_hosted_tools_from_request_body(prepared_body)
+    )
+    prepared_body, _grok_unsupported_request_params = (
+        _drop_unsupported_codex_request_params_from_request_body(prepared_body)
     )
     _sanitize_xai_responses_request_body_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
@@ -9635,6 +9644,30 @@ def _raise_antigravity_auto_agent_candidate_unavailable(exc: Exception) -> None:
     raise proxy_exc from exc
 
 
+def _is_grok_unsupported_reasoning_parameter_detail(normalized_detail: str) -> bool:
+    if "grok" not in normalized_detail:
+        return False
+    if not any(
+        marker in normalized_detail
+        for marker in (
+            "reasoningeffort",
+            "reasoning_effort",
+            "output_config.effort",
+            "reasoning",
+        )
+    ):
+        return False
+    return any(
+        marker in normalized_detail
+        for marker in (
+            "does not support parameter",
+            "unsupported parameter",
+            "invalid-argument",
+            "invalid argument",
+        )
+    )
+
+
 def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     detail = getattr(exc, "detail", None)
     if isinstance(detail, (dict, list)):
@@ -9644,6 +9677,8 @@ def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     else:
         detail_text = str(exc)
     normalized = detail_text.lower()
+    if _is_grok_unsupported_reasoning_parameter_detail(normalized):
+        return detail_text
     if (
         "xai oauth credential" not in normalized
         and "grok oidc credential" not in normalized
@@ -9662,6 +9697,8 @@ def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     else:
         detail_text = str(exc)
     normalized = detail_text.lower()
+    if _is_grok_unsupported_reasoning_parameter_detail(normalized):
+        return detail_text
     if not any(
         marker in normalized
         for marker in (
@@ -12879,18 +12916,26 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
         request=request,
     )
 
-    upstream_response = await pass_through_request(
-        request=request,
-        target=str(target_url),
-        custom_headers=custom_headers,
-        user_api_key_dict=user_api_key_dict,
-        custom_body=translated_request_body,
-        forward_headers=False,
-        stream=bool(translated_request_body.get("stream")),
-        custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
-        expected_target_family="xai",
-    )
+    try:
+        upstream_response = await pass_through_request(
+            request=request,
+            target=str(target_url),
+            custom_headers=custom_headers,
+            user_api_key_dict=user_api_key_dict,
+            custom_body=translated_request_body,
+            forward_headers=False,
+            stream=bool(translated_request_body.get("stream")),
+            custom_llm_provider=litellm.LlmProviders.XAI.value,
+            egress_credential_family="xai",
+            expected_target_family="xai",
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _xai_oauth_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
+        raise
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
     if isinstance(upstream_response, StreamingResponse):
@@ -13028,18 +13073,26 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
     )
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
-    upstream_response = await pass_through_request(
-        request=request,
-        target=str(target_url),
-        custom_headers=grok_headers,
-        user_api_key_dict=user_api_key_dict,
-        custom_body=translated_request_body,
-        forward_headers=False,
-        stream=bool(translated_request_body.get("stream")),
-        custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
-        expected_target_family="xai",
-    )
+    try:
+        upstream_response = await pass_through_request(
+            request=request,
+            target=str(target_url),
+            custom_headers=grok_headers,
+            user_api_key_dict=user_api_key_dict,
+            custom_body=translated_request_body,
+            forward_headers=False,
+            stream=bool(translated_request_body.get("stream")),
+            custom_llm_provider=litellm.LlmProviders.XAI.value,
+            egress_credential_family="xai",
+            expected_target_family="xai",
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _grok_native_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_grok_native_auto_agent_candidate_unavailable(exc)
+        raise
 
     if isinstance(upstream_response, StreamingResponse):
         if not client_requested_stream:
@@ -16200,18 +16253,40 @@ def _drop_unsupported_codex_request_params_from_request_body(
     if not unsupported_params:
         return request_body, []
 
-    def _drop_from_value(value: Any) -> tuple[Any, list[str], bool]:
+    def _drop_from_value(
+        value: Any,
+        *,
+        path: tuple[str, ...] = (),
+    ) -> tuple[Any, list[str], bool]:
         if isinstance(value, dict):
             updated_dict: dict[str, Any] = {}
             removed: list[str] = []
             changed = False
             for key, child_value in value.items():
-                if _normalize_low_cardinality_tag_value(key) in unsupported_params:
-                    removed.append(key)
+                normalized_key = _normalize_low_cardinality_tag_value(key)
+                normalized_path = (
+                    ".".join([*path, normalized_key])
+                    if normalized_key is not None
+                    else None
+                )
+                if normalized_key in unsupported_params or (
+                    normalized_path in unsupported_params
+                ):
+                    removed.append(
+                        normalized_path
+                        if normalized_key not in unsupported_params
+                        and normalized_path in unsupported_params
+                        else key
+                    )
                     changed = True
                     continue
                 updated_child, child_removed, child_changed = _drop_from_value(
-                    child_value
+                    child_value,
+                    path=(
+                        (*path, normalized_key)
+                        if normalized_key is not None
+                        else path
+                    ),
                 )
                 updated_dict[key] = updated_child
                 removed.extend(child_removed)
@@ -16223,7 +16298,10 @@ def _drop_unsupported_codex_request_params_from_request_body(
             list_removed: list[str] = []
             changed = False
             for item in value:
-                updated_item, item_removed, item_changed = _drop_from_value(item)
+                updated_item, item_removed, item_changed = _drop_from_value(
+                    item,
+                    path=path,
+                )
                 updated_list.append(updated_item)
                 list_removed.extend(item_removed)
                 changed = changed or item_changed
@@ -18996,6 +19074,9 @@ def _prepare_grok_request_body_for_passthrough(
     prepared_body = _prepare_grok_logging_body_for_passthrough(
         request=request,
         request_body=request_body,
+    )
+    prepared_body, _grok_unsupported_request_params = (
+        _drop_unsupported_codex_request_params_from_request_body(prepared_body)
     )
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
@@ -21923,19 +22004,24 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         )
     assert grok_context is not None
     _, grok_headers, grok_prepared_body, updated_url = grok_context
-    return await pass_through_request(
-        request=request,
-        target=updated_url,
-        custom_headers=grok_headers,
-        user_api_key_dict=user_api_key_dict,
-        forward_headers=False,
-        stream=bool(grok_prepared_body.get("stream")),
-        custom_body=grok_prepared_body,
-        custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
-        expected_target_family="xai",
-        retryable_upstream_status_codes=[429],
-    )
+    try:
+        return await pass_through_request(
+            request=request,
+            target=updated_url,
+            custom_headers=grok_headers,
+            user_api_key_dict=user_api_key_dict,
+            forward_headers=False,
+            stream=bool(grok_prepared_body.get("stream")),
+            custom_body=grok_prepared_body,
+            custom_llm_provider=litellm.LlmProviders.XAI.value,
+            egress_credential_family="xai",
+            expected_target_family="xai",
+            retryable_upstream_status_codes=[429],
+        )
+    except Exception as exc:
+        if _grok_native_candidate_unavailable_detail(exc) is not None:
+            _raise_grok_native_auto_agent_candidate_unavailable(exc)
+        raise
 
 
 async def _perform_codex_auto_agent_oa_xai_responses_request(
@@ -21965,22 +22051,27 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         )
     assert oa_xai_context is not None
     _, oa_xai_api_key, oa_xai_prepared_body, updated_url = oa_xai_context
-    return await pass_through_request(
-        request=request,
-        target=updated_url,
-        custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
-            api_key=oa_xai_api_key,
+    try:
+        return await pass_through_request(
             request=request,
-        ),
-        user_api_key_dict=user_api_key_dict,
-        forward_headers=False,
-        stream=bool(oa_xai_prepared_body.get("stream")),
-        custom_body=oa_xai_prepared_body,
-        custom_llm_provider=litellm.LlmProviders.XAI.value,
-        egress_credential_family="xai",
-        expected_target_family="xai",
-        retryable_upstream_status_codes=[429],
-    )
+            target=updated_url,
+            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+                api_key=oa_xai_api_key,
+                request=request,
+            ),
+            user_api_key_dict=user_api_key_dict,
+            forward_headers=False,
+            stream=bool(oa_xai_prepared_body.get("stream")),
+            custom_body=oa_xai_prepared_body,
+            custom_llm_provider=litellm.LlmProviders.XAI.value,
+            egress_credential_family="xai",
+            expected_target_family="xai",
+            retryable_upstream_status_codes=[429],
+        )
+    except Exception as exc:
+        if _xai_oauth_candidate_unavailable_detail(exc) is not None:
+            _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
+        raise
 
 
 async def _validate_codex_auto_agent_openrouter_responses_stream(

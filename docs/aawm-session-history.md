@@ -229,6 +229,14 @@ has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
 `custom`, that could not be classified while the inbound request model was still
 the abstract alias `aawm-code`.
 
+Grok Composer and Grok Build candidates also drop unsupported reasoning-effort
+fields before egress, including `reasoning`, `reasoning_effort`,
+`reasoningEffort`, and nested `output_config.effort`. If xAI still rejects an
+alias-probe request with an unsupported reasoning-parameter 400, LiteLLM treats
+that target as candidate-unavailable so the declared alias sequence can continue
+to the next candidate instead of terminating the agent dispatch on the provider
+400.
+
 Rows affected by this path may include:
 
 - `codex_unsupported_hosted_tool_removed_count`,
