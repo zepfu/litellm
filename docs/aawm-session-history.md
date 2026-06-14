@@ -26,6 +26,33 @@ for reporting and grouping by requested alias.
 Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
+## Alias Routing Audit Metadata
+
+AAWM auto-agent aliases attach bounded routing metadata to selected requests so
+operators can confirm ordered failover without replaying raw transcripts.
+
+Common keys include:
+
+- `requested_model_alias` / `model_alias_label`: the inbound alias, for example
+  `aawm-code` or `aawm-code-anthropic`.
+- `aawm_alias_routing_audit_events`: ordered events for skipped, failed, and
+  selected candidates.
+- `codex_auto_agent_attempts` or `anthropic_auto_agent_attempts`: candidate
+  attempts made by the selected alias handler.
+- `codex_auto_agent_skipped_candidates` or
+  `anthropic_auto_agent_skipped_candidates`: candidates skipped because of
+  cooldown or compatibility constraints.
+
+For retryable provider errors, the handler records a
+`candidate_retryable_failure` event, cools down that candidate, and selects the
+next configured usable candidate. For tool-bearing or stateful
+`aawm-code-anthropic` requests, non-Antigravity route families are intentionally
+not usable because they do not preserve the Claude Code tool contract. In that
+case the alias fails closed with
+`aawm_anthropic_auto_agent_no_tool_compatible_candidate` once the compatible
+Antigravity route is unavailable, rather than selecting a model that cannot
+execute the engineering tool contract.
+
 ## Tool Definition Snapshots
 
 Pass-through requests can advertise large tool definitions. LiteLLM records a
