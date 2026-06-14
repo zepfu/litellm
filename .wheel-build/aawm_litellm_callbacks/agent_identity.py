@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     provider_response_id TEXT,
     provider TEXT,
     model TEXT NOT NULL,
+    inbound_model_alias TEXT,
     model_group TEXT,
     agent_name TEXT,
     tenant_id TEXT,
@@ -313,6 +314,7 @@ CREATE TABLE IF NOT EXISTS public.session_history (
 )
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS inbound_model_alias TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tenant_id TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_read_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_modified_count INTEGER NOT NULL DEFAULT 0",
@@ -1043,7 +1045,8 @@ INSERT INTO public.session_history (
     is_compact_summary,
     compact_summary_source,
     compact_summary_id,
-    compact_summary_role
+    compact_summary_role,
+    inbound_model_alias
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, COALESCE($11, $12, NOW()), $12, $13, $14, $15, $16, $17, $18, $19, $20,
@@ -1057,7 +1060,7 @@ INSERT INTO public.session_history (
     $97, $98, $99, $100,
     $101, $102, $103, $104, $105, $106, $107, $108, $109, $110,
     $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121::jsonb,
-    $122, $123, $124, $125
+    $122, $123, $124, $125, $126
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -1068,6 +1071,10 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     ),
     provider = COALESCE(NULLIF(EXCLUDED.provider, ''), session_history.provider),
     model = COALESCE(NULLIF(EXCLUDED.model, ''), session_history.model),
+    inbound_model_alias = COALESCE(
+        NULLIF(EXCLUDED.inbound_model_alias, ''),
+        session_history.inbound_model_alias
+    ),
     model_group = COALESCE(NULLIF(EXCLUDED.model_group, ''), session_history.model_group),
     agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history.agent_name),
     tenant_id = COALESCE(NULLIF(EXCLUDED.tenant_id, ''), session_history.tenant_id),
@@ -12593,6 +12600,7 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
 
 
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    _normalize_inbound_model_alias_on_record(record)
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
     _normalize_invalid_tool_call_state_on_record(record)
@@ -12611,6 +12619,22 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _classify_zero_token_session_history_record(record)
     _sync_session_history_record_metadata(record)
     return record
+
+
+def _normalize_inbound_model_alias_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    record["inbound_model_alias"] = _first_non_empty_string(
+        record.get("inbound_model_alias"),
+        metadata.get("model_alias_label"),
+        metadata.get("requested_model_alias"),
+        metadata.get("codex_auto_agent_alias"),
+        metadata.get("anthropic_auto_agent_alias"),
+        metadata.get("aawm_auto_agent_alias"),
+        record.get("model"),
+    )
 
 
 def _extract_inline_tool_definition_snapshot_from_metadata(
@@ -14317,6 +14341,7 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         _maybe_get(output_response_payload, "model"),
         _extract_model_from_langfuse_output(output_payload),
     )
+    input_model = _extract_model_from_langfuse_input(observation.get("input"))
     explicit_openrouter_model = _first_explicit_openrouter_model_string(
         metadata.get("codex_auto_agent_selected_model"),
         metadata.get("anthropic_auto_agent_selected_model"),
@@ -14326,7 +14351,7 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         metadata.get("model"),
         observation.get("model"),
         output_model,
-        _extract_model_from_langfuse_input(observation.get("input")),
+        input_model,
     )
     resolved_model = _first_known_model_string(
         explicit_openrouter_model,
@@ -14334,14 +14359,14 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         _session_history_metadata_model(metadata),
         observation.get("model"),
         output_model,
-        _extract_model_from_langfuse_input(observation.get("input")),
+        input_model,
         _extract_codex_model_from_response_headers(metadata),
     ) or _first_non_empty_string(
         _session_history_adapter_model(metadata),
         _session_history_metadata_model(metadata),
         observation.get("model"),
         output_model,
-        _extract_model_from_langfuse_input(observation.get("input")),
+        input_model,
         _extract_codex_model_from_response_headers(metadata),
     ) or "unknown"
     model_group = _normalize_session_history_model_group(
@@ -14388,6 +14413,13 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         model_group=model_group,
         call_type=call_type,
         api_base=api_base,
+    )
+    inbound_model_alias = _resolve_inbound_model_alias_from_langfuse(
+        observation=observation,
+        metadata=metadata,
+        input_model=input_model,
+        output_model=output_model,
+        resolved_model=resolved_model,
     )
     permission_decision = _extract_claude_permission_check_decision_from_value(
         output_payload
@@ -14592,6 +14624,7 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         ),
         "provider": provider,
         "model": resolved_model,
+        "inbound_model_alias": inbound_model_alias,
         "model_group": model_group,
         "agent_name": agent_name,
         "tenant_id": tenant_id,
@@ -14795,6 +14828,60 @@ def _get_session_history_model_group(
         metadata.get("model_group"),
         standard_logging_object.get("model_group"),
     )
+
+
+def _resolve_inbound_model_alias(
+    *,
+    kwargs: Dict[str, Any],
+    standard_logging_object: Dict[str, Any],
+    metadata: Dict[str, Any],
+    resolved_model: str,
+) -> str:
+    return _first_non_empty_string(
+        metadata.get("model_alias_label"),
+        metadata.get("requested_model_alias"),
+        metadata.get("codex_auto_agent_alias"),
+        metadata.get("anthropic_auto_agent_alias"),
+        metadata.get("aawm_auto_agent_alias"),
+        _maybe_get_path(
+            kwargs.get("litellm_params"),
+            "proxy_server_request",
+            "body",
+            "model",
+        ),
+        _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"),
+            "request_body",
+            "model",
+        ),
+        _maybe_get_path(standard_logging_object, "request_body", "model"),
+        kwargs.get("model"),
+        standard_logging_object.get("model"),
+        metadata.get("model"),
+        resolved_model,
+    ) or "unknown"
+
+
+def _resolve_inbound_model_alias_from_langfuse(
+    *,
+    observation: Dict[str, Any],
+    metadata: Dict[str, Any],
+    input_model: Optional[str],
+    output_model: Optional[str],
+    resolved_model: str,
+) -> str:
+    return _first_non_empty_string(
+        metadata.get("model_alias_label"),
+        metadata.get("requested_model_alias"),
+        metadata.get("codex_auto_agent_alias"),
+        metadata.get("anthropic_auto_agent_alias"),
+        metadata.get("aawm_auto_agent_alias"),
+        input_model,
+        metadata.get("model"),
+        observation.get("model"),
+        output_model,
+        resolved_model,
+    ) or "unknown"
 
 
 def _normalize_session_history_model_group(
@@ -15292,6 +15379,12 @@ def _build_session_history_record(  # noqa: PLR0915
         call_type=call_type,
         api_base=api_base,
     )
+    inbound_model_alias = _resolve_inbound_model_alias(
+        kwargs=kwargs,
+        standard_logging_object=standard_logging_object,
+        metadata=metadata,
+        resolved_model=resolved_model,
+    )
 
     message = _extract_first_response_message(result)
     if reported_reasoning_tokens is None and provider_prefix == "gemini":
@@ -15515,6 +15608,7 @@ def _build_session_history_record(  # noqa: PLR0915
         "provider_response_id": _maybe_get(result, "id"),
         "provider": resolved_provider,
         "model": resolved_model,
+        "inbound_model_alias": inbound_model_alias,
         "model_group": model_group,
         "agent_name": agent_name,
         "tenant_id": tenant_id,
@@ -15802,6 +15896,7 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("compact_summary_source"),
         record.get("compact_summary_id"),
         record.get("compact_summary_role"),
+        record.get("inbound_model_alias"),
     )
 
 
