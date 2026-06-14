@@ -56,6 +56,35 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
+## Access Log Display Semantics
+
+AAWM passthrough route logs emit a compact route line to the LiteLLM proxy logger
+after the incoming request has been locally prepared and the egress target is
+known.
+The display shape is:
+
+```text
+AAWM_ROUTE: [agent@repository -] [model(alias) -] [ip:port -] METHOD incoming -> outgoing PROTOCOL
+```
+
+Agent, repository, model alias, and client address segments are omitted when
+that metadata is unavailable. The selected model is printed as `model(alias)`
+only when the inbound alias differs from the selected model.
+
+These lines are for live container-log triage, not durable reporting. Durable
+model and alias attribution still comes from `session_history.model` and
+`session_history.inbound_model_alias`. Route-log identity fields are conservative
+display tokens derived from normalized metadata or explicit headers such as
+`x-aawm-agent-name` and `x-aawm-repository`; LiteLLM omits prompt-like,
+sentence-like, or punctuation-heavy agent/repository values instead of printing
+raw request text. LiteLLM intentionally does not inspect prompt text or raw tool
+arguments for the route log.
+
+Route logs must not include API keys, authorization headers, full request or
+response bodies, prompt content, tool arguments, or arbitrary query strings.
+Incoming endpoints preserve only known-safe routing query markers, and outgoing
+targets are logged as host plus path.
+
 ## Tool Definition Snapshots
 
 Pass-through requests can advertise large tool definitions. LiteLLM records a

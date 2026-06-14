@@ -1,10 +1,12 @@
 import asyncio
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timedelta
 from io import BytesIO
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -26,7 +28,9 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    build_aawm_route_access_log_line,
     _direct_capture_xai_passthrough_failure,
+    emit_aawm_route_access_log,
     pass_through_request,
 )
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
@@ -36,6 +40,293 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
+
+
+def _build_aawm_route_log_request(
+    *,
+    method: str = "POST",
+    url: str = "http://127.0.0.1:4001/anthropic/v1/messages?beta=true",
+    client: tuple[str, int] = ("172.19.0.1", 52834),
+    http_version: str = "1.1",
+    headers: Optional[dict[str, str]] = None,
+) -> MagicMock:
+    request = MagicMock(spec=Request)
+    request.method = method
+    request.url = url
+    request.headers = Headers(headers or {})
+    query = httpx.URL(url).query
+    request.scope = {
+        "type": "http",
+        "method": method,
+        "path": httpx.URL(url).path,
+        "query_string": query if isinstance(query, bytes) else query.encode("utf-8"),
+        "client": client,
+        "http_version": http_version,
+    }
+    return request
+
+
+def test_build_aawm_route_access_log_line_includes_available_context() -> None:
+    request = _build_aawm_route_log_request(
+        url=(
+            "http://127.0.0.1:4001/anthropic/v1/messages"
+            "?beta=true&api_key=should-not-log"
+        )
+    )
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "litellm_metadata": {
+            "agent_name": "W4 engineer",
+            "repository": "dashboard-shell",
+            "requested_model_alias": "aawm-code",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses?ignored=1",
+        request_body=request_body,
+    )
+
+    assert line == (
+        "AAWM_ROUTE: W4 engineer@dashboard-shell - "
+        "grok-composer-2.5-fast(aawm-code) - 172.19.0.1:52834 - "
+        "POST /anthropic/v1/messages?beta=true -> "
+        "chatgpt.com/backend-api/codex/responses HTTP/1.1"
+    )
+    assert "api_key" not in line
+    assert "ignored=1" not in line
+
+
+def test_build_aawm_route_access_log_line_omits_missing_optional_context() -> None:
+    request = _build_aawm_route_log_request(
+        method="GET",
+        url="http://127.0.0.1:4001/openai_passthrough/responses?token=secret",
+        client=("127.0.0.1", 44780),
+        http_version="2",
+    )
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.openai.com/v1/responses?api_key=secret",
+        request_body={},
+    )
+
+    assert line == (
+        "AAWM_ROUTE: 127.0.0.1:44780 - GET /openai_passthrough/responses "
+        "-> api.openai.com/v1/responses HTTP/2"
+    )
+    assert "secret" not in line
+    assert "token" not in line
+    assert "None" not in line
+
+
+def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "gpt-5.5",
+        "litellm_metadata": {
+            "agent_name": (
+                "general-purpose@mypy fails, fix and retry. "
+                "This is prompt-like prose"
+            ),
+            "repository": (
+                "litellm; reuse_rule=safe for similar queue-shaping work"
+            ),
+            "requested_model_alias": "aawm-code",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body=request_body,
+    )
+
+    assert line == (
+        "AAWM_ROUTE: gpt-5.5(aawm-code) - 172.19.0.1:52834 - "
+        "POST /anthropic/v1/messages?beta=true -> "
+        "chatgpt.com/backend-api/codex/responses HTTP/1.1"
+    )
+    assert "general-purpose@" not in line
+    assert "reuse_rule" not in line
+    assert "prompt-like" not in line
+
+
+def test_build_aawm_route_access_log_line_rejects_freeform_identity_headers() -> None:
+    request = _build_aawm_route_log_request(
+        headers={
+            "x-aawm-agent-name": "worker; now run this unrelated shell command",
+            "x-aawm-repository": "mypy fails, fix and retry.",
+        }
+    )
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.openai.com/v1/responses",
+        request_body={"model": "gpt-5.3-codex-spark"},
+    )
+
+    assert line == (
+        "AAWM_ROUTE: gpt-5.3-codex-spark - 172.19.0.1:52834 - "
+        "POST /anthropic/v1/messages?beta=true -> "
+        "api.openai.com/v1/responses HTTP/1.1"
+    )
+    assert "unrelated shell command" not in line
+    assert "mypy fails" not in line
+
+
+def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "litellm_metadata": {
+            "agent_name": "W4 engineer",
+            "repository": "/home/zepfu/projects/dashboard-shell/",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body=request_body,
+    )
+
+    assert line.startswith("AAWM_ROUTE: W4 engineer@dashboard-shell -")
+    assert "/home/zepfu/projects" not in line
+
+
+def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "litellm_metadata": {
+            "agent_name": "W4 engineer",
+            "repository": "zepfu/litellm",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body=request_body,
+    )
+
+    assert line.startswith("AAWM_ROUTE: W4 engineer@zepfu/litellm -")
+
+
+def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "metadata": {"model_alias_label": "aawm-code-anthropic"},
+    }
+
+    with caplog.at_level(logging.INFO, logger="LiteLLM Proxy"):
+        emit_aawm_route_access_log(
+            request=request,
+            target="https://api.anthropic.com/v1/messages",
+            request_body=request_body,
+        )
+        emit_aawm_route_access_log(
+            request=request,
+            target="https://api.anthropic.com/v1/messages",
+            request_body=request_body,
+        )
+
+    route_records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("AAWM_ROUTE:")
+    ]
+    assert route_records == [
+        (
+            "AAWM_ROUTE: claude-sonnet-4-6(aawm-code-anthropic) - "
+            "172.19.0.1:52834 - POST /anthropic/v1/messages?beta=true "
+            "-> api.anthropic.com/v1/messages HTTP/1.1"
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/openai_passthrough/responses?stream=false",
+        client=("172.19.0.1", 44766),
+    )
+    request_body = {
+        "model": "gpt-5.3-codex-spark",
+        "input": "redacted",
+        "litellm_metadata": {
+            "agent_name": "W2 tester",
+            "repository": "litellm",
+            "requested_model_alias": "aawm-code",
+            "codex_auto_agent_selected_model": "gpt-5.3-codex-spark",
+        },
+    }
+    mock_user_api_key_dict = MagicMock()
+    mock_user_api_key_dict.api_key = "test-api-key"
+    mock_user_api_key_dict.key_alias = "test-alias"
+    mock_user_api_key_dict.user_email = "test@example.com"
+    mock_user_api_key_dict.user_id = "test-user-id"
+    mock_user_api_key_dict.team_id = "test-team-id"
+    mock_user_api_key_dict.org_id = "test-org-id"
+    mock_user_api_key_dict.project_id = "test-project-id"
+    mock_user_api_key_dict.team_alias = "test-team-alias"
+    mock_user_api_key_dict.end_user_id = "test-end-user-id"
+    mock_user_api_key_dict.request_route = "/openai_passthrough/responses"
+    mock_user_api_key_dict.spend = 0
+    mock_user_api_key_dict.max_budget = None
+    mock_user_api_key_dict.budget_reset_at = None
+    mock_user_api_key_dict.metadata = {}
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.aread = AsyncMock(return_value=b'{"success": true}')
+    mock_response.text = '{"success": true}'
+    mock_response.content = b'{"success": true}'
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging:
+        mock_proxy_logging.pre_call_hook = AsyncMock(return_value=request_body)
+        mock_proxy_logging.post_call_failure_hook = AsyncMock()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=AsyncMock(return_value=mock_response),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+            return_value={},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_response_body",
+            return_value={"success": True},
+        ), caplog.at_level(logging.INFO, logger="LiteLLM Proxy"):
+            await pass_through_request(
+                request=request,
+                target="https://api.openai.com/v1/responses?api_key=secret",
+                custom_headers={},
+                user_api_key_dict=mock_user_api_key_dict,
+                custom_body=request_body,
+                custom_llm_provider="openai",
+            )
+
+    route_records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("AAWM_ROUTE:")
+    ]
+    assert route_records == [
+        (
+            "AAWM_ROUTE: W2 tester@litellm - gpt-5.3-codex-spark(aawm-code) - "
+            "172.19.0.1:44766 - POST /openai_passthrough/responses?stream=false "
+            "-> api.openai.com/v1/responses HTTP/1.1"
+        )
+    ]
+    assert "redacted" not in route_records[0]
+    assert "api_key" not in route_records[0]
 
 
 # Test is_multipart
