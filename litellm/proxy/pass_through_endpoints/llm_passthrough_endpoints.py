@@ -2887,6 +2887,7 @@ def _add_codex_auto_agent_alias_metadata(
             "codex-auto-agent-alias",
             f"codex-auto-agent-selected:{target_model}",
             f"codex-auto-agent-route:{candidate['route_family']}",
+            f"model-alias:{alias_model}",
             *(
                 ["codex-auto-agent-last-resort"]
                 if candidate.get("last_resort")
@@ -2895,6 +2896,7 @@ def _add_codex_auto_agent_alias_metadata(
             f"codex-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
+            "model_alias_label": alias_model,
             "requested_model_alias": alias_model,
             "codex_auto_agent_alias": alias_model,
             "codex_auto_agent_selected_provider": candidate["provider"],
@@ -3384,6 +3386,7 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic-auto-agent-alias",
             f"anthropic-auto-agent-selected:{target_model}",
             f"anthropic-auto-agent-route:{candidate['route_family']}",
+            f"model-alias:{alias_model}",
             *(
                 ["anthropic-auto-agent-last-resort"]
                 if candidate.get("last_resort")
@@ -3392,6 +3395,7 @@ def _add_anthropic_auto_agent_alias_metadata(
             f"anthropic-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
+            "model_alias_label": alias_model,
             "requested_model_alias": alias_model,
             "anthropic_auto_agent_alias": alias_model,
             "anthropic_auto_agent_selected_provider": candidate["provider"],

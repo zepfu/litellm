@@ -2225,6 +2225,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_adapter_target_endpoint",
     "codex_adapter_input_shape",
     "codex_adapter_output_shape",
+    "model_alias_label",
     "requested_model_alias",
     "codex_auto_agent_alias",
     "codex_auto_agent_selected_provider",

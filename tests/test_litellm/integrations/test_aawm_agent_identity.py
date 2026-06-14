@@ -8312,6 +8312,7 @@ def test_build_session_history_record_preserves_alias_routing_audit_metadata() -
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": "session-alias-audit",
+            "model_alias_label": "aawm-read",
             "requested_model_alias": "aawm-read",
             "aawm_alias_routing_audit_events": [
                 {
@@ -8339,6 +8340,7 @@ def test_build_session_history_record_preserves_alias_routing_audit_metadata() -
     )
 
     assert record is not None
+    assert record["metadata"]["model_alias_label"] == "aawm-read"
     audit_events = record["metadata"]["aawm_alias_routing_audit_events"]
     assert audit_events[0]["alias_model"] == "aawm-read"
     assert audit_events[0]["session_id"] == "session-alias-audit"
