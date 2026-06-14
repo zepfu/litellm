@@ -15047,6 +15047,7 @@ async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(
     )
     metadata = updated_body["litellm_metadata"]
     assert updated_body["model"] == "gpt-5.3-codex-spark"
+    assert metadata["model_alias_label"] == "aawm-read-anthropic"
     assert metadata["requested_model_alias"] == "aawm-read-anthropic"
     assert metadata["anthropic_auto_agent_alias"] == "aawm-read-anthropic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
@@ -15063,6 +15064,7 @@ async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(
     assert audit_events[0]["event_type"] == "candidate_selected"
     assert audit_events[0]["selected"] is True
     assert audit_events[0]["attempt_number"] == 1
+    assert "model-alias:aawm-read-anthropic" in metadata["tags"]
     assert "anthropic-auto-agent-alias:aawm-read-anthropic" in metadata["tags"]
 
 
@@ -15226,6 +15228,7 @@ def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
     )
 
     metadata = updated_body["litellm_metadata"]
+    assert metadata["model_alias_label"] == "aawm-code-anthropic"
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
     assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
     audit_events = metadata["aawm_alias_routing_audit_events"]
@@ -15233,6 +15236,7 @@ def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
     assert audit_events[0]["event_type"] == "candidate_selected"
     assert audit_events[0]["provider"] == "antigravity"
     assert audit_events[0]["model"] == "claude-sonnet-4-6"
+    assert "model-alias:aawm-code-anthropic" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -17474,6 +17478,7 @@ async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypa
     )
     metadata = updated_body["litellm_metadata"]
     assert updated_body["model"] == "gpt-5.3-codex-spark"
+    assert metadata["model_alias_label"] == "aawm-read"
     assert metadata["requested_model_alias"] == "aawm-read"
     assert metadata["codex_auto_agent_alias"] == "aawm-read"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
@@ -17489,7 +17494,50 @@ async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypa
     assert audit_events[0]["event_type"] == "candidate_selected"
     assert audit_events[0]["candidate_status"] == "selected"
     assert audit_events[0]["selected"] is True
+    assert "model-alias:aawm-read" in metadata["tags"]
     assert "codex-auto-agent-alias:aawm-read" in metadata["tags"]
+
+
+@pytest.mark.parametrize(
+    ("alias_model", "target_model"),
+    [
+        ("aawm-code", "gpt-5.3-codex-spark"),
+        ("aawm-low", "gpt-5.4-mini"),
+    ],
+)
+def test_codex_auto_agent_alias_metadata_sets_model_alias_label(
+    alias_model,
+    target_model,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": alias_model,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        request=request,
+        selection={
+            "candidate": {
+                "provider": "openai",
+                "model": target_model,
+                "route_family": "codex_responses",
+                "last_resort": False,
+            },
+            "selection_reason": "first_available",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    metadata = updated_body["litellm_metadata"]
+    assert updated_body["model"] == target_model
+    assert metadata["model_alias_label"] == alias_model
+    assert metadata["requested_model_alias"] == alias_model
+    assert metadata["codex_auto_agent_alias"] == alias_model
+    assert f"model-alias:{alias_model}" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -17719,6 +17767,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
     )
 
     metadata = updated_body["litellm_metadata"]
+    assert metadata["model_alias_label"] == "aawm-low"
     assert metadata["requested_model_alias"] == "aawm-low"
     assert metadata["codex_auto_agent_alias"] == "aawm-low"
     assert metadata["codex_auto_agent_selected_provider"] == "opencode_zen"
@@ -17747,6 +17796,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
     assert skipped_event["cooldown_seconds"] == 60.0
     assert skipped_event["skipped"] is True
     assert "codex-auto-agent-alias:aawm-low" in metadata["tags"]
+    assert "model-alias:aawm-low" in metadata["tags"]
 
 
 @pytest.mark.asyncio
