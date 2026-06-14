@@ -5,6 +5,27 @@ This fork stores AAWM-specific routing and observability details in
 maintainer diagnostics and downstream reporting surfaces. They should not be
 treated as public LiteLLM API guarantees.
 
+## Inbound Alias Capture
+
+`public.session_history` includes a nullable `inbound_model_alias` text column.
+It stores the model request value exactly as LiteLLM received it before any alias
+resolution.
+
+- For AAWM alias requests, this is the inbound alias, for example
+  `aawm-read`, `aawm-low`, or `aawm-code-anthropic`.
+- For direct concrete requests, this is the concrete model string (and may equal
+  `session_history.model`).
+
+`session_history.model` remains the routed/selected concrete provider model and
+must not be repurposed for inbound alias grouping.
+
+Existing metadata fields `requested_model_alias` and `model_alias_label` remain
+compatibility and trace metadata. Use `inbound_model_alias` as the canonical field
+for reporting and grouping by requested alias.
+
+Historical rows written before this field existed may be `NULL` unless they were
+explicitly backfilled from prior metadata.
+
 ## Tool Definition Snapshots
 
 Pass-through requests can advertise large tool definitions. LiteLLM records a

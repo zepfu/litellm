@@ -2639,7 +2639,7 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
     assert record["metadata"]["usage_structured_output_mode"] == "json_schema"
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 125
+    assert len(payload) == 126
     assert payload[71] is True
     assert payload[72] is False
     assert payload[73] == "json_schema"
@@ -2744,7 +2744,7 @@ def test_build_session_history_record_persists_agent_score_metadata() -> None:  
     assert record["destructive_action_policy_score"] == pytest.approx(1.0)
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 125
+    assert len(payload) == 126
     assert payload[76] == pytest.approx(0.0)
     assert payload[77] is True
     assert payload[80] is False
@@ -3356,7 +3356,7 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 125
+    assert len(payload) == 126
     assert payload[61] == pytest.approx(25.0)
     assert payload[62] == pytest.approx(100.0)
     assert payload[63] == pytest.approx(130.0)
@@ -4759,7 +4759,11 @@ def test_build_session_history_record_routes_auto_agent_alias_to_selected_provid
     assert record is not None
     assert record["provider"] == "openrouter"
     assert record["model"] == "deepseek/deepseek-v4-flash:free"
+    assert record["inbound_model_alias"] == "aawm-codex-agent-auto"
     assert record["model_group"] == "deepseek/deepseek-v4-flash:free"
+    payload = _build_session_history_db_payload(record)
+    assert payload[5] == "deepseek/deepseek-v4-flash:free"
+    assert payload[125] == "aawm-codex-agent-auto"
 
 
 def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selected_provider() -> None:
@@ -4801,7 +4805,49 @@ def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selec
     assert record is not None
     assert record["provider"] == "antigravity"
     assert record["model"] == "claude-sonnet-4-6"
+    assert record["inbound_model_alias"] == "aawm-code-anthropic"
     assert record["model_group"] == "claude-sonnet-4-6"
+    payload = _build_session_history_db_payload(record)
+    assert payload[5] == "claude-sonnet-4-6"
+    assert payload[125] == "aawm-code-anthropic"
+
+
+def test_build_session_history_record_sets_inbound_model_alias_for_direct_request() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "acompletion"
+    kwargs["litellm_call_id"] = "call-direct-model-inbound-alias"
+    kwargs["litellm_params"]["metadata"]["session_id"] = (
+        "session-direct-model-inbound-alias"
+    )
+
+    result = {
+        "id": "direct-model-response-1",
+        "model": "gpt-5.4-mini",
+        "usage": {
+            "prompt_tokens": 16,
+            "completion_tokens": 4,
+            "total_tokens": 20,
+        },
+        "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    assert record["model"] == "gpt-5.4-mini"
+    assert record["inbound_model_alias"] == "gpt-5.4-mini"
+    assert record["model"] == record["inbound_model_alias"]
+    payload = _build_session_history_db_payload(record)
+    assert payload[5] == "gpt-5.4-mini"
+    assert payload[125] == "gpt-5.4-mini"
 
 
 def test_build_session_history_record_routes_openai_compatible_openrouter_model() -> None:
@@ -5463,7 +5509,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 125
+    assert len(payload) == 126
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -5885,7 +5931,7 @@ def test_d1_169_build_session_history_db_payload_appends_compact_summary_fields(
 
     assert record is not None
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 125
+    assert len(payload) == 126
     assert payload[121] == record["is_compact_summary"]
     assert payload[122] == record["compact_summary_source"]
     assert payload[123] == record["compact_summary_id"]
@@ -9570,10 +9616,11 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert app_name_args[2]
     executed_args = mock_conn.execute.await_args_list[1].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 125
+    assert len(executed_args[1:]) == 126
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
+    assert executed_args[126] == "anthropic/claude-sonnet-4-6"
     gap_args = mock_conn.execute.await_args_list[2].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-123"]
@@ -11412,6 +11459,52 @@ def test_build_session_history_record_from_langfuse_preserves_explicit_openroute
     )
 
 
+def test_build_session_history_record_from_langfuse_preserves_inbound_model_alias() -> None:
+    trace = {
+        "id": "trace-langfuse-inbound-alias",
+        "name": "codex.cli",
+        "sessionId": "session-langfuse-inbound-alias",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-langfuse-inbound-alias",
+        "type": "GENERATION",
+        "name": "litellm-completion",
+        "model": "gpt-5.3-codex-spark",
+        "startTime": "2026-06-14T13:05:00Z",
+        "endTime": "2026-06-14T13:05:02Z",
+        "usage": {
+            "input": 32,
+            "output": 4,
+            "total": 36,
+        },
+        "input": {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "aawm-read",
+        },
+        "output": {"model": "gpt-5.3-codex-spark", "content": "ack"},
+        "metadata": {
+            "model_alias_label": "aawm-read",
+            "requested_model_alias": "aawm-read",
+            "codex_auto_agent_selected_model": "gpt-5.3-codex-spark",
+            "request_tags": ["model-alias:aawm-read"],
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-inbound-alias",
+    )
+
+    assert record is not None
+    assert record["model"] == "gpt-5.3-codex-spark"
+    assert record["inbound_model_alias"] == "aawm-read"
+    payload = _build_session_history_db_payload(record)
+    assert payload[5] == "gpt-5.3-codex-spark"
+    assert payload[125] == "aawm-read"
+
+
 def test_build_session_history_record_from_langfuse_recovers_claude_model_from_exp_tag() -> None:
     trace = {
         "id": "trace-claude-exp-model",
@@ -12226,7 +12319,8 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert "INSERT INTO public.session_history" in history_args[0]
     assert "    start_time,\n    created_at,\n    end_time," in history_args[0]
     assert "$11, COALESCE($11, $12, NOW()), $12" in history_args[0]
-    assert len(history_args[1][0]) == 125
+    assert len(history_args[1][0]) == 126
+    assert history_args[1][0][125] == "anthropic/claude-sonnet-4-6"
     assert history_args[1][0][0] == "call-1"
     assert history_args[1][0][10] == start_time
     assert history_args[1][0][11] == end_time
@@ -12643,6 +12737,15 @@ def test_session_history_insert_sql_includes_sensitive_config_change_flags() -> 
     assert "changed_env_file = CASE" in sql
     assert "AND EXCLUDED.changed_env_file IS NULL" in sql
     assert "THEN NULL" in sql
+
+
+def test_session_history_insert_sql_includes_inbound_model_alias() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
+
+    assert "inbound_model_alias" in sql
+    assert "$126" in sql
+    assert "inbound_model_alias = COALESCE(" in sql
+    assert "NULLIF(EXCLUDED.inbound_model_alias, '')" in sql
 
 
 def test_session_history_insert_sql_uses_start_time_as_created_at() -> None:
