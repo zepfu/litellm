@@ -349,6 +349,7 @@ _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = (
 _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
     _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
 )
+_ANTHROPIC_AUTO_AGENT_NO_TOOL_COMPATIBLE_RETRY_AFTER_SECONDS = 5 * 60
 _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS = frozenset(
     {
         "HIGH_DEMAND",
@@ -2263,7 +2264,13 @@ def _raise_anthropic_auto_agent_no_tool_compatible_candidate(
         )
         and state["cooldown_seconds"] > 0
     ]
-    retry_after_seconds = int(max(1.0, min(compatible_cooldowns, default=1.0)))
+    compatible_route_cooldown_seconds = int(
+        max(1.0, min(compatible_cooldowns, default=1.0))
+    )
+    retry_after_seconds = min(
+        compatible_route_cooldown_seconds,
+        _ANTHROPIC_AUTO_AGENT_NO_TOOL_COMPATIBLE_RETRY_AFTER_SECONDS,
+    )
     candidates = _append_anthropic_auto_agent_incompatible_tool_route_skips(
         skipped=list(skipped),
         states=states,
@@ -2288,6 +2295,9 @@ def _raise_anthropic_auto_agent_no_tool_compatible_candidate(
             "required_provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
             "required_route_family": "anthropic_antigravity_completion_adapter",
             "in_flight_session": in_flight_session,
+            "compatible_candidate_available": False,
+            "candidate_progression_exhausted": True,
+            "compatible_route_cooldown_seconds": compatible_route_cooldown_seconds,
             "retry_after_seconds": retry_after_seconds,
             "candidates": candidates,
         },
