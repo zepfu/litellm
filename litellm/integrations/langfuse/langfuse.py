@@ -61,6 +61,32 @@ _LANGFUSE_SIZE_AUDIT_THRESHOLD_RATIO = 0.9
 _LANGFUSE_SIZE_AUDIT_METADATA_KEY_LIMIT = 10
 _LANGFUSE_EVENT_FIT_TARGET_RATIO = 0.95
 _LANGFUSE_INPUT_TRUNCATION_MARKER_TYPE = "litellm_langfuse_input_truncated"
+_LANGFUSE_FIELD_TRUNCATION_MARKER_TYPE = "litellm_langfuse_field_truncated"
+_LANGFUSE_FIELD_OMISSION_MARKER_TYPE = "litellm_langfuse_field_omitted"
+_LANGFUSE_FIELD_FIT_PRIORITY = (
+    "input",
+    "output",
+    "metadata",
+    "model_parameters",
+    "status_message",
+    "prompt",
+)
+_LANGFUSE_FIELD_FIT_EXCLUDED_KEYS = frozenset(
+    {
+        "id",
+        "name",
+        "start_time",
+        "end_time",
+        "model",
+        "usage",
+        "usage_details",
+        "cost_details",
+        "level",
+        "version",
+        "completion_start_time",
+        "parent_observation_id",
+    }
+)
 _AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY = "aawm_tool_definition_snapshot"
 _SENSITIVE_METADATA_KEY_FRAGMENTS = (
     "api_key",
@@ -127,13 +153,33 @@ def _largest_metadata_keys_by_size(metadata: Any) -> List[Dict[str, Any]]:
     )[:_LANGFUSE_SIZE_AUDIT_METADATA_KEY_LIMIT]
 
 
+def _langfuse_summary_identifier(value: Any) -> Any:
+    if value is None:
+        return None
+    value_text = str(value)
+    value_size_bytes = _json_size_bytes(value_text)
+    if value_size_bytes <= 200:
+        return value
+    return {
+        "type": "litellm_langfuse_identifier_omitted",
+        "size_bytes": value_size_bytes,
+    }
+
+
 def _langfuse_event_fit_target_bytes(max_event_size_bytes: int) -> int:
     return max(0, int(max_event_size_bytes * _LANGFUSE_EVENT_FIT_TARGET_RATIO))
 
 
 def _langfuse_string_truncation_marker(
-    *, omitted_bytes_estimate: int, omitted_count: int
+    *, omitted_bytes_estimate: int, omitted_count: int, field_name: str = "input"
 ) -> str:
+    if field_name != "input":
+        return (
+            "\n...[litellm_langfuse_field_truncated "
+            f"field={field_name} "
+            f"omitted_chars={omitted_count} "
+            f"omitted_bytes_estimate={max(0, omitted_bytes_estimate)}]...\n"
+        )
     return (
         "\n...[litellm_langfuse_input_truncated "
         f"omitted_chars={omitted_count} "
@@ -142,12 +188,34 @@ def _langfuse_string_truncation_marker(
 
 
 def _langfuse_structured_truncation_marker(
-    *, omitted_bytes_estimate: int, omitted_count: int
+    *, omitted_bytes_estimate: int, omitted_count: int, field_name: str = "input"
 ) -> Dict[str, Any]:
+    if field_name != "input":
+        return {
+            "type": _LANGFUSE_FIELD_TRUNCATION_MARKER_TYPE,
+            "field": field_name,
+            "omitted_items": max(0, omitted_count),
+            "omitted_bytes_estimate": max(0, omitted_bytes_estimate),
+        }
     return {
         "type": _LANGFUSE_INPUT_TRUNCATION_MARKER_TYPE,
         "omitted_items": max(0, omitted_count),
         "omitted_bytes_estimate": max(0, omitted_bytes_estimate),
+    }
+
+
+def _langfuse_field_omission_marker(
+    *,
+    field_name: str,
+    omitted_bytes_estimate: int,
+    omitted_count: int,
+) -> Dict[str, Any]:
+    return {
+        "type": _LANGFUSE_FIELD_OMISSION_MARKER_TYPE,
+        "field": field_name,
+        "omitted_items": max(0, omitted_count),
+        "omitted_bytes_estimate": max(0, omitted_bytes_estimate),
+        "reason": "langfuse_event_size_limit",
     }
 
 
@@ -156,6 +224,7 @@ def _truncate_langfuse_string_input(
     *,
     original_input_size_bytes: int,
     fits_event: Callable[[Any], bool],
+    field_name: str = "input",
 ) -> Tuple[str, int]:
     low = 0
     high = len(value)
@@ -181,6 +250,7 @@ def _truncate_langfuse_string_input(
                 + _langfuse_string_truncation_marker(
                     omitted_bytes_estimate=omitted_bytes_estimate,
                     omitted_count=omitted_count,
+                    field_name=field_name,
                 )
                 + (value[-(kept_count // 2) :] if kept_count // 2 > 0 else "")
             )
@@ -199,6 +269,7 @@ def _truncate_langfuse_string_input(
     fallback_marker = _langfuse_string_truncation_marker(
         omitted_bytes_estimate=original_input_size_bytes,
         omitted_count=len(value),
+        field_name=field_name,
     )
     return fallback_marker, len(value)
 
@@ -208,6 +279,7 @@ def _list_with_langfuse_truncation_marker(
     *,
     kept_count: int,
     original_input_size_bytes: int,
+    field_name: str = "input",
 ) -> Tuple[List[Any], int]:
     if kept_count >= len(value):
         return safe_deep_copy(value), 0
@@ -224,6 +296,7 @@ def _list_with_langfuse_truncation_marker(
     marker = _langfuse_structured_truncation_marker(
         omitted_bytes_estimate=omitted_bytes_estimate,
         omitted_count=omitted_items,
+        field_name=field_name,
     )
     return head + [marker] + tail, omitted_items
 
@@ -233,6 +306,7 @@ def _truncate_langfuse_list_input(
     *,
     original_input_size_bytes: int,
     fits_event: Callable[[Any], bool],
+    field_name: str = "input",
 ) -> Tuple[List[Any], int]:
     low = 0
     high = len(value)
@@ -245,6 +319,7 @@ def _truncate_langfuse_list_input(
             value,
             kept_count=kept_count,
             original_input_size_bytes=original_input_size_bytes,
+            field_name=field_name,
         )
         if fits_event(candidate):
             best_candidate = candidate
@@ -260,6 +335,7 @@ def _truncate_langfuse_list_input(
         _langfuse_structured_truncation_marker(
             omitted_bytes_estimate=original_input_size_bytes,
             omitted_count=len(value),
+            field_name=field_name,
         )
     ], len(value)
 
@@ -269,6 +345,7 @@ def _truncate_langfuse_dict_input(
     *,
     original_input_size_bytes: int,
     fits_event: Callable[[Any], bool],
+    field_name: str = "input",
 ) -> Tuple[Dict[Any, Any], int]:
     if fits_event(value):
         return safe_deep_copy(value), 0
@@ -292,6 +369,7 @@ def _truncate_langfuse_dict_input(
             list_value,
             original_input_size_bytes=original_input_size_bytes,
             fits_event=fits_nested_list,
+            field_name=field_name,
         )
         candidate_dict[key] = truncated_list
         if fits_event(candidate_dict):
@@ -316,16 +394,17 @@ def _truncate_langfuse_dict_input(
             string_value,
             original_input_size_bytes=_json_size_bytes(string_value),
             fits_event=fits_nested_string,
+            field_name=field_name,
         )
         candidate_dict[key] = truncated_string
         if fits_event(candidate_dict):
             return candidate_dict, omitted_count
 
-    return {
-        "type": _LANGFUSE_INPUT_TRUNCATION_MARKER_TYPE,
-        "omitted_items": len(value),
-        "omitted_bytes_estimate": original_input_size_bytes,
-    }, len(value)
+    return _langfuse_structured_truncation_marker(
+        omitted_bytes_estimate=original_input_size_bytes,
+        omitted_count=len(value),
+        field_name=field_name,
+    ), len(value)
 
 
 def _truncate_langfuse_input_to_fit_event(
@@ -333,26 +412,162 @@ def _truncate_langfuse_input_to_fit_event(
     *,
     original_input_size_bytes: int,
     fits_event: Callable[[Any], bool],
+    field_name: str = "input",
 ) -> Tuple[Any, int]:
     if isinstance(input_value, str):
         return _truncate_langfuse_string_input(
             input_value,
             original_input_size_bytes=original_input_size_bytes,
             fits_event=fits_event,
+            field_name=field_name,
         )
     if isinstance(input_value, list):
         return _truncate_langfuse_list_input(
             input_value,
             original_input_size_bytes=original_input_size_bytes,
             fits_event=fits_event,
+            field_name=field_name,
         )
     if isinstance(input_value, dict):
         return _truncate_langfuse_dict_input(
             input_value,
             original_input_size_bytes=original_input_size_bytes,
             fits_event=fits_event,
+            field_name=field_name,
         )
     return safe_deep_copy(input_value), 0
+
+
+def _langfuse_field_omitted_count(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    if value is None:
+        return 0
+    return 1
+
+
+def _langfuse_generation_field_fit_order(
+    generation_params: Dict[str, Any],
+) -> List[str]:
+    ordered_fields: List[str] = []
+    for field_name in _LANGFUSE_FIELD_FIT_PRIORITY:
+        if field_name in generation_params:
+            ordered_fields.append(field_name)
+
+    for field_name in generation_params:
+        if (
+            field_name not in ordered_fields
+            and field_name not in _LANGFUSE_FIELD_FIT_EXCLUDED_KEYS
+        ):
+            ordered_fields.append(field_name)
+    return ordered_fields
+
+
+def _fit_langfuse_generation_field_to_event_size(
+    fitted_generation_params: Dict[str, Any],
+    *,
+    field_name: str,
+    target_bytes: int,
+) -> Optional[Dict[str, Any]]:
+    if field_name not in fitted_generation_params:
+        return None
+
+    original_value = fitted_generation_params.get(field_name)
+    original_size_bytes = _json_size_bytes(original_value)
+    omission_marker = _langfuse_field_omission_marker(
+        field_name=field_name,
+        omitted_bytes_estimate=original_size_bytes,
+        omitted_count=_langfuse_field_omitted_count(original_value),
+    )
+    omission_marker_size_bytes = _json_size_bytes(omission_marker)
+    if original_size_bytes <= omission_marker_size_bytes:
+        return None
+
+    def fits_event(candidate_value: Any) -> bool:
+        candidate_generation_params = dict(fitted_generation_params)
+        candidate_generation_params[field_name] = candidate_value
+        return _json_size_bytes(candidate_generation_params) <= target_bytes
+
+    if fits_event(original_value):
+        return None
+
+    if field_name in {"metadata", "model_parameters"}:
+        truncated_value = omission_marker
+        final_size_bytes = omission_marker_size_bytes
+        omitted_count = _langfuse_field_omitted_count(original_value)
+        strategy = "omitted"
+    else:
+        truncated_value, omitted_count = _truncate_langfuse_input_to_fit_event(
+            original_value,
+            original_input_size_bytes=original_size_bytes,
+            fits_event=fits_event,
+            field_name=field_name,
+        )
+        final_size_bytes = _json_size_bytes(truncated_value)
+        strategy = "truncated"
+
+        if final_size_bytes >= original_size_bytes or not fits_event(truncated_value):
+            truncated_value = omission_marker
+            final_size_bytes = omission_marker_size_bytes
+            omitted_count = _langfuse_field_omitted_count(original_value)
+            strategy = "omitted"
+
+    fitted_generation_params[field_name] = truncated_value
+    return {
+        "field": field_name,
+        "strategy": strategy,
+        "original_size_bytes": original_size_bytes,
+        "final_size_bytes": final_size_bytes,
+        "truncated_bytes": max(0, original_size_bytes - final_size_bytes),
+        "omitted_count": omitted_count,
+    }
+
+
+def _build_langfuse_generation_fit_summary(
+    *,
+    target_bytes: int,
+    field_summaries: List[Dict[str, Any]],
+    final_total_size_bytes: int,
+) -> Optional[Dict[str, Any]]:
+    if not field_summaries and final_total_size_bytes <= target_bytes:
+        return None
+
+    summary: Dict[str, Any] = {
+        "event_fit_target_bytes": target_bytes,
+        "field_truncations": field_summaries,
+        "truncated_fields": [
+            field_summary["field"] for field_summary in field_summaries
+        ],
+        "omitted_fields": [
+            field_summary["field"]
+            for field_summary in field_summaries
+            if field_summary.get("strategy") == "omitted"
+        ],
+        "final_total_size_bytes": final_total_size_bytes,
+        "event_fit_failed": final_total_size_bytes > target_bytes,
+    }
+
+    input_summary = next(
+        (
+            field_summary
+            for field_summary in field_summaries
+            if field_summary.get("field") == "input"
+        ),
+        None,
+    )
+    if input_summary is not None:
+        summary.update(
+            {
+                "input_truncated": True,
+                "original_input_size_bytes": input_summary["original_size_bytes"],
+                "final_input_size_bytes": input_summary["final_size_bytes"],
+                "truncated_input_bytes": input_summary["truncated_bytes"],
+                "omitted_input_count": input_summary["omitted_count"],
+            }
+        )
+    return summary
 
 
 def _fit_langfuse_generation_params_to_event_size(
@@ -365,40 +580,30 @@ def _fit_langfuse_generation_params_to_event_size(
     if _json_size_bytes(generation_params) < target_bytes:
         return generation_params, None
 
-    if "input" not in generation_params:
-        return generation_params, None
-
-    original_input = generation_params.get("input")
-    original_input_size_bytes = _json_size_bytes(original_input)
     fitted_generation_params = dict(generation_params)
+    field_summaries: List[Dict[str, Any]] = []
 
-    def fits_event(candidate_input: Any) -> bool:
-        candidate_generation_params = dict(fitted_generation_params)
-        candidate_generation_params["input"] = candidate_input
-        return _json_size_bytes(candidate_generation_params) <= target_bytes
+    for field_name in _langfuse_generation_field_fit_order(fitted_generation_params):
+        if _json_size_bytes(fitted_generation_params) <= target_bytes:
+            break
 
-    truncated_input, omitted_count = _truncate_langfuse_input_to_fit_event(
-        original_input,
-        original_input_size_bytes=original_input_size_bytes,
-        fits_event=fits_event,
+        field_summary = _fit_langfuse_generation_field_to_event_size(
+            fitted_generation_params,
+            field_name=field_name,
+            target_bytes=target_bytes,
+        )
+        if field_summary is not None:
+            field_summaries.append(field_summary)
+
+    final_total_size_bytes = _json_size_bytes(fitted_generation_params)
+    fit_summary = _build_langfuse_generation_fit_summary(
+        target_bytes=target_bytes,
+        field_summaries=field_summaries,
+        final_total_size_bytes=final_total_size_bytes,
     )
-    final_input_size_bytes = _json_size_bytes(truncated_input)
-
-    if final_input_size_bytes >= original_input_size_bytes:
+    if fit_summary is None:
         return generation_params, None
-
-    fitted_generation_params["input"] = truncated_input
-    truncation_summary = {
-        "input_truncated": True,
-        "original_input_size_bytes": original_input_size_bytes,
-        "final_input_size_bytes": final_input_size_bytes,
-        "truncated_input_bytes": max(
-            0, original_input_size_bytes - final_input_size_bytes
-        ),
-        "omitted_input_count": omitted_count,
-        "event_fit_target_bytes": target_bytes,
-    }
-    return fitted_generation_params, truncation_summary
+    return fitted_generation_params, fit_summary
 
 
 def _build_langfuse_payload_size_summary(
@@ -419,9 +624,11 @@ def _build_langfuse_payload_size_summary(
     metadata = generation_params.get("metadata")
     summary = {
         "trace_id": trace_id,
-        "generation_id": generation_params.get("id"),
-        "generation_name": generation_params.get("name"),
-        "model": generation_params.get("model"),
+        "generation_id": _langfuse_summary_identifier(generation_params.get("id")),
+        "generation_name": _langfuse_summary_identifier(
+            generation_params.get("name")
+        ),
+        "model": _langfuse_summary_identifier(generation_params.get("model")),
         "call_type": call_type,
         "total_size_bytes": total_size_bytes,
         "max_event_size_bytes": max_bytes,
@@ -453,6 +660,21 @@ def _log_langfuse_payload_size_if_needed(
         input_truncation_summary=input_truncation_summary,
     )
     if size_summary is None:
+        return
+
+    event_fit_failed = bool(size_summary.get("event_fit_failed"))
+    total_size_bytes = size_summary.get("total_size_bytes")
+    warning_threshold_bytes = size_summary.get("warning_threshold_bytes")
+    still_near_limit = (
+        isinstance(total_size_bytes, int)
+        and isinstance(warning_threshold_bytes, int)
+        and total_size_bytes >= warning_threshold_bytes
+    )
+    if input_truncation_summary is not None and not event_fit_failed and not still_near_limit:
+        verbose_logger.debug(
+            "Langfuse event size fitting applied before SDK enqueue: %s",
+            json.dumps(size_summary, sort_keys=True),
+        )
         return
 
     verbose_logger.warning(
@@ -1256,6 +1478,16 @@ class LangFuseLogger:
                         # these headers can leak our API keys and/or JWT tokens
                         if key.lower() not in ["authorization", "cookie", "referer"]:
                             clean_headers[key] = value
+
+            trace_params, trace_fit_summary = (
+                _fit_langfuse_generation_params_to_event_size(trace_params)
+            )
+            _log_langfuse_payload_size_if_needed(
+                generation_params=trace_params,
+                trace_id=trace_id,
+                call_type=f"{kwargs.get('call_type', 'completion')}.trace",
+                input_truncation_summary=trace_fit_summary,
+            )
 
             trace: StatefulTraceClient = self.Langfuse.trace(**trace_params)
 
