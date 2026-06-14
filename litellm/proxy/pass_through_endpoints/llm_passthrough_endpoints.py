@@ -995,6 +995,7 @@ _openrouter_adapter_failure_circuit_until_monotonic_by_key: dict[str, float] = {
 _CODEX_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID = "spawn-agent-fanout-policy"
 _CODEX_SPAWN_AGENT_PAYLOAD_SCHEMA_PATCH_ID = "spawn-agent-payload-schema"
+_CODEX_CORE_TOOL_GUIDANCE_PATCH_PREFIX = "core-tool-guidance"
 _CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD = "unsupported_hosted_tools"
 _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params"
 _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
@@ -1052,6 +1053,35 @@ _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER = (
     "fork_context",
     "message",
 )
+_CODEX_CORE_TOOL_GUIDANCE_BY_NAME: dict[str, str] = {
+    "bash": (
+        "Claude Code core tool reliability guidance: Use Bash for inspection, "
+        "test, and simple commands. Prefer structured Edit or Write tools for "
+        "source changes instead of complex sed, perl, awk, or shell-quoted "
+        "rewrites. After a shell quoting or syntax error, do not retry a more "
+        "complex one-liner; switch to a smaller structured edit or report the "
+        "exact blocker."
+    ),
+    "edit": (
+        "Claude Code core tool reliability guidance: Edit old_string must be "
+        "copied from the current file contents. If an Edit fails with "
+        "`String to replace not found in file`, do not retry the same "
+        "old_string. Re-read the exact target span, narrow the hunk to the "
+        "smallest stable current context, and then retry once with current "
+        "text."
+    ),
+    "read": (
+        "Claude Code core tool reliability guidance: Use bounded reads for "
+        "large transcript, task-output, or log files. For .output transcript "
+        "files, use offset/limit or available transcript search/meta tools "
+        "instead of unbounded full-file reads."
+    ),
+    "write": (
+        "Claude Code core tool reliability guidance: Use Write for new files or "
+        "known full-file replacements. Before overwriting an existing file, read "
+        "the current file first and preserve unrelated content."
+    ),
+}
 _CODEX_SPAWN_AGENT_RESTRICTIVE_DESCRIPTION_PATTERNS = (
     re.compile(
         r"Only use `?spawn_agent`? if and only if the user explicitly asks for "
@@ -10760,10 +10790,9 @@ def _build_anthropic_responses_adapter_request_body(
         AnthropicMessagesRequest,
         {k: v for k, v in request_fields.items() if v is not None},
     )
-    translation_provider = litellm.LlmProviders.OPENAI.value
     translated_body = adapter.translate_request(
         anthropic_request,
-        custom_llm_provider=translation_provider,
+        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
         use_codex_native_tools=use_chatgpt_codex_defaults,
     )
     _normalize_openai_function_tool_schemas(translated_body)
@@ -10835,6 +10864,9 @@ def _build_anthropic_responses_adapter_request_body(
             **existing_litellm_metadata,
             **dict(translated_body.get("litellm_metadata") or {}),
         }
+    translated_body, _codex_tool_description_patch_events = (
+        _apply_codex_tool_description_patches_to_request_body(translated_body)
+    )
 
     span_metadata = {
         "requested_model": request_body.get("model"),
@@ -15753,6 +15785,26 @@ def _patch_codex_spawn_agent_description_text(description: str) -> tuple[str, in
     return updated_description, replacement_count
 
 
+def _get_codex_core_tool_guidance(tool_name: Optional[str]) -> Optional[str]:
+    normalized_tool_name = _normalize_low_cardinality_tag_value(tool_name)
+    if not normalized_tool_name:
+        return None
+    return _CODEX_CORE_TOOL_GUIDANCE_BY_NAME.get(normalized_tool_name)
+
+
+def _append_codex_core_tool_guidance_to_description(
+    description: Any,
+    *,
+    guidance: str,
+) -> tuple[str, bool]:
+    existing_description = description if isinstance(description, str) else ""
+    if guidance in existing_description:
+        return existing_description, False
+    if not existing_description.strip():
+        return guidance, True
+    return f"{existing_description.rstrip()}\n\n{guidance}", True
+
+
 def _patch_codex_spawn_agent_payload_parameters(
     parameters: Any,
 ) -> tuple[Any, list[str]]:
@@ -16436,6 +16488,68 @@ def _patch_codex_spawn_agent_tool_description(
     return updated_tool, patch_events
 
 
+def _patch_codex_core_tool_description(
+    tool: dict[str, Any],
+    *,
+    tool_index: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    tool_name = _get_openai_tool_name(tool)
+    guidance = _get_codex_core_tool_guidance(tool_name)
+    if guidance is None:
+        return tool, []
+
+    updated_tool = tool
+    patch_events: list[dict[str, Any]] = []
+    description_targets: list[tuple[dict[str, Any], str, str]] = []
+    function = tool.get("function")
+    if isinstance(function, dict):
+        description_targets.append(
+            (
+                function,
+                "description",
+                f"tools.{tool_index}.function.description",
+            )
+        )
+    if "description" in tool or not description_targets:
+        description_targets.append(
+            (tool, "description", f"tools.{tool_index}.description")
+        )
+
+    for container, key, path in description_targets:
+        updated_description, changed = _append_codex_core_tool_guidance_to_description(
+            container.get(key),
+            guidance=guidance,
+        )
+        if not changed:
+            continue
+
+        if updated_tool is tool:
+            updated_tool = dict(tool)
+
+        if container is tool:
+            updated_tool[key] = updated_description
+        else:
+            updated_function = dict(container)
+            updated_function[key] = updated_description
+            updated_tool["function"] = updated_function
+
+        normalized_tool_name = (
+            _normalize_low_cardinality_tag_value(tool_name) or "unknown"
+        )
+        patch_events.append(
+            {
+                "id": f"{_CODEX_CORE_TOOL_GUIDANCE_PATCH_PREFIX}-{normalized_tool_name}",
+                "status": "applied",
+                "tool_name": tool_name,
+                "path": path,
+                "occurrences": 0,
+                "guidance_chars": len(guidance),
+            }
+        )
+
+    return updated_tool, patch_events
+
+
 def _add_codex_tool_description_patch_logging_metadata(
     request_body: dict[str, Any],
     patch_events: list[dict[str, Any]],
@@ -16500,8 +16614,13 @@ def _apply_codex_tool_description_patches_to_request_body(
             tool,
             tool_index=index,
         )
+        updated_tool, core_tool_patch_events = _patch_codex_core_tool_description(
+            updated_tool,
+            tool_index=index,
+        )
         updated_tools.append(updated_tool)
         patch_events.extend(tool_patch_events)
+        patch_events.extend(core_tool_patch_events)
         if updated_tool is not tool:
             changed = True
 

@@ -1281,6 +1281,22 @@ class TestResponsesAdapterToolChoice:
 
         assert default_body["tools"][0]["name"] == "Bash"
         assert default_body["tool_choice"] == {"type": "function", "name": "Bash"}
+        assert default_body["tools"][0]["description"].startswith(
+            "Run a shell command."
+        )
+        assert "structured Edit or Write tools" in default_body["tools"][0][
+            "description"
+        ]
+        assert default_body["litellm_metadata"][
+            "codex_tool_description_patch_count"
+        ] == 1
+        assert default_body["litellm_metadata"][
+            "codex_tool_description_patch_ids"
+        ] == ["core-tool-guidance-bash"]
+        assert (
+            "codex-tool-description-patch:core-tool-guidance-bash"
+            in default_body["litellm_metadata"]["tags"]
+        )
 
         assert codex_body["tools"][0]["name"] == "exec_command"
         assert codex_body["tool_choice"] == {
@@ -14478,6 +14494,117 @@ def test_codex_spawn_agent_tool_description_patch_ignores_other_tools():
     assert updated_body is request_body
     assert patch_events == []
     assert "litellm_metadata" not in updated_body
+
+
+def test_codex_core_tool_guidance_patch_updates_claude_code_tools():
+    request_body = {
+        "model": "oa_xai/grok-build",
+        "tools": [
+            {
+                "type": "function",
+                "name": "Bash",
+                "description": "Run shell commands.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "Edit",
+                "description": "Edit files.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "Read",
+                "description": "Read files.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "Write",
+                "description": "Write files.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+
+    updated_body, patch_events = _apply_codex_tool_description_patches_to_request_body(
+        request_body
+    )
+
+    assert [event["id"] for event in patch_events] == [
+        "core-tool-guidance-bash",
+        "core-tool-guidance-edit",
+        "core-tool-guidance-read",
+        "core-tool-guidance-write",
+    ]
+    descriptions = {
+        tool["name"]: tool["description"] for tool in updated_body["tools"]
+    }
+    assert "structured Edit or Write tools" in descriptions["Bash"]
+    assert "String to replace not found in file" in descriptions["Edit"]
+    assert "do not retry the same old_string" in descriptions["Edit"]
+    assert "Re-read the exact target span" in descriptions["Edit"]
+    assert "transcript search/meta tools" in descriptions["Read"]
+    assert "Before overwriting an existing file, read" in descriptions["Write"]
+
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert "existing-tag" in litellm_metadata["tags"]
+    assert "codex-tool-description-patch" in litellm_metadata["tags"]
+    assert (
+        "codex-tool-description-patch:core-tool-guidance-edit"
+        in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["codex_tool_description_patch_count"] == 4
+    assert litellm_metadata["codex_tool_description_patch_replacement_count"] == 0
+    assert litellm_metadata["codex_tool_description_patch_ids"] == [
+        "core-tool-guidance-bash",
+        "core-tool-guidance-edit",
+        "core-tool-guidance-read",
+        "core-tool-guidance-write",
+    ]
+
+
+def test_codex_core_tool_guidance_patch_handles_function_tool_description():
+    request_body = {
+        "model": "grok-build",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "description": "Edit files.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    }
+
+    updated_body, patch_events = _apply_codex_tool_description_patches_to_request_body(
+        request_body
+    )
+
+    assert patch_events == [
+        {
+            "id": "core-tool-guidance-edit",
+            "status": "applied",
+            "tool_name": "Edit",
+            "path": "tools.0.function.description",
+            "occurrences": 0,
+            "guidance_chars": patch_events[0]["guidance_chars"],
+        }
+    ]
+    function = updated_body["tools"][0]["function"]
+    assert function["description"].startswith("Edit files.")
+    assert "old_string must be copied from the current file contents" in function[
+        "description"
+    ]
+
+    idempotent_body, idempotent_events = (
+        _apply_codex_tool_description_patches_to_request_body(updated_body)
+    )
+    assert idempotent_body is updated_body
+    assert idempotent_events == []
 
 
 def test_codex_spark_unsupported_image_generation_tool_is_removed():
