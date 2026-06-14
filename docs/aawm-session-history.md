@@ -148,8 +148,22 @@ managed xAI Responses requests also drop `tool_choice` when the outgoing payload
 has no usable `tools` definitions, since xAI rejects `tool_choice` without
 tools.
 
+For AAWM Codex aliases, hosted-tool support is evaluated again after the alias
+has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
+`oa_xai/grok-build`. This catches provider-invalid Codex tool variants, including
+`custom`, that could not be classified while the inbound request model was still
+the abstract alias `aawm-code`.
+
 Rows affected by this path may include:
 
+- `codex_unsupported_hosted_tool_removed_count`,
+  `codex_unsupported_hosted_tool_types_removed`, and
+  `codex_unsupported_hosted_tools_removed`: Codex hosted-tool definitions removed
+  because the selected concrete model marks them unsupported. For xAI/Grok
+  Responses routes this commonly includes `custom`, `image_generation`,
+  `namespace`, or `tool_search`.
+- `codex_unsupported_hosted_tool_choice_removed`: the removed `tool_choice` when
+  it referenced a hosted tool removed by the selected model policy.
 - `xai_responses_request_sanitized`: `true` when the outgoing request body was
   changed before xAI egress.
 - `xai_responses_sanitized_removed_params`: normalized top-level field names
