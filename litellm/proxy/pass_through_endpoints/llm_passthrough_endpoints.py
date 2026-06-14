@@ -1316,6 +1316,12 @@ async def _prepare_oa_xai_passthrough_request(
         return False, None, None
 
     if sanitize_responses_request:
+        updated_body, _xai_unsupported_hosted_tools = (
+            _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
+        )
+        if updated_body is not request_body:
+            request_body.clear()
+            request_body.update(updated_body)
         _sanitize_xai_responses_request_body_in_place(request_body)
         updated_body, _removed_tool_choice = (
             _drop_tool_choice_without_tools_from_request_body(request_body)
@@ -1457,6 +1463,9 @@ async def _prepare_grok_native_oauth_passthrough_request(
         model=model,
         tags_to_add=tags_to_add,
         extra_fields=extra_fields,
+    )
+    prepared_body, _grok_unsupported_hosted_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(prepared_body)
     )
     _sanitize_xai_responses_request_body_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (

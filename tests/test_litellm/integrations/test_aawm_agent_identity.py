@@ -6525,27 +6525,32 @@ def test_build_session_history_record_keeps_unsupported_hosted_tool_metadata() -
 
 def test_build_session_history_record_keeps_codex_unsupported_hosted_tool_metadata() -> None:
     kwargs = _base_kwargs()
-    kwargs["model"] = "gpt-5.3-codex-spark"
-    kwargs["custom_llm_provider"] = "openai"
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
     kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-codex-spark-hosted-tool-policy"
+    kwargs["litellm_call_id"] = "call-codex-xai-hosted-tool-policy"
     kwargs["litellm_params"]["metadata"].update(
         {
-            "session_id": "session-codex-spark-hosted-tool-policy",
+            "session_id": "session-codex-xai-hosted-tool-policy",
             "passthrough_route_family": "codex_responses",
-            "codex_unsupported_hosted_tool_removed_count": 1,
-            "codex_unsupported_hosted_tool_types_removed": ["image_generation"],
+            "codex_unsupported_hosted_tool_removed_count": 2,
+            "codex_unsupported_hosted_tool_types_removed": [
+                "custom",
+                "image_generation",
+            ],
             "codex_unsupported_hosted_tools_removed": [
-                {"type": "image_generation", "index": 0}
+                {"type": "custom", "index": 0, "name": "exec_command"},
+                {"type": "image_generation", "index": 0},
             ],
             "codex_unsupported_hosted_tool_choice_removed": {
-                "type": "image_generation"
+                "type": "custom",
+                "name": "exec_command",
             },
         }
     )
 
     result = {
-        "id": "provider-response-codex-spark-hosted-tool-policy",
+        "id": "provider-response-codex-xai-hosted-tool-policy",
         "usage": {
             "prompt_tokens": 317,
             "completion_tokens": 4,
@@ -6562,15 +6567,18 @@ def test_build_session_history_record_keeps_codex_unsupported_hosted_tool_metada
     )
 
     assert record is not None
-    assert record["metadata"]["codex_unsupported_hosted_tool_removed_count"] == 1
+    assert record["metadata"]["codex_unsupported_hosted_tool_removed_count"] == 2
     assert record["metadata"]["codex_unsupported_hosted_tool_types_removed"] == [
-        "image_generation"
+        "custom",
+        "image_generation",
     ]
     assert record["metadata"]["codex_unsupported_hosted_tools_removed"] == [
-        {"type": "image_generation", "index": 0}
+        {"type": "custom", "index": 0, "name": "exec_command"},
+        {"type": "image_generation", "index": 0},
     ]
     assert record["metadata"]["codex_unsupported_hosted_tool_choice_removed"] == {
-        "type": "image_generation"
+        "type": "custom",
+        "name": "exec_command",
     }
 
 
