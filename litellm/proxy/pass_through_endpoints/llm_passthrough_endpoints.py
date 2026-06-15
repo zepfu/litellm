@@ -446,9 +446,10 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-        "model": "gpt-5.3-codex",
+        "model": "gpt-5.5",
         "route_family": "codex_responses",
         "last_resort": True,
+        "request_defaults": {"reasoning": {"effort": "medium"}},
     },
 )
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -2787,6 +2788,55 @@ def _update_codex_auto_agent_retryable_attempt_record(
     return error_tokens
 
 
+def _codex_auto_agent_request_has_reasoning_setting(
+    request_body: dict[str, Any],
+) -> bool:
+    if "reasoning" in request_body:
+        return True
+    if "reasoning_effort" in request_body or "reasoningEffort" in request_body:
+        return True
+    output_config = request_body.get("output_config")
+    return isinstance(output_config, dict) and "effort" in output_config
+
+
+def _apply_codex_auto_agent_candidate_request_defaults(
+    request_body: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    request_defaults = candidate.get("request_defaults")
+    if not isinstance(request_defaults, dict) or not request_defaults:
+        return request_body
+
+    updated_body = request_body
+    applied_defaults: list[str] = []
+    for key, value in request_defaults.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if key == "reasoning" and _codex_auto_agent_request_has_reasoning_setting(
+            updated_body
+        ):
+            continue
+        if key in updated_body:
+            continue
+        if updated_body is request_body:
+            updated_body = copy.deepcopy(request_body)
+        updated_body[key] = copy.deepcopy(value)
+        applied_defaults.append(key)
+
+    if not applied_defaults:
+        return request_body
+
+    return _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            f"codex-auto-agent-default:{field}" for field in applied_defaults
+        ],
+        extra_fields={
+            "codex_auto_agent_request_defaults_applied": applied_defaults,
+        },
+    )
+
+
 def _add_codex_auto_agent_alias_metadata(
     request_body: dict[str, Any],
     *,
@@ -2803,6 +2853,10 @@ def _add_codex_auto_agent_alias_metadata(
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
+    updated_body = _apply_codex_auto_agent_candidate_request_defaults(
+        updated_body,
+        candidate,
+    )
     skipped = selection.get("skipped") or []
     audit_events = _build_auto_agent_alias_audit_events(
         alias_family="codex_auto_agent",
