@@ -193,10 +193,14 @@ before selecting or refreshing an access token. This lets a fresh Grok/OIDC logi
 take effect without writing back into `/home/zepfu/.grok`.
 
 Grok native and `oa_xai/*` Responses candidates remove request fields and hosted
-tools that the selected Grok-family model declares unsupported, but they preserve
-Responses `reasoning` input items that carry `encrypted_content`. Those encrypted
-items are treated as provider-owned compacted session state and must round-trip
-unchanged rather than being removed as ordinary unsupported reasoning summaries.
+tools that the selected Grok-family model declares unsupported. Direct native
+Grok passthrough preserves Responses `reasoning` input items that carry
+`encrypted_content`; those encrypted items are treated as provider-owned
+compacted session state and must round-trip unchanged rather than being removed
+as ordinary unsupported reasoning summaries. Adapter and alias-failover routes
+strip provider-bound compacted session state before xAI/Grok egress because a
+`previous_response_id` or encrypted reasoning blob from another route/session
+can trigger upstream `Could not decode the compaction blob` failures.
 If a Grok-family upstream still rejects a compacted request with `Could not
 decode the compaction blob`, alias-probe mode classifies that 400 as
 candidate-unavailable so the declared failover sequence can continue instead of
@@ -371,6 +375,13 @@ that target as candidate-unavailable so the declared alias sequence can continue
 to the next candidate instead of terminating the agent dispatch on the provider
 400.
 
+Adapter-managed xAI/Grok requests also remove provider-bound compacted
+continuation state before egress. This covers `previous_response_id` and
+Responses `reasoning` input items that contain `encrypted_content` when the
+request is being prepared for managed `oa_xai/*` or Grok native OAuth adapter
+routes. Direct `/grok` passthrough is excluded so native Grok clients can keep
+their own valid compact response state.
+
 Rows affected by this path may include:
 
 - `codex_unsupported_hosted_tool_removed_count`,
@@ -391,6 +402,11 @@ Rows affected by this path may include:
   shape changed, for example `["code_interpreter", "web_search", "x_search"]`.
 - `xai_responses_sanitized_tools`: bounded detail records keyed by tool index,
   type, and removed fields where available.
+- `xai_adapter_compaction_state_removed`: `true` when adapter/failover
+  preparation removed provider-bound compacted continuation state before
+  xAI/Grok egress.
+- `xai_adapter_compaction_state_removed_fields`: normalized field names removed
+  from the outgoing request, for example `["input", "previous_response_id"]`.
 - `xai_tool_choice_without_tools_removed`: the removed `tool_choice` value when
   no typed tool definitions were present in the outgoing payload.
 - `xai_tool_choice_without_tools_removed_reason`: currently `missing_tools`
