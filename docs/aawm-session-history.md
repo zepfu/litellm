@@ -115,6 +115,30 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
+## Antigravity Native OAuth Credentials
+
+Antigravity Code Assist routes use a LiteLLM-managed OAuth credential file for
+runtime access-token refreshes. The Antigravity CLI credential is treated as a
+seed, not as the long-term refresh target.
+
+The seed path comes from `LITELLM_ANTIGRAVITY_SEED_AUTH_FILE`, then legacy
+`LITELLM_ANTIGRAVITY_AUTH_FILE`, then the Antigravity CLI default token path.
+The managed path comes from `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` and defaults
+to `~/.litellm/antigravity/antigravity-oauth-token`.
+
+When the seed credential is newer than the managed credential, LiteLLM copies
+the seed into the managed file and invalidates the cached access token. Direct
+OAuth refreshes then write the new token data back to the managed file only. If
+direct refresh fails because the local OAuth client values are stale, LiteLLM can
+invoke `agy models` against the explicit seed path, reload the CLI-refreshed
+seed credential, and persist that refreshed data back into the managed file on
+the normal access-token load path.
+
+Prod and dev containers should mount the seed credential read-only when possible
+and mount the managed credential directory writable. Do not configure a single
+read-only Antigravity token file as the managed refresh target; doing so can
+leave the route pinned to stale credentials or make refresh persistence fail.
+
 ## Grok Native OIDC Credentials
 
 `xai/grok-composer-2.5-fast`, `xai/grok-build`, and

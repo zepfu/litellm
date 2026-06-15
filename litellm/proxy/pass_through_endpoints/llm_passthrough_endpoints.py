@@ -148,6 +148,17 @@ _ANTIGRAVITY_AUTH_FILE_ENV_VARS = (
     "LITELLM_ANTIGRAVITY_AUTH_FILE",
     "ANTIGRAVITY_OAUTH_TOKEN_FILE",
 )
+_ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE",
+    "ANTIGRAVITY_MANAGED_OAUTH_TOKEN_FILE",
+)
+_ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_SEED_AUTH_FILE",
+    "ANTIGRAVITY_SEED_OAUTH_TOKEN_FILE",
+)
+_ANTIGRAVITY_DEFAULT_MANAGED_AUTH_PATH = (
+    "~/.litellm/antigravity/antigravity-oauth-token"
+)
 _ANTIGRAVITY_DEFAULT_AUTH_PATHS = (
     "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token",
     "~/.gemini/antigravity-cli/antigravity-oauth-token",
@@ -10629,13 +10640,14 @@ def _write_json_file_atomic(
 ) -> None:
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(data, indent=2) + "\n"
         tmp_path.write_text(payload, encoding="utf-8")
         try:
             current_mode = path.stat().st_mode & 0o777
-            os.chmod(tmp_path, current_mode)
         except OSError:
-            pass
+            current_mode = 0o600
+        os.chmod(tmp_path, current_mode)
         os.replace(tmp_path, path)
     except (OSError, TypeError, ValueError) as exc:
         try:
@@ -18339,8 +18351,11 @@ def _get_gemini_passthrough_target_base(
     return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
 
 
-def _get_antigravity_auth_file_path() -> Optional[Path]:
-    for env_name in _ANTIGRAVITY_AUTH_FILE_ENV_VARS:
+def _get_existing_antigravity_auth_file_path(
+    env_var_names: tuple[str, ...],
+    default_paths: tuple[str, ...] = (),
+) -> Optional[Path]:
+    for env_name in env_var_names:
         raw_value = _clean_codex_auth_value(os.getenv(env_name))
         if not raw_value:
             continue
@@ -18348,12 +18363,48 @@ def _get_antigravity_auth_file_path() -> Optional[Path]:
         if path.exists():
             return path
 
-    for candidate_str in _ANTIGRAVITY_DEFAULT_AUTH_PATHS:
+    for candidate_str in default_paths:
         candidate = Path(candidate_str).expanduser()
         if candidate.exists():
             return candidate
 
     return None
+
+
+def _get_antigravity_seed_auth_file_path(
+    *,
+    allow_missing_explicit: bool = False,
+) -> Optional[Path]:
+    for env_var_names in (
+        _ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS,
+        _ANTIGRAVITY_AUTH_FILE_ENV_VARS,
+    ):
+        for env_name in env_var_names:
+            raw_value = _clean_codex_auth_value(os.getenv(env_name))
+            if not raw_value:
+                continue
+            path = Path(raw_value).expanduser()
+            if allow_missing_explicit or path.exists():
+                return path
+
+    return _get_existing_antigravity_auth_file_path(
+        (),
+        _ANTIGRAVITY_DEFAULT_AUTH_PATHS,
+    )
+
+
+def _get_antigravity_managed_auth_file_path() -> Path:
+    for env_name in _ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS:
+        raw_value = _clean_codex_auth_value(os.getenv(env_name))
+        if raw_value:
+            return Path(raw_value).expanduser()
+    return Path(_ANTIGRAVITY_DEFAULT_MANAGED_AUTH_PATH).expanduser()
+
+
+def _antigravity_auth_paths_match(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(
+        strict=False
+    )
 
 
 async def _load_antigravity_oauth_token_data_from_path(
@@ -18376,15 +18427,71 @@ async def _load_antigravity_oauth_token_data_from_path(
     return token_data
 
 
+async def _sync_antigravity_seed_oauth_token_data(
+    managed_auth_path: Path,
+) -> None:
+    seed_auth_path = _get_antigravity_seed_auth_file_path()
+    if seed_auth_path is None or _antigravity_auth_paths_match(
+        managed_auth_path,
+        seed_auth_path,
+    ):
+        return
+
+    try:
+        seed_stat = seed_auth_path.stat()
+    except FileNotFoundError:
+        return
+
+    seed_token_data: Optional[AntigravityOAuthTokenData] = None
+    try:
+        managed_stat = managed_auth_path.stat()
+    except FileNotFoundError:
+        should_sync = True
+    else:
+        if seed_stat.st_mtime_ns > managed_stat.st_mtime_ns:
+            should_sync = True
+        elif seed_stat.st_mtime_ns == managed_stat.st_mtime_ns:
+            seed_token_data = await _load_antigravity_oauth_token_data_from_path(
+                seed_auth_path
+            )
+            try:
+                managed_token_data = await _load_antigravity_oauth_token_data_from_path(
+                    managed_auth_path
+                )
+            except HTTPException:
+                should_sync = True
+            else:
+                should_sync = seed_token_data != managed_token_data
+        else:
+            should_sync = False
+
+    if not should_sync:
+        return
+
+    if seed_token_data is None:
+        seed_token_data = await _load_antigravity_oauth_token_data_from_path(
+            seed_auth_path
+        )
+    _write_antigravity_oauth_token_data_atomic(managed_auth_path, seed_token_data)
+    _antigravity_oauth_access_token_cache.pop(
+        str(managed_auth_path.expanduser()),
+        None,
+    )
+
+
 async def _load_local_antigravity_oauth_token_data() -> tuple[AntigravityOAuthTokenData, Path]:
-    auth_path = _get_antigravity_auth_file_path()
-    if auth_path is None:
+    auth_path = _get_antigravity_managed_auth_file_path()
+    await _sync_antigravity_seed_oauth_token_data(auth_path)
+    if not auth_path.exists():
         raise HTTPException(
             status_code=500,
             detail=(
-                "Antigravity passthrough requires local OAuth token data at "
-                "'~/.gemini/antigravity-cli/antigravity-oauth-token' or "
-                "'LITELLM_ANTIGRAVITY_AUTH_FILE'."
+                "Antigravity passthrough requires a LiteLLM-managed writable "
+                "OAuth token file at 'LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE' "
+                f"or '{_ANTIGRAVITY_DEFAULT_MANAGED_AUTH_PATH}', seeded from "
+                "'LITELLM_ANTIGRAVITY_SEED_AUTH_FILE', "
+                "'LITELLM_ANTIGRAVITY_AUTH_FILE', or the Antigravity CLI "
+                "default token path."
             ),
         )
 
@@ -18817,8 +18924,12 @@ async def _refresh_local_antigravity_oauth_token_data(
             and _get_oauth_token_error_code(response)
             in {"invalid_client", "invalid_grant", "unauthorized_client"}
         ):
+            cli_auth_path = (
+                _get_antigravity_seed_auth_file_path(allow_missing_explicit=True)
+                or auth_path
+            )
             return await _refresh_local_antigravity_oauth_token_data_via_cli(
-                auth_path,
+                cli_auth_path,
                 token_data,
             )
         raise HTTPException(

@@ -82,8 +82,10 @@ services:
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
       # OpenCode Zen auth for native OpenCode and Codex/Claude adapter testing
       - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
-      # Gemini and Antigravity OAuth tokens for adapter testing; refresh persists updated tokens.
+      # Gemini OAuth tokens and Antigravity CLI seed tokens for adapter testing.
       - /home/zepfu/.gemini:/home/zepfu/.gemini
+      # LiteLLM-owned Antigravity OAuth credential; refresh persists updated tokens here.
+      - /home/zepfu/.litellm/antigravity:/home/zepfu/.litellm/antigravity
       # Grok CLI OAuth tokens for native Grok OIDC passthrough seed only.
       - /home/zepfu/.grok:/home/zepfu/.grok:ro
       # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.
@@ -151,6 +153,8 @@ services:
       - LITELLM_GEMINI_OAUTH_CLIENT_ID=${LITELLM_GEMINI_OAUTH_CLIENT_ID:-}
       - LITELLM_GEMINI_OAUTH_CLIENT_SECRET=${LITELLM_GEMINI_OAUTH_CLIENT_SECRET:-}
       - LITELLM_GEMINI_CLI_BUNDLE_PATH=${LITELLM_GEMINI_CLI_BUNDLE_PATH:-}
+      - LITELLM_ANTIGRAVITY_SEED_AUTH_FILE=${LITELLM_ANTIGRAVITY_SEED_AUTH_FILE:-/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token}
+      - LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE=${LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE:-/home/zepfu/.litellm/antigravity/antigravity-oauth-token}
       - AAWM_NVIDIA_API_KEY=${AAWM_NVIDIA_API_KEY:-}
       - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
