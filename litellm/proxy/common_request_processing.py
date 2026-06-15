@@ -37,6 +37,7 @@ from litellm.litellm_core_utils.llm_response_utils.get_headers import (
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+from litellm.proxy.aawm_route_logging import emit_aawm_route_access_log
 from litellm.proxy.auth.auth_utils import check_response_size_is_safe
 from litellm.proxy.common_utils.callback_utils import (
     get_logging_caching_headers,
@@ -414,6 +415,47 @@ def _has_attribute_error_in_chain(exc: Exception) -> bool:
 class ProxyBaseLLMRequestProcessing:
     def __init__(self, data: dict):
         self.data = data
+
+    @staticmethod
+    def _get_aawm_route_access_log_target(
+        *,
+        route_type: str,
+        data: dict,
+        hidden_params: dict,
+    ) -> str:
+        for value in (
+            hidden_params.get("api_base"),
+            data.get("api_base"),
+            data.get("base_url"),
+        ):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return f"litellm://{route_type}"
+
+    def _emit_aawm_route_access_log(
+        self,
+        *,
+        request: Request,
+        route_type: str,
+        hidden_params: dict,
+    ) -> None:
+        target = self._get_aawm_route_access_log_target(
+            route_type=route_type,
+            data=self.data,
+            hidden_params=hidden_params,
+        )
+        try:
+            emit_aawm_route_access_log(
+                request=request,
+                target=target,
+                request_body=self.data,
+                kwargs=self.data,
+            )
+        except Exception:
+            verbose_proxy_logger.debug(
+                "Failed to emit AAWM route access log",
+                exc_info=True,
+            )
 
     @staticmethod
     def get_custom_headers(
@@ -956,6 +998,11 @@ class ProxyBaseLLMRequestProcessing:
 
         hidden_params = getattr(response, "_hidden_params", {}) or {}
         model_id = self._get_model_id_from_response(hidden_params, self.data)
+        self._emit_aawm_route_access_log(
+            request=request,
+            route_type=route_type,
+            hidden_params=hidden_params,
+        )
 
         cache_key, api_base, response_cost = (
             hidden_params.get("cache_key", None) or "",
