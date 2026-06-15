@@ -993,6 +993,7 @@ _openrouter_adapter_rate_limit_lock = asyncio.Lock()
 _openrouter_adapter_rate_limit_until_monotonic_by_key: dict[str, float] = {}
 _openrouter_adapter_failure_circuit_until_monotonic_by_key: dict[str, float] = {}
 _CODEX_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
+_CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE = "tool_search"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID = "spawn-agent-fanout-policy"
 _CODEX_SPAWN_AGENT_PAYLOAD_SCHEMA_PATCH_ID = "spawn-agent-payload-schema"
 _CODEX_CORE_TOOL_GUIDANCE_PATCH_PREFIX = "core-tool-guidance"
@@ -16584,6 +16585,43 @@ def _patch_codex_spawn_agent_tool_description(
     return updated_tool, patch_events
 
 
+def _patch_codex_multi_agent_tool_search_description(
+    tool: dict[str, Any],
+    *,
+    tool_index: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if _normalize_low_cardinality_tag_value(tool.get("type")) != (
+        _CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE
+    ):
+        return tool, []
+
+    description = tool.get("description")
+    if not isinstance(description, str):
+        return tool, []
+    if _CODEX_SPAWN_AGENT_FANOUT_POLICY in description:
+        return tool, []
+    if (
+        "Multi-agent tools" not in description
+        and "Spawn and manage sub-agents" not in description
+    ):
+        return tool, []
+
+    updated_tool = dict(tool)
+    updated_tool["description"] = (
+        f"{description.rstrip()}\n\n{_CODEX_SPAWN_AGENT_FANOUT_POLICY}"
+    )
+    return updated_tool, [
+        {
+            "id": _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID,
+            "status": "applied",
+            "tool_name": _CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE,
+            "path": f"tools.{tool_index}.description",
+            "occurrences": 0,
+            "guidance_chars": len(_CODEX_SPAWN_AGENT_FANOUT_POLICY),
+        }
+    ]
+
+
 def _patch_codex_core_tool_description(
     tool: dict[str, Any],
     *,
@@ -16710,12 +16748,19 @@ def _apply_codex_tool_description_patches_to_request_body(
             tool,
             tool_index=index,
         )
+        updated_tool, tool_search_patch_events = (
+            _patch_codex_multi_agent_tool_search_description(
+                updated_tool,
+                tool_index=index,
+            )
+        )
         updated_tool, core_tool_patch_events = _patch_codex_core_tool_description(
             updated_tool,
             tool_index=index,
         )
         updated_tools.append(updated_tool)
         patch_events.extend(tool_patch_events)
+        patch_events.extend(tool_search_patch_events)
         patch_events.extend(core_tool_patch_events)
         if updated_tool is not tool:
             changed = True
