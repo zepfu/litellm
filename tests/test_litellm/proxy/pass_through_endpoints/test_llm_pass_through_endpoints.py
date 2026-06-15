@@ -64,6 +64,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _anthropic_auto_agent_session_affinity_by_key,
     _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+    _CODEX_AAWM_CODE_CANDIDATES,
     _get_google_adapter_rate_limit_key,
     _get_or_load_google_code_assist_project,
     _get_google_code_assist_prime_cache_key,
@@ -15215,6 +15216,105 @@ def test_aawm_alias_candidate_maps_exclude_google_and_retired_free_deepseek():
     assert violations == []
 
 
+def test_codex_aawm_code_candidates_do_not_include_rejected_codex_model():
+    candidates_by_model = {
+        candidate["model"]: candidate for candidate in _CODEX_AAWM_CODE_CANDIDATES
+    }
+
+    assert set(candidates_by_model) == {
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+        "gpt-5.5",
+    }
+    assert "gpt-5.3-codex" not in candidates_by_model
+    assert candidates_by_model["gpt-5.5"]["last_resort"] is True
+    assert candidates_by_model["gpt-5.5"]["request_defaults"] == {
+        "reasoning": {"effort": "medium"}
+    }
+
+
+def test_codex_aawm_code_gpt55_last_resort_applies_medium_reasoning_default():
+    request = _build_codex_auto_agent_request()
+    gpt55_candidate = next(
+        candidate
+        for candidate in _CODEX_AAWM_CODE_CANDIDATES
+        if candidate["model"] == "gpt-5.5"
+    )
+
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        {
+            "model": "aawm-code",
+            "input": "hello",
+            "litellm_metadata": {"tags": ["existing-tag"]},
+        },
+        request=request,
+        selection={
+            "candidate": gpt55_candidate,
+            "selection_reason": "last_resort",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    assert updated_body["model"] == "gpt-5.5"
+    assert updated_body["reasoning"] == {"effort": "medium"}
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_request_defaults_applied"] == ["reasoning"]
+    assert "existing-tag" in metadata["tags"]
+    assert "codex-auto-agent-default:reasoning" in metadata["tags"]
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.5"
+    assert metadata["codex_auto_agent_selected_last_resort"] is True
+
+
+@pytest.mark.parametrize(
+    "reasoning_field",
+    [
+        {"reasoning": {"effort": "high"}},
+        {"reasoning_effort": "high"},
+        {"reasoningEffort": "high"},
+        {"output_config": {"effort": "high"}},
+    ],
+)
+def test_codex_aawm_code_gpt55_last_resort_preserves_explicit_reasoning(
+    reasoning_field,
+):
+    request = _build_codex_auto_agent_request()
+    gpt55_candidate = next(
+        candidate
+        for candidate in _CODEX_AAWM_CODE_CANDIDATES
+        if candidate["model"] == "gpt-5.5"
+    )
+    request_body = {
+        "model": "aawm-code",
+        "input": "hello",
+        **copy.deepcopy(reasoning_field),
+    }
+
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        request_body,
+        request=request,
+        selection={
+            "candidate": gpt55_candidate,
+            "selection_reason": "last_resort",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    for key, value in reasoning_field.items():
+        assert updated_body[key] == value
+    assert updated_body["model"] == "gpt-5.5"
+    if "reasoning" not in reasoning_field:
+        assert "reasoning" not in updated_body
+    metadata = updated_body["litellm_metadata"]
+    assert "codex_auto_agent_request_defaults_applied" not in metadata
+    assert "codex-auto-agent-default:reasoning" not in metadata["tags"]
+
+
 @pytest.mark.parametrize(
     "alias",
     [
@@ -18213,7 +18313,7 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
             False,
         ),
         ("xai", "oa_xai/grok-build", "codex_xai_oauth_responses_adapter", False),
-        ("openai", "gpt-5.3-codex", "codex_responses", True),
+        ("openai", "gpt-5.5", "codex_responses", True),
     ]
 
     with patch(

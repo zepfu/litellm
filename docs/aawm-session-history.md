@@ -104,7 +104,13 @@ Common keys include:
 
 For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the
-next configured usable candidate. For tool-bearing or stateful
+next configured usable candidate. The Codex `aawm-code` alias keeps
+`gpt-5.3-codex-spark` as its normal OpenAI/Codex Responses candidate and uses
+`gpt-5.5` as the OpenAI last-resort candidate with medium reasoning applied by
+default when the inbound request did not already provide a reasoning setting.
+Plain `gpt-5.3-codex` is intentionally not an `aawm-code` ChatGPT-account
+Codex Responses candidate because that account surface rejects it before work
+can start. For tool-bearing or stateful
 `aawm-code-anthropic` requests, every declared candidate route is treated as a
 Claude Code tool-contract route: if the alias declares Antigravity, OpenAI, xAI,
 native Anthropic, or another provider/model target, that target must preserve
