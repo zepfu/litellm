@@ -37,6 +37,15 @@ Before cutting or promoting a release:
 - Confirm `aawm-litellm` on `:4000` is the prod target being promoted.
 - Confirm `.env` / production env files contain the provider credentials needed
   for the lanes being validated.
+- Confirm Antigravity Code Assist has separate seed and managed OAuth paths in
+  prod: the seed may be read-only, but the
+  `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` directory must be writable so token
+  refreshes persist.
+- Confirm prod error-log mirroring is enabled with a writable mount for this
+  repo's `.analysis` directory and
+  `LITELLM_AAWM_ERROR_LOG_ENABLED=1`,
+  `LITELLM_AAWM_ERROR_LOG_ENV=prod`, and
+  `LITELLM_AAWM_ERROR_LOG_DIR=/app/.analysis`.
 - Confirm `PATCHES.md`, `TODO.md`, `COMPLETED.md`, `WHEEL.md`, and
   `TEST_HARNESS.md` reflect the current release state when behavior changes.
 
@@ -197,6 +206,17 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    For local TEI/Nomic/rerank services, production config should route through
    `host.docker.internal:<port>` from the container rather than a Docker bridge
    IP such as `172.20.0.1`.
+
+   Antigravity Code Assist OAuth refresh requires two prod credential mounts:
+   a seed token path from the Antigravity CLI login and a writable LiteLLM-owned
+   managed token path. Prefer mounting the seed credential directory read-only
+   instead of a single token file so host-side reauth and atomic file replacement
+   are visible inside the container. Mount the managed directory read-write and
+   set `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` to that path.
+
+   Prod error-log mirroring also requires a writable mount from this repo's
+   `.analysis` directory to the container path named by
+   `LITELLM_AAWM_ERROR_LOG_DIR`, normally `/app/.analysis`.
 
 2. Build the prod image.
 
