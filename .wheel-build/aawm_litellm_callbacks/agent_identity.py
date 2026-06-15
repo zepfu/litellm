@@ -191,6 +191,15 @@ _RESET_AFTER_SECONDS_RE = re.compile(
     r"\breset(?:s|ting)?\s+after\s+(?P<seconds>\d+)s\b",
     re.IGNORECASE,
 )
+_AAWM_AGENT_ID_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_AAWM_AGENT_ID_HEX_RE = re.compile(r"^(?=.*[a-f])[a-f0-9]{12,64}$", re.IGNORECASE)
+_AAWM_AGENT_ID_PREFIXED_RE = re.compile(
+    r"^(?:agent|subagent|task)[-_][A-Za-z0-9][A-Za-z0-9._:-]{5,127}$",
+    re.IGNORECASE,
+)
 _AAWM_SESSION_HISTORY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.session_history (
     id BIGSERIAL PRIMARY KEY,
@@ -204,6 +213,7 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     inbound_model_alias TEXT,
     model_group TEXT,
     agent_name TEXT,
+    agent_id TEXT,
     tenant_id TEXT,
     call_type TEXT,
     start_time TIMESTAMPTZ,
@@ -325,6 +335,7 @@ CREATE TABLE IF NOT EXISTS public.session_history (
 """
 _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS inbound_model_alias TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_id TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tenant_id TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_read_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_modified_count INTEGER NOT NULL DEFAULT 0",
@@ -468,6 +479,7 @@ CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
     provider TEXT,
     model TEXT NOT NULL,
     agent_name TEXT,
+    agent_id TEXT,
     tool_index INTEGER NOT NULL,
     tool_call_id TEXT,
     tool_name TEXT NOT NULL,
@@ -1074,7 +1086,8 @@ INSERT INTO public.session_history (
     compact_summary_source,
     compact_summary_id,
     compact_summary_role,
-    inbound_model_alias
+    inbound_model_alias,
+    agent_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, COALESCE($11, $12, NOW()), $12, $13, $14, $15, $16, $17, $18, $19, $20,
@@ -1088,7 +1101,7 @@ INSERT INTO public.session_history (
     $97, $98, $99, $100,
     $101, $102, $103, $104, $105, $106, $107, $108, $109, $110,
     $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121::jsonb,
-    $122, $123, $124, $125, $126
+    $122, $123, $124, $125, $126, $127
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -1105,6 +1118,7 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     ),
     model_group = COALESCE(NULLIF(EXCLUDED.model_group, ''), session_history.model_group),
     agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history.agent_name),
+    agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), session_history.agent_id),
     tenant_id = COALESCE(NULLIF(EXCLUDED.tenant_id, ''), session_history.tenant_id),
     call_type = COALESCE(NULLIF(EXCLUDED.call_type, ''), session_history.call_type),
     created_at = LEAST(session_history.created_at, EXCLUDED.created_at),
@@ -1655,10 +1669,11 @@ INSERT INTO public.session_history_tool_activity (
     git_push_count,
     command_text,
     arguments,
-    metadata
+    metadata,
+    agent_id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17::jsonb
+    $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17::jsonb, $18
 )
 ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history_tool_activity.session_id),
@@ -1666,6 +1681,7 @@ ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
     provider = COALESCE(NULLIF(EXCLUDED.provider, ''), session_history_tool_activity.provider),
     model = COALESCE(NULLIF(EXCLUDED.model, ''), session_history_tool_activity.model),
     agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history_tool_activity.agent_name),
+    agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), session_history_tool_activity.agent_id),
     tool_call_id = COALESCE(NULLIF(EXCLUDED.tool_call_id, ''), session_history_tool_activity.tool_call_id),
     tool_name = COALESCE(NULLIF(EXCLUDED.tool_name, ''), session_history_tool_activity.tool_name),
     tool_kind = COALESCE(NULLIF(EXCLUDED.tool_kind, ''), session_history_tool_activity.tool_kind),
@@ -2184,6 +2200,8 @@ ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO UPDATE SET
     metadata = COALESCE(aawm_alias_routing_audit.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
+    "agent_id",
+    "agent_id_source",
     "tenant_id_source",
     "workload_type",
     "workload_subtype",
@@ -2568,6 +2586,19 @@ _AAWM_TENANT_ID_HEADER_NAMES = (
     "x-org-id",
     "x-litellm-team-id",
     "x-team-id",
+)
+_AAWM_AGENT_ID_METADATA_KEYS = (
+    "agent_id",
+    "aawm_agent_id",
+    "source_agent_id",
+    "subagent_id",
+    "task_id",
+)
+_AAWM_AGENT_ID_HEADER_NAMES = (
+    "x-aawm-agent-id",
+    "x-grok-agent-id",
+    "x-litellm-agent-id",
+    "x-agent-id",
 )
 _AAWM_REPOSITORY_METADATA_KEYS = (
     "repository",
@@ -3734,6 +3765,206 @@ def _extract_tenant_identity_from_langfuse_trace_observation(
     )
 
 
+def _is_agent_id_like(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return False
+    return bool(
+        _AAWM_AGENT_ID_UUID_RE.fullmatch(normalized)
+        or _AAWM_AGENT_ID_HEX_RE.fullmatch(normalized)
+        or _AAWM_AGENT_ID_PREFIXED_RE.fullmatch(normalized)
+    )
+
+
+def _normalize_agent_id_identity(
+    value: Any,
+    *,
+    disallowed_values: Optional[Set[str]] = None,
+) -> Optional[str]:
+    cleaned = _clean_non_empty_string(value)
+    if not cleaned:
+        return None
+    cleaned = cleaned.strip("`'\"")
+    normalized = cleaned.lower()
+    if normalized in {"none", "null", "unknown", "orchestrator"}:
+        return None
+    if disallowed_values and normalized in disallowed_values:
+        return None
+    if not _is_agent_id_like(cleaned):
+        return None
+    return cleaned
+
+
+def _agent_id_disallowed_values(
+    *values: Any,
+) -> Set[str]:
+    disallowed: Set[str] = set()
+    for value in values:
+        cleaned = _clean_non_empty_string(value)
+        if cleaned:
+            disallowed.add(cleaned.strip("`'\"").lower())
+    return disallowed
+
+
+def _agent_id_disallowed_values_from_kwargs(
+    kwargs: Dict[str, Any],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    standard_logging_object: Optional[Dict[str, Any]] = None,
+    agent_name: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    repository: Optional[str] = None,
+) -> Set[str]:
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata = metadata or litellm_params.get("metadata") or {}
+    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
+    standard_metadata = standard_logging_object.get("metadata") or {}
+    return _agent_id_disallowed_values(
+        agent_name,
+        tenant_id,
+        repository,
+        _extract_session_id(kwargs),
+        _extract_trace_id(kwargs),
+        kwargs.get("litellm_call_id"),
+        litellm_params.get("litellm_call_id"),
+        metadata.get("session_id") if isinstance(metadata, dict) else None,
+        metadata.get("trace_id") if isinstance(metadata, dict) else None,
+        metadata.get("trace_user_id") if isinstance(metadata, dict) else None,
+        metadata.get("repository") if isinstance(metadata, dict) else None,
+        metadata.get("tenant_id") if isinstance(metadata, dict) else None,
+        metadata.get("agent_name") if isinstance(metadata, dict) else None,
+        standard_logging_object.get("session_id"),
+        standard_logging_object.get("trace_id"),
+        standard_metadata.get("session_id") if isinstance(standard_metadata, dict) else None,
+        standard_metadata.get("trace_id") if isinstance(standard_metadata, dict) else None,
+        standard_metadata.get("trace_user_id") if isinstance(standard_metadata, dict) else None,
+        standard_metadata.get("repository") if isinstance(standard_metadata, dict) else None,
+        standard_metadata.get("tenant_id") if isinstance(standard_metadata, dict) else None,
+        standard_metadata.get("agent_name") if isinstance(standard_metadata, dict) else None,
+    )
+
+
+def _extract_agent_id_from_metadata_sources(
+    *sources: Tuple[str, Any],
+    disallowed_values: Optional[Set[str]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    for source_name, raw_source in sources:
+        source = _coerce_mapping(raw_source)
+        if not source:
+            continue
+        for key in _AAWM_AGENT_ID_METADATA_KEYS:
+            agent_id = _normalize_agent_id_identity(
+                source.get(key),
+                disallowed_values=disallowed_values,
+            )
+            if agent_id:
+                return agent_id, f"{source_name}.{key}"
+
+        for nested_key in (
+            "metadata",
+            "litellm_metadata",
+            "request_metadata",
+            "user_api_key_metadata",
+        ):
+            nested_source = _coerce_mapping(source.get(nested_key))
+            if not nested_source:
+                continue
+            for key in _AAWM_AGENT_ID_METADATA_KEYS:
+                agent_id = _normalize_agent_id_identity(
+                    nested_source.get(key),
+                    disallowed_values=disallowed_values,
+                )
+                if agent_id:
+                    return agent_id, f"{source_name}.{nested_key}.{key}"
+
+    return None, None
+
+
+def _extract_agent_id_from_kwargs(
+    kwargs: Dict[str, Any],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    standard_logging_object: Optional[Dict[str, Any]] = None,
+    agent_name: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    repository: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    litellm_params = kwargs.get("litellm_params") or {}
+    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
+    passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
+    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
+    proxy_body = _coerce_mapping(proxy_request.get("body"))
+    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
+    disallowed_values = _agent_id_disallowed_values_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=standard_logging_object,
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        repository=repository,
+    )
+
+    agent_id, source = _extract_agent_id_from_metadata_sources(
+        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
+        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
+        ("kwargs.metadata", kwargs.get("metadata")),
+        ("litellm_params.proxy_server_request.body", proxy_body),
+        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
+        ("litellm_params.proxy_server_request.body.litellm_metadata", proxy_body.get("litellm_metadata")),
+        ("passthrough_logging_payload", passthrough_payload),
+        ("passthrough_logging_payload.request_body", passthrough_body),
+        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
+        ("passthrough_logging_payload.request_body.litellm_metadata", passthrough_body.get("litellm_metadata")),
+        disallowed_values=disallowed_values,
+    )
+    if agent_id:
+        return agent_id, source
+
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    for header_name in _AAWM_AGENT_ID_HEADER_NAMES:
+        agent_id = _normalize_agent_id_identity(
+            _get_header_value(headers, header_name),
+            disallowed_values=disallowed_values,
+        )
+        if agent_id:
+            return agent_id, f"request_headers.{header_name}"
+
+    return None, None
+
+
+def _extract_agent_id_from_langfuse_trace_observation(
+    trace: Dict[str, Any],
+    observation: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    agent_name: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    repository: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
+    disallowed_values = _agent_id_disallowed_values(
+        agent_name,
+        tenant_id,
+        repository,
+        trace.get("sessionId") if isinstance(trace, dict) else None,
+        trace.get("session_id") if isinstance(trace, dict) else None,
+        trace.get("id") if isinstance(trace, dict) else None,
+        observation.get("traceId") if isinstance(observation, dict) else None,
+        observation.get("id") if isinstance(observation, dict) else None,
+        metadata.get("session_id") if isinstance(metadata, dict) else None,
+        metadata.get("trace_id") if isinstance(metadata, dict) else None,
+        metadata.get("trace_user_id") if isinstance(metadata, dict) else None,
+        metadata.get("repository") if isinstance(metadata, dict) else None,
+        metadata.get("tenant_id") if isinstance(metadata, dict) else None,
+        metadata.get("agent_name") if isinstance(metadata, dict) else None,
+    )
+    return _extract_agent_id_from_metadata_sources(
+        ("observation.metadata", metadata or observation.get("metadata")),
+        ("trace.metadata", trace_metadata),
+        disallowed_values=disallowed_values,
+    )
+
+
 def _is_valid_repository_identity(value: str) -> bool:
     if value.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
         value = value[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
@@ -4273,29 +4504,54 @@ def _extract_agent_context_from_text(text: str) -> Tuple[Optional[str], Optional
     return None, None
 
 
+def _extract_agent_context_from_mapping(
+    source: Any,
+    *,
+    explicit_tenant_id: Optional[str],
+    is_codex_client: bool,
+) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(source, dict):
+        return None, None
+    agent_name = _clean_non_empty_string(
+        source.get("agent_name") or source.get("aawm_claude_agent_name")
+    )
+    if agent_name is None and is_codex_client:
+        agent_name = _clean_non_empty_string(
+            source.get("agent_role") or source.get("agent_nickname")
+        )
+    tenant_id = _clean_non_empty_string(
+        source.get("tenant_id")
+        or source.get("aawm_tenant_id")
+        or source.get("aawm_claude_project")
+    )
+    if agent_name:
+        return agent_name, explicit_tenant_id or tenant_id
+    trace_agent_name = _extract_claude_trace_agent_name(source.get("trace_name"))
+    if trace_agent_name:
+        return trace_agent_name, explicit_tenant_id or tenant_id
+    return None, None
+
+
 def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """Extract agent/tenant from request content when present."""
     explicit_tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(kwargs)
     litellm_params = kwargs.get("litellm_params") or {}
     metadata = litellm_params.get("metadata") or {}
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    is_codex_client = _is_codex_client_identity(
+        metadata if isinstance(metadata, dict) else {},
+        headers,
+    )
     standard_logging_object = kwargs.get("standard_logging_object") or {}
     standard_metadata = standard_logging_object.get("metadata") or {}
     for source in (metadata, standard_metadata):
-        if not isinstance(source, dict):
-            continue
-        agent_name = _clean_non_empty_string(
-            source.get("agent_name") or source.get("aawm_claude_agent_name")
-        )
-        tenant_id = _clean_non_empty_string(
-            source.get("tenant_id")
-            or source.get("aawm_tenant_id")
-            or source.get("aawm_claude_project")
+        agent_name, tenant_id = _extract_agent_context_from_mapping(
+            source,
+            explicit_tenant_id=explicit_tenant_id,
+            is_codex_client=is_codex_client,
         )
         if agent_name:
-            return agent_name, explicit_tenant_id or tenant_id
-        trace_agent_name = _extract_claude_trace_agent_name(source.get("trace_name"))
-        if trace_agent_name:
-            return trace_agent_name, explicit_tenant_id or tenant_id
+            return agent_name, tenant_id
 
     messages = kwargs.get("messages")
     if messages and isinstance(messages, list):
@@ -4339,6 +4595,12 @@ def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optio
                     if agent_name:
                         return agent_name, explicit_tenant_id or tenant_id
                     break
+
+    if _is_codex_default_agent_context(
+        kwargs,
+        metadata,
+    ) and not _is_codex_subagent_context(kwargs, metadata):
+        return _DEFAULT_AGENT, explicit_tenant_id
 
     return None, explicit_tenant_id
 
@@ -4404,6 +4666,76 @@ def _is_native_codex_passthrough_context(
         and user_agent
         and "codex" in user_agent.lower()
     )
+
+
+def _is_codex_client_identity(metadata: Dict[str, Any], headers: Dict[str, Any]) -> bool:
+    user_agent = _first_non_empty_string(
+        metadata.get("client_user_agent"),
+        metadata.get("user_agent"),
+        metadata.get("http_user_agent"),
+        _get_header_value(headers, "user-agent", "User-Agent"),
+    )
+    parsed_client_name, _parsed_client_version = _parse_client_identity_from_user_agent(
+        user_agent
+    )
+    client_name = _first_non_empty_string(metadata.get("client_name"), parsed_client_name)
+    return bool(
+        (client_name and "codex" in client_name.lower())
+        or (user_agent and "codex" in user_agent.lower())
+    )
+
+
+def _is_codex_default_agent_context(
+    kwargs: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    metadata = metadata or _ensure_mutable_metadata(kwargs)
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    return bool(
+        _is_native_codex_passthrough_context(metadata, headers)
+        and _is_codex_client_identity(metadata, headers)
+        and not _is_codex_subagent_context(kwargs, metadata)
+    )
+
+
+def _is_codex_subagent_context(
+    kwargs: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata = metadata or litellm_params.get("metadata") or {}
+    standard_logging_object = kwargs.get("standard_logging_object") or {}
+    passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
+    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
+    proxy_body = _coerce_mapping(proxy_request.get("body"))
+    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
+    sources = (
+        metadata,
+        standard_logging_object.get("metadata"),
+        proxy_body,
+        proxy_body.get("metadata"),
+        proxy_body.get("litellm_metadata"),
+        passthrough_payload,
+        passthrough_body,
+        passthrough_body.get("metadata"),
+        passthrough_body.get("litellm_metadata"),
+    )
+    for raw_source in sources:
+        source = _coerce_mapping(raw_source)
+        if not source:
+            continue
+        thread_source = _clean_non_empty_string(source.get("thread_source"))
+        if thread_source and thread_source.lower() == "subagent":
+            return True
+        nested_source = _coerce_mapping(source.get("source"))
+        nested_thread_source = _clean_non_empty_string(
+            nested_source.get("thread_source")
+        )
+        if nested_thread_source and nested_thread_source.lower() == "subagent":
+            return True
+        if "subagent" in nested_source:
+            return True
+    return False
 
 
 def _is_generic_grok_trace_user_id(value: Any) -> bool:
@@ -12878,6 +13210,7 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
 
 
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    _normalize_agent_id_on_record(record)
     _normalize_inbound_model_alias_on_record(record)
     _normalize_reasoning_state(record)
     _normalize_provider_cache_state_on_record(record)
@@ -12897,6 +13230,37 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
     _classify_zero_token_session_history_record(record)
     _sync_session_history_record_metadata(record)
     return record
+
+
+def _normalize_agent_id_on_record(record: Dict[str, Any]) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        record["metadata"] = metadata
+    disallowed_values = _agent_id_disallowed_values(
+        record.get("session_id"),
+        record.get("trace_id"),
+        record.get("litellm_call_id"),
+        record.get("agent_name"),
+        record.get("tenant_id"),
+        record.get("repository"),
+        metadata.get("session_id"),
+        metadata.get("trace_id"),
+        metadata.get("trace_user_id"),
+        metadata.get("agent_name"),
+        metadata.get("tenant_id"),
+        metadata.get("repository"),
+    )
+    agent_id = _normalize_agent_id_identity(
+        _first_non_empty_string(record.get("agent_id"), metadata.get("agent_id")),
+        disallowed_values=disallowed_values,
+    )
+    record["agent_id"] = agent_id
+    if agent_id:
+        metadata["agent_id"] = agent_id
+    else:
+        metadata.pop("agent_id", None)
+        metadata.pop("agent_id_source", None)
 
 
 def _normalize_inbound_model_alias_on_record(record: Dict[str, Any]) -> None:
@@ -14256,10 +14620,33 @@ def _build_session_history_record_from_spend_log_row(
         }
     )
     if spend_log_row.get("agent_id") is not None:
-        metadata["source_agent_id"] = spend_log_row.get("agent_id")
+        source_agent_id = spend_log_row.get("agent_id")
+        metadata["source_agent_id"] = source_agent_id
+        if not record.get("agent_id"):
+            agent_id = _normalize_agent_id_identity(
+                source_agent_id,
+                disallowed_values=_agent_id_disallowed_values(
+                    record.get("session_id"),
+                    record.get("trace_id"),
+                    record.get("litellm_call_id"),
+                    record.get("agent_name"),
+                    record.get("tenant_id"),
+                    record.get("repository"),
+                    metadata.get("session_id"),
+                    metadata.get("trace_id"),
+                    metadata.get("trace_user_id"),
+                    metadata.get("agent_name"),
+                    metadata.get("tenant_id"),
+                    metadata.get("repository"),
+                ),
+            )
+            if agent_id:
+                record["agent_id"] = agent_id
+                metadata["agent_id"] = agent_id
+                metadata["agent_id_source"] = "spend_log.agent_id"
     record["metadata"] = metadata
     record["trace_id"] = kwargs.get("litellm_trace_id") or record.get("trace_id")
-    return record
+    return _normalize_session_history_record(record)
 
 
 def _derive_langfuse_trace_tags_from_spend_log_row(
@@ -14819,6 +15206,18 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
     )
     if repository:
         metadata["repository"] = repository
+    agent_id, agent_id_source = _extract_agent_id_from_langfuse_trace_observation(
+        trace,
+        observation,
+        metadata,
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        repository=repository,
+    )
+    if agent_id:
+        metadata["agent_id"] = agent_id
+        if agent_id_source:
+            metadata["agent_id_source"] = agent_id_source
     request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
     response_cost_usd = _safe_float(
         _first_non_none(
@@ -14905,6 +15304,7 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         "inbound_model_alias": inbound_model_alias,
         "model_group": model_group,
         "agent_name": agent_name,
+        "agent_id": agent_id,
         "tenant_id": tenant_id,
         "repository": repository,
         "call_type": call_type,
@@ -15742,6 +16142,18 @@ def _build_session_history_record(  # noqa: PLR0915
     )
     if repository:
         metadata["repository"] = repository
+    agent_id, agent_id_source = _extract_agent_id_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=standard_logging_object,
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        repository=repository,
+    )
+    if agent_id:
+        metadata["agent_id"] = agent_id
+        if agent_id_source:
+            metadata["agent_id_source"] = agent_id_source
     if metadata.get("workload_type") == "agent_memory":
         request_tags = list(request_tags)
         for tag in metadata.get("tags") or []:
@@ -15889,6 +16301,7 @@ def _build_session_history_record(  # noqa: PLR0915
         "inbound_model_alias": inbound_model_alias,
         "model_group": model_group,
         "agent_name": agent_name,
+        "agent_id": agent_id,
         "tenant_id": tenant_id,
         "repository": repository,
         "call_type": kwargs.get("call_type") or standard_logging_object.get("call_type"),
@@ -16175,6 +16588,7 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("compact_summary_id"),
         record.get("compact_summary_role"),
         record.get("inbound_model_alias"),
+        record.get("agent_id"),
     )
 
 
@@ -16198,6 +16612,7 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
     tool_activity = record.get("tool_activity") or []
     if not isinstance(tool_activity, list):
         return []
+    agent_id = _clean_non_empty_string(record.get("agent_id"))
 
     payloads: List[Tuple[Any, ...]] = []
     for index, item in enumerate(tool_activity):
@@ -16211,7 +16626,9 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
                 record.get("provider"),
                 record["model"],
                 record.get("agent_name"),
-                _safe_int(item.get("tool_index")) if _safe_int(item.get("tool_index")) is not None else index,
+                _safe_int(item.get("tool_index"))
+                if _safe_int(item.get("tool_index")) is not None
+                else index,
                 item.get("tool_call_id"),
                 item.get("tool_name"),
                 item.get("tool_kind"),
@@ -16222,6 +16639,7 @@ def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, 
                 item.get("command_text"),
                 json.dumps(item.get("arguments") or {}),
                 json.dumps(item.get("metadata") or {}),
+                agent_id,
             )
         )
     return payloads
@@ -17555,6 +17973,40 @@ def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
     )
 
 
+def _enrich_agent_identity_metadata(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> None:
+    if (
+        _is_codex_default_agent_context(kwargs, metadata)
+        and not _clean_non_empty_string(metadata.get("agent_name"))
+        and not _clean_non_empty_string(metadata.get("aawm_claude_agent_name"))
+    ):
+        metadata["agent_name"] = _DEFAULT_AGENT
+
+    agent_context_name, agent_context_tenant_id = _extract_agent_context(kwargs)
+    agent_id_repository = _extract_repository_identity_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=kwargs.get("standard_logging_object") or {},
+    )
+    agent_id, agent_id_source = _extract_agent_id_from_kwargs(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=kwargs.get("standard_logging_object") or {},
+        agent_name=agent_context_name,
+        tenant_id=agent_context_tenant_id,
+        repository=agent_id_repository,
+    )
+    if agent_id:
+        metadata["agent_id"] = agent_id
+        if agent_id_source:
+            metadata["agent_id_source"] = agent_id_source
+    else:
+        metadata.pop("agent_id", None)
+        metadata.pop("agent_id_source", None)
+
+
 def _enrich_trace_name_and_provider_metadata(
     kwargs: Dict[str, Any], result: Any
 ) -> Tuple[dict, Any]:
@@ -17645,6 +18097,7 @@ def _enrich_trace_name_and_provider_metadata(
 
     _promote_codex_repository_trace_user_id(kwargs, metadata, headers)
     _promote_grok_repository_trace_identity(kwargs, metadata, headers)
+    _enrich_agent_identity_metadata(kwargs, metadata)
     _enrich_session_runtime_identity_metadata(kwargs)
 
     message = _extract_first_response_message(result)

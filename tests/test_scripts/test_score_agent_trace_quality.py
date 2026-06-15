@@ -20,6 +20,7 @@ def _candidate(**overrides: object) -> scorer.SessionCandidate:
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "agent_name": "principal",
+        "agent_id": None,
         "repository": "dashboard-shell",
         "tenant_id": "dashboard-shell",
         "input_tokens": 53874,
@@ -1773,6 +1774,7 @@ def test_should_upsert_codex_transcript_session_history_for_missing_native_row(
         provider="litellm",
         model="aawm-codex-agent-auto",
         agent_name="Planck",
+        agent_id="019e66f6-0ba8-7491-9e6a-d446cc1cab59",
         repository="aawm-tap",
         tenant_id="aawm-tap",
         output_tokens=12,
@@ -1861,6 +1863,7 @@ def test_should_upsert_codex_transcript_session_history_for_missing_native_row(
     assert params["litellm_call_id"] == "codex-transcript:child-session"
     assert params["session_id"] == "child-session"
     assert params["repository"] == "aawm-tap"
+    assert params["agent_id"] == "019e66f6-0ba8-7491-9e6a-d446cc1cab59"
     assert params["provider"] is None
     assert params["model"] == "codex-transcript"
     assert params["model_group"] is None
@@ -1878,6 +1881,8 @@ def test_should_upsert_codex_transcript_session_history_for_missing_native_row(
         == "d1_159_codex_transcript_policy_scoring"
     )
     assert metadata["source"] == "codex_transcript"
+    assert metadata["agent_id"] == "019e66f6-0ba8-7491-9e6a-d446cc1cab59"
+    assert metadata["agent_id_source"] == "codex_transcript.session_meta.id"
     assert metadata["usage_read_only_policy_compliance_score"] == 0.0
 
 

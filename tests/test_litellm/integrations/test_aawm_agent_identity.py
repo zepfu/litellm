@@ -454,6 +454,314 @@ def test_aawm_agent_identity_preserves_explicit_codex_user_header() -> None:
     assert langfuse_metadata["trace_user_id"] == "pytest-classifier"
 
 
+def test_aawm_agent_identity_extracts_safe_agent_id_from_metadata() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "codex-session-123",
+            "agent_id": "a2455b9a6286a4962",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"role": "user", "content": "Summarize the current task."}],
+    }
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "user-agent": "codex-tui/0.134.0",
+            "x-aawm-agent-id": "019ecbe0-4bb0-7f21-8239-a447b869d442",
+        }
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    assert metadata["agent_id"] == "a2455b9a6286a4962"
+    assert metadata["agent_id_source"] == "litellm_params.metadata.agent_id"
+    assert updated_kwargs["standard_logging_object"]["metadata"]["agent_id"] == (
+        "a2455b9a6286a4962"
+    )
+
+
+def test_aawm_agent_identity_rejects_agent_id_lookalikes() -> None:
+    logger = AawmAgentIdentity()
+    trace_id = "019ecbe0-4bb0-7f21-8239-a447b869d442"
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_trace_id"] = trace_id
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "codex-session-123",
+            "agent_id": "orchestrator",
+            "source_agent_id": "litellm",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"role": "user", "content": "Summarize the current task."}],
+        "metadata": {
+            "task_id": "codex-session-123",
+            "subagent_id": "reviewer",
+        },
+    }
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "user-agent": "codex-tui/0.134.0",
+            "x-aawm-agent-id": trace_id,
+        }
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    assert "agent_id" not in metadata
+    assert "agent_id_source" not in metadata
+    assert "agent_id" not in updated_kwargs["standard_logging_object"]["metadata"]
+
+
+def test_aawm_agent_identity_populates_codex_default_agent_name() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "codex-session-123",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"role": "user", "content": "Summarize the current task."}],
+    }
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "user-agent": "codex-tui/0.134.0",
+        }
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    assert metadata["agent_name"] == "orchestrator"
+    assert updated_kwargs["standard_logging_object"]["metadata"]["agent_name"] == (
+        "orchestrator"
+    )
+
+
+def test_build_session_history_record_persists_agent_id_and_codex_default_name() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-agent-id"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "codex-session-agent-id",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "user-agent": "codex-tui/0.134.0",
+            "x-aawm-agent-id": "019ecbe0-4bb0-7f21-8239-a447b869d442",
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"role": "user", "content": "Summarize the current task."}],
+    }
+    result = {
+        "id": "resp-codex-agent-id",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-15T21:00:00Z",
+        end_time="2026-06-15T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["agent_name"] == "orchestrator"
+    assert record["agent_id"] == "019ecbe0-4bb0-7f21-8239-a447b869d442"
+    assert record["metadata"]["agent_id"] == "019ecbe0-4bb0-7f21-8239-a447b869d442"
+    assert record["metadata"]["agent_id_source"] == (
+        "request_headers.x-aawm-agent-id"
+    )
+
+
+def test_build_session_history_record_preserves_claude_agent_id_from_metadata() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.researcher")
+    kwargs["model"] = "claude-opus-4-8"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-agent-id"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "claude-session-agent-id",
+            "repository": "litellm",
+            "aawm_agent_id": "a2455b9a6286a4962",
+        }
+    )
+    result = {
+        "id": "resp-claude-agent-id",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-15T21:00:00Z",
+        end_time="2026-06-15T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["agent_name"] == "researcher"
+    assert record["agent_id"] == "a2455b9a6286a4962"
+    assert record["metadata"]["agent_id_source"] == (
+        "litellm_params.metadata.aawm_agent_id"
+    )
+
+
+def test_build_session_history_record_preserves_grok_agent_id_from_header() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-composer-2.5-fast"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-agent-id"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "session_id": "grok-session-agent-id",
+            "repository": "litellm",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "user-agent": "grok-build/0.1",
+            "x-grok-agent-id": "agent_harness",
+        }
+    }
+    result = {
+        "id": "resp-grok-agent-id",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-15T21:00:00Z",
+        end_time="2026-06-15T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["agent_id"] == "agent_harness"
+    assert record["metadata"]["agent_id_source"] == "request_headers.x-grok-agent-id"
+
+
+def test_build_session_history_record_does_not_default_codex_subagent_to_orchestrator() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-subagent-no-name"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "codex-subagent-session",
+            "thread_source": "subagent",
+            "agent_id": "019ecbe0-4bb0-7f21-8239-a447b869d442",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "user-agent": "codex-tui/0.134.0",
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"role": "user", "content": "Summarize the current task."}],
+        "metadata": {"thread_source": "subagent"},
+    }
+    result = {
+        "id": "resp-codex-subagent-no-name",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-15T21:00:00Z",
+        end_time="2026-06-15T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["agent_name"] is None
+    assert record["agent_id"] == "019ecbe0-4bb0-7f21-8239-a447b869d442"
+
+
+def test_aawm_agent_identity_preserves_explicit_codex_agent_name() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "agent_name": "researcher",
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "codex-session-123",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"role": "user", "content": "Summarize the current task."}],
+    }
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "user-agent": "codex-tui/0.134.0",
+        }
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert updated_kwargs["litellm_params"]["metadata"]["agent_name"] == "researcher"
+
+
 def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
@@ -2654,7 +2962,7 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
     assert record["metadata"]["usage_structured_output_mode"] == "json_schema"
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == 127
     assert payload[71] is True
     assert payload[72] is False
     assert payload[73] == "json_schema"
@@ -2759,7 +3067,7 @@ def test_build_session_history_record_persists_agent_score_metadata() -> None:  
     assert record["destructive_action_policy_score"] == pytest.approx(1.0)
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == 127
     assert payload[76] == pytest.approx(0.0)
     assert payload[77] is True
     assert payload[80] is False
@@ -3371,7 +3679,7 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == 127
     assert payload[61] == pytest.approx(25.0)
     assert payload[62] == pytest.approx(100.0)
     assert payload[63] == pytest.approx(130.0)
@@ -5524,7 +5832,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 126
+    assert len(payload) == 127
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -5946,7 +6254,7 @@ def test_d1_169_build_session_history_db_payload_appends_compact_summary_fields(
 
     assert record is not None
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == 127
     assert payload[121] == record["is_compact_summary"]
     assert payload[122] == record["compact_summary_source"]
     assert payload[123] == record["compact_summary_id"]
@@ -9941,11 +10249,12 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert app_name_args[2]
     executed_args = mock_conn.execute.await_args_list[1].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 126
+    assert len(executed_args[1:]) == 127
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
     assert executed_args[126] == "anthropic/claude-sonnet-4-6"
+    assert executed_args[127] is None
     gap_args = mock_conn.execute.await_args_list[2].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-123"]
@@ -12644,8 +12953,9 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert "INSERT INTO public.session_history" in history_args[0]
     assert "    start_time,\n    created_at,\n    end_time," in history_args[0]
     assert "$11, COALESCE($11, $12, NOW()), $12" in history_args[0]
-    assert len(history_args[1][0]) == 126
+    assert len(history_args[1][0]) == 127
     assert history_args[1][0][125] == "anthropic/claude-sonnet-4-6"
+    assert history_args[1][0][126] is None
     assert history_args[1][0][0] == "call-1"
     assert history_args[1][0][10] == start_time
     assert history_args[1][0][11] == end_time
@@ -13073,6 +13383,35 @@ def test_session_history_insert_sql_includes_inbound_model_alias() -> None:
     assert "NULLIF(EXCLUDED.inbound_model_alias, '')" in sql
 
 
+def test_session_history_insert_sql_includes_nullable_agent_id() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
+
+    assert "agent_id" in aawm_agent_identity._AAWM_SESSION_HISTORY_TABLE_SQL
+    assert (
+        "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_id TEXT"
+        in aawm_agent_identity._AAWM_SESSION_HISTORY_ALTER_STATEMENTS
+    )
+    assert "agent_id" in sql
+    assert "$127" in sql
+    assert (
+        "agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), session_history.agent_id)"
+        in sql
+    )
+
+
+def test_tool_activity_insert_sql_includes_nullable_agent_id() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL
+
+    assert "agent_id TEXT" in aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL
+    assert "agent_id" in sql
+    assert "$18" in sql
+    assert (
+        "agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), "
+        "session_history_tool_activity.agent_id)"
+        in sql
+    )
+
+
 def test_session_history_insert_sql_uses_start_time_as_created_at() -> None:
     sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
 
@@ -13122,6 +13461,94 @@ def test_session_history_payload_preserves_unknown_sensitive_config_flags() -> N
     )
 
     assert payload[33:37] == (None, None, None, None)
+
+
+def test_session_history_db_payload_includes_nullable_agent_id() -> None:
+    payload = _build_session_history_db_payload(
+        {
+            "litellm_call_id": "call-agent-id",
+            "session_id": "session-not-agent-id",
+            "trace_id": "trace-not-agent-id",
+            "provider_response_id": None,
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "model_group": "claude-opus-4-8",
+            "agent_name": "reviewer",
+            "agent_id": "agent-opaque-123",
+            "tenant_id": "tenant-not-agent-id",
+            "repository": "repo-not-agent-id",
+            "call_type": "messages",
+            "start_time": None,
+            "end_time": None,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens_reported": None,
+            "reasoning_tokens_estimated": None,
+            "reasoning_tokens_source": "not_applicable",
+            "reasoning_present": False,
+            "thinking_signature_present": False,
+            "tool_call_count": 0,
+            "invalid_tool_call_count": 0,
+            "tool_names": [],
+            "file_read_count": 0,
+            "file_modified_count": 0,
+            "git_commit_count": 0,
+            "git_push_count": 0,
+            "response_cost_usd": None,
+            "metadata": {},
+        }
+    )
+
+    assert len(payload) == 127
+    assert payload[1] == "session-not-agent-id"
+    assert payload[2] == "trace-not-agent-id"
+    assert payload[7] == "reviewer"
+    assert payload[51] == "repo-not-agent-id"
+    assert payload[126] == "agent-opaque-123"
+
+
+def test_session_history_db_payload_keeps_agent_id_nullable_when_absent() -> None:
+    payload = _build_session_history_db_payload(
+        {
+            "litellm_call_id": "call-agent-id-absent",
+            "session_id": "session-agent-id-absent",
+            "trace_id": None,
+            "provider_response_id": None,
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "model_group": "gpt-5.4-mini",
+            "agent_name": None,
+            "tenant_id": None,
+            "call_type": "responses",
+            "start_time": None,
+            "end_time": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens_reported": None,
+            "reasoning_tokens_estimated": None,
+            "reasoning_tokens_source": "not_applicable",
+            "reasoning_present": False,
+            "thinking_signature_present": False,
+            "tool_call_count": 0,
+            "invalid_tool_call_count": 0,
+            "tool_names": [],
+            "file_read_count": 0,
+            "file_modified_count": 0,
+            "git_commit_count": 0,
+            "git_push_count": 0,
+            "response_cost_usd": None,
+            "metadata": {},
+        }
+    )
+
+    assert len(payload) == 127
+    assert payload[126] is None
 
 
 def test_session_history_db_payload_strips_postgres_nul_bytes() -> None:
@@ -13221,6 +13648,67 @@ def test_tool_activity_db_payload_strips_postgres_nul_bytes() -> None:
     assert "\\u0000" not in payload[11]
     assert "\\u0000" not in payload[15]
     assert "\\u0000" not in payload[16]
+
+
+def test_tool_activity_db_payload_includes_nullable_agent_id() -> None:
+    payloads = aawm_agent_identity._build_tool_activity_db_payloads(
+        {
+            "litellm_call_id": "call-tool-agent-id",
+            "session_id": "session-not-agent-id",
+            "trace_id": "trace-not-agent-id",
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "agent_name": "engineer",
+            "agent_id": "agent-opaque-tool-123",
+            "tool_activity": [
+                {
+                    "tool_index": 0,
+                    "tool_call_id": "tool-call-1",
+                    "tool_name": "Read",
+                    "tool_kind": "read",
+                    "file_paths_read": ["src/file.py"],
+                    "file_paths_modified": [],
+                    "git_commit_count": 0,
+                    "git_push_count": 0,
+                    "command_text": None,
+                    "arguments": {"path": "src/file.py"},
+                    "metadata": {"source": "message.tool_calls"},
+                }
+            ],
+        }
+    )
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert len(payload) == 18
+    assert payload[1] == "session-not-agent-id"
+    assert payload[2] == "trace-not-agent-id"
+    assert payload[5] == "engineer"
+    assert payload[17] == "agent-opaque-tool-123"
+
+
+def test_tool_activity_db_payload_keeps_agent_id_nullable_when_absent() -> None:
+    payloads = aawm_agent_identity._build_tool_activity_db_payloads(
+        {
+            "litellm_call_id": "call-tool-agent-id-absent",
+            "session_id": "session-tool-agent-id-absent",
+            "trace_id": None,
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "agent_name": None,
+            "tool_activity": [
+                {
+                    "tool_index": 0,
+                    "tool_call_id": "tool-call-absent",
+                    "tool_name": "Shell",
+                    "tool_kind": "command",
+                }
+            ],
+        }
+    )
+
+    assert len(payloads) == 1
+    assert payloads[0][17] is None
 
 
 def test_tool_activity_upsert_sql_guards_scalar_file_paths() -> None:

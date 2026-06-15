@@ -26,6 +26,30 @@ for reporting and grouping by requested alias.
 Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
+## Agent Identity Capture
+
+`public.session_history` and `public.session_history_tool_activity` include a
+nullable `agent_id` text column. This is an opaque client-provided dispatch,
+task, or subagent identifier. It is separate from `agent_name`, which remains the
+stable human-readable role or display name such as `orchestrator`, `researcher`,
+or `Planck`.
+
+The callback accepts explicit ID fields from bounded metadata/body/header sources
+such as `agent_id`, `aawm_agent_id`, `subagent_id`, `task_id`,
+`x-aawm-agent-id`, `x-grok-agent-id`, `x-litellm-agent-id`, and `x-agent-id`.
+Values that match the session id, trace id, repository, tenant, or human
+`agent_name` are rejected rather than copied into `agent_id`.
+
+Codex main-session rows default `agent_name` to `orchestrator` when the request
+is a native Codex passthrough and no explicit role/name is available. Child or
+subagent rows should only use a child display name when the request or transcript
+provides one. Rows without a reliable opaque id keep `agent_id = NULL`.
+
+Historical rows written before this field existed may be `NULL` unless they are
+backfilled from a trustworthy source. Synthetic Codex transcript rows use the
+transcript session metadata id as `agent_id` when available and mark
+`metadata.agent_id_source = codex_transcript.session_meta.id`.
+
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing

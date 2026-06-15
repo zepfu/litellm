@@ -179,6 +179,7 @@ class SessionCandidate:
     provider: Optional[str]
     model: Optional[str]
     agent_name: Optional[str]
+    agent_id: Optional[str]
     repository: Optional[str]
     tenant_id: Optional[str]
     input_tokens: int
@@ -324,6 +325,7 @@ class TraceScoreEvidence:
             "source": self.source,
             "source_locator": self.source_locator,
             "agent_name": self.agent_name,
+            "agent_id": self.agent_id,
             "repository": self.repository,
             "model": self.model,
             "provider_error_present": self.provider_error_present,
@@ -701,6 +703,7 @@ SELECT
   provider,
   model,
   agent_name,
+  agent_id,
   repository,
   tenant_id,
   coalesce(input_tokens, 0) AS input_tokens,
@@ -736,6 +739,7 @@ LIMIT %(limit)s
                 provider=_clean(row.get("provider")),
                 model=_clean(row.get("model")),
                 agent_name=_clean(row.get("agent_name")),
+                agent_id=_clean(row.get("agent_id")),
                 repository=_clean(row.get("repository")),
                 tenant_id=_clean(row.get("tenant_id")),
                 input_tokens=_coerce_int(row.get("input_tokens")),
@@ -1366,6 +1370,10 @@ def _build_codex_transcript_bundle(  # noqa: PLR0915
         "cli_version": _clean(session_meta.get("cli_version")),
         "agent_role": _clean(session_meta.get("agent_role")),
         "agent_nickname": _clean(session_meta.get("agent_nickname")),
+        "agent_id": _clean(session_meta.get("id")),
+        "agent_id_source": "codex_transcript.session_meta.id"
+        if _clean(session_meta.get("id"))
+        else None,
         "codex_transcript_model_provider_alias": transcript_provider_alias,
         "codex_transcript_model_alias": transcript_model_alias,
         "codex_transcript_terminal_state": terminal_state,
@@ -1390,6 +1398,7 @@ def _build_codex_transcript_bundle(  # noqa: PLR0915
         provider=session_history_provider,
         model=session_history_model,
         agent_name=_clean(session_meta.get("agent_nickname")),
+        agent_id=_clean(session_meta.get("id")),
         repository=repository,
         tenant_id=repository,
         input_tokens=input_tokens,
@@ -3403,6 +3412,7 @@ class LangfuseScoreClient:
 
 
 _SESSION_HISTORY_SCORE_ALTER_STATEMENTS = (
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_id TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS trace_quality_score DOUBLE PRECISION",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS empty_completion_failure BOOLEAN",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS large_tool_result_payload_risk BOOLEAN",
@@ -3777,6 +3787,7 @@ INSERT INTO public.session_history (
   model,
   model_group,
   agent_name,
+  agent_id,
   tenant_id,
   call_type,
   start_time,
@@ -3847,6 +3858,7 @@ INSERT INTO public.session_history (
   %(model)s,
   %(model_group)s,
   %(agent_name)s,
+  %(agent_id)s,
   %(tenant_id)s,
   %(call_type)s,
   %(start_time)s,
@@ -3935,6 +3947,7 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
     ELSE COALESCE(EXCLUDED.model_group, session_history.model_group)
   END,
   agent_name = COALESCE(EXCLUDED.agent_name, session_history.agent_name),
+  agent_id = COALESCE(EXCLUDED.agent_id, session_history.agent_id),
   tenant_id = COALESCE(EXCLUDED.tenant_id, session_history.tenant_id),
   call_type = COALESCE(EXCLUDED.call_type, session_history.call_type),
   start_time = COALESCE(session_history.start_time, EXCLUDED.start_time),
@@ -4156,6 +4169,9 @@ RETURNING id
             for candidate, evidence in pairs:
                 score_params, score_metadata = _session_history_score_values(evidence)
                 metadata = dict(candidate.metadata)
+                if candidate.agent_id:
+                    metadata.setdefault("agent_id", candidate.agent_id)
+                    metadata.setdefault("agent_id_source", "codex_transcript.session_meta.id")
                 metadata.update(score_metadata)
                 metadata.update(
                     {
@@ -4190,6 +4206,7 @@ RETURNING id
                         candidate.model
                     ),
                     "agent_name": candidate.agent_name,
+                    "agent_id": candidate.agent_id,
                     "tenant_id": candidate.tenant_id,
                     "call_type": "codex_transcript",
                     "start_time": candidate.created_at,
