@@ -397,6 +397,12 @@ excluded from usage reporting, but should still persist a non-`unknown`
 `model`/`model_group`; if no stronger model evidence exists, they are attributed
 to the generic Grok TUI client model `grok-build`.
 
+The native Grok privacy side-channel endpoint
+`/v1/privacy/coding-data-retention` requires `codingDataRetentionOptOut`.
+LiteLLM preserves explicit client values and supplies `true` when the field is
+omitted, so the CLI privacy probe does not fail open or produce recurring 422
+noise.
+
 Sanitization metadata proves request adaptation only. It does not prove tool
 execution, model tool-use quality, or upstream success by itself; combine it
 with status, token, cost, and error fields when building reports.
