@@ -2729,6 +2729,37 @@ nor direct native Anthropic passthrough is called.
 
 ---
 
+### aawm.74 — AAWM alias routing, logging, and billing-detail promotion set
+
+**What changed:** This release promotes the current AAWM LiteLLM work on
+`develop` after the `v1.82.3-aawm.73` image. The promoted set includes
+executable multi-provider failover behavior for AAWM aliases, route/access-log
+identity enrichment, native access-log suppression for enriched route lines,
+Grok/OIDC request-shape hardening, encrypted Grok compaction-state
+preservation, local session-history outage spooling, managed error-log intake,
+Langfuse event fitting, inbound model-alias persistence, and durable
+rate-limit/billing detail storage.
+
+**Why:** The prior prod line did not contain the completed follow-up work for
+AAWM alias failover, Grok/native passthrough robustness, route observability,
+session-history durability, and provider billing visibility. Promoting these
+changes gives prod the same behavior already validated on the development
+runtime and records a distinct fork image tag for the new core/runtime code.
+
+**Why not upstream:** These changes are AAWM-specific operational behavior for
+local alias routing, Claude/Codex/Grok/Antigravity provider adaptation,
+session-history observability, and production diagnostics.
+
+**Validation status:** Focused local tests cover the modified callback,
+passthrough, backfill, harness, and quality-rule paths. Dev runtime validation
+for the latest work verified `litellm-dev` readiness, in-container callback SQL
+markers, and sanitized `rate_limit_observations` billing-detail persistence in
+`aawm_tristore`. Production promotion must build and publish
+`v1.82.3-aawm.74`, rebuild the infrastructure image from that pinned base, then
+run the documented prod readiness, log, and harness gates.
+
+---
+
 
 ## Dropped Patches
 
