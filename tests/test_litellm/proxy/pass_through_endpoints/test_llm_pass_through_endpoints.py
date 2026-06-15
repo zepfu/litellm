@@ -14479,6 +14479,61 @@ def test_codex_spawn_agent_tool_patch_adds_function_payload_schema_fields():
     }
 
 
+def test_codex_multi_agent_tool_search_description_gets_fanout_policy():
+    request_body = {
+        "model": "gpt-5.4-mini",
+        "tools": [
+            {
+                "type": "tool_search",
+                "description": (
+                    "# Tool discovery\n\n"
+                    "You have access to tools from the following sources:\n"
+                    "- Multi-agent tools: Spawn and manage sub-agents."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query.",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            }
+        ],
+    }
+
+    updated_body, patch_events = _apply_codex_tool_description_patches_to_request_body(
+        request_body
+    )
+
+    assert patch_events == [
+        {
+            "id": "spawn-agent-fanout-policy",
+            "status": "applied",
+            "tool_name": "tool_search",
+            "path": "tools.0.description",
+            "occurrences": 0,
+            "guidance_chars": patch_events[0]["guidance_chars"],
+        }
+    ]
+    patched_tool = updated_body["tools"][0]
+    assert "Use subagents to parallelize independent work" in patched_tool[
+        "description"
+    ]
+    assert "latest Codex model" in patched_tool["description"]
+    assert patched_tool["parameters"] == request_body["tools"][0]["parameters"]
+
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert "codex-tool-description-patch" in litellm_metadata["tags"]
+    assert (
+        "codex-tool-description-patch:spawn-agent-fanout-policy"
+        in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["codex_tool_description_patch_count"] == 1
+
+
 def test_codex_spawn_agent_tool_description_patch_ignores_other_tools():
     request_body = {
         "tools": [

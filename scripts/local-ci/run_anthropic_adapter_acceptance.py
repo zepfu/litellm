@@ -320,8 +320,15 @@ def _apply_target_profile_to_config(
         updated_case['target_profile'] = target
         updated_case['case_name'] = case_name
         tenant_id = _resolve_harness_tenant_id(updated_config, updated_case)
+        cli_kind = str(updated_case.get('cli_passthrough') or '').strip().lower()
+        repository_tenant_id = (
+            _resolve_harness_repository() if cli_kind == 'codex' else None
+        )
         expected_session_history_tenant_id = (
-            _resolve_expected_session_history_tenant_id(tenant_id)
+            _resolve_expected_session_history_tenant_id(
+                tenant_id,
+                repository=repository_tenant_id,
+            )
         )
         updated_case['tenant_id'] = tenant_id
         harness_run_id = str(
@@ -446,7 +453,19 @@ def _is_harness_tenant_alias(value: str) -> bool:
     )
 
 
-def _resolve_expected_session_history_tenant_id(tenant_id: str) -> str:
+def _resolve_expected_session_history_tenant_id(
+    tenant_id: str,
+    *,
+    repository: str | None = None,
+) -> str:
+    if _is_harness_tenant_alias(tenant_id):
+        if isinstance(repository, str) and repository.strip():
+            return repository.strip()
+        return 'litellm'
+    return tenant_id
+
+
+def _resolve_expected_codex_trace_user_id(tenant_id: str) -> str:
     if _is_harness_tenant_alias(tenant_id):
         return 'litellm'
     return tenant_id
@@ -641,7 +660,7 @@ def _ensure_cli_harness_context(
         updated['expected_user_ids'] = []
         updated['require_trace_user_id'] = False
     else:
-        updated['expected_user_ids'] = [harness_user_id]
+        updated['expected_user_ids'] = [_resolve_expected_codex_trace_user_id(tenant_id)]
     if cli_kind == 'codex':
         updated['expected_trace_session_id'] = session_id
     else:

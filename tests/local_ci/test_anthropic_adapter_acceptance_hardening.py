@@ -1179,7 +1179,7 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
         if item == "-c"
     ]
 
-    assert case_config["expected_user_ids"] == ["pytest-classifier"]
+    assert case_config["expected_user_ids"] == ["litellm"]
     assert case_config["expected_trace_session_id"] == "pytest-classifier.session"
     assert (
         'model_providers.litellm-dev.http_headers.x-litellm-end-user-id="pytest-classifier"'
@@ -1205,6 +1205,20 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
     assert (
         'model_providers.litellm-dev.http_headers.x-aawm-repository="zepfu/litellm"'
         in config_values
+    )
+    session_history_validation = case_config["session_history_validation"]
+    assert session_history_validation["expected_tenant_id"] == "zepfu/litellm"
+    assert session_history_validation["metadata_required_equals"][
+        "tenant_id"
+    ] == "zepfu/litellm"
+    assert session_history_validation["metadata_required_equals"][
+        "aawm_original_tenant_id"
+    ] == "adapter-harness-tenant"
+    assert (
+        session_history_validation["metadata_required_equals"][
+            "aawm_harness_tenant_alias"
+        ]
+        is True
     )
 
 
