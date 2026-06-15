@@ -2738,7 +2738,10 @@ identity enrichment, native access-log suppression for enriched route lines,
 Grok/OIDC request-shape hardening, encrypted Grok compaction-state
 preservation, local session-history outage spooling, managed error-log intake,
 Langfuse event fitting, inbound model-alias persistence, and durable
-rate-limit/billing detail storage.
+rate-limit/billing detail storage. It also updates Codex native passthrough
+tool-description patching for the current deferred multi-agent `tool_search`
+surface, so the fanout guidance and patch metadata still apply when Codex no
+longer exposes a direct `spawn_agent` tool definition.
 
 **Why:** The prior prod line did not contain the completed follow-up work for
 AAWM alias failover, Grok/native passthrough robustness, route observability,
@@ -2754,7 +2757,9 @@ session-history observability, and production diagnostics.
 passthrough, backfill, harness, and quality-rule paths. Dev runtime validation
 for the latest work verified `litellm-dev` readiness, in-container callback SQL
 markers, and sanitized `rate_limit_observations` billing-detail persistence in
-`aawm_tristore`. Production promotion must build and publish
+`aawm_tristore`. A focused live Codex passthrough harness on `litellm-dev`
+verified the deferred-tool fanout guidance metadata after the dev container
+restart. Production promotion must build and publish
 `v1.82.3-aawm.74`, rebuild the infrastructure image from that pinned base, then
 run the documented prod readiness, log, and harness gates.
 
