@@ -1,6 +1,9 @@
+import asyncio
 import copy
 import datetime
-from typing import AsyncGenerator
+import logging
+import re
+from typing import AsyncGenerator, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,6 +11,10 @@ from fastapi import Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import litellm
+from litellm._logging import (
+    AawmRouteAccessLogReplacementFilter,
+    clear_aawm_route_access_log_replacements,
+)
 from litellm._uuid import uuid
 from litellm.integrations.opentelemetry import UserAPIKeyAuth
 from litellm.proxy.common_request_processing import (
@@ -23,6 +30,51 @@ from litellm.proxy.common_request_processing import (
 )
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.utils import ProxyLogging
+
+
+def _build_aawm_route_log_request(
+    *,
+    method: str = "POST",
+    url: str = "http://127.0.0.1:4001/v1/embeddings",
+    client: tuple[str, int] = ("172.19.0.1", 52834),
+    http_version: str = "1.1",
+    headers: Optional[dict[str, str]] = None,
+) -> MagicMock:
+    request = MagicMock(spec=Request)
+    request.method = method
+    request.url = url
+    request.headers = headers or {}
+    query = ""
+    if "?" in url:
+        query = url.split("?", 1)[1]
+    request.scope = {
+        "type": "http",
+        "method": method,
+        "path": "/" + url.split("://", 1)[-1].split("/", 1)[1].split("?", 1)[0],
+        "query_string": query.encode("utf-8"),
+        "client": client,
+        "http_version": http_version,
+    }
+    return request
+
+
+def _build_uvicorn_access_record(
+    *,
+    client_addr: str = "172.19.0.1:52834",
+    method: str = "POST",
+    full_path: str = "/v1/embeddings",
+    http_version: str = "1.1",
+    status_code: int = 200,
+) -> logging.LogRecord:
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(client_addr, method, full_path, http_version, status_code),
+        exc_info=None,
+    )
 
 
 class TestProxyBaseLLMRequestProcessing:
@@ -187,6 +239,107 @@ class TestProxyBaseLLMRequestProcessing:
         assert router_settings_override["num_retries"] == 3
         # model_list should NOT be in the override settings
         assert "model_list" not in router_settings_override
+
+    @pytest.mark.asyncio
+    async def test_base_process_llm_request_emits_aawm_route_log_for_embeddings(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        data = {
+            "model": "text-embedding-3-small",
+            "input": ["hello"],
+            "api_base": "https://api.openai.com/v1/embeddings?api_key=secret",
+            "metadata": {
+                "agent_name": "embed worker",
+                "repository": "litellm",
+                "requested_model_alias": "aawm-mini",
+            },
+        }
+        processing_obj = ProxyBaseLLMRequestProcessing(data=data)
+        mock_request = _build_aawm_route_log_request(
+            headers={"user-agent": "codex-cli/0.119.0-alpha.29"},
+        )
+        mock_fastapi_response = MagicMock()
+        mock_fastapi_response.headers = {}
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.tpm_limit = None
+        mock_user_api_key_dict.rpm_limit = None
+        mock_user_api_key_dict.max_budget = None
+        mock_user_api_key_dict.spend = 0
+        mock_user_api_key_dict.allowed_model_region = None
+        mock_proxy_config = MagicMock(spec=ProxyConfig)
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "test-call-id"
+
+        processing_obj.common_processing_pre_call_logic = AsyncMock(
+            return_value=(data, logging_obj)
+        )
+
+        async def mock_provider_response():
+            return {
+                "object": "list",
+                "model": "text-embedding-3-small",
+                "data": [],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            }
+
+        async def mock_route_request(*args, **kwargs):
+            return asyncio.create_task(mock_provider_response())
+
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing,
+            "route_request",
+            mock_route_request,
+        )
+
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.during_call_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.update_request_status = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_success_hook = AsyncMock(
+            side_effect=lambda *, response, **kwargs: response
+        )
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value={}
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                response = await processing_obj.base_process_llm_request(
+                    request=mock_request,
+                    fastapi_response=mock_fastapi_response,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    route_type="aembedding",
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                    general_settings={},
+                    proxy_config=mock_proxy_config,
+                )
+        finally:
+            route_logger.removeHandler(caplog.handler)
+
+        assert response["model"] == "text-embedding-3-small"
+        route_records = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("ROUTE:")
+        ]
+        assert len(route_records) == 1
+        assert re.fullmatch(
+            r"ROUTE: codex-cli/0\.119\.0-alpha\.29 - "
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
+            r"embed worker@litellm - text-embedding-3-small\(aawm-mini\) - "
+            r"172\.19\.0\.1:52834 - POST /v1/embeddings -> "
+            r"api\.openai\.com/v1/embeddings HTTP/1\.1",
+            route_records[0],
+        )
+        assert "api_key" not in route_records[0]
+
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        assert access_filter.filter(_build_uvicorn_access_record()) is False
+        assert access_filter.filter(_build_uvicorn_access_record()) is True
 
     @pytest.mark.asyncio
     async def test_stream_timeout_header_processing(self):
@@ -1007,14 +1160,6 @@ class TestCommonRequestProcessingHelpers:
 
             # Verify that tracer.trace was called for each chunk (4 chunks total)
             assert mock_tracer.trace.call_count == 4
-
-            # Verify that each call was made with the correct operation name
-            expected_calls = [
-                (("streaming.chunk.yield",), {}),
-                (("streaming.chunk.yield",), {}),
-                (("streaming.chunk.yield",), {}),
-                (("streaming.chunk.yield",), {}),
-            ]
 
             actual_calls = mock_tracer.trace.call_args_list
             assert len(actual_calls) == 4

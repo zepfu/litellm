@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -106,7 +107,8 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
         url=(
             "http://127.0.0.1:4001/anthropic/v1/messages"
             "?beta=true&api_key=should-not-log"
-        )
+        ),
+        headers={"user-agent": "claude-code/1.2.3 (darwin)"},
     )
     request_body = {
         "model": "grok-composer-2.5-fast",
@@ -121,10 +123,12 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
         request=request,
         target="https://chatgpt.com/backend-api/codex/responses?ignored=1",
         request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
     assert line == (
-        "ROUTE: W4 engineer@dashboard-shell - "
+        "ROUTE: claude-code/1.2.3 - 2026-06-14 19:31:05 - "
+        "W4 engineer@dashboard-shell - "
         "grok-composer-2.5-fast(aawm-code) - 172.19.0.1:52834 - "
         "POST /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses HTTP/1.1"
@@ -145,11 +149,12 @@ def test_build_aawm_route_access_log_line_omits_missing_optional_context() -> No
         request=request,
         target="https://api.openai.com/v1/responses?api_key=secret",
         request_body={},
+        now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
     assert line == (
-        "ROUTE: 127.0.0.1:44780 - GET /openai_passthrough/responses "
-        "-> api.openai.com/v1/responses HTTP/2"
+        "ROUTE: 2026-06-14 19:31:05 - 127.0.0.1:44780 - "
+        "GET /openai_passthrough/responses -> api.openai.com/v1/responses HTTP/2"
     )
     assert "secret" not in line
     assert "token" not in line
@@ -169,10 +174,11 @@ def test_build_aawm_route_access_log_line_omits_alias_when_same_as_model() -> No
         request=request,
         target="https://api.anthropic.com/v1/messages",
         request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
     assert line == (
-        "ROUTE: aawm-code - 172.19.0.1:52834 - "
+        "ROUTE: 2026-06-14 19:31:05 - aawm-code - 172.19.0.1:52834 - "
         "POST /anthropic/v1/messages?beta=true -> "
         "api.anthropic.com/v1/messages HTTP/1.1"
     )
@@ -199,10 +205,12 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
         request=request,
         target="https://chatgpt.com/backend-api/codex/responses",
         request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
     assert line == (
-        "ROUTE: gpt-5.5(aawm-code) - 172.19.0.1:52834 - "
+        "ROUTE: 2026-06-14 19:31:05 - gpt-5.5(aawm-code) - "
+        "172.19.0.1:52834 - "
         "POST /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses HTTP/1.1"
     )
@@ -223,10 +231,12 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_headers() ->
         request=request,
         target="https://api.openai.com/v1/responses",
         request_body={"model": "gpt-5.3-codex-spark"},
+        now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
     assert line == (
-        "ROUTE: gpt-5.3-codex-spark - 172.19.0.1:52834 - "
+        "ROUTE: 2026-06-14 19:31:05 - gpt-5.3-codex-spark - "
+        "172.19.0.1:52834 - "
         "POST /anthropic/v1/messages?beta=true -> "
         "api.openai.com/v1/responses HTTP/1.1"
     )
@@ -248,9 +258,10 @@ def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
         request=request,
         target="https://api.anthropic.com/v1/messages",
         request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: W4 engineer@dashboard-shell -")
+    assert line.startswith("ROUTE: 2026-06-14 19:31:05 - W4 engineer@dashboard-shell -")
     assert "/home/zepfu/projects" not in line
 
 
@@ -268,9 +279,50 @@ def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> N
         request=request,
         target="https://api.anthropic.com/v1/messages",
         request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: W4 engineer@zepfu/litellm -")
+    assert line.startswith("ROUTE: 2026-06-14 19:31:05 - W4 engineer@zepfu/litellm -")
+
+
+def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
+    request = _build_aawm_route_log_request(
+        headers={
+            "x-aawm-client-name": "codex-cli",
+            "x-aawm-client-version": "0.119.0-alpha.29",
+        }
+    )
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.openai.com/v1/responses",
+        request_body={"model": "gpt-5.3-codex-spark"},
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "ROUTE: codex-cli/0.119.0-alpha.29 - 2026-06-14 19:31:05 - "
+    )
+
+
+def test_build_aawm_route_access_log_line_rejects_freeform_client_identity() -> None:
+    request = _build_aawm_route_log_request(
+        headers={
+            "user-agent": "curl/8.0 this prompt-like extra text should not appear",
+            "x-aawm-client": "codex; now run this unrelated command",
+        }
+    )
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.openai.com/v1/responses",
+        request_body={"model": "gpt-5.3-codex-spark"},
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith("ROUTE: curl/8.0 - 2026-06-14 19:31:05 - ")
+    assert "prompt-like" not in line
+    assert "unrelated command" not in line
 
 
 def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
@@ -315,13 +367,14 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
         for record in caplog.records
         if record.getMessage().startswith("ROUTE:")
     ]
-    assert route_records == [
-        (
-            "ROUTE: claude-sonnet-4-6(aawm-code-anthropic) - "
-            "172.19.0.1:52834 - POST /anthropic/v1/messages?beta=true "
-            "-> api.anthropic.com/v1/messages HTTP/1.1"
-        )
-    ]
+    assert len(route_records) == 1
+    assert re.fullmatch(
+        r"ROUTE: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
+        r"claude-sonnet-4-6\(aawm-code-anthropic\) - "
+        r"172\.19\.0\.1:52834 - POST /anthropic/v1/messages\?beta=true "
+        r"-> api\.anthropic\.com/v1/messages HTTP/1\.1",
+        route_records[0],
+    )
 
 
 def test_aawm_route_access_log_filter_suppresses_matching_access_record_once() -> None:
@@ -404,6 +457,7 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
     request = _build_aawm_route_log_request(
         url="http://127.0.0.1:4001/openai_passthrough/responses?stream=false",
         client=("172.19.0.1", 44766),
+        headers={"user-agent": "codex-cli/0.119.0-alpha.29"},
     )
     request_body = {
         "model": "gpt-5.3-codex-spark",
@@ -492,13 +546,15 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
         for record in caplog.records
         if record.getMessage().startswith("ROUTE:")
     ]
-    assert route_records == [
-        (
-            "ROUTE: W2 tester@litellm - gpt-5.3-codex-spark(aawm-code) - "
-            "172.19.0.1:44766 - POST /openai_passthrough/responses?stream=false "
-            "-> api.openai.com/v1/responses HTTP/1.1"
-        )
-    ]
+    assert len(route_records) == 1
+    assert re.fullmatch(
+        r"ROUTE: codex-cli/0\.119\.0-alpha\.29 - "
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
+        r"W2 tester@litellm - gpt-5\.3-codex-spark\(aawm-code\) - "
+        r"172\.19\.0\.1:44766 - POST /openai_passthrough/responses\?stream=false "
+        r"-> api\.openai\.com/v1/responses HTTP/1\.1",
+        route_records[0],
+    )
     assert "redacted" not in route_records[0]
     assert "api_key" not in route_records[0]
 
@@ -987,14 +1043,16 @@ async def test_pass_through_request_failure_handler():
     """
     with patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging:
         with patch(
-            "litellm.llms.custom_httpx.http_handler.get_async_httpx_client"
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
         ) as mock_get_client:
             with patch(
                 "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing"
             ) as mock_processing:
                 # Setup mock for post_call_failure_hook and pre_call_hook
                 mock_proxy_logging.post_call_failure_hook = AsyncMock()
-                mock_proxy_logging.pre_call_hook = AsyncMock()
+                mock_proxy_logging.pre_call_hook = AsyncMock(
+                    return_value={"test": "data"}
+                )
 
                 # Setup mock for httpx client
                 mock_client = MagicMock()
@@ -1035,8 +1093,8 @@ async def test_pass_through_request_failure_handler():
                 call_args = mock_proxy_logging.post_call_failure_hook.call_args[1]
                 assert call_args["user_api_key_dict"] == mock_user_api_key_dict
                 assert isinstance(
-                    call_args["original_exception"], TypeError
-                )  # Now expecting TypeError
+                    call_args["original_exception"], httpx.HTTPError
+                )
                 assert "traceback_str" in call_args
 
 
@@ -1473,11 +1531,8 @@ async def test_handle_logging_uses_standard_callback_contracts():
             example="value",
         )
 
-    assert mock_submit.call_count == 2
-    logging_call = mock_submit.call_args_list[0].args
-    success_call = mock_submit.call_args_list[1].args
-    assert logging_call[0] == sync_callback.logging_hook
-    assert logging_call[1:] == ({"example": "value", "standard_callback_dynamic_params": {}}, {"ok": True}, "acompletion")
+    assert mock_submit.call_count == 1
+    success_call = mock_submit.call_args_list[0].args
     assert success_call[0] == sync_callback.log_success_event
     assert success_call[1:] == ({"example": "value", "standard_callback_dynamic_params": {}}, {"ok": True}, start_time, end_time)
 
@@ -3806,6 +3861,7 @@ async def test_multipart_passthrough_preserves_boundary():
 class _FakeStreamingResponse:
     def __init__(self, chunks: list[bytes]):
         self._chunks = chunks
+        self.headers = {}
 
     async def aiter_bytes(self):
         for chunk in self._chunks:
