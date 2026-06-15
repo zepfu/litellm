@@ -6,6 +6,7 @@ import json
 import traceback
 from base64 import b64encode
 from datetime import datetime, timezone
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from urllib.parse import urlencode, urlparse
 
@@ -238,6 +239,94 @@ def _collect_invalid_openai_object_schema_nodes(
     return invalid_nodes
 
 
+def _coerce_upstream_error_payload(detail: Any) -> Optional[dict[str, Any]]:
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="replace")
+    elif isinstance(detail, str):
+        detail_text = detail
+    elif isinstance(detail, dict):
+        return detail
+    else:
+        return None
+
+    try:
+        parsed = json.loads(detail_text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        parsed = int(float(value))
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _chatgpt_codex_usage_limit_retry_after_seconds(
+    error_block: dict[str, Any],
+) -> Optional[int]:
+    resets_in_seconds = _coerce_positive_int(error_block.get("resets_in_seconds"))
+    if resets_in_seconds is not None:
+        return resets_in_seconds
+
+    resets_at = _coerce_positive_int(error_block.get("resets_at"))
+    if resets_at is None:
+        return None
+    return max(1, int(resets_at - time.time()))
+
+
+def _build_chatgpt_codex_usage_limit_detail(
+    *,
+    error: httpx.HTTPStatusError,
+    upstream_payload: dict[str, Any],
+) -> Optional[tuple[dict[str, Any], Optional[int]]]:
+    if error.response.status_code != 429:
+        return None
+    request_url = error.request.url
+    if (
+        str(request_url.host or "").lower() != "chatgpt.com"
+        or "/backend-api/codex/" not in str(request_url.path or "").lower()
+    ):
+        return None
+    upstream_error = upstream_payload.get("error")
+    if not isinstance(upstream_error, dict):
+        return None
+    if upstream_error.get("type") != "usage_limit_reached":
+        return None
+
+    retry_after_seconds = _chatgpt_codex_usage_limit_retry_after_seconds(
+        upstream_error
+    )
+    structured_detail = {
+        "error": {
+            "message": (
+                "ChatGPT Codex usage limit has been reached for the upstream "
+                "account. Treat this as quota exhaustion, not transient high "
+                "demand."
+            ),
+            "type": "rate_limit_error",
+            "code": "usage_limit_reached",
+            "upstream_type": upstream_error.get("type"),
+            "upstream_message": upstream_error.get("message"),
+        },
+        "upstream_status_code": error.response.status_code,
+        "upstream_url": str(error.request.url),
+        "quota": {
+            "plan_type": upstream_error.get("plan_type"),
+            "resets_at": upstream_error.get("resets_at"),
+            "resets_in_seconds": upstream_error.get("resets_in_seconds"),
+            "eligible_promo": upstream_error.get("eligible_promo"),
+        },
+        "retry_after_seconds": retry_after_seconds,
+        "failover_disposition": "usage_limit_reached",
+    }
+    return structured_detail, retry_after_seconds
+
+
 def _build_http_exception_from_upstream_status_error(
     error: httpx.HTTPStatusError, detail: Any
 ) -> HTTPException:
@@ -245,6 +334,22 @@ def _build_http_exception_from_upstream_status_error(
         str(header_name): str(header_value)
         for header_name, header_value in error.response.headers.items()
     }
+    upstream_payload = _coerce_upstream_error_payload(detail)
+    if upstream_payload is not None:
+        usage_limit_detail = _build_chatgpt_codex_usage_limit_detail(
+            error=error,
+            upstream_payload=upstream_payload,
+        )
+        if usage_limit_detail is not None:
+            structured_detail, retry_after_seconds = usage_limit_detail
+            if retry_after_seconds is not None:
+                upstream_headers["Retry-After"] = str(retry_after_seconds)
+            return HTTPException(
+                status_code=error.response.status_code,
+                detail=structured_detail,
+                headers=upstream_headers or None,
+            )
+
     return HTTPException(
         status_code=error.response.status_code,
         detail=detail,
