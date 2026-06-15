@@ -34,6 +34,7 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    _build_http_exception_from_upstream_status_error,
     build_aawm_route_access_log_line,
     _direct_capture_xai_passthrough_failure,
     emit_aawm_route_access_log,
@@ -89,6 +90,51 @@ def _build_uvicorn_access_record(
         args=(client_addr, method, full_path, http_version, status_code),
         exc_info=None,
     )
+
+
+def test_build_http_exception_structures_chatgpt_codex_usage_limit() -> None:
+    request = httpx.Request(
+        "POST",
+        "https://chatgpt.com/backend-api/codex/responses",
+    )
+    response = httpx.Response(
+        429,
+        request=request,
+        content=json.dumps(
+            {
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                    "plan_type": "pro",
+                    "resets_at": 1781750798,
+                    "eligible_promo": None,
+                    "resets_in_seconds": 193472,
+                }
+            }
+        ).encode("utf-8"),
+    )
+    upstream_error = httpx.HTTPStatusError(
+        "429 Too Many Requests",
+        request=request,
+        response=response,
+    )
+
+    exc = _build_http_exception_from_upstream_status_error(
+        upstream_error,
+        response.content,
+    )
+
+    assert exc.status_code == 429
+    assert exc.detail["error"]["type"] == "rate_limit_error"
+    assert exc.detail["error"]["code"] == "usage_limit_reached"
+    assert exc.detail["error"]["upstream_type"] == "usage_limit_reached"
+    assert exc.detail["quota"]["plan_type"] == "pro"
+    assert exc.detail["quota"]["resets_at"] == 1781750798
+    assert exc.detail["quota"]["resets_in_seconds"] == 193472
+    assert exc.detail["retry_after_seconds"] == 193472
+    assert exc.detail["failover_disposition"] == "usage_limit_reached"
+    assert exc.headers is not None
+    assert exc.headers["Retry-After"] == "193472"
 
 
 @contextmanager
