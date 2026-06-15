@@ -7574,7 +7574,7 @@ def test_build_rate_limit_observations_extracts_anthropic_exception_headers() ->
     assert observations[0]["used_percentage"] == 25.0
 
 
-def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> None:
+def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> None:  # noqa: PLR0915
     kwargs = _base_kwargs(trace_name="oa-xai")
     kwargs["model"] = "xai/grok-4.3"
     kwargs["custom_llm_provider"] = "xai"
@@ -7623,9 +7623,15 @@ def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> 
     assert request_observation["remaining_requests"] == 97
     assert request_observation["used_requests"] == 3
     assert request_observation["remaining_pct"] == pytest.approx(97.0)
+    assert request_observation["quota_limit"] == pytest.approx(100.0)
+    assert request_observation["quota_used"] == pytest.approx(3.0)
+    assert request_observation["quota_remaining"] == pytest.approx(97.0)
     assert request_observation["used_percentage"] == pytest.approx(3.0)
     assert request_observation["quota_period"] == "monthly"
     assert request_observation["provider_resets_at"] == datetime(
+        2026, 7, 1, tzinfo=timezone.utc
+    )
+    assert request_observation["billing_period_end_at"] == datetime(
         2026, 7, 1, tzinfo=timezone.utc
     )
     assert request_observation["evidence"]["reset_absent"] is False
@@ -7660,9 +7666,22 @@ def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> 
     assert request_payload[6] == "xai_oauth_requests:requests"
     assert request_payload[8] == "requests"
     assert request_payload[10] == pytest.approx(97.0)
+    assert request_payload[11] == pytest.approx(100.0)
+    assert request_payload[12] == pytest.approx(3.0)
+    assert request_payload[13] == pytest.approx(97.0)
+    assert request_payload[15] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert json.loads(request_payload[16])["billingPeriodEnd"] == (
+        "2026-07-01T00:00:00+00:00"
+    )
+    assert json.loads(request_payload[17])["reset_source"] == (
+        "payload_config_billing_period_end"
+    )
     assert token_payload[6] == "xai_oauth_tokens:tokens"
     assert token_payload[8] == "tokens"
     assert token_payload[10] == pytest.approx(99.5)
+    assert token_payload[11] == pytest.approx(15000000.0)
+    assert token_payload[12] == pytest.approx(75000.0)
+    assert token_payload[13] == pytest.approx(14925000.0)
     assert request_payload[6] != "xai_grok_build_monthly_requests:requests"
 
 
@@ -8164,7 +8183,22 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
     assert observation["raw_provider_fields"]["quota_unit"] == "grok_billing_used"
     assert observation["raw_provider_fields"]["quota_unit_interpretation"] == "requests"
     assert observation["remaining_pct"] == 99.0
+    assert observation["quota_limit"] == pytest.approx(60000.0)
+    assert observation["quota_used"] == pytest.approx(324.0)
+    assert observation["quota_remaining"] == pytest.approx(59676.0)
     assert observation["used_percentage"] == 1.0
+    assert observation["billing_period_start_at"] == datetime(
+        2026,
+        5,
+        1,
+        tzinfo=timezone.utc,
+    )
+    assert observation["billing_period_end_at"] == datetime(
+        2026,
+        6,
+        1,
+        tzinfo=timezone.utc,
+    )
     assert observation["provider_resets_at"] == datetime(
         2026,
         6,
@@ -8179,6 +8213,13 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
     assert payload[6] == "xai_grok_build_monthly_requests:requests"
     assert payload[8] == "requests"
     assert payload[10] == 99.0
+    assert payload[11] == pytest.approx(60000.0)
+    assert payload[12] == pytest.approx(324.0)
+    assert payload[13] == pytest.approx(59676.0)
+    assert payload[14] == datetime(2026, 5, 1, tzinfo=timezone.utc)
+    assert payload[15] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert json.loads(payload[16])["monthlyLimit"] == {"val": 60000}
+    assert json.loads(payload[17])["signals"] == ["grok_billing_payload"]
 
 
 def test_build_rate_limit_observations_skips_invalid_grok_billing_limit() -> None:
@@ -10079,9 +10120,9 @@ async def test_persist_session_history_record_writes_openrouter_free_daily_meter
     assert payload[8] == "requests"
     assert payload[9] == datetime(2026, 5, 18, tzinfo=timezone.utc)
     assert payload[10] == pytest.approx(74.9)
-    assert payload[11] == "openrouter_free_daily_local_meter"
-    assert payload[12] == "session-openrouter-free-success"
-    assert payload[14] == "call-openrouter-free-success"
+    assert payload[18] == "openrouter_free_daily_local_meter"
+    assert payload[19] == "session-openrouter-free-success"
+    assert payload[21] == "call-openrouter-free-success"
 
 
 def test_build_session_history_record_from_spend_log_row_recovers_real_session_id() -> None:
@@ -13206,6 +13247,18 @@ def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() ->
     assert "latest.expected_reset_at IS NOT DISTINCT FROM candidate.expected_reset_at" in sql
     assert "ABS(EXTRACT(EPOCH FROM (candidate.expected_reset_at - latest.expected_reset_at))) < 900" in sql
     assert "latest.remaining_pct IS NOT DISTINCT FROM candidate.remaining_pct" in sql
+    assert "latest.quota_limit IS NOT DISTINCT FROM candidate.quota_limit" in sql
+    assert "latest.quota_used IS NOT DISTINCT FROM candidate.quota_used" in sql
+    assert "latest.quota_remaining IS NOT DISTINCT FROM candidate.quota_remaining" in sql
+    assert (
+        "latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at"
+        in sql
+    )
+    assert (
+        "latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at"
+        in sql
+    )
+    assert "latest.raw_provider_fields IS NOT DISTINCT FROM" in sql
 
 
 def test_rate_limit_meaningful_change_ignores_reset_hint_when_reset_time_exists() -> None:
