@@ -1,5 +1,45 @@
 # Completed
 
+## 2026-06-15
+
+- Promoted the latest AAWM LiteLLM work to prod as `v1.82.3-aawm.75`.
+
+  Release:
+  `origin/main` was advanced to artifact autobump commit
+  `7e8443b69bfb80c125a89f2b74be4dda3e6d54ed`, tagged as
+  `v1.82.3-aawm.75`, and GitHub Actions run `27522794121` completed
+  successfully. The published fork image is
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.75`. Overlay releases verified with
+  assets are callback `cb-v0.0.48`
+  (`aawm_litellm_callbacks-0.0.48-py3-none-any.whl`), control-plane
+  `cp-v0.0.9` (`aawm_litellm_control_plane-0.0.9-py3-none-any.whl`),
+  model-config `cfg-v0.0.17` (`litellm-model-config-0.0.17.tar.gz`), and
+  harness `h-v0.0.34` (`litellm-local-ci-harness-0.0.34.tar.gz`).
+
+  Runtime:
+  `/home/zepfu/projects/aawm-infrastructure` now pins
+  `ghcr.io/zepfu/litellm:1.82.3-aawm.75` on both `main` commit
+  `2f76f96` and `develop` commit `6d5d864`. The no-cache prod rebuild produced
+  local image `aawm-litellm:latest` with image id
+  `sha256:72283c84c8bc25c428efddd0836062ad314ff8dc7192621e73d2785d152ff93d`.
+  The running `aawm-litellm` container is healthy on `:4000`; readiness reports
+  `litellm_version=1.82.3+aawm.74`, and running-container package inspection
+  reports `litellm=1.82.3+aawm.74`,
+  `aawm-litellm-callbacks=0.0.48`, and
+  `aawm-litellm-control-plane=0.0.9`.
+
+  Validation:
+  pre-promotion dev validation for the changed Codex deferred-tool path passed
+  focused live case `native_openai_passthrough_responses_codex` on `:4001` with
+  zero failures and one documented duplicate-snapshot warning. For prod
+  promotion, the default harness was not rerun because the operator explicitly
+  instructed not to spend tokens rerunning it after the earlier harness pass.
+  Post-promotion no-token checks passed: `/health/readiness`,
+  `/health/liveliness`, running-container package inspection, and `/v1/models`.
+  Recent prod log review after restart showed successful startup, route traffic,
+  and health checks without ASGI/task/protocol tracebacks; the existing
+  `LITELLM_MASTER_KEY is not set` startup warning remains present.
+
 ## 2026-05-28
 
 - Promoted the `aawm.63` Codex Responses stream logging repair to prod.
