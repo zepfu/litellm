@@ -136,6 +136,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _expand_claude_persisted_output_text,
     _extract_codex_auto_agent_error_tokens,
     _prepare_anthropic_request_body_for_passthrough,
+    _prepare_grok_native_oauth_passthrough_request,
     _prepare_grok_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
     _handle_anthropic_google_completion_adapter_route,
@@ -15083,6 +15084,141 @@ def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
     assert updated_body["input"][1]["encrypted_content"] == (
         "encrypted-compaction-fixture"
     )
+
+
+def test_grok_direct_passthrough_preserves_encrypted_reasoning_compaction_item():
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_grok",
+                "summary": [],
+                "encrypted_content": "native-grok-compaction-fixture",
+            },
+        ],
+        "previous_response_id": "resp_grok_previous",
+    }
+    request = MagicMock(spec=Request)
+    request.headers = {
+        "content-type": "application/json",
+        "x-grok-model-override": "grok-composer-2.5-fast",
+        "x-grok-session-id": "grok-session",
+    }
+    request.query_params = {}
+    request.scope = {}
+
+    prepared_body = _prepare_grok_request_body_for_passthrough(
+        request=request,
+        request_body=request_body,
+    )
+
+    assert prepared_body["previous_response_id"] == "resp_grok_previous"
+    assert prepared_body["input"][1]["encrypted_content"] == (
+        "native-grok-compaction-fixture"
+    )
+    assert "xai_adapter_compaction_state_removed" not in prepared_body[
+        "litellm_metadata"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_adapter_strips_provider_bound_compaction_state(monkeypatch):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+    request_body = {
+        "model": "oa_xai/grok-build",
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_foreign",
+                "summary": [],
+                "encrypted_content": "foreign-compaction-blob",
+            },
+            {"type": "message", "role": "user", "content": "next"},
+        ],
+        "previous_response_id": "resp_foreign_previous",
+    }
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ):
+        prepared, target_base, api_key = await _prepare_oa_xai_passthrough_request(
+            request_body,
+            sanitize_responses_request=True,
+        )
+
+    assert prepared is True
+    assert target_base == "https://api.x.ai/v1"
+    assert api_key == "xai-oauth-token"
+    assert request_body["input"] == [
+        {"type": "message", "role": "user", "content": "continue"},
+        {"type": "message", "role": "user", "content": "next"},
+    ]
+    assert "previous_response_id" not in request_body
+    metadata = request_body["litellm_metadata"]
+    assert metadata["xai_adapter_compaction_state_removed"] is True
+    assert metadata["xai_adapter_compaction_state_removed_count"] == 2
+    assert metadata["xai_adapter_compaction_state_removed_fields"] == [
+        "input",
+        "previous_response_id",
+    ]
+    assert "xai-adapter-compaction-state-removed" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_grok_native_adapter_strips_provider_bound_compaction_state(monkeypatch):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "https://cli-chat-proxy.grok.com",
+    )
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_foreign",
+                "summary": [],
+                "encrypted_content": "foreign-compaction-blob",
+            },
+        ],
+        "previous_response_id": "resp_foreign_previous",
+        "litellm_metadata": {"session_id": "adapter-session"},
+    }
+    request = MagicMock(spec=Request)
+    request.headers = {"content-type": "application/json"}
+    request.query_params = {}
+    request.scope = {}
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ):
+        prepared, target_base, headers, prepared_body = (
+            await _prepare_grok_native_oauth_passthrough_request(
+                request_body,
+                request=request,
+            )
+        )
+
+    assert prepared is True
+    assert target_base == "https://cli-chat-proxy.grok.com"
+    assert headers["authorization"] == "Bearer grok-oidc-token"
+    assert prepared_body["input"] == [
+        {"type": "message", "role": "user", "content": "continue"}
+    ]
+    assert "previous_response_id" not in prepared_body
+    metadata = prepared_body["litellm_metadata"]
+    assert metadata["xai_adapter_compaction_state_removed"] is True
+    assert metadata["xai_adapter_compaction_state_removed_count"] == 2
+    assert metadata["xai_adapter_compaction_state_removed_fields"] == [
+        "input",
+        "previous_response_id",
+    ]
+    assert "xai-adapter-compaction-state-removed" in metadata["tags"]
 
 
 def _assert_xai_responses_body_sanitized(custom_body: dict[str, Any]) -> None:
