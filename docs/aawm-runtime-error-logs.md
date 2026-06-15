@@ -31,3 +31,17 @@ repositories should not keep a second durable queue for LiteLLM runtime errors.
 The sink reuses LiteLLM's secret-redaction filter and records traceback context
 without adding request bodies, prompt payloads, or tool arguments. Error-log
 files are local sensitive artifacts and must not be committed or pushed.
+
+## ChatGPT Codex quota errors
+
+When ChatGPT Codex passthrough returns HTTP 429 with
+`error.type = usage_limit_reached`, LiteLLM reshapes the client-facing error
+into a structured `rate_limit_error` instead of returning a raw upstream byte
+string. The detail preserves upstream quota fields such as `plan_type`,
+`resets_at`, `resets_in_seconds`, and `eligible_promo`, adds
+`retry_after_seconds`, and sets the `Retry-After` header from the reset data.
+
+Treat this class as upstream account quota exhaustion. It is distinct from
+short-lived high-demand throttling, and alias handlers should classify it as
+`usage_limit_reached` when deciding whether a fresh dispatch can advance to the
+next declared candidate.
