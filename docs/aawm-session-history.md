@@ -106,6 +106,16 @@ managed credential, LiteLLM replaces the managed Grok credential from the seed
 before selecting or refreshing an access token. This lets a fresh Grok/OIDC login
 take effect without writing back into `/home/zepfu/.grok`.
 
+Grok native and `oa_xai/*` Responses candidates remove request fields and hosted
+tools that the selected Grok-family model declares unsupported, but they preserve
+Responses `reasoning` input items that carry `encrypted_content`. Those encrypted
+items are treated as provider-owned compacted session state and must round-trip
+unchanged rather than being removed as ordinary unsupported reasoning summaries.
+If a Grok-family upstream still rejects a compacted request with `Could not
+decode the compaction blob`, alias-probe mode classifies that 400 as
+candidate-unavailable so the declared failover sequence can continue instead of
+stranding the worker on the rejecting candidate.
+
 ## Access Log Display Semantics
 
 AAWM route logs emit a compact route line to the LiteLLM proxy logger after the

@@ -34,6 +34,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _drop_unsupported_codex_hosted_tools_from_request_body,
     _drop_unsupported_codex_input_items_from_request_body,
     _drop_unsupported_codex_request_params_from_request_body,
+    _grok_native_candidate_unavailable_detail,
+    _xai_oauth_candidate_unavailable_detail,
     _apply_codex_tool_description_patches_to_request_body,
     _apply_google_adapter_completion_message_window,
     _apply_google_adapter_request_shape_policy,
@@ -14998,6 +15000,35 @@ def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
     ]
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["oa_xai/grok-4.3", "grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
+)
+def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
+    request_body = {
+        "model": model,
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [],
+                "encrypted_content": "encrypted-compaction-fixture",
+            },
+        ],
+    }
+
+    updated_body, removed_items = (
+        _drop_unsupported_codex_input_items_from_request_body(request_body)
+    )
+
+    assert updated_body is request_body
+    assert removed_items == []
+    assert updated_body["input"][1]["encrypted_content"] == (
+        "encrypted-compaction-fixture"
+    )
+
+
 def _assert_xai_responses_body_sanitized(custom_body: dict[str, Any]) -> None:
     _assert_xai_responses_top_level_fields_sanitized(custom_body)
 
@@ -15885,6 +15916,23 @@ def test_antigravity_candidate_unavailable_detail_ignores_request_envelope_400()
     )
 
     assert _antigravity_candidate_unavailable_detail(request_shape_error) is None
+
+
+def test_grok_candidate_unavailable_detail_matches_compaction_blob_decode_error():
+    compaction_error = HTTPException(
+        status_code=400,
+        detail=(
+            b'{"code":"invalid-argument","error":"Could not decode the '
+            b'compaction blob. Ensure it is unmodified from the compact response."}'
+        ),
+    )
+
+    assert "compaction blob" in (
+        _grok_native_candidate_unavailable_detail(compaction_error) or ""
+    )
+    assert "compaction blob" in (
+        _xai_oauth_candidate_unavailable_detail(compaction_error) or ""
+    )
 
 
 @pytest.mark.asyncio
@@ -17398,6 +17446,55 @@ async def test_anthropic_grok_native_alias_probe_reasoning_effort_400_is_candida
 
 
 @pytest.mark.asyncio
+async def test_anthropic_grok_native_alias_probe_compaction_blob_400_is_candidate_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "http://localhost:4001/grok/v1",
+    )
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "continue"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-grok-session"},
+    }
+    upstream_error = HTTPException(
+        status_code=400,
+        detail=(
+            b'{"code":"invalid-argument","error":"Could not decode the '
+            b'compaction blob. Ensure it is unmodified from the compact response."}'
+        ),
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=upstream_error),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="grok-composer-2.5-fast",
+                use_alias_candidate_probe=True,
+            )
+
+    assert str(exc_info.value.code) == "429"
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    assert "compaction blob" in exc_info.value.message
+
+
+@pytest.mark.asyncio
 async def test_anthropic_xai_oauth_completion_adapter_uses_managed_oauth(
     monkeypatch,
 ):
@@ -17576,6 +17673,52 @@ async def test_anthropic_xai_oauth_alias_probe_reasoning_effort_400_is_candidate
         "aawm_codex_auto_agent_candidate_unavailable"
     )
     assert "reasoningEffort" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_anthropic_xai_oauth_alias_probe_compaction_blob_400_is_candidate_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "continue"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-xai-session"},
+    }
+    upstream_error = HTTPException(
+        status_code=400,
+        detail=(
+            b'{"code":"invalid-argument","error":"Could not decode the '
+            b'compaction blob. Ensure it is unmodified from the compact response."}'
+        ),
+    )
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=upstream_error),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_anthropic_xai_oauth_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="oa_xai/grok-build",
+                use_alias_candidate_probe=True,
+            )
+
+    assert str(exc_info.value.code) == "429"
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    assert "compaction blob" in exc_info.value.message
 
 
 @pytest.mark.asyncio
