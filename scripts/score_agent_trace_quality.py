@@ -238,6 +238,7 @@ class TraceScoreEvidence:
     source: str
     source_locator: Optional[str]
     agent_name: Optional[str]
+    agent_id: Optional[str]
     repository: Optional[str]
     model: Optional[str]
     provider_error_present: bool
@@ -3065,6 +3066,7 @@ def score_candidate(  # noqa: PLR0915
         source=payload.source if payload is not None else "missing",
         source_locator=payload.source_locator if payload is not None else None,
         agent_name=candidate.agent_name,
+        agent_id=candidate.agent_id,
         repository=candidate.repository,
         model=candidate.model,
         provider_error_present=provider_error_present,
