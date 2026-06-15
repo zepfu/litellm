@@ -2089,7 +2089,12 @@ def _rate_limit_observation_candidate_summary(
         'quota_key': row.get('quota_key'),
         'quota_type': row.get('quota_type'),
         'remaining_pct': row.get('remaining_pct'),
+        'quota_limit': row.get('quota_limit'),
+        'quota_used': row.get('quota_used'),
+        'quota_remaining': row.get('quota_remaining'),
         'expected_reset_at': row.get('expected_reset_at'),
+        'billing_period_start_at': row.get('billing_period_start_at'),
+        'billing_period_end_at': row.get('billing_period_end_at'),
         'source': row.get('source'),
         'session_id': row.get('session_id'),
     }
@@ -2226,8 +2231,10 @@ def _validate_rate_limit_observations(
     session_query = '''
         select observed_at, created_at, client, client_version, account_hash,
                provider, model, quota_key, quota_period, quota_type,
-               expected_reset_at, remaining_pct, source, session_id,
-               trace_id, litellm_call_id
+               expected_reset_at, remaining_pct, quota_limit, quota_used,
+               quota_remaining, billing_period_start_at, billing_period_end_at,
+               raw_provider_fields, evidence, source, session_id, trace_id,
+               litellm_call_id
         from public.rate_limit_observations
         where session_id = %s
         order by observed_at desc, id desc
@@ -2235,8 +2242,10 @@ def _validate_rate_limit_observations(
     latest_query = '''
         select observed_at, created_at, client, client_version, account_hash,
                provider, model, quota_key, quota_period, quota_type,
-               expected_reset_at, remaining_pct, source, session_id,
-               trace_id, litellm_call_id
+               expected_reset_at, remaining_pct, quota_limit, quota_used,
+               quota_remaining, billing_period_start_at, billing_period_end_at,
+               raw_provider_fields, evidence, source, session_id, trace_id,
+               litellm_call_id
         from public.rate_limit_observations
         where observed_at >= %s
         order by observed_at desc, id desc

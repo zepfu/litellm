@@ -26,6 +26,38 @@ for reporting and grouping by requested alias.
 Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
+## Rate Limit And Billing Observations
+
+`public.rate_limit_observations` stores provider quota, rate-limit, and billing
+snapshots discovered during normal request logging and quota probes. The
+canonical grouping fields are `provider`, `client`, `account_hash`, `model`,
+`quota_key`, `quota_period`, `quota_type`, and `source`.
+
+The normalized progress fields are:
+
+- `expected_reset_at`: the provider reset or billing-period boundary when one
+  is known.
+- `remaining_pct`: bounded 0-100 remaining percentage used by dashboards and
+  interval materializations.
+- `quota_limit`, `quota_used`, and `quota_remaining`: provider-reported absolute
+  amounts when the unit is known from `quota_type` or the provider payload.
+- `billing_period_start_at` and `billing_period_end_at`: explicit billing-period
+  boundaries when a provider reports them separately from short-window reset
+  headers.
+
+Provider-specific fields that do not fit a stable column live in
+`raw_provider_fields` as sanitized JSONB. `evidence` records the bounded
+signals, source fields, and interpretation notes that explain how the snapshot
+was classified. These JSONB fields must not contain credentials, account ids,
+authorization headers, prompt bodies, response text, or raw tool arguments.
+
+Grok monthly billing payloads populate `quota_limit`, `quota_used`,
+`quota_remaining`, both billing-period boundary columns, and a raw copy of the
+sanitized `monthlyLimit`, `used`, `onDemandCap`, and period fields. xAI OAuth
+rate-limit headers populate absolute request/token amounts and carry billing
+period ends when the provider config or managed subscription context exposes
+one.
+
 ## Session History Outage Spool
 
 `session_history` rows are normally written directly to

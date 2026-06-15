@@ -60,8 +60,13 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
     _build_rate_limit_observations,
     _ensure_session_history_schema,
     _persist_session_history_records,
+    _rate_limit_storage_billing_period_end_at,
+    _rate_limit_storage_billing_period_start_at,
     _rate_limit_storage_provider,
+    _rate_limit_storage_quota_limit,
     _rate_limit_storage_quota_key,
+    _rate_limit_storage_quota_remaining,
+    _rate_limit_storage_quota_used,
     _rate_limit_storage_remaining_pct,
 )
 from litellm.secret_managers.main import get_secret_str  # noqa: E402
@@ -608,6 +613,11 @@ def _observation_signature(observation: Dict[str, Any]) -> Tuple[Any, ...]:
         _signature_datetime_millis(observation.get("observed_at")),
         _signature_datetime_millis(observation.get("provider_resets_at")),
         _rate_limit_storage_remaining_pct(observation),
+        _rate_limit_storage_quota_limit(observation),
+        _rate_limit_storage_quota_used(observation),
+        _rate_limit_storage_quota_remaining(observation),
+        _signature_datetime_millis(_rate_limit_storage_billing_period_start_at(observation)),
+        _signature_datetime_millis(_rate_limit_storage_billing_period_end_at(observation)),
         observation.get("trace_id"),
     )
 
@@ -649,7 +659,8 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
             """
             SELECT source, provider, model, quota_key, observed_at,
                    expected_reset_at AS provider_resets_at,
-                   remaining_pct, trace_id
+                   remaining_pct, quota_limit, quota_used, quota_remaining,
+                   billing_period_start_at, billing_period_end_at, trace_id
             FROM public.rate_limit_observations
             WHERE litellm_call_id = ANY($1::text[])
                OR trace_id = ANY($2::text[])
