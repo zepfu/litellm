@@ -20874,7 +20874,9 @@ async def test_openai_passthrough_codex_spark_drops_image_generation_tool(
 async def test_load_valid_local_antigravity_access_token_from_env(
     tmp_path, monkeypatch
 ):
+    _antigravity_oauth_access_token_cache.clear()
     token_path = tmp_path / "antigravity-oauth-token"
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path.write_text(
         json.dumps(
             {
@@ -20889,11 +20891,123 @@ async def test_load_valid_local_antigravity_access_token_from_env(
         )
     )
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN_FILE", raising=False)
 
     assert await _load_valid_local_antigravity_access_token() == (
         "test-antigravity-token"
     )
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
+        "access_token"
+    ] == "test-antigravity-token"
+    assert managed_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_newer_seed_invalidates_cache(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    seed_path = tmp_path / "seed" / "antigravity-oauth-token"
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
+    seed_path.parent.mkdir(parents=True)
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "managed-old-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "managed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    seed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "seed-new-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "seed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(managed_path, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(seed_path, ns=(2_000_000_000, 2_000_000_000))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(seed_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
+    _antigravity_oauth_access_token_cache[str(managed_path.expanduser())] = (
+        "cached-old-token",
+        int(datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp() * 1000),
+    )
+
+    assert await _load_valid_local_antigravity_access_token() == "seed-new-token"
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
+        "access_token"
+    ] == "seed-new-token"
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_equal_mtime_seed_invalidates_cache(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    seed_path = tmp_path / "seed" / "antigravity-oauth-token"
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
+    seed_path.parent.mkdir(parents=True)
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "managed-old-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "managed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    seed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "seed-equal-mtime-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "seed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(managed_path, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(seed_path, ns=(1_000_000_000, 1_000_000_000))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(seed_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
+    _antigravity_oauth_access_token_cache[str(managed_path.expanduser())] = (
+        "cached-old-token",
+        int(datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp() * 1000),
+    )
+
+    assert (
+        await _load_valid_local_antigravity_access_token()
+        == "seed-equal-mtime-token"
+    )
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
+        "access_token"
+    ] == "seed-equal-mtime-token"
 
 
 def test_load_antigravity_oauth_client_values_from_local_cli_binary(
@@ -21089,6 +21203,7 @@ async def test_load_valid_local_antigravity_access_token_persists_refresh(
 ):
     _antigravity_oauth_access_token_cache.clear()
     token_path = tmp_path / "antigravity-oauth-token"
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path.write_text(
         json.dumps(
             {
@@ -21105,6 +21220,7 @@ async def test_load_valid_local_antigravity_access_token_persists_refresh(
     )
     token_path.chmod(0o600)
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
         "222222222222-client.apps.googleusercontent.com",
@@ -21125,14 +21241,15 @@ async def test_load_valid_local_antigravity_access_token_persists_refresh(
     ):
         token = await _load_valid_local_antigravity_access_token()
 
-    persisted = json.loads(token_path.read_text(encoding="utf-8"))
+    persisted = json.loads(managed_path.read_text(encoding="utf-8"))
+    seed = json.loads(token_path.read_text(encoding="utf-8"))
     assert token == "ya29.refreshed-antigravity"
     assert persisted["auth_method"] == "consumer"
     assert persisted["token"]["access_token"] == "ya29.refreshed-antigravity"
     assert persisted["token"]["refresh_token"] == "refresh-token-123"
     assert persisted["token"]["token_type"] == "Bearer"
     assert isinstance(persisted["token"]["expiry"], str)
-    assert token_path.stat().st_mode & 0o777 == 0o600
+    assert seed["token"]["access_token"] == "ya29.expired-antigravity"
 
 
 @pytest.mark.asyncio
@@ -21141,6 +21258,7 @@ async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallbac
 ):
     _antigravity_oauth_access_token_cache.clear()
     home_path = tmp_path / "home"
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path = (
         home_path
         / ".gemini"
@@ -21167,6 +21285,7 @@ async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallbac
     cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     cli_path.chmod(0o755)
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
@@ -21213,15 +21332,111 @@ async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallbac
     ):
         token = await _load_valid_local_antigravity_access_token()
 
+    managed = json.loads(managed_path.read_text(encoding="utf-8"))
     persisted = json.loads(token_path.read_text(encoding="utf-8"))
     assert token == "ya29.refreshed-via-agy"
+    assert managed["token"]["access_token"] == "ya29.refreshed-via-agy"
     assert persisted["token"]["access_token"] == "ya29.refreshed-via-agy"
     assert persisted["token"]["refresh_token"] == "refresh-token-123"
     assert subprocess_calls
 
 
 @pytest.mark.asyncio
-async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_passed_auth_path(
+async def test_load_valid_local_antigravity_access_token_cli_fallback_recreates_seed_and_persists_managed(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    seed_home = tmp_path / "seed-home"
+    seed_path = (
+        seed_home
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
+    managed_path.parent.mkdir(parents=True)
+    managed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.managed-expired",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "managed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cli_path = tmp_path / "agy"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(seed_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
+    monkeypatch.setenv(
+        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+        "222222222222-client.apps.googleusercontent.com",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(
+        401,
+        json={"error": "invalid_client"},
+    )
+    mock_context = AsyncMock()
+    mock_context.__aenter__.return_value = mock_client
+    mock_context.__aexit__.return_value = False
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            seed_path.parent.mkdir(parents=True)
+            seed_path.write_text(
+                json.dumps(
+                    {
+                        "auth_method": "consumer",
+                        "token": {
+                            "access_token": "ya29.recreated-seed",
+                            "expiry": (
+                                datetime.now(timezone.utc) + timedelta(hours=1)
+                            ).isoformat(),
+                            "refresh_token": "seed-refresh-token",
+                            "token_type": "Bearer",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        assert args[-1] == "models"
+        assert kwargs["env"]["HOME"] == str(seed_home)
+        return FakeProcess()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+        return_value=mock_context,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.create_subprocess_exec",
+        new=fake_create_subprocess_exec,
+    ):
+        token = await _load_valid_local_antigravity_access_token()
+
+    assert token == "ya29.recreated-seed"
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
+        "access_token"
+    ] == "ya29.recreated-seed"
+    assert json.loads(seed_path.read_text(encoding="utf-8"))["token"][
+        "access_token"
+    ] == "ya29.recreated-seed"
+
+
+@pytest.mark.asyncio
+async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_seed_auth_path(
     tmp_path, monkeypatch
 ):
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -21294,17 +21509,17 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_p
         returncode = 0
 
         async def communicate(self):
-            refreshed = json.loads(target_path.read_text(encoding="utf-8"))
-            refreshed["token"]["access_token"] = "ya29.refreshed-target"
+            refreshed = json.loads(env_path.read_text(encoding="utf-8"))
+            refreshed["token"]["access_token"] = "ya29.refreshed-seed"
             refreshed["token"]["expiry"] = (
                 datetime.now(timezone.utc) + timedelta(hours=1)
             ).isoformat()
-            target_path.write_text(json.dumps(refreshed), encoding="utf-8")
+            env_path.write_text(json.dumps(refreshed), encoding="utf-8")
             return b"", b""
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         assert args[-1] == "models"
-        assert kwargs["env"]["HOME"] == str(target_home)
+        assert kwargs["env"]["HOME"] == str(env_home)
         return FakeProcess()
 
     with patch(
@@ -21319,10 +21534,41 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_p
             target_path,
         )
 
-    assert refreshed["token"]["access_token"] == "ya29.refreshed-target"
+    assert refreshed["token"]["access_token"] == "ya29.refreshed-seed"
+    assert json.loads(target_path.read_text(encoding="utf-8"))["token"][
+        "access_token"
+    ] == "ya29.target-expired"
     assert json.loads(env_path.read_text(encoding="utf-8"))["token"][
         "access_token"
-    ] == "ya29.env-token"
+    ] == "ya29.refreshed-seed"
+
+
+def test_write_antigravity_oauth_token_data_atomic_wraps_parent_creation_failure(
+    tmp_path,
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _write_antigravity_oauth_token_data_atomic,
+    )
+
+    parent_file = tmp_path / "not-a-directory"
+    parent_file.write_text("", encoding="utf-8")
+
+    with pytest.raises(
+        HTTPException,
+        match="Failed to persist refreshed Antigravity OAuth token auth data",
+    ):
+        _write_antigravity_oauth_token_data_atomic(
+            parent_file / "antigravity-oauth-token",
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "refresh",
+                    "token_type": "Bearer",
+                },
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -21357,6 +21603,7 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_noop_accepts_unexp
     cli_path = tmp_path / "agy"
     cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     cli_path.chmod(0o755)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(target_path))
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
@@ -21435,6 +21682,7 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_noop_rejects_expir
     cli_path = tmp_path / "agy"
     cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     cli_path.chmod(0o755)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(target_path))
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
@@ -21589,6 +21837,7 @@ async def test_load_valid_local_antigravity_access_token_caches_concurrent_refre
 ):
     _antigravity_oauth_access_token_cache.clear()
     token_path = tmp_path / "antigravity-oauth-token"
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path.write_text(
         json.dumps(
             {
@@ -21603,6 +21852,7 @@ async def test_load_valid_local_antigravity_access_token_caches_concurrent_refre
         )
     )
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     future_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
 
     async def refresh_token_data(_token_data, _auth_path=None):
