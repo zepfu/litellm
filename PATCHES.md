@@ -2765,6 +2765,39 @@ run the documented prod readiness, log, and harness gates.
 
 ---
 
+### aawm.77 — D1-272/D1-274 Grok compaction-state prod promotion
+
+**What changed:** The fork release line now includes the post-`aawm.76` core
+proxy fixes for session-history agent-id trace scoring, ChatGPT Codex
+`usage_limit_reached` passthrough shaping, and Grok/xAI adapter compaction-state
+handling. Adapter-managed `oa_xai/*` and Grok native OAuth routes strip
+provider-bound `previous_response_id` and encrypted Responses reasoning items
+before xAI/Grok egress, while direct `/grok` passthrough continues preserving
+native Grok compact response state for same-client continuation.
+
+**Why:** Prod logged Grok/xAI Responses 400s with `Could not decode the
+compaction blob` after a request reached both `cli-chat-proxy.grok.com` and
+`api.x.ai`. Those compact blobs are provider/session-bound; replaying them
+through an adapter or failover route can strand a worker on an upstream
+invalid-argument error. The release also carries the already-pushed structured
+ChatGPT Codex `usage_limit_reached` handling and agent-id trace-score fix so
+prod is not promoted with only part of the current dev-verified source set.
+
+**Why not upstream:** This is AAWM-specific operational behavior for local
+Codex/Grok/xAI alias routing, prod error-log intake, and session-history
+observability.
+
+**Validation status:** Focused dev validation for D1-272 passed the Grok/xAI
+passthrough test cluster (`70 passed`), `ruff`, `py_compile`, `git diff
+--check`, and a `litellm-dev` restart/readiness check. Production promotion
+requires publishing `v1.82.3-aawm.77`, rebuilding/restarting `aawm-litellm` from
+that pinned base, verifying the prod runtime contains
+`_strip_xai_adapter_compaction_state_from_request_body`, and archiving or
+deleting the active `.analysis/prod-error.log` after the fixed runtime is
+healthy.
+
+---
+
 
 ## Dropped Patches
 
