@@ -1315,6 +1315,81 @@ def _sanitize_xai_responses_request_body_in_place(
     return removed_params, tool_changes
 
 
+def _strip_xai_adapter_compaction_state_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    removed_items: list[dict[str, Any]] = []
+    updated_body: Optional[dict[str, Any]] = None
+
+    if request_body.get("previous_response_id") is not None:
+        updated_body = dict(request_body)
+        updated_body.pop("previous_response_id", None)
+        removed_items.append({"field": "previous_response_id"})
+
+    input_items = request_body.get("input")
+    if isinstance(input_items, list):
+        updated_input_items: list[Any] = []
+        for index, item in enumerate(input_items):
+            if (
+                isinstance(item, dict)
+                and _normalize_low_cardinality_tag_value(item.get("type"))
+                == "reasoning"
+                and isinstance(item.get("encrypted_content"), str)
+            ):
+                removed_items.append(
+                    {
+                        "field": "input",
+                        "index": index,
+                        "type": "reasoning",
+                        "reason": "encrypted_content",
+                    }
+                )
+                continue
+            updated_input_items.append(item)
+
+        if len(updated_input_items) != len(input_items):
+            if updated_body is None:
+                updated_body = dict(request_body)
+            updated_body["input"] = updated_input_items
+
+    if not removed_items or updated_body is None:
+        return request_body, []
+
+    removed_fields = _dedupe_sorted_str_list(
+        [
+            str(item["field"])
+            for item in removed_items
+            if isinstance(item.get("field"), str)
+        ]
+    )
+    updated_body = _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            "xai-adapter-compaction-state-removed",
+            *(
+                f"xai-adapter-compaction-state:{field}"
+                for field in removed_fields
+            ),
+        ],
+        extra_fields={
+            "xai_adapter_compaction_state_removed": True,
+            "xai_adapter_compaction_state_removed_count": len(removed_items),
+            "xai_adapter_compaction_state_removed_fields": removed_fields,
+            "xai_adapter_compaction_state_removed_items": removed_items,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="xai.adapter_compaction_state_removed",
+                    metadata={
+                        "removed_count": len(removed_items),
+                        "removed_fields": removed_fields,
+                    },
+                )
+            ],
+        },
+    )
+    return updated_body, removed_items
+
+
 async def _prepare_oa_xai_passthrough_request(
     request_body: dict[str, Any],
     *,
@@ -1337,6 +1412,12 @@ async def _prepare_oa_xai_passthrough_request(
             request_body.update(updated_body)
         updated_body, _xai_unsupported_request_params = (
             _drop_unsupported_codex_request_params_from_request_body(request_body)
+        )
+        if updated_body is not request_body:
+            request_body.clear()
+            request_body.update(updated_body)
+        updated_body, _xai_compaction_state_removed = (
+            _strip_xai_adapter_compaction_state_from_request_body(request_body)
         )
         if updated_body is not request_body:
             request_body.clear()
@@ -1488,6 +1569,9 @@ async def _prepare_grok_native_oauth_passthrough_request(
     )
     prepared_body, _grok_unsupported_request_params = (
         _drop_unsupported_codex_request_params_from_request_body(prepared_body)
+    )
+    prepared_body, _grok_compaction_state_removed = (
+        _strip_xai_adapter_compaction_state_from_request_body(prepared_body)
     )
     _sanitize_xai_responses_request_body_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
