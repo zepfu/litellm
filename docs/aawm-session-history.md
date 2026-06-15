@@ -203,8 +203,15 @@ display tokens derived from normalized metadata or explicit headers such as
 `x-aawm-client-name`, `x-aawm-client-version`, `user-agent`,
 `x-aawm-agent-name`, and `x-aawm-repository`; LiteLLM omits prompt-like,
 sentence-like, or punctuation-heavy identity values instead of printing raw
-request text. LiteLLM intentionally does not inspect prompt text or raw tool
-arguments for the route log.
+request text. Explicit request metadata wins first, then explicit headers. If
+no repository token is available from those sources, LiteLLM may infer only the
+repository label from bounded, known workspace fields in the parsed request body,
+including `workspace_root`, `project_root`, `working_directory`, `cwd_path`,
+`cwdUri`, `request.metadata.repository`, and Claude/Codex cwd markers such as
+`<cwd>...</cwd>`. Body-derived repository values are normalized to a slug or
+`owner/repo` label, and worktree paths are trimmed back to the repository root
+before logging. LiteLLM does not print raw prompt text or raw tool arguments for
+the route log.
 
 Route logs must not include API keys, authorization headers, full request or
 response bodies, prompt content, tool arguments, or arbitrary query strings.
