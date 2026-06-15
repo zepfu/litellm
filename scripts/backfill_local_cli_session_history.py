@@ -760,6 +760,7 @@ def _base_record(
     metadata: dict[str, Any],
     client_version: Optional[str] = None,
     agent_name: Optional[str] = None,
+    agent_id: Optional[str] = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     total_tokens: Optional[int] = None,
@@ -807,6 +808,7 @@ def _base_record(
         "model": model or "unknown",
         "model_group": model or "unknown",
         "agent_name": agent_name,
+        "agent_id": agent_id,
         "tenant_id": "aawm",
         "call_type": "local_cli_history",
         "start_time": created_at,
@@ -1522,6 +1524,7 @@ INSERT INTO public.session_history (
     model,
     model_group,
     agent_name,
+    agent_id,
     tenant_id,
     call_type,
     start_time,
@@ -1567,8 +1570,8 @@ INSERT INTO public.session_history (
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+    %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
 )
 ON CONFLICT (litellm_call_id) DO NOTHING
 """
@@ -1582,6 +1585,7 @@ INSERT INTO public.session_history_tool_activity (
     provider,
     model,
     agent_name,
+    agent_id,
     tool_index,
     tool_call_id,
     tool_name,
@@ -1595,7 +1599,7 @@ INSERT INTO public.session_history_tool_activity (
     metadata
 ) VALUES (
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb
+    %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb
 )
 ON CONFLICT (litellm_call_id, tool_index) DO NOTHING
 """
@@ -1612,6 +1616,7 @@ def _history_payload(record: dict[str, Any]) -> tuple[Any, ...]:
         record["model"],
         record.get("model_group"),
         record.get("agent_name"),
+        record.get("agent_id"),
         record.get("tenant_id"),
         record.get("call_type"),
         record.get("start_time"),
@@ -1680,6 +1685,7 @@ def _tool_payloads(record: dict[str, Any]) -> list[tuple[Any, ...]]:
                 record.get("provider"),
                 record["model"],
                 record.get("agent_name"),
+                record.get("agent_id"),
                 _safe_int(tool.get("tool_index")) if _safe_int(tool.get("tool_index")) is not None else index,
                 tool.get("tool_call_id"),
                 tool.get("tool_name") or "unknown",

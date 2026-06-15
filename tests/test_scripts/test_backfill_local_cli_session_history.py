@@ -487,12 +487,13 @@ def test_history_payload_should_include_cache_miss_detail() -> None:
     payload = backfill._history_payload(record)
 
     assert backfill.SESSION_HISTORY_INSERT_SQL.count("%s") == len(payload)
-    assert len(payload) == 50
-    assert payload[24] == "write"
-    assert payload[25] is True
-    assert payload[26] == "cache_write_only"
-    assert payload[27] == 10
-    assert abs(payload[28] - 0.0000575) < 0.000000001
+    assert len(payload) == 51
+    assert payload[9] is None
+    assert payload[25] == "write"
+    assert payload[26] is True
+    assert payload[27] == "cache_write_only"
+    assert payload[28] == 10
+    assert abs(payload[29] - 0.0000575) < 0.000000001
 
 
 def test_tool_payload_should_include_backfill_identity() -> None:
@@ -518,6 +519,8 @@ def test_tool_payload_should_include_backfill_identity() -> None:
     [payload] = backfill._tool_payloads(record)
     metadata = json.loads(payload[-1])
 
+    assert len(payload) == 19
+    assert payload[7] is None
     assert metadata["source"] == "unit"
     assert metadata["source_import"] == backfill.IMPORT_MARKER
     assert metadata["parser_version"] == backfill.PARSER_VERSION
