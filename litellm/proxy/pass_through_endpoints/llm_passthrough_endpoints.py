@@ -9679,6 +9679,8 @@ def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     normalized = detail_text.lower()
     if _is_grok_unsupported_reasoning_parameter_detail(normalized):
         return detail_text
+    if "could not decode the compaction blob" in normalized:
+        return detail_text
     if (
         "xai oauth credential" not in normalized
         and "grok oidc credential" not in normalized
@@ -9698,6 +9700,8 @@ def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
         detail_text = str(exc)
     normalized = detail_text.lower()
     if _is_grok_unsupported_reasoning_parameter_detail(normalized):
+        return detail_text
+    if "could not decode the compaction blob" in normalized:
         return detail_text
     if not any(
         marker in normalized
@@ -16388,6 +16392,11 @@ def _drop_unsupported_codex_input_items_from_request_body(
 
         item_type = _normalize_low_cardinality_tag_value(item.get("type"))
         if item_type in unsupported_input_item_types:
+            if item_type == "reasoning" and isinstance(
+                item.get("encrypted_content"), str
+            ):
+                updated_input_items.append(item)
+                continue
             removed_items.append(
                 {
                     "type": item_type,
