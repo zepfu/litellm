@@ -530,6 +530,13 @@ CREATE TABLE IF NOT EXISTS public.rate_limit_observations (
     quota_type TEXT,
     expected_reset_at TIMESTAMPTZ,
     remaining_pct DOUBLE PRECISION,
+    quota_limit DOUBLE PRECISION,
+    quota_used DOUBLE PRECISION,
+    quota_remaining DOUBLE PRECISION,
+    billing_period_start_at TIMESTAMPTZ,
+    billing_period_end_at TIMESTAMPTZ,
+    raw_provider_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
     source TEXT,
     session_id TEXT,
     trace_id TEXT,
@@ -548,6 +555,19 @@ _AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS = (
     "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_type TEXT",
     "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS expected_reset_at TIMESTAMPTZ",
     "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS remaining_pct DOUBLE PRECISION",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_limit DOUBLE PRECISION",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_used DOUBLE PRECISION",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_remaining DOUBLE PRECISION",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS billing_period_start_at TIMESTAMPTZ",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS billing_period_end_at TIMESTAMPTZ",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS raw_provider_fields JSONB DEFAULT '{}'::jsonb",
+    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS evidence JSONB DEFAULT '{}'::jsonb",
+    "UPDATE public.rate_limit_observations SET raw_provider_fields = '{}'::jsonb WHERE raw_provider_fields IS NULL",
+    "UPDATE public.rate_limit_observations SET evidence = '{}'::jsonb WHERE evidence IS NULL",
+    "ALTER TABLE public.rate_limit_observations ALTER COLUMN raw_provider_fields SET DEFAULT '{}'::jsonb",
+    "ALTER TABLE public.rate_limit_observations ALTER COLUMN evidence SET DEFAULT '{}'::jsonb",
+    "ALTER TABLE public.rate_limit_observations ALTER COLUMN raw_provider_fields SET NOT NULL",
+    "ALTER TABLE public.rate_limit_observations ALTER COLUMN evidence SET NOT NULL",
     """
 DO $$
 BEGIN
@@ -749,8 +769,6 @@ END $$;
     "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS response_model",
     "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_name",
     "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_user_agent",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS raw_provider_fields",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS evidence",
     "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS metadata",
     "DELETE FROM public.rate_limit_observations WHERE source LIKE 'claude_statusline%'",
     """
@@ -1785,10 +1803,17 @@ WITH candidate AS (
         $9::text AS quota_type,
         $10::timestamptz AS expected_reset_at,
         $11::double precision AS remaining_pct,
-        $12::text AS source,
-        $13::text AS session_id,
-        $14::text AS trace_id,
-        $15::text AS litellm_call_id
+        $12::double precision AS quota_limit,
+        $13::double precision AS quota_used,
+        $14::double precision AS quota_remaining,
+        $15::timestamptz AS billing_period_start_at,
+        $16::timestamptz AS billing_period_end_at,
+        $17::jsonb AS raw_provider_fields,
+        $18::jsonb AS evidence,
+        $19::text AS source,
+        $20::text AS session_id,
+        $21::text AS trace_id,
+        $22::text AS litellm_call_id
 ),
 locked AS (
     SELECT pg_advisory_xact_lock(
@@ -1817,6 +1842,13 @@ INSERT INTO public.rate_limit_observations (
     quota_type,
     expected_reset_at,
     remaining_pct,
+    quota_limit,
+    quota_used,
+    quota_remaining,
+    billing_period_start_at,
+    billing_period_end_at,
+    raw_provider_fields,
+    evidence,
     source,
     session_id,
     trace_id,
@@ -1834,6 +1866,13 @@ SELECT
     candidate.quota_type,
     candidate.expected_reset_at,
     candidate.remaining_pct,
+    candidate.quota_limit,
+    candidate.quota_used,
+    candidate.quota_remaining,
+    candidate.billing_period_start_at,
+    candidate.billing_period_end_at,
+    COALESCE(candidate.raw_provider_fields, '{}'::jsonb),
+    COALESCE(candidate.evidence, '{}'::jsonb),
     candidate.source,
     candidate.session_id,
     candidate.trace_id,
@@ -1848,7 +1887,13 @@ WHERE NOT EXISTS (
             latest.quota_period,
             latest.quota_type,
             latest.expected_reset_at,
-            latest.remaining_pct
+            latest.remaining_pct,
+            latest.quota_limit,
+            latest.quota_used,
+            latest.quota_remaining,
+            latest.billing_period_start_at,
+            latest.billing_period_end_at,
+            latest.raw_provider_fields
         FROM public.rate_limit_observations AS latest
         WHERE latest.provider = candidate.provider
           AND latest.quota_key = candidate.quota_key
@@ -1870,6 +1915,12 @@ WHERE NOT EXISTS (
           )
       )
       AND latest.remaining_pct IS NOT DISTINCT FROM candidate.remaining_pct
+      AND latest.quota_limit IS NOT DISTINCT FROM candidate.quota_limit
+      AND latest.quota_used IS NOT DISTINCT FROM candidate.quota_used
+      AND latest.quota_remaining IS NOT DISTINCT FROM candidate.quota_remaining
+      AND latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at
+      AND latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at
+      AND latest.raw_provider_fields IS NOT DISTINCT FROM COALESCE(candidate.raw_provider_fields, '{}'::jsonb)
 )
 """
 _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL = """
@@ -1902,6 +1953,11 @@ SELECT
     NULL::text AS exhaustion_kind,
     NULL::integer AS reset_hint_seconds,
     model,
+    quota_limit,
+    quota_used,
+    quota_remaining,
+    billing_period_start_at,
+    billing_period_end_at,
     NULL::text AS model_family,
     NULL::text AS model_tier,
     NULL::text AS parent_limit_key,
@@ -1914,8 +1970,8 @@ SELECT
     client AS client_name,
     client_version,
     NULL::text AS client_user_agent,
-    '{}'::jsonb AS raw_provider_fields,
-    '{}'::jsonb AS evidence,
+    COALESCE(raw_provider_fields, '{}'::jsonb) AS raw_provider_fields,
+    COALESCE(evidence, '{}'::jsonb) AS evidence,
     '{}'::jsonb AS metadata
 FROM public.rate_limit_observations
 WHERE quota_key = $1
@@ -6204,6 +6260,11 @@ def _rate_limit_snapshot_signature(observation: Dict[str, Any]) -> Tuple[Any, ..
         _safe_int(observation.get("remaining_requests")),
         _safe_int(observation.get("used_requests")),
         _safe_int(observation.get("total_requests")),
+        _rate_limit_storage_quota_limit(observation),
+        _rate_limit_storage_quota_used(observation),
+        _rate_limit_storage_quota_remaining(observation),
+        _rate_limit_storage_billing_period_start_at(observation),
+        _rate_limit_storage_billing_period_end_at(observation),
         _clean_non_empty_string(observation.get("status")),
         bool(observation.get("exhausted")),
         _clean_non_empty_string(observation.get("exhaustion_kind")),
@@ -7086,6 +7147,21 @@ def _extract_xai_oauth_header_rate_limit_observations(
                         "quota_type": limit_scope,
                         "provider_resets_at": provider_resets_at,
                         "remaining_pct": remaining_pct,
+                        "quota_limit": float(total) if total is not None else None,
+                        "quota_used": float(used) if used is not None else None,
+                        "quota_remaining": (
+                            float(remaining) if remaining is not None else None
+                        ),
+                        "billing_period_end_at": provider_resets_at
+                        if reset_source
+                        in {
+                            "payload_billing_period_end",
+                            "payload_config_billing_period_end",
+                            "metadata_billing_period_end",
+                            "metadata_xai_oauth_billing_period_end",
+                            "xai_grok_subscription_month_boundary",
+                        }
+                        else None,
                         "used_percentage": used_percentage,
                         "remaining_requests": remaining,
                         "used_requests": used,
@@ -7218,6 +7294,8 @@ def _extract_grok_billing_observations(
         remaining_pct = int(
             math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
         )
+        quota_remaining = max(0.0, monthly_limit - used)
+        billing_period_start_at = _parse_provider_timestamp(config.get("billingPeriodStart"))
         provider_resets_at = _parse_provider_timestamp(config.get("billingPeriodEnd"))
         model = (
             _clean_non_empty_string(context.get("model"))
@@ -7240,6 +7318,11 @@ def _extract_grok_billing_observations(
                     "quota_type": "requests",
                     "provider_resets_at": provider_resets_at,
                     "remaining_pct": float(remaining_pct),
+                    "quota_limit": monthly_limit,
+                    "quota_used": used,
+                    "quota_remaining": quota_remaining,
+                    "billing_period_start_at": billing_period_start_at,
+                    "billing_period_end_at": provider_resets_at,
                     "used_percentage": float(100 - remaining_pct),
                     "model": model,
                     "model_family": "grok",
@@ -16431,6 +16514,116 @@ def _rate_limit_storage_remaining_pct(record: Dict[str, Any]) -> Optional[float]
     return None
 
 
+def _rate_limit_storage_numeric_detail(
+    record: Dict[str, Any],
+    key: str,
+    *raw_paths: str,
+) -> Optional[float]:
+    direct_value = _nonnegative_float_or_none(record.get(key))
+    if direct_value is not None:
+        return direct_value
+    raw_provider_fields = record.get("raw_provider_fields")
+    if not isinstance(raw_provider_fields, dict):
+        return None
+    for raw_path in raw_paths:
+        value: Any = raw_provider_fields
+        for part in raw_path.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = None
+                break
+        normalized = _nonnegative_float_or_none(value.get("val") if isinstance(value, dict) else value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _rate_limit_storage_quota_limit(record: Dict[str, Any]) -> Optional[float]:
+    return _first_non_none(
+        _rate_limit_storage_numeric_detail(
+            record,
+            "quota_limit",
+            "monthlyLimit",
+            "total",
+            "limit",
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-limit-tokens",
+        ),
+        _nonnegative_float_or_none(record.get("total_requests")),
+    )
+
+
+def _rate_limit_storage_quota_used(record: Dict[str, Any]) -> Optional[float]:
+    return _first_non_none(
+        _rate_limit_storage_numeric_detail(record, "quota_used", "used"),
+        _nonnegative_float_or_none(record.get("used_requests")),
+    )
+
+
+def _rate_limit_storage_quota_remaining(record: Dict[str, Any]) -> Optional[float]:
+    return _first_non_none(
+        _rate_limit_storage_numeric_detail(
+            record,
+            "quota_remaining",
+            "remaining",
+            "x-ratelimit-remaining-requests",
+            "x-ratelimit-remaining-tokens",
+        ),
+        _nonnegative_float_or_none(record.get("remaining_requests")),
+    )
+
+
+def _rate_limit_storage_timestamp_detail(
+    record: Dict[str, Any],
+    key: str,
+    *raw_paths: str,
+) -> Optional[datetime]:
+    direct_value = _parse_provider_timestamp(record.get(key))
+    if direct_value is not None:
+        return direct_value
+    raw_provider_fields = record.get("raw_provider_fields")
+    if not isinstance(raw_provider_fields, dict):
+        return None
+    for raw_path in raw_paths:
+        value: Any = raw_provider_fields
+        for part in raw_path.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = None
+                break
+        parsed = _parse_provider_timestamp(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _rate_limit_storage_billing_period_start_at(
+    record: Dict[str, Any],
+) -> Optional[datetime]:
+    return _rate_limit_storage_timestamp_detail(
+        record,
+        "billing_period_start_at",
+        "billingPeriodStart",
+    )
+
+
+def _rate_limit_storage_billing_period_end_at(
+    record: Dict[str, Any],
+) -> Optional[datetime]:
+    return _first_non_none(
+        _rate_limit_storage_timestamp_detail(
+            record,
+            "billing_period_end_at",
+            "billingPeriodEnd",
+        ),
+        _parse_provider_timestamp(record.get("provider_resets_at"))
+        if record.get("quota_period") == "monthly"
+        else None,
+    )
+
+
 def _build_rate_limit_observation_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
     return (
         record["observed_at"],
@@ -16444,6 +16637,13 @@ def _build_rate_limit_observation_db_payload(record: Dict[str, Any]) -> Tuple[An
         _rate_limit_storage_quota_type(record),
         record.get("provider_resets_at"),
         _rate_limit_storage_remaining_pct(record),
+        _rate_limit_storage_quota_limit(record),
+        _rate_limit_storage_quota_used(record),
+        _rate_limit_storage_quota_remaining(record),
+        _rate_limit_storage_billing_period_start_at(record),
+        _rate_limit_storage_billing_period_end_at(record),
+        json.dumps(_json_safe_rate_limit_value(record.get("raw_provider_fields") or {})),
+        json.dumps(_json_safe_rate_limit_value(record.get("evidence") or {})),
         record.get("source"),
         record.get("session_id"),
         record.get("trace_id"),
@@ -16730,6 +16930,11 @@ async def _fetch_previous_rate_limit_observation(
                 "exhaustion_kind",
                 "reset_hint_seconds",
                 "model",
+                "quota_limit",
+                "quota_used",
+                "quota_remaining",
+                "billing_period_start_at",
+                "billing_period_end_at",
                 "model_family",
                 "model_tier",
                 "parent_limit_key",
