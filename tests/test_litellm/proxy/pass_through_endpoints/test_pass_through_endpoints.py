@@ -265,6 +265,131 @@ def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
     assert "/home/zepfu/projects" not in line
 
 
+def test_build_aawm_route_access_log_line_infers_repository_from_claude_cwd() -> None:
+    request = _build_aawm_route_log_request(
+        headers={"user-agent": "claude-cli/2.1.177"}
+    )
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "<environment_context>\n"
+                    "<cwd>/home/zepfu/projects/dashboard-shell</cwd>\n"
+                    "</environment_context>"
+                ),
+            }
+        ],
+        "litellm_metadata": {
+            "agent_name": "engineer",
+            "requested_model_alias": "aawm-code-anthropic",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://cli-chat-proxy.grok.com/v1/responses",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "ROUTE: claude-cli/2.1.177 - 2026-06-14 19:31:05 - "
+        "engineer@dashboard-shell - "
+        "grok-composer-2.5-fast(aawm-code-anthropic) - "
+    )
+    assert "/home/zepfu/projects" not in line
+    assert "<cwd>" not in line
+
+
+def test_build_aawm_route_access_log_line_normalizes_worktree_cwd_to_repo() -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "cwd: "
+                    "/home/zepfu/projects/dashboard-shell/.claude/worktrees/agent-123"
+                ),
+            }
+        ],
+        "litellm_metadata": {"agent_name": "engineer"},
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "ROUTE: 2026-06-14 19:31:05 - engineer@dashboard-shell - "
+    )
+    assert ".claude" not in line
+    assert "worktrees" not in line
+    assert "agent-123" not in line
+    assert "/home/zepfu/projects" not in line
+
+
+def test_build_aawm_route_access_log_line_infers_codex_workspace_repository() -> None:
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/openai_passthrough/responses",
+        headers={"user-agent": "codex-tui/0.139.0"},
+    )
+    request_body = {
+        "model": "gpt-5.5",
+        "input": "hello",
+        "workspace_root": "/home/zepfu/projects/litellm",
+        "litellm_metadata": {
+            "agent_name": "orchestrator",
+            "requested_model_alias": "aawm-code",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "ROUTE: codex-tui/0.139.0 - 2026-06-14 19:31:05 - "
+        "orchestrator@litellm - gpt-5.5(aawm-code) - "
+    )
+    assert "/home/zepfu/projects" not in line
+
+
+def test_build_aawm_route_access_log_line_omits_alias_with_body_repository() -> None:
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/openai_passthrough/responses",
+        headers={"user-agent": "codex-tui/0.139.0"},
+    )
+    request_body = {
+        "model": "gpt-5.5",
+        "request": {"metadata": {"workspace_root": "/home/zepfu/projects/litellm"}},
+        "litellm_metadata": {
+            "agent_name": "orchestrator",
+            "requested_model_alias": "gpt-5.5",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert "orchestrator@litellm - gpt-5.5 - " in line
+    assert "gpt-5.5(gpt-5.5)" not in line
+    assert "/home/zepfu/projects" not in line
+
+
 def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> None:
     request = _build_aawm_route_log_request()
     request_body = {

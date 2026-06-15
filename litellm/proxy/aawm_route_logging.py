@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from typing import Any, Callable, Optional, Union
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -99,6 +100,103 @@ _AAWM_ROUTE_LOG_SELECTED_MODEL_METADATA_KEYS = (
     "xai_oauth_upstream_model",
     "grok_model_override",
 )
+_AAWM_ROUTE_LOG_REPOSITORY_BODY_PATHS = (
+    ("repository",),
+    ("repo",),
+    ("workspace_root",),
+    ("workspaceRoot",),
+    ("project_root",),
+    ("projectRoot",),
+    ("root_path",),
+    ("rootPath",),
+    ("working_directory",),
+    ("workingDirectory",),
+    ("cwd_path",),
+    ("cwdPath",),
+    ("cwd_uri",),
+    ("cwdUri",),
+    ("metadata", "repository"),
+    ("metadata", "repo"),
+    ("metadata", "workspace_root"),
+    ("metadata", "workspaceRoot"),
+    ("litellm_metadata", "repository"),
+    ("litellm_metadata", "repo"),
+    ("litellm_metadata", "workspace_root"),
+    ("litellm_metadata", "workspaceRoot"),
+    ("request", "repository"),
+    ("request", "repo"),
+    ("request", "workspace_root"),
+    ("request", "workspaceRoot"),
+    ("request", "project_root"),
+    ("request", "projectRoot"),
+    ("request", "root_path"),
+    ("request", "rootPath"),
+    ("request", "working_directory"),
+    ("request", "workingDirectory"),
+    ("request", "cwd_path"),
+    ("request", "cwdPath"),
+    ("request", "cwd_uri"),
+    ("request", "cwdUri"),
+    ("request", "metadata", "repository"),
+    ("request", "metadata", "repo"),
+    ("request", "metadata", "workspace_root"),
+    ("request", "metadata", "workspaceRoot"),
+    ("request", "litellm_metadata", "repository"),
+    ("request", "litellm_metadata", "repo"),
+)
+_AAWM_ROUTE_LOG_REPOSITORY_BODY_KEYS = frozenset(
+    path[-1] for path in _AAWM_ROUTE_LOG_REPOSITORY_BODY_PATHS
+)
+_AAWM_ROUTE_LOG_REPOSITORY_TEXT_PATTERNS = (
+    re.compile(
+        r"<environment_context>[\s\S]{0,2000}<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>",
+        re.IGNORECASE,
+    ),
+    re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>", re.IGNORECASE),
+    re.compile(
+        r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)", re.IGNORECASE),
+    re.compile(
+        r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
+        re.IGNORECASE,
+    ),
+)
+_AAWM_ROUTE_LOG_REPOSITORY_PLACEHOLDER_VALUES = {
+    "...",
+    "memories",
+    "new",
+    "path",
+    "project",
+    "remote",
+    "repo",
+    "repository",
+    "unknown",
+}
+_AAWM_ROUTE_LOG_REPOSITORY_AGENT_ROLE_VALUES = {
+    "agent",
+    "analyst",
+    "architect",
+    "engineer",
+    "infra",
+    "ops",
+    "orchestrator",
+    "principal",
+    "qa",
+    "researcher",
+    "reviewer",
+    "salvage",
+    "tester",
+}
+_AAWM_ROUTE_LOG_REPOSITORY_AGENT_ID_RE = re.compile(
+    r"^agent-[a-f0-9]{3,}$",
+    re.IGNORECASE,
+)
+_AAWM_ROUTE_LOG_REPOSITORY_WAVE_AGENT_RE = re.compile(
+    r"^w\d+(?:[-_ ].*)?$",
+    re.IGNORECASE,
+)
 
 
 def _clean_aawm_route_log_field(value: Any) -> Optional[str]:
@@ -167,11 +265,35 @@ def _normalize_aawm_route_log_repository_label(value: Any) -> Optional[str]:
             owner, repo = path_parts
             if _is_aawm_route_log_slug(owner) and _is_aawm_route_log_slug(repo):
                 return f"{owner}/{repo}"
+        path_parts = _trim_aawm_route_log_worktree_path_parts(path_parts)
         cleaned = path_parts[-1]
+
+    normalized = cleaned.lower()
+    if (
+        normalized in _AAWM_ROUTE_LOG_REPOSITORY_PLACEHOLDER_VALUES
+        or normalized in _AAWM_ROUTE_LOG_REPOSITORY_AGENT_ROLE_VALUES
+        or _AAWM_ROUTE_LOG_REPOSITORY_AGENT_ID_RE.fullmatch(normalized)
+        or _AAWM_ROUTE_LOG_REPOSITORY_WAVE_AGENT_RE.fullmatch(normalized)
+    ):
+        return None
 
     if _is_aawm_route_log_slug(cleaned):
         return cleaned
     return None
+
+
+def _trim_aawm_route_log_worktree_path_parts(path_parts: list[str]) -> list[str]:
+    for marker in (".claude", ".codex", ".agents"):
+        if marker in path_parts:
+            marker_index = path_parts.index(marker)
+            if marker_index > 0:
+                return path_parts[:marker_index]
+    for marker in ("worktrees", "worktree"):
+        if marker in path_parts:
+            marker_index = path_parts.index(marker)
+            if marker_index > 0:
+                return path_parts[:marker_index]
+    return path_parts
 
 
 def _normalize_aawm_route_log_client_product(value: Any) -> Optional[str]:
@@ -204,6 +326,80 @@ def _first_aawm_route_log_value(
             value = normalizer(source.get(key))
             if value:
                 return value
+    return None
+
+
+def _get_nested_aawm_route_log_value(
+    source: dict[str, Any],
+    path: tuple[str, ...],
+) -> Optional[Any]:
+    current: Any = source
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_aawm_route_log_repository_from_text(value: str) -> Optional[str]:
+    for pattern in _AAWM_ROUTE_LOG_REPOSITORY_TEXT_PATTERNS:
+        matches = list(pattern.finditer(value))
+        for match in reversed(matches):
+            repository = _normalize_aawm_route_log_repository_label(
+                match.group("path")
+            )
+            if repository:
+                return repository
+    return None
+
+
+def _extract_aawm_route_log_repository_from_body_text(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return _extract_aawm_route_log_repository_from_text(value)
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in _AAWM_ROUTE_LOG_REPOSITORY_BODY_KEYS and isinstance(child, str):
+                repository = _normalize_aawm_route_log_repository_label(child)
+                if repository:
+                    return repository
+            repository = _extract_aawm_route_log_repository_from_body_text(child)
+            if repository:
+                return repository
+    if isinstance(value, list):
+        for child in reversed(value):
+            repository = _extract_aawm_route_log_repository_from_body_text(child)
+            if repository:
+                return repository
+    return None
+
+
+def _extract_aawm_route_log_repository_from_body(
+    request_body: Optional[dict[str, Any]],
+    kwargs: Optional[dict],
+) -> Optional[str]:
+    body_candidates: list[dict[str, Any]] = []
+    if isinstance(request_body, dict):
+        body_candidates.append(request_body)
+    if isinstance(kwargs, dict):
+        passthrough_logging_payload = kwargs.get("passthrough_logging_payload")
+        payload_body = getattr(passthrough_logging_payload, "request_body", None)
+        if isinstance(payload_body, dict):
+            body_candidates.append(payload_body)
+        elif isinstance(passthrough_logging_payload, dict):
+            payload_body = passthrough_logging_payload.get("request_body")
+            if isinstance(payload_body, dict):
+                body_candidates.append(payload_body)
+
+    for body in body_candidates:
+        for path in _AAWM_ROUTE_LOG_REPOSITORY_BODY_PATHS:
+            value = _get_nested_aawm_route_log_value(body, path)
+            if isinstance(value, str):
+                repository = _normalize_aawm_route_log_repository_label(value)
+                if repository:
+                    return repository
+        repository = _extract_aawm_route_log_repository_from_body_text(body)
+        if repository:
+            return repository
     return None
 
 
@@ -434,6 +630,9 @@ def build_aawm_route_access_log_line(
         headers,
         _AAWM_ROUTE_LOG_REPOSITORY_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_repository_label,
+    ) or _extract_aawm_route_log_repository_from_body(
+        request_body,
+        kwargs,
     )
     model_label = _get_aawm_route_log_model_label(request_body, metadata)
     client_label = _get_aawm_route_client_label(request)
