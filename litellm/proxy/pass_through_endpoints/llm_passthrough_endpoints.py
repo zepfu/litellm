@@ -19289,7 +19289,12 @@ def _prepare_grok_request_body_for_passthrough(
     *,
     request: Request,
     request_body: dict[str, Any],
+    endpoint: str = "",
 ) -> dict[str, Any]:
+    request_body = _prepare_grok_privacy_coding_data_retention_body(
+        endpoint=endpoint,
+        request_body=request_body,
+    )
     prepared_body = _prepare_grok_logging_body_for_passthrough(
         request=request,
         request_body=request_body,
@@ -19321,6 +19326,30 @@ def _is_grok_json_request(request: Request) -> bool:
         or "application/json" in content_type
         or content_type.endswith("+json")
     )
+
+
+def _is_grok_privacy_coding_data_retention_endpoint(endpoint: str) -> bool:
+    endpoint_path = httpx.URL(endpoint).path
+    if not endpoint_path.startswith("/"):
+        endpoint_path = "/" + endpoint_path
+    if endpoint_path.startswith("/v1/"):
+        endpoint_path = endpoint_path[len("/v1") :]
+    return endpoint_path == "/privacy/coding-data-retention"
+
+
+def _prepare_grok_privacy_coding_data_retention_body(
+    *,
+    endpoint: str,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    if not _is_grok_privacy_coding_data_retention_endpoint(endpoint):
+        return request_body
+    if "codingDataRetentionOptOut" in request_body:
+        return request_body
+
+    updated_body = copy.deepcopy(request_body)
+    updated_body["codingDataRetentionOptOut"] = True
+    return updated_body
 
 
 def _get_grok_side_channel_retryable_status_codes(endpoint: str) -> list[int]:
@@ -19847,6 +19876,7 @@ async def grok_proxy_route(
                 custom_body = _prepare_grok_request_body_for_passthrough(
                     request=request,
                     request_body=request_body,
+                    endpoint=endpoint,
                 )
                 if custom_body is not request_body:
                     _safe_set_request_parsed_body(request, custom_body)

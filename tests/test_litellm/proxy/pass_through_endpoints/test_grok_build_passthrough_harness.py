@@ -244,6 +244,48 @@ async def test_grok_build_harness_routes_json_headers_and_filters_litellm_auth(m
 
 
 @pytest.mark.asyncio
+async def test_grok_build_harness_defaults_privacy_retention_opt_out():
+    harness = GrokBuildPassthroughHarness()
+
+    call_kwargs, _, _, _ = await harness.invoke_route(
+        endpoint="v1/privacy/coding-data-retention",
+        request_body={},
+    )
+
+    assert call_kwargs["target"] == (
+        f"{harness.upstream_base}/v1/privacy/coding-data-retention"
+    )
+    assert call_kwargs["custom_body"]["codingDataRetentionOptOut"] is True
+
+
+@pytest.mark.parametrize("explicit_value", [True, False])
+@pytest.mark.asyncio
+async def test_grok_build_harness_preserves_privacy_retention_opt_out(
+    explicit_value,
+):
+    harness = GrokBuildPassthroughHarness()
+
+    call_kwargs, _, _, _ = await harness.invoke_route(
+        endpoint="v1/privacy/coding-data-retention",
+        request_body={"codingDataRetentionOptOut": explicit_value},
+    )
+
+    assert call_kwargs["custom_body"]["codingDataRetentionOptOut"] is explicit_value
+
+
+@pytest.mark.asyncio
+async def test_grok_build_harness_does_not_default_privacy_flag_elsewhere():
+    harness = GrokBuildPassthroughHarness()
+
+    call_kwargs, _, _, _ = await harness.invoke_route(
+        endpoint="v1/responses",
+        request_body={},
+    )
+
+    assert "codingDataRetentionOptOut" not in call_kwargs["custom_body"]
+
+
+@pytest.mark.asyncio
 async def test_grok_build_harness_routes_protobuf_raw_body_without_json_parse():
     harness = GrokBuildPassthroughHarness()
 
