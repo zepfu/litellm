@@ -2710,6 +2710,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "rate_limited"
     if status_code in {503, 529}:
         return "upstream_overloaded"
+    if status_code == 504:
+        return "upstream_timeout"
     return None
 
 
