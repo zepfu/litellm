@@ -181,7 +181,7 @@ async def get_xai_oauth_access_token() -> str:
         )
 
 
-async def get_grok_native_oauth_access_token() -> str:
+async def get_grok_native_oauth_access_token(*, force_refresh: bool = False) -> str:
     credential_path = default_grok_xai_oauth_auth_path()
     scope = (
         get_secret_str("LITELLM_XAI_GROK_OAUTH_SCOPE")
@@ -196,6 +196,7 @@ async def get_grok_native_oauth_access_token() -> str:
             scope=scope,
             lock_path=default_grok_xai_oauth_auth_lock_path(credential_path),
             is_grok_native_oauth=True,
+            force_refresh=force_refresh,
         )
 
 
@@ -463,6 +464,7 @@ async def _get_xai_oauth_access_token_locked(
     scope: str,
     lock_path: Optional[Path] = None,
     is_grok_native_oauth: bool,
+    force_refresh: bool = False,
 ) -> str:
     with _credential_file_lock(lock_path):
         if is_grok_native_oauth:
@@ -470,7 +472,7 @@ async def _get_xai_oauth_access_token_locked(
         raw_payload = _read_credential_payload(credential_path)
         credential = _select_credential_record(raw_payload, scope)
         token = _credential_access_token(credential)
-        if token and not _credential_needs_refresh(credential):
+        if token and not force_refresh and not _credential_needs_refresh(credential):
             return token
 
         refreshed = await _refresh_xai_oauth_credential(
@@ -544,25 +546,33 @@ def _sync_grok_native_oauth_seed_credential(credential_path: Path) -> None:
         return
 
     try:
-        seed_stat = seed_path.stat()
-    except FileNotFoundError:
+        seed_payload = _read_json_object(
+            seed_path,
+            description="Grok OIDC seed auth file",
+        )
+    except (ValueError, FileNotFoundError):
+        return
+
+    managed_exists = credential_path.exists()
+    if not managed_exists:
+        _write_credential_payload(credential_path, seed_payload)
         return
 
     try:
-        credential_stat = credential_path.stat()
-    except FileNotFoundError:
-        should_sync = True
-    else:
-        should_sync = seed_stat.st_mtime_ns > credential_stat.st_mtime_ns
-
-    if not should_sync:
+        managed_payload = _read_credential_payload(credential_path)
+    except ValueError:
+        _write_credential_payload(credential_path, seed_payload)
         return
 
-    seed_payload = _read_json_object(
-        seed_path,
-        description="Grok OIDC seed auth file",
+    scope = (
+        get_secret_str("LITELLM_XAI_GROK_OAUTH_SCOPE")
+        or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
+        or _DEFAULT_XAI_OAUTH_SCOPE
     )
-    _write_credential_payload(credential_path, seed_payload)
+    seed_record = _select_credential_record_if_present(seed_payload, scope)
+    managed_record = _select_credential_record_if_present(managed_payload, scope)
+    if _seed_credential_should_replace_managed(seed_record, managed_record):
+        _write_credential_payload(credential_path, seed_payload)
 
 
 def _select_credential_record(
@@ -584,6 +594,77 @@ def _select_credential_record(
         "xAI OAuth credential file does not contain a usable credential record. "
         "Expected a Grok-style scoped record or a flat object with key/access_token."
     )
+
+
+def _select_credential_record_if_present(
+    payload: Dict[str, Any],
+    scope: str,
+) -> Optional[Dict[str, Any]]:
+    try:
+        return _select_credential_record(payload, scope)
+    except ValueError:
+        return None
+
+
+def _credential_refresh_state_rank(credential: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(credential, dict):
+        return 0
+    expires_at = _parse_expires_at(credential.get("expires_at"))
+    has_refresh_token = _credential_has_refresh_token(credential)
+    if expires_at is None:
+        return 2 if has_refresh_token else 1
+    if _credential_needs_refresh(credential):
+        return 2 if has_refresh_token else 1
+    return 4
+
+
+def _credential_has_refresh_token(credential: Dict[str, Any]) -> bool:
+    refresh_token = credential.get("refresh_token")
+    return isinstance(refresh_token, str) and bool(refresh_token.strip())
+
+
+def _seed_credential_should_replace_managed(
+    seed_record: Optional[Dict[str, Any]],
+    managed_record: Optional[Dict[str, Any]],
+) -> bool:
+    if not isinstance(seed_record, dict) or not _looks_like_credential_record(seed_record):
+        return False
+    if not isinstance(managed_record, dict) or not _looks_like_credential_record(
+            managed_record
+    ):
+        return True
+
+    seed_has_refresh_token = _credential_has_refresh_token(seed_record)
+    managed_has_refresh_token = _credential_has_refresh_token(managed_record)
+    if managed_has_refresh_token and not seed_has_refresh_token:
+        return False
+    if seed_has_refresh_token and not managed_has_refresh_token:
+        return True
+
+    seed_expires_at = _parse_expires_at(seed_record.get("expires_at"))
+    managed_expires_at = _parse_expires_at(managed_record.get("expires_at"))
+    if seed_expires_at is not None and managed_expires_at is not None:
+        if seed_expires_at > managed_expires_at:
+            return True
+        if managed_expires_at > seed_expires_at:
+            return False
+        if _credential_needs_refresh(seed_record) and _credential_needs_refresh(
+            managed_record
+        ):
+            return True
+
+    seed_rank = _credential_refresh_state_rank(seed_record)
+    managed_rank = _credential_refresh_state_rank(managed_record)
+    if seed_rank > managed_rank:
+        return True
+    if managed_rank > seed_rank:
+        return False
+
+    if managed_expires_at is not None and seed_expires_at is None:
+        return False
+    if seed_expires_at is not None and managed_expires_at is None:
+        return True
+    return False
 
 
 def _looks_like_credential_record(value: Dict[str, Any]) -> bool:
@@ -609,9 +690,13 @@ def _parse_expires_at(value: Any) -> Optional[datetime]:
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        return _datetime_from_epoch_numeric(float(value))
     if isinstance(value, str) and value.strip():
         normalized = value.strip()
+        try:
+            return _datetime_from_epoch_numeric(float(normalized))
+        except ValueError:
+            pass
         if normalized.endswith("Z"):
             normalized = normalized[:-1] + "+00:00"
         try:
@@ -622,6 +707,13 @@ def _parse_expires_at(value: Any) -> Optional[datetime]:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
     return None
+
+
+def _datetime_from_epoch_numeric(raw_value: float) -> datetime:
+    # Grok auth files may persist expiry as epoch seconds or milliseconds.
+    if raw_value >= 1_000_000_000_000:
+        raw_value = raw_value / 1000.0
+    return datetime.fromtimestamp(raw_value, tz=timezone.utc)
 
 
 def _refresh_buffer_seconds() -> int:

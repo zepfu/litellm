@@ -192,10 +192,28 @@ declared alias failover order. Keep `grok-auth.json` separate from the managed
 `oa_xai/*` `oauth-auth.json` file so the two credential families remain
 auditable.
 
-When the read-only Grok CLI seed credential is newer than the LiteLLM-owned
-managed credential, LiteLLM replaces the managed Grok credential from the seed
-before selecting or refreshing an access token. This lets a fresh Grok/OIDC login
-take effect without writing back into `/home/zepfu/.grok`.
+LiteLLM uses the read-only Grok CLI seed as bootstrap input, not as the
+long-term refresh target. If the managed Grok credential is missing or invalid,
+LiteLLM copies the seed into the managed path. If both files contain usable
+credential records, seed replacement is decided by credential semantics such as
+parsed expiry and refresh-token availability, not by file mtime alone. A seed
+with a newer timestamp must not overwrite a longer-lived managed credential just
+because the personal CLI file was touched.
+
+Grok OIDC access tokens can be short-lived even when the refresh credential is
+expected to remain usable for days. LiteLLM parses ISO expiry values as well as
+epoch seconds and milliseconds so it refreshes near-expiry credentials
+reliably. If the Grok CLI proxy rejects a still-recorded-valid token with an
+auth-shaped 401/403 such as `Invalid or expired credentials` or `no auth
+context`, the Grok native adapter forces one refresh of the managed credential
+and retries the same Composer/Grok candidate once before marking that candidate
+unavailable and advancing through the declared alias order.
+
+Codex/Anthropic alias routing records distinct xAI lane keys for the two xAI
+credential families: Grok native OIDC candidates use `xai_grok_oidc`, while
+managed `oa_xai/*` OAuth candidates use `xai_oauth`. They may share subscription
+quota, but auth failures and cooldowns should remain attributable to the
+credential family that actually failed.
 
 Grok native and `oa_xai/*` Responses candidates remove request fields and hosted
 tools that the selected Grok-family model declares unsupported. Direct native
