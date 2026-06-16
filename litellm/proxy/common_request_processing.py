@@ -449,7 +449,7 @@ class ProxyBaseLLMRequestProcessing:
                 request=request,
                 target=target,
                 request_body=self.data,
-                kwargs=self.data,
+                kwargs={**self.data, "aawm_route_type": route_type},
             )
         except Exception:
             verbose_proxy_logger.debug(
