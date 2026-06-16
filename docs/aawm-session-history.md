@@ -297,13 +297,25 @@ continues through oversized `output`, `metadata`, `model_parameters`,
 event fits or all safe fields have been reduced.
 
 Structured metadata and model-parameter fields are replaced with compact
-omission markers instead of partial raw values. Successful fitting that leaves
-the event safely below the warning threshold is debug-only telemetry. Warnings
-are reserved for raw near-limit events, events that remain near the warning
-threshold after fitting, or events that still cannot fit after all safe fields
-have been reduced. Any emitted size summary reports only identifiers, field
-names, byte counts, omission counts, and whether fitting still failed; it must
-not include prompt bodies, response text, tool arguments, credentials, or
+omission markers instead of partial raw values.
+
+Before SDK enqueue, LiteLLM may emit a pre-enqueue size audit when the serialized
+generation is at or above 90% of the configured Langfuse event limit, or when
+input truncation already produced a truncation summary. The audit log line is
+`Langfuse event size audit below SDK limit before enqueue` at debug severity when
+fitting succeeded and `total_size_bytes` is at or below `max_event_size_bytes`,
+even if the payload is still above the 90% audit threshold. Use
+`Langfuse event near/exceeds size limit before SDK enqueue` at warning severity
+when fitting failed (`event_fit_failed`) or the final fitted event still
+exceeds `max_event_size_bytes`. This split keeps large-but-accepted events out
+of warning-level proxy logs while preserving warnings for events that may still
+fail Langfuse ingestion.
+
+Any emitted size summary reports only identifiers (`trace_id`, generation id/name,
+`model`, `call_type`), per-field byte counts (`input`, `output`, `metadata`,
+`model_parameters`, `total_size_bytes`), the largest metadata key sizes
+(`largest_metadata_keys`), omission/truncation counts, and `event_fit_failed`; it
+must not include prompt bodies, response text, tool arguments, credentials, or
 oversized raw metadata values.
 
 ## Tool Definition Snapshots

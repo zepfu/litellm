@@ -2796,6 +2796,16 @@ that pinned base, verifying the prod runtime contains
 deleting the active `.analysis/prod-error.log` after the fixed runtime is
 healthy.
 
+### aawm.78 — D1-276/D1-279 Grok OIDC refresh and Langfuse payload-size logging
+
+**What changed:** The fork release line now includes the post-`aawm.77` Grok native OIDC refresh and candidate-selection fixes plus the Langfuse under-limit payload-size log severity fix. Grok/xAI passthrough and OAuth handling now force credential refresh after auth-shaped upstream failures, keep Composer OIDC and managed xAI OAuth cooldown lanes distinct, and prefer durable managed refresh credentials over seed mtime or access-token expiry alone when selecting Grok OIDC candidates. Langfuse payload-size auditing now logs successful under-limit fits at debug severity instead of warning when the event is below the SDK size threshold.
+
+**Why:** Grok native OIDC failover could keep retrying stale or misclassified candidates after upstream 401/403 or quota-shaped failures, and Langfuse under-limit payload-size messages were noisy enough to look like real ingestion risk during normal large-session traffic.
+
+**Why not upstream:** These changes are AAWM-specific operational behavior for local Grok/xAI alias routing, managed OAuth seed handling, and Langfuse/session-history observability.
+
+**Validation status:** Focused validation for D1-276 and D1-279 passed the Grok OIDC refresh/candidate-selection tests, Langfuse payload-size audit tests, `ruff`, `py_compile`, and `git diff --check`. Production promotion requires publishing `v1.82.3-aawm.78`, rebuilding/restarting `aawm-litellm` from that pinned base, and rerunning the documented prod readiness and harness gates.
+
 ---
 
 
