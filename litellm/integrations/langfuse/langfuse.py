@@ -670,13 +670,9 @@ def _log_langfuse_payload_size_if_needed(
         and isinstance(max_event_size_bytes, int)
         and total_size_bytes > max_event_size_bytes
     )
-    if (
-        input_truncation_summary is not None
-        and not event_fit_failed
-        and not still_over_limit
-    ):
+    if not event_fit_failed and not still_over_limit:
         verbose_logger.debug(
-            "Langfuse event size fitting applied before SDK enqueue: %s",
+            "Langfuse event size audit below SDK limit before enqueue: %s",
             json.dumps(size_summary, sort_keys=True),
         )
         return

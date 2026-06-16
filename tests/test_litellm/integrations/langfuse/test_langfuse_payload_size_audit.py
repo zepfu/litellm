@@ -69,7 +69,8 @@ def test_langfuse_payload_size_summary_reports_identifiers_and_sizes() -> None:
     }
 
 
-def test_langfuse_payload_size_warning_is_sanitized(caplog) -> None:
+def test_langfuse_payload_size_warning_is_sanitized(caplog, monkeypatch) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "900000")
     generation_params = {
         "id": "generation-log",
         "name": "aawm.large",
@@ -97,6 +98,35 @@ def test_langfuse_payload_size_warning_is_sanitized(caplog) -> None:
     assert "raw input should not appear" not in logged_text
     assert "raw output should not appear" not in logged_text
     assert "raw metadata value should not appear" not in logged_text
+
+
+def test_langfuse_payload_size_near_limit_under_max_is_debug(caplog) -> None:
+    generation_params = {
+        "id": "generation-near-log",
+        "name": "aawm.near",
+        "model": "gpt-test",
+        "input": "raw input should not appear",
+        "output": "raw output should not appear" + ("x" * 900_000),
+        "metadata": {"repository": "litellm"},
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
+        _log_langfuse_payload_size_if_needed(
+            generation_params,
+            trace_id="trace-near-log",
+            call_type="completion",
+        )
+
+    warning_records = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert warning_records == []
+    logged_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Langfuse event size audit below SDK limit before enqueue" in logged_text
+    assert "trace-near-log" in logged_text
+    assert "generation-near-log" in logged_text
+    assert "raw input should not appear" not in logged_text
+    assert "raw output should not appear" not in logged_text
 
 
 def test_langfuse_string_input_is_truncated_without_mutating_non_input_fields() -> None:
@@ -231,7 +261,7 @@ def test_langfuse_payload_size_successful_fit_below_threshold_is_not_warning(
     ]
     assert warning_records == []
     logged_text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "Langfuse event size fitting applied before SDK enqueue" in logged_text
+    assert "Langfuse event size audit below SDK limit before enqueue" in logged_text
     assert "trace-log-fit" in logged_text
     assert "generation-log-fit" in logged_text
     assert "original_input_size_bytes" in logged_text
@@ -284,7 +314,7 @@ def test_langfuse_payload_size_successful_fit_still_near_limit_is_debug(
     ]
     assert warning_records == []
     logged_text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "Langfuse event size fitting applied before SDK enqueue" in logged_text
+    assert "Langfuse event size audit below SDK limit before enqueue" in logged_text
     assert "trace-near-limit-fit" in logged_text
     assert "generation-near-limit-fit" in logged_text
     assert "raw output should not appear" not in logged_text
@@ -356,7 +386,7 @@ def test_langfuse_oversized_metadata_is_fit_without_log_value_leak(caplog) -> No
     ]
     assert warning_records == []
     logged_text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "Langfuse event size fitting applied before SDK enqueue" in logged_text
+    assert "Langfuse event size audit below SDK limit before enqueue" in logged_text
     assert "metadata" in logged_text
     assert "field_truncations" in logged_text
     assert "raw metadata value should not appear" not in logged_text
