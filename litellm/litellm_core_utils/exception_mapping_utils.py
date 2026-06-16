@@ -360,6 +360,7 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                 or custom_llm_provider == "text-completion-openai"
                 or custom_llm_provider == "custom_openai"
                 or custom_llm_provider in litellm.openai_compatible_providers
+                or custom_llm_provider == "local_embed"
                 or custom_llm_provider == "mistral"
             ):
                 # custom_llm_provider is openai, make it OpenAI

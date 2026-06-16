@@ -14,6 +14,9 @@ from litellm.litellm_core_utils.exception_mapping_utils import (
     exception_type,
     extract_and_raise_litellm_exception,
 )
+from litellm.llms.hosted_vllm.embedding.transformation import (
+    HostedVLLMEmbeddingError,
+)
 
 # Test cases for is_error_str_context_window_exceeded
 # Tuple format: (error_message, expected_result)
@@ -279,6 +282,27 @@ def test_vertex_ai_rate_limit_error_mapping(error_message, should_raise_rate_lim
                 original_exception=original_exception,
                 custom_llm_provider=custom_llm_provider,
             )
+
+
+def test_local_embed_503_maps_to_service_unavailable():
+    """Local embedding backend warmup should preserve upstream 503 semantics."""
+
+    original_exception = HostedVLLMEmbeddingError(
+        message='{"error":{"message":"Loading model","type":"unavailable_error","code":503}}',
+        status_code=503,
+        headers={},
+    )
+
+    with pytest.raises(litellm.ServiceUnavailableError) as excinfo:
+        exception_type(
+            model="local_embed/nomic-embed-code.Q8_0.gguf",
+            original_exception=original_exception,
+            custom_llm_provider="local_embed",
+        )
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.llm_provider == "local_embed"
+    assert "Loading model" in str(excinfo.value)
 
 
 class TestExtractAndRaiseLitellmException:
