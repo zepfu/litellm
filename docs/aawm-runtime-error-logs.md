@@ -55,6 +55,23 @@ Practical `context` fields to inspect are:
 - `status_code`
 - `trace_id`
 - `litellm_call_id`
+- `callback_name`
+- `callback_phase`
+- `langfuse_failure_class`
+
+When the Langfuse SDK background ingestion consumer emits its generic support
+message (`Unexpected error occurred. Please check your request and contact
+support: https://langfuse.com/support.`), LiteLLM keeps the original message and
+adds structured context for triage:
+
+- `source=langfuse_sdk`
+- `callback_name=langfuse`
+- `callback_phase=sdk_background_ingestion_upload`
+- `langfuse_failure_class=langfuse_sdk_background_ingestion_upload_failure`
+
+Treat that class as a Langfuse ingestion/upload failure signal. Check the
+Langfuse web/worker/blob-storage logs near the same timestamp before assuming
+the LiteLLM callback wrapper itself failed.
 
 Use the structured fields to group and triage failures, but keep
 `.analysis/todo.md` as the source of truth for active work.
