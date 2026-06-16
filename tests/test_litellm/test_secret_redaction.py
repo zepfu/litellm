@@ -324,6 +324,9 @@ def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
         "status_code": 529,
         "trace_id": "trace-123",
         "litellm_call_id": "call-REDACTED",
+        "callback_name": None,
+        "callback_phase": None,
+        "langfuse_failure_class": None,
     }
     assert SECRET not in json.dumps(payload)
 
