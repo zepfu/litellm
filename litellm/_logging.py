@@ -1,11 +1,13 @@
 import ast
 from collections import deque
+import hashlib
+import json
 import logging
 import os
 import re
 import sys
 import threading
-from datetime import datetime
+from datetime import UTC, datetime
 from logging import Formatter
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
@@ -138,7 +140,100 @@ def _get_aawm_error_log_path() -> Optional[str]:
     log_dir = _get_aawm_error_log_dir()
     if not log_dir:
         return None
+    return os.path.join(log_dir, f"{_get_aawm_error_log_environment()}-error.jsonl")
+
+
+def _get_aawm_legacy_error_log_path() -> Optional[str]:
+    """Legacy text sink path retained for migration and discovery."""
+    log_dir = _get_aawm_error_log_dir()
+    if not log_dir:
+        return None
     return os.path.join(log_dir, f"{_get_aawm_error_log_environment()}-error.log")
+
+
+_AAWM_ERROR_LOG_CONTEXT_FIELDS = (
+    "source",
+    "container",
+    "endpoint",
+    "upstream_url",
+    "provider",
+    "model",
+    "model_alias",
+    "route_family",
+    "status_code",
+    "trace_id",
+    "litellm_call_id",
+)
+
+
+def _build_aawm_error_log_context(record: logging.LogRecord) -> Dict[str, Any]:
+    context: Dict[str, Any] = {field: None for field in _AAWM_ERROR_LOG_CONTEXT_FIELDS}
+    for field in _AAWM_ERROR_LOG_CONTEXT_FIELDS:
+        value = getattr(record, field, None)
+        if value is not None:
+            context[field] = value
+    return context
+
+
+def _build_aawm_error_log_fingerprint(
+    *,
+    logger_name: str,
+    level: str,
+    message: str,
+    traceback_text: Optional[str],
+    context: Dict[str, Any],
+) -> str:
+    fingerprint_source = {
+        "context": context,
+        "logger": logger_name,
+        "level": level,
+        "message": message,
+        "traceback": traceback_text,
+        "traceback_text": traceback_text,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint_source,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_aawm_error_log_record(
+    record: logging.LogRecord,
+    *,
+    formatter: logging.Formatter,
+) -> Dict[str, Any]:
+    context = _build_aawm_error_log_context(record)
+    message = record.getMessage()
+    traceback_text: Optional[str] = None
+    traceback_lines: List[str] = []
+    if record.exc_info and record.exc_info[1] is not None:
+        traceback_text = record.exc_text or formatter.formatException(record.exc_info)
+        traceback_lines = traceback_text.splitlines()
+
+    return {
+        "schema_version": 1,
+        "observed_at": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+        "environment": _get_aawm_error_log_environment(),
+        "logger": record.name,
+        "level": record.levelname,
+        "message": message,
+        "traceback": traceback_text,
+        "traceback_text": traceback_text,
+        "traceback_lines": traceback_lines,
+        "raw_text": formatter.format(record),
+        "fingerprint": _build_aawm_error_log_fingerprint(
+            logger_name=record.name,
+            level=record.levelname,
+            message=message,
+            traceback_text=traceback_text,
+            context=context,
+        ),
+        "context": context,
+    }
 
 
 class AawmErrorLogFileHandler(logging.Handler):
@@ -168,13 +263,12 @@ class AawmErrorLogFileHandler(logging.Handler):
 
         self._emit_state.active = True
         try:
-            message = self.format(record)
+            payload = _build_aawm_error_log_record(record, formatter=self._formatter)
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with open(log_path, "a", encoding="utf-8") as error_log:
-                    error_log.write(message)
-                    if not message.endswith("\n"):
-                        error_log.write("\n")
+                    error_log.write(safe_dumps(payload))
+                    error_log.write("\n")
         except Exception:
             # Never let local error-intake logging break application logging.
             return
