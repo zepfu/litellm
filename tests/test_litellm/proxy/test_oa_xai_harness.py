@@ -19,6 +19,7 @@ from litellm.integrations.aawm_agent_identity import (
 )
 from litellm.llms.xai import oauth
 from litellm.proxy.route_llm_request import route_request
+from litellm.responses.utils import ResponsesAPIRequestUtils
 
 
 class OaXaiHarness:
@@ -656,6 +657,90 @@ async def test_oa_xai_harness_routes_litellm_client_to_upstream_oauth(
     assert "authorization" not in harness.request_data(public_model)
     assert "api_key" not in harness.request_data(public_model)
     assert "api_base" not in harness.request_data(public_model)
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_harness_decodes_previous_response_id_before_responses_egress():
+    harness = OaXaiHarness()
+    public_model = "oa_xai/grok-4.3"
+    original_response_id = "resp_xai_upstream_compaction_blob"
+    encoded_response_id = ResponsesAPIRequestUtils._build_responses_api_response_id(
+        custom_llm_provider="xai",
+        model_id="oa-xai-deployment-id",
+        response_id=original_response_id,
+    )
+    data = {
+        "model": public_model,
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_direct_oa_xai_compaction",
+                "summary": [],
+                "encrypted_content": "encrypted-direct-oa-xai-compaction",
+            },
+            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+        "previous_response_id": encoded_response_id,
+        "metadata": {"session_id": harness.session_id, "tags": ["existing-tag"]},
+        "litellm_metadata": {"tags": ["existing-litellm-tag"]},
+    }
+    llm_router = MagicMock()
+    llm_router.model_names = []
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="managed-oauth-token"),
+    ):
+        mock_responses = MagicMock(return_value={"id": "resp_next"})
+        original_aresponses = litellm.aresponses
+        litellm.aresponses = mock_responses
+        try:
+            response = await route_request(data, llm_router, None, "aresponses")
+        finally:
+            litellm.aresponses = original_aresponses
+
+    assert response == {"id": "resp_next"}
+    mock_responses.assert_called_once()
+    call_kwargs = mock_responses.call_args.kwargs
+    assert call_kwargs["model"] == harness.public_to_upstream[public_model]
+    assert call_kwargs["input"] == [
+        {"type": "message", "role": "user", "content": "continue"},
+        {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "ok",
+        },
+    ]
+    assert call_kwargs["previous_response_id"] == original_response_id
+    assert call_kwargs["previous_response_id"] != encoded_response_id
+    assert call_kwargs["metadata"]["session_id"] == harness.session_id
+    assert call_kwargs["metadata"]["xai_responses_previous_response_id_decoded"] is True
+    assert call_kwargs["litellm_metadata"][
+        "xai_responses_previous_response_id_decoded"
+    ] is True
+    assert "existing-tag" in call_kwargs["metadata"]["tags"]
+    assert "xai-responses-previous-response-id-decoded" in call_kwargs["metadata"][
+        "tags"
+    ]
+    assert original_response_id not in call_kwargs["metadata"]["tags"]
+    assert encoded_response_id not in call_kwargs["metadata"]["tags"]
+    assert "existing-litellm-tag" in call_kwargs["litellm_metadata"]["tags"]
+    assert "xai-responses-previous-response-id-decoded" in call_kwargs[
+        "litellm_metadata"
+    ]["tags"]
+    assert call_kwargs["litellm_metadata"][
+        "codex_unsupported_input_item_removed_count"
+    ] == 1
+    assert call_kwargs["litellm_metadata"][
+        "codex_unsupported_input_items_removed"
+    ] == [{"type": "reasoning", "index": 1, "encrypted_content": True}]
 
 
 @pytest.mark.parametrize(

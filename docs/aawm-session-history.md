@@ -146,15 +146,17 @@ managed credential, LiteLLM replaces the managed Grok credential from the seed
 before selecting or refreshing an access token. This lets a fresh Grok/OIDC login
 take effect without writing back into `/home/zepfu/.grok`.
 
-Grok native and `oa_xai/*` Responses candidates remove request fields and hosted
-tools that the selected Grok-family model declares unsupported, but they preserve
-Responses `reasoning` input items that carry `encrypted_content`. Those encrypted
-items are treated as provider-owned compacted session state and must round-trip
-unchanged rather than being removed as ordinary unsupported reasoning summaries.
-If a Grok-family upstream still rejects a compacted request with `Could not
-decode the compaction blob`, alias-probe mode classifies that 400 as
-candidate-unavailable so the declared failover sequence can continue instead of
-stranding the worker on the rejecting candidate.
+Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
+tools, and `reasoning` input items that the selected Grok-family model declares
+unsupported. This includes `reasoning` items that carry `encrypted_content` from
+another provider's compacted Responses state; forwarding those blobs to Grok can
+trigger provider errors such as `Could not decode the compaction blob`. Ordinary
+non-reasoning continuation items, including `function_call` and
+`function_call_output`, remain in the outbound request. If a Grok-family
+upstream still rejects a compacted request with `Could not decode the compaction
+blob`, alias-probe mode classifies that 400 as candidate-unavailable so the
+declared failover sequence can continue instead of stranding the worker on the
+rejecting candidate.
 
 ## Access Log Display Semantics
 
@@ -324,6 +326,14 @@ that target as candidate-unavailable so the declared alias sequence can continue
 to the next candidate instead of terminating the agent dispatch on the provider
 400.
 
+Grok Composer and Grok Build candidates also remove unsupported Responses
+`reasoning` input items before egress, including encrypted compaction items from
+another provider. The sanitizer records only bounded metadata about the removal,
+for example the input index and whether `encrypted_content` was present; it does
+not record the encrypted blob value. Non-reasoning continuation items stay in the
+outbound `input` array so function-call state can continue without sending
+provider-invalid compaction state.
+
 Rows affected by this path may include:
 
 - `codex_unsupported_hosted_tool_removed_count`,
@@ -334,6 +344,12 @@ Rows affected by this path may include:
   `namespace`, or `tool_search`.
 - `codex_unsupported_hosted_tool_choice_removed`: the removed `tool_choice` when
   it referenced a hosted tool removed by the selected model policy.
+- `codex_unsupported_input_item_removed_count`,
+  `codex_unsupported_input_item_types_removed`, and
+  `codex_unsupported_input_items_removed`: unsupported Responses input items
+  removed before egress. For Grok-family routes this includes `reasoning` input
+  items and records `encrypted_content=true` when an encrypted compaction blob
+  was removed without logging the blob.
 - `xai_responses_request_sanitized`: `true` when the outgoing request body was
   changed before xAI egress.
 - `xai_responses_previous_response_id_decoded`: `true` when a LiteLLM-encoded
