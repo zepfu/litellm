@@ -243,7 +243,7 @@ def test_langfuse_payload_size_successful_fit_below_threshold_is_not_warning(
     assert "raw metadata value should not appear" not in logged_text
 
 
-def test_langfuse_payload_size_successful_fit_still_near_limit_warns(
+def test_langfuse_payload_size_successful_fit_still_near_limit_is_debug(
     caplog, monkeypatch
 ) -> None:
     monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "1_000")
@@ -271,7 +271,7 @@ def test_langfuse_payload_size_successful_fit_still_near_limit_warns(
         "omitted_fields": [],
     }
 
-    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
         _log_langfuse_payload_size_if_needed(
             generation_params,
             trace_id="trace-near-limit-fit",
@@ -279,8 +279,12 @@ def test_langfuse_payload_size_successful_fit_still_near_limit_warns(
             input_truncation_summary=fit_summary,
         )
 
+    warning_records = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert warning_records == []
     logged_text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "Langfuse event near/exceeds size limit before SDK enqueue" in logged_text
+    assert "Langfuse event size fitting applied before SDK enqueue" in logged_text
     assert "trace-near-limit-fit" in logged_text
     assert "generation-near-limit-fit" in logged_text
     assert "raw output should not appear" not in logged_text

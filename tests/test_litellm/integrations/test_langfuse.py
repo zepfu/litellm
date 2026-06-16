@@ -502,7 +502,7 @@ class TestLangfuseUsageDetails(unittest.TestCase):
             _langfuse_event_fit_target_bytes(1_000),
         )
         log_text = "\n".join(captured_logs.output)
-        self.assertIn("Langfuse event near/exceeds size limit before SDK enqueue", log_text)
+        self.assertIn("Langfuse event size fitting applied before SDK enqueue", log_text)
         self.assertIn("pass_through_endpoint.trace", log_text)
         self.assertNotIn(raw_trace_input, log_text)
 
