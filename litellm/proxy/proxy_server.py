@@ -3115,20 +3115,26 @@ class ProxyConfig:
                 verbose_proxy_logger.debug("GOING INTO LITELLM.GET_SECRET!")
                 database_url = get_secret(database_url)
                 verbose_proxy_logger.debug("RETRIEVED DB URL: %s", database_url)
-            ### MASTER KEY ###
-            master_key = general_settings.get(
-                "master_key", get_secret("LITELLM_MASTER_KEY", None)
+
+        ### MASTER KEY ###
+        master_key = general_settings.get(
+            "master_key", get_secret("LITELLM_MASTER_KEY", None)
+        )
+
+        if master_key and master_key.startswith("os.environ/"):
+            master_key = get_secret(master_key)  # type: ignore
+
+        if master_key is not None and isinstance(master_key, str):
+            litellm_master_key_hash = hash_token(master_key)
+        else:
+            litellm_master_key_hash = None
+            verbose_proxy_logger.warning(
+                "No resolved LiteLLM master key found from either LITELLM_MASTER_KEY or general_settings.master_key. "
+                "Requests without valid user API keys will run without proxy admin access. "
+                "Set LITELLM_MASTER_KEY or general_settings.master_key for production use."
             )
 
-            if master_key and master_key.startswith("os.environ/"):
-                master_key = get_secret(master_key)  # type: ignore
-
-            if master_key is not None and isinstance(master_key, str):
-                litellm_master_key_hash = hash_token(master_key)
-            else:
-                verbose_proxy_logger.critical(
-                    "LITELLM_MASTER_KEY is not set! All requests will be treated as INTERNAL_USER with no admin access. Set LITELLM_MASTER_KEY for production use."
-                )
+        if general_settings:
             ### USER API KEY CACHE IN-MEMORY TTL ###
             user_api_key_cache_ttl = general_settings.get(
                 "user_api_key_cache_ttl", None
