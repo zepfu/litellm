@@ -3,6 +3,7 @@ import asyncio
 import copy
 import importlib
 import json
+import os
 import traceback
 from base64 import b64encode
 from datetime import datetime, timezone
@@ -87,6 +88,48 @@ pass_through_endpoint_logging = PassThroughEndpointLogging()
 _registered_pass_through_routes: Dict[
     str, Dict[str, Union[str, List[str], Dict[str, Any]]]
 ] = {}
+
+_AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS = 240
+_AAWM_PASSTHROUGH_ERROR_LOG_SAFE_QUERY_KEYS = frozenset(
+    {
+        "alt",
+        "api-version",
+        "beta",
+        "stream",
+    }
+)
+_AAWM_PASSTHROUGH_ERROR_LOG_MODEL_METADATA_KEYS = (
+    "codex_auto_agent_selected_model",
+    "anthropic_auto_agent_selected_model",
+    "anthropic_adapter_model",
+    "xai_oauth_upstream_model",
+    "xai_oauth_public_model",
+    "grok_model_override",
+    "model_group",
+)
+_AAWM_PASSTHROUGH_ERROR_LOG_MODEL_ALIAS_METADATA_KEYS = (
+    "inbound_model_alias",
+    "requested_model_alias",
+    "model_alias_label",
+    "anthropic_auto_agent_alias",
+    "codex_auto_agent_alias",
+)
+_AAWM_PASSTHROUGH_ERROR_LOG_PROVIDER_METADATA_KEYS = (
+    "provider",
+    "custom_llm_provider",
+    "litellm_provider",
+)
+_AAWM_PASSTHROUGH_ERROR_LOG_ROUTE_FAMILY_METADATA_KEYS = (
+    "route_family",
+    "passthrough_route_family",
+    "openai_passthrough_route_family",
+)
+_AAWM_PASSTHROUGH_ERROR_LOG_TRACE_METADATA_KEYS = (
+    "trace_id",
+    "langfuse_trace_id",
+    "existing_trace_id",
+    "langfuse_existing_trace_id",
+)
 
 
 def get_response_body(response: httpx.Response) -> Optional[dict]:
@@ -412,6 +455,148 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
         litellm_params["metadata"] = metadata
 
     return metadata
+
+
+def _clean_passthrough_error_context_value(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    if not isinstance(value, (str, int, float)):
+        return None
+
+    cleaned = "".join(
+        char if char.isprintable() and char not in "\r\n\t" else " "
+        for char in str(value).strip()
+    )
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return None
+
+    lower_cleaned = cleaned.lower()
+    if lower_cleaned.startswith(("bearer ", "sk-", "pk-", "xai-", "ya29.")):
+        return None
+
+    if len(cleaned) > _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS:
+        cleaned = (
+            cleaned[: _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS - 3] + "..."
+        )
+    return cleaned
+
+
+def _first_passthrough_error_context_value(
+    metadata: Dict[str, Any],
+    keys: Tuple[str, ...],
+) -> Optional[str]:
+    for key in keys:
+        value = _clean_passthrough_error_context_value(metadata.get(key))
+        if value:
+            return value
+    return None
+
+
+def _build_passthrough_error_log_endpoint(request: Request) -> Optional[str]:
+    request_url = getattr(request, "url", None)
+    parsed_url = urlparse(str(request_url or ""))
+    path = parsed_url.path
+
+    if not path:
+        direct_path = _clean_passthrough_error_context_value(
+            getattr(request_url, "path", None)
+        )
+        path = direct_path or "/"
+
+    safe_query_pairs: list[tuple[str, str]] = []
+    for key, value in dict(getattr(request, "query_params", {}) or {}).items():
+        normalized_key = str(key).lower()
+        if normalized_key not in _AAWM_PASSTHROUGH_ERROR_LOG_SAFE_QUERY_KEYS:
+            continue
+        safe_key = _clean_passthrough_error_context_value(key)
+        safe_value = _clean_passthrough_error_context_value(value)
+        if safe_key and safe_value is not None:
+            safe_query_pairs.append((safe_key, safe_value))
+
+    if not safe_query_pairs:
+        return path
+    return f"{path}?{urlencode(safe_query_pairs)}"
+
+
+def _build_passthrough_error_log_upstream_url(
+    url: Optional[httpx.URL],
+) -> Optional[str]:
+    if url is None:
+        return None
+
+    parsed_url = urlparse(str(url))
+    if parsed_url.scheme and parsed_url.hostname:
+        host = parsed_url.hostname
+        if parsed_url.port is not None:
+            host = f"{host}:{parsed_url.port}"
+        return f"{parsed_url.scheme}://{host}{parsed_url.path or '/'}"
+    return _clean_passthrough_error_context_value(str(url))
+
+
+def _build_passthrough_error_log_context(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    parsed_body: Optional[dict],
+    kwargs: Optional[dict],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    litellm_call_id: Optional[str],
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    if isinstance(parsed_body, dict):
+        for metadata_key in ("litellm_metadata", "metadata"):
+            metadata_value = parsed_body.get(metadata_key)
+            if isinstance(metadata_value, dict):
+                metadata.update(metadata_value)
+
+    if isinstance(kwargs, dict):
+        litellm_params = kwargs.get("litellm_params")
+        if isinstance(litellm_params, dict):
+            kwargs_metadata = litellm_params.get("metadata")
+            if isinstance(kwargs_metadata, dict):
+                metadata.update(kwargs_metadata)
+
+    model = None
+    if isinstance(parsed_body, dict):
+        model = _clean_passthrough_error_context_value(parsed_body.get("model"))
+    model = model or _first_passthrough_error_context_value(
+        metadata,
+        _AAWM_PASSTHROUGH_ERROR_LOG_MODEL_METADATA_KEYS,
+    )
+
+    provider = _clean_passthrough_error_context_value(
+        custom_llm_provider
+    ) or _first_passthrough_error_context_value(
+        metadata,
+        _AAWM_PASSTHROUGH_ERROR_LOG_PROVIDER_METADATA_KEYS,
+    )
+
+    return {
+        "source": "pass_through_endpoint",
+        "container": _clean_passthrough_error_context_value(os.getenv("HOSTNAME")),
+        "endpoint": _build_passthrough_error_log_endpoint(request),
+        "upstream_url": _build_passthrough_error_log_upstream_url(url),
+        "provider": provider,
+        "model": model,
+        "model_alias": _first_passthrough_error_context_value(
+            metadata,
+            _AAWM_PASSTHROUGH_ERROR_LOG_MODEL_ALIAS_METADATA_KEYS,
+        ),
+        "route_family": _first_passthrough_error_context_value(
+            metadata,
+            _AAWM_PASSTHROUGH_ERROR_LOG_ROUTE_FAMILY_METADATA_KEYS,
+        ),
+        "status_code": status_code,
+        "trace_id": _first_passthrough_error_context_value(
+            metadata,
+            _AAWM_PASSTHROUGH_ERROR_LOG_TRACE_METADATA_KEYS,
+        ),
+        "litellm_call_id": _clean_passthrough_error_context_value(
+            litellm_call_id
+        ),
+    }
 
 
 def _format_passthrough_span_timestamp(value: datetime) -> str:
@@ -1404,6 +1589,7 @@ async def pass_through_request(  # noqa: PLR0915
     _parsed_body: Optional[dict] = None
     # kwargs for pass through endpoint, contains metadata, litellm_params, call_type, litellm_call_id, passthrough_logging_payload
     kwargs: Optional[dict] = None
+    error_log_context: Optional[Dict[str, Any]] = None
     raw_body: Optional[bytes] = None
     retryable_status_codes = {
         status_code
@@ -1591,6 +1777,15 @@ async def pass_through_request(  # noqa: PLR0915
 
         metadata = _ensure_passthrough_metadata(kwargs)
         metadata["aawm_passthrough_endpoint_type"] = endpoint_type.value
+        error_log_context = _build_passthrough_error_log_context(
+            request=request,
+            url=url,
+            parsed_body=_parsed_body,
+            kwargs=kwargs,
+            custom_llm_provider=custom_llm_provider,
+            status_code=None,
+            litellm_call_id=litellm_call_id,
+        )
         try:
             emit_aawm_route_access_log(
                 request=request,
@@ -1714,6 +1909,7 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_wait_started_at=upstream_wait_started_at,
                     upstream_wait_completed_at=upstream_wait_completed_at,
                     local_prepare_ms=local_prepare_ms,
+                    error_log_context=error_log_context,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
@@ -1782,6 +1978,7 @@ async def pass_through_request(  # noqa: PLR0915
                     upstream_wait_started_at=upstream_wait_started_at,
                     upstream_wait_completed_at=upstream_wait_completed_at,
                     local_prepare_ms=local_prepare_ms,
+                    error_log_context=error_log_context,
                 ),
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
@@ -1902,6 +2099,21 @@ async def pass_through_request(  # noqa: PLR0915
         suppress_retryable_failure_logging = (
             status_code in retryable_status_codes if status_code is not None else False
         )
+        if error_log_context is None:
+            error_log_context = _build_passthrough_error_log_context(
+                request=request,
+                url=url,
+                parsed_body=_parsed_body,
+                kwargs=kwargs,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                litellm_call_id=litellm_call_id,
+            )
+        else:
+            error_log_context = {
+                **error_log_context,
+                "status_code": status_code,
+            }
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
@@ -1911,7 +2123,8 @@ async def pass_through_request(  # noqa: PLR0915
             verbose_proxy_logger.exception(
                 "litellm.proxy.proxy_server.pass_through_endpoint(): Exception occured - {}".format(
                     str(e)
-                )
+                ),
+                extra=error_log_context,
             )
 
         #########################################################

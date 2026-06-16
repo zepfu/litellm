@@ -59,6 +59,14 @@ Practical `context` fields to inspect are:
 - `callback_phase`
 - `langfuse_failure_class`
 
+Pass-through upstream failures populate this context from safe route metadata.
+For both main pass-through exceptions and streaming chunk-processor exceptions,
+the error record should include endpoint, upstream URL without query secrets,
+provider, selected/requested model label, model alias, route family, status
+code when available, trace id, and LiteLLM call id. The pass-through sink
+intentionally omits raw request bodies, response bodies, headers, prompts, and
+credentials.
+
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact
 support: https://langfuse.com/support.`), LiteLLM keeps the original message and
