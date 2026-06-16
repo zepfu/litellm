@@ -7,6 +7,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -26,6 +27,24 @@ except ModuleNotFoundError:
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
+PROVIDER_FAILURE_SUMMARY_LIMIT = 8
+PROVIDER_FAILURE_FIELD_LIMIT = 160
+PROVIDER_FAILURE_MESSAGE_LIMIT = 240
+PROVIDER_FAILURE_SECRET_RE = re.compile(
+    "|".join(
+        (
+            r"Bearer\s+[A-Za-z0-9\-._~+/]{10,}=*",
+            r"Basic\s+[A-Za-z0-9+/]{10,}={0,2}",
+            r"sk-[A-Za-z0-9\-_]{20,}",
+            r"(?:api[_-]?key|x-api-key|api-key|token|password|passwd|secret)"
+            r"['\"]?\s*[:=]\s*['\"]?[^\s,'\"})\]{}>]+",
+            r"(?<=://)[^\s'\"]*:[^\s'\"@]+(?=@)",
+            r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+            r"\b(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:.]{1,}\b",
+        )
+    ),
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -297,6 +316,48 @@ def setup_schema_once(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     }
 
 
+def _bounded_summary_field(value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT) -> Optional[str]:
+    if value is None:
+        return None
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _redacted_failure_message(value: Any) -> Optional[str]:
+    text = _bounded_summary_field(value, limit=4096)
+    if text is None:
+        return None
+    text = PROVIDER_FAILURE_SECRET_RE.sub("REDACTED", text)
+    return _bounded_summary_field(text, limit=PROVIDER_FAILURE_MESSAGE_LIMIT)
+
+
+def _redacted_summary_field(value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT) -> Optional[str]:
+    text = _bounded_summary_field(value, limit=limit)
+    if text is None:
+        return None
+    return PROVIDER_FAILURE_SECRET_RE.sub("REDACTED", text)
+
+
+def _provider_failure_summaries(rows: Sequence[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], int]:
+    failed_rows = [row for row in rows if not row.get("success")]
+    summaries: list[Dict[str, Any]] = []
+    for row in failed_rows[:PROVIDER_FAILURE_SUMMARY_LIMIT]:
+        summaries.append(
+            {
+                "provider": _redacted_summary_field(row.get("provider")),
+                "endpoint_key": _redacted_summary_field(row.get("endpoint_key")),
+                "probe_type": _redacted_summary_field(row.get("probe_type")),
+                "error_class": _redacted_summary_field(row.get("error_class")),
+                "error_message": _redacted_failure_message(row.get("error_message")),
+            }
+        )
+    return summaries, max(0, len(failed_rows) - len(summaries))
+
+
 def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     started = time.perf_counter()
     rows = probes.collect_observations(
@@ -330,7 +391,7 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
     successes = sum(1 for row in rows if row.get("success"))
     failures = len(rows) - successes
-    return {
+    summary = {
         "event": "provider_status_observations_cycle",
         "observed_at": _utc_timestamp(),
         "apply": config.apply,
@@ -344,6 +405,11 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
         "failure_count": failures,
         "duration_ms": elapsed_ms,
     }
+    if failures:
+        failure_summaries, omitted_count = _provider_failure_summaries(rows)
+        summary["failure_summaries"] = failure_summaries
+        summary["failure_summaries_omitted_count"] = omitted_count
+    return summary
 
 
 def _emit(payload: Dict[str, Any]) -> None:

@@ -414,8 +414,20 @@ def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
         db_statement_timeout_ms=5000,
     )
     rows = [
-        {"provider": "control", "probe_type": "dns", "success": True},
-        {"provider": "control", "probe_type": "tls_handshake", "success": False},
+        {
+            "provider": "control",
+            "endpoint_key": "control:google.com",
+            "probe_type": "dns",
+            "success": True,
+        },
+        {
+            "provider": "anthropic",
+            "endpoint_key": "api.anthropic.com:443",
+            "probe_type": "tls_handshake",
+            "success": False,
+            "error_class": "tls_error",
+            "error_message": "handshake failed with api_key=sk-testsecret1234567890",
+        },
     ]
     inserted = {}
 
@@ -467,6 +479,16 @@ def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
     assert summary["row_count"] == 2
     assert summary["success_count"] == 1
     assert summary["failure_count"] == 1
+    assert summary["failure_summaries"] == [
+        {
+            "provider": "anthropic",
+            "endpoint_key": "api.anthropic.com:443",
+            "probe_type": "tls_handshake",
+            "error_class": "tls_error",
+            "error_message": "handshake failed with REDACTED",
+        }
+    ]
+    assert summary["failure_summaries_omitted_count"] == 0
 
 
 def test_run_cycle_requires_dsn_when_apply_enabled(monkeypatch) -> None:
@@ -490,6 +512,86 @@ def test_run_cycle_requires_dsn_when_apply_enabled(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="No database DSN found"):
         loop.run_cycle(config)
+
+
+def test_run_cycle_omits_failure_summaries_for_green_cycle(monkeypatch) -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=False,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+    )
+    rows = [
+        {
+            "provider": "control",
+            "endpoint_key": "control:google.com",
+            "probe_type": "dns",
+            "success": True,
+        }
+    ]
+
+    monkeypatch.setattr(loop.probes, "collect_observations", lambda *_args, **_kwargs: rows)
+
+    summary = loop.run_cycle(config)
+
+    assert summary["failure_count"] == 0
+    assert "failure_summaries" not in summary
+    assert "failure_summaries_omitted_count" not in summary
+
+
+def test_provider_failure_summaries_are_bounded_and_redacted() -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    rows = [
+        {
+            "provider": f"provider-{index}",
+            "endpoint_key": f"160.79.104.{index}:443",
+            "probe_type": "dns",
+            "success": False,
+            "error_class": "dns_error",
+            "error_message": (
+                f"PING api.anthropic.com (160.79.104.{index}) failure {index} "
+                f"token={secret} ipv6=2001:db8::{index} "
+                + ("extra detail " * 40)
+            ),
+            "metadata": {"raw_payload": secret},
+            "resolved_ip": "203.0.113.10",
+        }
+        for index in range(loop.PROVIDER_FAILURE_SUMMARY_LIMIT + 2)
+    ]
+
+    summaries, omitted_count = loop._provider_failure_summaries(rows)
+
+    assert len(summaries) == loop.PROVIDER_FAILURE_SUMMARY_LIMIT
+    assert omitted_count == 2
+    assert all(
+        set(summary) == {
+            "provider",
+            "endpoint_key",
+            "probe_type",
+            "error_class",
+            "error_message",
+        }
+        for summary in summaries
+    )
+    assert summaries[0]["provider"] == "provider-0"
+    assert summaries[0]["endpoint_key"] == "REDACTED:443"
+    assert summaries[0]["probe_type"] == "dns"
+    assert summaries[0]["error_class"] == "dns_error"
+    assert "REDACTED" in summaries[0]["error_message"]
+    assert secret not in str(summaries)
+    assert "160.79.104" not in str(summaries)
+    assert "2001:db8" not in str(summaries)
+    assert "raw_payload" not in str(summaries)
+    assert "resolved_ip" not in str(summaries)
+    assert len(summaries[0]["error_message"]) <= loop.PROVIDER_FAILURE_MESSAGE_LIMIT
 
 
 def test_run_cycle_skips_database_timeout_without_raising(monkeypatch) -> None:
