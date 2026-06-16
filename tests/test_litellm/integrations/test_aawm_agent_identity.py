@@ -8664,6 +8664,60 @@ def test_provider_status_observations_schema_includes_icmp_fields() -> None:
     )
 
 
+def test_build_provider_error_observation_classifies_anthropic_upstream_reset_503() -> None:
+    reset_body = (
+        "upstream connect error or disconnect/reset before headers. "
+        "reset reason: connection termination"
+    )
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-8"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-upstream-reset"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-upstream-reset",
+            "trace_id": "trace-anthropic-upstream-reset",
+            "litellm_environment": "dev",
+            "passthrough_route_family": "anthropic_messages",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = "claude-opus-4-8"
+    kwargs["exception"] = HTTPException(status_code=503, detail=reset_body)
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result=kwargs["exception"],
+        start_time="2026-06-16T08:51:07Z",
+        end_time="2026-06-16T08:51:08Z",
+    )
+
+    assert observation is not None
+    assert observation["provider"] == "anthropic"
+    assert observation["model"] == "claude-opus-4-8"
+    assert observation["route_family"] == "anthropic_messages"
+    assert observation["status_code"] == 503
+    assert observation["error_class"] == "provider_5xx"
+    assert observation["error_class"] != "auth_failed"
+    assert observation["error_class"] != "rate_limited"
+    normalized_error_text = observation["metadata"]["normalized_error_text"]
+    assert reset_body in normalized_error_text
+
+    failure_record = aawm_agent_identity._build_failure_observation_only_record(
+        kwargs=kwargs,
+        result=kwargs["exception"],
+        start_time="2026-06-16T08:51:07Z",
+        end_time="2026-06-16T08:51:08Z",
+    )
+
+    assert failure_record is not None
+    assert failure_record["_skip_session_history"] is True
+    assert "rate_limit_observations" not in failure_record
+    assert (
+        failure_record["provider_error_observations"][0]["error_class"]
+        == "provider_5xx"
+    )
+
+
 def test_build_provider_error_observation_classifies_openrouter_5xx() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "openrouter/meta-llama/llama-3.3-70b-instruct"
