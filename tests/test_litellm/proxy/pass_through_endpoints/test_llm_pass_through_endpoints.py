@@ -15002,7 +15002,21 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
     request_body = {
         "model": "oa_xai/grok-build",
-        "input": "hello",
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_prepare_compaction",
+                "summary": [],
+                "encrypted_content": "encrypted-prepare-compaction",
+            },
+            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
         "reasoning": {"effort": "medium"},
         "reasoning_effort": "medium",
         "reasoningEffort": "medium",
@@ -15025,6 +15039,15 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
     assert "reasoning" not in request_body
     assert "reasoning_effort" not in request_body
     assert "reasoningEffort" not in request_body
+    assert request_body["input"] == [
+        {"type": "message", "role": "user", "content": "continue"},
+        {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "ok",
+        },
+    ]
     if "output_config" in request_body:
         assert request_body["output_config"] == {"verbosity": "low"}
     metadata = request_body["litellm_metadata"]
@@ -15034,6 +15057,11 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
         "reasoning",
         "reasoning_effort",
         "reasoningeffort",
+    ]
+    assert metadata["codex_unsupported_input_item_removed_count"] == 1
+    assert metadata["codex_unsupported_input_item_types_removed"] == ["reasoning"]
+    assert metadata["codex_unsupported_input_items_removed"] == [
+        {"type": "reasoning", "index": 1, "encrypted_content": True}
     ]
 
 
@@ -15097,7 +15125,7 @@ def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
     "model",
     ["oa_xai/grok-4.3", "grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
 )
-def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
+def test_grok_responses_removes_encrypted_reasoning_compaction_item(model):
     request_body = {
         "model": model,
         "input": [
@@ -15108,6 +15136,12 @@ def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
                 "summary": [],
                 "encrypted_content": "encrypted-compaction-fixture",
             },
+            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
         ],
     }
 
@@ -15115,11 +15149,18 @@ def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
         _drop_unsupported_codex_input_items_from_request_body(request_body)
     )
 
-    assert updated_body is request_body
-    assert removed_items == []
-    assert updated_body["input"][1]["encrypted_content"] == (
-        "encrypted-compaction-fixture"
-    )
+    assert removed_items == [
+        {"type": "reasoning", "index": 1, "encrypted_content": True}
+    ]
+    assert updated_body["input"] == [
+        request_body["input"][0],
+        request_body["input"][2],
+        request_body["input"][3],
+    ]
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["codex_unsupported_input_item_removed_count"] == 1
+    assert metadata["codex_unsupported_input_item_types_removed"] == ["reasoning"]
+    assert metadata["codex_unsupported_input_items_removed"] == removed_items
 
 
 def _assert_xai_responses_body_sanitized(custom_body: dict[str, Any]) -> None:
@@ -24976,7 +25017,12 @@ class TestOpenAIPassthroughRoute:
             "model": public_model,
             "input": [
                 {"type": "message", "role": "user", "content": "hello"},
-                {"type": "reasoning", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "rs_oa_xai_compaction",
+                    "summary": [],
+                    "encrypted_content": "encrypted-oa-xai-compaction",
+                },
                 {
                     "type": "function_call",
                     "name": "exec_command",
@@ -25085,6 +25131,9 @@ class TestOpenAIPassthroughRoute:
         assert prepared_body["litellm_metadata"][
             "codex_unsupported_input_item_types_removed"
         ] == ["reasoning"]
+        assert prepared_body["litellm_metadata"][
+            "codex_unsupported_input_items_removed"
+        ] == [{"type": "reasoning", "index": 1, "encrypted_content": True}]
         assert prepared_body["litellm_metadata"]["xai_oauth_public_model"] == public_model
         assert prepared_body["litellm_metadata"]["xai_oauth_upstream_model"] == (
             f"xai/{upstream_model}"
@@ -25189,7 +25238,12 @@ class TestOpenAIPassthroughRoute:
             "model": model,
             "input": [
                 {"type": "message", "role": "user", "content": "hello"},
-                {"type": "reasoning", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "rs_grok_compaction",
+                    "summary": [],
+                    "encrypted_content": "encrypted-grok-compaction",
+                },
                 {
                     "type": "function_call",
                     "name": "exec_command",
@@ -25316,6 +25370,9 @@ class TestOpenAIPassthroughRoute:
         assert metadata["codex_unsupported_input_item_removed_count"] == 1
         assert metadata["codex_unsupported_input_item_types_removed"] == [
             "reasoning"
+        ]
+        assert metadata["codex_unsupported_input_items_removed"] == [
+            {"type": "reasoning", "index": 1, "encrypted_content": True}
         ]
         assert "route:grok_cli_chat_proxy" in metadata["tags"]
         assert "openai-grok-native-responses-adapter" in metadata["tags"]
@@ -25759,6 +25816,82 @@ class TestGrokProxyRoute:
         metadata = prepared_body["litellm_metadata"]
         assert metadata["xai_tool_choice_without_tools_removed"] == "auto"
         assert "xai-tool-choice-without-tools-removed" in metadata["tags"]
+        assert call_kwargs["passthrough_logging_metadata"] == metadata
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_removes_encrypted_reasoning_compaction_item(self):
+        """should remove invalid encrypted reasoning compaction while preserving function calls"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/responses"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": "0.2.50",
+            "x-grok-session-id": "session_123",
+            "x-grok-model-override": "grok-build",
+            "user-agent": "grok-shell/0.2.50 (linux; x86_64)",
+            "content-type": "application/json",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        request_body = {
+            "model": "grok-build",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_grok_direct_compaction",
+                    "summary": [],
+                    "encrypted_content": "encrypted-grok-direct-compaction",
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        call_kwargs = mock_pass_through.await_args.kwargs
+        prepared_body = call_kwargs["custom_body"]
+        assert prepared_body["input"] == [
+            request_body["input"][0],
+            request_body["input"][2],
+            request_body["input"][3],
+        ]
+        metadata = prepared_body["litellm_metadata"]
+        assert metadata["codex_unsupported_input_item_removed_count"] == 1
+        assert metadata["codex_unsupported_input_item_types_removed"] == [
+            "reasoning"
+        ]
+        assert metadata["codex_unsupported_input_items_removed"] == [
+            {"type": "reasoning", "index": 1, "encrypted_content": True}
+        ]
         assert call_kwargs["passthrough_logging_metadata"] == metadata
 
     @pytest.mark.asyncio
