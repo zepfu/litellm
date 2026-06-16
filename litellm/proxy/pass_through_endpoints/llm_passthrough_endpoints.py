@@ -113,6 +113,7 @@ from litellm.proxy.utils import is_known_model
 from litellm.proxy.vector_store_endpoints.utils import (
     is_allowed_to_call_vector_store_endpoint,
 )
+from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues, ResponsesAPIOptionalRequestParams
 from litellm.types.utils import LlmProviders
@@ -435,9 +436,10 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-        "model": "gpt-5.3-codex",
+        "model": "gpt-5.5",
         "route_family": "codex_responses",
         "last_resort": True,
+        "default_reasoning_effort": "medium",
     },
 )
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -1243,7 +1245,18 @@ def _sanitize_xai_responses_request_body(
         request_body.get("tools"),
         sanitized_body.get("tools"),
     )
-    if not removed_params and not tool_changes:
+    decoded_previous_response_id = False
+    previous_response_id = sanitized_body.get("previous_response_id")
+    if isinstance(previous_response_id, str) and previous_response_id:
+        decoded = ResponsesAPIRequestUtils.decode_previous_response_id_to_original_previous_response_id(
+            previous_response_id
+        )
+        if decoded != previous_response_id:
+            sanitized_body = dict(sanitized_body)
+            sanitized_body["previous_response_id"] = decoded
+            decoded_previous_response_id = True
+
+    if not removed_params and not tool_changes and not decoded_previous_response_id:
         return request_body, [], []
 
     tool_types = _dedupe_sorted_str_list(
@@ -1265,6 +1278,11 @@ def _sanitize_xai_responses_request_body(
         tags_to_add=[
             "xai-responses-request-sanitized",
             *(
+                ["xai-responses-previous-response-id-decoded"]
+                if decoded_previous_response_id
+                else []
+            ),
+            *(
                 f"xai-responses-removed-param:{param}"
                 for param in normalized_removed_params
             ),
@@ -1276,6 +1294,9 @@ def _sanitize_xai_responses_request_body(
             "xai_responses_sanitized_tool_count": len(tool_changes),
             "xai_responses_sanitized_tool_types": tool_types,
             "xai_responses_sanitized_tools": tool_changes,
+            "xai_responses_previous_response_id_decoded": (
+                decoded_previous_response_id
+            ),
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
                     name="xai.responses_request_sanitized",
@@ -1283,6 +1304,9 @@ def _sanitize_xai_responses_request_body(
                         "removed_params": normalized_removed_params,
                         "tool_count": len(tool_changes),
                         "tool_types": tool_types,
+                        "previous_response_id_decoded": (
+                            decoded_previous_response_id
+                        ),
                     },
                 )
             ],
@@ -2792,6 +2816,21 @@ def _add_codex_auto_agent_alias_metadata(
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
+    default_reasoning_effort = _normalize_low_cardinality_tag_value(
+        candidate.get("default_reasoning_effort")
+    )
+    default_reasoning_applied = False
+    if default_reasoning_effort and "reasoning_effort" not in updated_body:
+        reasoning = updated_body.get("reasoning")
+        if not isinstance(reasoning, dict):
+            updated_body["reasoning"] = {"effort": default_reasoning_effort}
+            default_reasoning_applied = True
+        elif not reasoning.get("effort"):
+            updated_body["reasoning"] = {
+                **reasoning,
+                "effort": default_reasoning_effort,
+            }
+            default_reasoning_applied = True
     skipped = selection.get("skipped") or []
     audit_events = _build_auto_agent_alias_audit_events(
         alias_family="codex_auto_agent",
@@ -2813,6 +2852,11 @@ def _add_codex_auto_agent_alias_metadata(
                 if candidate.get("last_resort")
                 else []
             ),
+            *(
+                [f"codex-auto-agent-default-effort:{default_reasoning_effort}"]
+                if default_reasoning_applied
+                else []
+            ),
             f"codex-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
@@ -2824,6 +2868,16 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_selected_route_family": candidate["route_family"],
             "codex_auto_agent_selected_last_resort": bool(
                 candidate.get("last_resort")
+            ),
+            **(
+                {
+                    "codex_auto_agent_default_reasoning_effort": (
+                        default_reasoning_effort
+                    ),
+                    "codex_reasoning_effort": default_reasoning_effort,
+                }
+                if default_reasoning_applied
+                else {}
             ),
             "codex_auto_agent_selection_reason": selection.get("selection_reason"),
             "codex_auto_agent_lane_key": selection.get("lane_key"),

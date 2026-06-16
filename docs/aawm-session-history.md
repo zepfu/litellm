@@ -115,6 +115,14 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
+The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate,
+not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejects the
+plain `gpt-5.3-codex` model. When that last-resort candidate is selected,
+LiteLLM applies medium reasoning by default if the request did not already set a
+reasoning effort. Stateful continuation requests keep the established candidate
+through session affinity, including last-resort `gpt-5.5`, until that candidate
+itself cools down or the session is redispatched.
+
 ## Grok Native OIDC Credentials
 
 `xai/grok-composer-2.5-fast`, `xai/grok-build`, and
@@ -296,6 +304,12 @@ managed xAI Responses requests also drop `tool_choice` when the outgoing payload
 has no usable `tools` definitions, since xAI rejects `tool_choice` without
 tools.
 
+If the request carries a LiteLLM-encoded Responses `previous_response_id`, the
+xAI/Grok sanitizer decodes it back to the original upstream response id before
+egress. The encoded id is only for LiteLLM deployment affinity; xAI and Grok
+must receive the raw upstream id, otherwise compacted continuations can fail
+with provider errors such as `Could not decode the compaction blob`.
+
 For AAWM Codex aliases, hosted-tool support is evaluated again after the alias
 has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
 `oa_xai/grok-build`. This catches provider-invalid Codex tool variants, including
@@ -322,6 +336,9 @@ Rows affected by this path may include:
   it referenced a hosted tool removed by the selected model policy.
 - `xai_responses_request_sanitized`: `true` when the outgoing request body was
   changed before xAI egress.
+- `xai_responses_previous_response_id_decoded`: `true` when a LiteLLM-encoded
+  `previous_response_id` was decoded back to the upstream response id before
+  egress.
 - `xai_responses_sanitized_removed_params`: normalized top-level field names
   removed from the request, for example `["instructions", "metadata"]`.
 - `xai_responses_sanitized_tool_count`: number of tool definitions whose
