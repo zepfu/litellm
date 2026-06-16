@@ -67,6 +67,12 @@ code when available, trace id, and LiteLLM call id. The pass-through sink
 intentionally omits raw request bodies, response bodies, headers, prompts, and
 credentials.
 
+Pass-through `httpx.TimeoutException` failures during upstream setup are
+reported as status code `504` so alias wrappers can classify them as upstream
+timeouts. Midstream streaming timeouts are logged with the same safe context
+and traceback, but remain terminal because response bytes may already have been
+sent to the client.
+
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact
 support: https://langfuse.com/support.`), LiteLLM keeps the original message and

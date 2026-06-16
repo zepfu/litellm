@@ -5451,6 +5451,156 @@ class TestPassThroughRequestRetryableFailures:
         assert "ReadTimeout" in payload["traceback"]
 
     @pytest.mark.asyncio
+    async def test_pass_through_request_read_timeout_jsonl_uses_504_status(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"beta": "true"}
+        custom_body = {
+            "model": "grok-composer-2.5-fast",
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "grok_cli_chat_proxy",
+                "trace_id": "trace-timeout",
+                "custom_llm_provider": "xai",
+            },
+        }
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+        timeout_exc = httpx.ReadTimeout(
+            "Timeout on reading data from socket",
+            request=httpx.Request("POST", target_url),
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=AsyncMock(side_effect=timeout_exc),
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+                new=AsyncMock(),
+            ), patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_body=custom_body,
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "504"
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Timeout on reading data from socket" in item["message"]
+        )
+
+        assert payload["context"]["status_code"] == 504
+        assert payload["context"]["provider"] == "xai"
+        assert payload["context"]["model"] == "grok-composer-2.5-fast"
+        assert payload["context"]["model_alias"] == "aawm-code-anthropic"
+        assert payload["context"]["route_family"] == "grok_cli_chat_proxy"
+        assert "ReadTimeout" in payload["traceback"]
+
+    @pytest.mark.asyncio
+    async def test_stream_setup_read_timeout_uses_504_proxy_code(self):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"beta": "true"}
+        custom_body = {
+            "model": "grok-composer-2.5-fast",
+            "stream": True,
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "grok_cli_chat_proxy",
+                "trace_id": "trace-stream-setup-timeout",
+                "custom_llm_provider": "xai",
+            },
+        }
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+
+        mock_client = MagicMock()
+        mock_client.build_request.return_value = httpx.Request("POST", target_url)
+        mock_client.send = AsyncMock(
+            side_effect=httpx.ReadTimeout(
+                "Timeout on reading data from socket",
+                request=httpx.Request("POST", target_url),
+            )
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={},
+                    user_api_key_dict=MagicMock(),
+                    custom_body=custom_body,
+                    custom_llm_provider="xai",
+                    stream=True,
+                )
+
+        assert exc_info.value.code == "504"
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_preserves_retry_headers_and_skips_failure_hook(
         self,
     ):
@@ -18935,6 +19085,17 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_deepseek_tool_mismatch
     assert "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in _extract_codex_auto_agent_error_tokens(
         exc
     )
+
+
+def test_codex_auto_agent_retryable_exhaustion_classifies_timeout_status():
+    exc = ProxyException(
+        message="Timeout on reading data from socket",
+        type="None",
+        param="None",
+        code=504,
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_timeout"
 
 
 @pytest.mark.asyncio
