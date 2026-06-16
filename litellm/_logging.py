@@ -163,6 +163,9 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "status_code",
     "trace_id",
     "litellm_call_id",
+    "callback_name",
+    "callback_phase",
+    "langfuse_failure_class",
 )
 
 
@@ -513,6 +516,55 @@ def _get_standard_record_attrs() -> frozenset:
 
 _STANDARD_RECORD_ATTRS = _get_standard_record_attrs()
 
+_LANGFUSE_SUPPORT_STRING = (
+    "Unexpected error occurred. Please check your request and contact support: "
+    "https://langfuse.com/support."
+)
+_LANGFUSE_SUPPORT_STRING_RECOMMENDED_OPERATOR_ACTION = (
+    "Inspect Langfuse ingestion/storage health (web/worker/blob storage), then retry "
+    "or reduce oversized Langfuse event payloads before re-exporting traces."
+)
+
+
+def _is_langfuse_support_string_message(message: str) -> bool:
+    return message == _LANGFUSE_SUPPORT_STRING
+
+
+def _apply_langfuse_support_string_diagnostics(record: logging.LogRecord) -> None:
+    if record.name != "langfuse":
+        return
+    if getattr(record, "langfuse_support_string", False):
+        return
+
+    message = record.getMessage()
+    if not _is_langfuse_support_string_message(message):
+        return
+
+    setattr(record, "source", "langfuse_sdk")
+    setattr(record, "callback_name", "langfuse")
+    setattr(record, "callback_phase", "sdk_background_ingestion_upload")
+    setattr(record, "langfuse_support_string", True)
+    setattr(record, "langfuse_sdk_background_ingestion_failure", True)
+    setattr(
+        record,
+        "langfuse_failure_class",
+        "langfuse_sdk_background_ingestion_upload_failure",
+    )
+    setattr(
+        record,
+        "recommended_operator_action",
+        _LANGFUSE_SUPPORT_STRING_RECOMMENDED_OPERATOR_ACTION,
+    )
+
+
+class LangfuseSupportStringDiagnosticFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        _apply_langfuse_support_string_diagnostics(record)
+        return True
+
+
+_langfuse_support_string_diagnostic_filter = LangfuseSupportStringDiagnosticFilter()
+
 
 class JsonFormatter(Formatter):
     def __init__(self):
@@ -524,11 +576,13 @@ class JsonFormatter(Formatter):
         return dt.isoformat()
 
     def format(self, record):
+        _apply_langfuse_support_string_diagnostics(record)
         message_str = record.getMessage()
         json_record: Dict[str, Any] = {
             "message": message_str,
             "level": record.levelname,
             "timestamp": self.formatTime(record),
+            "logger": record.name,
         }
 
         # Parse embedded JSON or Python dict repr in message so sub-fields become first-class properties
@@ -675,6 +729,7 @@ def _ensure_filter_on_logger(logger: logging.Logger, log_filter: logging.Filter)
 
 for _logger in ALL_LOGGERS:
     _ensure_filter_on_logger(_logger, _egress_guard_alert_filter)
+    _ensure_filter_on_logger(_logger, _langfuse_support_string_diagnostic_filter)
 
 _ensure_filter_on_logger(
     logging.getLogger("uvicorn.access"),
@@ -738,10 +793,14 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
     """
     handler.addFilter(_secret_filter)
     handler.addFilter(_egress_guard_alert_filter)
+    handler.addFilter(_langfuse_support_string_diagnostic_filter)
     for lg in _get_loggers_to_initialize():
         lg.handlers.clear()  # remove any existing handlers
         _ensure_filter_on_logger(lg, _egress_guard_alert_filter)
+        _ensure_filter_on_logger(lg, _langfuse_support_string_diagnostic_filter)
         lg.addHandler(handler)  # add JSON formatter handler
+        if lg.name == "langfuse" and _get_aawm_error_log_path() is not None:
+            _ensure_aawm_error_log_handler_on_logger(lg)
         lg.propagate = False  # prevent bubbling to parent/root
     _configure_aawm_error_log_handlers()
 

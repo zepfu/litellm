@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import sys
@@ -16,6 +17,8 @@ import litellm
 from litellm._logging import (
     ALL_LOGGERS,
     JsonFormatter,
+    LangfuseSupportStringDiagnosticFilter,
+    _LANGFUSE_SUPPORT_STRING,
     _initialize_loggers_with_handler,
     _turn_on_json,
     verbose_logger,
@@ -51,9 +54,8 @@ def test_json_mode_emits_one_record_per_logger(capfd):
 
     # Capture stdout
     out, err = capfd.readouterr()
-    print("out", out)
-    print("err", err)
-    lines = [l for l in err.splitlines() if l.strip()]
+    assert out == ""
+    lines = [line for line in err.splitlines() if line.strip()]
 
     # Expect exactly three JSON lines
     assert len(lines) == 3, f"got {len(lines)} lines, want 3: {lines!r}"
@@ -137,6 +139,124 @@ def test_json_formatter_plain_message_unchanged():
     assert "exception" not in obj
 
 
+def test_json_formatter_includes_logger_name():
+    formatter = JsonFormatter()
+    record = logging.LogRecord(
+        name="LiteLLM Router",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="Cache hit!",
+        args=(),
+        exc_info=None,
+    )
+    output = formatter.format(record)
+    obj = json.loads(output)
+    assert obj["logger"] == "LiteLLM Router"
+
+
+def test_json_formatter_adds_langfuse_support_string_diagnostics():
+    formatter = JsonFormatter()
+    record = logging.LogRecord(
+        name="langfuse",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg=_LANGFUSE_SUPPORT_STRING,
+        args=(),
+        exc_info=None,
+    )
+    output = formatter.format(record)
+    obj = json.loads(output)
+    assert obj["logger"] == "langfuse"
+    assert obj["message"] == _LANGFUSE_SUPPORT_STRING
+    assert obj["source"] == "langfuse_sdk"
+    assert obj["callback_name"] == "langfuse"
+    assert obj["callback_phase"] == "sdk_background_ingestion_upload"
+    assert obj["langfuse_support_string"] is True
+    assert obj["langfuse_sdk_background_ingestion_failure"] is True
+    assert obj["langfuse_failure_class"] == (
+        "langfuse_sdk_background_ingestion_upload_failure"
+    )
+    assert "recommended_operator_action" in obj
+    assert "Langfuse ingestion/storage health" in obj["recommended_operator_action"]
+
+
+def test_langfuse_support_string_filter_preserves_message_for_plain_formatter():
+    log_filter = LangfuseSupportStringDiagnosticFilter()
+    record = logging.LogRecord(
+        name="langfuse",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg=_LANGFUSE_SUPPORT_STRING,
+        args=(),
+        exc_info=None,
+    )
+    plain_formatter = logging.Formatter("%(message)s")
+
+    assert log_filter.filter(record) is True
+    assert record.getMessage() == _LANGFUSE_SUPPORT_STRING
+    assert plain_formatter.format(record) == _LANGFUSE_SUPPORT_STRING
+
+
+def test_initialize_loggers_routes_langfuse_support_string_diagnostics(
+    monkeypatch, tmp_path
+):
+    original_success_callback = litellm.success_callback.copy()
+    original_failure_callback = litellm.failure_callback.copy()
+    langfuse_logger = logging.getLogger("langfuse")
+    original_handlers = langfuse_logger.handlers[:]
+    original_filters = langfuse_logger.filters[:]
+    original_propagate = langfuse_logger.propagate
+    original_level = langfuse_logger.level
+    stream = io.StringIO()
+    test_handler = logging.StreamHandler(stream)
+    test_handler.setFormatter(JsonFormatter())
+
+    try:
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+        litellm.success_callback = ["langfuse"]
+        litellm.failure_callback = []
+        _initialize_loggers_with_handler(test_handler)
+
+        langfuse_logger.error(_LANGFUSE_SUPPORT_STRING)
+
+        output = stream.getvalue().strip()
+        obj = json.loads(output)
+        assert obj["logger"] == "langfuse"
+        assert obj["message"] == _LANGFUSE_SUPPORT_STRING
+        assert obj["source"] == "langfuse_sdk"
+        assert obj["callback_phase"] == "sdk_background_ingestion_upload"
+        assert obj["langfuse_support_string"] is True
+        assert obj["langfuse_failure_class"] == (
+            "langfuse_sdk_background_ingestion_upload_failure"
+        )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        error_record = json.loads(error_log_path.read_text().strip())
+        assert error_record["logger"] == "langfuse"
+        assert error_record["message"] == _LANGFUSE_SUPPORT_STRING
+        assert error_record["context"]["source"] == "langfuse_sdk"
+        assert (
+            error_record["context"]["callback_phase"]
+            == "sdk_background_ingestion_upload"
+        )
+        assert (
+            error_record["context"]["langfuse_failure_class"]
+            == "langfuse_sdk_background_ingestion_upload_failure"
+        )
+    finally:
+        litellm.success_callback = original_success_callback
+        litellm.failure_callback = original_failure_callback
+        langfuse_logger.handlers = original_handlers
+        langfuse_logger.filters = original_filters
+        langfuse_logger.propagate = original_propagate
+        langfuse_logger.setLevel(original_level)
+
+
 def test_json_formatter_parses_embedded_python_dict_repr():
     """
     Test that JsonFormatter parses Python dict repr (str/deployment) embedded in
@@ -204,7 +324,7 @@ async def test_cache_hit_includes_custom_llm_provider():
 
     try:
         # First call - should be a cache miss
-        response1 = await litellm.acompletion(
+        await litellm.acompletion(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": "test cache hit message"}],
             mock_response="test response",
@@ -215,7 +335,7 @@ async def test_cache_hit_includes_custom_llm_provider():
         await asyncio.sleep(0.5)
 
         # Second identical call - should be a cache hit
-        response2 = await litellm.acompletion(
+        await litellm.acompletion(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": "test cache hit message"}],
             mock_response="test response",
@@ -252,11 +372,6 @@ async def test_cache_hit_includes_custom_llm_provider():
         assert (
             custom_llm_provider is not None and custom_llm_provider != ""
         ), f"custom_llm_provider should not be None or empty, got: {custom_llm_provider}"
-
-        print(
-            f"Cache hit standard logging payload with custom_llm_provider: {custom_llm_provider}",
-            json.dumps(cache_hit_payload, indent=2),
-        )
 
     finally:
         # Clean up
