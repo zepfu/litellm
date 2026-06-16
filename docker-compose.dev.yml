@@ -28,6 +28,7 @@ services:
       - ./litellm/main.py:/app/litellm/main.py
       - ./litellm/utils.py:/app/litellm/utils.py
       - ./litellm/litellm_core_utils/get_model_cost_map.py:/app/litellm/litellm_core_utils/get_model_cost_map.py
+      - ./litellm/litellm_core_utils/exception_mapping_utils.py:/app/litellm/litellm_core_utils/exception_mapping_utils.py
       - ./litellm/litellm_core_utils/prompt_templates/factory.py:/app/litellm/litellm_core_utils/prompt_templates/factory.py
       - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json
       - ./litellm/types/llms/anthropic.py:/app/litellm/types/llms/anthropic.py
