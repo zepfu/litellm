@@ -74,6 +74,8 @@ services:
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
       # Repo-local error intake for managed LiteLLM runtime errors.
       - ./.analysis:/app/.analysis
+      # Durable retry spool for session_history records during DB outages.
+      - ./.analysis/session_history:/mnt/e/litellm/session_history
       # Claude persisted-output files for local expansion
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
       # Claude agent specs for subagent model resolution
@@ -124,6 +126,7 @@ services:
       - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
       - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=${LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME:-aawm-litellm-session-history}
       - AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE=${LITELLM_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE:-0}
+      - AAWM_SESSION_HISTORY_SPOOL_DIR=${LITELLM_AAWM_SESSION_HISTORY_SPOOL_DIR:-/mnt/e/litellm/session_history}
       - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME:-aawm-litellm-dynamic-injection}
       - PGAPPNAME=${LITELLM_AAWM_DB_APPLICATION_NAME:-aawm-litellm-runtime}
       - AAWM_POSTGRES_SERVER=${LITELLM_AAWM_POSTGRES_SERVER:-}

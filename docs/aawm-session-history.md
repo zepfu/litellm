@@ -91,9 +91,14 @@ spool for later replay instead of logging full tracebacks indefinitely.
 
 The default spool directory is `/mnt/e/litellm/session_history`; override it with
 `AAWM_SESSION_HISTORY_SPOOL_DIR` when a deployment needs a different local
-volume. Failed flushes retry every `AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS`
-seconds, and `AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES` controls how many
-retry attempts happen before the batch is atomically written to the spool.
+volume. The directory must be a writable host bind mount, not only an
+in-container path, or outage records can disappear when the container is
+recreated. `litellm-dev` maps the default path to repo-local ignored
+`.analysis/session_history` so local outage datasets stay available without
+being committed. Failed flushes retry every
+`AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS` seconds, and
+`AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES` controls how many retry attempts
+happen before the batch is atomically written to the spool.
 
 Spool filenames include a UTC timestamp and a trace/session/call identifier so
 operators can find the affected dataset without printing prompt, tool, or

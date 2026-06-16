@@ -46,6 +46,11 @@ Before cutting or promoting a release:
   `LITELLM_AAWM_ERROR_LOG_ENABLED=1`,
   `LITELLM_AAWM_ERROR_LOG_ENV=prod`, and
   `LITELLM_AAWM_ERROR_LOG_DIR=/app/.analysis`.
+- Confirm the session-history outage spool has a writable host bind mount at
+  the path named by `AAWM_SESSION_HISTORY_SPOOL_DIR`, normally
+  `/mnt/e/litellm/session_history`. Do not leave this as an unmounted
+  in-container directory, because spooled retry datasets must survive container
+  recreation.
 - Confirm `PATCHES.md`, `TODO.md`, `COMPLETED.md`, `WHEEL.md`, and
   `TEST_HARNESS.md` reflect the current release state when behavior changes.
 
