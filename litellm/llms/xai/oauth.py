@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterator, Optional
 import httpx
 
 from litellm.constants import XAI_API_BASE
+from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
 
 
@@ -42,6 +43,15 @@ _XAI_OAUTH_MODEL_MAP = {
     "oa_xai/grok-4.20-0309-non-reasoning": "xai/grok-4.20-0309-non-reasoning",
     "oa_xai/grok-4.20-multi-agent-0309": "xai/grok-4.20-multi-agent-0309",
 }
+
+_XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA = {
+    "xai_responses_previous_response_id_decoded": True,
+    "tags": ["xai-responses-previous-response-id-decoded"],
+}
+
+_XAI_UNSUPPORTED_REASONING_INPUT_REMOVED_TAG = (
+    "codex-unsupported-input-item-removed"
+)
 
 _refresh_locks: Dict[str, asyncio.Lock] = {}
 
@@ -130,18 +140,102 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     data["api_base"] = get_secret_str("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
     data["api_key"] = await get_xai_oauth_access_token()
     data["custom_llm_provider"] = "xai"
+    decoded_previous_response_id = _decode_previous_response_id_in_place(data)
+    removed_input_items = _drop_xai_unsupported_reasoning_input_items_in_place(data)
 
     metadata = data.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
         data["metadata"] = metadata
     _merge_metadata(metadata, build_oa_xai_metadata(public_model, upstream_model))
+    if decoded_previous_response_id:
+        _merge_metadata(
+            metadata, _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA
+        )
+    if removed_input_items:
+        _merge_metadata(
+            metadata,
+            _build_xai_unsupported_reasoning_input_removed_metadata(
+                removed_input_items
+            ),
+        )
 
     litellm_metadata = data.get("litellm_metadata")
     if isinstance(litellm_metadata, dict):
         _merge_metadata(litellm_metadata, build_oa_xai_metadata(public_model, upstream_model))
+        if decoded_previous_response_id:
+            _merge_metadata(
+                litellm_metadata,
+                _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA,
+            )
+        if removed_input_items:
+            _merge_metadata(
+                litellm_metadata,
+                _build_xai_unsupported_reasoning_input_removed_metadata(
+                    removed_input_items
+                ),
+            )
 
     return True
+
+
+def _decode_previous_response_id_in_place(data: Dict[str, Any]) -> bool:
+    previous_response_id = data.get("previous_response_id")
+    if not isinstance(previous_response_id, str) or not previous_response_id:
+        return False
+
+    decoded = (
+        ResponsesAPIRequestUtils.decode_previous_response_id_to_original_previous_response_id(
+            previous_response_id
+        )
+    )
+    if decoded == previous_response_id:
+        return False
+
+    data["previous_response_id"] = decoded
+    return True
+
+
+def _drop_xai_unsupported_reasoning_input_items_in_place(
+    data: Dict[str, Any],
+) -> list[Dict[str, Any]]:
+    input_items = data.get("input")
+    if not isinstance(input_items, list):
+        return []
+
+    updated_input_items: list[Any] = []
+    removed_items: list[Dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            updated_input_items.append(item)
+            continue
+
+        if str(item.get("type") or "").lower() == "reasoning":
+            removed_item: Dict[str, Any] = {"type": "reasoning", "index": index}
+            if isinstance(item.get("encrypted_content"), str):
+                removed_item["encrypted_content"] = True
+            removed_items.append(removed_item)
+            continue
+
+        updated_input_items.append(item)
+
+    if removed_items:
+        data["input"] = updated_input_items
+    return removed_items
+
+
+def _build_xai_unsupported_reasoning_input_removed_metadata(
+    removed_items: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "codex_unsupported_input_item_removed_count": len(removed_items),
+        "codex_unsupported_input_item_types_removed": ["reasoning"],
+        "codex_unsupported_input_items_removed": removed_items,
+        "tags": [
+            _XAI_UNSUPPORTED_REASONING_INPUT_REMOVED_TAG,
+            "codex-unsupported-input-item:reasoning",
+        ],
+    }
 
 
 def _merge_metadata(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:

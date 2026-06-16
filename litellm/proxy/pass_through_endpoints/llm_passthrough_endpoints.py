@@ -1353,6 +1353,12 @@ async def _prepare_oa_xai_passthrough_request(
         if updated_body is not request_body:
             request_body.clear()
             request_body.update(updated_body)
+        updated_body, _xai_unsupported_input_items = (
+            _drop_unsupported_codex_input_items_from_request_body(request_body)
+        )
+        if updated_body is not request_body:
+            request_body.clear()
+            request_body.update(updated_body)
         _sanitize_xai_responses_request_body_in_place(request_body)
         updated_body, _removed_tool_choice = (
             _drop_tool_choice_without_tools_from_request_body(request_body)
@@ -1500,6 +1506,9 @@ async def _prepare_grok_native_oauth_passthrough_request(
     )
     prepared_body, _grok_unsupported_request_params = (
         _drop_unsupported_codex_request_params_from_request_body(prepared_body)
+    )
+    prepared_body, _grok_unsupported_input_items = (
+        _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
     _sanitize_xai_responses_request_body_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
@@ -16447,17 +16456,15 @@ def _drop_unsupported_codex_input_items_from_request_body(
 
         item_type = _normalize_low_cardinality_tag_value(item.get("type"))
         if item_type in unsupported_input_item_types:
+            removed_item: dict[str, Any] = {
+                "type": item_type,
+                "index": index,
+            }
             if item_type == "reasoning" and isinstance(
                 item.get("encrypted_content"), str
             ):
-                updated_input_items.append(item)
-                continue
-            removed_items.append(
-                {
-                    "type": item_type,
-                    "index": index,
-                }
-            )
+                removed_item["encrypted_content"] = True
+            removed_items.append(removed_item)
             continue
 
         updated_input_items.append(item)
@@ -19185,6 +19192,9 @@ def _prepare_grok_request_body_for_passthrough(
     )
     prepared_body, _grok_unsupported_request_params = (
         _drop_unsupported_codex_request_params_from_request_body(prepared_body)
+    )
+    prepared_body, _grok_unsupported_input_items = (
+        _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
