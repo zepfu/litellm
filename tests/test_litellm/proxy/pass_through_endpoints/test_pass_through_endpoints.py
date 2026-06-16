@@ -160,6 +160,7 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
         "model": "grok-composer-2.5-fast",
         "litellm_metadata": {
             "agent_name": "W4 engineer",
+            "agent_id": "a9150f66743e0f185",
             "repository": "dashboard-shell",
             "requested_model_alias": "aawm-code",
         },
@@ -173,11 +174,11 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
     )
 
     assert line == (
-        "ROUTE: claude-code/1.2.3 - 2026-06-14 19:31:05 - "
-        "W4 engineer@dashboard-shell - "
-        "grok-composer-2.5-fast(aawm-code) - 172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "chatgpt.com/backend-api/codex/responses HTTP/1.1"
+        "20260614 19:31:05 ROUTE Claude/1.2.3 - "
+        "W4 engineer#a9150f66743e0f185@dashboard-shell."
+        "grok-composer-2.5-fast(aawm-code) POST 172.19.0.1:52834 "
+        "/anthropic/v1/messages?beta=true -> "
+        "chatgpt.com/backend-api/codex/responses"
     )
     assert "api_key" not in line
     assert "ignored=1" not in line
@@ -199,8 +200,8 @@ def test_build_aawm_route_access_log_line_omits_missing_optional_context() -> No
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - 127.0.0.1:44780 - "
-        "GET /openai_passthrough/responses -> api.openai.com/v1/responses HTTP/2"
+        "20260614 19:31:05 ROUTE GET 127.0.0.1:44780 "
+        "/openai_passthrough/responses -> api.openai.com/v1/responses"
     )
     assert "secret" not in line
     assert "token" not in line
@@ -224,9 +225,8 @@ def test_build_aawm_route_access_log_line_omits_alias_when_same_as_model() -> No
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - aawm-code - 172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "api.anthropic.com/v1/messages HTTP/1.1"
+        "20260614 19:31:05 ROUTE aawm-code POST 172.19.0.1:52834 "
+        "/anthropic/v1/messages?beta=true -> api.anthropic.com/v1/messages"
     )
     assert "aawm-code(aawm-code)" not in line
 
@@ -255,10 +255,9 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - gpt-5.5(aawm-code) - "
-        "172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "chatgpt.com/backend-api/codex/responses HTTP/1.1"
+        "20260614 19:31:05 ROUTE gpt-5.5(aawm-code) "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
+        "chatgpt.com/backend-api/codex/responses"
     )
     assert "general-purpose@" not in line
     assert "reuse_rule" not in line
@@ -281,10 +280,9 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_headers() ->
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - gpt-5.3-codex-spark - "
-        "172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "api.openai.com/v1/responses HTTP/1.1"
+        "20260614 19:31:05 ROUTE gpt-5.3-codex-spark "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
+        "api.openai.com/v1/responses"
     )
     assert "unrelated shell command" not in line
     assert "mypy fails" not in line
@@ -307,7 +305,9 @@ def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: 2026-06-14 19:31:05 - W4 engineer@dashboard-shell -")
+    assert line.startswith(
+        "20260614 19:31:05 ROUTE W4 engineer@dashboard-shell."
+    )
     assert "/home/zepfu/projects" not in line
 
 
@@ -341,9 +341,8 @@ def test_build_aawm_route_access_log_line_infers_repository_from_claude_cwd() ->
     )
 
     assert line.startswith(
-        "ROUTE: claude-cli/2.1.177 - 2026-06-14 19:31:05 - "
-        "engineer@dashboard-shell - "
-        "grok-composer-2.5-fast(aawm-code-anthropic) - "
+        "20260614 19:31:05 ROUTE Claude/2.1.177 - "
+        "engineer@dashboard-shell.grok-composer-2.5-fast(aawm-code-anthropic) "
     )
     assert "/home/zepfu/projects" not in line
     assert "<cwd>" not in line
@@ -373,9 +372,8 @@ def test_build_aawm_route_access_log_line_normalizes_worktree_cwd_to_repo() -> N
     )
 
     assert line.startswith(
-        "ROUTE: 2026-06-14 19:31:05 - engineer@dashboard-shell - "
+        "20260614 19:31:05 ROUTE engineer@dashboard-shell."
     )
-    assert ".claude" not in line
     assert "worktrees" not in line
     assert "agent-123" not in line
     assert "/home/zepfu/projects" not in line
@@ -404,10 +402,40 @@ def test_build_aawm_route_access_log_line_infers_codex_workspace_repository() ->
     )
 
     assert line.startswith(
-        "ROUTE: codex-tui/0.139.0 - 2026-06-14 19:31:05 - "
-        "orchestrator@litellm - gpt-5.5(aawm-code) - "
+        "20260614 19:31:05 ROUTE Codex/0.139.0 - "
+        "orchestrator@litellm.gpt-5.5(aawm-code) "
     )
     assert "/home/zepfu/projects" not in line
+
+
+def test_build_aawm_route_access_log_line_defaults_tui_repo_agent_to_orchestrator() -> None:
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/openai_passthrough/responses",
+        headers={"user-agent": "codex-tui/0.139.0"},
+    )
+    request_body = {
+        "model": "gpt-5.5",
+        "workspace_root": "/home/zepfu/projects/aawm-tap",
+        "litellm_metadata": {
+            "requested_model_alias": "aawm-code",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line == (
+        "20260614 19:31:05 ROUTE Codex/0.139.0 - "
+        "orchestrator@aawm-tap.gpt-5.5(aawm-code) "
+        "POST 172.19.0.1:52834 /openai_passthrough/responses -> "
+        "chatgpt.com/backend-api/codex/responses"
+    )
+    assert "aawm-tap.gpt-5.5" in line
+    assert " - aawm-tap.gpt-5.5" not in line
 
 
 def test_build_aawm_route_access_log_line_omits_alias_with_body_repository() -> None:
@@ -431,7 +459,7 @@ def test_build_aawm_route_access_log_line_omits_alias_with_body_repository() -> 
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert "orchestrator@litellm - gpt-5.5 - " in line
+    assert "orchestrator@litellm.gpt-5.5 " in line
     assert "gpt-5.5(gpt-5.5)" not in line
     assert "/home/zepfu/projects" not in line
 
@@ -453,7 +481,7 @@ def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> N
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: 2026-06-14 19:31:05 - W4 engineer@zepfu/litellm -")
+    assert line.startswith("20260614 19:31:05 ROUTE W4 engineer@zepfu/litellm.")
 
 
 def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
@@ -472,7 +500,7 @@ def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
     )
 
     assert line.startswith(
-        "ROUTE: codex-cli/0.119.0-alpha.29 - 2026-06-14 19:31:05 - "
+        "20260614 19:31:05 ROUTE Codex/0.119.0-alpha.29 - "
     )
 
 
@@ -491,7 +519,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_client_identity() -> 
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: curl/8.0 - 2026-06-14 19:31:05 - ")
+    assert line.startswith("20260614 19:31:05 ROUTE curl/8.0 - ")
     assert "prompt-like" not in line
     assert "unrelated command" not in line
 
@@ -536,14 +564,14 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("ROUTE:")
+        if " ROUTE " in record.getMessage()
     ]
     assert len(route_records) == 1
     assert re.fullmatch(
-        r"ROUTE: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
-        r"claude-sonnet-4-6\(aawm-code-anthropic\) - "
-        r"172\.19\.0\.1:52834 - POST /anthropic/v1/messages\?beta=true "
-        r"-> api\.anthropic\.com/v1/messages HTTP/1\.1",
+        r"\d{8} \d{2}:\d{2}:\d{2} ROUTE "
+        r"claude-sonnet-4-6\(aawm-code-anthropic\) "
+        r"POST 172\.19\.0\.1:52834 /anthropic/v1/messages\?beta=true "
+        r"-> api\.anthropic\.com/v1/messages",
         route_records[0],
     )
 
@@ -715,19 +743,139 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("ROUTE:")
+        if " ROUTE " in record.getMessage()
     ]
     assert len(route_records) == 1
     assert re.fullmatch(
-        r"ROUTE: codex-cli/0\.119\.0-alpha\.29 - "
-        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
-        r"W2 tester@litellm - gpt-5\.3-codex-spark\(aawm-code\) - "
-        r"172\.19\.0\.1:44766 - POST /openai_passthrough/responses\?stream=false "
-        r"-> api\.openai\.com/v1/responses HTTP/1\.1",
+        r"\d{8} \d{2}:\d{2}:\d{2} ROUTE Codex/0\.119\.0-alpha\.29 - "
+        r"W2 tester@litellm\.gpt-5\.3-codex-spark\(aawm-code\) "
+        r"POST 172\.19\.0\.1:44766 /openai_passthrough/responses\?stream=false "
+        r"-> api\.openai\.com/v1/responses",
         route_records[0],
     )
     assert "redacted" not in route_records[0]
     assert "api_key" not in route_records[0]
+
+
+def test_build_aawm_route_access_log_line_uses_nested_litellm_params_repository() -> None:
+    request = _build_aawm_route_log_request(
+        headers={
+            "user-agent": "claude-cli/2.1.177",
+            "x-aawm-agent-id": "a9150f66743e0f185",
+        }
+    )
+    kwargs = {
+        "litellm_params": {
+            "proxy_server_request": {
+                "headers": {},
+                "body": {
+                    "litellm_metadata": {
+                        "agent_name": "engineer",
+                        "repository": "dashboard-shell",
+                    }
+                },
+            }
+        }
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body={"model": "claude-sonnet-4-6"},
+        kwargs=kwargs,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "20260614 19:31:05 ROUTE Claude/2.1.177 - "
+        "engineer#a9150f66743e0f185@dashboard-shell.claude-sonnet-4-6 "
+    )
+
+
+def test_build_aawm_route_access_log_line_uses_request_header_tenant_repository_fallback() -> None:
+    request = _build_aawm_route_log_request(
+        headers={"user-agent": "claude-cli/2.1.177"}
+    )
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "agent_name": "ops",
+                "tenant_id_source": "request_headers",
+                "tenant_id": "dashboard-shell",
+            }
+        }
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body={"model": "claude-sonnet-4-6"},
+        kwargs=kwargs,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "20260614 19:31:05 ROUTE Claude/2.1.177 - "
+        "ops@dashboard-shell.claude-sonnet-4-6 "
+    )
+
+
+def test_build_aawm_route_access_log_line_normalizes_grok_client_identity() -> None:
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/grok/v1/responses",
+        headers={"user-agent": "grok-build/0.4.2"},
+    )
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "litellm_metadata": {
+            "agent_name": "engineer",
+            "agent_id": "grok-session-abc123",
+            "repository": "dashboard-shell",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://cli-chat-proxy.grok.com/v1/responses",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line == (
+        "20260614 19:31:05 ROUTE Grok/0.4.2 - "
+        "engineer#grok-session-abc123@dashboard-shell.grok-composer-2.5-fast "
+        "POST 172.19.0.1:52834 /grok/v1/responses -> "
+        "cli-chat-proxy.grok.com/v1/responses"
+    )
+
+
+def test_build_aawm_route_access_log_line_uses_rerank_type_without_agent_context() -> None:
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/v1/rerank",
+        headers={"user-agent": "python-httpx/0.28.1"},
+    )
+    request_body = {
+        "model": "tei-reranker",
+        "litellm_metadata": {
+            "agent_name": "ranking worker",
+            "repository": "litellm",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="http://172.20.0.1:8080/rerank",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line == (
+        "20260614 19:31:05 RERANK python-httpx/0.28.1 - "
+        "tei-reranker POST 172.19.0.1:52834 /v1/rerank -> "
+        "172.20.0.1/rerank"
+    )
+    assert "ranking worker" not in line
+    assert "litellm." not in line
 
 
 # Test is_multipart

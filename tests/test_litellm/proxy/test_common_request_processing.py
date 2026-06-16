@@ -324,15 +324,13 @@ class TestProxyBaseLLMRequestProcessing:
         route_records = [
             record.getMessage()
             for record in caplog.records
-            if record.getMessage().startswith("ROUTE:")
+            if " EMBED " in record.getMessage()
         ]
         assert len(route_records) == 1
         assert re.fullmatch(
-            r"ROUTE: codex-cli/0\.119\.0-alpha\.29 - "
-            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
-            r"embed worker@litellm - text-embedding-3-small\(aawm-mini\) - "
-            r"172\.19\.0\.1:52834 - POST /v1/embeddings -> "
-            r"api\.openai\.com/v1/embeddings HTTP/1\.1",
+            r"\d{8} \d{2}:\d{2}:\d{2} EMBED Codex/0\.119\.0-alpha\.29 - "
+            r"text-embedding-3-small\(aawm-mini\) POST 172\.19\.0\.1:52834 "
+            r"/v1/embeddings -> api\.openai\.com/v1/embeddings",
             route_records[0],
         )
         assert "api_key" not in route_records[0]
