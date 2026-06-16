@@ -216,26 +216,40 @@ path.
 The display shape is:
 
 ```text
-ROUTE: [client-name/version -] YYYY-MM-DD HH:MM:SS - [agent@repository -] [model(alias) -] [ip:port -] METHOD incoming -> outgoing PROTOCOL
+YYYYMMDD HH:MM:SS TYPE [Client/Version -] [agent[#agent_id]@repository.]model(alias) METHOD ip:port incoming -> outgoing
 ```
 
-The timestamp uses a 24-hour clock. Client name/version, agent, repository,
-model alias, and client address segments are omitted when that metadata is
-unavailable. The selected model is printed as `model(alias)` only when the
-inbound alias differs from the selected model.
+The timestamp uses a 24-hour clock. `TYPE` is normally `ROUTE`, with lighter
+`EMBED` and `RERANK` forms for embedding/rerank traffic. TUI clients are
+normalized to common product names such as `Claude`, `Codex`, and `Grok`; other
+client products keep their parsed product name/version. Agent, agent id,
+repository, model alias, and client address segments are omitted when that
+metadata is unavailable or not relevant. Route logs print `#agent_id` only when
+a real client-provided opaque id is available before egress; they do not
+synthesize an agent id from `session_id`. The selected model is printed as
+`model(alias)` only when the inbound alias differs from the selected model.
+For TUI route traffic with a known repository but no explicit agent name,
+LiteLLM uses the same `orchestrator` default as `session_history`, so those rows
+display as `orchestrator@repository.model(alias)` instead of `repository.model`.
+Embedding and rerank route logs intentionally omit agent/repository identity
+unless the model label itself carries the needed operational context.
 
 These lines are for live container-log triage, not durable reporting. Durable
 model and alias attribution still comes from `session_history.model` and
 `session_history.inbound_model_alias`. Route-log identity fields are conservative
 display tokens derived from normalized metadata or explicit headers such as
 `x-aawm-client-name`, `x-aawm-client-version`, `user-agent`,
-`x-aawm-agent-name`, and `x-aawm-repository`; LiteLLM omits prompt-like,
-sentence-like, or punctuation-heavy identity values instead of printing raw
-request text. Explicit request metadata wins first, then explicit headers. If
-no repository token is available from those sources, LiteLLM may infer only the
-repository label from bounded, known workspace fields in the parsed request body,
-including `workspace_root`, `project_root`, `working_directory`, `cwd_path`,
-`cwdUri`, `request.metadata.repository`, and Claude/Codex cwd markers such as
+`x-aawm-agent-name`, `x-aawm-agent-id`, and `x-aawm-repository`; LiteLLM omits
+prompt-like, sentence-like, or punctuation-heavy identity values instead of
+printing raw request text. Repository lookup intentionally mirrors the
+`session_history` callback's safe source order where route logging has access to
+the same data: explicit request metadata, nested `litellm_metadata`, explicit
+headers, request-body workspace/cwd fields, and the bounded request-header
+tenant fallback used for repository-like tenant ids. If no repository token is
+available from those sources, LiteLLM may infer only the repository label from
+bounded, known workspace fields in the parsed request body, including
+`workspace_root`, `project_root`, `working_directory`, `cwd_path`, `cwdUri`,
+`request.metadata.repository`, and Claude/Codex cwd markers such as
 `<cwd>...</cwd>`. Body-derived repository values are normalized to a slug or
 `owner/repo` label, and worktree paths are trimmed back to the repository root
 before logging. LiteLLM does not print raw prompt text or raw tool arguments for
@@ -246,7 +260,7 @@ response bodies, prompt content, tool arguments, or arbitrary query strings.
 Incoming endpoints preserve only known-safe routing query markers, and outgoing
 targets are logged as host plus path.
 
-For requests that emit this enriched `ROUTE:` line, LiteLLM suppresses the
+For requests that emit this enriched route line, LiteLLM suppresses the
 matching native Uvicorn/Gunicorn access record for that request. Unrelated
 routes should continue to use the normal server access log.
 
