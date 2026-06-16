@@ -121,6 +121,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
     _prepare_oa_xai_passthrough_request,
+    _sanitize_xai_responses_request_body,
     _resolve_google_adapter_session_id,
     _resolve_codex_google_code_assist_adapter_model,
     _resolve_codex_opencode_zen_adapter_model,
@@ -165,6 +166,7 @@ from litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrou
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
 )
+from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
@@ -14957,6 +14959,42 @@ def test_grok_direct_passthrough_removes_unsupported_reasoning_request_params():
     ]
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+    ],
+)
+def test_xai_responses_sanitizer_decodes_litellm_previous_response_id(model):
+    encoded_previous_response_id = (
+        ResponsesAPIRequestUtils._build_responses_api_response_id(
+            custom_llm_provider="xai",
+            model_id=model,
+            response_id="resp_original_upstream",
+        )
+    )
+    request_body = {
+        "model": model,
+        "input": "continue",
+        "previous_response_id": encoded_previous_response_id,
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+
+    updated_body, removed_params, tool_changes = _sanitize_xai_responses_request_body(
+        request_body
+    )
+
+    assert removed_params == []
+    assert tool_changes == []
+    assert updated_body["previous_response_id"] == "resp_original_upstream"
+    assert updated_body["previous_response_id"] != encoded_previous_response_id
+    metadata = updated_body["litellm_metadata"]
+    assert "existing-tag" in metadata["tags"]
+    assert "xai-responses-previous-response-id-decoded" in metadata["tags"]
+    assert metadata["xai_responses_previous_response_id_decoded"] is True
+
+
 @pytest.mark.asyncio
 async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_params(
     monkeypatch,
@@ -18213,7 +18251,7 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
             False,
         ),
         ("xai", "oa_xai/grok-build", "codex_xai_oauth_responses_adapter", False),
-        ("openai", "gpt-5.3-codex", "codex_responses", True),
+        ("openai", "gpt-5.5", "codex_responses", True),
     ]
 
     with patch(
@@ -18234,6 +18272,7 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
             assert candidate["last_resort"] is last_resort
             if last_resort:
                 assert selection["selection_reason"] == "last_resort"
+                assert candidate["default_reasoning_effort"] == "medium"
             else:
                 assert selection["selection_reason"] == "first_available"
             if index < len(expected_candidates) - 1:
@@ -18241,6 +18280,95 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
                     selection["cooldown_key"],
                     60.0,
                 )
+
+
+def test_codex_auto_agent_alias_last_resort_sets_default_medium_reasoning():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        request=request,
+        selection={
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "route_family": "codex_responses",
+                "last_resort": True,
+                "default_reasoning_effort": "medium",
+            },
+            "selection_reason": "last_resort",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    assert updated_body["model"] == "gpt-5.5"
+    assert updated_body["reasoning"] == {"effort": "medium"}
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_default_reasoning_effort"] == "medium"
+    assert metadata["codex_reasoning_effort"] == "medium"
+    assert "codex-auto-agent-default-effort:medium" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-code:codex-session:session:codex-session"
+    ] = {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "route_family": "codex_responses",
+        "last_resort": True,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    mock_pass_through.assert_awaited_once()
+    candidate_body = mock_pass_through.await_args.kwargs["custom_body"]
+    assert candidate_body["model"] == "gpt-5.5"
+    assert candidate_body["reasoning"] == {"effort": "medium"}
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_last_resort"] is True
+    assert metadata["codex_auto_agent_selection_reason"] == "session_affinity"
+    assert metadata["codex_auto_agent_default_reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio
