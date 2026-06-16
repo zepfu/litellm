@@ -385,7 +385,11 @@ _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = "openrouter"
 _CODEX_AUTO_AGENT_XAI_PROVIDER = "xai"
 _CODEX_AUTO_AGENT_OPENCODE_PROVIDER = _OPENCODE_ZEN_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
-_CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
+_CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY = "xai_grok_oidc"
+_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = "xai_oauth"
+# Backward-compatible alias for older tests and notes that referred to the
+# shared xAI lane before Composer OIDC and managed OAuth were split.
+_CODEX_AUTO_AGENT_XAI_LANE_KEY = _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY
 _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _OPENCODE_ZEN_PROVIDER
 _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
@@ -1551,18 +1555,25 @@ async def _prepare_grok_native_oauth_passthrough_request(
     request: Request,
     tags_to_add: Optional[list[str]] = None,
     extra_fields: Optional[dict[str, Any]] = None,
+    force_refresh: bool = False,
 ) -> tuple[bool, Optional[str], dict[str, Any], dict[str, Any]]:
     model = normalize_grok_native_oauth_model(request_body.get("model"))
     if model is None:
         return False, None, {}, request_body
+
+    merged_tags_to_add = list(tags_to_add or [])
+    merged_extra_fields = dict(extra_fields or {})
+    if force_refresh:
+        merged_tags_to_add.append("grok-native-oauth-forced-refresh")
+        merged_extra_fields["grok_native_oauth_forced_refresh"] = True
 
     prepared_body = dict(request_body)
     prepared_body["model"] = model
     prepared_body = _add_grok_native_oauth_metadata(
         prepared_body,
         model=model,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
+        tags_to_add=merged_tags_to_add,
+        extra_fields=merged_extra_fields,
     )
     prepared_body, _grok_unsupported_hosted_tools = (
         _drop_unsupported_codex_hosted_tools_from_request_body(prepared_body)
@@ -1577,7 +1588,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
     )
-    access_token = await get_grok_native_oauth_access_token()
+    access_token = await get_grok_native_oauth_access_token(force_refresh=force_refresh)
     headers = _build_grok_native_oauth_headers(
         access_token=access_token,
         model=model,
@@ -2031,6 +2042,48 @@ def _resolve_codex_auto_agent_session_key(
         f"{alias_model}:{session_id}:"
         f"{_resolve_codex_auto_agent_openai_lane_key(request)}"
     )
+
+
+def _is_xai_quota_or_usage_exhaustion_detail(normalized_detail: str) -> bool:
+    if any(
+        marker in normalized_detail
+        for marker in (
+            "usage_limit_reached",
+            "quota exhausted",
+            "exhausted your capacity",
+            "resource_exhausted",
+            "resource exhausted",
+            "rate limit exceeded",
+            "too many requests",
+        )
+    ):
+        return True
+    if "quota" in normalized_detail and any(
+        marker in normalized_detail
+        for marker in ("exhaust", "limit", "reset", "usage")
+    ):
+        return True
+    return False
+
+
+def _extract_candidate_exception_detail_text(exc: Exception) -> str:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        return json.dumps(detail, sort_keys=True, default=str)
+    if detail is not None:
+        return str(detail)
+    return str(exc)
+
+
+def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
+    route_family = str(candidate.get("route_family") or "").lower()
+    if route_family in {
+        "codex_xai_oauth_responses_adapter",
+        "anthropic_xai_oauth_responses_adapter",
+        "anthropic_xai_oauth_completion_adapter",
+    }:
+        return _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
+    return _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY
 
 
 def _codex_auto_agent_candidate_key(
@@ -2497,7 +2550,7 @@ async def _build_codex_auto_agent_candidate_states(
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-            lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
+            lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
         else:
@@ -3168,7 +3221,7 @@ async def _build_anthropic_auto_agent_candidate_states(
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-            lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
+            lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
         elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
@@ -9819,51 +9872,110 @@ def _is_grok_unsupported_reasoning_parameter_detail(normalized_detail: str) -> b
 
 
 def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, (dict, list)):
-        detail_text = json.dumps(detail, sort_keys=True, default=str)
-    elif detail is not None:
-        detail_text = str(detail)
-    else:
-        detail_text = str(exc)
+    detail_text = _extract_candidate_exception_detail_text(exc)
     normalized = detail_text.lower()
     if _is_grok_unsupported_reasoning_parameter_detail(normalized):
         return detail_text
     if "could not decode the compaction blob" in normalized:
         return detail_text
-    if (
-        "xai oauth credential" not in normalized
-        and "grok oidc credential" not in normalized
-        and "grok native" not in normalized
-    ):
+    if _is_xai_quota_or_usage_exhaustion_detail(normalized):
         return None
-    return detail_text
+    if _grok_native_auth_failure_detail(exc) is not None:
+        return detail_text
+    if any(
+        marker in normalized
+        for marker in (
+            "xai oauth credential",
+            "grok oidc credential",
+            "grok native",
+            "grok oidc credential refresh failed",
+            "invalid_grant",
+        )
+    ):
+        return detail_text
+    return None
+
+
+def _grok_native_auth_failure_detail(exc: Exception) -> Optional[str]:
+    detail_text = _extract_candidate_exception_detail_text(exc)
+    normalized = detail_text.lower()
+    if _is_xai_quota_or_usage_exhaustion_detail(normalized):
+        return None
+    if any(
+        marker in normalized
+        for marker in (
+            "invalid or expired credentials",
+            "permissiondenied",
+            "no auth context",
+            "x_xai_token_auth=xai-grok-cli",
+            "auth_kind=bearer",
+        )
+    ):
+        return detail_text
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    if status_code not in {401, 403}:
+        return None
+    if any(
+        marker in normalized
+        for marker in (
+            "credential",
+            "credentials",
+            "authentication",
+            "authorization",
+            "unauthorized",
+            "forbidden",
+            "invalid_grant",
+            "oauth",
+            "oidc",
+            "token",
+            "auth context",
+            "x_xai_token_auth",
+            "xai-grok-cli",
+        )
+    ):
+        return detail_text
+    return None
 
 
 def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, (dict, list)):
-        detail_text = json.dumps(detail, sort_keys=True, default=str)
-    elif detail is not None:
-        detail_text = str(detail)
-    else:
-        detail_text = str(exc)
+    detail_text = _extract_candidate_exception_detail_text(exc)
     normalized = detail_text.lower()
     if _is_grok_unsupported_reasoning_parameter_detail(normalized):
         return detail_text
     if "could not decode the compaction blob" in normalized:
         return detail_text
-    if not any(
+    if _is_xai_quota_or_usage_exhaustion_detail(normalized):
+        return None
+    if any(
         marker in normalized
         for marker in (
             "xai oauth credential",
             "xai oauth-managed",
             "managed xai oauth",
             "litellm_xai_oauth_auth_file",
+            "invalid or expired credentials",
+            "permissiondenied",
+            "no auth context",
         )
     ):
-        return None
-    return detail_text
+        return detail_text
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    if status_code in {401, 403} and any(
+        marker in normalized
+        for marker in (
+            "credential",
+            "credentials",
+            "authentication",
+            "authorization",
+            "unauthorized",
+            "forbidden",
+            "oauth",
+            "token",
+            "auth context",
+        )
+    ):
+        return detail_text
+    return None
 
 
 def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> None:
@@ -13184,52 +13296,58 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
         )
     )
 
-    try:
-        (
-            prepared_grok_native,
-            target_base_url,
-            grok_headers,
-            translated_request_body,
-        ) = await _prepare_grok_native_oauth_passthrough_request(
-            translated_request_body,
-            request=request,
-            tags_to_add=[
-                "anthropic-grok-native-responses-adapter-entrypoint",
-            ],
-            extra_fields={
-                "anthropic_grok_native_requested_model": prepared_request_body.get("model"),
-                "anthropic_grok_native_adapter_model": adapter_model,
-                "anthropic_adapter_target_endpoint": "xai:/v1/responses",
-                "grok_native_entrypoint": "anthropic_messages",
-            },
-        )
-    except Exception as exc:
-        if (
-            use_alias_candidate_probe
-            and _grok_native_candidate_unavailable_detail(exc) is not None
-        ):
-            _raise_grok_native_auto_agent_candidate_unavailable(exc)
-        raise
-    if not prepared_grok_native or target_base_url is None:
-        if use_alias_candidate_probe:
-            _raise_grok_native_auto_agent_candidate_unavailable(
-                Exception(
-                    "Anthropic adapter requests for Grok native OAuth models "
-                    "require a Grok OIDC credential."
-                )
+    async def _prepare_and_send_grok_native(
+        *,
+        force_refresh: bool = False,
+    ) -> Response:
+        nonlocal translated_request_body
+        try:
+            (
+                prepared_grok_native,
+                target_base_url,
+                grok_headers,
+                translated_request_body,
+            ) = await _prepare_grok_native_oauth_passthrough_request(
+                translated_request_body,
+                request=request,
+                tags_to_add=[
+                    "anthropic-grok-native-responses-adapter-entrypoint",
+                ],
+                extra_fields={
+                    "anthropic_grok_native_requested_model": prepared_request_body.get(
+                        "model"
+                    ),
+                    "anthropic_grok_native_adapter_model": adapter_model,
+                    "anthropic_adapter_target_endpoint": "xai:/v1/responses",
+                    "grok_native_entrypoint": "anthropic_messages",
+                },
+                force_refresh=force_refresh,
             )
-        raise Exception(
-            "Anthropic adapter requests for Grok native OAuth models require a Grok OIDC credential."
+        except Exception as exc:
+            if (
+                use_alias_candidate_probe
+                and _grok_native_candidate_unavailable_detail(exc) is not None
+            ):
+                _raise_grok_native_auto_agent_candidate_unavailable(exc)
+            raise
+        if not prepared_grok_native or target_base_url is None:
+            if use_alias_candidate_probe:
+                _raise_grok_native_auto_agent_candidate_unavailable(
+                    Exception(
+                        "Anthropic adapter requests for Grok native OAuth models "
+                        "require a Grok OIDC credential."
+                    )
+                )
+            raise Exception(
+                "Anthropic adapter requests for Grok native OAuth models require a Grok OIDC credential."
+            )
+
+        target_url = _join_grok_passthrough_url(
+            base_target_url=target_base_url,
+            endpoint="/v1/responses",
         )
-
-    target_url = _join_grok_passthrough_url(
-        base_target_url=target_base_url,
-        endpoint="/v1/responses",
-    )
-    _annotate_request_scope_for_adapted_access_log(request, target_url)
-
-    try:
-        upstream_response = await pass_through_request(
+        _annotate_request_scope_for_adapted_access_log(request, target_url)
+        return await pass_through_request(
             request=request,
             target=str(target_url),
             custom_headers=grok_headers,
@@ -13241,13 +13359,30 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
             egress_credential_family="xai",
             expected_target_family="xai",
         )
+
+    try:
+        upstream_response = await _prepare_and_send_grok_native()
     except Exception as exc:
-        if (
+        if _grok_native_auth_failure_detail(exc) is not None:
+            try:
+                upstream_response = await _prepare_and_send_grok_native(
+                    force_refresh=True,
+                )
+            except Exception as retry_exc:
+                if (
+                    use_alias_candidate_probe
+                    and _grok_native_candidate_unavailable_detail(retry_exc)
+                    is not None
+                ):
+                    _raise_grok_native_auto_agent_candidate_unavailable(retry_exc)
+                raise
+        elif (
             use_alias_candidate_probe
             and _grok_native_candidate_unavailable_detail(exc) is not None
         ):
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
-        raise
+        else:
+            raise
 
     if isinstance(upstream_response, StreamingResponse):
         if not client_requested_stream:
@@ -22317,27 +22452,28 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     user_api_key_dict: UserAPIKeyAuth,
     request_body: dict[str, Any],
 ) -> Response:
-    try:
-        grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
-            endpoint=endpoint,
-            request=request,
-            request_body=request_body,
-            extra_headers={},
-        )
-    except Exception as exc:
-        if _grok_native_candidate_unavailable_detail(exc) is not None:
-            _raise_grok_native_auto_agent_candidate_unavailable(exc)
-        raise
-    if grok_context is None:
-        _raise_grok_native_auto_agent_candidate_unavailable(
-            Exception(
-                "Grok native Codex auto-agent candidate requires a managed "
-                "Grok OIDC credential."
+    async def _send_grok_native_request(*, force_refresh: bool = False) -> Response:
+        try:
+            grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
+                endpoint=endpoint,
+                request=request,
+                request_body=request_body,
+                extra_headers={},
+                force_refresh=force_refresh,
             )
-        )
-    assert grok_context is not None
-    _, grok_headers, grok_prepared_body, updated_url = grok_context
-    try:
+        except Exception as exc:
+            if _grok_native_candidate_unavailable_detail(exc) is not None:
+                _raise_grok_native_auto_agent_candidate_unavailable(exc)
+            raise
+        if grok_context is None:
+            _raise_grok_native_auto_agent_candidate_unavailable(
+                Exception(
+                    "Grok native Codex auto-agent candidate requires a managed "
+                    "Grok OIDC credential."
+                )
+            )
+        assert grok_context is not None
+        _, grok_headers, grok_prepared_body, updated_url = grok_context
         return await pass_through_request(
             request=request,
             target=updated_url,
@@ -22351,7 +22487,17 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             expected_target_family="xai",
             retryable_upstream_status_codes=[429],
         )
+
+    try:
+        return await _send_grok_native_request()
     except Exception as exc:
+        if _grok_native_auth_failure_detail(exc) is not None:
+            try:
+                return await _send_grok_native_request(force_refresh=True)
+            except Exception as retry_exc:
+                if _grok_native_candidate_unavailable_detail(retry_exc) is not None:
+                    _raise_grok_native_auto_agent_candidate_unavailable(retry_exc)
+                raise
         if _grok_native_candidate_unavailable_detail(exc) is not None:
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
         raise
@@ -23112,6 +23258,7 @@ class BaseOpenAIPassThroughHandler:
         request: Request,
         request_body: dict[str, Any],
         extra_headers: Optional[dict],
+        force_refresh: bool = False,
     ) -> Optional[tuple[str, dict[str, Any], dict[str, Any], str]]:
         (
             prepared_grok_native,
@@ -23130,6 +23277,7 @@ class BaseOpenAIPassThroughHandler:
                 ),
                 "grok_native_entrypoint": "openai_responses",
             },
+            force_refresh=force_refresh,
         )
         if not prepared_grok_native:
             return None

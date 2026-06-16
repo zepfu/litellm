@@ -65,6 +65,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     _CODEX_AAWM_CODE_CANDIDATES,
+    _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY,
+    _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
+    _build_codex_auto_agent_candidate_states,
     _get_google_adapter_rate_limit_key,
     _get_or_load_google_code_assist_project,
     _get_google_code_assist_prime_cache_key,
@@ -16226,6 +16229,78 @@ def test_grok_candidate_unavailable_detail_matches_compaction_blob_decode_error(
     )
 
 
+def test_grok_candidate_unavailable_detail_matches_grok_proxy_auth_401():
+    auth_error = HTTPException(
+        status_code=401,
+        detail=(
+            "Invalid or expired credentials "
+            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
+            "upstream=PermissionDenied, reason=no auth context)"
+        ),
+    )
+
+    assert _grok_native_candidate_unavailable_detail(auth_error) == auth_error.detail
+
+
+def test_grok_candidate_unavailable_detail_matches_grok_proxy_auth_403():
+    auth_error = HTTPException(
+        status_code=403,
+        detail=(
+            "Forbidden: invalid or expired credentials "
+            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
+            "upstream=PermissionDenied, reason=no auth context)"
+        ),
+    )
+
+    assert _grok_native_candidate_unavailable_detail(auth_error) == auth_error.detail
+
+
+
+def test_grok_candidate_unavailable_detail_ignores_usage_limit_quota():
+    quota_error = HTTPException(
+        status_code=429,
+        detail='{"error":{"message":"usage_limit_reached","code":"usage_limit_reached"}}',
+    )
+
+    assert _grok_native_candidate_unavailable_detail(quota_error) is None
+    assert _xai_oauth_candidate_unavailable_detail(quota_error) is None
+
+
+@pytest.mark.asyncio
+async def test_codex_aawm_code_xai_lane_keys_distinguish_composer_oidc_and_managed_oauth():
+    request = _build_codex_auto_agent_request()
+
+    states = await _build_codex_auto_agent_candidate_states(
+        request=request,
+        alias_model="aawm-code",
+    )
+    xai_states = [
+        state
+        for state in states
+        if state["candidate"]["provider"] == "xai"
+    ]
+
+    assert [
+        (
+            state["candidate"]["model"],
+            state["lane_key"],
+            state["cooldown_key"],
+        )
+        for state in xai_states
+    ] == [
+        (
+            "grok-composer-2.5-fast",
+            _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY,
+            "xai:grok-composer-2.5-fast:xai_grok_oidc",
+        ),
+        (
+            "oa_xai/grok-build",
+            _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
+            "xai:oa_xai/grok-build:xai_oauth",
+        ),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_anthropic_antigravity_completion_adapter_direct_preserves_not_logged_in_error():
     request = _build_anthropic_auto_agent_request()
@@ -16633,8 +16708,8 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_
     for cooldown_key in (
         "antigravity:claude-sonnet-4-6:antigravity-lane",
         "openai:gpt-5.3-codex-spark:__default__",
-        "xai:grok-composer-2.5-fast:xai_grok_native",
-        "xai:oa_xai/grok-build:xai_grok_native",
+        "xai:grok-composer-2.5-fast:xai_grok_oidc",
+        "xai:oa_xai/grok-build:xai_oauth",
     ):
         await _set_anthropic_auto_agent_cooldown(cooldown_key, 60.0)
 
@@ -19110,6 +19185,195 @@ async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_silent_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auth_status_code", [401, 403])
+async def test_codex_auto_agent_alias_code_retries_grok_composer_after_auth_401_or_403(
+    monkeypatch,
+    auth_status_code,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    antigravity_error = ProxyException(
+        message="antigravity unavailable",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    antigravity_error.detail = {
+        "error": {
+            "message": "Antigravity credential unavailable",
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    spark_error = ProxyException(
+        message="spark usage limit",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    spark_error.detail = {
+        "error": {
+            "message": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        }
+    }
+    grok_auth_error = HTTPException(
+        status_code=auth_status_code,
+        detail=(
+            "Invalid or expired credentials "
+            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
+            "upstream=PermissionDenied, reason=no auth context)"
+        ),
+    )
+    grok_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=[spark_error, grok_auth_error, grok_success]),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(side_effect=["stale-grok-token", "fresh-grok-token"]),
+    ) as mock_grok_token, patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ) as mock_xai_token:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is grok_success
+    assert mock_pass_through.await_count == 3
+    assert mock_grok_token.await_args_list[0].kwargs == {"force_refresh": False}
+    assert mock_grok_token.await_args_list[1].kwargs == {"force_refresh": True}
+    mock_xai_token.assert_not_awaited()
+    grok_retry_call = mock_pass_through.await_args_list[2].kwargs
+    assert grok_retry_call["target"] == "https://cli-chat-proxy.grok.com/v1/responses"
+    assert grok_retry_call["custom_headers"]["authorization"] == (
+        "Bearer fresh-grok-token"
+    )
+    final_body = grok_retry_call["custom_body"]
+    assert final_body["model"] == "grok-composer-2.5-fast"
+    metadata = final_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["grok_native_oauth_forced_refresh"] is True
+    assert "grok-native-oauth-forced-refresh" in metadata["tags"]
+    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_retries_grok_composer_after_auth_403(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    antigravity_error = ProxyException(
+        message="antigravity unavailable",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    antigravity_error.detail = {
+        "error": {
+            "message": "Antigravity credential unavailable",
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    spark_error = ProxyException(
+        message="spark usage limit",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    spark_error.detail = {
+        "error": {
+            "message": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        }
+    }
+    grok_auth_error = HTTPException(
+        status_code=403,
+        detail=(
+            "Forbidden: invalid or expired credentials "
+            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
+            "upstream=PermissionDenied, reason=no auth context)"
+        ),
+    )
+    grok_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(side_effect=antigravity_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=[spark_error, grok_auth_error, grok_success]),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(side_effect=["stale-grok-token", "fresh-grok-token"]),
+    ) as mock_grok_token, patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ) as mock_xai_token:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is grok_success
+    assert mock_pass_through.await_count == 3
+    assert mock_grok_token.await_args_list[0].kwargs == {"force_refresh": False}
+    assert mock_grok_token.await_args_list[1].kwargs == {"force_refresh": True}
+    mock_xai_token.assert_not_awaited()
+    grok_retry_call = mock_pass_through.await_args_list[2].kwargs
+    assert grok_retry_call["custom_headers"]["authorization"] == (
+        "Bearer fresh-grok-token"
+    )
+    metadata = grok_retry_call["custom_body"]["litellm_metadata"]
+    assert metadata["grok_native_oauth_forced_refresh"] is True
+    assert "grok-native-oauth-forced-refresh" in metadata["tags"]
+
+
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invalid_grant(
     monkeypatch,
 ):
@@ -19154,9 +19418,13 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
             "code": "usage_limit_reached",
         }
     }
-    grok_refresh_error = ValueError(
-        "Grok OIDC credential refresh failed (invalid_grant). Reseed or relogin "
-        "the Grok OIDC credential."
+    grok_auth_error = HTTPException(
+        status_code=401,
+        detail=(
+            "Invalid or expired credentials "
+            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
+            "upstream=PermissionDenied, reason=no auth context)"
+        ),
     )
     managed_xai_success = Response(
         content='{"ok": true}', media_type="application/json"
@@ -19170,10 +19438,12 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         new=AsyncMock(side_effect=antigravity_error),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=[spark_error, managed_xai_success]),
+        new=AsyncMock(
+            side_effect=[spark_error, grok_auth_error, grok_auth_error, managed_xai_success]
+        ),
     ) as mock_pass_through, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
-        new=AsyncMock(side_effect=grok_refresh_error),
+        new=AsyncMock(side_effect=["stale-grok-token", "fresh-grok-token"]),
     ) as mock_grok_token, patch(
         "litellm.llms.xai.oauth.get_xai_oauth_access_token",
         new=AsyncMock(return_value="xai-oauth-token"),
@@ -19190,10 +19460,12 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         )
 
     assert response is managed_xai_success
-    assert mock_pass_through.await_count == 2
-    mock_grok_token.assert_awaited_once()
+    assert mock_pass_through.await_count == 4
+    assert mock_grok_token.await_count == 2
+    assert mock_grok_token.await_args_list[0].kwargs == {"force_refresh": False}
+    assert mock_grok_token.await_args_list[1].kwargs == {"force_refresh": True}
     mock_xai_token.assert_awaited_once()
-    managed_call = mock_pass_through.await_args_list[1].kwargs
+    managed_call = mock_pass_through.await_args_list[3].kwargs
     assert managed_call["target"] == "https://api.x.ai/v1/responses"
     assert managed_call["custom_headers"]["authorization"] == (
         "Bearer xai-oauth-token"
@@ -19235,10 +19507,13 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         "xai",
         "xai",
     ]
+    composer_attempt = metadata["codex_auto_agent_attempts"][2]
+    assert composer_attempt["error_class"] == "candidate_unavailable"
     assert (
         "aawm_codex_auto_agent_candidate_unavailable"
-        in metadata["codex_auto_agent_attempts"][2]["error_tokens"]
+        in composer_attempt["error_tokens"]
     )
+    assert composer_attempt["lane_key"] == _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY
 
 
 @pytest.mark.asyncio

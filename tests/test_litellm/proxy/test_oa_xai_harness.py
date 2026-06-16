@@ -272,7 +272,11 @@ async def test_grok_native_oauth_reseeds_managed_auth_file_when_seed_is_newer(
     harness = OaXaiHarness()
     seed_path = tmp_path / ".grok" / "auth.json"
     seed_path.parent.mkdir()
-    seed_payload = harness.credential_payload(token="fresh-seed-token", scoped=True)
+    seed_payload = harness.credential_payload(
+        token="fresh-seed-token",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        scoped=True,
+    )
     seed_path.write_text(json.dumps(seed_payload), encoding="utf-8")
     seed_path.chmod(0o600)
 
@@ -281,12 +285,13 @@ async def test_grok_native_oauth_reseeds_managed_auth_file_when_seed_is_newer(
     managed_payload = harness.credential_payload(
         token="stale-managed-token",
         refresh_token="stale-managed-refresh",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         scoped=True,
     )
     managed_path.write_text(json.dumps(managed_payload), encoding="utf-8")
     managed_path.chmod(0o600)
-    os.utime(managed_path, (1000, 1000))
-    os.utime(seed_path, (2000, 2000))
+    os.utime(managed_path, (2000, 2000))
+    os.utime(seed_path, (1000, 1000))
 
     monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(managed_path))
     monkeypatch.setenv("LITELLM_XAI_GROK_SEED_AUTH_FILE", str(seed_path))
@@ -304,6 +309,55 @@ async def test_grok_native_oauth_reseeds_managed_auth_file_when_seed_is_newer(
 
 
 @pytest.mark.asyncio
+async def test_grok_native_oauth_keeps_managed_auth_file_when_seed_has_later_expiry_without_refresh_token(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    seed_path = tmp_path / ".grok" / "auth.json"
+    seed_path.parent.mkdir()
+    seed_payload = harness.credential_payload(
+        token="newer-seed-access-only",
+        refresh_token="",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=3),
+        scoped=True,
+    )
+    seed_path.write_text(json.dumps(seed_payload), encoding="utf-8")
+    seed_path.chmod(0o600)
+
+    managed_path = tmp_path / ".litellm" / "xai" / "grok-auth.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_payload = harness.credential_payload(
+        token="durable-managed-token",
+        refresh_token="durable-managed-refresh",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        scoped=True,
+    )
+    managed_path.write_text(json.dumps(managed_payload), encoding="utf-8")
+    managed_path.chmod(0o600)
+    os.utime(seed_path, (3000, 3000))
+    os.utime(managed_path, (1000, 1000))
+
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(managed_path))
+    monkeypatch.setenv("LITELLM_XAI_GROK_SEED_AUTH_FILE", str(seed_path))
+
+    class UnexpectedRefreshClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                "seed without refresh token must not replace managed refreshable credential"
+            )
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", UnexpectedRefreshClient):
+        assert (
+            await oauth.get_grok_native_oauth_access_token()
+            == "durable-managed-token"
+        )
+
+    assert json.loads(managed_path.read_text(encoding="utf-8")) == managed_payload
+    assert json.loads(seed_path.read_text(encoding="utf-8")) == seed_payload
+
+
+@pytest.mark.asyncio
 async def test_grok_native_oauth_keeps_managed_auth_file_when_seed_is_older(
     tmp_path,
     monkeypatch,
@@ -311,7 +365,11 @@ async def test_grok_native_oauth_keeps_managed_auth_file_when_seed_is_older(
     harness = OaXaiHarness()
     seed_path = tmp_path / ".grok" / "auth.json"
     seed_path.parent.mkdir()
-    seed_payload = harness.credential_payload(token="older-seed-token", scoped=True)
+    seed_payload = harness.credential_payload(
+        token="older-seed-token",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        scoped=True,
+    )
     seed_path.write_text(json.dumps(seed_payload), encoding="utf-8")
     seed_path.chmod(0o600)
 
@@ -320,12 +378,13 @@ async def test_grok_native_oauth_keeps_managed_auth_file_when_seed_is_older(
     managed_payload = harness.credential_payload(
         token="current-managed-token",
         refresh_token="current-managed-refresh",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
         scoped=True,
     )
     managed_path.write_text(json.dumps(managed_payload), encoding="utf-8")
     managed_path.chmod(0o600)
-    os.utime(seed_path, (1000, 1000))
-    os.utime(managed_path, (2000, 2000))
+    os.utime(seed_path, (2000, 2000))
+    os.utime(managed_path, (1000, 1000))
 
     monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(managed_path))
     monkeypatch.setenv("LITELLM_XAI_GROK_SEED_AUTH_FILE", str(seed_path))
@@ -350,12 +409,13 @@ async def test_grok_native_oauth_refresh_uses_newer_seed_refresh_token(
     monkeypatch,
 ):
     harness = OaXaiHarness()
+    near_expiry = datetime.now(timezone.utc) + timedelta(seconds=5)
     seed_path = tmp_path / ".grok" / "auth.json"
     seed_path.parent.mkdir()
     seed_payload = harness.credential_payload(
         token="fresh-seed-token",
         refresh_token="fresh-seed-refresh",
-        expires_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+        expires_at=near_expiry,
         scoped=True,
     )
     seed_path.write_text(json.dumps(seed_payload), encoding="utf-8")
@@ -366,7 +426,7 @@ async def test_grok_native_oauth_refresh_uses_newer_seed_refresh_token(
     managed_payload = harness.credential_payload(
         token="stale-managed-token",
         refresh_token="stale-managed-refresh",
-        expires_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+        expires_at=near_expiry - timedelta(seconds=1),
         scoped=True,
     )
     managed_path.write_text(json.dumps(managed_payload), encoding="utf-8")
@@ -410,6 +470,214 @@ async def test_grok_native_oauth_refresh_uses_newer_seed_refresh_token(
     refreshed_record = refreshed_payload[oauth._DEFAULT_XAI_OAUTH_SCOPE]
     assert refreshed_record["access_token"] == "refreshed-seed-token"
     assert refreshed_record["refresh_token"] == "refreshed-seed-refresh"
+    assert json.loads(seed_path.read_text(encoding="utf-8")) == seed_payload
+
+
+@pytest.mark.parametrize(
+    "expires_at_value",
+    [
+        int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp()),
+        str(int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp())),
+        f"{(datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp():.3f}",
+        str(
+            int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp() * 1000)
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_grok_native_oauth_refreshes_when_expires_at_is_epoch_value(
+    tmp_path,
+    monkeypatch,
+    expires_at_value,
+):
+    harness = OaXaiHarness()
+    credential_path = harness.write_credential(
+        tmp_path,
+        harness.credential_payload(
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=5)
+        ),
+    )
+    payload = json.loads(credential_path.read_text(encoding="utf-8"))
+    payload["expires_at"] = expires_at_value
+    credential_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, data, headers):
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "refreshed-epoch-managed-token",
+                    "refresh_token": "refreshed-epoch-refresh-token",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
+        assert await oauth.get_xai_oauth_access_token() == "refreshed-epoch-managed-token"
+
+    refreshed_payload = json.loads(credential_path.read_text(encoding="utf-8"))
+    assert refreshed_payload["access_token"] == "refreshed-epoch-managed-token"
+    assert refreshed_payload["refresh_token"] == "refreshed-epoch-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_grok_native_oauth_force_refreshes_before_recorded_expiry(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    managed_path = tmp_path / ".litellm" / "xai" / "grok-auth.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_payload = harness.credential_payload(
+        token="rejected-managed-token",
+        refresh_token="usable-managed-refresh",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        scoped=True,
+    )
+    managed_path.write_text(json.dumps(managed_payload), encoding="utf-8")
+    managed_path.chmod(0o600)
+
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(managed_path))
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
+    refresh_calls: list[dict[str, Any]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, data, headers):
+            refresh_calls.append({"url": url, "data": data, "headers": headers})
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "force-refreshed-grok-token",
+                    "refresh_token": "force-refreshed-grok-refresh",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
+        assert await oauth.get_grok_native_oauth_access_token() == "rejected-managed-token"
+        assert (
+            await oauth.get_grok_native_oauth_access_token(force_refresh=True)
+            == "force-refreshed-grok-token"
+        )
+
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0]["data"]["refresh_token"] == "usable-managed-refresh"
+    refreshed_payload = json.loads(managed_path.read_text(encoding="utf-8"))
+    refreshed_record = refreshed_payload[oauth._DEFAULT_XAI_OAUTH_SCOPE]
+    assert refreshed_record["access_token"] == "force-refreshed-grok-token"
+    assert refreshed_record["refresh_token"] == "force-refreshed-grok-refresh"
+
+
+@pytest.mark.asyncio
+async def test_grok_native_oauth_keeps_managed_auth_file_when_seed_is_newer_by_mtime_only(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    seed_path = tmp_path / ".grok" / "auth.json"
+    seed_path.parent.mkdir()
+    seed_payload = harness.credential_payload(
+        token="newer-seed-token",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        scoped=True,
+    )
+    seed_path.write_text(json.dumps(seed_payload), encoding="utf-8")
+    seed_path.chmod(0o600)
+
+    managed_path = tmp_path / ".litellm" / "xai" / "grok-auth.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_payload = harness.credential_payload(
+        token="current-managed-token",
+        refresh_token="current-managed-refresh",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        scoped=True,
+    )
+    managed_path.write_text(json.dumps(managed_payload), encoding="utf-8")
+    managed_path.chmod(0o600)
+    os.utime(seed_path, (2000, 2000))
+    os.utime(managed_path, (1000, 1000))
+
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(managed_path))
+    monkeypatch.setenv("LITELLM_XAI_GROK_SEED_AUTH_FILE", str(seed_path))
+
+    class UnexpectedRefreshClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("managed credential should remain authoritative")
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", UnexpectedRefreshClient):
+        assert (
+            await oauth.get_grok_native_oauth_access_token()
+            == "current-managed-token"
+        )
+
+    assert json.loads(managed_path.read_text(encoding="utf-8")) == managed_payload
+    assert json.loads(seed_path.read_text(encoding="utf-8")) == seed_payload
+
+
+@pytest.mark.asyncio
+async def test_grok_native_oauth_keeps_refreshable_managed_auth_when_seed_expires_later_without_refresh(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    seed_path = tmp_path / ".grok" / "auth.json"
+    seed_path.parent.mkdir()
+    seed_payload = harness.credential_payload(
+        token="later-seed-token",
+        refresh_token="",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        scoped=True,
+    )
+    seed_path.write_text(json.dumps(seed_payload), encoding="utf-8")
+    seed_path.chmod(0o600)
+
+    managed_path = tmp_path / ".litellm" / "xai" / "grok-auth.json"
+    managed_path.parent.mkdir(parents=True)
+    managed_payload = harness.credential_payload(
+        token="refreshable-managed-token",
+        refresh_token="refreshable-managed-refresh",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        scoped=True,
+    )
+    managed_path.write_text(json.dumps(managed_payload), encoding="utf-8")
+    managed_path.chmod(0o600)
+
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(managed_path))
+    monkeypatch.setenv("LITELLM_XAI_GROK_SEED_AUTH_FILE", str(seed_path))
+
+    class UnexpectedRefreshClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("managed credential should remain authoritative")
+
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", UnexpectedRefreshClient):
+        assert (
+            await oauth.get_grok_native_oauth_access_token()
+            == "refreshable-managed-token"
+        )
+
+    assert json.loads(managed_path.read_text(encoding="utf-8")) == managed_payload
     assert json.loads(seed_path.read_text(encoding="utf-8")) == seed_payload
 
 
