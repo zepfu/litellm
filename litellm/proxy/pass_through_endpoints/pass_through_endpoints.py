@@ -296,6 +296,8 @@ def _build_http_exception_from_upstream_status_error(
 
 
 def _extract_exception_status_code(exc: Exception) -> Optional[int]:
+    if isinstance(exc, (httpx.TimeoutException, httpx.ReadTimeout)):
+        return status.HTTP_504_GATEWAY_TIMEOUT
     for attr_name in ("status_code", "code"):
         value = getattr(exc, attr_name, None)
         if isinstance(value, int):
@@ -2180,7 +2182,9 @@ async def pass_through_request(  # noqa: PLR0915
                 message=getattr(e, "message", str(getattr(e, "detail", str(e)))),
                 type=getattr(e, "type", "None"),
                 param=getattr(e, "param", "None"),
-                code=getattr(e, "status_code", status.HTTP_400_BAD_REQUEST),
+                code=status_code
+                if status_code is not None
+                else getattr(e, "status_code", status.HTTP_400_BAD_REQUEST),
                 headers=custom_headers,
             )
             setattr(proxy_exc, "detail", getattr(e, "detail", None))
@@ -2201,7 +2205,9 @@ async def pass_through_request(  # noqa: PLR0915
                 message=getattr(e, "message", error_msg),
                 type=getattr(e, "type", "None"),
                 param=getattr(e, "param", "None"),
-                code=getattr(e, "status_code", 500),
+                code=status_code
+                if status_code is not None
+                else getattr(e, "status_code", 500),
                 headers=custom_headers,
             )
 
