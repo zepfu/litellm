@@ -2,6 +2,7 @@ import asyncio
 import base64
 import copy
 import json
+import logging
 import os
 import re
 import sys
@@ -24,6 +25,7 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 import litellm
+from litellm._logging import AawmErrorLogFileHandler, verbose_proxy_logger
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     _add_anthropic_auto_agent_alias_metadata,
@@ -165,6 +167,7 @@ from litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrou
 )
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    _build_passthrough_error_log_context,
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.proxy.pass_through_endpoints.success_handler import (
@@ -5173,6 +5176,280 @@ class TestGoogleAdapterRequestShapePolicy:
 
 
 class TestPassThroughRequestRetryableFailures:
+    @staticmethod
+    def _install_aawm_error_log_handler(tmp_path, monkeypatch):
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        handler = AawmErrorLogFileHandler()
+        saved_handlers = verbose_proxy_logger.handlers[:]
+        saved_level = verbose_proxy_logger.level
+        saved_propagate = verbose_proxy_logger.propagate
+        verbose_proxy_logger.handlers.clear()
+        verbose_proxy_logger.addHandler(handler)
+        verbose_proxy_logger.setLevel(logging.ERROR)
+        verbose_proxy_logger.propagate = False
+
+        return saved_handlers, saved_level, saved_propagate
+
+    @staticmethod
+    def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        verbose_proxy_logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            verbose_proxy_logger.addHandler(saved_handler)
+        verbose_proxy_logger.setLevel(saved_level)
+        verbose_proxy_logger.propagate = saved_propagate
+
+    def test_build_passthrough_error_log_context_uses_safe_metadata(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true&api_key=secret"
+        mock_request.query_params = {
+            "beta": "true",
+            "api_key": "secret",
+        }
+
+        parsed_body = {
+            "model": "claude-sonnet-4-6",
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "anthropic_grok_native_responses_adapter",
+                "trace_id": "trace-123",
+                "provider": "anthropic",
+            },
+        }
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "grok_model_override": "grok-composer-2.5-fast",
+                    "custom_llm_provider": "xai",
+                    "passthrough_route_family": "grok_cli_chat_proxy",
+                    "trace_id": "trace-456",
+                }
+            }
+        }
+
+        context = _build_passthrough_error_log_context(
+            request=mock_request,
+            url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses?api_key=secret"),
+            parsed_body=parsed_body,
+            kwargs=kwargs,
+            custom_llm_provider="xai",
+            status_code=400,
+            litellm_call_id="call-123",
+        )
+
+        assert context == {
+            "source": "pass_through_endpoint",
+            "container": mock.ANY,
+            "endpoint": "/anthropic/v1/messages?beta=true",
+            "upstream_url": "https://cli-chat-proxy.grok.com/v1/responses",
+            "provider": "xai",
+            "model": "claude-sonnet-4-6",
+            "model_alias": "aawm-code-anthropic",
+            "route_family": "grok_cli_chat_proxy",
+            "status_code": 400,
+            "trace_id": "trace-456",
+            "litellm_call_id": "call-123",
+        }
+
+    def test_build_passthrough_error_log_context_redacts_upstream_userinfo(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.query_params = {"beta": "true"}
+
+        context = _build_passthrough_error_log_context(
+            request=mock_request,
+            url=httpx.URL(
+                "https://user:password@cli-chat-proxy.grok.com:8443/v1/responses?api_key=secret"
+            ),
+            parsed_body={"model": "grok-composer-2.5-fast"},
+            kwargs={},
+            custom_llm_provider="xai",
+            status_code=400,
+            litellm_call_id="call-123",
+        )
+
+        assert (
+            context["upstream_url"]
+            == "https://cli-chat-proxy.grok.com:8443/v1/responses"
+        )
+        serialized_context = json.dumps(context)
+        assert "user" not in serialized_context
+        assert "password" not in serialized_context
+        assert "api_key=secret" not in serialized_context
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_error_jsonl_includes_route_context(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = (
+            "http://localhost:4001/anthropic/v1/messages?beta=true&api_key=secret"
+        )
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {
+            "beta": "true",
+            "api_key": "secret",
+        }
+        custom_body = {
+            "model": "grok-composer-2.5-fast",
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "grok_cli_chat_proxy",
+                "trace_id": "trace-xyz",
+                "custom_llm_provider": "xai",
+            },
+        }
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=b'{"error":"bad request"}',
+            request=httpx.Request("POST", target_url),
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=AsyncMock(return_value=upstream_response),
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException):
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_body=custom_body,
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "pass_through_endpoint" in item["message"]
+        )
+        assert payload["context"]["source"] == "pass_through_endpoint"
+        assert payload["context"]["endpoint"] == "/anthropic/v1/messages?beta=true"
+        assert payload["context"]["upstream_url"] == target_url
+        assert payload["context"]["provider"] == "xai"
+        assert payload["context"]["model"] == "grok-composer-2.5-fast"
+        assert payload["context"]["model_alias"] == "aawm-code-anthropic"
+        assert payload["context"]["route_family"] == "grok_cli_chat_proxy"
+        assert payload["context"]["status_code"] == 400
+        assert payload["context"]["trace_id"] == "trace-xyz"
+        assert payload["context"]["litellm_call_id"]
+        assert "api_key=secret" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_streaming_timeout_error_jsonl_includes_route_context(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/anthropic/v1/messages?beta=true",
+            "upstream_url": target_url,
+            "provider": "xai",
+            "model": "grok-composer-2.5-fast",
+            "model_alias": "aawm-code-anthropic",
+            "route_family": "grok_cli_chat_proxy",
+            "status_code": None,
+            "trace_id": "trace-stream-timeout",
+            "litellm_call_id": "call-stream-timeout",
+        }
+
+        class FailingStreamingResponse:
+            headers = httpx.Headers({})
+
+            async def aiter_bytes(self):
+                raise httpx.ReadTimeout(
+                    "Timeout on reading data from socket",
+                    request=httpx.Request("POST", target_url),
+                )
+                yield b""
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with pytest.raises(httpx.ReadTimeout):
+                async for _ in PassThroughStreamingHandler.chunk_processor(
+                    response=FailingStreamingResponse(),  # type: ignore[arg-type]
+                    request_body={"model": "grok-composer-2.5-fast"},
+                    litellm_logging_obj=MagicMock(),
+                    endpoint_type=EndpointType.OPENAI,
+                    start_time=datetime.now(),
+                    passthrough_success_handler_obj=MagicMock(),
+                    url_route=target_url,
+                    custom_llm_provider="xai",
+                    success_handler_kwargs={"litellm_params": {"metadata": {}}},
+                    error_log_context=error_context,
+                ):
+                    pass
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Error in chunk_processor" in item["message"]
+        )
+
+        assert payload["message"] == (
+            "Error in chunk_processor: Timeout on reading data from socket"
+        )
+        for key, value in error_context.items():
+            assert payload["context"][key] == value
+        assert "ReadTimeout" in payload["traceback"]
+
     @pytest.mark.asyncio
     async def test_pass_through_request_preserves_retry_headers_and_skips_failure_hook(
         self,

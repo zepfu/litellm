@@ -350,6 +350,7 @@ class PassThroughStreamingHandler:
         upstream_wait_started_at: Optional[datetime] = None,
         upstream_wait_completed_at: Optional[datetime] = None,
         local_prepare_ms: Optional[float] = None,
+        error_log_context: Optional[Dict[str, Any]] = None,
     ):
         """
         - Yields chunks from the response
@@ -500,7 +501,11 @@ class PassThroughStreamingHandler:
                 )
             )
         except Exception as e:
-            verbose_proxy_logger.error(f"Error in chunk_processor: {str(e)}")
+            verbose_proxy_logger.exception(
+                "Error in chunk_processor: %s",
+                str(e),
+                extra=error_log_context or {},
+            )
             raise
 
     @staticmethod
