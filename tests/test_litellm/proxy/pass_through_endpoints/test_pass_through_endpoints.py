@@ -120,6 +120,7 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
         "model": "grok-composer-2.5-fast",
         "litellm_metadata": {
             "agent_name": "W4 engineer",
+            "agent_id": "019ed4f2",
             "repository": "dashboard-shell",
             "requested_model_alias": "aawm-code",
         },
@@ -133,11 +134,10 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
     )
 
     assert line == (
-        "ROUTE: claude-code/1.2.3 - 2026-06-14 19:31:05 - "
-        "W4 engineer@dashboard-shell - "
-        "grok-composer-2.5-fast(aawm-code) - 172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "chatgpt.com/backend-api/codex/responses HTTP/1.1"
+        "20260614 19:31:05 [ROUTE] Claude/1.2.3 - "
+        "W4 engineer#019ed4f2@dashboard-shell.grok-composer-2.5-fast(aawm-code) "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
+        "chatgpt.com/backend-api/codex/responses"
     )
     assert "api_key" not in line
     assert "ignored=1" not in line
@@ -159,8 +159,8 @@ def test_build_aawm_route_access_log_line_omits_missing_optional_context() -> No
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - 127.0.0.1:44780 - "
-        "GET /openai_passthrough/responses -> api.openai.com/v1/responses HTTP/2"
+        "20260614 19:31:05 [ROUTE] GET 127.0.0.1:44780 "
+        "/openai_passthrough/responses -> api.openai.com/v1/responses"
     )
     assert "secret" not in line
     assert "token" not in line
@@ -184,9 +184,9 @@ def test_build_aawm_route_access_log_line_omits_alias_when_same_as_model() -> No
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - aawm-code - 172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "api.anthropic.com/v1/messages HTTP/1.1"
+        "20260614 19:31:05 [ROUTE] - aawm-code "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
+        "api.anthropic.com/v1/messages"
     )
     assert "aawm-code(aawm-code)" not in line
 
@@ -215,10 +215,9 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - gpt-5.5(aawm-code) - "
-        "172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "chatgpt.com/backend-api/codex/responses HTTP/1.1"
+        "20260614 19:31:05 [ROUTE] - gpt-5.5(aawm-code) "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
+        "chatgpt.com/backend-api/codex/responses"
     )
     assert "general-purpose@" not in line
     assert "reuse_rule" not in line
@@ -241,10 +240,9 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_headers() ->
     )
 
     assert line == (
-        "ROUTE: 2026-06-14 19:31:05 - gpt-5.3-codex-spark - "
-        "172.19.0.1:52834 - "
-        "POST /anthropic/v1/messages?beta=true -> "
-        "api.openai.com/v1/responses HTTP/1.1"
+        "20260614 19:31:05 [ROUTE] - gpt-5.3-codex-spark "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
+        "api.openai.com/v1/responses"
     )
     assert "unrelated shell command" not in line
     assert "mypy fails" not in line
@@ -267,7 +265,9 @@ def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: 2026-06-14 19:31:05 - W4 engineer@dashboard-shell -")
+    assert line.startswith(
+        "20260614 19:31:05 [ROUTE] - W4 engineer@dashboard-shell."
+    )
     assert "/home/zepfu/projects" not in line
 
 
@@ -288,7 +288,52 @@ def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> N
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: 2026-06-14 19:31:05 - W4 engineer@zepfu/litellm -")
+    assert line.startswith(
+        "20260614 19:31:05 [ROUTE] - W4 engineer@zepfu/litellm."
+    )
+
+
+def test_build_aawm_route_access_log_line_uses_session_history_repo_aliases() -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "workspaceRoot": "/home/zepfu/projects/dashboard-shell",
+        "metadata": {
+            "agent_name": "orchestrator",
+            "trace_name": "claude-code.orchestrator",
+            "trace_user_id": "should-not-win",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "20260614 19:31:05 [ROUTE] - orchestrator@dashboard-shell."
+    )
+    assert "should-not-win" not in line
+
+
+def test_build_aawm_route_access_log_line_uses_trace_user_repo_when_structured_repo_missing() -> None:
+    request = _build_aawm_route_log_request(
+        headers={
+            "langfuse_trace_name": "claude-code.orchestrator",
+            "langfuse_trace_user_id": "aegis",
+        }
+    )
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body={"model": "claude-opus-4-8"},
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith("20260614 19:31:05 [ROUTE] - aegis.claude-opus-4-8 ")
 
 
 def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
@@ -307,7 +352,7 @@ def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
     )
 
     assert line.startswith(
-        "ROUTE: codex-cli/0.119.0-alpha.29 - 2026-06-14 19:31:05 - "
+        "20260614 19:31:05 [ROUTE] Codex/0.119.0-alpha.29 - "
     )
 
 
@@ -326,9 +371,36 @@ def test_build_aawm_route_access_log_line_rejects_freeform_client_identity() -> 
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("ROUTE: curl/8.0 - 2026-06-14 19:31:05 - ")
+    assert line.startswith("20260614 19:31:05 [ROUTE] curl/8.0 - ")
     assert "prompt-like" not in line
     assert "unrelated command" not in line
+
+
+@pytest.mark.parametrize(
+    ("route_type", "url", "expected_log_type"),
+    (
+        ("aembedding", "http://127.0.0.1:4001/v1/embeddings", "EMBED"),
+        ("arerank", "http://127.0.0.1:4001/v1/rerank", "RERANK"),
+        (None, "http://127.0.0.1:4001/v1/embeddings", "EMBED"),
+        (None, "http://127.0.0.1:4001/v1/rerank", "RERANK"),
+    ),
+)
+def test_build_aawm_route_access_log_line_classifies_route_type(
+    route_type: Optional[str],
+    url: str,
+    expected_log_type: str,
+) -> None:
+    request = _build_aawm_route_log_request(url=url)
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.openai.com/v1/responses",
+        request_body={"model": "test-model"},
+        route_type=route_type,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(f"20260614 19:31:05 [{expected_log_type}] - test-model ")
 
 
 def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
@@ -371,15 +443,64 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("ROUTE:")
+        if " [ROUTE] " in record.getMessage()
     ]
     assert len(route_records) == 1
     assert re.fullmatch(
-        r"ROUTE: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
-        r"claude-sonnet-4-6\(aawm-code-anthropic\) - "
-        r"172\.19\.0\.1:52834 - POST /anthropic/v1/messages\?beta=true "
-        r"-> api\.anthropic\.com/v1/messages HTTP/1\.1",
+        r"\d{8} \d{2}:\d{2}:\d{2} \[ROUTE\] - "
+        r"claude-sonnet-4-6\(aawm-code-anthropic\) "
+        r"POST 172\.19\.0\.1:52834 /anthropic/v1/messages\?beta=true "
+        r"-> api\.anthropic\.com/v1/messages",
         route_records[0],
+    )
+
+
+def test_emit_aawm_route_access_log_refreshes_suppression_for_same_scope(
+    caplog,
+) -> None:
+    clear_aawm_route_access_log_replacements()
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "gpt-5.3-codex-spark",
+        "metadata": {"model_alias_label": "aawm-code-anthropic"},
+    }
+
+    with _capture_aawm_route_logs(caplog):
+        emit_aawm_route_access_log(
+            request=request,
+            target="https://chatgpt.com/backend-api/codex/responses",
+            request_body=request_body,
+        )
+        request.scope["query_string"] = (
+            b"beta=true -> cli-chat-proxy.grok.com/v1/responses"
+        )
+        emit_aawm_route_access_log(
+            request=request,
+            target="https://cli-chat-proxy.grok.com/v1/responses",
+            request_body={
+                **request_body,
+                "model": "grok-composer-2.5-fast",
+            },
+        )
+
+    route_records = [
+        record.getMessage()
+        for record in caplog.records
+        if " [ROUTE] " in record.getMessage()
+    ]
+    assert len(route_records) == 1
+
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path=(
+                    "/anthropic/v1/messages?beta=true%20-%3E%20"
+                    "cli-chat-proxy.grok.com/v1/responses"
+                ),
+            )
+        )
+        is False
     )
 
 
@@ -414,6 +535,45 @@ def test_aawm_route_access_log_filter_suppresses_matching_access_record_once() -
         access_filter.filter(
             _build_uvicorn_access_record(
                 full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is True
+    )
+
+
+def test_aawm_route_access_log_filter_suppresses_escaped_adapted_paths() -> None:
+    clear_aawm_route_access_log_replacements()
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    register_aawm_route_access_log_replacement(
+        client_addr="172.19.0.1:41278",
+        method="POST",
+        full_path=(
+            "/anthropic/v1/messages?beta=true -> "
+            "cli-chat-proxy.grok.com/v1/responses"
+        ),
+        http_version="1.1",
+    )
+
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                client_addr="172.19.0.1:41278",
+                full_path=(
+                    "/anthropic/v1/messages?beta=true%20-%3E%20"
+                    "cli-chat-proxy.grok.com/v1/responses"
+                ),
+            )
+        )
+        is False
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                client_addr="172.19.0.1:41278",
+                full_path=(
+                    "/anthropic/v1/messages?beta=true%20-%3E%20"
+                    "cli-chat-proxy.grok.com/v1/responses"
+                ),
             )
         )
         is True
@@ -550,15 +710,14 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("ROUTE:")
+        if " [ROUTE] " in record.getMessage()
     ]
     assert len(route_records) == 1
     assert re.fullmatch(
-        r"ROUTE: codex-cli/0\.119\.0-alpha\.29 - "
-        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - "
-        r"W2 tester@litellm - gpt-5\.3-codex-spark\(aawm-code\) - "
-        r"172\.19\.0\.1:44766 - POST /openai_passthrough/responses\?stream=false "
-        r"-> api\.openai\.com/v1/responses HTTP/1\.1",
+        r"\d{8} \d{2}:\d{2}:\d{2} \[ROUTE\] Codex/0\.119\.0-alpha\.29 - "
+        r"W2 tester@litellm\.gpt-5\.3-codex-spark\(aawm-code\) "
+        r"POST 172\.19\.0\.1:44766 /openai_passthrough/responses\?stream=false "
+        r"-> api\.openai\.com/v1/responses",
         route_records[0],
     )
     assert "redacted" not in route_records[0]

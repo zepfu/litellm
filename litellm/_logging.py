@@ -10,6 +10,7 @@ import threading
 from datetime import UTC, datetime
 from logging import Formatter
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import unquote
 
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
@@ -376,6 +377,10 @@ _aawm_route_access_log_replacement_order: Deque[
 ] = deque()
 
 
+def _normalize_aawm_route_access_log_replacement_path(full_path: object) -> str:
+    return unquote(str(full_path))
+
+
 def clear_aawm_route_access_log_replacements() -> None:
     with _aawm_route_access_log_replacement_lock:
         _aawm_route_access_log_replacements.clear()
@@ -395,7 +400,7 @@ def register_aawm_route_access_log_replacement(
     key = (
         str(client_addr),
         str(method),
-        str(full_path),
+        _normalize_aawm_route_access_log_replacement_path(full_path),
         str(http_version),
     )
     with _aawm_route_access_log_replacement_lock:
@@ -426,7 +431,12 @@ def _aawm_route_access_log_key_from_record(
         or http_version is None
     ):
         return None
-    return (str(client_addr), str(method), str(full_path), str(http_version))
+    return (
+        str(client_addr),
+        str(method),
+        _normalize_aawm_route_access_log_replacement_path(full_path),
+        str(http_version),
+    )
 
 
 def _consume_aawm_route_access_log_replacement(
