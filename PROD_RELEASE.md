@@ -247,6 +247,11 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    Grok CLI auth file. Do not configure prod LiteLLM to refresh, seed, copy, or
    write the Grok CLI credential directly. Keep managed `oa_xai/*`
    `LITELLM_XAI_OAUTH_AUTH_FILE` on LiteLLM-owned writable storage.
+   The provider-status sidecar must also enable the hourly Grok billing poll
+   (`AAWM_GROK_BILLING_POLL_ENABLED=1`) with the Grok CLI billing headers and
+   the writable `.grok` mount. After sidecar recreation, verify the logs emit a
+   `grok_billing_poll` event with `status_code=200` and `persisted=true`; the
+   LiteLLM serving container does not emit this scheduled billing snapshot.
 
    When model-config behavior changed, verify the built image has the expected
    metadata before restarting prod. For example:
