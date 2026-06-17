@@ -42,6 +42,11 @@ PROVIDER_FAILURE_FIELD_LIMIT = 160
 PROVIDER_FAILURE_MESSAGE_LIMIT = 240
 DEFAULT_GROK_OIDC_AUTH_FILE = "/home/zepfu/.grok/auth.json"
 DEFAULT_GROK_OIDC_LOCK_FILE = "/home/zepfu/.grok/auth.json.lock"
+GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS = (
+    "LITELLM_XAI_GROK_AUTH_FILE",
+    "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
+    "GROK_AUTH_FILE",
+)
 DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
@@ -268,6 +273,7 @@ class ProviderStatusLoopConfig:
     require_pgbouncer: bool = False
     grok_oidc_refresh_enabled: bool = False
     grok_oidc_auth_file: str = DEFAULT_GROK_OIDC_AUTH_FILE
+    grok_oidc_auth_file_source: str = "default"
     grok_oidc_lock_file: str = DEFAULT_GROK_OIDC_LOCK_FILE
     grok_oidc_refresh_interval_seconds: float = (
         DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS
@@ -314,6 +320,51 @@ def _env_bool(name: str, default: bool) -> bool:
     if value in FALSE_VALUES:
         return False
     raise ValueError(f"{name} must be one of {sorted(TRUE_VALUES | FALSE_VALUES)}")
+
+
+def _first_non_empty_env(*names: str) -> Optional[str]:
+    for name in names:
+        raw_value = os.getenv(name)
+        if isinstance(raw_value, str) and raw_value.strip():
+            return raw_value.strip()
+    return None
+
+
+def _resolve_grok_sidecar_auth_file(
+    explicit_auth_file: Optional[str],
+) -> tuple[str, str]:
+    explicit_value = (
+        explicit_auth_file.strip()
+        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
+        else None
+    )
+
+    aawm_auth_file = os.getenv("AAWM_GROK_OIDC_AUTH_FILE", "").strip()
+    if aawm_auth_file:
+        return str(Path(aawm_auth_file).expanduser()), "AAWM_GROK_OIDC_AUTH_FILE"
+
+    if explicit_value and explicit_value != DEFAULT_GROK_OIDC_AUTH_FILE:
+        return str(Path(explicit_value).expanduser()), "explicit"
+
+    for env_name in GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS:
+        env_value = os.getenv(env_name, "").strip()
+        if env_value:
+            return str(Path(env_value).expanduser()), env_name
+
+    grok_home = os.getenv("GROK_HOME", "").strip()
+    if grok_home:
+        return str(Path(grok_home).expanduser() / "auth.json"), "GROK_HOME"
+
+    return DEFAULT_GROK_OIDC_AUTH_FILE, "default"
+
+
+def _resolve_grok_billing_client_version() -> str:
+    return (
+        _first_non_empty_env("AAWM_GROK_BILLING_CLIENT_VERSION")
+        or _first_non_empty_env("LITELLM_XAI_GROK_CLIENT_VERSION")
+        or _first_non_empty_env("GROK_CLIENT_VERSION")
+        or DEFAULT_GROK_BILLING_CLIENT_VERSION
+    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -456,7 +507,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.getenv("AAWM_GROK_OIDC_AUTH_FILE", DEFAULT_GROK_OIDC_AUTH_FILE),
         help=(
             "Grok CLI auth JSON file maintained by this sidecar. Defaults to "
-            "AAWM_GROK_OIDC_AUTH_FILE or /home/zepfu/.grok/auth.json."
+            "AAWM_GROK_OIDC_AUTH_FILE, then native Grok auth-file env vars, "
+            "GROK_HOME/auth.json, or /home/zepfu/.grok/auth.json."
         ),
     )
     parser.add_argument(
@@ -566,14 +618,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--grok-billing-client-version",
-        default=os.getenv(
-            "AAWM_GROK_BILLING_CLIENT_VERSION",
-            os.getenv("LITELLM_XAI_GROK_CLIENT_VERSION", DEFAULT_GROK_BILLING_CLIENT_VERSION),
-        ),
+        default=_resolve_grok_billing_client_version(),
         help=(
             "Grok CLI client version header for billing polls. Defaults to "
             "AAWM_GROK_BILLING_CLIENT_VERSION, LITELLM_XAI_GROK_CLIENT_VERSION, "
-            "or 0.2.55."
+            "GROK_CLIENT_VERSION, or 0.2.55."
         ),
     )
     parser.add_argument(
@@ -717,6 +766,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
             "--grok-billing-poll-retry-backoff-seconds must be non-negative"
         )
 
+    resolved_grok_auth_file, resolved_grok_auth_file_source = (
+        _resolve_grok_sidecar_auth_file(args.grok_oidc_auth_file)
+    )
+
     return ProviderStatusLoopConfig(
         apply=args.apply,
         dsn=args.dsn,
@@ -733,7 +786,8 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         schema_dsn=args.schema_dsn,
         require_pgbouncer=args.require_pgbouncer,
         grok_oidc_refresh_enabled=args.grok_oidc_refresh_enabled,
-        grok_oidc_auth_file=args.grok_oidc_auth_file,
+        grok_oidc_auth_file=resolved_grok_auth_file,
+        grok_oidc_auth_file_source=resolved_grok_auth_file_source,
         grok_oidc_lock_file=args.grok_oidc_lock_file,
         grok_oidc_refresh_interval_seconds=args.grok_oidc_refresh_interval_seconds,
         grok_oidc_refresh_buffer_seconds=args.grok_oidc_refresh_buffer_seconds,
@@ -995,9 +1049,7 @@ def _build_grok_billing_request_headers(
         "x-xai-token-auth": config.grok_billing_xai_token_auth,
     }
     model_override = str(config.grok_billing_model).strip()
-    if not config.grok_billing_include_model_override:
-        headers.pop("content-type", None)
-    elif model_override:
+    if config.grok_billing_include_model_override and model_override:
         headers["x-grok-model-override"] = model_override
     if identity_headers:
         for header_name, _credential_field in GROK_BILLING_IDENTITY_HEADER_FIELDS:
@@ -1077,6 +1129,9 @@ def _grok_billing_request_contract_summary(
         "client_identifier": config.grok_billing_client_identifier,
         "client_version": config.grok_billing_client_version,
         "x_xai_token_auth_configured": bool(config.grok_billing_xai_token_auth),
+        "resolved_auth_file": config.grok_oidc_auth_file,
+        "auth_file_source": config.grok_oidc_auth_file_source,
+        "poll_max_attempts": max(1, config.grok_billing_poll_max_attempts),
         "request_contract_fingerprint": fingerprint,
     }
 
@@ -1673,6 +1728,8 @@ def _run_grok_billing_poll_task(
         "persisted": False,
         "skipped": False,
         "auth_file": config.grok_oidc_auth_file,
+        "resolved_auth_file": config.grok_oidc_auth_file,
+        "auth_file_source": config.grok_oidc_auth_file_source,
         "billing_url": config.grok_billing_url,
         "client_version": config.grok_billing_client_version,
         "model": config.grok_billing_model,
@@ -1681,6 +1738,7 @@ def _run_grok_billing_poll_task(
         "status_code": None,
         "attempt_count": 0,
         "retry_count": 0,
+        "poll_max_attempts": max(1, config.grok_billing_poll_max_attempts),
         "error_class": None,
         "error_message": None,
     }
