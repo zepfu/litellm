@@ -67,13 +67,97 @@ contain access tokens, refresh tokens, id tokens, client secrets, raw auth
 headers, or the full credential payload.
 
 When Grok OIDC refresh is enabled, the sidecar also performs a metadata-only
-repair on every provider-status cycle before token refreshes. It applies the
-configured auth-file uid/gid/mode without reading or rewriting token values and
-emits `grok_oidc_metadata_repair` only when it repairs the file or encounters an
-error. This bounds damage from another process recreating the shared auth file
-with container-owned metadata between hourly refreshes.
+repair on every provider-status cycle before billing polls or token refreshes.
+It applies the configured auth-file uid/gid/mode without reading or rewriting
+token values and emits `grok_oidc_metadata_repair` only when it repairs the file
+or encounters an error. This bounds damage from another process recreating the
+shared auth file with container-owned metadata between hourly refreshes.
 
-The hourly Grok billing poll should run in this same sidecar context so quota
-snapshots use the sidecar-maintained OIDC credential. Billing extraction and
-quota persistence remain owned by the Grok billing work item; the credential
-writer boundary is shared.
+## Grok Billing Poll Task
+
+The same sidecar can also run an explicit hourly Grok billing poll. This is
+telemetry-only and separate from the five-minute provider front-door probes and
+the Grok OIDC refresh task. The poll reads the current OIDC credential from
+`AAWM_GROK_OIDC_AUTH_FILE`, derives the Grok account identity headers from the
+scoped credential record, and calls
+`https://cli-chat-proxy.grok.com/v1/billing?format=credits` with Grok CLI-style
+headers. The request includes the OIDC bearer token plus `x-userid`,
+`x-grok-user-id`, `x-teamid`, and `x-email` derived from the credential
+`user_id`, `team_id`, and `email` fields. The poll persists the returned billing
+snapshot as a sanitized `rate_limit_observations` row using the same stored field
+shape and dedupe guard as the LiteLLM callback path.
+
+Relevant environment variables:
+
+- `AAWM_GROK_BILLING_POLL_ENABLED`: enables the scheduled billing poll.
+- `AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS`: minimum seconds between billing
+  poll attempts.
+- `AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS`: billing endpoint timeout.
+- `AAWM_GROK_BILLING_URL`: billing endpoint URL.
+- `AAWM_GROK_BILLING_CLIENT_VERSION`: Grok CLI client version header.
+- `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
+- `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
+- `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
+- `AAWM_GROK_BILLING_HTTP_METHOD`: HTTP method used for billing poll requests.
+  Defaults to `GET`.
+- `AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE`: when true, include native
+  Grok billing request-shape headers on billing poll requests:
+  `content-type: application/json` and `x-grok-model-override` using
+  `AAWM_GROK_BILLING_MODEL`. Defaults to true so the sidecar matches successful
+  native Grok passthrough/manual billing calls. Set to false only when an
+  operator explicitly wants the older minimal header shape. The model label is
+  still persisted on `rate_limit_observations.model` regardless of this
+  setting.
+- `AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS`: maximum billing poll attempts per
+  scheduled run, including retries.
+- `AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS`: base backoff seconds between
+  retryable billing poll failures.
+
+The billing poll retries only transient transport/capacity failures and the
+known Grok `400` timeout/cancel response (`The operation was cancelled` /
+`Timeout expired`). Auth failures and provider rate limits (`401`, `403`, and
+`429`) are not retried; they are surfaced as a single degraded telemetry event
+for that scheduled run.
+
+Each due attempt emits a separate `grok_billing_poll` JSON line with sanitized
+status fields such as `attempted`, `persisted`, `skipped`, `auth_file`,
+`billing_url`, `client_version`, `model`, `status_code`, `attempt_count`,
+`retry_count`, `observation_count`, `inserted_count`, `error_class`, and
+`error_message`. For D1-304 debugging, the event also includes compact
+request/transport diagnostics such as `http_client`, `request_method`,
+`billing_host`, `billing_path`, `billing_query_keys`, `billing_query_present`,
+`header_names`, `include_model_override`, `model_override_configured`,
+`client_identifier`, `x_xai_token_auth_configured`, and
+`request_contract_fingerprint`.
+
+The fingerprint is derived from the non-secret request contract only: HTTP
+method, billing host/path, query key names, configured client version and
+identifier, whether `x-xai-token-auth` is configured, model-override flags, and
+header names. It must not include authorization tokens, account identity values,
+raw auth payloads, resolved IP addresses, or the configured
+`x-xai-token-auth` value. The event must not emit dedicated identity fields or
+raw auth headers. It must not contain access tokens, refresh tokens, id tokens,
+client secrets, account identity values (`user_id`, `team_id`, `email`, or the
+derived `x-userid`, `x-grok-user-id`, `x-teamid`, and `x-email` headers), or the
+full billing credential payload. Billing poll failures are logged and do not
+raise out of the sidecar loop.
+
+Successful sidecar billing polls copy the same safe request-contract evidence
+into `rate_limit_observations.evidence` with
+`request_contract_source=grok_billing_sidecar_poll`. This lets later DB-only
+investigations distinguish snapshots inserted by the scheduled sidecar from
+snapshots extracted from Grok passthrough/manual traffic without storing auth
+tokens or account identity values.
+
+Successful native Grok billing passthrough calls also record comparable
+request-contract metadata in Langfuse/session-history metadata and copy the
+fingerprint into `rate_limit_observations.evidence` when a Grok billing payload
+is extracted. Those fields are prefixed with
+`grok_billing_passthrough_` and include the HTTP client, method, target
+host/path, query key names, outbound header names, user-agent, whether
+`x-xai-token-auth` was configured, and a non-secret request-contract
+fingerprint. They intentionally omit authorization tokens, account identity
+values, raw auth payloads, resolved IP addresses, and the configured
+`x-xai-token-auth` value. Compare that passthrough fingerprint with the
+sidecar `request_contract_fingerprint` when investigating sidecar billing poll
+parity.

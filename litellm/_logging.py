@@ -1,13 +1,16 @@
 import ast
 from collections import deque
+import hashlib
+import json
 import logging
 import os
 import re
 import sys
 import threading
-from datetime import datetime
+from datetime import UTC, datetime
 from logging import Formatter
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import unquote
 
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
@@ -138,7 +141,114 @@ def _get_aawm_error_log_path() -> Optional[str]:
     log_dir = _get_aawm_error_log_dir()
     if not log_dir:
         return None
+    return os.path.join(log_dir, f"{_get_aawm_error_log_environment()}-error.jsonl")
+
+
+def _get_aawm_legacy_error_log_path() -> Optional[str]:
+    """Legacy text sink path retained for migration and discovery."""
+    log_dir = _get_aawm_error_log_dir()
+    if not log_dir:
+        return None
     return os.path.join(log_dir, f"{_get_aawm_error_log_environment()}-error.log")
+
+
+_AAWM_ERROR_LOG_CONTEXT_FIELDS = (
+    "source",
+    "container",
+    "endpoint",
+    "upstream_url",
+    "provider",
+    "model",
+    "model_alias",
+    "route_family",
+    "status_code",
+    "failure_kind",
+    "hidden_retry_final_outcome",
+    "hidden_retry_failure_classification",
+    "hidden_retry_count",
+    "trace_id",
+    "litellm_call_id",
+    "callback_name",
+    "callback_phase",
+    "handler_branch",
+    "langfuse_failure_class",
+    "event_type",
+    "worker_timeout_seconds",
+    "queue_depth",
+    "queue_maxsize",
+    "coroutine_name",
+    "worker_delivery_state",
+)
+
+
+def _build_aawm_error_log_context(record: logging.LogRecord) -> Dict[str, Any]:
+    context: Dict[str, Any] = {field: None for field in _AAWM_ERROR_LOG_CONTEXT_FIELDS}
+    for field in _AAWM_ERROR_LOG_CONTEXT_FIELDS:
+        value = getattr(record, field, None)
+        if value is not None:
+            context[field] = value
+    return context
+
+
+def _build_aawm_error_log_fingerprint(
+    *,
+    logger_name: str,
+    level: str,
+    message: str,
+    traceback_text: Optional[str],
+    context: Dict[str, Any],
+) -> str:
+    fingerprint_source = {
+        "context": context,
+        "logger": logger_name,
+        "level": level,
+        "message": message,
+        "traceback": traceback_text,
+        "traceback_text": traceback_text,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint_source,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_aawm_error_log_record(
+    record: logging.LogRecord,
+    *,
+    formatter: logging.Formatter,
+) -> Dict[str, Any]:
+    context = _build_aawm_error_log_context(record)
+    message = record.getMessage()
+    traceback_text: Optional[str] = None
+    traceback_lines: List[str] = []
+    if record.exc_info and record.exc_info[1] is not None:
+        traceback_text = record.exc_text or formatter.formatException(record.exc_info)
+        traceback_lines = traceback_text.splitlines()
+
+    return {
+        "schema_version": 1,
+        "observed_at": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+        "environment": _get_aawm_error_log_environment(),
+        "logger": record.name,
+        "level": record.levelname,
+        "message": message,
+        "traceback": traceback_text,
+        "traceback_text": traceback_text,
+        "traceback_lines": traceback_lines,
+        "raw_text": formatter.format(record),
+        "fingerprint": _build_aawm_error_log_fingerprint(
+            logger_name=record.name,
+            level=record.levelname,
+            message=message,
+            traceback_text=traceback_text,
+            context=context,
+        ),
+        "context": context,
+    }
 
 
 class AawmErrorLogFileHandler(logging.Handler):
@@ -168,13 +278,12 @@ class AawmErrorLogFileHandler(logging.Handler):
 
         self._emit_state.active = True
         try:
-            message = self.format(record)
+            payload = _build_aawm_error_log_record(record, formatter=self._formatter)
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with open(log_path, "a", encoding="utf-8") as error_log:
-                    error_log.write(message)
-                    if not message.endswith("\n"):
-                        error_log.write("\n")
+                    error_log.write(safe_dumps(payload))
+                    error_log.write("\n")
         except Exception:
             # Never let local error-intake logging break application logging.
             return
@@ -268,6 +377,10 @@ _aawm_route_access_log_replacement_order: Deque[
 ] = deque()
 
 
+def _normalize_aawm_route_access_log_replacement_path(full_path: object) -> str:
+    return unquote(str(full_path))
+
+
 def clear_aawm_route_access_log_replacements() -> None:
     with _aawm_route_access_log_replacement_lock:
         _aawm_route_access_log_replacements.clear()
@@ -287,7 +400,7 @@ def register_aawm_route_access_log_replacement(
     key = (
         str(client_addr),
         str(method),
-        str(full_path),
+        _normalize_aawm_route_access_log_replacement_path(full_path),
         str(http_version),
     )
     with _aawm_route_access_log_replacement_lock:
@@ -318,7 +431,12 @@ def _aawm_route_access_log_key_from_record(
         or http_version is None
     ):
         return None
-    return (str(client_addr), str(method), str(full_path), str(http_version))
+    return (
+        str(client_addr),
+        str(method),
+        _normalize_aawm_route_access_log_replacement_path(full_path),
+        str(http_version),
+    )
 
 
 def _consume_aawm_route_access_log_replacement(
@@ -419,6 +537,55 @@ def _get_standard_record_attrs() -> frozenset:
 
 _STANDARD_RECORD_ATTRS = _get_standard_record_attrs()
 
+_LANGFUSE_SUPPORT_STRING = (
+    "Unexpected error occurred. Please check your request and contact support: "
+    "https://langfuse.com/support."
+)
+_LANGFUSE_SUPPORT_STRING_RECOMMENDED_OPERATOR_ACTION = (
+    "Inspect Langfuse ingestion/storage health (web/worker/blob storage), then retry "
+    "or reduce oversized Langfuse event payloads before re-exporting traces."
+)
+
+
+def _is_langfuse_support_string_message(message: str) -> bool:
+    return message == _LANGFUSE_SUPPORT_STRING
+
+
+def _apply_langfuse_support_string_diagnostics(record: logging.LogRecord) -> None:
+    if record.name != "langfuse":
+        return
+    if getattr(record, "langfuse_support_string", False):
+        return
+
+    message = record.getMessage()
+    if not _is_langfuse_support_string_message(message):
+        return
+
+    setattr(record, "source", "langfuse_sdk")
+    setattr(record, "callback_name", "langfuse")
+    setattr(record, "callback_phase", "sdk_background_ingestion_upload")
+    setattr(record, "langfuse_support_string", True)
+    setattr(record, "langfuse_sdk_background_ingestion_failure", True)
+    setattr(
+        record,
+        "langfuse_failure_class",
+        "langfuse_sdk_background_ingestion_upload_failure",
+    )
+    setattr(
+        record,
+        "recommended_operator_action",
+        _LANGFUSE_SUPPORT_STRING_RECOMMENDED_OPERATOR_ACTION,
+    )
+
+
+class LangfuseSupportStringDiagnosticFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        _apply_langfuse_support_string_diagnostics(record)
+        return True
+
+
+_langfuse_support_string_diagnostic_filter = LangfuseSupportStringDiagnosticFilter()
+
 
 class JsonFormatter(Formatter):
     def __init__(self):
@@ -430,11 +597,13 @@ class JsonFormatter(Formatter):
         return dt.isoformat()
 
     def format(self, record):
+        _apply_langfuse_support_string_diagnostics(record)
         message_str = record.getMessage()
         json_record: Dict[str, Any] = {
             "message": message_str,
             "level": record.levelname,
             "timestamp": self.formatTime(record),
+            "logger": record.name,
         }
 
         # Parse embedded JSON or Python dict repr in message so sub-fields become first-class properties
@@ -581,6 +750,7 @@ def _ensure_filter_on_logger(logger: logging.Logger, log_filter: logging.Filter)
 
 for _logger in ALL_LOGGERS:
     _ensure_filter_on_logger(_logger, _egress_guard_alert_filter)
+    _ensure_filter_on_logger(_logger, _langfuse_support_string_diagnostic_filter)
 
 _ensure_filter_on_logger(
     logging.getLogger("uvicorn.access"),
@@ -644,10 +814,14 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
     """
     handler.addFilter(_secret_filter)
     handler.addFilter(_egress_guard_alert_filter)
+    handler.addFilter(_langfuse_support_string_diagnostic_filter)
     for lg in _get_loggers_to_initialize():
         lg.handlers.clear()  # remove any existing handlers
         _ensure_filter_on_logger(lg, _egress_guard_alert_filter)
+        _ensure_filter_on_logger(lg, _langfuse_support_string_diagnostic_filter)
         lg.addHandler(handler)  # add JSON formatter handler
+        if lg.name == "langfuse" and _get_aawm_error_log_path() is not None:
+            _ensure_aawm_error_log_handler_on_logger(lg)
         lg.propagate = False  # prevent bubbling to parent/root
     _configure_aawm_error_log_handlers()
 

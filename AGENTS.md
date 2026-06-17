@@ -78,6 +78,39 @@ document instead of silently dropping it. Creating the handoff is part of this
 repo's process ownership and does not require separate operator approval;
 implementing the sibling-repo change still does.
 
+### Runtime Error Log Intake
+
+At the start of TODO-driven work, inspect `.analysis/*-error.jsonl` files and
+legacy `.analysis/*-error.log` files in addition to `investigate-*`, `handoff-*`,
+and request-style intake files. Treat these files as error intake, not as the
+durable work queue.
+
+Structured JSONL is the preferred runtime error intake format. Each file is
+append-safe and contains one JSON object per line. Use the event fields to group
+and triage failures, but keep `.analysis/todo.md` as the source of truth for
+active work.
+
+For every active error-intake file, add or update an entry in `.analysis/todo.md`
+for the underlying resolution. The TODO entry should capture the environment
+name, error detail, traceback context, intended fix, acceptance evidence, and a
+specific requirement to clean up the source `*-error.jsonl` or legacy
+`*-error.log` file when the error is resolved.
+
+When reading JSONL intake, expect each event to include at least:
+- `environment`, `observed_at`, `logger`, `level`, and `message`
+- `traceback`, `traceback_text`, `traceback_lines`, and `raw_text` so the exact
+  traceback remains inspectable
+- `fingerprint` for grouping repeated failures
+- `context` fields when available for `source`, `container`, `endpoint`,
+  `upstream_url`, `provider`, `model`, `model_alias`, `route_family`,
+  `status_code`, `trace_id`, and `litellm_call_id`
+
+Do not mark an error-intake-driven item complete until the underlying error is
+fixed, verification evidence is recorded, and the corresponding active
+`.analysis/*-error.jsonl` or legacy `.analysis/*-error.log` file has been
+deleted or archived out of active intake. Keep `.analysis/todo.md` as the source
+of truth for active work.
+
 ### Broad Discovery Subtasks
 
 When delegating broad discovery work to a subagent, put the discovery contract in

@@ -454,314 +454,6 @@ def test_aawm_agent_identity_preserves_explicit_codex_user_header() -> None:
     assert langfuse_metadata["trace_user_id"] == "pytest-classifier"
 
 
-def test_aawm_agent_identity_extracts_safe_agent_id_from_metadata() -> None:
-    logger = AawmAgentIdentity()
-    kwargs = _base_kwargs(trace_name="codex")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "passthrough_route_family": "codex_responses",
-            "repository": "litellm",
-            "session_id": "codex-session-123",
-            "agent_id": "a2455b9a6286a4962",
-        }
-    )
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gpt-5.4-mini",
-        "input": [{"role": "user", "content": "Summarize the current task."}],
-    }
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "langfuse_trace_name": "codex",
-            "user-agent": "codex-tui/0.134.0",
-            "x-aawm-agent-id": "019ecbe0-4bb0-7f21-8239-a447b869d442",
-        }
-    }
-
-    updated_kwargs, result = logger.logging_hook(
-        kwargs=kwargs,
-        result={"choices": []},
-        call_type="pass_through_endpoint",
-    )
-
-    assert result == {"choices": []}
-    metadata = updated_kwargs["litellm_params"]["metadata"]
-    assert metadata["agent_id"] == "a2455b9a6286a4962"
-    assert metadata["agent_id_source"] == "litellm_params.metadata.agent_id"
-    assert updated_kwargs["standard_logging_object"]["metadata"]["agent_id"] == (
-        "a2455b9a6286a4962"
-    )
-
-
-def test_aawm_agent_identity_rejects_agent_id_lookalikes() -> None:
-    logger = AawmAgentIdentity()
-    trace_id = "019ecbe0-4bb0-7f21-8239-a447b869d442"
-    kwargs = _base_kwargs(trace_name="codex")
-    kwargs["litellm_trace_id"] = trace_id
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "passthrough_route_family": "codex_responses",
-            "repository": "litellm",
-            "session_id": "codex-session-123",
-            "agent_id": "orchestrator",
-            "source_agent_id": "litellm",
-        }
-    )
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gpt-5.4-mini",
-        "input": [{"role": "user", "content": "Summarize the current task."}],
-        "metadata": {
-            "task_id": "codex-session-123",
-            "subagent_id": "reviewer",
-        },
-    }
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "langfuse_trace_name": "codex",
-            "user-agent": "codex-tui/0.134.0",
-            "x-aawm-agent-id": trace_id,
-        }
-    }
-
-    updated_kwargs, result = logger.logging_hook(
-        kwargs=kwargs,
-        result={"choices": []},
-        call_type="pass_through_endpoint",
-    )
-
-    assert result == {"choices": []}
-    metadata = updated_kwargs["litellm_params"]["metadata"]
-    assert "agent_id" not in metadata
-    assert "agent_id_source" not in metadata
-    assert "agent_id" not in updated_kwargs["standard_logging_object"]["metadata"]
-
-
-def test_aawm_agent_identity_populates_codex_default_agent_name() -> None:
-    logger = AawmAgentIdentity()
-    kwargs = _base_kwargs(trace_name="codex")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "passthrough_route_family": "codex_responses",
-            "repository": "litellm",
-            "session_id": "codex-session-123",
-        }
-    )
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gpt-5.4-mini",
-        "input": [{"role": "user", "content": "Summarize the current task."}],
-    }
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "langfuse_trace_name": "codex",
-            "user-agent": "codex-tui/0.134.0",
-        }
-    }
-
-    updated_kwargs, result = logger.logging_hook(
-        kwargs=kwargs,
-        result={"choices": []},
-        call_type="pass_through_endpoint",
-    )
-
-    assert result == {"choices": []}
-    metadata = updated_kwargs["litellm_params"]["metadata"]
-    assert metadata["agent_name"] == "orchestrator"
-    assert updated_kwargs["standard_logging_object"]["metadata"]["agent_name"] == (
-        "orchestrator"
-    )
-
-
-def test_build_session_history_record_persists_agent_id_and_codex_default_name() -> None:
-    kwargs = _base_kwargs(trace_name="codex")
-    kwargs["model"] = "gpt-5.4-mini"
-    kwargs["custom_llm_provider"] = "openai"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-codex-agent-id"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "passthrough_route_family": "codex_responses",
-            "repository": "litellm",
-            "session_id": "codex-session-agent-id",
-        }
-    )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "langfuse_trace_name": "codex",
-            "user-agent": "codex-tui/0.134.0",
-            "x-aawm-agent-id": "019ecbe0-4bb0-7f21-8239-a447b869d442",
-        }
-    }
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gpt-5.4-mini",
-        "input": [{"role": "user", "content": "Summarize the current task."}],
-    }
-    result = {
-        "id": "resp-codex-agent-id",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-15T21:00:00Z",
-        end_time="2026-06-15T21:00:01Z",
-    )
-
-    assert record is not None
-    assert record["agent_name"] == "orchestrator"
-    assert record["agent_id"] == "019ecbe0-4bb0-7f21-8239-a447b869d442"
-    assert record["metadata"]["agent_id"] == "019ecbe0-4bb0-7f21-8239-a447b869d442"
-    assert record["metadata"]["agent_id_source"] == (
-        "request_headers.x-aawm-agent-id"
-    )
-
-
-def test_build_session_history_record_preserves_claude_agent_id_from_metadata() -> None:
-    kwargs = _base_kwargs(trace_name="claude-code.researcher")
-    kwargs["model"] = "claude-opus-4-8"
-    kwargs["custom_llm_provider"] = "anthropic"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-claude-agent-id"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "claude-session-agent-id",
-            "repository": "litellm",
-            "aawm_agent_id": "a2455b9a6286a4962",
-        }
-    )
-    result = {
-        "id": "resp-claude-agent-id",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-15T21:00:00Z",
-        end_time="2026-06-15T21:00:01Z",
-    )
-
-    assert record is not None
-    assert record["agent_name"] == "researcher"
-    assert record["agent_id"] == "a2455b9a6286a4962"
-    assert record["metadata"]["agent_id_source"] == (
-        "litellm_params.metadata.aawm_agent_id"
-    )
-
-
-def test_build_session_history_record_preserves_grok_agent_id_from_header() -> None:
-    kwargs = _base_kwargs(trace_name="grok-build")
-    kwargs["model"] = "grok-composer-2.5-fast"
-    kwargs["custom_llm_provider"] = "xai"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-grok-agent-id"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "passthrough_route_family": "grok_cli_chat_proxy",
-            "session_id": "grok-session-agent-id",
-            "repository": "litellm",
-        }
-    )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "user-agent": "grok-build/0.1",
-            "x-grok-agent-id": "agent_harness",
-        }
-    }
-    result = {
-        "id": "resp-grok-agent-id",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-15T21:00:00Z",
-        end_time="2026-06-15T21:00:01Z",
-    )
-
-    assert record is not None
-    assert record["agent_id"] == "agent_harness"
-    assert record["metadata"]["agent_id_source"] == "request_headers.x-grok-agent-id"
-
-
-def test_build_session_history_record_does_not_default_codex_subagent_to_orchestrator() -> None:
-    kwargs = _base_kwargs(trace_name="codex")
-    kwargs["model"] = "gpt-5.4-mini"
-    kwargs["custom_llm_provider"] = "openai"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-codex-subagent-no-name"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "passthrough_route_family": "codex_responses",
-            "repository": "litellm",
-            "session_id": "codex-subagent-session",
-            "thread_source": "subagent",
-            "agent_id": "019ecbe0-4bb0-7f21-8239-a447b869d442",
-        }
-    )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "langfuse_trace_name": "codex",
-            "user-agent": "codex-tui/0.134.0",
-        }
-    }
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gpt-5.4-mini",
-        "input": [{"role": "user", "content": "Summarize the current task."}],
-        "metadata": {"thread_source": "subagent"},
-    }
-    result = {
-        "id": "resp-codex-subagent-no-name",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-15T21:00:00Z",
-        end_time="2026-06-15T21:00:01Z",
-    )
-
-    assert record is not None
-    assert record["agent_name"] is None
-    assert record["agent_id"] == "019ecbe0-4bb0-7f21-8239-a447b869d442"
-
-
-def test_aawm_agent_identity_preserves_explicit_codex_agent_name() -> None:
-    logger = AawmAgentIdentity()
-    kwargs = _base_kwargs(trace_name="codex")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "agent_name": "researcher",
-            "passthrough_route_family": "codex_responses",
-            "repository": "litellm",
-            "session_id": "codex-session-123",
-        }
-    )
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gpt-5.4-mini",
-        "input": [{"role": "user", "content": "Summarize the current task."}],
-    }
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "langfuse_trace_name": "codex",
-            "user-agent": "codex-tui/0.134.0",
-        }
-    }
-
-    updated_kwargs, _ = logger.logging_hook(
-        kwargs=kwargs,
-        result={"choices": []},
-        call_type="pass_through_endpoint",
-    )
-
-    assert updated_kwargs["litellm_params"]["metadata"]["agent_name"] == "researcher"
-
-
 def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
@@ -2962,7 +2654,7 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
     assert record["metadata"]["usage_structured_output_mode"] == "json_schema"
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 127
+    assert len(payload) == 126
     assert payload[71] is True
     assert payload[72] is False
     assert payload[73] == "json_schema"
@@ -3067,7 +2759,7 @@ def test_build_session_history_record_persists_agent_score_metadata() -> None:  
     assert record["destructive_action_policy_score"] == pytest.approx(1.0)
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 127
+    assert len(payload) == 126
     assert payload[76] == pytest.approx(0.0)
     assert payload[77] is True
     assert payload[80] is False
@@ -3679,7 +3371,7 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 127
+    assert len(payload) == 126
     assert payload[61] == pytest.approx(25.0)
     assert payload[62] == pytest.approx(100.0)
     assert payload[63] == pytest.approx(130.0)
@@ -5832,7 +5524,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 127
+    assert len(payload) == 126
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -6254,7 +5946,7 @@ def test_d1_169_build_session_history_db_payload_appends_compact_summary_fields(
 
     assert record is not None
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 127
+    assert len(payload) == 126
     assert payload[121] == record["is_compact_summary"]
     assert payload[122] == record["compact_summary_source"]
     assert payload[123] == record["compact_summary_id"]
@@ -8530,6 +8222,186 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
     assert json.loads(payload[17])["signals"] == ["grok_billing_payload"]
 
 
+def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> None:  # noqa: PLR0915
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-composer-2.5-fast"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-percentage-billing"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-composer-2.5-fast",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+            "grok_billing_passthrough_http_client": "httpx",
+            "grok_billing_passthrough_request_method": "GET",
+            "grok_billing_passthrough_target_host": "cli-chat-proxy.grok.com",
+            "grok_billing_passthrough_target_path": "/v1/billing",
+            "grok_billing_passthrough_query_keys": ["format"],
+            "grok_billing_passthrough_header_names": [
+                "authorization",
+                "user-agent",
+                "x-grok-client-version",
+                "x-grok-model-override",
+                "x-xai-token-auth",
+            ],
+            "grok_billing_passthrough_user_agent": (
+                "grok-pager/0.2.55 grok-shell/0.2.55 (linux; x86_64)"
+            ),
+            "grok_billing_passthrough_x_xai_token_auth_configured": True,
+            "grok_billing_passthrough_request_contract_fingerprint": (
+                "abcd" * 16
+            ),
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        "request_headers": {
+            "x-grok-client-version": "0.2.55",
+            "x-grok-model-override": "grok-composer-2.5-fast",
+        },
+        "response_body": {
+            "config": {
+                "creditUsagePercent": 14.539333,
+                "productUsage": [
+                    {"name": "GrokBuild", "usagePercent": 12.507334},
+                    {"name": "Api", "usagePercent": 2.032},
+                ],
+                "billingPeriodStart": "2026-06-01T00:00:00+00:00",
+                "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+            }
+        },
+    }
+    observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=kwargs["standard_pass_through_logging_payload"]["response_body"],
+        start_time=observed_at,
+        end_time=observed_at,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["source"] == "grok_billing"
+    assert observation["provider"] == "xai"
+    assert observation["client_family"] == "grok-build"
+    assert observation["model"] == "grok-composer-2.5-fast"
+    assert observation["quota_type"] == "credits"
+    assert observation["quota_period"] == "monthly"
+    assert observation["limit_scope"] == "credits"
+    assert observation["raw_provider_fields"]["quota_unit"] == (
+        "grok_billing_credit_usage_percent"
+    )
+    assert observation["raw_provider_fields"]["quota_unit_interpretation"] == (
+        "percent_of_credit_quota"
+    )
+    assert observation["remaining_pct"] == pytest.approx(85.460667)
+    assert observation["used_percentage"] == pytest.approx(14.539333)
+    assert observation["quota_limit"] is None
+    assert observation["quota_used"] is None
+    assert observation["quota_remaining"] is None
+    assert observation["billing_period_start_at"] == datetime(
+        2026,
+        6,
+        1,
+        tzinfo=timezone.utc,
+    )
+    assert observation["billing_period_end_at"] == datetime(
+        2026,
+        7,
+        1,
+        tzinfo=timezone.utc,
+    )
+    assert observation["provider_resets_at"] == datetime(
+        2026,
+        7,
+        1,
+        tzinfo=timezone.utc,
+    )
+    assert observation["evidence"]["signals"] == [
+        "grok_billing_payload",
+        "grok_billing_percentage_only",
+    ]
+    assert observation["evidence"]["request_contract_fingerprint"] == "abcd" * 16
+    assert observation["evidence"]["request_contract_http_client"] == "httpx"
+    assert observation["evidence"]["request_contract_method"] == "GET"
+    assert observation["evidence"]["request_contract_target_host"] == (
+        "cli-chat-proxy.grok.com"
+    )
+    assert observation["evidence"]["request_contract_target_path"] == "/v1/billing"
+    assert observation["evidence"]["request_contract_query_keys"] == ["format"]
+    assert "authorization" in observation["evidence"][
+        "request_contract_header_names"
+    ]
+    assert observation["evidence"][
+        "request_contract_x_xai_token_auth_configured"
+    ] is True
+
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+        observation
+    )
+    assert payload[4] == "xai"
+    assert payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert payload[8] == "credits"
+    assert payload[10] == pytest.approx(85.460667)
+    assert payload[11] is None
+    assert payload[12] is None
+    assert payload[13] is None
+    assert payload[14] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert payload[15] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    raw_provider_fields = json.loads(payload[16])
+    assert raw_provider_fields["creditUsagePercent"] == pytest.approx(14.539333)
+    assert raw_provider_fields["productUsage"][0]["name"] == "GrokBuild"
+    assert json.loads(payload[17])["signals"] == [
+        "grok_billing_payload",
+        "grok_billing_percentage_only",
+    ]
+
+
+def test_build_rate_limit_observations_prefers_absolute_grok_billing_counts() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-mixed-billing"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        "response_body": {
+            "config": {
+                "monthlyLimit": {"val": 1000},
+                "used": {"val": 125},
+                "creditUsagePercent": 14.539333,
+                "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+            }
+        },
+    }
+    observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=kwargs["standard_pass_through_logging_payload"]["response_body"],
+        start_time=observed_at,
+        end_time=observed_at,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["quota_type"] == "requests"
+    assert observation["quota_limit"] == pytest.approx(1000.0)
+    assert observation["quota_used"] == pytest.approx(125.0)
+    assert observation["quota_remaining"] == pytest.approx(875.0)
+    assert observation["remaining_pct"] == 88.0
+    assert observation["raw_provider_fields"]["quota_unit"] == "grok_billing_used"
+
+
 def test_build_rate_limit_observations_skips_invalid_grok_billing_limit() -> None:
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["custom_llm_provider"] = "xai"
@@ -8969,6 +8841,60 @@ def test_provider_status_observations_schema_includes_icmp_fields() -> None:
     assert any(
         "provider_status_observations_probe_time_idx" in statement
         for statement in aawm_agent_identity._AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS
+    )
+
+
+def test_build_provider_error_observation_classifies_anthropic_upstream_reset_503() -> None:
+    reset_body = (
+        "upstream connect error or disconnect/reset before headers. "
+        "reset reason: connection termination"
+    )
+    kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
+    kwargs["model"] = "claude-opus-4-8"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-upstream-reset"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-upstream-reset",
+            "trace_id": "trace-anthropic-upstream-reset",
+            "litellm_environment": "dev",
+            "passthrough_route_family": "anthropic_messages",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = "claude-opus-4-8"
+    kwargs["exception"] = HTTPException(status_code=503, detail=reset_body)
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result=kwargs["exception"],
+        start_time="2026-06-16T08:51:07Z",
+        end_time="2026-06-16T08:51:08Z",
+    )
+
+    assert observation is not None
+    assert observation["provider"] == "anthropic"
+    assert observation["model"] == "claude-opus-4-8"
+    assert observation["route_family"] == "anthropic_messages"
+    assert observation["status_code"] == 503
+    assert observation["error_class"] == "provider_5xx"
+    assert observation["error_class"] != "auth_failed"
+    assert observation["error_class"] != "rate_limited"
+    normalized_error_text = observation["metadata"]["normalized_error_text"]
+    assert reset_body in normalized_error_text
+
+    failure_record = aawm_agent_identity._build_failure_observation_only_record(
+        kwargs=kwargs,
+        result=kwargs["exception"],
+        start_time="2026-06-16T08:51:07Z",
+        end_time="2026-06-16T08:51:08Z",
+    )
+
+    assert failure_record is not None
+    assert failure_record["_skip_session_history"] is True
+    assert "rate_limit_observations" not in failure_record
+    assert (
+        failure_record["provider_error_observations"][0]["error_class"]
+        == "provider_5xx"
     )
 
 
@@ -9693,7 +9619,8 @@ def test_flush_session_history_batch_logs_exception_type_when_message_is_empty(
     assert flushed is False
     exception_mock.assert_called_once()
     assert exception_mock.call_args.args[0] == (
-        "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)"
+        "AawmAgentIdentity: failed to flush %d session_history records; "
+        "retrying within the configured retry budget: %s (%s)"
     )
     assert exception_mock.call_args.args[1] == 1
     assert exception_mock.call_args.args[2] == (
@@ -9816,14 +9743,6 @@ def test_session_history_spool_round_trips_event_timestamps_and_quota_only_recor
     paths = aawm_agent_identity._session_history_spool_paths()
     assert len(paths) == 1
     assert paths[0].endswith(".jsonl")
-    raw_lines = [
-        json.loads(line)
-        for line in Path(paths[0]).read_text().splitlines()
-        if line.strip()
-    ]
-    assert raw_lines[0]["type"] == "metadata"
-    assert raw_lines[0]["record_count"] == 1
-    assert raw_lines[1]["type"] == "record"
     loaded = aawm_agent_identity._load_session_history_spool_record(paths[0])
     assert loaded["_skip_session_history"] is True
     assert loaded["litellm_call_id"] == "call-quota-only"
@@ -9866,7 +9785,9 @@ def test_session_history_spool_dir_defaults_to_local_fallback(monkeypatch) -> No
     )
 
 
-def test_session_history_spool_summary_reports_unavailable_listing(monkeypatch) -> None:
+def test_session_history_spool_summary_reports_unavailable_listing(
+    monkeypatch,
+) -> None:
     listing = aawm_agent_identity._SessionHistorySpoolListing(
         paths=(),
         availability="unavailable",
@@ -9877,13 +9798,13 @@ def test_session_history_spool_summary_reports_unavailable_listing(monkeypatch) 
         lambda: listing,
     )
 
-    assert (
-        aawm_agent_identity._session_history_spool_summary()
-        == "spool_pending=unknown, spool_state=unavailable"
-    )
+    summary = aawm_agent_identity._session_history_spool_summary()
+
+    assert summary == "spool_pending=unknown, spool_state=unavailable"
+    assert "spool_pending=0" not in summary
 
 
-def test_session_history_spool_summary_treats_missing_directory_as_empty(
+def test_session_history_spool_summary_keeps_missing_directory_empty(
     monkeypatch,
 ) -> None:
     listing = aawm_agent_identity._SessionHistorySpoolListing(
@@ -10067,7 +9988,6 @@ def test_failed_session_history_batch_spools_after_retry_budget(
     assert len(timestamp_part) == 14
     assert timestamp_part.isdigit()
     assert "trace-d1-267" in path.name
-    assert path.suffix == ".jsonl"
     assert not list(tmp_path.glob("*.tmp"))
 
     loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
@@ -10084,10 +10004,13 @@ def test_failed_session_history_batch_spools_after_retry_budget(
     assert exception_mock.call_count == 1
     warning_messages = [call.args[0] for call in warning_mock.call_args_list]
     assert (
-        "AawmAgentIdentity: session_history flush still failing: %s "
-        "(batch_size=%d, %s)"
+        "AawmAgentIdentity: session_history flush still failing within "
+        "the configured retry budget: %s (batch_size=%d, %s)"
     ) in warning_messages
-    assert any("spooled batch for replay" in message for message in warning_messages)
+    assert any(
+        "protected batch by spooling for replay" in message
+        for message in warning_messages
+    )
 
 
 def test_failed_session_history_traceback_is_suppressed_across_batches(
@@ -10282,7 +10205,6 @@ def test_session_history_spool_drainer_flushes_batch_spool_records(
     assert flushed_batches == [records]
     assert aawm_agent_identity._session_history_spool_paths() == []
 
-
 def test_session_history_spool_loads_legacy_json_artifacts(
     monkeypatch,
     tmp_path,
@@ -10325,6 +10247,89 @@ def test_session_history_spool_loads_legacy_json_artifacts(
     assert loaded_records[0]["start_time"] == observed_at
 
 
+def test_failed_session_history_batch_logs_spool_failure_severity(
+    monkeypatch,
+) -> None:
+    records = [{"litellm_call_id": "call-spool-failure-log"}]
+    exception_mock = MagicMock()
+    attempts = []
+
+    def fake_flush(batch, **kwargs):
+        attempts.append((batch, kwargs))
+        failure_callback = kwargs.get("failure_callback")
+        if failure_callback is not None:
+            failure_callback(OSError("pgbouncer unavailable"))
+        return len(attempts) >= 2
+
+    def failing_spool(*args, **kwargs):
+        raise OSError("spool unwritable")
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: "0"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
+        else None,
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_flush_session_history_batch", fake_flush)
+    monkeypatch.setattr(
+        aawm_agent_identity, "_spool_session_history_records", failing_spool
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", MagicMock())
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+
+    aawm_agent_identity._flush_session_history_batch_with_retry(records)
+
+    assert len(attempts) == 2
+    assert exception_mock.call_count == 1
+    assert (
+        "potential session_history data loss until inline retry succeeds"
+        in exception_mock.call_args.args[0]
+    )
+
+
+def test_session_history_spool_drainer_logs_recovery_and_retention(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    record = {"litellm_call_id": "call-spool-logging"}
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    aawm_agent_identity._spool_session_history_record(record)
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda batch: True,
+    )
+    aawm_agent_identity._session_history_spool_drainer_main()
+    success_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any("recovered" in message for message in success_messages)
+
+    aawm_agent_identity._spool_session_history_record(record)
+    warning_mock.reset_mock()
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda batch: False,
+    )
+    aawm_agent_identity._session_history_spool_drainer_main()
+    failure_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any("records remain spooled" in message for message in failure_messages)
+    assert len(aawm_agent_identity._session_history_spool_paths()) == 1
 def test_session_history_spool_drainer_keeps_records_when_flush_fails(
     monkeypatch,
     tmp_path,
@@ -10453,12 +10458,11 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert app_name_args[2]
     executed_args = mock_conn.execute.await_args_list[1].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 127
+    assert len(executed_args[1:]) == 126
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
     assert executed_args[126] == "anthropic/claude-sonnet-4-6"
-    assert executed_args[127] is None
     gap_args = mock_conn.execute.await_args_list[2].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-123"]
@@ -13157,9 +13161,8 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert "INSERT INTO public.session_history" in history_args[0]
     assert "    start_time,\n    created_at,\n    end_time," in history_args[0]
     assert "$11, COALESCE($11, $12, NOW()), $12" in history_args[0]
-    assert len(history_args[1][0]) == 127
+    assert len(history_args[1][0]) == 126
     assert history_args[1][0][125] == "anthropic/claude-sonnet-4-6"
-    assert history_args[1][0][126] is None
     assert history_args[1][0][0] == "call-1"
     assert history_args[1][0][10] == start_time
     assert history_args[1][0][11] == end_time
@@ -13172,7 +13175,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_persist_session_history_records_keeps_history_when_rate_limit_side_write_fails(
+async def test_persist_session_history_records_propagates_rate_limit_side_write_failure(
     monkeypatch,
 ) -> None:
     records: list[dict[str, Any]] = [
@@ -13242,29 +13245,127 @@ async def test_persist_session_history_records_keeps_history_when_rate_limit_sid
         "litellm.integrations.aawm_agent_identity._derive_rate_limit_transitions",
         AsyncMock(return_value=[]),
     )
-    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
-
-    await _persist_session_history_records(records)
+    with pytest.raises(RuntimeError, match="rate-limit insert unavailable"):
+        await _persist_session_history_records(records)
 
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
     assert history_args[1][0][0] == "call-side-write-fails"
     side_write_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.rate_limit_observations" in side_write_args[0]
-    assert mock_conn.execute.await_count == 3
-    first_app_name_args = mock_conn.execute.await_args_list[0].args
-    assert first_app_name_args[0] == "select set_config($1, $2, false)"
-    assert first_app_name_args[1] == "application_name"
-    assert first_app_name_args[2]
-    gap_args = mock_conn.execute.await_args_list[1].args
-    assert "previous_response_to_current_request_ms" in gap_args[0]
-    assert gap_args[1] == ["call-side-write-fails"]
-    final_app_name_args = mock_conn.execute.await_args_list[2].args
-    assert final_app_name_args[0] == "select set_config($1, $2, false)"
-    assert final_app_name_args[1] == "application_name"
-    assert final_app_name_args[2]
-    exception_mock.assert_called_once()
-    assert "best-effort rate-limit observations" in exception_mock.call_args.args[0]
+    exception_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "helper_name,record,expected_match",
+    [
+        (
+            "_persist_tool_definition_snapshots_best_effort",
+            {
+                "litellm_call_id": "call-tool-snapshot-side-write-fails",
+                "session_id": "session-tool-snapshot-side-write-fails",
+                "trace_id": "trace-tool-snapshot-side-write-fails",
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "model_group": "gpt-5.5",
+                "metadata": {
+                    "aawm_tool_definition_capture_version": "v1",
+                    "aawm_tool_definition_capture_source": "passthrough_request_body",
+                    "aawm_tool_definition_count": 1,
+                    "aawm_tool_definition_captured_count": 1,
+                    "aawm_tool_definition_sources": ["tools"],
+                    "aawm_tool_definition_names": ["spawn_agent"],
+                    "aawm_tool_definition_types": ["function"],
+                    "aawm_tool_definition_snapshot_hash": "hash-tool-snapshot-side-write-fails",
+                    "aawm_tool_definition_snapshot_truncated": False,
+                },
+                "aawm_tool_definition_snapshot": [
+                    {"source": "tools", "index": 0, "name": "spawn_agent"}
+                ],
+            },
+            "tool-definition snapshot insert unavailable",
+        ),
+        (
+            "_persist_provider_error_observations_best_effort",
+            {
+                "provider_error_observations": [
+                    {
+                        "observed_at": datetime(2026, 6, 5, 19, 13, tzinfo=timezone.utc),
+                        "environment": "dev",
+                        "provider": "openrouter",
+                        "model": "openrouter/meta-llama/llama-3.3-70b-instruct",
+                        "model_group": "llama-3.3-70b",
+                        "route_family": "openrouter_chat_completions",
+                        "status_code": 503,
+                        "error_type": "ProviderError",
+                        "error_code": "503",
+                        "error_class": "provider_5xx",
+                        "retry_after_seconds": None,
+                        "expected_reset_at": None,
+                        "session_id": "session-provider-error-side-write-fails",
+                        "trace_id": "trace-provider-error-side-write-fails",
+                        "litellm_call_id": "call-provider-error-side-write-fails",
+                        "metadata": {"observed_signal": "normal_traffic_failure"},
+                    }
+                ]
+            },
+            "provider-error insert unavailable",
+        ),
+        (
+            "_persist_alias_routing_audit_best_effort",
+            {
+                "litellm_call_id": "call-alias-side-write-fails",
+                "session_id": "session-alias-side-write-fails",
+                "start_time": datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc),
+                "metadata": {
+                    "aawm_alias_routing_audit_events": [
+                        {
+                            "alias_family": "anthropic_auto_agent",
+                            "alias_model": "aawm-code-anthropic",
+                            "provider": "antigravity",
+                            "model": "claude-sonnet-4-6",
+                            "route_family": "anthropic_antigravity_completion_adapter",
+                            "event_type": "candidate_selected",
+                            "candidate_status": "selected",
+                            "selected": True,
+                        }
+                    ]
+                },
+            },
+            "alias-routing audit insert unavailable",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_persist_session_history_records_propagates_side_write_helper_failures(
+    monkeypatch,
+    helper_name: str,
+    record: dict[str, Any],
+    expected_match: str,
+) -> None:
+    records = [{**record, "_skip_session_history": True}]
+
+    mock_conn = AsyncMock()
+    fake_pool = _FakePool(mock_conn)
+    helper_mock = AsyncMock(side_effect=RuntimeError(expected_match))
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        f"litellm.integrations.aawm_agent_identity.{helper_name}",
+        helper_mock,
+    )
+
+    with pytest.raises(RuntimeError, match=expected_match):
+        await _persist_session_history_records(records)
+
+    helper_mock.assert_awaited_once()
+    mock_conn.executemany.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -13587,35 +13688,6 @@ def test_session_history_insert_sql_includes_inbound_model_alias() -> None:
     assert "NULLIF(EXCLUDED.inbound_model_alias, '')" in sql
 
 
-def test_session_history_insert_sql_includes_nullable_agent_id() -> None:
-    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
-
-    assert "agent_id" in aawm_agent_identity._AAWM_SESSION_HISTORY_TABLE_SQL
-    assert (
-        "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_id TEXT"
-        in aawm_agent_identity._AAWM_SESSION_HISTORY_ALTER_STATEMENTS
-    )
-    assert "agent_id" in sql
-    assert "$127" in sql
-    assert (
-        "agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), session_history.agent_id)"
-        in sql
-    )
-
-
-def test_tool_activity_insert_sql_includes_nullable_agent_id() -> None:
-    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL
-
-    assert "agent_id TEXT" in aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL
-    assert "agent_id" in sql
-    assert "$18" in sql
-    assert (
-        "agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), "
-        "session_history_tool_activity.agent_id)"
-        in sql
-    )
-
-
 def test_session_history_insert_sql_uses_start_time_as_created_at() -> None:
     sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
 
@@ -13665,94 +13737,6 @@ def test_session_history_payload_preserves_unknown_sensitive_config_flags() -> N
     )
 
     assert payload[33:37] == (None, None, None, None)
-
-
-def test_session_history_db_payload_includes_nullable_agent_id() -> None:
-    payload = _build_session_history_db_payload(
-        {
-            "litellm_call_id": "call-agent-id",
-            "session_id": "session-not-agent-id",
-            "trace_id": "trace-not-agent-id",
-            "provider_response_id": None,
-            "provider": "anthropic",
-            "model": "claude-opus-4-8",
-            "model_group": "claude-opus-4-8",
-            "agent_name": "reviewer",
-            "agent_id": "agent-opaque-123",
-            "tenant_id": "tenant-not-agent-id",
-            "repository": "repo-not-agent-id",
-            "call_type": "messages",
-            "start_time": None,
-            "end_time": None,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens_reported": None,
-            "reasoning_tokens_estimated": None,
-            "reasoning_tokens_source": "not_applicable",
-            "reasoning_present": False,
-            "thinking_signature_present": False,
-            "tool_call_count": 0,
-            "invalid_tool_call_count": 0,
-            "tool_names": [],
-            "file_read_count": 0,
-            "file_modified_count": 0,
-            "git_commit_count": 0,
-            "git_push_count": 0,
-            "response_cost_usd": None,
-            "metadata": {},
-        }
-    )
-
-    assert len(payload) == 127
-    assert payload[1] == "session-not-agent-id"
-    assert payload[2] == "trace-not-agent-id"
-    assert payload[7] == "reviewer"
-    assert payload[51] == "repo-not-agent-id"
-    assert payload[126] == "agent-opaque-123"
-
-
-def test_session_history_db_payload_keeps_agent_id_nullable_when_absent() -> None:
-    payload = _build_session_history_db_payload(
-        {
-            "litellm_call_id": "call-agent-id-absent",
-            "session_id": "session-agent-id-absent",
-            "trace_id": None,
-            "provider_response_id": None,
-            "provider": "openai",
-            "model": "gpt-5.4-mini",
-            "model_group": "gpt-5.4-mini",
-            "agent_name": None,
-            "tenant_id": None,
-            "call_type": "responses",
-            "start_time": None,
-            "end_time": None,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens_reported": None,
-            "reasoning_tokens_estimated": None,
-            "reasoning_tokens_source": "not_applicable",
-            "reasoning_present": False,
-            "thinking_signature_present": False,
-            "tool_call_count": 0,
-            "invalid_tool_call_count": 0,
-            "tool_names": [],
-            "file_read_count": 0,
-            "file_modified_count": 0,
-            "git_commit_count": 0,
-            "git_push_count": 0,
-            "response_cost_usd": None,
-            "metadata": {},
-        }
-    )
-
-    assert len(payload) == 127
-    assert payload[126] is None
 
 
 def test_session_history_db_payload_strips_postgres_nul_bytes() -> None:
@@ -13852,67 +13836,6 @@ def test_tool_activity_db_payload_strips_postgres_nul_bytes() -> None:
     assert "\\u0000" not in payload[11]
     assert "\\u0000" not in payload[15]
     assert "\\u0000" not in payload[16]
-
-
-def test_tool_activity_db_payload_includes_nullable_agent_id() -> None:
-    payloads = aawm_agent_identity._build_tool_activity_db_payloads(
-        {
-            "litellm_call_id": "call-tool-agent-id",
-            "session_id": "session-not-agent-id",
-            "trace_id": "trace-not-agent-id",
-            "provider": "anthropic",
-            "model": "claude-opus-4-8",
-            "agent_name": "engineer",
-            "agent_id": "agent-opaque-tool-123",
-            "tool_activity": [
-                {
-                    "tool_index": 0,
-                    "tool_call_id": "tool-call-1",
-                    "tool_name": "Read",
-                    "tool_kind": "read",
-                    "file_paths_read": ["src/file.py"],
-                    "file_paths_modified": [],
-                    "git_commit_count": 0,
-                    "git_push_count": 0,
-                    "command_text": None,
-                    "arguments": {"path": "src/file.py"},
-                    "metadata": {"source": "message.tool_calls"},
-                }
-            ],
-        }
-    )
-
-    assert len(payloads) == 1
-    payload = payloads[0]
-    assert len(payload) == 18
-    assert payload[1] == "session-not-agent-id"
-    assert payload[2] == "trace-not-agent-id"
-    assert payload[5] == "engineer"
-    assert payload[17] == "agent-opaque-tool-123"
-
-
-def test_tool_activity_db_payload_keeps_agent_id_nullable_when_absent() -> None:
-    payloads = aawm_agent_identity._build_tool_activity_db_payloads(
-        {
-            "litellm_call_id": "call-tool-agent-id-absent",
-            "session_id": "session-tool-agent-id-absent",
-            "trace_id": None,
-            "provider": "openai",
-            "model": "gpt-5.4-mini",
-            "agent_name": None,
-            "tool_activity": [
-                {
-                    "tool_index": 0,
-                    "tool_call_id": "tool-call-absent",
-                    "tool_name": "Shell",
-                    "tool_kind": "command",
-                }
-            ],
-        }
-    )
-
-    assert len(payloads) == 1
-    assert payloads[0][17] is None
 
 
 def test_tool_activity_upsert_sql_guards_scalar_file_paths() -> None:

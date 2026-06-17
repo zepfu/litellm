@@ -237,6 +237,24 @@ class AnthropicPassthroughLoggingHandler:
         ):
             model = cast(str, litellm_logging_obj.model_call_details.get("model"))
 
+        upstream_stream_errors = (
+            AnthropicPassthroughLoggingHandler._collect_upstream_stream_errors_from_chunks(
+                all_chunks
+            )
+        )
+        logging_kwargs = dict(kwargs or {})
+        if upstream_stream_errors:
+            logging_kwargs = (
+                AnthropicPassthroughLoggingHandler._record_upstream_stream_error_metadata(
+                    logging_kwargs,
+                    upstream_errors=upstream_stream_errors,
+                )
+            )
+            return {
+                "result": None,
+                "kwargs": logging_kwargs,
+            }
+
         complete_streaming_response = (
             AnthropicPassthroughLoggingHandler._build_complete_streaming_response(
                 all_chunks=all_chunks,
@@ -252,7 +270,6 @@ class AnthropicPassthroughLoggingHandler:
                 "result": None,
                 "kwargs": {},
             }
-        logging_kwargs = dict(kwargs or {})
         if passthrough_logging_payload:
             logging_kwargs["passthrough_logging_payload"] = passthrough_logging_payload
         kwargs = AnthropicPassthroughLoggingHandler._create_anthropic_response_logging_payload(
@@ -294,6 +311,75 @@ class AnthropicPassthroughLoggingHandler:
         return events
 
     @staticmethod
+    def _parse_sse_event_data(event_str: str) -> Optional[dict]:
+        """Extract the JSON payload from a single Anthropic SSE event string."""
+        data_line = None
+        for line in event_str.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("data:"):
+                data_line = stripped
+                break
+        if data_line is None:
+            return None
+        try:
+            parsed = json.loads(data_line[5:].strip())
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _collect_upstream_stream_errors_from_chunks(
+        all_chunks: Sequence[Union[str, bytes]],
+    ) -> List[dict]:
+        """Collect upstream Anthropic SSE `event: error` payloads without raising."""
+        errors: List[dict] = []
+        for chunk in all_chunks:
+            for event_str in AnthropicPassthroughLoggingHandler._split_sse_chunk_into_events(
+                chunk
+            ):
+                payload = AnthropicPassthroughLoggingHandler._parse_sse_event_data(
+                    event_str
+                )
+                if not isinstance(payload, dict) or payload.get("type") != "error":
+                    continue
+                error_payload = payload.get("error")
+                if not isinstance(error_payload, dict):
+                    error_payload = {"message": str(error_payload)}
+                errors.append(
+                    {
+                        "type": error_payload.get("type"),
+                        "message": error_payload.get("message"),
+                        "code": error_payload.get("code") or error_payload.get("type"),
+                    }
+                )
+        return errors
+
+    @staticmethod
+    def _record_upstream_stream_error_metadata(
+        kwargs: Optional[dict],
+        *,
+        upstream_errors: List[dict],
+    ) -> dict:
+        logging_kwargs = dict(kwargs or {})
+        litellm_params = logging_kwargs.get("litellm_params")
+        if not isinstance(litellm_params, dict):
+            litellm_params = {}
+            logging_kwargs["litellm_params"] = litellm_params
+        metadata = litellm_params.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            litellm_params["metadata"] = metadata
+
+        metadata["aawm_upstream_stream_degraded"] = True
+        metadata["aawm_upstream_stream_errors"] = upstream_errors
+        if upstream_errors:
+            latest_error = upstream_errors[-1]
+            metadata["aawm_upstream_stream_error"] = latest_error
+            metadata["aawm_upstream_stream_error_type"] = latest_error.get("type")
+            metadata["aawm_upstream_stream_error_message"] = latest_error.get("message")
+        return logging_kwargs
+
+    @staticmethod
     def _build_complete_streaming_response(
         all_chunks: Sequence[Union[str, bytes]],
         litellm_logging_obj: LiteLLMLoggingObj,
@@ -327,6 +413,11 @@ class AnthropicPassthroughLoggingHandler:
 
             # Process each individual event
             for event_str in individual_events:
+                payload = AnthropicPassthroughLoggingHandler._parse_sse_event_data(
+                    event_str
+                )
+                if isinstance(payload, dict) and payload.get("type") == "error":
+                    continue
                 try:
                     transformed_openai_chunk = anthropic_model_response_iterator.convert_str_chunk_to_generic_chunk(
                         chunk=event_str

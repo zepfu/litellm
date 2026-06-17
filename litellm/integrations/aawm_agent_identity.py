@@ -3089,7 +3089,7 @@ def _session_history_spool_drainer_main() -> None:
                         _format_exception_for_warning(exc),
                     )
             verbose_logger.warning(
-                "AawmAgentIdentity: drained %d spooled session_history records "
+                "AawmAgentIdentity: recovered %d spooled session_history records "
                 "from %d files (%s)",
                 drained_record_count,
                 removed,
@@ -3297,15 +3297,16 @@ def _flush_session_history_batch(
             failure_callback(exc)
         if log_exception and _mark_session_history_flush_failure_for_logging():
             verbose_logger.exception(
-                "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)",
+                "AawmAgentIdentity: failed to flush %d session_history records; "
+                "retrying within the configured retry budget: %s (%s)",
                 len(records),
                 _format_exception_for_warning(exc),
                 _session_history_queue_depth_summary(),
             )
         else:
             verbose_logger.warning(
-                "AawmAgentIdentity: session_history flush still failing: %s "
-                "(batch_size=%d, %s)",
+                "AawmAgentIdentity: session_history flush still failing within "
+                "the configured retry budget: %s (batch_size=%d, %s)",
                 _format_exception_for_warning(exc),
                 len(records),
                 _session_history_queue_depth_summary(),
@@ -3372,7 +3373,7 @@ def _flush_session_history_batch_with_retry(
                 )
                 verbose_logger.warning(
                     "AawmAgentIdentity: %s failed after %d retries; "
-                    "spooled batch for replay (path=%s, batch_size=%d, %s)",
+                    "protected batch by spooling for replay (path=%s, batch_size=%d, %s)",
                     retry_message,
                     retry_count,
                     spool_path,
@@ -3383,7 +3384,7 @@ def _flush_session_history_batch_with_retry(
             except Exception as spool_exc:
                 verbose_logger.exception(
                     "AawmAgentIdentity: failed to spool %s after %d retries; "
-                    "continuing inline retry to avoid dropping records: %s",
+                    "potential session_history data loss until inline retry succeeds: %s",
                     retry_message,
                     retry_count,
                     _format_exception_for_warning(spool_exc),
@@ -3391,7 +3392,7 @@ def _flush_session_history_batch_with_retry(
 
         retry_count += 1
         verbose_logger.warning(
-            "AawmAgentIdentity: retrying %s after failure "
+            "AawmAgentIdentity: retrying %s within the configured retry budget "
             "(retry_count=%d, batch_size=%d, %s)",
             retry_message,
             retry_count,
@@ -3514,7 +3515,7 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
             except Exception as exc:
                 verbose_logger.exception(
                     "AawmAgentIdentity: failed to spool session_history overflow "
-                    "record; flushing inline with retry: %s",
+                    "record; potential data loss until inline retry succeeds: %s",
                     _format_exception_for_warning(exc),
                 )
                 _flush_session_history_batch_with_retry(
@@ -7700,12 +7701,69 @@ def _extract_grok_billing_config(candidate: Dict[str, Any]) -> Optional[Dict[str
     )
     if not isinstance(config, dict):
         return None
-    if not isinstance(config.get("monthlyLimit"), dict) or not isinstance(
+    has_absolute_quota = isinstance(config.get("monthlyLimit"), dict) and isinstance(
         config.get("used"),
         dict,
-    ):
+    )
+    has_percentage_quota = _safe_float(config.get("creditUsagePercent")) is not None
+    if not has_absolute_quota and not has_percentage_quota:
         return None
     return config
+
+
+def _grok_billing_model(
+    context: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> str:
+    return (
+        _clean_non_empty_string(context.get("model"))
+        if context.get("model") != "unknown"
+        else None
+    ) or _clean_non_empty_string(
+        metadata.get("grok_model_override")
+    ) or "grok-build"
+
+
+def _grok_billing_request_contract_evidence(
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    fingerprint = _clean_non_empty_string(
+        metadata.get("grok_billing_passthrough_request_contract_fingerprint")
+    )
+    if not fingerprint:
+        return {}
+
+    evidence: Dict[str, Any] = {
+        "request_contract_fingerprint": fingerprint,
+    }
+    for metadata_key, evidence_key in (
+        ("grok_billing_passthrough_http_client", "request_contract_http_client"),
+        ("grok_billing_passthrough_request_method", "request_contract_method"),
+        ("grok_billing_passthrough_target_host", "request_contract_target_host"),
+        ("grok_billing_passthrough_target_path", "request_contract_target_path"),
+        ("grok_billing_passthrough_user_agent", "request_contract_user_agent"),
+    ):
+        value = _clean_non_empty_string(metadata.get(metadata_key))
+        if value:
+            evidence[evidence_key] = value
+
+    for metadata_key, evidence_key in (
+        ("grok_billing_passthrough_query_keys", "request_contract_query_keys"),
+        ("grok_billing_passthrough_header_names", "request_contract_header_names"),
+    ):
+        value = metadata.get(metadata_key)
+        if isinstance(value, list):
+            evidence[evidence_key] = [
+                str(item)
+                for item in value
+                if isinstance(item, (str, int, float)) and str(item)
+            ]
+
+    configured = metadata.get("grok_billing_passthrough_x_xai_token_auth_configured")
+    if configured is not None:
+        evidence["request_contract_x_xai_token_auth_configured"] = bool(configured)
+
+    return evidence
 
 
 def _extract_grok_billing_observations(
@@ -7723,6 +7781,7 @@ def _extract_grok_billing_observations(
         observed_at,
         "grok_billing",
     )
+    request_contract_evidence = _grok_billing_request_contract_evidence(metadata)
     observations: List[Dict[str, Any]] = []
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         config = _extract_grok_billing_config(candidate)
@@ -7731,23 +7790,75 @@ def _extract_grok_billing_observations(
 
         monthly_limit = _grok_billing_quota_value(config.get("monthlyLimit"))
         used = _grok_billing_quota_value(config.get("used"))
-        if monthly_limit is None or monthly_limit <= 0 or used is None or used < 0:
-            continue
-
-        used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
-        remaining_pct = int(
-            math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
-        )
-        quota_remaining = max(0.0, monthly_limit - used)
         billing_period_start_at = _parse_provider_timestamp(config.get("billingPeriodStart"))
         provider_resets_at = _parse_provider_timestamp(config.get("billingPeriodEnd"))
-        model = (
-            _clean_non_empty_string(context.get("model"))
-            if context.get("model") != "unknown"
-            else None
-        ) or _clean_non_empty_string(
-            metadata.get("grok_model_override")
-        ) or "grok-build"
+        model = _grok_billing_model(context, metadata)
+        if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
+            used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
+            remaining_pct = int(
+                math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
+            )
+            quota_remaining = max(0.0, monthly_limit - used)
+            observations.append(
+                _finalize_rate_limit_observation(
+                    {
+                        "observed_at": context["observed_at"],
+                        "source": "grok_billing",
+                        "provider": "xai",
+                        "client_family": "grok-build",
+                        "limit_id": "xai_grok_build_monthly_requests",
+                        "limit_name": "Grok Build monthly requests",
+                        "limit_scope": "requests",
+                        "quota_period": "monthly",
+                        "quota_type": "requests",
+                        "provider_resets_at": provider_resets_at,
+                        "remaining_pct": float(remaining_pct),
+                        "quota_limit": monthly_limit,
+                        "quota_used": used,
+                        "quota_remaining": quota_remaining,
+                        "billing_period_start_at": billing_period_start_at,
+                        "billing_period_end_at": provider_resets_at,
+                        "used_percentage": float(100 - remaining_pct),
+                        "model": model,
+                        "model_family": "grok",
+                        "raw_provider_fields": {
+                            "monthlyLimit": _json_safe_rate_limit_value(
+                                config.get("monthlyLimit")
+                            ),
+                            "used": _json_safe_rate_limit_value(config.get("used")),
+                            "onDemandCap": _json_safe_rate_limit_value(
+                                config.get("onDemandCap")
+                            ),
+                            "billingPeriodStart": config.get("billingPeriodStart"),
+                            "billingPeriodEnd": config.get("billingPeriodEnd"),
+                            "quota_unit": "grok_billing_used",
+                            "quota_unit_interpretation": "requests",
+                        },
+                        "evidence": {
+                            "signals": ["grok_billing_payload"],
+                            "provider_fields": [
+                                "config.monthlyLimit.val",
+                                "config.used.val",
+                                "config.billingPeriodEnd",
+                            ],
+                            "rounding": "whole_remaining_percentage",
+                            "unit_note": (
+                                "Grok billing does not label used.val; observed tool "
+                                "traffic behaves request-like."
+                            ),
+                            **request_contract_evidence,
+                        },
+                    },
+                    context,
+                )
+            )
+            continue
+
+        credit_usage_percent = _safe_float(config.get("creditUsagePercent"))
+        if credit_usage_percent is None:
+            continue
+        used_percentage = max(0.0, min(100.0, credit_usage_percent))
+        remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
         observations.append(
             _finalize_rate_limit_observation(
                 {
@@ -7755,46 +7866,49 @@ def _extract_grok_billing_observations(
                     "source": "grok_billing",
                     "provider": "xai",
                     "client_family": "grok-build",
-                    "limit_id": "xai_grok_build_monthly_requests",
-                    "limit_name": "Grok Build monthly requests",
-                    "limit_scope": "requests",
+                    "limit_id": "xai_grok_build_monthly_credits",
+                    "limit_name": "Grok Build monthly credits",
+                    "limit_scope": "credits",
                     "quota_period": "monthly",
-                    "quota_type": "requests",
+                    "quota_type": "credits",
                     "provider_resets_at": provider_resets_at,
-                    "remaining_pct": float(remaining_pct),
-                    "quota_limit": monthly_limit,
-                    "quota_used": used,
-                    "quota_remaining": quota_remaining,
+                    "remaining_pct": remaining_pct,
+                    "quota_limit": None,
+                    "quota_used": None,
+                    "quota_remaining": None,
                     "billing_period_start_at": billing_period_start_at,
                     "billing_period_end_at": provider_resets_at,
-                    "used_percentage": float(100 - remaining_pct),
+                    "used_percentage": used_percentage,
                     "model": model,
                     "model_family": "grok",
                     "raw_provider_fields": {
-                        "monthlyLimit": _json_safe_rate_limit_value(
-                            config.get("monthlyLimit")
+                        "creditUsagePercent": _json_safe_rate_limit_value(
+                            config.get("creditUsagePercent")
                         ),
-                        "used": _json_safe_rate_limit_value(config.get("used")),
-                        "onDemandCap": _json_safe_rate_limit_value(
-                            config.get("onDemandCap")
+                        "productUsage": _json_safe_rate_limit_value(
+                            config.get("productUsage")
                         ),
                         "billingPeriodStart": config.get("billingPeriodStart"),
                         "billingPeriodEnd": config.get("billingPeriodEnd"),
-                        "quota_unit": "grok_billing_used",
-                        "quota_unit_interpretation": "requests",
+                        "quota_unit": "grok_billing_credit_usage_percent",
+                        "quota_unit_interpretation": "percent_of_credit_quota",
                     },
                     "evidence": {
-                        "signals": ["grok_billing_payload"],
+                        "signals": [
+                            "grok_billing_payload",
+                            "grok_billing_percentage_only",
+                        ],
                         "provider_fields": [
-                            "config.monthlyLimit.val",
-                            "config.used.val",
+                            "config.creditUsagePercent",
+                            "config.productUsage",
                             "config.billingPeriodEnd",
                         ],
-                        "rounding": "whole_remaining_percentage",
+                        "rounding": "none",
                         "unit_note": (
-                            "Grok billing does not label used.val; observed tool "
-                            "traffic behaves request-like."
+                            "Grok billing provided percentage-only credit usage; "
+                            "absolute quota counts are intentionally left null."
                         ),
+                        **request_contract_evidence,
                     },
                 },
                 context,
@@ -16848,18 +16962,10 @@ async def _persist_tool_definition_snapshots_best_effort(
     if not snapshot_payloads:
         return
 
-    try:
-        await conn.executemany(
-            _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
-            snapshot_payloads,
-        )
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort tool-definition "
-            "snapshots for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
-        )
+    await conn.executemany(
+        _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
+        snapshot_payloads,
+    )
 
 
 async def _lookup_claude_auto_review_parent_identity(
@@ -17391,24 +17497,16 @@ async def _persist_alias_routing_audit_best_effort(
     conn: Any,
     records: List[Dict[str, Any]],
 ) -> None:
-    try:
-        payloads: List[Tuple[Any, ...]] = []
-        for record in records:
-            events = _extract_alias_routing_audit_events(record)
-            payloads.extend(
-                _build_alias_routing_audit_db_payload(record, event, index)
-                for index, event in enumerate(events)
-            )
-        if not payloads:
-            return
-        await conn.executemany(_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL, payloads)
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort alias routing "
-            "audit events for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
+    payloads: List[Tuple[Any, ...]] = []
+    for record in records:
+        events = _extract_alias_routing_audit_events(record)
+        payloads.extend(
+            _build_alias_routing_audit_db_payload(record, event, index)
+            for index, event in enumerate(events)
         )
+    if not payloads:
+        return
+    await conn.executemany(_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL, payloads)
 
 
 async def _fetch_previous_rate_limit_observation(
@@ -17585,59 +17683,51 @@ async def _persist_rate_limit_observations_best_effort(
     *,
     history_records: List[Dict[str, Any]],
 ) -> None:
-    try:
-        openrouter_free_daily_observations = (
-            await _build_openrouter_free_daily_observations_for_records(
-                conn,
-                history_records,
-            )
-        )
-        rate_limit_observations: List[Dict[str, Any]] = []
-        for record in records:
-            observations = record.get("rate_limit_observations")
-            if isinstance(observations, list):
-                rate_limit_observations.extend(
-                    observation
-                    for observation in observations
-                    if isinstance(observation, dict)
-                )
-        rate_limit_observations.extend(openrouter_free_daily_observations)
-        if rate_limit_observations:
-            (
-                rate_limit_observations,
-                initial_previous_by_limit_key,
-            ) = await _filter_meaningful_rate_limit_observations(
-                conn,
-                rate_limit_observations,
-            )
-        if not rate_limit_observations:
-            return
-        transitions = await _derive_rate_limit_transitions(
+    openrouter_free_daily_observations = (
+        await _build_openrouter_free_daily_observations_for_records(
             conn,
+            history_records,
+        )
+    )
+    rate_limit_observations: List[Dict[str, Any]] = []
+    for record in records:
+        observations = record.get("rate_limit_observations")
+        if isinstance(observations, list):
+            rate_limit_observations.extend(
+                observation
+                for observation in observations
+                if isinstance(observation, dict)
+            )
+    rate_limit_observations.extend(openrouter_free_daily_observations)
+    if rate_limit_observations:
+        (
             rate_limit_observations,
             initial_previous_by_limit_key,
+        ) = await _filter_meaningful_rate_limit_observations(
+            conn,
+            rate_limit_observations,
         )
+    if not rate_limit_observations:
+        return
+    transitions = await _derive_rate_limit_transitions(
+        conn,
+        rate_limit_observations,
+        initial_previous_by_limit_key,
+    )
+    await conn.executemany(
+        _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+        [
+            _build_rate_limit_observation_db_payload(observation)
+            for observation in rate_limit_observations
+        ],
+    )
+    if transitions:
         await conn.executemany(
-            _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+            _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
             [
-                _build_rate_limit_observation_db_payload(observation)
-                for observation in rate_limit_observations
+                _build_rate_limit_transition_db_payload(transition)
+                for transition in transitions
             ],
-        )
-        if transitions:
-            await conn.executemany(
-                _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
-                [
-                    _build_rate_limit_transition_db_payload(transition)
-                    for transition in transitions
-                ],
-            )
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort rate-limit "
-            "observations for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
         )
 
 
@@ -17647,38 +17737,30 @@ async def _persist_provider_error_observations_best_effort(
     *,
     identity_by_session: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
-    try:
-        provider_error_observations: List[Dict[str, Any]] = []
-        for record in records:
-            observations = record.get("provider_error_observations")
-            if isinstance(observations, list):
-                provider_error_observations.extend(
-                    observation
-                    for observation in observations
-                    if isinstance(observation, dict)
-                )
-        if not provider_error_observations:
-            return
-        for observation in provider_error_observations:
-            await _apply_claude_auto_review_parent_identity_from_store(
-                conn,
-                observation,
-                identity_by_session,
+    provider_error_observations: List[Dict[str, Any]] = []
+    for record in records:
+        observations = record.get("provider_error_observations")
+        if isinstance(observations, list):
+            provider_error_observations.extend(
+                observation
+                for observation in observations
+                if isinstance(observation, dict)
             )
-        await conn.executemany(
-            _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
-            [
-                _build_provider_error_observation_db_payload(observation)
-                for observation in provider_error_observations
-            ],
+    if not provider_error_observations:
+        return
+    for observation in provider_error_observations:
+        await _apply_claude_auto_review_parent_identity_from_store(
+            conn,
+            observation,
+            identity_by_session,
         )
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort provider error "
-            "observations for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
-        )
+    await conn.executemany(
+        _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
+        [
+            _build_provider_error_observation_db_payload(observation)
+            for observation in provider_error_observations
+        ],
+    )
 
 
 async def _persist_session_history_record(record: Dict[str, Any]) -> None:

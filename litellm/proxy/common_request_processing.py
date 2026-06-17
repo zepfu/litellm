@@ -285,7 +285,8 @@ def _override_openai_response_model(
     We log mismatches as warnings (and then restamp to the client-requested value) so these
     paths stay observable for maintainers/operators without breaking client compatibility.
 
-    Errors are reserved for cases where the proxy cannot read/override the response model field.
+    Response types that do not expose a model field, such as rerank responses,
+    are skipped because there is no OpenAI-compatible model field to restamp.
 
     Exceptions:
     1. If a fallback occurred (indicated by x-litellm-attempted-fallbacks header),
@@ -333,8 +334,8 @@ def _override_openai_response_model(
         return
 
     if not hasattr(response_obj, "model"):
-        verbose_proxy_logger.error(
-            "%s: cannot override response model; missing `model` attribute. response_type=%s",
+        verbose_proxy_logger.debug(
+            "%s: response type has no model field to override. response_type=%s",
             log_context,
             type(response_obj),
         )
@@ -449,7 +450,8 @@ class ProxyBaseLLMRequestProcessing:
                 request=request,
                 target=target,
                 request_body=self.data,
-                kwargs={**self.data, "aawm_route_type": route_type},
+                kwargs=self.data,
+                route_type=route_type,
             )
         except Exception:
             verbose_proxy_logger.debug(

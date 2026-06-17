@@ -3,7 +3,8 @@
 
 import asyncio
 import contextvars
-from typing import Coroutine, Optional
+import re
+from typing import Any, Coroutine, Dict, Optional
 import atexit
 from typing_extensions import TypedDict
 
@@ -19,7 +20,7 @@ from litellm.constants import (
 )
 
 
-class LoggingTask(TypedDict):
+class LoggingTask(TypedDict, total=False):
     """
     A logging task with its associated context to ensure logging is executed in
     the original task's context.
@@ -27,6 +28,165 @@ class LoggingTask(TypedDict):
 
     coroutine: Coroutine
     context: contextvars.Context
+    metadata: Dict[str, str]
+
+
+_LOGGING_WORKER_METADATA_ALLOWLIST = frozenset(
+    {
+        "source",
+        "event_type",
+        "callback_name",
+        "callback_phase",
+        "trace_id",
+        "litellm_call_id",
+        "model",
+        "model_alias",
+        "provider",
+        "custom_llm_provider",
+        "route_family",
+        "worker_timeout_seconds",
+        "queue_depth",
+        "queue_maxsize",
+        "coroutine_name",
+        "worker_delivery_state",
+    }
+)
+_LOGGING_WORKER_METADATA_MAX_FIELD_CHARS = 180
+_LOGGING_WORKER_MODEL_ALIAS_METADATA_KEYS = (
+    "inbound_model_alias",
+    "requested_model_alias",
+    "model_alias_label",
+    "model_group",
+)
+_LOGGING_WORKER_ROUTE_FAMILY_METADATA_KEYS = (
+    "route_family",
+    "passthrough_route_family",
+    "openai_passthrough_route_family",
+)
+_SECRET_METADATA_RE = re.compile(
+    r"(?i)(?:bearer\s+\S+|sk-[A-Za-z0-9\-_]{8,}|api[_-]?key\s*[:=]\s*\S+)"
+)
+_ACTIVE_LOGGING_WORKER_METADATA: contextvars.ContextVar[
+    Optional[Dict[str, str]]
+] = contextvars.ContextVar("active_logging_worker_metadata", default=None)
+
+
+def _sanitize_logging_worker_metadata_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return None
+        return str(value)
+    if not isinstance(value, str):
+        return None
+
+    cleaned = "".join(
+        char if char.isprintable() and char not in "\r\n\t" else " "
+        for char in value.strip()
+    )
+    cleaned = " ".join(cleaned.split())
+    if not cleaned or _SECRET_METADATA_RE.search(cleaned):
+        return None
+    if len(cleaned) > _LOGGING_WORKER_METADATA_MAX_FIELD_CHARS:
+        cleaned = cleaned[: _LOGGING_WORKER_METADATA_MAX_FIELD_CHARS - 3] + "..."
+    return cleaned
+
+
+def sanitize_logging_worker_metadata(
+    metadata: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    if not isinstance(metadata, dict):
+        return {}
+
+    sanitized: Dict[str, str] = {}
+    for key, value in metadata.items():
+        if key not in _LOGGING_WORKER_METADATA_ALLOWLIST:
+            continue
+        cleaned_value = _sanitize_logging_worker_metadata_value(value)
+        if cleaned_value is not None:
+            sanitized[key] = cleaned_value
+    return sanitized
+
+
+def set_logging_worker_active_callback(
+    *,
+    callback_name: Optional[str],
+    callback_phase: Optional[str] = "async_success_handler",
+) -> None:
+    metadata = _ACTIVE_LOGGING_WORKER_METADATA.get()
+    if not isinstance(metadata, dict):
+        return
+
+    metadata.update(
+        sanitize_logging_worker_metadata(
+            {
+                "callback_name": callback_name,
+                "callback_phase": callback_phase,
+            }
+        )
+    )
+
+
+def _first_logging_worker_metadata_value(
+    metadata: Dict[str, Any], keys: tuple[str, ...]
+) -> Optional[str]:
+    for key in keys:
+        cleaned_value = _sanitize_logging_worker_metadata_value(metadata.get(key))
+        if cleaned_value is not None:
+            return cleaned_value
+    return None
+
+
+def build_async_success_logging_worker_metadata(logging_obj: Any) -> Dict[str, str]:
+    litellm_params = getattr(logging_obj, "litellm_params", {}) or {}
+    merged_metadata = {}
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata_value = litellm_params.get(metadata_key)
+        if isinstance(metadata_value, dict):
+            merged_metadata.update(metadata_value)
+    provider = getattr(logging_obj, "custom_llm_provider", None) or litellm_params.get(
+        "custom_llm_provider"
+    )
+
+    return sanitize_logging_worker_metadata(
+        {
+            "source": "logging_worker",
+            "event_type": "async_success",
+            "callback_name": "async_success_handler",
+            "callback_phase": "async_success_handler",
+            "trace_id": getattr(logging_obj, "litellm_trace_id", None),
+            "litellm_call_id": getattr(logging_obj, "litellm_call_id", None),
+            "model": getattr(logging_obj, "model", None),
+            "model_alias": _first_logging_worker_metadata_value(
+                merged_metadata, _LOGGING_WORKER_MODEL_ALIAS_METADATA_KEYS
+            ),
+            "provider": provider,
+            "custom_llm_provider": provider,
+            "route_family": _first_logging_worker_metadata_value(
+                merged_metadata, _LOGGING_WORKER_ROUTE_FAMILY_METADATA_KEYS
+            ),
+        }
+    )
+
+
+def _get_logging_coroutine_name(coroutine: Coroutine) -> Optional[str]:
+    function = getattr(coroutine, "cr_code", None)
+    if function is not None:
+        return _sanitize_logging_worker_metadata_value(
+            getattr(function, "co_name", None)
+        )
+
+    qualname = getattr(coroutine, "__qualname__", None) or getattr(
+        coroutine, "__name__", None
+    )
+    if isinstance(qualname, str) and ".<locals>." in qualname:
+        qualname = qualname.rsplit(".<locals>.", 1)[-1]
+    return _sanitize_logging_worker_metadata_value(qualname)
 
 
 class LoggingWorker:
@@ -54,6 +214,7 @@ class LoggingWorker:
         self._bound_loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_aggressive_clear_time: float = 0.0
         self._aggressive_clear_in_progress: bool = False
+        self._helper_tasks: set[asyncio.Task] = set()
 
         # Register cleanup handler to flush remaining events on exit
         atexit.register(self._flush_on_exit)
@@ -76,6 +237,7 @@ class LoggingWorker:
             self._sem = None
             self._worker_task = None
             self._running_tasks.clear()
+            self._helper_tasks.clear()
 
         if self._queue is None:
             self._queue = asyncio.Queue(maxsize=self.max_queue_size)
@@ -89,6 +251,80 @@ class LoggingWorker:
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker_loop())
 
+    def _build_worker_failure_log_extra(
+        self,
+        task: LoggingTask,
+        *,
+        worker_delivery_state: str,
+        worker_timeout_seconds: Optional[float] = None,
+    ) -> Dict[str, str]:
+        extra = sanitize_logging_worker_metadata(task.get("metadata"))
+        extra.update(
+            sanitize_logging_worker_metadata(
+                {
+                    "worker_timeout_seconds": worker_timeout_seconds
+                    if worker_timeout_seconds is not None
+                    else self.timeout,
+                    "queue_depth": self._queue.qsize() if self._queue is not None else None,
+                    "queue_maxsize": self.max_queue_size,
+                    "coroutine_name": _get_logging_coroutine_name(task["coroutine"]),
+                    "worker_delivery_state": worker_delivery_state,
+                }
+            )
+        )
+        return extra
+
+    def _log_worker_failure(
+        self,
+        task: LoggingTask,
+        *,
+        worker_delivery_state: str,
+        error: BaseException,
+        worker_timeout_seconds: Optional[float] = None,
+    ) -> None:
+        extra = self._build_worker_failure_log_extra(
+            task,
+            worker_delivery_state=worker_delivery_state,
+            worker_timeout_seconds=worker_timeout_seconds,
+        )
+        callback_phase = extra.get("callback_phase", "unknown")
+        coroutine_name = extra.get("coroutine_name", "unknown")
+        message = (
+            "LoggingWorker failed while delivering async logging coroutine "
+            f"(callback_phase={callback_phase}, coroutine_name={coroutine_name}, "
+            f"worker_delivery_state={worker_delivery_state})"
+        )
+        if isinstance(error, asyncio.TimeoutError):
+            timeout_seconds = extra.get("worker_timeout_seconds", str(self.timeout))
+            message = (
+                "LoggingWorker timed out while delivering async logging coroutine "
+                f"(callback_phase={callback_phase}, coroutine_name={coroutine_name}, "
+                f"worker_timeout_seconds={timeout_seconds}, "
+                f"worker_delivery_state={worker_delivery_state})"
+            )
+            verbose_logger.error(message, exc_info=error, extra=extra)
+            return
+
+        verbose_logger.error(message, exc_info=error, extra=extra)
+
+    @staticmethod
+    def _close_task_coroutine(task: LoggingTask) -> None:
+        coroutine = task.get("coroutine")
+        if hasattr(coroutine, "close"):
+            coroutine.close()
+
+    def _close_queued_tasks(self) -> None:
+        if self._queue is None:
+            return
+
+        while True:
+            try:
+                task = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._close_task_coroutine(task)
+            self._queue.task_done()
+
     async def _process_log_task(self, task: LoggingTask, sem: asyncio.Semaphore):
         """Runs the logging task and handles cleanup. Releases semaphore when done."""
         try:
@@ -99,8 +335,19 @@ class LoggingWorker:
                         task["context"].run(asyncio.create_task, task["coroutine"]),
                         timeout=self.timeout,
                     )
+                except asyncio.TimeoutError as e:
+                    self._log_worker_failure(
+                        task,
+                        worker_delivery_state="timed_out",
+                        error=e,
+                        worker_timeout_seconds=self.timeout,
+                    )
                 except Exception as e:
-                    verbose_logger.exception(f"LoggingWorker error: {e}")
+                    self._log_worker_failure(
+                        task,
+                        worker_delivery_state="failed",
+                        error=e,
+                    )
                 finally:
                     self._queue.task_done()
         finally:
@@ -135,7 +382,11 @@ class LoggingWorker:
             # Attempt to clear remaining items to prevent "never awaited" warnings
             await self.clear_queue()
 
-    def enqueue(self, coroutine: Coroutine) -> None:
+    def enqueue(
+        self,
+        coroutine: Coroutine,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         Add a coroutine to the logging queue.
         Hot path: never blocks, aggressively clears queue if full.
@@ -144,7 +395,14 @@ class LoggingWorker:
             return
 
         # Capture the current context when enqueueing
-        task = LoggingTask(coroutine=coroutine, context=contextvars.copy_context())
+        task_metadata = sanitize_logging_worker_metadata(metadata)
+        task_context = contextvars.copy_context()
+        task_context.run(_ACTIVE_LOGGING_WORKER_METADATA.set, task_metadata)
+        task = LoggingTask(
+            coroutine=coroutine,
+            context=task_context,
+            metadata=task_metadata,
+        )
 
         try:
             self._queue.put_nowait(task)
@@ -194,10 +452,15 @@ class LoggingWorker:
         if self._should_start_aggressive_clear():
             self._mark_aggressive_clear_started()
             # Schedule clearing as async task so enqueue returns immediately (non-blocking)
-            asyncio.create_task(self._aggressively_clear_queue_async(task))
+            self._schedule_helper_task(self._aggressively_clear_queue_async(task))
         else:
             # Cooldown active or clear in progress, schedule a delayed retry
             self._schedule_delayed_enqueue_retry(task)
+
+    def _schedule_helper_task(self, coroutine: Coroutine) -> None:
+        helper_task = asyncio.create_task(coroutine)
+        self._helper_tasks.add(helper_task)
+        helper_task.add_done_callback(self._helper_tasks.discard)
 
     def _calculate_retry_delay(self) -> float:
         """
@@ -234,9 +497,10 @@ class LoggingWorker:
             delay = self._calculate_retry_delay()
 
             # Schedule the retry as a background task
-            asyncio.create_task(self._retry_enqueue_task(task, delay))
+            self._schedule_helper_task(self._retry_enqueue_task(task, delay))
         except RuntimeError:
             # No event loop, drop the task as we can't schedule a retry
+            self._close_task_coroutine(task)
             pass
 
     async def _retry_enqueue_task(self, task: LoggingTask, delay: float) -> None:
@@ -244,10 +508,15 @@ class LoggingWorker:
         Retry enqueueing the task after delay, preserving original context.
         This is called as a background task from _schedule_delayed_enqueue_retry.
         """
-        await asyncio.sleep(delay)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            self._close_task_coroutine(task)
+            raise
 
         # Try to enqueue the task directly, preserving its original context
         if self._queue is None:
+            self._close_task_coroutine(task)
             return
 
         try:
@@ -292,6 +561,7 @@ class LoggingWorker:
         This is called when the queue is full to prevent dropping logs.
         Fully async and non-blocking - runs in background task.
         """
+        extracted_tasks: list[LoggingTask] = []
         try:
             if self._queue is None:
                 return
@@ -305,6 +575,12 @@ class LoggingWorker:
             # Process extracted tasks directly
             if extracted_tasks:
                 await self._process_extracted_tasks(extracted_tasks)
+        except asyncio.CancelledError:
+            if new_task is not None:
+                self._close_task_coroutine(new_task)
+            for task in extracted_tasks:
+                self._close_task_coroutine(task)
+            raise
         except Exception as e:
             verbose_logger.exception(
                 f"LoggingWorker error during aggressive clear: {e}"
@@ -340,20 +616,29 @@ class LoggingWorker:
         # Process all tasks concurrently for maximum speed
         await asyncio.gather(*[self._process_single_task(task) for task in tasks])
 
-    def ensure_initialized_and_enqueue(self, async_coroutine: Coroutine):
+    def ensure_initialized_and_enqueue(
+        self,
+        async_coroutine: Coroutine,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         """
         Ensure the logging worker is initialized and enqueue the coroutine.
         """
         self.start()
-        self.enqueue(async_coroutine)
+        self.enqueue(async_coroutine, metadata=metadata)
 
     async def stop(self) -> None:
         """Stop the logging worker and clean up resources."""
-        if self._worker_task is None and not self._running_tasks:
+        if (
+            self._worker_task is None
+            and not self._running_tasks
+            and not self._helper_tasks
+        ):
             # No worker launched and no in-flight tasks to drain.
             return
 
         tasks_to_cancel: list[asyncio.Task] = list(self._running_tasks)
+        tasks_to_cancel.extend(self._helper_tasks)
         if self._worker_task:
             # Include the main worker loop so it stops fetching work.
             tasks_to_cancel.append(self._worker_task)
@@ -364,10 +649,12 @@ class LoggingWorker:
 
         # Wait for cancellation to settle; ignore errors raised during shutdown.
         await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        self._close_queued_tasks()
 
         self._worker_task = None
         # Drop references to completed tasks so we can restart cleanly.
         self._running_tasks.clear()
+        self._helper_tasks.clear()
 
     async def flush(self) -> None:
         """Flush the logging queue."""
