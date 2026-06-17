@@ -86,31 +86,40 @@ one.
 
 `session_history` rows are normally written directly to
 `aawm_tristore.public.session_history`. If a batch flush keeps failing after the
-configured retry budget, LiteLLM writes the exact batch payload to a local JSON
+configured retry budget, LiteLLM writes the exact batch payload to a local JSONL
 spool for later replay instead of logging full tracebacks indefinitely.
 
 The default spool directory is `/mnt/e/litellm/session_history`; override it with
 `AAWM_SESSION_HISTORY_SPOOL_DIR` when a deployment needs a different local
-volume. The directory must be a writable host bind mount, not only an
-in-container path, or outage records can disappear when the container is
-recreated. `litellm-dev` maps the default path to repo-local ignored
-`.analysis/session_history` so local outage datasets stay available without
-being committed. Failed flushes retry every
-`AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS` seconds, and
-`AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES` controls how many retry attempts
-happen before the batch is atomically written to the spool.
+volume. In dev compose, mount the host durable fallback path and set
+`AAWM_SESSION_HISTORY_SPOOL_DIR=/mnt/e/litellm/session_history` explicitly so
+outage replay survives container restarts. Production deployments must make the
+same path host-backed in their owning compose/infrastructure repo; otherwise the
+fallback file is only container-local and can be lost on recreate. Failed
+flushes retry every `AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS` seconds,
+and `AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES` controls how many retry
+attempts happen before the batch is atomically written to the spool.
 
-Spool filenames include a UTC timestamp and a trace/session/call identifier so
-operators can find the affected dataset without printing prompt, tool, or
-metadata payloads into logs. Writes use a same-directory temporary file followed
-by replacement, so completed `.json` files are replayable and partial writes do
-not look like ready datasets.
+Each `.jsonl` artifact contains one JSON object per line. The first line is a
+metadata/header record with `type=metadata`, `format_version`, `spooled_at`,
+`reason`, `retry_count`, and `record_count`. Each following line is a
+`type=record` object containing one sanitized `session_history` record. Legacy
+`.json` spool files from earlier releases are still loaded and drained when
+present. Spool filenames include a UTC timestamp and a trace/session/call
+identifier so operators can find the affected dataset without printing prompt,
+tool, or metadata payloads into logs. Writes use a same-directory temporary file
+followed by replacement, so completed `.jsonl` files are replayable and partial
+writes do not look like ready datasets.
 
 The in-process drainer checks for existing spool files when the callback starts
 and after successful writes, so records left behind by a prior outage can replay
-without waiting for a new failed batch. Replay is at-least-once. The database
-insert path remains idempotent, so recovery tools and the in-process drainer
-should assume duplicates are possible after a crash or partial outage. The spool
+without waiting for a new failed batch. If the spool directory exists but
+cannot be listed temporarily, startup and replay summaries report
+`spool_pending=unknown` instead of `spool_pending=0`; future drainer triggers
+retry the listing rather than treating the backlog as empty. Missing directories
+still report `spool_pending=0`. Replay is at-least-once. The database insert
+path remains idempotent, so recovery tools and the in-process drainer should
+assume duplicates are possible after a crash or partial outage. The spool
 contains local sensitive session metadata and must stay out of git, shared logs,
 and external artifacts unless it has been reviewed and sanitized.
 
