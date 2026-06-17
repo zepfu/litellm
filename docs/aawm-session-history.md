@@ -494,6 +494,17 @@ LiteLLM preserves explicit client values and supplies `true` when the field is
 omitted, so the CLI privacy probe does not fail open or produce recurring 422
 noise.
 
+Grok session mutation side channels such as `/grok/v1/sessions/register` and
+`/grok/v1/sessions/{id}/replicas/update` attach redacted request-shape metadata
+to passthrough logging/session metadata. The fields include
+`grok_side_channel_endpoint_type`, `grok_side_channel_endpoint_path_template`,
+content type, canonical/raw body byte length, body SHA-256, digest source, JSON
+container type, top-level JSON key/type names, and array length when applicable.
+They deliberately omit raw body values, auth headers, credential payloads, and
+concrete session ids from path templates. Use these fields to capture real
+native side-channel payload shape for refresh-continuity debugging without
+persisting the payload itself.
+
 Sanitization metadata proves request adaptation only. It does not prove tool
 execution, model tool-use quality, or upstream success by itself; combine it
 with status, token, cost, and error fields when building reports.
