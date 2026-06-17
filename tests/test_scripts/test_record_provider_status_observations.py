@@ -1,3 +1,4 @@
+import json
 from argparse import Namespace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,7 @@ class _FakeProviderStatusCursor:
     def __init__(self) -> None:
         self.execute_calls = []
         self.executemany_calls = []
+        self.rowcount = 1
 
     def __enter__(self):
         return self
@@ -314,6 +316,52 @@ def test_insert_observations_does_not_execute_provider_status_ddl(monkeypatch) -
     assert fake_conn.rollback_count == 0
 
 
+def _grok_billing_poll_config(**overrides):
+    from dataclasses import replace
+
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+        grok_oidc_refresh_enabled=False,
+        grok_oidc_auth_file="/home/zepfu/.grok/auth.json",
+        grok_billing_poll_enabled=True,
+        grok_billing_poll_interval_seconds=3600.0,
+        grok_billing_poll_http_timeout_seconds=30.0,
+        grok_billing_url="https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        grok_billing_client_version="0.2.55",
+        grok_billing_client_identifier="grok-cli",
+        grok_billing_xai_token_auth="xai-grok-cli",
+        grok_billing_model="grok-build",
+    )
+    if overrides:
+        config = replace(config, **overrides)
+    return config
+
+
+def _grok_billing_payload() -> dict:
+    return {
+        "config": {
+            "creditUsagePercent": 14.539333,
+            "productUsage": [
+                {"name": "GrokBuild", "usagePercent": 12.507334},
+                {"name": "Api", "usagePercent": 2.032},
+            ],
+            "billingPeriodStart": "2026-06-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+        }
+    }
+
+
 def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     for env_name in (
         "AAWM_LITELLM_ENVIRONMENT",
@@ -330,6 +378,17 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER",
         "AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS",
         "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS",
+        "AAWM_GROK_BILLING_POLL_ENABLED",
+        "AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS",
+        "AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS",
+        "AAWM_GROK_BILLING_URL",
+        "AAWM_GROK_BILLING_CLIENT_VERSION",
+        "AAWM_GROK_BILLING_CLIENT_IDENTIFIER",
+        "AAWM_GROK_BILLING_XAI_TOKEN_AUTH",
+        "AAWM_GROK_BILLING_MODEL",
+        "LITELLM_XAI_GROK_CLIENT_VERSION",
+        "LITELLM_XAI_GROK_CLIENT_IDENTIFIER",
+        "LITELLM_XAI_GROK_XAI_TOKEN_AUTH",
     ):
         monkeypatch.delenv(env_name, raising=False)
 
@@ -348,6 +407,17 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.db_statement_timeout_ms == 5000
     assert config.schema_dsn is None
     assert config.require_pgbouncer is False
+    assert config.grok_billing_poll_enabled is False
+    assert config.grok_billing_poll_interval_seconds == 3600.0
+    assert config.grok_billing_poll_http_timeout_seconds == 30.0
+    assert (
+        config.grok_billing_url
+        == "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+    )
+    assert config.grok_billing_client_version == "0.2.55"
+    assert config.grok_billing_client_identifier == "grok-cli"
+    assert config.grok_billing_xai_token_auth == "xai-grok-cli"
+    assert config.grok_billing_model == "grok-build"
 
 
 def test_loop_config_uses_explicit_direct_schema_dsn(monkeypatch) -> None:
@@ -417,6 +487,30 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
+    assert (
+        "AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=${AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS:-3600}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS:-30}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_CLIENT_VERSION=${AAWM_GROK_BILLING_CLIENT_VERSION:-0.2.55}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_CLIENT_IDENTIFIER=${AAWM_GROK_BILLING_CLIENT_IDENTIFIER:-grok-cli}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_XAI_TOKEN_AUTH=${AAWM_GROK_BILLING_XAI_TOKEN_AUTH:-xai-grok-cli}"
+        in compose_text
+    )
 
 
 def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
@@ -888,3 +982,220 @@ def test_validate_runtime_guardrails_accepts_pgbouncer_when_required() -> None:
     )
 
     loop.validate_runtime_guardrails(config)
+
+
+def test_loop_config_reads_grok_billing_poll_env_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("AAWM_GROK_BILLING_POLL_ENABLED", "1")
+    monkeypatch.setenv("AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS", "7200")
+    monkeypatch.setenv("AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv(
+        "AAWM_GROK_BILLING_URL",
+        "https://cli-chat-proxy.grok.com/v1/billing?format=credits&lane=dev",
+    )
+    monkeypatch.setenv("AAWM_GROK_BILLING_CLIENT_VERSION", "0.2.60")
+    monkeypatch.setenv("AAWM_GROK_BILLING_CLIENT_IDENTIFIER", "grok-cli-dev")
+    monkeypatch.setenv("AAWM_GROK_BILLING_XAI_TOKEN_AUTH", "xai-grok-cli-dev")
+    monkeypatch.setenv("AAWM_GROK_BILLING_MODEL", "grok-composer-2.5-fast")
+
+    config = loop.parse_config([])
+
+    assert config.grok_billing_poll_enabled is True
+    assert config.grok_billing_poll_interval_seconds == 7200.0
+    assert config.grok_billing_poll_http_timeout_seconds == 45.0
+    assert (
+        config.grok_billing_url
+        == "https://cli-chat-proxy.grok.com/v1/billing?format=credits&lane=dev"
+    )
+    assert config.grok_billing_client_version == "0.2.60"
+    assert config.grok_billing_client_identifier == "grok-cli-dev"
+    assert config.grok_billing_xai_token_auth == "xai-grok-cli-dev"
+    assert config.grok_billing_model == "grok-composer-2.5-fast"
+
+
+def test_run_due_sidecar_tasks_skips_when_grok_billing_poll_disabled(monkeypatch) -> None:
+    config = _grok_billing_poll_config(grok_billing_poll_enabled=False)
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_grok_billing_payload",
+        lambda *_args, **_kwargs: pytest.fail("Grok billing poll should not run"),
+    )
+
+    assert loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    ) == []
+
+
+def test_run_due_sidecar_tasks_throttles_grok_billing_poll(monkeypatch) -> None:
+    config = _grok_billing_poll_config(apply=False)
+    calls = {"fetch": 0, "persist": 0}
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_grok_billing_payload",
+        lambda *_args, **_kwargs: (
+            calls.__setitem__("fetch", calls["fetch"] + 1)
+            or {"status_code": 200, "payload": _grok_billing_payload()}
+        ),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_grok_billing_observations",
+        lambda *_args, **_kwargs: (
+            calls.__setitem__("persist", calls["persist"] + 1) or 1
+        ),
+    )
+
+    state = loop.SidecarTaskState()
+    first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
+    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
+
+    assert calls == {"fetch": 2, "persist": 0}
+    assert first_events[0]["event"] == "grok_billing_poll"
+    assert first_events[0]["status_code"] == 200
+    assert first_events[0]["observation_count"] == 1
+    assert first_events[0]["inserted_count"] == 0
+    assert first_events[0]["persisted"] is False
+    assert second_events == []
+    assert third_events[0]["event"] == "grok_billing_poll"
+
+
+def test_run_due_sidecar_tasks_persists_grok_billing_snapshot(monkeypatch) -> None:
+    config = _grok_billing_poll_config()
+    captured = {}
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_grok_billing_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": _grok_billing_payload(),
+        },
+    )
+
+    def fake_persist(cfg, *, observed_at, response_body):
+        captured["config"] = cfg
+        captured["observed_at"] = observed_at
+        captured["response_body"] = response_body
+        return 1, 1
+
+    monkeypatch.setattr(loop, "_persist_grok_billing_observations", fake_persist)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    assert captured["config"] is config
+    assert captured["response_body"] == _grok_billing_payload()
+    assert events[0]["event"] == "grok_billing_poll"
+    assert events[0]["persisted"] is True
+    assert events[0]["observation_count"] == 1
+    assert events[0]["inserted_count"] == 1
+    assert events[0]["status_code"] == 200
+    assert "access-token" not in json.dumps(events)
+
+
+def test_run_due_sidecar_tasks_redacts_grok_billing_poll_failure(monkeypatch) -> None:
+    config = _grok_billing_poll_config()
+
+    def fake_fetch(_config):
+        raise ValueError(
+            "Grok billing poll failed with Authorization=Bearer secret-token "
+            "and client_secret=super-secret and x_xai_token_auth=secret-xai-auth"
+        )
+
+    monkeypatch.setattr(loop, "_fetch_grok_billing_payload", fake_fetch)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    assert events[0]["event"] == "grok_billing_poll"
+    assert events[0]["persisted"] is False
+    assert events[0]["error_class"] == "ValueError"
+    assert "REDACTED" in events[0]["error_message"]
+    assert "secret-token" not in json.dumps(events)
+    assert "super-secret" not in json.dumps(events)
+    assert "secret-xai-auth" not in json.dumps(events)
+
+
+def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
+    config = _grok_billing_poll_config(grok_billing_model="grok-composer-2.5-fast")
+    observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
+
+    payload = loop._build_grok_billing_rate_limit_payload(
+        config,
+        observed_at=observed_at,
+        response_body=_grok_billing_payload(),
+    )
+
+    assert payload[0] == observed_at
+    assert payload[1] == "grok-build"
+    assert payload[2] == "0.2.55"
+    assert payload[3] is None
+    assert payload[4] == "xai"
+    assert payload[5] == "grok-composer-2.5-fast"
+    assert payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert payload[7] == "monthly"
+    assert payload[8] == "credits"
+    assert payload[9] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert payload[10] == pytest.approx(85.460667)
+    assert payload[11] is None
+    assert payload[12] is None
+    assert payload[13] is None
+    assert payload[14] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert payload[15] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    raw_provider_fields = json.loads(payload[16])
+    assert raw_provider_fields["creditUsagePercent"] == pytest.approx(14.539333)
+    assert raw_provider_fields["productUsage"][0]["name"] == "GrokBuild"
+    assert raw_provider_fields["quota_unit"] == "grok_billing_credit_usage_percent"
+    evidence = json.loads(payload[17])
+    assert evidence["signals"] == [
+        "grok_billing_payload",
+        "grok_billing_percentage_only",
+    ]
+    assert payload[18] == "grok_billing"
+    assert payload[19] is None
+    assert payload[20] is None
+    assert payload[21] == "grok-billing-poll-20260616200400"
+
+
+def test_persist_grok_billing_observations_uses_sidecar_db_path(monkeypatch) -> None:
+    config = _grok_billing_poll_config(
+        dsn="postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
+        db_lock_timeout_ms=123,
+        db_statement_timeout_ms=456,
+    )
+    observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
+    fake_conn = _FakeProviderStatusConnection()
+    monkeypatch.setattr(loop.probes.psycopg, "connect", lambda _dsn: fake_conn)
+
+    observation_count, inserted_count = loop._persist_grok_billing_observations(
+        config,
+        observed_at=observed_at,
+        response_body=_grok_billing_payload(),
+    )
+
+    assert observation_count == 1
+    assert inserted_count == 1
+    assert fake_conn.cursor_instance.execute_calls[:3] == [
+        (
+            "SELECT set_config('application_name', %s, false)",
+            ("aawm-provider-status-observations-grok-billing",),
+        ),
+        ("SELECT set_config('lock_timeout', %s, true)", ("123ms",)),
+        ("SELECT set_config('statement_timeout', %s, true)", ("456ms",)),
+    ]
+    insert_sql, insert_payload = fake_conn.cursor_instance.execute_calls[3]
+    assert insert_sql == loop.GROK_BILLING_RATE_LIMIT_INSERT_SQL
+    assert insert_payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert insert_payload[11] is None
+    assert insert_payload[12] is None
+    assert insert_payload[13] is None
