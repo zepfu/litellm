@@ -434,6 +434,14 @@ session replay material, terminal output, tool calls/results, local config, and
 compressed session state, so they must not enter pass-through logs, Langfuse,
 session history, or upstream xAI storage.
 
+Native Grok coding-data-retention probes are also local-only. LiteLLM
+authenticates `/grok/*/privacy/coding-data-retention` requests with the normal
+LiteLLM key path, clears any parsed request body before auth/logging hooks, does
+not forward the probe to `cli-chat-proxy.grok.com`, and returns a benign local
+success response. This avoids upstream 422 noise for empty probes while keeping
+privacy preference payloads out of logs, Langfuse, session history, and upstream
+storage unless a future route explicitly implements a validated translation.
+
 Grok session mutation side channels such as `/grok/v1/sessions/register` and
 `/grok/v1/sessions/{id}/replicas/update` attach redacted request-shape metadata
 to passthrough logging/session metadata. The fields include
