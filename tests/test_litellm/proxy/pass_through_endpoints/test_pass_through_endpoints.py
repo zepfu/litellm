@@ -3459,6 +3459,119 @@ class TestPassThroughTerminalFailureLogging:
         assert not (tmp_path / "dev-error.jsonl").exists()
 
     @pytest.mark.asyncio
+    async def test_pass_through_request_exhausted_chatgpt_codex_503_logs_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = (
+            "http://localhost:4001/openai_passthrough/codex/responses"
+        )
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        upstream_detail = (
+            b"upstream connect error or disconnect/reset before headers. "
+            b"reset reason: connection termination"
+        )
+        upstream_response = httpx.Response(
+            status_code=503,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "gpt-5.4"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(side_effect=fake_sleep),
+            ), patch.object(
+                verbose_proxy_logger,
+                "exception",
+            ) as mock_exception:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "gpt-5.4"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        custom_llm_provider="openai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "503"
+                assert handler.await_count == 6
+                assert sleep_calls == [5.0, 15.0, 30.0, 60.0, 120.0]
+                mock_exception.assert_not_called()
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "exhausted hidden retries for upstream failure" in item["message"]
+        )
+
+        assert payload["context"]["status_code"] == 503
+        assert payload["context"]["upstream_url"] == target_url
+        assert payload["context"]["failure_kind"] == (
+            "expected_upstream_capacity_or_internal"
+        )
+        assert payload["context"]["hidden_retry_final_outcome"] == (
+            "failed_after_retry"
+        )
+        assert payload["context"]["hidden_retry_count"] == 6
+        assert "final_outcome=failed_after_retry" in payload["message"]
+        assert "retry_count=6" in payload["message"]
+        assert "connection termination" in payload["message"]
+        assert payload.get("traceback") in (None, "")
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_exhausted_dns_failure_uses_503_without_traceback(
         self,
         monkeypatch,
