@@ -167,6 +167,12 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "callback_phase",
     "handler_branch",
     "langfuse_failure_class",
+    "event_type",
+    "worker_timeout_seconds",
+    "queue_depth",
+    "queue_maxsize",
+    "coroutine_name",
+    "worker_delivery_state",
 )
 
 

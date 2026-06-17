@@ -326,7 +326,14 @@ def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
         "litellm_call_id": "call-REDACTED",
         "callback_name": None,
         "callback_phase": None,
+        "handler_branch": None,
         "langfuse_failure_class": None,
+        "event_type": None,
+        "worker_timeout_seconds": None,
+        "queue_depth": None,
+        "queue_maxsize": None,
+        "coroutine_name": None,
+        "worker_delivery_state": None,
     }
     assert SECRET not in json.dumps(payload)
 
