@@ -134,6 +134,20 @@ context includes `failure_kind`, `hidden_retry_final_outcome`,
 `hidden_retry_failure_classification`, and `hidden_retry_count` so operators can
 distinguish retry exhaustion from unexpected LiteLLM exceptions.
 
+Grok session side-channel failures keep their 401/404 responses visible instead
+of retrying or suppressing them. Their runtime error JSONL context copies only
+safe scalar side-channel descriptors from passthrough metadata, such as
+`grok_side_channel`, `grok_side_channel_endpoint_type`,
+`grok_side_channel_endpoint_path_template`,
+`grok_side_channel_request_content_type`,
+`grok_side_channel_request_body_byte_length`,
+`grok_side_channel_request_body_digest_source`,
+`grok_side_channel_request_json_container_type`, and
+`grok_side_channel_request_array_length`. It deliberately omits raw body values,
+body digests, top-level key maps, auth headers, credential payloads, and concrete
+session ids so stale-session and no-auth-context errors remain diagnosable
+without leaking client state.
+
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact
 support: https://langfuse.com/support.`), LiteLLM keeps the original message and
