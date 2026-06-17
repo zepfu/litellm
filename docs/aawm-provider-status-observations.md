@@ -58,7 +58,33 @@ status fields such as `attempted`, `refreshed`, `skipped`, `auth_file`,
 contain access tokens, refresh tokens, id tokens, client secrets, raw auth
 headers, or the full credential payload.
 
-The hourly Grok billing poll should run in this same sidecar context so quota
-snapshots use the sidecar-maintained OIDC credential. Billing extraction and
-quota persistence remain owned by the Grok billing work item; the credential
-writer boundary is shared.
+## Grok Billing Poll Task
+
+The same sidecar can also run an explicit hourly Grok billing poll. This is
+telemetry-only and separate from the five-minute provider front-door probes and
+the Grok OIDC refresh task. The poll reads the current OIDC access token from
+`AAWM_GROK_OIDC_AUTH_FILE`, calls
+`https://cli-chat-proxy.grok.com/v1/billing?format=credits` with Grok CLI-style
+headers, and persists the returned billing snapshot as a sanitized
+`rate_limit_observations` row using the same stored field shape and dedupe guard
+as the LiteLLM callback path.
+
+Relevant environment variables:
+
+- `AAWM_GROK_BILLING_POLL_ENABLED`: enables the scheduled billing poll.
+- `AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS`: minimum seconds between billing
+  poll attempts.
+- `AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS`: billing endpoint timeout.
+- `AAWM_GROK_BILLING_URL`: billing endpoint URL.
+- `AAWM_GROK_BILLING_CLIENT_VERSION`: Grok CLI client version header.
+- `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
+- `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
+- `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
+
+Each due attempt emits a separate `grok_billing_poll` JSON line with sanitized
+status fields such as `attempted`, `persisted`, `skipped`, `auth_file`,
+`billing_url`, `client_version`, `model`, `status_code`, `observation_count`,
+`inserted_count`, `error_class`, and `error_message`. The event must not contain
+access tokens, refresh tokens, id tokens, client secrets, raw auth headers, or
+the full billing credential payload. Billing poll failures are logged and do not
+raise out of the sidecar loop.
