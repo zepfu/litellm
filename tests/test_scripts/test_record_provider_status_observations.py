@@ -1316,11 +1316,17 @@ def test_run_due_sidecar_tasks_persists_grok_billing_snapshot(monkeypatch) -> No
             "payload": _grok_billing_payload(),
         },
     )
+    monkeypatch.setattr(
+        loop,
+        "_load_grok_billing_auth_context",
+        lambda _path: _grok_billing_auth_context(),
+    )
 
-    def fake_persist(cfg, *, observed_at, response_body):
+    def fake_persist(cfg, *, observed_at, response_body, identity_headers=None):
         captured["config"] = cfg
         captured["observed_at"] = observed_at
         captured["response_body"] = response_body
+        captured["identity_headers"] = identity_headers
         return 1, 1
 
     monkeypatch.setattr(loop, "_persist_grok_billing_observations", fake_persist)
@@ -1333,6 +1339,9 @@ def test_run_due_sidecar_tasks_persists_grok_billing_snapshot(monkeypatch) -> No
 
     assert captured["config"] is config
     assert captured["response_body"] == _grok_billing_payload()
+    assert captured["identity_headers"] == _grok_billing_auth_context()[
+        "identity_headers"
+    ]
     assert events[0]["event"] == "grok_billing_poll"
     assert events[0]["persisted"] is True
     assert events[0]["observation_count"] == 1
@@ -1434,11 +1443,13 @@ def test_run_due_sidecar_tasks_grok_billing_event_does_not_emit_identity_fields(
 def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     config = _grok_billing_poll_config(grok_billing_model="grok-composer-2.5-fast")
     observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
+    identity_headers = _grok_billing_auth_context()["identity_headers"]
 
     payload = loop._build_grok_billing_rate_limit_payload(
         config,
         observed_at=observed_at,
         response_body=_grok_billing_payload(),
+        identity_headers=identity_headers,
     )
 
     assert payload[0] == observed_at
@@ -1465,7 +1476,23 @@ def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     assert evidence["signals"] == [
         "grok_billing_payload",
         "grok_billing_percentage_only",
+        "grok_billing_sidecar_request_contract",
     ]
+    assert len(evidence["request_contract_fingerprint"]) == 64
+    assert evidence["request_contract_source"] == "grok_billing_sidecar_poll"
+    assert evidence["request_contract_method"] == "GET"
+    assert evidence["request_contract_target_host"] == "cli-chat-proxy.grok.com"
+    assert evidence["request_contract_target_path"] == "/v1/billing"
+    assert evidence["request_contract_http_client"] == "urllib"
+    assert "x-userid" in evidence["request_contract_header_names"]
+    assert "authorization" in evidence["request_contract_header_names"]
+    assert evidence["request_contract_x_xai_token_auth_configured"] is True
+    evidence_json = json.dumps(evidence)
+    assert "user_123" not in evidence_json
+    assert "team_123" not in evidence_json
+    assert "user@example.com" not in evidence_json
+    assert "access-token-secret" not in evidence_json
+    assert "xai-grok-cli" not in evidence_json
     assert payload[18] == "grok_billing"
     assert payload[19] is None
     assert payload[20] is None
@@ -1500,10 +1527,15 @@ def test_persist_grok_billing_observations_uses_sidecar_db_path(monkeypatch) -> 
     ]
     insert_sql, insert_payload = fake_conn.cursor_instance.execute_calls[3]
     assert insert_sql == loop.GROK_BILLING_RATE_LIMIT_INSERT_SQL
+    assert "latest.evidence" in insert_sql
+    assert "candidate.evidence" in insert_sql
     assert insert_payload[6] == "xai_grok_build_monthly_credits:credits"
     assert insert_payload[11] is None
     assert insert_payload[12] is None
     assert insert_payload[13] is None
+    evidence = json.loads(insert_payload[17])
+    assert evidence["request_contract_source"] == "grok_billing_sidecar_poll"
+    assert len(evidence["request_contract_fingerprint"]) == 64
 
 
 def test_fetch_grok_billing_payload_retries_cancelled_timeout_then_succeeds(
