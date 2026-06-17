@@ -24,12 +24,22 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     probes = importlib.import_module("record_provider_status_observations")
 
+try:
+    from scripts import grok_oidc_refresh
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    grok_oidc_refresh = importlib.import_module("grok_oidc_refresh")
+
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
 PROVIDER_FAILURE_SUMMARY_LIMIT = 8
 PROVIDER_FAILURE_FIELD_LIMIT = 160
 PROVIDER_FAILURE_MESSAGE_LIMIT = 240
+DEFAULT_GROK_OIDC_AUTH_FILE = "/home/zepfu/.grok/auth.json"
+DEFAULT_GROK_OIDC_LOCK_FILE = "/home/zepfu/.grok/auth.json.lock"
+DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS = 30.0
 PROVIDER_FAILURE_SECRET_RE = re.compile(
     "|".join(
         (
@@ -63,6 +73,22 @@ class ProviderStatusLoopConfig:
     db_statement_timeout_ms: int
     schema_dsn: Optional[str] = None
     require_pgbouncer: bool = False
+    grok_oidc_refresh_enabled: bool = False
+    grok_oidc_auth_file: str = DEFAULT_GROK_OIDC_AUTH_FILE
+    grok_oidc_lock_file: str = DEFAULT_GROK_OIDC_LOCK_FILE
+    grok_oidc_refresh_interval_seconds: float = (
+        DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS
+    )
+    grok_oidc_refresh_buffer_seconds: int = (
+        grok_oidc_refresh.DEFAULT_GROK_OIDC_REFRESH_BUFFER_SECONDS
+    )
+    grok_oidc_force_refresh: bool = False
+    grok_oidc_http_timeout_seconds: float = DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS
+
+
+@dataclass
+class SidecarTaskState:
+    grok_oidc_last_attempt_monotonic: Optional[float] = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -196,6 +222,84 @@ def _build_parser() -> argparse.ArgumentParser:
             "PgBouncer transaction pool."
         ),
     )
+    grok_group = parser.add_mutually_exclusive_group()
+    grok_group.add_argument(
+        "--grok-oidc-refresh-enabled",
+        dest="grok_oidc_refresh_enabled",
+        action="store_true",
+        default=_env_bool("AAWM_GROK_OIDC_REFRESH_ENABLED", False),
+        help=(
+            "Run the Grok OIDC auth-file refresh task from this sidecar loop. "
+            "Defaults to AAWM_GROK_OIDC_REFRESH_ENABLED or false."
+        ),
+    )
+    grok_group.add_argument(
+        "--no-grok-oidc-refresh",
+        dest="grok_oidc_refresh_enabled",
+        action="store_false",
+        help="Disable the Grok OIDC auth-file refresh task.",
+    )
+    parser.add_argument(
+        "--grok-oidc-auth-file",
+        default=os.getenv("AAWM_GROK_OIDC_AUTH_FILE", DEFAULT_GROK_OIDC_AUTH_FILE),
+        help=(
+            "Grok CLI auth JSON file maintained by this sidecar. Defaults to "
+            "AAWM_GROK_OIDC_AUTH_FILE or /home/zepfu/.grok/auth.json."
+        ),
+    )
+    parser.add_argument(
+        "--grok-oidc-lock-file",
+        default=os.getenv("AAWM_GROK_OIDC_LOCK_FILE", DEFAULT_GROK_OIDC_LOCK_FILE),
+        help=(
+            "Lock file for sidecar Grok OIDC refresh writes. Defaults to "
+            "AAWM_GROK_OIDC_LOCK_FILE or /home/zepfu/.grok/auth.json.lock."
+        ),
+    )
+    parser.add_argument(
+        "--grok-oidc-refresh-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS",
+            DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Grok OIDC refresh attempts. Defaults to "
+            "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--grok-oidc-refresh-buffer-seconds",
+        type=int,
+        default=_env_int(
+            "AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS",
+            grok_oidc_refresh.DEFAULT_GROK_OIDC_REFRESH_BUFFER_SECONDS,
+        ),
+        help=(
+            "Refresh buffer for non-forced Grok OIDC refreshes. Defaults to "
+            "AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS or 300."
+        ),
+    )
+    parser.add_argument(
+        "--grok-oidc-force-refresh",
+        action="store_true",
+        default=_env_bool("AAWM_GROK_OIDC_FORCE_REFRESH", False),
+        help=(
+            "Refresh the Grok OIDC credential on every scheduled attempt even "
+            "when the current access token is still valid."
+        ),
+    )
+    parser.add_argument(
+        "--grok-oidc-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Grok OIDC token endpoint calls. Defaults to "
+            "AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
     return parser
 
 
@@ -213,6 +317,12 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         raise SystemExit("--db-lock-timeout-ms must be greater than 0")
     if args.db_statement_timeout_ms <= 0:
         raise SystemExit("--db-statement-timeout-ms must be greater than 0")
+    if args.grok_oidc_refresh_interval_seconds <= 0:
+        raise SystemExit("--grok-oidc-refresh-interval-seconds must be greater than 0")
+    if args.grok_oidc_refresh_buffer_seconds < 0:
+        raise SystemExit("--grok-oidc-refresh-buffer-seconds must be non-negative")
+    if args.grok_oidc_http_timeout_seconds <= 0:
+        raise SystemExit("--grok-oidc-http-timeout-seconds must be greater than 0")
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -229,6 +339,13 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         db_statement_timeout_ms=args.db_statement_timeout_ms,
         schema_dsn=args.schema_dsn,
         require_pgbouncer=args.require_pgbouncer,
+        grok_oidc_refresh_enabled=args.grok_oidc_refresh_enabled,
+        grok_oidc_auth_file=args.grok_oidc_auth_file,
+        grok_oidc_lock_file=args.grok_oidc_lock_file,
+        grok_oidc_refresh_interval_seconds=args.grok_oidc_refresh_interval_seconds,
+        grok_oidc_refresh_buffer_seconds=args.grok_oidc_refresh_buffer_seconds,
+        grok_oidc_force_refresh=args.grok_oidc_force_refresh,
+        grok_oidc_http_timeout_seconds=args.grok_oidc_http_timeout_seconds,
     )
 
 
@@ -412,6 +529,53 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     return summary
 
 
+def run_due_sidecar_tasks(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: Optional[float] = None,
+) -> list[Dict[str, Any]]:
+    if not config.grok_oidc_refresh_enabled:
+        return []
+
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    last_attempt = state.grok_oidc_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now - last_attempt < config.grok_oidc_refresh_interval_seconds
+    ):
+        return []
+
+    state.grok_oidc_last_attempt_monotonic = now
+    try:
+        summary = grok_oidc_refresh.refresh_grok_oidc_auth_file(
+            config.grok_oidc_auth_file,
+            buffer_seconds=config.grok_oidc_refresh_buffer_seconds,
+            force=config.grok_oidc_force_refresh,
+            lock_file=config.grok_oidc_lock_file,
+            http_timeout_seconds=config.grok_oidc_http_timeout_seconds,
+        )
+    except Exception as exc:
+        summary = {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.grok_oidc_auth_file,
+            "scope": None,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+
+    return [
+        {
+            "event": "grok_oidc_refresh",
+            "observed_at": _utc_timestamp(),
+            "environment": config.environment,
+            **summary,
+        }
+    ]
+
+
 def _emit(payload: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, sort_keys=True))
     sys.stdout.write("\n")
@@ -463,6 +627,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if config.once:
                 return 1
 
+    sidecar_state = SidecarTaskState()
     while not stopping:
         cycle_started = time.monotonic()
         try:
@@ -475,6 +640,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "environment": config.environment,
                     "error_class": exc.__class__.__name__,
                     "error_message": str(exc),
+                    "traceback": traceback.format_exc(limit=5),
+                }
+            )
+            if config.once:
+                return 1
+        try:
+            for event in run_due_sidecar_tasks(config, sidecar_state):
+                _emit(event)
+        except Exception as exc:
+            _emit(
+                {
+                    "event": "provider_status_sidecar_task_error",
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "task": "grok_oidc_refresh",
+                    "error_class": exc.__class__.__name__,
+                    "error_message": _redacted_failure_message(str(exc)),
                     "traceback": traceback.format_exc(limit=5),
                 }
             )

@@ -30,3 +30,35 @@ resolved IP details, and credentials. If more failed rows exist than the
 summary cap, `failure_summaries_omitted_count` records how many failed rows were
 not included in the log payload. All-green cycles omit the summary fields so
 normal logs stay compact.
+
+## Grok OIDC Refresh Task
+
+The same sidecar can also own the scheduled Grok native OIDC credential refresh.
+This is separate from the five-minute provider front-door probes. In dev compose
+the sidecar mounts `/home/zepfu/.grok` writable and refreshes
+`/home/zepfu/.grok/auth.json` on a one-hour cadence. The LiteLLM container mounts
+that directory read-only and reads the credential directly for
+`xai/grok-composer-2.5-fast`, `xai/grok-build`, and `xai/grok-build-0.1`.
+
+Relevant environment variables:
+
+- `AAWM_GROK_OIDC_REFRESH_ENABLED`: enables the scheduled task.
+- `AAWM_GROK_OIDC_AUTH_FILE`: Grok CLI auth JSON path.
+- `AAWM_GROK_OIDC_LOCK_FILE`: file lock path used while writing the auth JSON.
+- `AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS`: minimum seconds between attempts.
+- `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS`: near-expiry window for non-forced
+  refreshes.
+- `AAWM_GROK_OIDC_FORCE_REFRESH`: when true, refreshes on every scheduled
+  attempt even if the current token still appears valid.
+- `AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS`: token endpoint timeout.
+
+Each due attempt emits a separate `grok_oidc_refresh` JSON line with sanitized
+status fields such as `attempted`, `refreshed`, `skipped`, `auth_file`,
+`scope`, `expires_at`, `error_class`, and `error_message`. The event must not
+contain access tokens, refresh tokens, id tokens, client secrets, raw auth
+headers, or the full credential payload.
+
+The hourly Grok billing poll should run in this same sidecar context so quota
+snapshots use the sidecar-maintained OIDC credential. Billing extraction and
+quota persistence remain owned by the Grok billing work item; the credential
+writer boundary is shared.

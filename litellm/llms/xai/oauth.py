@@ -282,15 +282,64 @@ async def get_grok_native_oauth_access_token() -> str:
         or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
         or _DEFAULT_XAI_OAUTH_SCOPE
     )
-    lock_key = f"grok-native:{credential_path}:{scope}"
+    lock_key = f"grok-native-read:{credential_path}:{scope}"
     lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
-        return await _get_xai_oauth_access_token_locked(
+        return _get_grok_native_oauth_access_token_read_only(
             credential_path=credential_path,
             scope=scope,
-            lock_path=default_grok_xai_oauth_auth_lock_path(credential_path),
-            is_grok_native_oauth=True,
         )
+
+
+def _grok_native_oauth_refresh_required_error(*, missing_token: bool) -> ValueError:
+    if missing_token:
+        message = (
+            "Grok OIDC credential does not contain an access token. "
+            "Run the health/provider-status sidecar Grok OIDC refresh or "
+            "relogin with the Grok CLI before Grok native traffic can proceed."
+        )
+    else:
+        message = (
+            "Grok OIDC credential is missing, expired, or near expiry. "
+            "Run the health/provider-status sidecar Grok OIDC refresh or "
+            "relogin with the Grok CLI before Grok native traffic can proceed."
+        )
+    return ValueError(message)
+
+
+def _read_grok_native_credential_payload(credential_path: Path) -> Dict[str, Any]:
+    try:
+        with credential_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Grok OIDC credential file not found at {credential_path}. "
+            "Run the health/provider-status sidecar Grok OIDC refresh or "
+            "relogin with the Grok CLI before Grok native traffic can proceed."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Grok OIDC credential file at {credential_path} is not valid JSON."
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Grok OIDC credential file must contain a JSON object.")
+    return payload
+
+
+def _get_grok_native_oauth_access_token_read_only(
+    *,
+    credential_path: Path,
+    scope: str,
+) -> str:
+    raw_payload = _read_grok_native_credential_payload(credential_path)
+    credential = _select_credential_record(raw_payload, scope)
+    token = _credential_access_token(credential)
+    if token and not _credential_needs_refresh(credential):
+        return token
+    if not token:
+        raise _grok_native_oauth_refresh_required_error(missing_token=True)
+    raise _grok_native_oauth_refresh_required_error(missing_token=False)
 
 
 def default_litellm_xai_oauth_auth_path() -> Path:
@@ -314,20 +363,6 @@ def default_grok_xai_oauth_auth_path() -> Path:
         return Path(grok_home.strip()).expanduser() / "auth.json"
 
     return Path(_DEFAULT_GROK_XAI_OAUTH_AUTH_PATH).expanduser()
-
-
-def default_grok_xai_oauth_seed_auth_path() -> Optional[Path]:
-    configured = get_secret_str("LITELLM_XAI_GROK_SEED_AUTH_FILE")
-    if isinstance(configured, str) and configured.strip():
-        return Path(configured.strip()).expanduser()
-    return None
-
-
-def default_grok_xai_oauth_auth_lock_path(credential_path: Path) -> Path:
-    configured = get_secret_str("LITELLM_XAI_GROK_AUTH_LOCK_FILE")
-    if isinstance(configured, str) and configured.strip():
-        return Path(configured.strip()).expanduser()
-    return credential_path.with_name(f"{credential_path.name}.lock")
 
 
 def migrate_hermes_xai_oauth_credential(
@@ -559,8 +594,6 @@ async def _get_xai_oauth_access_token_locked(
     is_grok_native_oauth: bool,
 ) -> str:
     with _credential_file_lock(lock_path):
-        if is_grok_native_oauth:
-            _sync_grok_native_oauth_seed_credential(credential_path)
         raw_payload = _read_credential_payload(credential_path)
         credential = _select_credential_record(raw_payload, scope)
         token = _credential_access_token(credential)
@@ -630,33 +663,6 @@ def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("xAI OAuth credential file must contain a JSON object.")
     return payload
-
-
-def _sync_grok_native_oauth_seed_credential(credential_path: Path) -> None:
-    seed_path = default_grok_xai_oauth_seed_auth_path()
-    if seed_path is None or seed_path == credential_path:
-        return
-
-    try:
-        seed_stat = seed_path.stat()
-    except FileNotFoundError:
-        return
-
-    try:
-        credential_stat = credential_path.stat()
-    except FileNotFoundError:
-        should_sync = True
-    else:
-        should_sync = seed_stat.st_mtime_ns > credential_stat.st_mtime_ns
-
-    if not should_sync:
-        return
-
-    seed_payload = _read_json_object(
-        seed_path,
-        description="Grok OIDC seed auth file",
-    )
-    _write_credential_payload(credential_path, seed_payload)
 
 
 def _select_credential_record(

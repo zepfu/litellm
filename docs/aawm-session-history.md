@@ -127,24 +127,29 @@ itself cools down or the session is redispatched.
 
 `xai/grok-composer-2.5-fast`, `xai/grok-build`, and
 `xai/grok-build-0.1` use the Grok native OIDC credential path, not the managed
-`oa_xai/*` OAuth credential file. In `litellm-dev`, `LITELLM_XAI_GROK_AUTH_FILE`
-defaults to `/home/zepfu/.litellm/xai/grok-auth.json`, while the personal Grok
-CLI credential at `/home/zepfu/.grok/auth.json` is mounted read-only and exposed
-only as `LITELLM_XAI_GROK_SEED_AUTH_FILE`.
+`oa_xai/*` OAuth credential file. `LITELLM_XAI_GROK_AUTH_FILE` should point
+directly at the Grok CLI credential, normally `/home/zepfu/.grok/auth.json`.
 
-The Grok native refresh path updates the configured credential by writing a
-temporary file beside it and then atomically replacing the original file. The
-configured refresh target must therefore live on writable LiteLLM-owned storage.
-Mounting the configured target read-only makes Composer and other Grok native
-candidates fail as `candidate_unavailable` during token refresh, which breaks the
-declared alias failover order. Keep `grok-auth.json` separate from the managed
-`oa_xai/*` `oauth-auth.json` file so the two credential families remain
-auditable.
+LiteLLM is a read-only consumer of that file. It selects a valid access token
+from the configured Grok OIDC credential and fails the Grok native candidate as
+`candidate_unavailable` when the file is missing, lacks an access token, or is
+expired/near expiry. LiteLLM must not copy, seed, refresh, atomically replace,
+or otherwise mutate the Grok CLI credential during model requests.
 
-When the read-only Grok CLI seed credential is newer than the LiteLLM-owned
-managed credential, LiteLLM replaces the managed Grok credential from the seed
-before selecting or refreshing an access token. This lets a fresh Grok/OIDC login
-take effect without writing back into `/home/zepfu/.grok`.
+The provider-status sidecar is the scheduled writer. It mounts
+`/home/zepfu/.grok` writable, takes a file lock, refreshes the credential on the
+configured cadence, and writes the updated JSON atomically with file mode
+`0600`. In dev compose the sidecar runs with
+`AAWM_GROK_OIDC_REFRESH_ENABLED=1`,
+`AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/.grok/auth.json`, and a one-hour refresh
+interval. The dev LiteLLM container mounts the same host directory read-only.
+
+Keep the Grok CLI/OIDC credential separate from the managed `oa_xai/*`
+`oauth-auth.json` file. Managed `oa_xai/*` routes still use LiteLLM-owned OAuth
+refresh/write behavior, while native Grok routes rely on the sidecar-maintained
+CLI credential. The explicit Grok billing poll should run from the same
+sidecar context so quota snapshots use the credential that the sidecar keeps
+fresh, not a second LiteLLM-managed copy.
 
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
 tools, and `reasoning` input items that the selected Grok-family model declares
