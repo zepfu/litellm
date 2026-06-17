@@ -393,6 +393,14 @@ excluded from usage reporting, but should still persist a non-`unknown`
 `model`/`model_group`; if no stronger model evidence exists, they are attributed
 to the generic Grok TUI client model `grok-build`.
 
+Native Grok storage uploads are a local-only side channel. LiteLLM authenticates
+`/grok/*/storage` requests with the normal LiteLLM key path, records no raw
+storage body, does not forward those uploads to `cli-chat-proxy.grok.com`, and
+returns a benign local success response. These storage artifacts can contain
+session replay material, terminal output, tool calls/results, local config, and
+compressed session state, so they must not enter pass-through logs, Langfuse,
+session history, or upstream xAI storage.
+
 Sanitization metadata proves request adaptation only. It does not prove tool
 execution, model tool-use quality, or upstream success by itself; combine it
 with status, token, cost, and error fields when building reports.
