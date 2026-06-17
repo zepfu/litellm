@@ -151,6 +151,8 @@ _AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS = (
     "grok_side_channel_request_json_container_type",
     "grok_side_channel_request_array_length",
 )
+_GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_CODE = "the operation was cancelled"
+_GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_ERROR = "timeout expired"
 
 
 def get_response_body(response: httpx.Response) -> Optional[dict]:
@@ -331,6 +333,92 @@ def _extract_exception_status_code(exc: Exception) -> Optional[int]:
         except Exception:
             continue
     return None
+
+
+
+
+def _extract_passthrough_exception_detail(exc: Exception) -> Optional[str]:
+    for attr_name in ("detail", "message"):
+        value = getattr(exc, attr_name, None)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            try:
+                return safe_dumps(value)
+            except Exception:
+                continue
+        value_text = str(value).strip()
+        if value_text:
+            return value_text
+    return None
+
+
+def _extract_passthrough_grok_billing_timeout_cancel_hint(
+    detail: Optional[Any],
+) -> Optional[str]:
+    if detail is None:
+        return None
+
+    if isinstance(detail, dict):
+        code = detail.get("code")
+        error = detail.get("error")
+        if isinstance(code, str) and code.strip():
+            return code.strip()
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+        return None
+
+    detail_text = str(detail).strip()
+    if not detail_text:
+        return None
+
+    try:
+        parsed_detail = json.loads(detail_text)
+    except json.JSONDecodeError:
+        return detail_text
+
+    if isinstance(parsed_detail, dict):
+        return _extract_passthrough_grok_billing_timeout_cancel_hint(parsed_detail)
+    return detail_text
+
+
+def _is_known_grok_billing_passthrough_timeout_cancel_response(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_400_BAD_REQUEST:
+        return False
+
+    if not _is_xai_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return False
+
+    request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
+        request
+    )
+    upstream_path = urlparse(str(url or "")).path
+    if not (
+        request_path.rstrip("/").endswith("/grok/v1/billing")
+        or upstream_path.rstrip("/").endswith("/v1/billing")
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    error_hint = _extract_passthrough_grok_billing_timeout_cancel_hint(detail)
+    if not error_hint:
+        return False
+
+    normalized_hint = error_hint.strip().lower()
+    return (
+        _GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_CODE in normalized_hint
+        or _GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_ERROR in normalized_hint
+    )
 
 
 def _get_case_insensitive_mapping_value(
@@ -585,6 +673,10 @@ def _get_passthrough_terminal_failure_kind(
     }:
         return "transient_provider_connectivity"
     return "expected_upstream_capacity_or_internal"
+
+
+def _get_passthrough_grok_billing_timeout_failure_kind() -> str:
+    return "degraded_grok_billing_timeout"
 
 
 def _record_passthrough_hidden_retry_metadata(
@@ -2422,6 +2514,15 @@ async def pass_through_request(  # noqa: PLR0915
         suppress_provider_rate_limit_traceback = (
             _is_passthrough_expected_provider_rate_limit(status_code=status_code)
         )
+        suppress_grok_billing_timeout_traceback = (
+            _is_known_grok_billing_passthrough_timeout_cancel_response(
+                request=request,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
@@ -2435,6 +2536,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": "expected_provider_rate_limit",
+                },
+            )
+        elif suppress_grok_billing_timeout_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced known Grok billing timeout/cancel status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": _get_passthrough_grok_billing_timeout_failure_kind(),
                 },
             )
         elif suppress_terminal_failure_traceback:
@@ -2503,11 +2614,12 @@ async def pass_through_request(  # noqa: PLR0915
         if (
             not suppress_terminal_failure_traceback
             and not suppress_provider_rate_limit_traceback
+            and not suppress_grok_billing_timeout_traceback
         ):
             traceback_str = traceback.format_exc(
                 limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
             )
-        if not suppress_retryable_failure_logging:
+        if not suppress_retryable_failure_logging and not suppress_grok_billing_timeout_traceback:
             try:
                 await proxy_logging_obj.post_call_failure_hook(
                     user_api_key_dict=user_api_key_dict,
