@@ -2765,6 +2765,41 @@ run the documented prod readiness, log, and harness gates.
 
 ---
 
+### aawm.80 — Grok OIDC sidecar ownership and side-channel continuity hardening
+
+**What changed:** Native Grok OIDC credential refresh ownership is hardened so
+the provider-status sidecar remains the scheduled writer for
+`~/.grok/auth.json` while LiteLLM stays a read-only consumer. Atomic refresh
+writes now apply configured uid/gid/private mode before replacement, clamp
+unsafe group/other modes back to `0600`, and include a metadata-only repair task
+that can fix bad file ownership without reading or rewriting token values. The
+Grok side-channel classifier also covers the current CLI endpoints
+`/sessions/{id}/signals`, `/sessions/{id}/turn-deltas`, and `/traces` while
+retaining historical `/sessions/register` and
+`/sessions/{id}/replicas/update` coverage for redacted shape metadata and
+retryable 5xx handling.
+
+**Why:** Prod/dev showed stale Grok OIDC ownership could require repeated manual
+login and could steer `aawm-code` away from Composer 2.5 Fast toward other Grok
+targets. The sidecar must refresh and repair the shared credential even during
+long idle windows, while model requests must not mutate credential files.
+
+**Why not upstream:** This is AAWM-specific local Grok CLI/OIDC credential
+ownership, provider-status sidecar behavior, and pass-through observability for
+AAWM native Grok routes.
+
+**Validation status:** Focused pytest coverage passes for the Grok OIDC refresh
+script, provider-status sidecar tasks, native Grok OIDC harness config, and
+Grok side-channel pass-through request handling. Dev runtime validation rebuilt
+the provider-status sidecar, verified `auth.json` remains `zepfu:zepfu 0600`,
+observed a successful Grok billing poll, restarted `litellm-dev`, and confirmed
+the running container recognizes current and historical side-channel endpoint
+types. Production promotion still requires publishing `v1.82.3-aawm.80`,
+rebuilding/restarting `aawm-litellm`, verifying the prod Grok mount/env split,
+and running the documented prod readiness/log gates.
+
+---
+
 
 ## Dropped Patches
 
