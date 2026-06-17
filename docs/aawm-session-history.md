@@ -91,7 +91,11 @@ writes do not look like ready datasets.
 
 The in-process drainer checks for existing spool files when the callback starts
 and after successful writes, so records left behind by a prior outage can replay
-without waiting for a new failed batch. Replay is at-least-once. The database
+without waiting for a new failed batch. If the spool directory exists but
+cannot be listed temporarily, startup and replay summaries report
+`spool_pending=unknown` instead of `spool_pending=0`; future drainer triggers
+retry the listing rather than treating the backlog as empty. Missing directories
+still report `spool_pending=0`. Replay is at-least-once. The database
 insert path remains idempotent, so recovery tools and the in-process drainer
 should assume duplicates are possible after a crash or partial outage. The spool
 contains local sensitive session metadata and must stay out of git, shared logs,

@@ -9752,6 +9752,154 @@ def test_session_history_spool_dir_defaults_to_local_fallback(monkeypatch) -> No
     )
 
 
+def test_session_history_spool_summary_reports_unavailable_listing(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="unavailable",
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+
+    summary = aawm_agent_identity._session_history_spool_summary()
+
+    assert summary == "spool_pending=unknown, spool_state=unavailable"
+    assert "spool_pending=0" not in summary
+
+
+def test_session_history_spool_summary_keeps_missing_directory_empty(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="missing",
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+
+    assert aawm_agent_identity._session_history_spool_summary() == "spool_pending=0"
+
+
+def test_ensure_session_history_spool_drainer_started_retries_when_listing_unavailable(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="unavailable",
+    )
+    warning_mock = MagicMock()
+    started_threads = []
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            self._alive = False
+
+        def start(self) -> None:
+            self._alive = True
+            started_threads.append(self)
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+    monkeypatch.setattr(aawm_agent_identity.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_spool_drainer",
+        None,
+    )
+
+    aawm_agent_identity._ensure_session_history_spool_drainer_started()
+
+    assert len(started_threads) == 1
+    warning_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any(
+        "session_history spool replay status is unknown" in message
+        for message in warning_messages
+    )
+
+
+def test_ensure_session_history_spool_drainer_started_skips_missing_directory(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="missing",
+    )
+    started_threads = []
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            self._alive = False
+
+        def start(self) -> None:
+            self._alive = True
+            started_threads.append(self)
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+    monkeypatch.setattr(aawm_agent_identity.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_spool_drainer",
+        None,
+    )
+
+    aawm_agent_identity._ensure_session_history_spool_drainer_started()
+
+    assert started_threads == []
+
+
+def test_session_history_spool_drainer_skips_when_listing_unavailable(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="unavailable",
+    )
+    warning_mock = MagicMock()
+    flush_attempts = []
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda batch: flush_attempts.append(batch) or True,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    aawm_agent_identity._session_history_spool_drainer_main()
+
+    assert flush_attempts == []
+    warning_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any(
+        "session_history spool replay status is unknown" in message
+        for message in warning_messages
+    )
+
+
 def test_failed_session_history_batch_spools_after_retry_budget(
     monkeypatch,
     tmp_path,

@@ -47,6 +47,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -2817,12 +2818,17 @@ def _reset_session_history_flush_failure_window() -> Optional[int]:
         return suppressed_failures
 
 
-def _session_history_spool_paths() -> List[str]:
+class _SessionHistorySpoolListing(NamedTuple):
+    paths: Tuple[str, ...]
+    availability: str
+
+
+def _list_session_history_spool() -> _SessionHistorySpoolListing:
     spool_dir = _get_session_history_spool_dir()
     try:
         names = os.listdir(spool_dir)
     except FileNotFoundError:
-        return []
+        return _SessionHistorySpoolListing(paths=(), availability="missing")
     except Exception as exc:
         verbose_logger.warning(
             "AawmAgentIdentity: unable to list session_history spool directory "
@@ -2830,22 +2836,44 @@ def _session_history_spool_paths() -> List[str]:
             spool_dir,
             _format_exception_for_warning(exc),
         )
-        return []
-    return sorted(
-        os.path.join(spool_dir, name)
-        for name in names
-        if name.endswith(".jsonl") or name.endswith(".json")
+        return _SessionHistorySpoolListing(paths=(), availability="unavailable")
+    return _SessionHistorySpoolListing(
+        paths=tuple(
+            sorted(
+                os.path.join(spool_dir, name)
+                for name in names
+                if name.endswith(".jsonl") or name.endswith(".json")
+            )
+        ),
+        availability="available",
     )
 
 
-def _session_history_spool_summary(paths: Optional[List[str]] = None) -> str:
-    if paths is None:
-        paths = _session_history_spool_paths()
-    if not paths:
+def _session_history_spool_paths() -> List[str]:
+    return list(_list_session_history_spool().paths)
+
+
+def _session_history_spool_summary(
+    paths: Optional[List[str]] = None,
+    *,
+    listing: Optional[_SessionHistorySpoolListing] = None,
+) -> str:
+    if listing is None:
+        if paths is None:
+            listing = _list_session_history_spool()
+        else:
+            listing = _SessionHistorySpoolListing(
+                paths=tuple(paths),
+                availability="available",
+            )
+    if listing.availability == "unavailable":
+        return "spool_pending=unknown, spool_state=unavailable"
+    if not listing.paths:
         return "spool_pending=0"
+    paths_list = list(listing.paths)
 
     oldest_mtime: Optional[float] = None
-    for path in paths:
+    for path in paths_list:
         try:
             mtime = os.path.getmtime(path)
         except OSError:
@@ -2853,9 +2881,11 @@ def _session_history_spool_summary(paths: Optional[List[str]] = None) -> str:
         oldest_mtime = mtime if oldest_mtime is None else min(oldest_mtime, mtime)
 
     if oldest_mtime is None:
-        return f"spool_pending={len(paths)}, oldest_pending_age_s=unknown"
+        return f"spool_pending={len(paths_list)}, oldest_pending_age_s=unknown"
     oldest_age = max(0.0, time.time() - oldest_mtime)
-    return f"spool_pending={len(paths)}, oldest_pending_age_s={oldest_age:.1f}"
+    return (
+        f"spool_pending={len(paths_list)}, oldest_pending_age_s={oldest_age:.1f}"
+    )
 
 
 def _encode_session_history_spool_value(value: Any) -> Any:
@@ -2978,7 +3008,15 @@ def _session_history_spool_drainer_main() -> None:
     try:
         batch_size = _get_session_history_batch_size()
         while True:
-            paths = _session_history_spool_paths()
+            listing = _list_session_history_spool()
+            if listing.availability == "unavailable":
+                verbose_logger.warning(
+                    "AawmAgentIdentity: session_history spool replay status is "
+                    "unknown because the spool directory could not be listed (%s)",
+                    _session_history_spool_summary(listing=listing),
+                )
+                return
+            paths = list(listing.paths)
             if not paths:
                 return
 
@@ -3039,7 +3077,17 @@ def _ensure_session_history_spool_drainer_started() -> None:
     ):
         return
 
-    if not _session_history_spool_paths():
+    listing = _list_session_history_spool()
+    if listing.availability == "missing":
+        return
+    if listing.availability == "unavailable":
+        verbose_logger.warning(
+            "AawmAgentIdentity: session_history spool replay status is unknown "
+            "because the spool directory could not be listed (%s); starting "
+            "spool drainer to retry",
+            _session_history_spool_summary(listing=listing),
+        )
+    elif not listing.paths:
         return
 
     with _aawm_session_history_spool_drainer_lock:
