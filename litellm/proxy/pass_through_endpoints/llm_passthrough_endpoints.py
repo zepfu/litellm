@@ -5282,6 +5282,7 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
         await _wait_for_google_adapter_cooldown_if_needed(rate_limit_key)
         try:
             passthrough_kwargs["retryable_upstream_status_codes"] = [429]
+            passthrough_kwargs["caller_managed_hidden_retry"] = True
             return await pass_through_request(**passthrough_kwargs)
         except Exception as exc:
             status_code = _extract_google_adapter_exception_status_code(exc)
@@ -5806,6 +5807,7 @@ async def _perform_openrouter_adapter_pass_through_request(
             result = await pass_through_request(
                 **kwargs,
                 retryable_upstream_status_codes=[429, 500, 502, 503, 504],
+                caller_managed_hidden_retry=True,
             )
             _clear_openrouter_adapter_failure_circuit(adapter_model)
             return result
@@ -12730,6 +12732,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
     local_codex_headers = None
@@ -12849,6 +12852,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
         egress_credential_family="openai" if local_codex_headers is not None else None,
         expected_target_family="openai",
         retryable_upstream_status_codes=[429],
+        caller_managed_hidden_retry=use_alias_candidate_probe,
     )
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
@@ -12998,6 +13002,7 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
         if (
@@ -13155,6 +13160,7 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
         if (
@@ -13800,6 +13806,7 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
             custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
             egress_credential_family="opencode",
             expected_target_family="opencode",
+            caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
         if (
@@ -19788,6 +19795,9 @@ async def grok_proxy_route(
         for key, value in dict(request.query_params).items()
         if str(key).lower() != "key"
     }
+    grok_side_channel_retryable_status_codes = (
+        _get_grok_side_channel_retryable_status_codes(endpoint)
+    )
 
     return await pass_through_request(
         request=request,
@@ -19804,9 +19814,8 @@ async def grok_proxy_route(
         allowed_forward_headers=list(_GROK_CLI_FORWARD_HEADER_ALLOWLIST),
         raw_body_passthrough=raw_body_passthrough,
         passthrough_logging_metadata=passthrough_logging_metadata,
-        retryable_upstream_status_codes=_get_grok_side_channel_retryable_status_codes(
-            endpoint
-        ),
+        retryable_upstream_status_codes=grok_side_channel_retryable_status_codes,
+        caller_managed_hidden_retry=bool(grok_side_channel_retryable_status_codes),
     )
 
 
@@ -20186,6 +20195,7 @@ async def _handle_anthropic_auto_agent_alias_route(
                     user_api_key_dict=user_api_key_dict,
                     prepared_request_body=candidate_body,
                     adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
                 )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
                 response = await _handle_anthropic_google_completion_adapter_route(
@@ -22111,6 +22121,7 @@ async def _perform_codex_auto_agent_native_openai_request(
         egress_credential_family="openai" if forward_headers else None,
         expected_target_family="openai",
         retryable_upstream_status_codes=[429],
+        caller_managed_hidden_retry=True,
     )
 
 
@@ -22154,6 +22165,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             egress_credential_family="xai",
             expected_target_family="xai",
             retryable_upstream_status_codes=[429],
+            caller_managed_hidden_retry=True,
         )
     except Exception as exc:
         if _grok_native_candidate_unavailable_detail(exc) is not None:
@@ -22204,6 +22216,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             egress_credential_family="xai",
             expected_target_family="xai",
             retryable_upstream_status_codes=[429],
+            caller_managed_hidden_retry=True,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
@@ -23359,6 +23372,7 @@ async def cursor_proxy_route(
         target=str(updated_url),
         custom_headers={"Authorization": f"Basic {auth_value}"},
         custom_llm_provider="cursor",
+        caller_managed_hidden_retry=True,
     )
     received_value = await endpoint_func(
         request,

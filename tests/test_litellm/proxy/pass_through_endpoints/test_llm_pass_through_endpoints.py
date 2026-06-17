@@ -6867,6 +6867,60 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert mock_pass_through.await_args.kwargs[
             "retryable_upstream_status_codes"
         ] == [429]
+        assert (
+            mock_pass_through.await_args.kwargs["caller_managed_hidden_retry"]
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_adapter_probe_disables_shared_hidden_retry(
+        self,
+    ):
+        request = MagicMock(spec=Request)
+        request.headers = {"x-pass-authorization": "Bearer codex-token"}
+        request.method = "POST"
+        request.url = MagicMock()
+        request.url.path = "/anthropic/v1/messages"
+        request.query_params = {}
+        upstream_response = Response(
+            content='{"id":"resp_test","output":[]}',
+            media_type="application/json",
+        )
+        translated_response = Response(
+            content='{"id":"msg_test","content":[]}',
+            media_type="application/json",
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(return_value=upstream_response),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+            return_value=translated_response,
+        ):
+            response = await _handle_anthropic_openai_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body={
+                    "model": "gpt-5.3-codex-spark",
+                    "max_tokens": 16,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "ping"}],
+                        }
+                    ],
+                },
+                adapter_model="gpt-5.3-codex-spark",
+                use_alias_candidate_probe=True,
+            )
+
+        assert response is translated_response
+        assert mock_pass_through.await_args.kwargs[
+            "caller_managed_hidden_retry"
+        ] is True
 
     @pytest.mark.asyncio
     async def test_openrouter_responses_adapter_preserves_agent_project_litellm_metadata(
@@ -16608,6 +16662,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
     assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
     assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
     assert mock_spark.await_args.kwargs["adapter_model"] == "gpt-5.3-codex-spark"
+    assert mock_spark.await_args.kwargs["use_alias_candidate_probe"] is True
     spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
     metadata = spark_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
@@ -26535,6 +26590,7 @@ class TestGrokProxyRoute:
             503,
             504,
         ]
+        assert call_kwargs["caller_managed_hidden_retry"] is True
 
 
 class TestCursorProxyRoute:
