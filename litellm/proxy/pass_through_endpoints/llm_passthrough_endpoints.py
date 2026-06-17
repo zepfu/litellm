@@ -19224,6 +19224,15 @@ def _is_grok_json_request(request: Request) -> bool:
     )
 
 
+def _is_grok_storage_endpoint(endpoint: str) -> bool:
+    endpoint_path = httpx.URL(endpoint).path
+    if not endpoint_path.startswith("/"):
+        endpoint_path = "/" + endpoint_path
+    if endpoint_path.startswith("/v1/"):
+        endpoint_path = endpoint_path[len("/v1") :]
+    return endpoint_path == "/storage" or endpoint_path.startswith("/storage/")
+
+
 def _get_grok_side_channel_retryable_status_codes(endpoint: str) -> list[int]:
     endpoint_path = httpx.URL(endpoint).path
     if not endpoint_path.startswith("/"):
@@ -19719,8 +19728,9 @@ async def grok_proxy_route(
     LiteLLM auth should be supplied separately with `x-litellm-api-key` or a
     `key` query parameter so the upstream Authorization header can remain intact.
     """
-    raw_body_passthrough = (
-        request.method in {"POST", "PUT", "PATCH"} and not _is_grok_json_request(request)
+    is_storage_endpoint = _is_grok_storage_endpoint(endpoint)
+    raw_body_passthrough = request.method in {"POST", "PUT", "PATCH"} and (
+        is_storage_endpoint or not _is_grok_json_request(request)
     )
     if raw_body_passthrough:
         _safe_set_request_parsed_body(request, {})
@@ -19729,6 +19739,13 @@ async def grok_proxy_route(
         request=request,
         api_key=_get_grok_litellm_auth_header(request),
     )
+
+    if is_storage_endpoint:
+        return {
+            "ok": True,
+            "suppressed": True,
+            "endpoint": "grok_storage",
+        }
 
     base_target_url = _get_grok_passthrough_target_base()
     target_url = _join_grok_passthrough_url(
