@@ -9439,7 +9439,8 @@ def test_flush_session_history_batch_logs_exception_type_when_message_is_empty(
     assert flushed is False
     exception_mock.assert_called_once()
     assert exception_mock.call_args.args[0] == (
-        "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)"
+        "AawmAgentIdentity: failed to flush %d session_history records; "
+        "retrying within the configured retry budget: %s (%s)"
     )
     assert exception_mock.call_args.args[1] == 1
     assert exception_mock.call_args.args[2] == (
@@ -9561,6 +9562,7 @@ def test_session_history_spool_round_trips_event_timestamps_and_quota_only_recor
 
     paths = aawm_agent_identity._session_history_spool_paths()
     assert len(paths) == 1
+    assert paths[0].endswith(".jsonl")
     loaded = aawm_agent_identity._load_session_history_spool_record(paths[0])
     assert loaded["_skip_session_history"] is True
     assert loaded["litellm_call_id"] == "call-quota-only"
@@ -9663,15 +9665,24 @@ def test_failed_session_history_batch_spools_after_retry_budget(
     loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
     assert loaded_records == records
     assert loaded_records[0]["start_time"] == observed_at
-    raw_payload = json.loads(Path(paths[0]).read_text())
-    assert raw_payload["failure"] == {"type": "OSError"}
+    raw_lines = [
+        json.loads(line)
+        for line in Path(paths[0]).read_text().splitlines()
+        if line.strip()
+    ]
+    assert raw_lines[0]["type"] == "metadata"
+    assert raw_lines[0]["failure"] == {"type": "OSError"}
+    assert all(line["type"] == "record" for line in raw_lines[1:])
     assert exception_mock.call_count == 1
     warning_messages = [call.args[0] for call in warning_mock.call_args_list]
     assert (
-        "AawmAgentIdentity: session_history flush still failing: %s "
-        "(batch_size=%d, %s)"
+        "AawmAgentIdentity: session_history flush still failing within "
+        "the configured retry budget: %s (batch_size=%d, %s)"
     ) in warning_messages
-    assert any("spooled batch for replay" in message for message in warning_messages)
+    assert any(
+        "protected batch by spooling for replay" in message
+        for message in warning_messages
+    )
 
 
 def test_failed_session_history_traceback_is_suppressed_across_batches(
@@ -9866,7 +9877,131 @@ def test_session_history_spool_drainer_flushes_batch_spool_records(
     assert flushed_batches == [records]
     assert aawm_agent_identity._session_history_spool_paths() == []
 
+def test_session_history_spool_loads_legacy_json_artifacts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    observed_at = datetime(2026, 6, 14, 22, 45, tzinfo=timezone.utc)
+    datetime_marker = aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER
+    legacy_path = tmp_path / "20260614224500-trace-legacy-abc123.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "spooled_at": {
+                    datetime_marker: observed_at.isoformat(),
+                },
+                "reason": "legacy",
+                "record_count": 1,
+                "records": [
+                    {
+                        "litellm_call_id": "call-legacy-json",
+                        "start_time": {
+                            datetime_marker: observed_at.isoformat(),
+                        },
+                    }
+                ],
+            }
+        )
+    )
 
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+
+    paths = aawm_agent_identity._session_history_spool_paths()
+    assert paths == [str(legacy_path)]
+    loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
+    assert loaded_records[0]["litellm_call_id"] == "call-legacy-json"
+    assert loaded_records[0]["start_time"] == observed_at
+
+
+def test_failed_session_history_batch_logs_spool_failure_severity(
+    monkeypatch,
+) -> None:
+    records = [{"litellm_call_id": "call-spool-failure-log"}]
+    exception_mock = MagicMock()
+    attempts = []
+
+    def fake_flush(batch, **kwargs):
+        attempts.append((batch, kwargs))
+        failure_callback = kwargs.get("failure_callback")
+        if failure_callback is not None:
+            failure_callback(OSError("pgbouncer unavailable"))
+        return len(attempts) >= 2
+
+    def failing_spool(*args, **kwargs):
+        raise OSError("spool unwritable")
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: "0"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
+        else None,
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_flush_session_history_batch", fake_flush)
+    monkeypatch.setattr(
+        aawm_agent_identity, "_spool_session_history_records", failing_spool
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", MagicMock())
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+
+    aawm_agent_identity._flush_session_history_batch_with_retry(records)
+
+    assert len(attempts) == 2
+    assert exception_mock.call_count == 1
+    assert (
+        "potential session_history data loss until inline retry succeeds"
+        in exception_mock.call_args.args[0]
+    )
+
+
+def test_session_history_spool_drainer_logs_recovery_and_retention(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    record = {"litellm_call_id": "call-spool-logging"}
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    aawm_agent_identity._spool_session_history_record(record)
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda batch: True,
+    )
+    aawm_agent_identity._session_history_spool_drainer_main()
+    success_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any("recovered" in message for message in success_messages)
+
+    aawm_agent_identity._spool_session_history_record(record)
+    warning_mock.reset_mock()
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda batch: False,
+    )
+    aawm_agent_identity._session_history_spool_drainer_main()
+    failure_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any("records remain spooled" in message for message in failure_messages)
+    assert len(aawm_agent_identity._session_history_spool_paths()) == 1
 def test_session_history_spool_drainer_keeps_records_when_flush_fails(
     monkeypatch,
     tmp_path,
@@ -12712,7 +12847,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_persist_session_history_records_keeps_history_when_rate_limit_side_write_fails(
+async def test_persist_session_history_records_propagates_rate_limit_side_write_failure(
     monkeypatch,
 ) -> None:
     records: list[dict[str, Any]] = [
@@ -12782,29 +12917,127 @@ async def test_persist_session_history_records_keeps_history_when_rate_limit_sid
         "litellm.integrations.aawm_agent_identity._derive_rate_limit_transitions",
         AsyncMock(return_value=[]),
     )
-    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
-
-    await _persist_session_history_records(records)
+    with pytest.raises(RuntimeError, match="rate-limit insert unavailable"):
+        await _persist_session_history_records(records)
 
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
     assert history_args[1][0][0] == "call-side-write-fails"
     side_write_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.rate_limit_observations" in side_write_args[0]
-    assert mock_conn.execute.await_count == 3
-    first_app_name_args = mock_conn.execute.await_args_list[0].args
-    assert first_app_name_args[0] == "select set_config($1, $2, false)"
-    assert first_app_name_args[1] == "application_name"
-    assert first_app_name_args[2]
-    gap_args = mock_conn.execute.await_args_list[1].args
-    assert "previous_response_to_current_request_ms" in gap_args[0]
-    assert gap_args[1] == ["call-side-write-fails"]
-    final_app_name_args = mock_conn.execute.await_args_list[2].args
-    assert final_app_name_args[0] == "select set_config($1, $2, false)"
-    assert final_app_name_args[1] == "application_name"
-    assert final_app_name_args[2]
-    exception_mock.assert_called_once()
-    assert "best-effort rate-limit observations" in exception_mock.call_args.args[0]
+    exception_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "helper_name,record,expected_match",
+    [
+        (
+            "_persist_tool_definition_snapshots_best_effort",
+            {
+                "litellm_call_id": "call-tool-snapshot-side-write-fails",
+                "session_id": "session-tool-snapshot-side-write-fails",
+                "trace_id": "trace-tool-snapshot-side-write-fails",
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "model_group": "gpt-5.5",
+                "metadata": {
+                    "aawm_tool_definition_capture_version": "v1",
+                    "aawm_tool_definition_capture_source": "passthrough_request_body",
+                    "aawm_tool_definition_count": 1,
+                    "aawm_tool_definition_captured_count": 1,
+                    "aawm_tool_definition_sources": ["tools"],
+                    "aawm_tool_definition_names": ["spawn_agent"],
+                    "aawm_tool_definition_types": ["function"],
+                    "aawm_tool_definition_snapshot_hash": "hash-tool-snapshot-side-write-fails",
+                    "aawm_tool_definition_snapshot_truncated": False,
+                },
+                "aawm_tool_definition_snapshot": [
+                    {"source": "tools", "index": 0, "name": "spawn_agent"}
+                ],
+            },
+            "tool-definition snapshot insert unavailable",
+        ),
+        (
+            "_persist_provider_error_observations_best_effort",
+            {
+                "provider_error_observations": [
+                    {
+                        "observed_at": datetime(2026, 6, 5, 19, 13, tzinfo=timezone.utc),
+                        "environment": "dev",
+                        "provider": "openrouter",
+                        "model": "openrouter/meta-llama/llama-3.3-70b-instruct",
+                        "model_group": "llama-3.3-70b",
+                        "route_family": "openrouter_chat_completions",
+                        "status_code": 503,
+                        "error_type": "ProviderError",
+                        "error_code": "503",
+                        "error_class": "provider_5xx",
+                        "retry_after_seconds": None,
+                        "expected_reset_at": None,
+                        "session_id": "session-provider-error-side-write-fails",
+                        "trace_id": "trace-provider-error-side-write-fails",
+                        "litellm_call_id": "call-provider-error-side-write-fails",
+                        "metadata": {"observed_signal": "normal_traffic_failure"},
+                    }
+                ]
+            },
+            "provider-error insert unavailable",
+        ),
+        (
+            "_persist_alias_routing_audit_best_effort",
+            {
+                "litellm_call_id": "call-alias-side-write-fails",
+                "session_id": "session-alias-side-write-fails",
+                "start_time": datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc),
+                "metadata": {
+                    "aawm_alias_routing_audit_events": [
+                        {
+                            "alias_family": "anthropic_auto_agent",
+                            "alias_model": "aawm-code-anthropic",
+                            "provider": "antigravity",
+                            "model": "claude-sonnet-4-6",
+                            "route_family": "anthropic_antigravity_completion_adapter",
+                            "event_type": "candidate_selected",
+                            "candidate_status": "selected",
+                            "selected": True,
+                        }
+                    ]
+                },
+            },
+            "alias-routing audit insert unavailable",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_persist_session_history_records_propagates_side_write_helper_failures(
+    monkeypatch,
+    helper_name: str,
+    record: dict[str, Any],
+    expected_match: str,
+) -> None:
+    records = [{**record, "_skip_session_history": True}]
+
+    mock_conn = AsyncMock()
+    fake_pool = _FakePool(mock_conn)
+    helper_mock = AsyncMock(side_effect=RuntimeError(expected_match))
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+    monkeypatch.setattr(
+        "litellm.integrations.aawm_agent_identity._ensure_session_history_schema",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        f"litellm.integrations.aawm_agent_identity.{helper_name}",
+        helper_mock,
+    )
+
+    with pytest.raises(RuntimeError, match=expected_match):
+        await _persist_session_history_records(records)
+
+    helper_mock.assert_awaited_once()
+    mock_conn.executemany.assert_not_awaited()
 
 
 @pytest.mark.asyncio
