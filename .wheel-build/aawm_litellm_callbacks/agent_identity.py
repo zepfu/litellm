@@ -2834,7 +2834,7 @@ def _session_history_spool_paths() -> List[str]:
     return sorted(
         os.path.join(spool_dir, name)
         for name in names
-        if name.endswith(".json")
+        if name.endswith(".jsonl") or name.endswith(".json")
     )
 
 
@@ -2891,7 +2891,50 @@ def _decode_session_history_spool_value(value: Any) -> Any:
 
 def _load_session_history_spool_records(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as spool_file:
-        payload = json.load(spool_file)
+        raw_payload = spool_file.read().strip()
+    if not raw_payload:
+        raise ValueError("session_history spool payload is empty")
+
+    if path.endswith(".jsonl"):
+        records: List[Dict[str, Any]] = []
+        for line_number, raw_line in enumerate(raw_payload.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"session_history spool payload line {line_number} is not valid JSON"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"session_history spool payload line {line_number} is not a JSON object"
+                )
+            line_type = payload.get("type")
+            if line_type == "metadata":
+                continue
+            if line_type == "record":
+                record = payload.get("record")
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        "session_history spool payload contains a non-object record"
+                    )
+                records.append(
+                    cast(Dict[str, Any], _decode_session_history_spool_value(record))
+                )
+                continue
+            raise ValueError(
+                f"session_history spool payload line {line_number} has unsupported type"
+            )
+        if records:
+            return records
+        raise ValueError("session_history spool payload does not contain records")
+
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("session_history spool payload is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("session_history spool payload is not a JSON object")
     records = payload.get("records")
@@ -2954,8 +2997,8 @@ def _session_history_spool_drainer_main() -> None:
 
             if not _flush_session_history_batch(batch):
                 verbose_logger.warning(
-                    "AawmAgentIdentity: session_history spool drain failed "
-                    "(batch_size=%d, %s)",
+                    "AawmAgentIdentity: session_history spool drain failed; "
+                    "records remain spooled (batch_size=%d, %s)",
                     len(batch),
                     _session_history_spool_summary(paths),
                 )
@@ -2977,7 +3020,7 @@ def _session_history_spool_drainer_main() -> None:
                         _format_exception_for_warning(exc),
                     )
             verbose_logger.warning(
-                "AawmAgentIdentity: drained %d spooled session_history records "
+                "AawmAgentIdentity: recovered %d spooled session_history records "
                 "from %d files (%s)",
                 drained_record_count,
                 removed,
@@ -3065,7 +3108,7 @@ def _session_history_spool_filename(records: List[Dict[str, Any]]) -> str:
     digest = hashlib.sha256(
         json.dumps(digest_input, sort_keys=True).encode("utf-8")
     ).hexdigest()[:12]
-    return f"{timestamp}-{identity}-{digest}.json"
+    return f"{timestamp}-{identity}-{digest}.jsonl"
 
 
 def _spool_session_history_records(
@@ -3093,14 +3136,35 @@ def _spool_session_history_records(
         payload["failure"] = {
             "type": type(failure).__name__,
         }
-    encoded_payload = _encode_session_history_spool_value(payload)
+    metadata_line = {
+        "type": "metadata",
+        "format_version": 1,
+        "spooled_at": _encode_session_history_spool_value(payload["spooled_at"]),
+        "reason": reason,
+        "retry_count": retry_count,
+        "record_count": len(records),
+    }
+    if failure is not None:
+        metadata_line["failure"] = payload["failure"]
     with open(tmp_path, "w", encoding="utf-8") as spool_file:
-        json.dump(encoded_payload, spool_file, separators=(",", ":"), sort_keys=True)
+        spool_file.write(
+            json.dumps(metadata_line, separators=(",", ":"), sort_keys=True)
+        )
         spool_file.write("\n")
+        for index, record in enumerate(records):
+            record_line = {
+                "type": "record",
+                "index": index,
+                "record": _encode_session_history_spool_value(record),
+            }
+            spool_file.write(
+                json.dumps(record_line, separators=(",", ":"), sort_keys=True)
+            )
+            spool_file.write("\n")
     os.replace(tmp_path, final_path)
     verbose_logger.warning(
-        "AawmAgentIdentity: spooled %d session_history records for retry "
-        "(path=%s, reason=%s, %s, %s)",
+        "AawmAgentIdentity: protected %d session_history records by spooling "
+        "for replay (path=%s, reason=%s, %s, %s)",
         len(records),
         final_path,
         reason,
@@ -3154,15 +3218,16 @@ def _flush_session_history_batch(
             failure_callback(exc)
         if log_exception and _mark_session_history_flush_failure_for_logging():
             verbose_logger.exception(
-                "AawmAgentIdentity: failed to flush %d session_history records: %s (%s)",
+                "AawmAgentIdentity: failed to flush %d session_history records; "
+                "retrying within the configured retry budget: %s (%s)",
                 len(records),
                 _format_exception_for_warning(exc),
                 _session_history_queue_depth_summary(),
             )
         else:
             verbose_logger.warning(
-                "AawmAgentIdentity: session_history flush still failing: %s "
-                "(batch_size=%d, %s)",
+                "AawmAgentIdentity: session_history flush still failing within "
+                "the configured retry budget: %s (batch_size=%d, %s)",
                 _format_exception_for_warning(exc),
                 len(records),
                 _session_history_queue_depth_summary(),
@@ -3229,7 +3294,7 @@ def _flush_session_history_batch_with_retry(
                 )
                 verbose_logger.warning(
                     "AawmAgentIdentity: %s failed after %d retries; "
-                    "spooled batch for replay (path=%s, batch_size=%d, %s)",
+                    "protected batch by spooling for replay (path=%s, batch_size=%d, %s)",
                     retry_message,
                     retry_count,
                     spool_path,
@@ -3240,7 +3305,7 @@ def _flush_session_history_batch_with_retry(
             except Exception as spool_exc:
                 verbose_logger.exception(
                     "AawmAgentIdentity: failed to spool %s after %d retries; "
-                    "continuing inline retry to avoid dropping records: %s",
+                    "potential session_history data loss until inline retry succeeds: %s",
                     retry_message,
                     retry_count,
                     _format_exception_for_warning(spool_exc),
@@ -3248,7 +3313,7 @@ def _flush_session_history_batch_with_retry(
 
         retry_count += 1
         verbose_logger.warning(
-            "AawmAgentIdentity: retrying %s after failure "
+            "AawmAgentIdentity: retrying %s within the configured retry budget "
             "(retry_count=%d, batch_size=%d, %s)",
             retry_message,
             retry_count,
@@ -3371,7 +3436,7 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
             except Exception as exc:
                 verbose_logger.exception(
                     "AawmAgentIdentity: failed to spool session_history overflow "
-                    "record; flushing inline with retry: %s",
+                    "record; potential data loss until inline retry succeeds: %s",
                     _format_exception_for_warning(exc),
                 )
                 _flush_session_history_batch_with_retry(
@@ -16318,18 +16383,10 @@ async def _persist_tool_definition_snapshots_best_effort(
     if not snapshot_payloads:
         return
 
-    try:
-        await conn.executemany(
-            _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
-            snapshot_payloads,
-        )
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort tool-definition "
-            "snapshots for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
-        )
+    await conn.executemany(
+        _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
+        snapshot_payloads,
+    )
 
 
 async def _lookup_claude_auto_review_parent_identity(
@@ -16861,24 +16918,16 @@ async def _persist_alias_routing_audit_best_effort(
     conn: Any,
     records: List[Dict[str, Any]],
 ) -> None:
-    try:
-        payloads: List[Tuple[Any, ...]] = []
-        for record in records:
-            events = _extract_alias_routing_audit_events(record)
-            payloads.extend(
-                _build_alias_routing_audit_db_payload(record, event, index)
-                for index, event in enumerate(events)
-            )
-        if not payloads:
-            return
-        await conn.executemany(_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL, payloads)
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort alias routing "
-            "audit events for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
+    payloads: List[Tuple[Any, ...]] = []
+    for record in records:
+        events = _extract_alias_routing_audit_events(record)
+        payloads.extend(
+            _build_alias_routing_audit_db_payload(record, event, index)
+            for index, event in enumerate(events)
         )
+    if not payloads:
+        return
+    await conn.executemany(_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL, payloads)
 
 
 async def _fetch_previous_rate_limit_observation(
@@ -17055,59 +17104,51 @@ async def _persist_rate_limit_observations_best_effort(
     *,
     history_records: List[Dict[str, Any]],
 ) -> None:
-    try:
-        openrouter_free_daily_observations = (
-            await _build_openrouter_free_daily_observations_for_records(
-                conn,
-                history_records,
-            )
-        )
-        rate_limit_observations: List[Dict[str, Any]] = []
-        for record in records:
-            observations = record.get("rate_limit_observations")
-            if isinstance(observations, list):
-                rate_limit_observations.extend(
-                    observation
-                    for observation in observations
-                    if isinstance(observation, dict)
-                )
-        rate_limit_observations.extend(openrouter_free_daily_observations)
-        if rate_limit_observations:
-            (
-                rate_limit_observations,
-                initial_previous_by_limit_key,
-            ) = await _filter_meaningful_rate_limit_observations(
-                conn,
-                rate_limit_observations,
-            )
-        if not rate_limit_observations:
-            return
-        transitions = await _derive_rate_limit_transitions(
+    openrouter_free_daily_observations = (
+        await _build_openrouter_free_daily_observations_for_records(
             conn,
+            history_records,
+        )
+    )
+    rate_limit_observations: List[Dict[str, Any]] = []
+    for record in records:
+        observations = record.get("rate_limit_observations")
+        if isinstance(observations, list):
+            rate_limit_observations.extend(
+                observation
+                for observation in observations
+                if isinstance(observation, dict)
+            )
+    rate_limit_observations.extend(openrouter_free_daily_observations)
+    if rate_limit_observations:
+        (
             rate_limit_observations,
             initial_previous_by_limit_key,
+        ) = await _filter_meaningful_rate_limit_observations(
+            conn,
+            rate_limit_observations,
         )
+    if not rate_limit_observations:
+        return
+    transitions = await _derive_rate_limit_transitions(
+        conn,
+        rate_limit_observations,
+        initial_previous_by_limit_key,
+    )
+    await conn.executemany(
+        _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+        [
+            _build_rate_limit_observation_db_payload(observation)
+            for observation in rate_limit_observations
+        ],
+    )
+    if transitions:
         await conn.executemany(
-            _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+            _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
             [
-                _build_rate_limit_observation_db_payload(observation)
-                for observation in rate_limit_observations
+                _build_rate_limit_transition_db_payload(transition)
+                for transition in transitions
             ],
-        )
-        if transitions:
-            await conn.executemany(
-                _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
-                [
-                    _build_rate_limit_transition_db_payload(transition)
-                    for transition in transitions
-                ],
-            )
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort rate-limit "
-            "observations for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
         )
 
 
@@ -17117,38 +17158,30 @@ async def _persist_provider_error_observations_best_effort(
     *,
     identity_by_session: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
-    try:
-        provider_error_observations: List[Dict[str, Any]] = []
-        for record in records:
-            observations = record.get("provider_error_observations")
-            if isinstance(observations, list):
-                provider_error_observations.extend(
-                    observation
-                    for observation in observations
-                    if isinstance(observation, dict)
-                )
-        if not provider_error_observations:
-            return
-        for observation in provider_error_observations:
-            await _apply_claude_auto_review_parent_identity_from_store(
-                conn,
-                observation,
-                identity_by_session,
+    provider_error_observations: List[Dict[str, Any]] = []
+    for record in records:
+        observations = record.get("provider_error_observations")
+        if isinstance(observations, list):
+            provider_error_observations.extend(
+                observation
+                for observation in observations
+                if isinstance(observation, dict)
             )
-        await conn.executemany(
-            _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
-            [
-                _build_provider_error_observation_db_payload(observation)
-                for observation in provider_error_observations
-            ],
+    if not provider_error_observations:
+        return
+    for observation in provider_error_observations:
+        await _apply_claude_auto_review_parent_identity_from_store(
+            conn,
+            observation,
+            identity_by_session,
         )
-    except Exception as exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to persist best-effort provider error "
-            "observations for %d session_history records: %s",
-            len(records),
-            _format_exception_for_warning(exc),
-        )
+    await conn.executemany(
+        _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
+        [
+            _build_provider_error_observation_db_payload(observation)
+            for observation in provider_error_observations
+        ],
+    )
 
 
 async def _persist_session_history_record(record: Dict[str, Any]) -> None:
