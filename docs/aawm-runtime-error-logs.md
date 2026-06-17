@@ -57,6 +57,7 @@ Practical `context` fields to inspect are:
 - `litellm_call_id`
 - `callback_name`
 - `callback_phase`
+- `handler_branch`
 - `langfuse_failure_class`
 
 Pass-through upstream failures populate this context from safe route metadata.
