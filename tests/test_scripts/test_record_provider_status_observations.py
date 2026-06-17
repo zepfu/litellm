@@ -382,6 +382,127 @@ def _grok_billing_auth_context(**overrides) -> dict:
     return context
 
 
+def test_resolve_grok_sidecar_auth_file_prefers_aawm_override(tmp_path, monkeypatch) -> None:
+    aawm_auth = tmp_path / "aawm-auth.json"
+    native_auth = tmp_path / "native-auth.json"
+    aawm_auth.write_text("{}", encoding="utf-8")
+    native_auth.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE", str(aawm_auth))
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(native_auth))
+
+    resolved_path, source = loop._resolve_grok_sidecar_auth_file(
+        loop.DEFAULT_GROK_OIDC_AUTH_FILE
+    )
+
+    assert resolved_path == str(aawm_auth)
+    assert source == "AAWM_GROK_OIDC_AUTH_FILE"
+
+
+def test_resolve_grok_sidecar_auth_file_falls_back_to_native_precedence(tmp_path, monkeypatch) -> None:
+    litellm_auth = tmp_path / "litellm-auth.json"
+    oauth_auth = tmp_path / "oauth-auth.json"
+    litellm_auth.write_text("{}", encoding="utf-8")
+    oauth_auth.write_text("{}", encoding="utf-8")
+
+    for env_name in (
+        "AAWM_GROK_OIDC_AUTH_FILE",
+        "LITELLM_XAI_GROK_AUTH_FILE",
+        "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
+        "GROK_AUTH_FILE",
+        "GROK_HOME",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(litellm_auth))
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_GROK_AUTH_FILE", str(oauth_auth))
+
+    resolved_path, source = loop._resolve_grok_sidecar_auth_file(
+        loop.DEFAULT_GROK_OIDC_AUTH_FILE
+    )
+
+    assert resolved_path == str(litellm_auth)
+    assert source == "LITELLM_XAI_GROK_AUTH_FILE"
+
+
+def test_resolve_grok_sidecar_auth_file_keeps_configured_missing_path(
+    tmp_path, monkeypatch
+) -> None:
+    missing_auth = tmp_path / "missing-auth.json"
+    default_like_auth = tmp_path / "default-auth.json"
+    default_like_auth.write_text("{}", encoding="utf-8")
+
+    for env_name in (
+        "AAWM_GROK_OIDC_AUTH_FILE",
+        "LITELLM_XAI_GROK_AUTH_FILE",
+        "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
+        "GROK_AUTH_FILE",
+        "GROK_HOME",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(missing_auth))
+    monkeypatch.setenv("GROK_AUTH_FILE", str(default_like_auth))
+
+    resolved_path, source = loop._resolve_grok_sidecar_auth_file(None)
+
+    assert resolved_path == str(missing_auth)
+    assert source == "LITELLM_XAI_GROK_AUTH_FILE"
+
+
+def test_resolve_grok_sidecar_auth_file_uses_grok_home_and_default(tmp_path, monkeypatch) -> None:
+    grok_home = tmp_path / "grok-home"
+    grok_home.mkdir()
+    grok_auth = grok_home / "auth.json"
+    grok_auth.write_text("{}", encoding="utf-8")
+
+    for env_name in (
+        "AAWM_GROK_OIDC_AUTH_FILE",
+        "LITELLM_XAI_GROK_AUTH_FILE",
+        "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
+        "GROK_AUTH_FILE",
+        "GROK_HOME",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    monkeypatch.setenv("GROK_HOME", str(grok_home))
+
+    resolved_path, source = loop._resolve_grok_sidecar_auth_file(
+        loop.DEFAULT_GROK_OIDC_AUTH_FILE
+    )
+
+    assert resolved_path == str(grok_auth)
+    assert source == "GROK_HOME"
+
+
+def test_resolve_grok_billing_client_version_prefers_grok_client_version(monkeypatch) -> None:
+    for env_name in (
+        "AAWM_GROK_BILLING_CLIENT_VERSION",
+        "LITELLM_XAI_GROK_CLIENT_VERSION",
+        "GROK_CLIENT_VERSION",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    monkeypatch.setenv("GROK_CLIENT_VERSION", "0.2.70")
+
+    assert loop._resolve_grok_billing_client_version() == "0.2.70"
+
+
+def test_loop_config_defaults_use_grok_client_version_fallback(monkeypatch) -> None:
+    for env_name in (
+        "AAWM_GROK_BILLING_CLIENT_VERSION",
+        "LITELLM_XAI_GROK_CLIENT_VERSION",
+        "GROK_CLIENT_VERSION",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    monkeypatch.setenv("GROK_CLIENT_VERSION", "0.2.70")
+
+    config = loop.parse_config([])
+
+    assert config.grok_billing_client_version == "0.2.70"
+
+
 def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     for env_name in (
         "AAWM_LITELLM_ENVIRONMENT",
@@ -1250,6 +1371,9 @@ def test_grok_billing_request_contract_summary_includes_safe_diagnostics() -> No
     assert summary["client_identifier"] == "grok-cli"
     assert summary["client_version"] == "0.2.55"
     assert summary["x_xai_token_auth_configured"] is True
+    assert summary["resolved_auth_file"] == "/home/zepfu/.grok/auth.json"
+    assert summary["auth_file_source"] == "default"
+    assert summary["poll_max_attempts"] == 3
     assert "authorization" in summary["header_names"]
     assert "x-userid" in summary["header_names"]
     assert len(summary["request_contract_fingerprint"]) == 64
@@ -1296,6 +1420,9 @@ def test_run_due_sidecar_tasks_grok_billing_event_includes_safe_diagnostics(
     assert event["billing_query_keys"] == ["format"]
     assert event["billing_query_present"] is True
     assert event["model_override_configured"] is True
+    assert event["resolved_auth_file"] == "/home/zepfu/.grok/auth.json"
+    assert event["auth_file_source"] == "default"
+    assert event["poll_max_attempts"] == 3
     assert event["request_contract_fingerprint"]
     assert "access-token-secret" not in json.dumps(events)
     assert "xai-grok-cli" not in json.dumps(events)
@@ -1406,6 +1533,8 @@ def test_run_due_sidecar_tasks_grok_billing_event_does_not_emit_identity_fields(
         "persisted",
         "skipped",
         "auth_file",
+        "resolved_auth_file",
+        "auth_file_source",
         "billing_url",
         "client_version",
         "model",
@@ -1414,6 +1543,7 @@ def test_run_due_sidecar_tasks_grok_billing_event_does_not_emit_identity_fields(
         "status_code",
         "attempt_count",
         "retry_count",
+        "poll_max_attempts",
         "http_client",
         "request_method",
         "billing_host",
@@ -1763,7 +1893,7 @@ def test_build_grok_billing_request_headers_omits_native_shape_when_disabled() -
         identity_headers=_grok_billing_auth_context()["identity_headers"],
     )
 
-    assert "content-type" not in headers
+    assert headers["content-type"] == "application/json"
     assert "x-grok-model-override" not in headers
 
 

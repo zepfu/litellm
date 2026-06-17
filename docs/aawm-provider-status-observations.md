@@ -43,7 +43,10 @@ that directory read-only and reads the credential directly for
 Relevant environment variables:
 
 - `AAWM_GROK_OIDC_REFRESH_ENABLED`: enables the scheduled task.
-- `AAWM_GROK_OIDC_AUTH_FILE`: Grok CLI auth JSON path.
+- `AAWM_GROK_OIDC_AUTH_FILE`: Grok CLI auth JSON path. When unset, the
+  sidecar falls back through `LITELLM_XAI_GROK_AUTH_FILE`,
+  `LITELLM_XAI_OAUTH_GROK_AUTH_FILE`, `GROK_AUTH_FILE`, `GROK_HOME/auth.json`,
+  and finally `/home/zepfu/.grok/auth.json`.
 - `AAWM_GROK_OIDC_LOCK_FILE`: file lock path used while writing the auth JSON.
 - `AAWM_GROK_OIDC_AUTH_FILE_UID`: optional uid applied to the atomic auth-file
   replacement. Use this when the sidecar runs as a different container user
@@ -95,19 +98,21 @@ Relevant environment variables:
 - `AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS`: billing endpoint timeout.
 - `AAWM_GROK_BILLING_URL`: billing endpoint URL.
 - `AAWM_GROK_BILLING_CLIENT_VERSION`: Grok CLI client version header.
+  Defaults to `AAWM_GROK_BILLING_CLIENT_VERSION`,
+  `LITELLM_XAI_GROK_CLIENT_VERSION`, `GROK_CLIENT_VERSION`, then `0.2.55`.
 - `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
 - `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
 - `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
 - `AAWM_GROK_BILLING_HTTP_METHOD`: HTTP method used for billing poll requests.
   Defaults to `GET`.
-- `AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE`: when true, include native
-  Grok billing request-shape headers on billing poll requests:
-  `content-type: application/json` and `x-grok-model-override` using
-  `AAWM_GROK_BILLING_MODEL`. Defaults to true so the sidecar matches successful
-  native Grok passthrough/manual billing calls. Set to false only when an
-  operator explicitly wants the older minimal header shape. The model label is
-  still persisted on `rate_limit_observations.model` regardless of this
-  setting.
+- `AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE`: when true, include
+  `x-grok-model-override` using `AAWM_GROK_BILLING_MODEL` on billing poll
+  requests. Defaults to true so the sidecar matches successful native Grok
+  passthrough/manual billing calls. Set to false only when an operator
+  explicitly wants the older minimal header shape. The sidecar still sends
+  `content-type: application/json`; disabling model override only omits
+  `x-grok-model-override`. The model label is still persisted on
+  `rate_limit_observations.model` regardless of this setting.
 - `AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS`: maximum billing poll attempts per
   scheduled run, including retries.
 - `AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS`: base backoff seconds between
@@ -121,14 +126,14 @@ for that scheduled run.
 
 Each due attempt emits a separate `grok_billing_poll` JSON line with sanitized
 status fields such as `attempted`, `persisted`, `skipped`, `auth_file`,
-`billing_url`, `client_version`, `model`, `status_code`, `attempt_count`,
-`retry_count`, `observation_count`, `inserted_count`, `error_class`, and
-`error_message`. For D1-304 debugging, the event also includes compact
-request/transport diagnostics such as `http_client`, `request_method`,
-`billing_host`, `billing_path`, `billing_query_keys`, `billing_query_present`,
-`header_names`, `include_model_override`, `model_override_configured`,
-`client_identifier`, `x_xai_token_auth_configured`, and
-`request_contract_fingerprint`.
+`resolved_auth_file`, `auth_file_source`, `billing_url`, `client_version`,
+`model`, `status_code`, `attempt_count`, `retry_count`, `poll_max_attempts`,
+`observation_count`, `inserted_count`, `error_class`, and `error_message`. For
+D1-304 debugging, the event also includes compact request/transport diagnostics
+such as `http_client`, `request_method`, `billing_host`, `billing_path`,
+`billing_query_keys`, `billing_query_present`, `header_names`,
+`include_model_override`, `model_override_configured`, `client_identifier`,
+`x_xai_token_auth_configured`, and `request_contract_fingerprint`.
 
 The fingerprint is derived from the non-secret request contract only: HTTP
 method, billing host/path, query key names, configured client version and
