@@ -73,6 +73,39 @@ timeouts. Midstream streaming timeouts are logged with the same safe context
 and traceback, but remain terminal because response bytes may already have been
 sent to the client.
 
+## Pass-through hidden upstream retry
+
+AAWM pass-through routes use a fixed hidden retry schedule for retry-safe
+upstream failures before the first response byte is returned to the client. The
+schedule is `5s, 15s, 30s, 60s, 120s` and applies to upstream
+`500`/`502`/`503`/`504`/`529` statuses plus pre-first-byte transport
+connectivity failures such as DNS resolution errors and request timeouts.
+
+`429` rate-limit responses are not hidden-retried. They should surface to the
+client with available retry/reset metadata so alias selection and quota
+observation can make the next decision without burning extra quota.
+
+The retry wrapper intentionally stops at the pre-first-byte boundary. Once a
+streaming response has been handed to the client, midstream failures remain
+terminal for that stream and are recorded through the streaming error context
+path instead of replaying the request.
+
+Routes with their own retry, cooldown, or alias-candidate progression set
+`caller_managed_hidden_retry=True` so the shared pass-through wrapper does not
+double retry. This includes Google/Antigravity adapter calls, OpenRouter adapter
+calls, Codex/auto-agent candidate probes, Cursor lifecycle calls, and Grok
+session side-channel mutation routes.
+
+Successful or exhausted hidden retries add bounded metadata under
+`litellm_params.metadata`, including
+`aawm_passthrough_hidden_retry_attempts`,
+`aawm_passthrough_hidden_retry_count`,
+`aawm_passthrough_hidden_retry_final_outcome`, and, for transport failures,
+`aawm_passthrough_hidden_retry_failure_classification`. These fields contain
+attempt numbers, status/failure class, and wait seconds only; they must not
+contain raw request bodies, response bodies, headers, prompts, tool arguments,
+or credentials.
+
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact
 support: https://langfuse.com/support.`), LiteLLM keeps the original message and
