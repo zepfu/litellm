@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import copy
+import hashlib
 import importlib
 import json
 import os
@@ -8,7 +9,7 @@ import traceback
 from base64 import b64encode
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
 from fastapi import (
@@ -568,6 +569,116 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
         litellm_params["metadata"] = metadata
 
     return metadata
+
+
+def _passthrough_header_value(headers: dict, header_name: str) -> Optional[str]:
+    normalized_name = header_name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == normalized_name and value is not None:
+            return str(value)
+    return None
+
+
+def _safe_passthrough_query_keys(
+    *,
+    url: httpx.URL,
+    requested_query_params: Optional[dict],
+) -> list[str]:
+    query_keys = {
+        key
+        for key, _value in parse_qsl(
+            str(urlparse(str(url)).query),
+            keep_blank_values=True,
+        )
+        if key
+    }
+    if isinstance(requested_query_params, dict):
+        query_keys.update(str(key) for key in requested_query_params if str(key))
+    return sorted(query_keys)
+
+
+def _is_grok_billing_passthrough_request(
+    *,
+    request: Request,
+    url: httpx.URL,
+    metadata: dict[str, Any],
+    custom_llm_provider: Optional[str],
+) -> bool:
+    route_text = " ".join(
+        str(value)
+        for value in (
+            str(url),
+            getattr(request, "url", ""),
+            metadata.get("user_api_key_request_route"),
+            metadata.get("passthrough_route_family"),
+            custom_llm_provider,
+        )
+        if value is not None
+    ).lower()
+    return "/billing" in route_text and (
+        "grok" in route_text or "xai" in route_text or "x.ai" in route_text
+    )
+
+
+def _record_grok_billing_passthrough_request_contract(
+    *,
+    request: Request,
+    url: httpx.URL,
+    headers: dict,
+    requested_query_params: Optional[dict],
+    metadata: dict[str, Any],
+    custom_llm_provider: Optional[str],
+) -> None:
+    if not _is_grok_billing_passthrough_request(
+        request=request,
+        url=url,
+        metadata=metadata,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return
+
+    header_names = sorted({str(key).lower() for key in headers if str(key)})
+    query_keys = _safe_passthrough_query_keys(
+        url=url,
+        requested_query_params=requested_query_params,
+    )
+    user_agent = _passthrough_header_value(headers, "user-agent")
+    fingerprint_payload = {
+        "header_names": header_names,
+        "http_client": "httpx",
+        "method": getattr(request, "method", None),
+        "query_keys": query_keys,
+        "target_host": url.host,
+        "target_path": url.path or "/",
+        "user_agent": user_agent,
+        "x_xai_token_auth_configured": "x-xai-token-auth" in header_names,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+    metadata.update(
+        {
+            "grok_billing_passthrough_http_client": "httpx",
+            "grok_billing_passthrough_request_method": getattr(
+                request,
+                "method",
+                None,
+            ),
+            "grok_billing_passthrough_target_host": url.host,
+            "grok_billing_passthrough_target_path": url.path or "/",
+            "grok_billing_passthrough_query_keys": query_keys,
+            "grok_billing_passthrough_query_present": bool(query_keys),
+            "grok_billing_passthrough_header_names": header_names,
+            "grok_billing_passthrough_user_agent": user_agent,
+            "grok_billing_passthrough_x_xai_token_auth_configured": (
+                "x-xai-token-auth" in header_names
+            ),
+            "grok_billing_passthrough_request_contract_fingerprint": fingerprint,
+        }
+    )
 
 
 async def _passthrough_hidden_retry_sleep(seconds: float) -> None:
@@ -2205,6 +2316,15 @@ async def pass_through_request(  # noqa: PLR0915
                 logging_url = str(url) + "&" + requested_query_params_str
             else:
                 logging_url = str(url) + "?" + requested_query_params_str
+
+        _record_grok_billing_passthrough_request_contract(
+            request=request,
+            url=url,
+            headers=headers,
+            requested_query_params=requested_query_params,
+            metadata=metadata,
+            custom_llm_provider=custom_llm_provider,
+        )
 
         logging_obj.pre_call(
             input=[{"role": "user", "content": safe_dumps(_parsed_body)}],
