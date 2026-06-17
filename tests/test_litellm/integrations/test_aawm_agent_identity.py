@@ -9815,6 +9815,15 @@ def test_session_history_spool_round_trips_event_timestamps_and_quota_only_recor
 
     paths = aawm_agent_identity._session_history_spool_paths()
     assert len(paths) == 1
+    assert paths[0].endswith(".jsonl")
+    raw_lines = [
+        json.loads(line)
+        for line in Path(paths[0]).read_text().splitlines()
+        if line.strip()
+    ]
+    assert raw_lines[0]["type"] == "metadata"
+    assert raw_lines[0]["record_count"] == 1
+    assert raw_lines[1]["type"] == "record"
     loaded = aawm_agent_identity._load_session_history_spool_record(paths[0])
     assert loaded["_skip_session_history"] is True
     assert loaded["litellm_call_id"] == "call-quota-only"
@@ -9854,6 +9863,152 @@ def test_session_history_spool_dir_defaults_to_local_fallback(monkeypatch) -> No
     assert (
         aawm_agent_identity._get_session_history_spool_dir()
         == "/mnt/e/litellm/session_history"
+    )
+
+
+def test_session_history_spool_summary_reports_unavailable_listing(monkeypatch) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="unavailable",
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+
+    assert (
+        aawm_agent_identity._session_history_spool_summary()
+        == "spool_pending=unknown, spool_state=unavailable"
+    )
+
+
+def test_session_history_spool_summary_treats_missing_directory_as_empty(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="missing",
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+
+    assert aawm_agent_identity._session_history_spool_summary() == "spool_pending=0"
+
+
+def test_ensure_session_history_spool_drainer_started_retries_when_listing_unavailable(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="unavailable",
+    )
+    warning_mock = MagicMock()
+    started_threads = []
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            self._alive = False
+
+        def start(self) -> None:
+            self._alive = True
+            started_threads.append(self)
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+    monkeypatch.setattr(aawm_agent_identity.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_spool_drainer",
+        None,
+    )
+
+    aawm_agent_identity._ensure_session_history_spool_drainer_started()
+
+    assert len(started_threads) == 1
+    warning_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any(
+        "session_history spool replay status is unknown" in message
+        for message in warning_messages
+    )
+
+
+def test_ensure_session_history_spool_drainer_started_skips_missing_directory(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="missing",
+    )
+    started_threads = []
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            self._alive = False
+
+        def start(self) -> None:
+            self._alive = True
+            started_threads.append(self)
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+    monkeypatch.setattr(aawm_agent_identity.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_aawm_session_history_spool_drainer",
+        None,
+    )
+
+    aawm_agent_identity._ensure_session_history_spool_drainer_started()
+
+    assert started_threads == []
+
+
+def test_session_history_spool_drainer_skips_when_listing_unavailable(
+    monkeypatch,
+) -> None:
+    listing = aawm_agent_identity._SessionHistorySpoolListing(
+        paths=(),
+        availability="unavailable",
+    )
+    warning_mock = MagicMock()
+    flush_attempts = []
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_list_session_history_spool",
+        lambda: listing,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        lambda batch: flush_attempts.append(batch) or True,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    aawm_agent_identity._session_history_spool_drainer_main()
+
+    assert flush_attempts == []
+    warning_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any(
+        "session_history spool replay status is unknown" in message
+        for message in warning_messages
     )
 
 
@@ -9912,13 +10067,20 @@ def test_failed_session_history_batch_spools_after_retry_budget(
     assert len(timestamp_part) == 14
     assert timestamp_part.isdigit()
     assert "trace-d1-267" in path.name
+    assert path.suffix == ".jsonl"
     assert not list(tmp_path.glob("*.tmp"))
 
     loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
     assert loaded_records == records
     assert loaded_records[0]["start_time"] == observed_at
-    raw_payload = json.loads(Path(paths[0]).read_text())
-    assert raw_payload["failure"] == {"type": "OSError"}
+    raw_lines = [
+        json.loads(line)
+        for line in Path(paths[0]).read_text().splitlines()
+        if line.strip()
+    ]
+    assert raw_lines[0]["type"] == "metadata"
+    assert raw_lines[0]["failure"] == {"type": "OSError"}
+    assert all(line["type"] == "record" for line in raw_lines[1:])
     assert exception_mock.call_count == 1
     warning_messages = [call.args[0] for call in warning_mock.call_args_list]
     assert (
@@ -10119,6 +10281,48 @@ def test_session_history_spool_drainer_flushes_batch_spool_records(
 
     assert flushed_batches == [records]
     assert aawm_agent_identity._session_history_spool_paths() == []
+
+
+def test_session_history_spool_loads_legacy_json_artifacts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    observed_at = datetime(2026, 6, 14, 22, 45, tzinfo=timezone.utc)
+    datetime_marker = aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER
+    legacy_path = tmp_path / "20260614224500-trace-legacy-abc123.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "spooled_at": {
+                    datetime_marker: observed_at.isoformat(),
+                },
+                "reason": "legacy",
+                "record_count": 1,
+                "records": [
+                    {
+                        "litellm_call_id": "call-legacy-json",
+                        "start_time": {
+                            datetime_marker: observed_at.isoformat(),
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+
+    paths = aawm_agent_identity._session_history_spool_paths()
+    assert paths == [str(legacy_path)]
+    loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
+    assert loaded_records[0]["litellm_call_id"] == "call-legacy-json"
+    assert loaded_records[0]["start_time"] == observed_at
 
 
 def test_session_history_spool_drainer_keeps_records_when_flush_fails(

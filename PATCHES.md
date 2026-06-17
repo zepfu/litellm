@@ -2851,6 +2851,36 @@ and running the documented prod readiness/log gates.
 
 ---
 
+### cb-v0.0.50 — Callback overlay parity for durable JSONL session-history spool
+
+**Status:** AAWM callback overlay release candidate.
+
+**What changed:** The callback wheel source under
+`.wheel-build/aawm_litellm_callbacks/agent_identity.py` is synced with the
+in-repo callback at `litellm/integrations/aawm_agent_identity.py` for durable
+session-history outage spooling. New spool artifacts are JSONL files with a
+metadata line followed by one `type=record` line per protected row, while legacy
+`.json` artifacts remain replayable. Spool directory listing failures now report
+`spool_pending=unknown` and keep replay retryable instead of looking like an
+empty backlog.
+
+**Why:** Production imports `aawm_litellm_callbacks.agent_identity` from the
+installed callback wheel, not the in-repo source callback used by `litellm-dev`.
+The production container on `aawm-litellm-callbacks=0.0.48` still wrote legacy
+`.json` spool files even after the base image and host mount were promoted.
+
+**Why not upstream:** This is specific to AAWM's callback overlay release line,
+`aawm_tristore` session-history persistence, and local host-mounted outage
+spooling.
+
+**Validation status:** Source and overlay callback files are kept in parity.
+Focused tests cover JSONL write/load/replay behavior and legacy `.json`
+loading. Production promotion requires publishing `cb-v0.0.50`, rebuilding the
+production image so it installs that wheel, and rerunning the prod-safe spool
+write/load/replay cleanup proof.
+
+---
+
 
 ## Dropped Patches
 

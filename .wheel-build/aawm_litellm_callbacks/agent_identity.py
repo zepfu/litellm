@@ -47,6 +47,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -2848,12 +2849,17 @@ def _reset_session_history_flush_failure_window() -> Optional[int]:
         return suppressed_failures
 
 
-def _session_history_spool_paths() -> List[str]:
+class _SessionHistorySpoolListing(NamedTuple):
+    paths: Tuple[str, ...]
+    availability: str
+
+
+def _list_session_history_spool() -> _SessionHistorySpoolListing:
     spool_dir = _get_session_history_spool_dir()
     try:
         names = os.listdir(spool_dir)
     except FileNotFoundError:
-        return []
+        return _SessionHistorySpoolListing(paths=(), availability="missing")
     except Exception as exc:
         verbose_logger.warning(
             "AawmAgentIdentity: unable to list session_history spool directory "
@@ -2861,22 +2867,44 @@ def _session_history_spool_paths() -> List[str]:
             spool_dir,
             _format_exception_for_warning(exc),
         )
-        return []
-    return sorted(
-        os.path.join(spool_dir, name)
-        for name in names
-        if name.endswith(".json")
+        return _SessionHistorySpoolListing(paths=(), availability="unavailable")
+    return _SessionHistorySpoolListing(
+        paths=tuple(
+            sorted(
+                os.path.join(spool_dir, name)
+                for name in names
+                if name.endswith(".jsonl") or name.endswith(".json")
+            )
+        ),
+        availability="available",
     )
 
 
-def _session_history_spool_summary(paths: Optional[List[str]] = None) -> str:
-    if paths is None:
-        paths = _session_history_spool_paths()
-    if not paths:
+def _session_history_spool_paths() -> List[str]:
+    return list(_list_session_history_spool().paths)
+
+
+def _session_history_spool_summary(
+    paths: Optional[List[str]] = None,
+    *,
+    listing: Optional[_SessionHistorySpoolListing] = None,
+) -> str:
+    if listing is None:
+        if paths is None:
+            listing = _list_session_history_spool()
+        else:
+            listing = _SessionHistorySpoolListing(
+                paths=tuple(paths),
+                availability="available",
+            )
+    if listing.availability == "unavailable":
+        return "spool_pending=unknown, spool_state=unavailable"
+    if not listing.paths:
         return "spool_pending=0"
+    paths_list = list(listing.paths)
 
     oldest_mtime: Optional[float] = None
-    for path in paths:
+    for path in paths_list:
         try:
             mtime = os.path.getmtime(path)
         except OSError:
@@ -2884,9 +2912,11 @@ def _session_history_spool_summary(paths: Optional[List[str]] = None) -> str:
         oldest_mtime = mtime if oldest_mtime is None else min(oldest_mtime, mtime)
 
     if oldest_mtime is None:
-        return f"spool_pending={len(paths)}, oldest_pending_age_s=unknown"
+        return f"spool_pending={len(paths_list)}, oldest_pending_age_s=unknown"
     oldest_age = max(0.0, time.time() - oldest_mtime)
-    return f"spool_pending={len(paths)}, oldest_pending_age_s={oldest_age:.1f}"
+    return (
+        f"spool_pending={len(paths_list)}, oldest_pending_age_s={oldest_age:.1f}"
+    )
 
 
 def _encode_session_history_spool_value(value: Any) -> Any:
@@ -2922,7 +2952,50 @@ def _decode_session_history_spool_value(value: Any) -> Any:
 
 def _load_session_history_spool_records(path: str) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as spool_file:
-        payload = json.load(spool_file)
+        raw_payload = spool_file.read().strip()
+    if not raw_payload:
+        raise ValueError("session_history spool payload is empty")
+
+    if path.endswith(".jsonl"):
+        records: List[Dict[str, Any]] = []
+        for line_number, raw_line in enumerate(raw_payload.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"session_history spool payload line {line_number} is not valid JSON"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"session_history spool payload line {line_number} is not a JSON object"
+                )
+            line_type = payload.get("type")
+            if line_type == "metadata":
+                continue
+            if line_type == "record":
+                record = payload.get("record")
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        "session_history spool payload contains a non-object record"
+                    )
+                records.append(
+                    cast(Dict[str, Any], _decode_session_history_spool_value(record))
+                )
+                continue
+            raise ValueError(
+                f"session_history spool payload line {line_number} has unsupported type"
+            )
+        if records:
+            return records
+        raise ValueError("session_history spool payload does not contain records")
+
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("session_history spool payload is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("session_history spool payload is not a JSON object")
     records = payload.get("records")
@@ -2966,7 +3039,15 @@ def _session_history_spool_drainer_main() -> None:
     try:
         batch_size = _get_session_history_batch_size()
         while True:
-            paths = _session_history_spool_paths()
+            listing = _list_session_history_spool()
+            if listing.availability == "unavailable":
+                verbose_logger.warning(
+                    "AawmAgentIdentity: session_history spool replay status is "
+                    "unknown because the spool directory could not be listed (%s)",
+                    _session_history_spool_summary(listing=listing),
+                )
+                return
+            paths = list(listing.paths)
             if not paths:
                 return
 
@@ -2985,8 +3066,8 @@ def _session_history_spool_drainer_main() -> None:
 
             if not _flush_session_history_batch(batch):
                 verbose_logger.warning(
-                    "AawmAgentIdentity: session_history spool drain failed "
-                    "(batch_size=%d, %s)",
+                    "AawmAgentIdentity: session_history spool drain failed; "
+                    "records remain spooled (batch_size=%d, %s)",
                     len(batch),
                     _session_history_spool_summary(paths),
                 )
@@ -3027,7 +3108,17 @@ def _ensure_session_history_spool_drainer_started() -> None:
     ):
         return
 
-    if not _session_history_spool_paths():
+    listing = _list_session_history_spool()
+    if listing.availability == "missing":
+        return
+    if listing.availability == "unavailable":
+        verbose_logger.warning(
+            "AawmAgentIdentity: session_history spool replay status is unknown "
+            "because the spool directory could not be listed (%s); starting "
+            "spool drainer to retry",
+            _session_history_spool_summary(listing=listing),
+        )
+    elif not listing.paths:
         return
 
     with _aawm_session_history_spool_drainer_lock:
@@ -3096,7 +3187,7 @@ def _session_history_spool_filename(records: List[Dict[str, Any]]) -> str:
     digest = hashlib.sha256(
         json.dumps(digest_input, sort_keys=True).encode("utf-8")
     ).hexdigest()[:12]
-    return f"{timestamp}-{identity}-{digest}.json"
+    return f"{timestamp}-{identity}-{digest}.jsonl"
 
 
 def _spool_session_history_records(
@@ -3124,14 +3215,35 @@ def _spool_session_history_records(
         payload["failure"] = {
             "type": type(failure).__name__,
         }
-    encoded_payload = _encode_session_history_spool_value(payload)
+    metadata_line = {
+        "type": "metadata",
+        "format_version": 1,
+        "spooled_at": _encode_session_history_spool_value(payload["spooled_at"]),
+        "reason": reason,
+        "retry_count": retry_count,
+        "record_count": len(records),
+    }
+    if failure is not None:
+        metadata_line["failure"] = payload["failure"]
     with open(tmp_path, "w", encoding="utf-8") as spool_file:
-        json.dump(encoded_payload, spool_file, separators=(",", ":"), sort_keys=True)
+        spool_file.write(
+            json.dumps(metadata_line, separators=(",", ":"), sort_keys=True)
+        )
         spool_file.write("\n")
+        for index, record in enumerate(records):
+            record_line = {
+                "type": "record",
+                "index": index,
+                "record": _encode_session_history_spool_value(record),
+            }
+            spool_file.write(
+                json.dumps(record_line, separators=(",", ":"), sort_keys=True)
+            )
+            spool_file.write("\n")
     os.replace(tmp_path, final_path)
     verbose_logger.warning(
-        "AawmAgentIdentity: spooled %d session_history records for retry "
-        "(path=%s, reason=%s, %s, %s)",
+        "AawmAgentIdentity: protected %d session_history records by spooling "
+        "for replay (path=%s, reason=%s, %s, %s)",
         len(records),
         final_path,
         reason,
