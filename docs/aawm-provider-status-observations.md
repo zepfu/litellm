@@ -45,6 +45,14 @@ Relevant environment variables:
 - `AAWM_GROK_OIDC_REFRESH_ENABLED`: enables the scheduled task.
 - `AAWM_GROK_OIDC_AUTH_FILE`: Grok CLI auth JSON path.
 - `AAWM_GROK_OIDC_LOCK_FILE`: file lock path used while writing the auth JSON.
+- `AAWM_GROK_OIDC_AUTH_FILE_UID`: optional uid applied to the atomic auth-file
+  replacement. Use this when the sidecar runs as a different container user
+  than the host Grok CLI owner.
+- `AAWM_GROK_OIDC_AUTH_FILE_GID`: optional gid applied to the atomic auth-file
+  replacement.
+- `AAWM_GROK_OIDC_AUTH_FILE_MODE`: optional private file mode applied to the
+  atomic auth-file replacement. Group/other-readable or writable values are
+  rejected and fall back to `0600`.
 - `AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS`: minimum seconds between attempts.
 - `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS`: near-expiry window for non-forced
   refreshes.
@@ -57,6 +65,13 @@ status fields such as `attempted`, `refreshed`, `skipped`, `auth_file`,
 `scope`, `expires_at`, `error_class`, and `error_message`. The event must not
 contain access tokens, refresh tokens, id tokens, client secrets, raw auth
 headers, or the full credential payload.
+
+When Grok OIDC refresh is enabled, the sidecar also performs a metadata-only
+repair on every provider-status cycle before billing polls or token refreshes.
+It applies the configured auth-file uid/gid/mode without reading or rewriting
+token values and emits `grok_oidc_metadata_repair` only when it repairs the file
+or encounters an error. This bounds damage from another process recreating the
+shared auth file with container-owned metadata between hourly refreshes.
 
 ## Grok Billing Poll Task
 
