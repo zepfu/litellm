@@ -79,6 +79,7 @@ def test_refresh_grok_oidc_auth_file_refreshes_near_expiry_and_sanitizes_summary
         ),
         encoding="utf-8",
     )
+    auth_path.chmod(0o640)
 
     class FakeResponse:
         def __init__(self, body: str) -> None:
@@ -259,6 +260,8 @@ def test_refresh_grok_oidc_auth_file_sanitizes_http_error_payload(
         ),
         encoding="utf-8",
     )
+    auth_path.chmod(0o640)
+    initial_mode = stat.S_IMODE(auth_path.stat().st_mode)
 
     class FakeHTTPError(urllib_error.HTTPError):
         def read(self) -> bytes:
@@ -286,3 +289,229 @@ def test_refresh_grok_oidc_auth_file_sanitizes_http_error_payload(
     assert summary["error_class"] == "ValueError"
     assert "invalid_grant" in (summary["error_message"] or "")
     assert "super-secret-token" not in json.dumps(summary)
+
+
+def test_write_credential_payload_preserves_existing_uid_gid_and_clamps_unsafe_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text('{"scope": {"key": "old"}}\n', encoding="utf-8")
+    auth_path.chmod(0o640)
+
+    real_chmod = os.chmod
+    chown_calls: list[tuple[str, int, int]] = []
+    chmod_calls: list[tuple[str, int]] = []
+
+    def fake_chown(target: str | os.PathLike[str], uid: int, gid: int) -> None:
+        chown_calls.append((os.fspath(target), uid, gid))
+
+    def fake_chmod(target: str | os.PathLike[str], mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((os.fspath(target), mode))
+        real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setattr(refresh.os, "chown", fake_chown)
+    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+    monkeypatch.setattr(
+        refresh,
+        "_snapshot_credential_file_metadata",
+        lambda path: refresh._CredentialFileMetadata(uid=1001, gid=1002, mode=0o640),
+    )
+
+    refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
+
+    assert json.loads(auth_path.read_text(encoding="utf-8")) == {"scope": {"key": "new"}}
+    assert len(chown_calls) == 1
+    assert chown_calls[0][0] != str(auth_path)
+    assert chown_calls[0][1:] == (1001, 1002)
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][0] != str(auth_path)
+    assert chmod_calls[0][1] == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
+
+
+def test_write_credential_payload_env_uid_gid_override_existing_bad_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text('{"scope": {"key": "old"}}\n', encoding="utf-8")
+
+    chown_calls: list[tuple[str, int, int]] = []
+
+    def fake_chown(target: str | os.PathLike[str], uid: int, gid: int) -> None:
+        chown_calls.append((os.fspath(target), uid, gid))
+
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_UID", "1001")
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_GID", "1002")
+    monkeypatch.setattr(refresh.os, "chown", fake_chown)
+    monkeypatch.setattr(
+        refresh,
+        "_snapshot_credential_file_metadata",
+        lambda path: refresh._CredentialFileMetadata(uid=65534, gid=65534, mode=0o600),
+    )
+
+    refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
+
+    assert json.loads(auth_path.read_text(encoding="utf-8")) == {"scope": {"key": "new"}}
+    assert len(chown_calls) == 1
+    assert chown_calls[0][1:] == (1001, 1002)
+
+
+def test_write_credential_payload_uses_conservative_mode_for_new_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+
+    real_chmod = os.chmod
+    chmod_calls: list[tuple[str, int]] = []
+
+    def fake_chmod(target: str | os.PathLike[str], mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((os.fspath(target), mode))
+        real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.delenv("AAWM_GROK_OIDC_AUTH_FILE_MODE", raising=False)
+    monkeypatch.delenv("AAWM_GROK_OIDC_AUTH_FILE_UID", raising=False)
+    monkeypatch.delenv("AAWM_GROK_OIDC_AUTH_FILE_GID", raising=False)
+    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+
+    refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
+
+    assert auth_path.exists()
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][0] != str(auth_path)
+    assert chmod_calls[0][1] == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
+
+
+def test_write_credential_payload_honors_optional_new_file_metadata_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+
+    real_chmod = os.chmod
+    chown_calls: list[tuple[str, int, int]] = []
+    chmod_calls: list[tuple[str, int]] = []
+
+    def fake_chown(target: str | os.PathLike[str], uid: int, gid: int) -> None:
+        chown_calls.append((os.fspath(target), uid, gid))
+
+    def fake_chmod(target: str | os.PathLike[str], mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((os.fspath(target), mode))
+        real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_UID", "1001")
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_GID", "1002")
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_MODE", "0o600")
+    monkeypatch.setattr(refresh.os, "chown", fake_chown)
+    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+
+    refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
+
+    assert len(chown_calls) == 1
+    assert chown_calls[0][1:] == (1001, 1002)
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][1] == 0o600
+
+
+def test_write_credential_payload_rejects_wide_env_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    real_chmod = os.chmod
+    chmod_calls: list[tuple[str, int]] = []
+
+    def fake_chmod(target: str | os.PathLike[str], mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((os.fspath(target), mode))
+        real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_MODE", "0o640")
+    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+
+    refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
+
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][1] == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
+
+
+def test_write_credential_payload_preserves_existing_private_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text('{"scope": {"key": "old"}}\n', encoding="utf-8")
+    auth_path.chmod(0o400)
+
+    real_chmod = os.chmod
+    chmod_calls: list[tuple[str, int]] = []
+
+    def fake_chmod(target: str | os.PathLike[str], mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((os.fspath(target), mode))
+        real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+
+    refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
+
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][1] == 0o400
+    if os.name != "nt":
+        assert stat.S_IMODE(auth_path.stat().st_mode) == 0o400
+
+
+def test_repair_grok_oidc_auth_file_metadata_applies_env_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text('{"scope": {"key": "old"}}\n', encoding="utf-8")
+    chown_calls: list[tuple[str, int, int]] = []
+
+    def fake_chown(target: str | os.PathLike[str], uid: int, gid: int) -> None:
+        chown_calls.append((os.fspath(target), uid, gid))
+
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_UID", "1001")
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_GID", "1002")
+    monkeypatch.setattr(refresh.os, "chown", fake_chown)
+    monkeypatch.setattr(
+        refresh,
+        "_snapshot_credential_file_metadata",
+        lambda path: refresh._CredentialFileMetadata(uid=65534, gid=65534, mode=0o600),
+    )
+
+    summary = refresh.repair_grok_oidc_auth_file_metadata(auth_path)
+
+    assert summary["attempted"] is True
+    assert summary["repaired"] is True
+    assert summary["auth_file"] == str(auth_path)
+    assert summary["error_class"] is None
+    assert len(chown_calls) == 1
+    assert chown_calls[0][1:] == (1001, 1002)
+
+
+def test_repair_grok_oidc_auth_file_metadata_quiet_when_already_correct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text('{"scope": {"key": "old"}}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        refresh,
+        "_snapshot_credential_file_metadata",
+        lambda path: refresh._CredentialFileMetadata(uid=1001, gid=1002, mode=0o600),
+    )
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_UID", "1001")
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_GID", "1002")
+
+    summary = refresh.repair_grok_oidc_auth_file_metadata(auth_path)
+
+    assert summary["attempted"] is True
+    assert summary["repaired"] is False
+    assert summary["error_class"] is None

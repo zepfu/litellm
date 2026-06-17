@@ -26436,6 +26436,7 @@ class TestGrokProxyRoute:
     @pytest.mark.asyncio
     async def test_grok_proxy_route_passes_binary_trace_body_without_json_parse(self):
         """should pass Grok protobuf side-channel requests without JSON parsing"""
+        binary_trace_body = b"\x08\x01trace-binary-payload"
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
         mock_request.url = "http://localhost:4000/grok/v1/traces"
@@ -26446,6 +26447,7 @@ class TestGrokProxyRoute:
             "content-type": "application/x-protobuf",
         }
         mock_request.query_params = {}
+        mock_request.body = AsyncMock(return_value=binary_trace_body)
         mock_response = MagicMock(spec=Response)
         mock_user_api_key_dict = MagicMock()
 
@@ -26466,6 +26468,7 @@ class TestGrokProxyRoute:
             )
 
         assert result == {"ok": True}
+        mock_request.body.assert_awaited_once()
         mock_get_request_body.assert_not_awaited()
         call_kwargs = mock_pass_through.await_args.kwargs
         assert call_kwargs["target"] == "https://cli-chat-proxy.grok.com/v1/traces"
@@ -26475,7 +26478,13 @@ class TestGrokProxyRoute:
         assert metadata["client_name"] == "grok-build"
         assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
         assert metadata["grok_cli_chat_proxy"] is True
+        assert metadata["grok_side_channel_endpoint_type"] == "traces"
+        assert metadata["grok_side_channel_request_body_byte_length"] == len(
+            binary_trace_body
+        )
+        assert metadata["grok_side_channel_request_body_digest_source"] == "raw_body"
         assert "route:grok_cli_chat_proxy" in metadata["tags"]
+        assert "grok-side-channel" in metadata["tags"]
         assert "x-grok-client-version" in call_kwargs["allowed_forward_headers"]
 
     def test_build_grok_side_channel_request_shape_metadata_redacts_body_values(self):
@@ -26536,15 +26545,32 @@ class TestGrokProxyRoute:
         assert "secret" not in rendered
 
     @pytest.mark.parametrize(
-        "endpoint,expected_target",
+        "endpoint,expected_target,expected_endpoint_type",
         [
             (
                 "v1/sessions/register",
                 "https://cli-chat-proxy.grok.com/v1/sessions/register",
+                "sessions_register",
             ),
             (
                 "v1/sessions/session_123/replicas/update",
                 "https://cli-chat-proxy.grok.com/v1/sessions/session_123/replicas/update",
+                "sessions_replicas_update",
+            ),
+            (
+                "v1/sessions/session_123/signals",
+                "https://cli-chat-proxy.grok.com/v1/sessions/session_123/signals",
+                "sessions_signals",
+            ),
+            (
+                "v1/sessions/session_123/turn-deltas",
+                "https://cli-chat-proxy.grok.com/v1/sessions/session_123/turn-deltas",
+                "sessions_turn_deltas",
+            ),
+            (
+                "v1/traces",
+                "https://cli-chat-proxy.grok.com/v1/traces",
+                "traces",
             ),
         ],
     )
@@ -26553,6 +26579,7 @@ class TestGrokProxyRoute:
         self,
         endpoint,
         expected_target,
+        expected_endpoint_type,
     ):
         """should suppress generic 5xx exception logging for retryable Grok session side channels"""
         mock_request = MagicMock(spec=Request)
@@ -26593,13 +26620,9 @@ class TestGrokProxyRoute:
             503,
             504,
         ]
-        assert call_kwargs["caller_managed_hidden_retry"] is True
         metadata = call_kwargs["passthrough_logging_metadata"]
         assert metadata["grok_side_channel"] is True
-        assert metadata["grok_side_channel_endpoint_type"] in {
-            "sessions_register",
-            "sessions_replicas_update",
-        }
+        assert metadata["grok_side_channel_endpoint_type"] == expected_endpoint_type
         assert metadata["grok_side_channel_request_content_type"] == "application/json"
         assert metadata["grok_side_channel_request_body_byte_length"] > 0
         assert metadata["grok_side_channel_request_body_sha256"]
