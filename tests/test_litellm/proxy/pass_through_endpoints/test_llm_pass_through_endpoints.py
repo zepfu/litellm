@@ -137,6 +137,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_google_code_assist_function_names,
     _expand_claude_persisted_output_text,
     _extract_codex_auto_agent_error_tokens,
+    _build_grok_side_channel_request_shape_metadata,
+    _extract_redacted_grok_json_request_shape,
     _prepare_anthropic_request_body_for_passthrough,
     _prepare_grok_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
@@ -26627,6 +26629,63 @@ class TestGrokProxyRoute:
         mock_get_request_body.assert_not_awaited()
         mock_pass_through.assert_not_awaited()
 
+    def test_build_grok_side_channel_request_shape_metadata_redacts_body_values(self):
+        """should expose only non-secret request shape metadata for Grok session side channels"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"content-type": "application/json"}
+        parsed_body = {
+            "sessionId": "session-secret-123",
+            "replicaId": "replica-secret-456",
+            "nested": {"token": "super-secret-token"},
+            "items": [{"value": "do-not-log"}],
+            "litellm_metadata": {"session_id": "also-secret"},
+        }
+
+        metadata = _build_grok_side_channel_request_shape_metadata(
+            endpoint="v1/sessions/session-secret-123/replicas/update",
+            request=mock_request,
+            parsed_body=parsed_body,
+        )
+
+        rendered = json.dumps(metadata)
+        assert metadata is not None
+        assert metadata["grok_side_channel"] is True
+        assert metadata["grok_side_channel_endpoint_type"] == "sessions_replicas_update"
+        assert metadata["grok_side_channel_endpoint_path_template"] == (
+            "/sessions/{session_id}/replicas/update"
+        )
+        assert metadata["grok_side_channel_request_content_type"] == "application/json"
+        assert metadata["grok_side_channel_request_body_byte_length"] > 0
+        assert (
+            metadata["grok_side_channel_request_body_digest_source"]
+            == "canonical_json_without_litellm_metadata"
+        )
+        assert metadata["grok_side_channel_request_json_container_type"] == "object"
+        assert metadata["grok_side_channel_request_top_level_key_types"] == {
+            "items": "array",
+            "nested": "object",
+            "replicaId": "str",
+            "sessionId": "str",
+        }
+        assert "session-secret-123" not in rendered
+        assert "replica-secret-456" not in rendered
+        assert "super-secret-token" not in rendered
+        assert "do-not-log" not in rendered
+        assert "also-secret" not in rendered
+
+    def test_extract_redacted_grok_json_request_shape_handles_arrays(self):
+        """should summarize JSON arrays without logging element values"""
+        shape = _extract_redacted_grok_json_request_shape(
+            [{"sessionId": "secret"}, {"sessionId": "secret-2"}]
+        )
+
+        assert shape == {
+            "json_container_type": "array",
+            "array_length": 2,
+        }
+        rendered = json.dumps(shape)
+        assert "secret" not in rendered
+
     @pytest.mark.parametrize(
         "endpoint,expected_target",
         [
@@ -26686,6 +26745,27 @@ class TestGrokProxyRoute:
             504,
         ]
         assert call_kwargs["caller_managed_hidden_retry"] is True
+        metadata = call_kwargs["passthrough_logging_metadata"]
+        assert metadata["grok_side_channel"] is True
+        assert metadata["grok_side_channel_endpoint_type"] in {
+            "sessions_register",
+            "sessions_replicas_update",
+        }
+        assert metadata["grok_side_channel_request_content_type"] == "application/json"
+        assert metadata["grok_side_channel_request_body_byte_length"] > 0
+        assert metadata["grok_side_channel_request_body_sha256"]
+        assert (
+            metadata["grok_side_channel_request_body_digest_source"]
+            == "canonical_json_without_litellm_metadata"
+        )
+        assert metadata["grok_side_channel_request_json_container_type"] == "object"
+        assert metadata["grok_side_channel_request_top_level_key_types"] == {
+            "sessionId": "str",
+        }
+        assert "grok-side-channel" in metadata["tags"]
+        rendered = json.dumps(metadata)
+        assert "sessionId" in rendered
+        assert "session_123" not in rendered
 
 
 class TestCursorProxyRoute:
