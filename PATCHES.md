@@ -2806,6 +2806,16 @@ healthy.
 
 **Validation status:** Focused validation for D1-276 and D1-279 passed the Grok OIDC refresh/candidate-selection tests, Langfuse payload-size audit tests, `ruff`, `py_compile`, and `git diff --check`. Production promotion requires publishing `v1.82.3-aawm.78`, rebuilding/restarting `aawm-litellm` from that pinned base, and rerunning the documented prod readiness and harness gates.
 
+### aawm.79 — D1-296 Grok OIDC sidecar refresh ownership
+
+**What changed:** The fork release line now moves Grok native OIDC refresh ownership out of foreground LiteLLM model requests and into the provider-status/health sidecar. LiteLLM reads the Grok CLI `auth.json` directly as a read-only consumer, no longer copies seed credentials into a managed Grok auth file, no longer force-refreshes Grok credentials after auth-shaped upstream failures, and surfaces sidecar/relogin guidance when the credential is missing, expired, near expiry, or lacks an access token. Managed `oa_xai/*` OAuth remains separate and continues to use the LiteLLM-owned refresh path.
+
+**Why:** Manual Grok OIDC reauth was recurring after idle windows because foreground request handling had become a second credential writer and did not give a durable owner for hourly refresh. The intended production shape is one writable sidecar/CLI credential owner and read-only LiteLLM consumers, so Composer and Grok Build can keep using the declared alias order without LiteLLM racing or replacing the host credential during model dispatch.
+
+**Why not upstream:** This is AAWM-specific local Grok CLI/OIDC operational behavior, provider-status sidecar wiring, and alias failover ergonomics for the AAWM deployment.
+
+**Validation status:** Focused validation passed the xAI/Grok harness subset (`16 passed`), Grok passthrough candidate subset (`6 passed`), sidecar/script tests (`28 passed`), `ruff`, `py_compile`, and `git diff --check`. Production promotion requires publishing `v1.82.3-aawm.79`, adding the corresponding prod provider-status/Grok OIDC writer sidecar in `aawm-infrastructure`, rebuilding/restarting `aawm-litellm` from that pinned base, and verifying the prod LiteLLM container mounts `.grok` read-only while the sidecar owns refresh writes.
+
 ---
 
 
