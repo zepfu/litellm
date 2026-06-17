@@ -151,7 +151,15 @@ or otherwise mutate the Grok CLI credential during model requests.
 The provider-status sidecar is the scheduled writer. It mounts
 `/home/zepfu/.grok` writable, takes a file lock, refreshes the credential on the
 configured cadence, and writes the updated JSON atomically with file mode
-`0600`. In dev compose the sidecar runs with
+`0600`. The atomic write preserves existing file ownership/private mode unless
+`AAWM_GROK_OIDC_AUTH_FILE_UID`, `AAWM_GROK_OIDC_AUTH_FILE_GID`, or
+`AAWM_GROK_OIDC_AUTH_FILE_MODE` are set; group/other-readable or writable modes
+are clamped back to `0600`. Dev compose sets those ownership
+defaults so a prior container-owned `nobody:nogroup` credential is corrected on
+the next sidecar cycle without giving LiteLLM write access. This metadata-only
+repair runs every provider-status sidecar cycle when Grok OIDC refresh is
+enabled; token refresh still follows the configured refresh interval. In dev
+compose the sidecar runs with
 `AAWM_GROK_OIDC_REFRESH_ENABLED=1`,
 `AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/.grok/auth.json`, and a one-hour refresh
 interval. The dev LiteLLM container mounts the same host directory read-only.

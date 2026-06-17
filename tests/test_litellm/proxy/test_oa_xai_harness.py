@@ -210,6 +210,18 @@ def test_litellm_dev_grok_native_oidc_auth_is_sidecar_refreshed_read_only() -> N
         in provider_status["environment"]
     )
     assert (
+        "AAWM_GROK_OIDC_AUTH_FILE_UID=${AAWM_GROK_OIDC_AUTH_FILE_UID:-1000}"
+        in provider_status["environment"]
+    )
+    assert (
+        "AAWM_GROK_OIDC_AUTH_FILE_GID=${AAWM_GROK_OIDC_AUTH_FILE_GID:-1000}"
+        in provider_status["environment"]
+    )
+    assert (
+        "AAWM_GROK_OIDC_AUTH_FILE_MODE=${AAWM_GROK_OIDC_AUTH_FILE_MODE:-0o600}"
+        in provider_status["environment"]
+    )
+    assert (
         "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=${AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS:-3600}"
         in provider_status["environment"]
     )

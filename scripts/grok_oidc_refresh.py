@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,24 @@ class GrokOidcRefreshSummary:
             "auth_file": self.auth_file,
             "scope": self.scope,
             "expires_at": self.expires_at,
+            "error_class": self.error_class,
+            "error_message": self.error_message,
+        }
+
+
+@dataclass(frozen=True)
+class GrokOidcMetadataRepairSummary:
+    attempted: bool
+    repaired: bool
+    auth_file: str
+    error_class: Optional[str] = None
+    error_message: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "attempted": self.attempted,
+            "repaired": self.repaired,
+            "auth_file": self.auth_file,
             "error_class": self.error_class,
             "error_message": self.error_message,
         }
@@ -119,6 +138,42 @@ def refresh_grok_oidc_auth_file(
                 skipped=False,
                 auth_file=str(resolved_auth_file),
                 scope=resolved_scope,
+                error_class=exc.__class__.__name__,
+                error_message=_sanitize_error_message(str(exc)),
+            ).as_dict()
+
+
+def repair_grok_oidc_auth_file_metadata(
+    auth_file: str | Path,
+    *,
+    lock_file: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Repair ownership/mode on the Grok auth file without touching tokens."""
+
+    resolved_auth_file = Path(auth_file).expanduser()
+    resolved_lock_file = (
+        Path(lock_file).expanduser()
+        if lock_file is not None
+        else resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
+    )
+
+    with _credential_file_lock(resolved_lock_file):
+        try:
+            before = _snapshot_credential_file_metadata(resolved_auth_file)
+            target_metadata = _resolve_credential_file_metadata(resolved_auth_file)
+            repaired = before != target_metadata
+            if repaired:
+                _apply_credential_file_metadata(resolved_auth_file, target_metadata)
+            return GrokOidcMetadataRepairSummary(
+                attempted=True,
+                repaired=repaired,
+                auth_file=str(resolved_auth_file),
+            ).as_dict()
+        except Exception as exc:
+            return GrokOidcMetadataRepairSummary(
+                attempted=True,
+                repaired=False,
+                auth_file=str(resolved_auth_file),
                 error_class=exc.__class__.__name__,
                 error_message=_sanitize_error_message(str(exc)),
             ).as_dict()
@@ -374,16 +429,104 @@ def _update_credential_record(
         credential["token_type"] = token_type.strip()
 
 
+DEFAULT_GROK_OIDC_AUTH_FILE_MODE = 0o600
+
+
+@dataclass(frozen=True)
+class _CredentialFileMetadata:
+    uid: Optional[int]
+    gid: Optional[int]
+    mode: int
+
+
+def _parse_optional_positive_int(value: Optional[str]) -> Optional[int]:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = int(str(value).strip(), 0)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _resolve_credential_file_mode_override() -> Optional[int]:
+    mode = _parse_optional_positive_int(
+        os.getenv("AAWM_GROK_OIDC_AUTH_FILE_MODE")
+    )
+    if mode is None:
+        return None
+    # Keep credential files user-private; never widen beyond the default.
+    mode = mode & 0o777
+    if mode & 0o077:
+        return DEFAULT_GROK_OIDC_AUTH_FILE_MODE
+    return mode
+
+
+def _resolve_credential_file_metadata(credential_path: Path) -> _CredentialFileMetadata:
+    metadata = _snapshot_credential_file_metadata(credential_path)
+    uid_override = _parse_optional_positive_int(
+        os.getenv("AAWM_GROK_OIDC_AUTH_FILE_UID")
+    )
+    gid_override = _parse_optional_positive_int(
+        os.getenv("AAWM_GROK_OIDC_AUTH_FILE_GID")
+    )
+    mode_override = _resolve_credential_file_mode_override()
+    mode = mode_override if mode_override is not None else metadata.mode
+    if mode & 0o077:
+        mode = DEFAULT_GROK_OIDC_AUTH_FILE_MODE
+    return _CredentialFileMetadata(
+        uid=uid_override if uid_override is not None else metadata.uid,
+        gid=gid_override if gid_override is not None else metadata.gid,
+        mode=mode,
+    )
+
+
+def _snapshot_credential_file_metadata(credential_path: Path) -> _CredentialFileMetadata:
+    if not credential_path.exists():
+        return _CredentialFileMetadata(
+            uid=None,
+            gid=None,
+            mode=DEFAULT_GROK_OIDC_AUTH_FILE_MODE,
+        )
+    file_stat = credential_path.stat()
+    return _CredentialFileMetadata(
+        uid=file_stat.st_uid,
+        gid=file_stat.st_gid,
+        mode=stat.S_IMODE(file_stat.st_mode),
+    )
+
+
+def _apply_credential_file_metadata(
+    target_path: Path,
+    metadata: _CredentialFileMetadata,
+) -> None:
+    if metadata.uid is not None or metadata.gid is not None:
+        os.chown(
+            target_path,
+            metadata.uid if metadata.uid is not None else -1,
+            metadata.gid if metadata.gid is not None else -1,
+        )
+    os.chmod(target_path, metadata.mode)
+
+
 def _write_credential_payload(credential_path: Path, payload: Mapping[str, Any]) -> None:
     credential_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = _resolve_credential_file_metadata(credential_path)
     tmp_path = credential_path.with_name(
         f".{credential_path.name}.{os.getpid()}.tmp"
     )
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.chmod(0o600)
-    os.replace(tmp_path, credential_path)
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        _apply_credential_file_metadata(tmp_path, metadata)
+        os.replace(tmp_path, credential_path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _sanitize_error_message(message: str) -> str:
