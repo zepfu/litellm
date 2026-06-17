@@ -51,12 +51,14 @@ signals, source fields, and interpretation notes that explain how the snapshot
 was classified. These JSONB fields must not contain credentials, account ids,
 authorization headers, prompt bodies, response text, or raw tool arguments.
 
-Grok monthly billing payloads populate `quota_limit`, `quota_used`,
-`quota_remaining`, both billing-period boundary columns, and a raw copy of the
-sanitized `monthlyLimit`, `used`, `onDemandCap`, and period fields. xAI OAuth
-rate-limit headers populate absolute request/token amounts and carry billing
-period ends when the provider config or managed subscription context exposes
-one.
+Grok monthly billing payloads with absolute counters populate `quota_limit`,
+`quota_used`, `quota_remaining`, both billing-period boundary columns, and a raw
+copy of the sanitized `monthlyLimit`, `used`, `onDemandCap`, and period fields.
+Newer Grok credit billing payloads may provide only `creditUsagePercent` and
+`productUsage`; those snapshots populate `remaining_pct` and leave absolute
+quota fields null rather than inventing counts. xAI OAuth rate-limit headers
+populate absolute request/token amounts and carry billing period ends when the
+provider config or managed subscription context exposes one.
 
 ## Session History Outage Spool
 

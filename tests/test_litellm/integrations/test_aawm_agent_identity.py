@@ -8222,6 +8222,153 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
     assert json.loads(payload[17])["signals"] == ["grok_billing_payload"]
 
 
+def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-composer-2.5-fast"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-percentage-billing"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-composer-2.5-fast",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        "request_headers": {
+            "x-grok-client-version": "0.2.55",
+            "x-grok-model-override": "grok-composer-2.5-fast",
+        },
+        "response_body": {
+            "config": {
+                "creditUsagePercent": 14.539333,
+                "productUsage": [
+                    {"name": "GrokBuild", "usagePercent": 12.507334},
+                    {"name": "Api", "usagePercent": 2.032},
+                ],
+                "billingPeriodStart": "2026-06-01T00:00:00+00:00",
+                "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+            }
+        },
+    }
+    observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=kwargs["standard_pass_through_logging_payload"]["response_body"],
+        start_time=observed_at,
+        end_time=observed_at,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["source"] == "grok_billing"
+    assert observation["provider"] == "xai"
+    assert observation["client_family"] == "grok-build"
+    assert observation["model"] == "grok-composer-2.5-fast"
+    assert observation["quota_type"] == "credits"
+    assert observation["quota_period"] == "monthly"
+    assert observation["limit_scope"] == "credits"
+    assert observation["raw_provider_fields"]["quota_unit"] == (
+        "grok_billing_credit_usage_percent"
+    )
+    assert observation["raw_provider_fields"]["quota_unit_interpretation"] == (
+        "percent_of_credit_quota"
+    )
+    assert observation["remaining_pct"] == pytest.approx(85.460667)
+    assert observation["used_percentage"] == pytest.approx(14.539333)
+    assert observation["quota_limit"] is None
+    assert observation["quota_used"] is None
+    assert observation["quota_remaining"] is None
+    assert observation["billing_period_start_at"] == datetime(
+        2026,
+        6,
+        1,
+        tzinfo=timezone.utc,
+    )
+    assert observation["billing_period_end_at"] == datetime(
+        2026,
+        7,
+        1,
+        tzinfo=timezone.utc,
+    )
+    assert observation["provider_resets_at"] == datetime(
+        2026,
+        7,
+        1,
+        tzinfo=timezone.utc,
+    )
+    assert observation["evidence"]["signals"] == [
+        "grok_billing_payload",
+        "grok_billing_percentage_only",
+    ]
+
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
+        observation
+    )
+    assert payload[4] == "xai"
+    assert payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert payload[8] == "credits"
+    assert payload[10] == pytest.approx(85.460667)
+    assert payload[11] is None
+    assert payload[12] is None
+    assert payload[13] is None
+    assert payload[14] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert payload[15] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    raw_provider_fields = json.loads(payload[16])
+    assert raw_provider_fields["creditUsagePercent"] == pytest.approx(14.539333)
+    assert raw_provider_fields["productUsage"][0]["name"] == "GrokBuild"
+    assert json.loads(payload[17])["signals"] == [
+        "grok_billing_payload",
+        "grok_billing_percentage_only",
+    ]
+
+
+def test_build_rate_limit_observations_prefers_absolute_grok_billing_counts() -> None:
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-mixed-billing"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        "response_body": {
+            "config": {
+                "monthlyLimit": {"val": 1000},
+                "used": {"val": 125},
+                "creditUsagePercent": 14.539333,
+                "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+            }
+        },
+    }
+    observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=kwargs["standard_pass_through_logging_payload"]["response_body"],
+        start_time=observed_at,
+        end_time=observed_at,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["quota_type"] == "requests"
+    assert observation["quota_limit"] == pytest.approx(1000.0)
+    assert observation["quota_used"] == pytest.approx(125.0)
+    assert observation["quota_remaining"] == pytest.approx(875.0)
+    assert observation["remaining_pct"] == 88.0
+    assert observation["raw_provider_fields"]["quota_unit"] == "grok_billing_used"
+
+
 def test_build_rate_limit_observations_skips_invalid_grok_billing_limit() -> None:
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["custom_llm_provider"] = "xai"
