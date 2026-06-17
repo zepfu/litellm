@@ -5220,6 +5220,15 @@ class TestPassThroughRequestRetryableFailures:
                 "passthrough_route_family": "anthropic_grok_native_responses_adapter",
                 "trace_id": "trace-123",
                 "provider": "anthropic",
+                "grok_side_channel": True,
+                "grok_side_channel_endpoint_type": "sessions_register",
+                "grok_side_channel_endpoint_path_template": "/sessions/body-secret",
+                "grok_side_channel_request_body_sha256": "deadbeef",
+                "grok_side_channel_request_body_byte_length": 999,
+                "grok_side_channel_request_top_level_key_types": {
+                    "session_id": "string",
+                    "api_key": "string",
+                },
             },
         }
         kwargs = {
@@ -5229,6 +5238,15 @@ class TestPassThroughRequestRetryableFailures:
                     "custom_llm_provider": "xai",
                     "passthrough_route_family": "grok_cli_chat_proxy",
                     "trace_id": "trace-456",
+                    "grok_side_channel": True,
+                    "grok_side_channel_endpoint_type": "traces",
+                    "grok_side_channel_endpoint_path_template": "/grok/v1/traces/{trace_id}",
+                    "grok_side_channel_request_content_type": "application/json",
+                    "grok_side_channel_request_body_byte_length": 128,
+                    "grok_side_channel_request_body_digest_source": "raw_body",
+                    "grok_side_channel_request_json_container_type": "object",
+                    "grok_side_channel_request_array_length": 3,
+                    "grok_side_channel_request_body_sha256": "should-not-appear",
                 }
             }
         }
@@ -5238,6 +5256,21 @@ class TestPassThroughRequestRetryableFailures:
             url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses?api_key=secret"),
             parsed_body=parsed_body,
             kwargs=kwargs,
+            passthrough_logging_metadata={
+                "grok_side_channel": True,
+                "grok_side_channel_endpoint_type": "traces",
+                "grok_side_channel_endpoint_path_template": "/traces",
+                "grok_side_channel_request_content_type": "application/json",
+                "grok_side_channel_request_body_byte_length": 128,
+                "grok_side_channel_request_body_digest_source": "raw_body",
+                "grok_side_channel_request_json_container_type": "object",
+                "grok_side_channel_request_array_length": 3,
+                "grok_side_channel_request_body_sha256": "should-not-appear",
+                "grok_side_channel_request_top_level_key_types": {
+                    "session_id": "string",
+                    "api_key": "string",
+                },
+            },
             custom_llm_provider="xai",
             status_code=400,
             litellm_call_id="call-123",
@@ -5255,7 +5288,23 @@ class TestPassThroughRequestRetryableFailures:
             "status_code": 400,
             "trace_id": "trace-456",
             "litellm_call_id": "call-123",
+            "grok_side_channel": True,
+            "grok_side_channel_endpoint_type": "traces",
+            "grok_side_channel_endpoint_path_template": "/traces",
+            "grok_side_channel_request_content_type": "application/json",
+            "grok_side_channel_request_body_byte_length": 128,
+            "grok_side_channel_request_body_digest_source": "raw_body",
+            "grok_side_channel_request_json_container_type": "object",
+            "grok_side_channel_request_array_length": 3,
         }
+
+        serialized_context = json.dumps(context)
+        assert "deadbeef" not in serialized_context
+        assert "should-not-appear" not in serialized_context
+        assert "session_id" not in serialized_context
+        assert "api_key" not in serialized_context
+        assert "/sessions/body-secret" not in serialized_context
+        assert "999" not in serialized_context
 
     def test_build_passthrough_error_log_context_redacts_upstream_userinfo(self):
         mock_request = MagicMock(spec=Request)
@@ -5270,6 +5319,7 @@ class TestPassThroughRequestRetryableFailures:
             ),
             parsed_body={"model": "grok-composer-2.5-fast"},
             kwargs={},
+            passthrough_logging_metadata=None,
             custom_llm_provider="xai",
             status_code=400,
             litellm_call_id="call-123",

@@ -141,6 +141,16 @@ _AAWM_PASSTHROUGH_ERROR_LOG_TRACE_METADATA_KEYS = (
     "existing_trace_id",
     "langfuse_existing_trace_id",
 )
+_AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS = (
+    "grok_side_channel",
+    "grok_side_channel_endpoint_type",
+    "grok_side_channel_endpoint_path_template",
+    "grok_side_channel_request_content_type",
+    "grok_side_channel_request_body_byte_length",
+    "grok_side_channel_request_body_digest_source",
+    "grok_side_channel_request_json_container_type",
+    "grok_side_channel_request_array_length",
+)
 
 
 def get_response_body(response: httpx.Response) -> Optional[dict]:
@@ -730,6 +740,25 @@ def _first_passthrough_error_context_value(
     return None
 
 
+def _passthrough_error_context_metadata_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return _clean_passthrough_error_context_value(value)
+
+
+def _build_passthrough_error_log_grok_side_channel_context(
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    for field_name in _AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS:
+        value = _passthrough_error_context_metadata_value(metadata.get(field_name))
+        if value is not None:
+            context[field_name] = value
+    return context
+
+
 def _build_passthrough_error_log_endpoint(request: Request) -> Optional[str]:
     request_url = getattr(request, "url", None)
     parsed_url = urlparse(str(request_url or ""))
@@ -777,6 +806,7 @@ def _build_passthrough_error_log_context(
     url: Optional[httpx.URL],
     parsed_body: Optional[dict],
     kwargs: Optional[dict],
+    passthrough_logging_metadata: Optional[dict],
     custom_llm_provider: Optional[str],
     status_code: Optional[int],
     litellm_call_id: Optional[str],
@@ -810,7 +840,7 @@ def _build_passthrough_error_log_context(
         _AAWM_PASSTHROUGH_ERROR_LOG_PROVIDER_METADATA_KEYS,
     )
 
-    return {
+    context = {
         "source": "pass_through_endpoint",
         "container": _clean_passthrough_error_context_value(os.getenv("HOSTNAME")),
         "endpoint": _build_passthrough_error_log_endpoint(request),
@@ -834,6 +864,13 @@ def _build_passthrough_error_log_context(
             litellm_call_id
         ),
     }
+    if isinstance(passthrough_logging_metadata, dict):
+        context.update(
+            _build_passthrough_error_log_grok_side_channel_context(
+                passthrough_logging_metadata
+            )
+        )
+    return context
 
 
 def _format_passthrough_span_timestamp(value: datetime) -> str:
@@ -2022,6 +2059,7 @@ async def pass_through_request(  # noqa: PLR0915
             url=url,
             parsed_body=_parsed_body,
             kwargs=kwargs,
+            passthrough_logging_metadata=passthrough_logging_metadata,
             custom_llm_provider=custom_llm_provider,
             status_code=None,
             litellm_call_id=litellm_call_id,
@@ -2364,6 +2402,7 @@ async def pass_through_request(  # noqa: PLR0915
                 url=url,
                 parsed_body=_parsed_body,
                 kwargs=kwargs,
+                passthrough_logging_metadata=passthrough_logging_metadata,
                 custom_llm_provider=custom_llm_provider,
                 status_code=status_code,
                 litellm_call_id=litellm_call_id,
