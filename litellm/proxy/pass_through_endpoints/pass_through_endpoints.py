@@ -527,6 +527,35 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
     return False
 
 
+def _should_log_passthrough_terminal_failure_without_traceback(
+    *,
+    exc: Exception,
+    kwargs: Optional[dict],
+    status_code: Optional[int],
+) -> bool:
+    if status_code == 429:
+        return False
+
+    metadata = _ensure_passthrough_metadata(kwargs)
+    final_outcome = metadata.get("aawm_passthrough_hidden_retry_final_outcome")
+    if final_outcome not in {"failed_after_retry", "failed_without_retry"}:
+        return False
+
+    if status_code in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES:
+        return True
+
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        return True
+
+    failure_classification = metadata.get(
+        "aawm_passthrough_hidden_retry_failure_classification"
+    )
+    return failure_classification in {
+        "upstream_connectivity_failure",
+        "transport_dns_failure",
+    }
+
+
 def _record_passthrough_hidden_retry_metadata(
     kwargs: Optional[dict],
     *,
@@ -633,7 +662,7 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 wait_seconds=wait_seconds,
                 failure_classification=failure_classification,
             )
-            verbose_proxy_logger.warning(
+            verbose_proxy_logger.info(
                 "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
                 operation_name,
                 attempt_number,
@@ -2323,10 +2352,43 @@ async def pass_through_request(  # noqa: PLR0915
                 **error_log_context,
                 "status_code": status_code,
             }
+        suppress_terminal_failure_traceback = (
+            _should_log_passthrough_terminal_failure_without_traceback(
+                exc=e,
+                kwargs=kwargs,
+                status_code=status_code,
+            )
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
                 status_code,
+            )
+        elif suppress_terminal_failure_traceback:
+            hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)
+            terminal_failure_context = {
+                **error_log_context,
+                "failure_kind": "expected_upstream_capacity_or_internal",
+                "hidden_retry_final_outcome": hidden_retry_metadata.get(
+                    "aawm_passthrough_hidden_retry_final_outcome"
+                ),
+                "hidden_retry_failure_classification": hidden_retry_metadata.get(
+                    "aawm_passthrough_hidden_retry_failure_classification"
+                ),
+                "hidden_retry_count": hidden_retry_metadata.get(
+                    "aawm_passthrough_hidden_retry_count"
+                ),
+            }
+            verbose_proxy_logger.error(
+                (
+                    "Pass through endpoint exhausted hidden retries for upstream failure "
+                    "status=%s error=%s final_outcome=%s retry_count=%s"
+                ),
+                status_code,
+                str(e),
+                hidden_retry_metadata.get("aawm_passthrough_hidden_retry_final_outcome"),
+                hidden_retry_metadata.get("aawm_passthrough_hidden_retry_count"),
+                extra=terminal_failure_context,
             )
         else:
             verbose_proxy_logger.exception(
@@ -2361,9 +2423,11 @@ async def pass_through_request(  # noqa: PLR0915
             custom_llm_provider=custom_llm_provider,
         )
 
-        traceback_str = traceback.format_exc(
-            limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
-        )
+        traceback_str = None
+        if not suppress_terminal_failure_traceback:
+            traceback_str = traceback.format_exc(
+                limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
+            )
         if not suppress_retryable_failure_logging:
             try:
                 await proxy_logging_obj.post_call_failure_hook(

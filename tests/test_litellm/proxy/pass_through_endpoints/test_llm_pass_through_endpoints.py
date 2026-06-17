@@ -139,6 +139,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_codex_auto_agent_error_tokens,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
+    _log_grok_forward_header_compare,
     _prepare_anthropic_request_body_for_passthrough,
     _prepare_grok_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
@@ -5546,6 +5547,87 @@ class TestPassThroughRequestRetryableFailures:
         assert payload["context"]["handler_branch"] == "openai"
         assert "RuntimeError: Overloaded" in payload["traceback"]
         assert "do not log" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_streaming_overloaded_sse_does_not_log_internal_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://api.anthropic.com/v1/messages"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/anthropic/v1/messages",
+            "upstream_url": target_url,
+            "provider": "anthropic",
+            "model": "claude-3-5-sonnet-20240620",
+            "model_alias": "aawm-code-anthropic",
+            "route_family": "anthropic",
+            "status_code": None,
+            "trace_id": "trace-anthropic-overload",
+            "litellm_call_id": "call-anthropic-overload",
+        }
+        success_handler_kwargs = {
+            "litellm_call_id": "call-anthropic-overload",
+            "litellm_params": {"metadata": {}},
+            "standard_logging_object": {"metadata": {}, "request_tags": []},
+        }
+        logging_obj = MagicMock()
+        logging_obj.async_success_handler = AsyncMock()
+        logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
+
+        overloaded_chunk = (
+            'event: error\ndata: {"type":"error","error":{"type":"overloaded_error",'
+            '"message":"Overloaded"}}\n\n'
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                litellm_logging_obj=logging_obj,
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                response=httpx.Response(
+                    200,
+                    request=httpx.Request("POST", target_url),
+                ),
+                url_route=target_url,
+                request_body={"model": "claude-3-5-sonnet-20240620"},
+                endpoint_type=EndpointType.ANTHROPIC,
+                start_time=datetime.now() - timedelta(milliseconds=10),
+                raw_bytes=[overloaded_chunk.encode("utf-8")],
+                end_time=datetime.now(),
+                custom_llm_provider="anthropic",
+                success_handler_kwargs=success_handler_kwargs,
+                error_log_context=error_context,
+            )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        logging_obj.async_success_handler.assert_not_awaited()
+        metadata = success_handler_kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_upstream_stream_degraded"] is True
+        assert metadata["aawm_upstream_stream_error_message"] == "Overloaded"
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        if error_log_path.exists():
+            payloads = [
+                json.loads(line)
+                for line in error_log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            assert not any(
+                "Error in _route_streaming_logging_to_handler" in item.get("message", "")
+                for item in payloads
+            )
 
     @pytest.mark.asyncio
     async def test_pass_through_request_read_timeout_jsonl_uses_504_status(
@@ -26694,6 +26776,139 @@ class TestGrokProxyRoute:
         }
         rendered = json.dumps(shape)
         assert "secret" not in rendered
+
+    def test_log_grok_forward_header_compare_ignores_tracing_headers(self):
+        """should not warn when only expected tracing headers are stripped"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "traceparent": "00-traceparent-value",
+            "tracestate": "vendor=state",
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+        ) as mock_warning:
+            _log_grok_forward_header_compare(
+                endpoint="v1/sessions/register",
+                request=mock_request,
+            )
+
+        mock_warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_side_channel_shape_logs_debug_by_default(self):
+        """should keep side-channel shape metadata while logging at debug by default"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/sessions/register"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "content-type": "application/json",
+            "user-agent": "grok/0.1",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value={"sessionId": "session_123"}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+        ) as mock_info, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.debug"
+        ) as mock_debug:
+            result = await grok_proxy_route(
+                endpoint="v1/sessions/register",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        mock_info.assert_not_called()
+        shape_debug_calls = [
+            call
+            for call in mock_debug.call_args_list
+            if call.args
+            and call.args[0]
+            == "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s"
+        ]
+        assert len(shape_debug_calls) == 1
+        metadata = mock_pass_through.await_args.kwargs["passthrough_logging_metadata"]
+        assert metadata["grok_side_channel_endpoint_type"] == "sessions_register"
+        assert metadata["grok_side_channel_request_body_sha256"]
+        assert metadata["grok_side_channel_request_top_level_key_types"] == {
+            "sessionId": "str",
+        }
+        assert "grok-side-channel" in metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_side_channel_shape_logs_info_when_debug_enabled(
+        self,
+        monkeypatch,
+    ):
+        """should emit info-level side-channel shape logs when Grok route debug is enabled"""
+        monkeypatch.setenv("AAWM_GROK_ROUTE_DEBUG", "1")
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/sessions/register"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "content-type": "application/json",
+            "user-agent": "grok/0.1",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value={"sessionId": "session_123"}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+        ) as mock_info, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.debug"
+        ) as mock_debug:
+            result = await grok_proxy_route(
+                endpoint="v1/sessions/register",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        shape_debug_calls = [
+            call
+            for call in mock_debug.call_args_list
+            if call.args
+            and call.args[0]
+            == "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s"
+        ]
+        assert shape_debug_calls == []
+        shape_info_calls = [
+            call
+            for call in mock_info.call_args_list
+            if call.args
+            and call.args[0]
+            == "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s"
+        ]
+        assert len(shape_info_calls) == 1
 
     @pytest.mark.parametrize(
         "endpoint,expected_target,expected_endpoint_type",
