@@ -396,6 +396,27 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS=${AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS:-5000}"
         in compose_text
     )
+    assert "/home/zepfu/.grok:/home/zepfu/.grok:ro" in compose_text
+    assert "/home/zepfu/.grok:/home/zepfu/.grok" in compose_text
+    assert (
+        "LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}"
+        in compose_text
+    )
+    assert "LITELLM_XAI_GROK_SEED_AUTH_FILE" not in compose_text
+    assert "LITELLM_XAI_GROK_AUTH_LOCK_FILE" not in compose_text
+    assert (
+        "AAWM_GROK_OIDC_REFRESH_ENABLED=${AAWM_GROK_OIDC_REFRESH_ENABLED:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_OIDC_AUTH_FILE=${AAWM_GROK_OIDC_AUTH_FILE:-/home/zepfu/.grok/auth.json}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=${AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS:-3600}"
+        in compose_text
+    )
+    assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
 
 
 def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
@@ -467,6 +488,102 @@ def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
     assert summary["row_count"] == 2
     assert summary["success_count"] == 1
     assert summary["failure_count"] == 1
+
+
+def test_run_due_sidecar_tasks_skips_when_grok_oidc_refresh_disabled(monkeypatch) -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=False,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+        grok_oidc_refresh_enabled=False,
+    )
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "refresh_grok_oidc_auth_file",
+        lambda *_args, **_kwargs: pytest.fail("Grok OIDC refresh should not run"),
+    )
+
+    assert loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    ) == []
+
+
+def test_run_due_sidecar_tasks_runs_grok_oidc_refresh_when_due(monkeypatch) -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=False,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+        grok_oidc_refresh_enabled=True,
+        grok_oidc_auth_file="/home/zepfu/.grok/auth.json",
+        grok_oidc_lock_file="/home/zepfu/.grok/auth.json.lock",
+        grok_oidc_refresh_interval_seconds=3600.0,
+        grok_oidc_refresh_buffer_seconds=300,
+        grok_oidc_force_refresh=True,
+        grok_oidc_http_timeout_seconds=30.0,
+    )
+    calls = []
+
+    def fake_refresh(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "auth_file": "/home/zepfu/.grok/auth.json",
+            "scope": "scope",
+            "expires_at": "2026-06-16T22:00:00Z",
+            "error_class": None,
+            "error_message": None,
+        }
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "refresh_grok_oidc_auth_file",
+        fake_refresh,
+    )
+
+    state = loop.SidecarTaskState()
+    events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
+    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
+
+    assert len(calls) == 2
+    assert calls[0] == (
+        ("/home/zepfu/.grok/auth.json",),
+        {
+            "buffer_seconds": 300,
+            "force": True,
+            "lock_file": "/home/zepfu/.grok/auth.json.lock",
+            "http_timeout_seconds": 30.0,
+        },
+    )
+    assert events[0]["event"] == "grok_oidc_refresh"
+    assert events[0]["environment"] == "dev"
+    assert events[0]["refreshed"] is True
+    assert "access-token" not in str(events)
+    assert second_events == []
+    assert third_events[0]["event"] == "grok_oidc_refresh"
 
 
 def test_run_cycle_requires_dsn_when_apply_enabled(monkeypatch) -> None:

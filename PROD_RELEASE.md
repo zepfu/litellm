@@ -240,6 +240,14 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    environment. In AAWM infra, map it from `AAWM_OPENAI_API_KEY`; having only
    `AAWM_OPENAI_API_KEY` is not enough for `/openai_passthrough/*`.
 
+   Native Grok OIDC routes require the same credential ownership split used in
+   dev: the `aawm-litellm` container must read `/root/.grok/auth.json` or the
+   configured `LITELLM_XAI_GROK_AUTH_FILE` from a read-only `.grok` mount, and
+   the health/provider-status sidecar must be the scheduled writer for the host
+   Grok CLI auth file. Do not configure prod LiteLLM to refresh, seed, copy, or
+   write the Grok CLI credential directly. Keep managed `oa_xai/*`
+   `LITELLM_XAI_OAUTH_AUTH_FILE` on LiteLLM-owned writable storage.
+
    When model-config behavior changed, verify the built image has the expected
    metadata before restarting prod. For example:
 
@@ -281,6 +289,19 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    ```bash
    docker logs --tail 500 aawm-litellm
    ```
+
+7. Verify the Grok OIDC credential ownership split after prod restart.
+
+   ```bash
+   docker inspect aawm-litellm --format '{{json .Mounts}} {{json .Config.Env}}'
+   ```
+
+   The prod LiteLLM container must show a read-only `.grok` mount, must point
+   `LITELLM_XAI_GROK_AUTH_FILE` at the mounted Grok CLI `auth.json`, and must
+   not set legacy seed/copy variables such as `LITELLM_XAI_GROK_SEED_AUTH_FILE`
+   or `LITELLM_XAI_GROK_AUTH_LOCK_FILE`. Verify the health/provider-status
+   sidecar has the writable `.grok` mount plus `AAWM_GROK_OIDC_REFRESH_*`
+   environment variables before running Grok Composer or Grok Build validation.
 
 Do not use `:latest` as the prod base image pin. Production infrastructure
 should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
