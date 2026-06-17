@@ -1188,12 +1188,16 @@ async def _client_async_logging_helper(
         ################################################
         # Async Logging Worker
         ################################################
-        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+        from litellm.litellm_core_utils.logging_worker import (
+            GLOBAL_LOGGING_WORKER,
+            build_async_success_logging_worker_metadata,
+        )
 
         GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
             async_coroutine=logging_obj.async_success_handler(
                 result=result, start_time=start_time, end_time=end_time
-            )
+            ),
+            metadata=build_async_success_logging_worker_metadata(logging_obj),
         )
 
         ################################################

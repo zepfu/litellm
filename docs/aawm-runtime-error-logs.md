@@ -59,6 +59,12 @@ Practical `context` fields to inspect are:
 - `callback_phase`
 - `handler_branch`
 - `langfuse_failure_class`
+- `event_type`
+- `worker_timeout_seconds`
+- `queue_depth`
+- `queue_maxsize`
+- `coroutine_name`
+- `worker_delivery_state`
 
 Pass-through upstream failures populate this context from safe route metadata.
 For both main pass-through exceptions and streaming chunk-processor exceptions,
@@ -120,6 +126,21 @@ adds structured context for triage:
 Treat that class as a Langfuse ingestion/upload failure signal. Check the
 Langfuse web/worker/blob-storage logs near the same timestamp before assuming
 the LiteLLM callback wrapper itself failed.
+
+When the async logging worker times out or fails while delivering a queued
+callback coroutine, the JSONL record uses `source=logging_worker`. The
+`callback_name` and `callback_phase` fields identify the active callback or
+phase when known, while `event_type`, `coroutine_name`,
+`worker_timeout_seconds`, `queue_depth`, `queue_maxsize`, and
+`worker_delivery_state` describe the worker state. These diagnostics are
+bounded scalar fields only; the worker metadata path must not include prompts,
+headers, request or response bodies, tool arguments, OAuth tokens, API keys, or
+raw metadata blobs.
+
+Treat `worker_delivery_state=timed_out` as degraded telemetry. It should make
+the successful provider response fail only if a separate client-facing path
+already failed. Use the callback fields to decide whether the timeout belongs
+to Langfuse, session history, another built-in callback, or a custom logger.
 
 Use the structured fields to group and triage failures, but keep
 `.analysis/todo.md` as the source of truth for active work.
