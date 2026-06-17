@@ -76,9 +76,11 @@ credentials.
 
 Pass-through `httpx.TimeoutException` failures during upstream setup are
 reported as status code `504` so alias wrappers can classify them as upstream
-timeouts. Midstream streaming timeouts are logged with the same safe context
-and traceback, but remain terminal because response bytes may already have been
-sent to the client.
+timeouts. Pre-first-byte `httpx.ConnectError` failures, including DNS
+resolution failures, are retried on the same schedule and reported as status
+code `503` if the retry budget is exhausted. Midstream streaming timeouts are
+logged with the same safe context and traceback, but remain terminal because
+response bytes may already have been sent to the client.
 
 ## Pass-through hidden upstream retry
 
@@ -90,7 +92,11 @@ connectivity failures such as DNS resolution errors and request timeouts.
 
 `429` rate-limit responses are not hidden-retried. They should surface to the
 client with available retry/reset metadata so alias selection and quota
-observation can make the next decision without burning extra quota.
+observation can make the next decision without burning extra quota. Expected
+provider `429` responses are logged at warning level and still run failure
+callbacks with sanitized context, but they do not create active
+`.analysis/*-error.jsonl` exception-intake rows unless a separate callback or
+logging failure occurs.
 
 The retry wrapper intentionally stops at the pre-first-byte boundary. Once a
 streaming response has been handed to the client, midstream failures remain
@@ -112,6 +118,12 @@ Successful or exhausted hidden retries add bounded metadata under
 attempt numbers, status/failure class, and wait seconds only; they must not
 contain raw request bodies, response bodies, headers, prompts, tool arguments,
 or credentials.
+
+When a hidden retry budget is exhausted, the runtime error JSONL context uses
+`failure_kind=transient_provider_connectivity` for DNS/connectivity failures
+and `failure_kind=expected_upstream_capacity_or_internal` for retryable upstream
+HTTP capacity/internal statuses. This keeps active error intake visible while
+making the expected transient class machine-readable.
 
 Intermediate hidden-retry attempts are progress events, not terminal runtime
 failures, and are logged at `INFO`. When all attempts are exhausted for an
