@@ -309,6 +309,8 @@ def _build_http_exception_from_upstream_status_error(
 def _extract_exception_status_code(exc: Exception) -> Optional[int]:
     if isinstance(exc, (httpx.TimeoutException, httpx.ReadTimeout)):
         return status.HTTP_504_GATEWAY_TIMEOUT
+    if isinstance(exc, httpx.ConnectError):
+        return status.HTTP_503_SERVICE_UNAVAILABLE
     for attr_name in ("status_code", "code"):
         value = getattr(exc, attr_name, None)
         if isinstance(value, int):
@@ -554,6 +556,25 @@ def _should_log_passthrough_terminal_failure_without_traceback(
         "upstream_connectivity_failure",
         "transport_dns_failure",
     }
+
+
+def _is_passthrough_expected_provider_rate_limit(
+    *,
+    status_code: Optional[int],
+) -> bool:
+    return status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+
+def _get_passthrough_terminal_failure_kind(
+    *,
+    hidden_retry_failure_classification: Optional[Any],
+) -> str:
+    if hidden_retry_failure_classification in {
+        "transport_dns_failure",
+        "upstream_connectivity_failure",
+    }:
+        return "transient_provider_connectivity"
+    return "expected_upstream_capacity_or_internal"
 
 
 def _record_passthrough_hidden_retry_metadata(
@@ -2359,22 +2380,38 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=status_code,
             )
         )
+        suppress_provider_rate_limit_traceback = (
+            _is_passthrough_expected_provider_rate_limit(status_code=status_code)
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
                 status_code,
             )
+        elif suppress_provider_rate_limit_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced upstream rate limit status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": "expected_provider_rate_limit",
+                },
+            )
         elif suppress_terminal_failure_traceback:
             hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)
+            hidden_retry_failure_classification = hidden_retry_metadata.get(
+                "aawm_passthrough_hidden_retry_failure_classification"
+            )
             terminal_failure_context = {
                 **error_log_context,
-                "failure_kind": "expected_upstream_capacity_or_internal",
+                "failure_kind": _get_passthrough_terminal_failure_kind(
+                    hidden_retry_failure_classification=hidden_retry_failure_classification,
+                ),
                 "hidden_retry_final_outcome": hidden_retry_metadata.get(
                     "aawm_passthrough_hidden_retry_final_outcome"
                 ),
-                "hidden_retry_failure_classification": hidden_retry_metadata.get(
-                    "aawm_passthrough_hidden_retry_failure_classification"
-                ),
+                "hidden_retry_failure_classification": hidden_retry_failure_classification,
                 "hidden_retry_count": hidden_retry_metadata.get(
                     "aawm_passthrough_hidden_retry_count"
                 ),
@@ -2424,7 +2461,10 @@ async def pass_through_request(  # noqa: PLR0915
         )
 
         traceback_str = None
-        if not suppress_terminal_failure_traceback:
+        if (
+            not suppress_terminal_failure_traceback
+            and not suppress_provider_rate_limit_traceback
+        ):
             traceback_str = traceback.format_exc(
                 limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
             )
