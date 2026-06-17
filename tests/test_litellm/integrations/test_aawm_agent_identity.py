@@ -8222,7 +8222,7 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
     assert json.loads(payload[17])["signals"] == ["grok_billing_payload"]
 
 
-def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> None:
+def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> None:  # noqa: PLR0915
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["model"] = "grok-composer-2.5-fast"
     kwargs["custom_llm_provider"] = "xai"
@@ -8233,6 +8233,25 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> Non
             "client_name": "grok-build",
             "grok_model_override": "grok-composer-2.5-fast",
             "passthrough_route_family": "grok_cli_chat_proxy",
+            "grok_billing_passthrough_http_client": "httpx",
+            "grok_billing_passthrough_request_method": "GET",
+            "grok_billing_passthrough_target_host": "cli-chat-proxy.grok.com",
+            "grok_billing_passthrough_target_path": "/v1/billing",
+            "grok_billing_passthrough_query_keys": ["format"],
+            "grok_billing_passthrough_header_names": [
+                "authorization",
+                "user-agent",
+                "x-grok-client-version",
+                "x-grok-model-override",
+                "x-xai-token-auth",
+            ],
+            "grok_billing_passthrough_user_agent": (
+                "grok-pager/0.2.55 grok-shell/0.2.55 (linux; x86_64)"
+            ),
+            "grok_billing_passthrough_x_xai_token_auth_configured": True,
+            "grok_billing_passthrough_request_contract_fingerprint": (
+                "abcd" * 16
+            ),
         }
     )
     kwargs["standard_pass_through_logging_payload"] = {
@@ -8304,6 +8323,20 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> Non
         "grok_billing_payload",
         "grok_billing_percentage_only",
     ]
+    assert observation["evidence"]["request_contract_fingerprint"] == "abcd" * 16
+    assert observation["evidence"]["request_contract_http_client"] == "httpx"
+    assert observation["evidence"]["request_contract_method"] == "GET"
+    assert observation["evidence"]["request_contract_target_host"] == (
+        "cli-chat-proxy.grok.com"
+    )
+    assert observation["evidence"]["request_contract_target_path"] == "/v1/billing"
+    assert observation["evidence"]["request_contract_query_keys"] == ["format"]
+    assert "authorization" in observation["evidence"][
+        "request_contract_header_names"
+    ]
+    assert observation["evidence"][
+        "request_contract_x_xai_token_auth_configured"
+    ] is True
 
     payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
         observation
