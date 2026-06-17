@@ -19242,6 +19242,11 @@ def _is_grok_storage_endpoint(endpoint: str) -> bool:
     return endpoint_path == "/storage" or endpoint_path.startswith("/storage/")
 
 
+def _is_grok_coding_data_retention_endpoint(endpoint: str) -> bool:
+    endpoint_path = _normalize_grok_endpoint_path(endpoint)
+    return endpoint_path == "/privacy/coding-data-retention"
+
+
 def _normalize_grok_endpoint_path(endpoint: str) -> str:
     endpoint_path = httpx.URL(endpoint).path
     if not endpoint_path.startswith("/"):
@@ -19921,8 +19926,13 @@ async def grok_proxy_route(
     `key` query parameter so the upstream Authorization header can remain intact.
     """
     is_storage_endpoint = _is_grok_storage_endpoint(endpoint)
+    is_coding_data_retention_endpoint = (
+        _is_grok_coding_data_retention_endpoint(endpoint)
+    )
     raw_body_passthrough = request.method in {"POST", "PUT", "PATCH"} and (
-        is_storage_endpoint or not _is_grok_json_request(request)
+        is_storage_endpoint
+        or is_coding_data_retention_endpoint
+        or not _is_grok_json_request(request)
     )
     if raw_body_passthrough:
         _safe_set_request_parsed_body(request, {})
@@ -19937,6 +19947,13 @@ async def grok_proxy_route(
             "ok": True,
             "suppressed": True,
             "endpoint": "grok_storage",
+        }
+
+    if is_coding_data_retention_endpoint:
+        return {
+            "ok": True,
+            "suppressed": True,
+            "endpoint": "grok_coding_data_retention",
         }
 
     base_target_url = _get_grok_passthrough_target_base()
