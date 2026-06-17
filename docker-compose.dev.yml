@@ -89,7 +89,8 @@ services:
       - /home/zepfu/.gemini:/home/zepfu/.gemini
       # LiteLLM-owned Antigravity OAuth credential; refresh persists updated tokens here.
       - /home/zepfu/.litellm/antigravity:/home/zepfu/.litellm/antigravity
-      # Grok CLI OAuth tokens for native Grok OIDC passthrough seed only.
+      # Grok CLI OAuth tokens for native Grok OIDC passthrough. LiteLLM reads only;
+      # provider-status-observations owns scheduled refresh writes.
       - /home/zepfu/.grok:/home/zepfu/.grok:ro
       # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
@@ -168,9 +169,7 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
-      - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.litellm/xai/grok-auth.json}
-      - LITELLM_XAI_GROK_SEED_AUTH_FILE=${LITELLM_XAI_GROK_SEED_AUTH_FILE:-/home/zepfu/.grok/auth.json}
-      - LITELLM_XAI_GROK_AUTH_LOCK_FILE=${LITELLM_XAI_GROK_AUTH_LOCK_FILE:-/tmp/grok-auth.json.lock}
+      - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
@@ -194,6 +193,9 @@ services:
       - NET_RAW
     security_opt:
       - no-new-privileges:true
+    volumes:
+      # The provider-status sidecar is the scheduled writer for Grok OIDC.
+      - /home/zepfu/.grok:/home/zepfu/.grok
     environment:
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
@@ -229,6 +231,13 @@ services:
       - AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER=${AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER:-1}
       - AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS=${AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS:-1000}
       - AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS=${AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS:-5000}
+      - AAWM_GROK_OIDC_REFRESH_ENABLED=${AAWM_GROK_OIDC_REFRESH_ENABLED:-1}
+      - AAWM_GROK_OIDC_AUTH_FILE=${AAWM_GROK_OIDC_AUTH_FILE:-/home/zepfu/.grok/auth.json}
+      - AAWM_GROK_OIDC_LOCK_FILE=${AAWM_GROK_OIDC_LOCK_FILE:-/home/zepfu/.grok/auth.json.lock}
+      - AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=${AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS:-3600}
+      - AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=${AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS:-300}
+      - AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}
+      - AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS:-30}
     networks:
       - default
       - aawm_default
