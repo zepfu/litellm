@@ -98,11 +98,14 @@ Relevant environment variables:
 - `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
 - `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
 - `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
-- `AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE`: when true, include
-  `x-grok-model-override` on billing poll requests. Defaults to false; billing
-  is not model-specific and successful native captures did not require this
-  header. The model label is still persisted on `rate_limit_observations.model`
-  regardless of this setting.
+- `AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE`: when true, include native
+  Grok billing request-shape headers on billing poll requests:
+  `content-type: application/json` and `x-grok-model-override` using
+  `AAWM_GROK_BILLING_MODEL`. Defaults to true so the sidecar matches successful
+  native Grok passthrough/manual billing calls. Set to false only when an
+  operator explicitly wants the older minimal header shape. The model label is
+  still persisted on `rate_limit_observations.model` regardless of this
+  setting.
 - `AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS`: maximum billing poll attempts per
   scheduled run, including retries.
 - `AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS`: base backoff seconds between
