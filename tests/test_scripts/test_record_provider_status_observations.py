@@ -344,6 +344,7 @@ def _grok_billing_poll_config(**overrides):
         grok_billing_client_identifier="grok-cli",
         grok_billing_xai_token_auth="xai-grok-cli",
         grok_billing_model="grok-build",
+        grok_billing_http_method="GET",
         grok_billing_include_model_override=True,
         grok_billing_poll_max_attempts=3,
         grok_billing_poll_retry_backoff_seconds=0.5,
@@ -405,6 +406,7 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_GROK_BILLING_CLIENT_IDENTIFIER",
         "AAWM_GROK_BILLING_XAI_TOKEN_AUTH",
         "AAWM_GROK_BILLING_MODEL",
+        "AAWM_GROK_BILLING_HTTP_METHOD",
         "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE",
         "AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS",
         "AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS",
@@ -440,6 +442,7 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.grok_billing_client_identifier == "grok-cli"
     assert config.grok_billing_xai_token_auth == "xai-grok-cli"
     assert config.grok_billing_model == "grok-build"
+    assert config.grok_billing_http_method == "GET"
     assert config.grok_billing_include_model_override is True
     assert config.grok_billing_poll_max_attempts == 3
     assert config.grok_billing_poll_retry_backoff_seconds == 0.5
@@ -554,6 +557,10 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     )
     assert (
         "AAWM_GROK_BILLING_XAI_TOKEN_AUTH=${AAWM_GROK_BILLING_XAI_TOKEN_AUTH:-xai-grok-cli}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_HTTP_METHOD=${AAWM_GROK_BILLING_HTTP_METHOD:-GET}"
         in compose_text
     )
     assert (
@@ -1213,6 +1220,90 @@ def test_run_due_sidecar_tasks_throttles_grok_billing_poll(monkeypatch) -> None:
     assert third_events[0]["event"] == "grok_billing_poll"
 
 
+def test_loop_config_reads_grok_billing_http_method_override(monkeypatch) -> None:
+    monkeypatch.setenv("AAWM_GROK_BILLING_HTTP_METHOD", "post")
+
+    config = loop.parse_config([])
+
+    assert config.grok_billing_http_method == "POST"
+
+
+def test_grok_billing_request_contract_summary_includes_safe_diagnostics() -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_url="https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        grok_billing_http_method="GET",
+    )
+
+    summary = loop._grok_billing_request_contract_summary(
+        config,
+        identity_headers=_grok_billing_auth_context()["identity_headers"],
+    )
+
+    assert summary["http_client"] == "urllib"
+    assert summary["request_method"] == "GET"
+    assert summary["billing_host"] == "cli-chat-proxy.grok.com"
+    assert summary["billing_path"] == "/v1/billing"
+    assert summary["billing_query_keys"] == ["format"]
+    assert summary["billing_query_present"] is True
+    assert summary["include_model_override"] is True
+    assert summary["model_override_configured"] is True
+    assert summary["client_identifier"] == "grok-cli"
+    assert summary["client_version"] == "0.2.55"
+    assert summary["x_xai_token_auth_configured"] is True
+    assert "authorization" in summary["header_names"]
+    assert "x-userid" in summary["header_names"]
+    assert len(summary["request_contract_fingerprint"]) == 64
+    assert "xai-grok-cli" not in json.dumps(summary)
+
+
+def test_run_due_sidecar_tasks_grok_billing_event_includes_safe_diagnostics(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config()
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_grok_billing_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": _grok_billing_payload(),
+            "attempt_count": 1,
+            "retry_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_load_grok_billing_auth_context",
+        lambda _path: _grok_billing_auth_context(),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_grok_billing_observations",
+        lambda *_args, **_kwargs: (1, 1),
+    )
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    event = events[0]
+    assert event["http_client"] == "urllib"
+    assert event["request_method"] == "GET"
+    assert event["billing_host"] == "cli-chat-proxy.grok.com"
+    assert event["billing_path"] == "/v1/billing"
+    assert event["billing_query_keys"] == ["format"]
+    assert event["billing_query_present"] is True
+    assert event["model_override_configured"] is True
+    assert event["request_contract_fingerprint"]
+    assert "access-token-secret" not in json.dumps(events)
+    assert "xai-grok-cli" not in json.dumps(events)
+    assert "user_123" not in json.dumps(events)
+    assert "team_123" not in json.dumps(events)
+    assert "user@example.com" not in json.dumps(events)
+
+
 def test_run_due_sidecar_tasks_persists_grok_billing_snapshot(monkeypatch) -> None:
     config = _grok_billing_poll_config()
     captured = {}
@@ -1314,6 +1405,19 @@ def test_run_due_sidecar_tasks_grok_billing_event_does_not_emit_identity_fields(
         "status_code",
         "attempt_count",
         "retry_count",
+        "http_client",
+        "request_method",
+        "billing_host",
+        "billing_path",
+        "billing_query_keys",
+        "billing_query_present",
+        "header_names",
+        "include_model_override",
+        "model_override_configured",
+        "client_identifier",
+        "client_version",
+        "request_contract_fingerprint",
+        "x_xai_token_auth_configured",
         "error_class",
         "error_message",
     }
@@ -1467,6 +1571,60 @@ def test_fetch_grok_billing_payload_retries_cancelled_timeout_then_succeeds(
     assert fetched["payload"] == _grok_billing_payload()
 
 
+def test_fetch_grok_billing_payload_reloads_auth_context_between_retries(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_max_attempts=2,
+        grok_billing_poll_retry_backoff_seconds=0,
+    )
+    auth_contexts = [
+        _grok_billing_auth_context(access_token="first-token-secret"),
+        _grok_billing_auth_context(access_token="second-token-secret"),
+    ]
+    captured_authorizations: list[str] = []
+
+    def fake_load_auth_context(_path):
+        return auth_contexts.pop(0)
+
+    def fake_urlopen(request, timeout):
+        captured_authorizations.append(request.headers["Authorization"])
+        if len(captured_authorizations) == 1:
+            body = (
+                '{"code":"The operation was cancelled",'
+                '"error":"Timeout expired"}'
+            )
+            raise urllib_error.HTTPError(
+                config.grok_billing_url,
+                400,
+                "Bad Request",
+                hdrs=None,
+                fp=BytesIO(body.encode("utf-8")),
+            )
+        return type(
+            "Resp",
+            (),
+            {
+                "status": 200,
+                "getcode": lambda self: 200,
+                "read": lambda self: json.dumps(_grok_billing_payload()).encode(),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            },
+        )()
+
+    monkeypatch.setattr(loop, "_load_grok_billing_auth_context", fake_load_auth_context)
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    fetched = loop._fetch_grok_billing_payload(config)
+
+    assert fetched["status_code"] == 200
+    assert captured_authorizations == [
+        "Bearer first-token-secret",
+        "Bearer second-token-secret",
+    ]
+
+
 def test_grok_billing_identity_headers_derive_from_oidc_credential() -> None:
     credential = {
         "access_token": "access-token-secret",
@@ -1575,6 +1733,38 @@ def test_build_grok_billing_request_headers_omits_native_shape_when_disabled() -
 
     assert "content-type" not in headers
     assert "x-grok-model-override" not in headers
+
+
+def test_fetch_grok_billing_payload_uses_configured_http_method(monkeypatch) -> None:
+    config = _grok_billing_poll_config(grok_billing_http_method="POST")
+    captured = {}
+
+    monkeypatch.setattr(
+        loop,
+        "_load_grok_billing_auth_context",
+        lambda _path: _grok_billing_auth_context(),
+    )
+
+    def fake_urlopen(request, timeout):
+        captured["method"] = request.get_method()
+        return type(
+            "Resp",
+            (),
+            {
+                "status": 200,
+                "getcode": lambda self: 200,
+                "read": lambda self: json.dumps(_grok_billing_payload()).encode(),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            },
+        )()
+
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    fetched = loop._fetch_grok_billing_payload(config)
+
+    assert fetched["status_code"] == 200
+    assert captured["method"] == "POST"
 
 
 def test_fetch_grok_billing_payload_includes_identity_headers(monkeypatch) -> None:
