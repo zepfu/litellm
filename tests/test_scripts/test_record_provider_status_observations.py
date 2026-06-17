@@ -344,7 +344,7 @@ def _grok_billing_poll_config(**overrides):
         grok_billing_client_identifier="grok-cli",
         grok_billing_xai_token_auth="xai-grok-cli",
         grok_billing_model="grok-build",
-        grok_billing_include_model_override=False,
+        grok_billing_include_model_override=True,
         grok_billing_poll_max_attempts=3,
         grok_billing_poll_retry_backoff_seconds=0.5,
     )
@@ -440,7 +440,7 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.grok_billing_client_identifier == "grok-cli"
     assert config.grok_billing_xai_token_auth == "xai-grok-cli"
     assert config.grok_billing_model == "grok-build"
-    assert config.grok_billing_include_model_override is False
+    assert config.grok_billing_include_model_override is True
     assert config.grok_billing_poll_max_attempts == 3
     assert config.grok_billing_poll_retry_backoff_seconds == 0.5
 
@@ -557,7 +557,7 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert (
-        "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE=${AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE:-0}"
+        "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE=${AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE:-1}"
         in compose_text
     )
 
@@ -1529,7 +1529,7 @@ def test_load_grok_billing_auth_context_reads_identity_from_oidc_credential(
     }
 
 
-def test_build_grok_billing_request_headers_omits_model_override_by_default() -> None:
+def test_build_grok_billing_request_headers_matches_native_passthrough_by_default() -> None:
     config = _grok_billing_poll_config(
         grok_billing_client_version="0.2.55",
         grok_billing_client_identifier="grok-cli",
@@ -1545,26 +1545,26 @@ def test_build_grok_billing_request_headers_omits_model_override_by_default() ->
 
     assert headers["accept"] == "application/json"
     assert headers["authorization"] == "Bearer access-token-secret"
+    assert headers["content-type"] == "application/json"
     assert headers["user-agent"] == "grok/0.2.55"
     assert headers["x-grok-client-identifier"] == "grok-cli"
     assert headers["x-grok-client-version"] == "0.2.55"
-    assert "x-grok-model-override" not in headers
+    assert headers["x-grok-model-override"] == "grok-composer-2.5-fast"
     assert headers["x-xai-token-auth"] == "xai-grok-cli"
     assert headers["x-userid"] == "user_123"
     assert headers["x-grok-user-id"] == "user_123"
     assert headers["x-teamid"] == "team_123"
     assert headers["x-email"] == "user@example.com"
     assert headers["x-grok-req-id"] == headers["x-request-id"]
-    assert "content-type" not in headers
 
 
-def test_build_grok_billing_request_headers_includes_model_override_when_enabled() -> None:
+def test_build_grok_billing_request_headers_omits_native_shape_when_disabled() -> None:
     config = _grok_billing_poll_config(
         grok_billing_client_version="0.2.55",
         grok_billing_client_identifier="grok-cli",
         grok_billing_xai_token_auth="xai-grok-cli",
         grok_billing_model="grok-composer-2.5-fast",
-        grok_billing_include_model_override=True,
+        grok_billing_include_model_override=False,
     )
 
     headers = loop._build_grok_billing_request_headers(
@@ -1573,7 +1573,8 @@ def test_build_grok_billing_request_headers_includes_model_override_when_enabled
         identity_headers=_grok_billing_auth_context()["identity_headers"],
     )
 
-    assert headers["x-grok-model-override"] == "grok-composer-2.5-fast"
+    assert "content-type" not in headers
+    assert "x-grok-model-override" not in headers
 
 
 def test_fetch_grok_billing_payload_includes_identity_headers(monkeypatch) -> None:
