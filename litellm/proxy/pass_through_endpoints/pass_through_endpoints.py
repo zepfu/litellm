@@ -84,6 +84,17 @@ router = APIRouter()
 
 pass_through_endpoint_logging = PassThroughEndpointLogging()
 
+PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (
+    5,
+    15,
+    30,
+    60,
+    120,
+)
+PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset(
+    {500, 502, 503, 504, 529}
+)
+
 # Global registry to track registered pass-through routes and prevent memory leaks
 _registered_pass_through_routes: Dict[
     str, Dict[str, Union[str, List[str], Dict[str, Any]]]
@@ -457,6 +468,180 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
         litellm_params["metadata"] = metadata
 
     return metadata
+
+
+async def _passthrough_hidden_retry_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def _get_passthrough_hidden_retry_wait_seconds(attempt_index: int) -> float:
+    if attempt_index < 0:
+        return 0.0
+    if attempt_index < len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS):
+        return float(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS[attempt_index])
+    return float(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS[-1])
+
+
+def _classify_passthrough_hidden_retry_failure(exc: Exception) -> Tuple[
+    Optional[int],
+    str,
+    Optional[str],
+]:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code, f"http_status_{status_code}", None
+
+    if isinstance(exc, httpx.TimeoutException):
+        return None, "upstream_connectivity_failure", "upstream_connectivity_failure"
+
+    if isinstance(exc, httpx.ConnectError):
+        message = str(exc).lower()
+        if (
+            "name resolution" in message
+            or "temporary failure in name resolution" in message
+        ):
+            return None, "transport_dns_failure", "transport_dns_failure"
+        return None, "upstream_connectivity_failure", "upstream_connectivity_failure"
+
+    status_code = _extract_exception_status_code(exc)
+    if status_code is not None:
+        return status_code, f"http_status_{status_code}", None
+
+    return None, exc.__class__.__name__, None
+
+
+def _is_passthrough_pre_first_byte_hidden_retryable(
+    exc: Exception,
+    *,
+    status_code: Optional[int],
+    failure_class: str,
+) -> bool:
+    if status_code == 429:
+        return False
+    if status_code in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES:
+        return True
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        return True
+    if failure_class in {"transport_dns_failure", "upstream_connectivity_failure"}:
+        return True
+    return False
+
+
+def _record_passthrough_hidden_retry_metadata(
+    kwargs: Optional[dict],
+    *,
+    attempt_number: int,
+    max_attempts: int,
+    status_code: Optional[int],
+    failure_class: str,
+    wait_seconds: float,
+    final_outcome: Optional[str] = None,
+    failure_classification: Optional[str] = None,
+) -> None:
+    if not isinstance(kwargs, dict):
+        return
+    metadata = _ensure_passthrough_metadata(kwargs)
+
+    attempts = metadata.get("aawm_passthrough_hidden_retry_attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+        metadata["aawm_passthrough_hidden_retry_attempts"] = attempts
+
+    attempt_record: Dict[str, Any] = {
+        "attempt": attempt_number,
+        "max_attempts": max_attempts,
+        "failure_class": failure_class,
+        "wait_seconds": round(wait_seconds, 3),
+    }
+    if status_code is not None:
+        attempt_record["status_code"] = status_code
+    if failure_classification is not None:
+        attempt_record["failure_classification"] = failure_classification
+    attempts.append(attempt_record)
+
+    metadata["aawm_passthrough_hidden_retry_count"] = len(attempts)
+    if final_outcome is not None:
+        metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
+    if failure_classification is not None:
+        metadata["aawm_passthrough_hidden_retry_failure_classification"] = (
+            failure_classification
+        )
+
+
+async def _execute_passthrough_pre_first_byte_with_hidden_retries(
+    *,
+    kwargs: Optional[dict],
+    operation_name: str,
+    operation: Any,
+    caller_managed_hidden_retry: bool,
+) -> Any:
+    if caller_managed_hidden_retry:
+        return await operation()
+
+    max_attempts = len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS) + 1
+    attempt_number = 0
+    while True:
+        attempt_number += 1
+        try:
+            result = await operation()
+            if attempt_number > 1:
+                _record_passthrough_hidden_retry_metadata(
+                    kwargs,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    status_code=None,
+                    failure_class="success",
+                    wait_seconds=0.0,
+                    final_outcome="success_after_retry",
+                )
+            return result
+        except Exception as exc:
+            status_code, failure_class, failure_classification = (
+                _classify_passthrough_hidden_retry_failure(exc)
+            )
+            should_retry = _is_passthrough_pre_first_byte_hidden_retryable(
+                exc,
+                status_code=status_code,
+                failure_class=failure_class,
+            )
+            if not should_retry or attempt_number >= max_attempts:
+                _record_passthrough_hidden_retry_metadata(
+                    kwargs,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    status_code=status_code,
+                    failure_class=failure_class,
+                    wait_seconds=0.0,
+                    final_outcome=(
+                        "failed_after_retry"
+                        if attempt_number > 1
+                        else "failed_without_retry"
+                    ),
+                    failure_classification=failure_classification,
+                )
+                raise
+
+            wait_seconds = _get_passthrough_hidden_retry_wait_seconds(
+                attempt_number - 1
+            )
+            _record_passthrough_hidden_retry_metadata(
+                kwargs,
+                attempt_number=attempt_number,
+                max_attempts=max_attempts,
+                status_code=status_code,
+                failure_class=failure_class,
+                wait_seconds=wait_seconds,
+                failure_classification=failure_classification,
+            )
+            verbose_proxy_logger.warning(
+                "Pass-through %s hidden retry attempt %s/%s after %s; sleeping %.1fs",
+                operation_name,
+                attempt_number,
+                max_attempts,
+                failure_class,
+                wait_seconds,
+            )
+            await _passthrough_hidden_retry_sleep(wait_seconds)
 
 
 def _clean_passthrough_error_context_value(value: Any) -> Optional[str]:
@@ -1544,6 +1729,7 @@ async def pass_through_request(  # noqa: PLR0915
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
     retryable_upstream_status_codes: Optional[list[int]] = None,
+    caller_managed_hidden_retry: bool = False,
     raw_body_passthrough: bool = False,
     passthrough_logging_metadata: Optional[dict[str, Any]] = None,
 ):
@@ -1568,6 +1754,8 @@ async def pass_through_request(  # noqa: PLR0915
         expected_target_family: Optional provider family expected for the final egress target
         retryable_upstream_status_codes: Optional upstream status codes that will be retried by the
             caller, so generic passthrough failure logging should be deferred to the adapter layer
+        caller_managed_hidden_retry: When true, disables shared pre-first-byte hidden retries so
+            adapter/candidate-rotation callers do not double-retry upstream failures
         raw_body_passthrough: Forward the original request body as bytes while
             using a small synthetic body for logging. This is intended for
             native binary/protobuf side-channel endpoints.
@@ -1856,15 +2044,44 @@ async def pass_through_request(  # noqa: PLR0915
 
         if stream:
             upstream_wait_started_at = datetime.now()
-            req = async_client.build_request(
-                "POST",
-                url,
-                json=_parsed_body,
-                params=requested_query_params,
-                headers=headers,
-            )
 
-            response = await async_client.send(req, stream=stream)
+            async def _send_stream_pre_first_byte() -> Tuple[httpx.Response, httpx.Request]:
+                req = async_client.build_request(
+                    "POST",
+                    url,
+                    json=_parsed_body,
+                    params=requested_query_params,
+                    headers=headers,
+                )
+                response = await async_client.send(req, stream=stream)
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    error_content = await e.response.aread()
+                    capture_passthrough_shape(
+                        mode="stream_error",
+                        provider=custom_llm_provider or endpoint_type.value,
+                        endpoint_type=endpoint_type,
+                        url_route=str(url),
+                        request_body=_parsed_body,
+                        response=e.response,
+                        upstream_request=getattr(e.response, "request", None) or req,
+                        response_content=error_content,
+                        litellm_call_id=litellm_call_id,
+                        extra_metadata={"stream": True},
+                    )
+                    raise _build_http_exception_from_upstream_status_error(
+                        e,
+                        error_content,
+                    ) from e
+                return response, req
+
+            response, req = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs=kwargs,
+                operation_name="stream_pre_first_byte",
+                operation=_send_stream_pre_first_byte,
+                caller_managed_hidden_retry=caller_managed_hidden_retry,
+            )
             upstream_wait_completed_at = datetime.now()
             _record_passthrough_duration(
                 kwargs,
@@ -1874,27 +2091,6 @@ async def pass_through_request(  # noqa: PLR0915
                 end_time=upstream_wait_completed_at,
                 span_metadata={"stage": "upstream_wait", "stream": True},
             )
-
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                error_content = await e.response.aread()
-                capture_passthrough_shape(
-                    mode="stream_error",
-                    provider=custom_llm_provider or endpoint_type.value,
-                    endpoint_type=endpoint_type,
-                    url_route=str(url),
-                    request_body=_parsed_body,
-                    response=e.response,
-                    upstream_request=getattr(e.response, "request", None) or req,
-                    response_content=error_content,
-                    litellm_call_id=litellm_call_id,
-                    extra_metadata={"stream": True},
-                )
-                raise _build_http_exception_from_upstream_status_error(
-                    e,
-                    error_content,
-                )
 
             return StreamingResponse(
                 PassThroughStreamingHandler.chunk_processor(
@@ -1921,16 +2117,68 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
         upstream_wait_started_at = datetime.now()
-        response = (
-            await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
-                request=request,
-                async_client=async_client,
-                url=url,
-                headers=headers,
-                requested_query_params=requested_query_params,
-                _parsed_body=_parsed_body,
-                raw_body=raw_body,
+
+        async def _send_non_stream_pre_first_byte() -> httpx.Response:
+            response = (
+                await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
+                    request=request,
+                    async_client=async_client,
+                    url=url,
+                    headers=headers,
+                    requested_query_params=requested_query_params,
+                    _parsed_body=_parsed_body,
+                    raw_body=raw_body,
+                )
             )
+            if _is_streaming_response(response) is True:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    error_content = await e.response.aread()
+                    capture_passthrough_shape(
+                        mode="stream_error",
+                        provider=custom_llm_provider or endpoint_type.value,
+                        endpoint_type=endpoint_type,
+                        url_route=str(url),
+                        request_body=_parsed_body,
+                        response=e.response,
+                        upstream_request=getattr(e.response, "request", None),
+                        response_content=error_content,
+                        litellm_call_id=litellm_call_id,
+                        extra_metadata={"stream": True},
+                    )
+                    raise _build_http_exception_from_upstream_status_error(
+                        e,
+                        error_content,
+                    ) from e
+                return response
+
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                capture_passthrough_shape(
+                    mode="nonstream_error",
+                    provider=custom_llm_provider or endpoint_type.value,
+                    endpoint_type=endpoint_type,
+                    url_route=str(url),
+                    request_body=_parsed_body,
+                    response=e.response,
+                    upstream_request=getattr(e.response, "request", None),
+                    response_content=e.response.content,
+                    litellm_call_id=litellm_call_id,
+                    extra_metadata={"stream": False},
+                )
+                raise _build_http_exception_from_upstream_status_error(
+                    e,
+                    e.response.text,
+                ) from e
+            return response
+
+        response = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs=kwargs,
+            operation_name="non_stream_pre_first_byte",
+            operation=_send_non_stream_pre_first_byte,
+            caller_managed_hidden_retry=caller_managed_hidden_retry,
         )
         upstream_wait_completed_at = datetime.now()
         _record_passthrough_duration(
@@ -1944,27 +2192,6 @@ async def pass_through_request(  # noqa: PLR0915
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
         if _is_streaming_response(response) is True:
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                error_content = await e.response.aread()
-                capture_passthrough_shape(
-                    mode="stream_error",
-                    provider=custom_llm_provider or endpoint_type.value,
-                    endpoint_type=endpoint_type,
-                    url_route=str(url),
-                    request_body=_parsed_body,
-                    response=e.response,
-                    upstream_request=getattr(e.response, "request", None),
-                    response_content=error_content,
-                    litellm_call_id=litellm_call_id,
-                    extra_metadata={"stream": True},
-                )
-                raise _build_http_exception_from_upstream_status_error(
-                    e,
-                    error_content,
-                )
-
             return StreamingResponse(
                 PassThroughStreamingHandler.chunk_processor(
                     response=response,
@@ -1987,26 +2214,6 @@ async def pass_through_request(  # noqa: PLR0915
                     litellm_call_id=litellm_call_id,
                 ),
                 status_code=response.status_code,
-            )
-
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            capture_passthrough_shape(
-                mode="nonstream_error",
-                provider=custom_llm_provider or endpoint_type.value,
-                endpoint_type=endpoint_type,
-                url_route=str(url),
-                request_body=_parsed_body,
-                response=e.response,
-                upstream_request=getattr(e.response, "request", None),
-                response_content=e.response.content,
-                litellm_call_id=litellm_call_id,
-                extra_metadata={"stream": False},
-            )
-            raise _build_http_exception_from_upstream_status_error(
-                e,
-                e.response.text,
             )
 
         if response.status_code >= 300:
@@ -2317,6 +2524,7 @@ def create_pass_through_route(
     allowed_forward_headers: Optional[list[str]] = None,
     allowed_pass_through_prefixed_headers: Optional[list[str]] = None,
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
+    caller_managed_hidden_retry: bool = False,
 ):
     # check if target is an adapter.py or a url
     from litellm._uuid import uuid
@@ -2397,6 +2605,7 @@ def create_pass_through_route(
                 "allowed_forward_headers": allowed_forward_headers,
                 "allowed_pass_through_prefixed_headers": allowed_pass_through_prefixed_headers,
                 "blocked_pass_through_prefixed_headers": blocked_pass_through_prefixed_headers,
+                "caller_managed_hidden_retry": caller_managed_hidden_retry,
             }
 
             if passthrough_params is not None:
@@ -2432,6 +2641,10 @@ def create_pass_through_route(
             param_blocked_pass_through_prefixed_headers = target_params.get(
                 "blocked_pass_through_prefixed_headers",
                 blocked_pass_through_prefixed_headers,
+            )
+            param_caller_managed_hidden_retry = target_params.get(
+                "caller_managed_hidden_retry",
+                caller_managed_hidden_retry,
             )
 
             # Construct the full target URL with subpath if needed
@@ -2488,6 +2701,7 @@ def create_pass_through_route(
                 blocked_pass_through_prefixed_headers=cast(
                     Optional[list[str]], param_blocked_pass_through_prefixed_headers
                 ),
+                caller_managed_hidden_retry=bool(param_caller_managed_hidden_retry),
             )
 
     return endpoint_func

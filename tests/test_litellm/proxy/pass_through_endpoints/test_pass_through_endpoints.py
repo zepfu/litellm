@@ -36,6 +36,8 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
     build_aawm_route_access_log_line,
     _direct_capture_xai_passthrough_failure,
+    _execute_passthrough_pre_first_byte_with_hidden_retries,
+    _record_passthrough_hidden_retry_metadata,
     emit_aawm_route_access_log,
     pass_through_request,
 )
@@ -2815,6 +2817,447 @@ async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallba
         request_data=request_payload,
         traceback_str="traceback",
     )
+
+
+class TestPassThroughHiddenRetry:
+    def test_hidden_retry_metadata_initializes_empty_metadata(self):
+        kwargs: dict = {}
+
+        _record_passthrough_hidden_retry_metadata(
+            kwargs,
+            attempt_number=1,
+            max_attempts=6,
+            status_code=529,
+            failure_class="http_status_529",
+            wait_seconds=5.0,
+            failure_classification=None,
+        )
+
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 1
+        assert metadata["aawm_passthrough_hidden_retry_attempts"] == [
+            {
+                "attempt": 1,
+                "max_attempts": 6,
+                "failure_class": "http_status_529",
+                "wait_seconds": 5.0,
+                "status_code": 529,
+            }
+        ]
+
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+    @pytest.mark.asyncio
+    async def test_pass_through_request_retries_non_stream_transient_status_then_succeeds(
+        self,
+        status_code,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        failing_response = httpx.Response(
+            status_code=status_code,
+            content=b'{"error":"internal"}',
+            request=httpx.Request("POST", target_url),
+        )
+        success_response = httpx.Response(
+            status_code=200,
+            content=b'{"id":"msg_1"}',
+            headers={"content-type": "application/json"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(side_effect=[failing_response, success_response])
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(side_effect=fake_sleep),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ) as mock_success_handler:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=False,
+            )
+
+        assert response.status_code == 200
+        assert handler.await_count == 2
+        assert sleep_calls == [5.0]
+        metadata = mock_success_handler.call_args.kwargs["litellm_params"][
+            "metadata"
+        ]
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "success_after_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_attempts"][0][
+            "status_code"
+        ] == status_code
+        assert metadata["aawm_passthrough_hidden_retry_attempts"][-1][
+            "failure_class"
+        ] == "success"
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_retries_transport_dns_failure(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        success_response = httpx.Response(
+            status_code=200,
+            content=b'{"id":"msg_1"}',
+            headers={"content-type": "application/json"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(
+            side_effect=[
+                httpx.ConnectError(
+                    "Temporary failure in name resolution",
+                    request=httpx.Request("POST", target_url),
+                ),
+                success_response,
+            ]
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ):
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=False,
+            )
+
+        assert response.status_code == 200
+        assert handler.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_exhausts_timeout_failures_with_metadata(self):
+        kwargs: dict = {}
+        target_url = "https://api.anthropic.com/v1/messages"
+        operation = AsyncMock(
+            side_effect=httpx.ReadTimeout(
+                "read timed out",
+                request=httpx.Request("POST", target_url),
+            )
+        )
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(side_effect=fake_sleep),
+        ):
+            with pytest.raises(httpx.ReadTimeout):
+                await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                    kwargs=kwargs,
+                    operation_name="test_operation",
+                    operation=operation,
+                    caller_managed_hidden_retry=False,
+                )
+
+        assert operation.await_count == 6
+        assert sleep_calls == [5.0, 15.0, 30.0, 60.0, 120.0]
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "failed_after_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_failure_classification"] == (
+            "upstream_connectivity_failure"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 6
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_does_not_retry_429(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=429,
+            content=b'{"error":"throttled"}',
+            headers={"retry-after": "17"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_sleep:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "429"
+        assert handler.await_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_retries_stream_pre_yield_status(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        req = httpx.Request("POST", target_url)
+        failing_response = httpx.Response(
+            status_code=529,
+            content=b'{"error":"overloaded"}',
+            request=req,
+        )
+        success_response = httpx.Response(
+            status_code=200,
+            content=b"event: message_start\n\ndata: {}\n\n",
+            headers={"content-type": "text/event-stream"},
+            request=req,
+        )
+
+        async def fake_send(request, stream=True):
+            if fake_send.calls == 0:
+                fake_send.calls += 1
+                return failing_response
+            fake_send.calls += 1
+            return success_response
+
+        fake_send.calls = 0
+
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=req)
+        mock_client.send = AsyncMock(side_effect=fake_send)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6", "stream": True},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.PassThroughStreamingHandler.chunk_processor",
+            return_value=iter([b"chunk"]),
+        ):
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6", "stream": True}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=True,
+            )
+
+        assert response.status_code == 200
+        assert mock_client.send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_does_not_retry_after_streaming_response_returned(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        req = httpx.Request("POST", target_url)
+        success_response = httpx.Response(
+            status_code=200,
+            content=b"event: message_start\n\ndata: {}\n\n",
+            headers={"content-type": "text/event-stream"},
+            request=req,
+        )
+
+        async def post_first_byte_failure():
+            yield b"event: message_start\n\n"
+            raise RuntimeError("post-first-byte stream failure")
+
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=req)
+        mock_client.send = AsyncMock(return_value=success_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6", "stream": True},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_sleep, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.PassThroughStreamingHandler.chunk_processor",
+            return_value=post_first_byte_failure(),
+        ):
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6", "stream": True}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=True,
+            )
+            with pytest.raises(RuntimeError, match="post-first-byte stream failure"):
+                async for _chunk in response.body_iterator:
+                    pass
+
+        assert mock_client.send.await_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_opt_out_skips_hidden_retry(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=500,
+            content=b'{"error":"internal"}',
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_sleep:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException):
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    stream=False,
+                    caller_managed_hidden_retry=True,
+                )
+
+        assert handler.await_count == 1
+        mock_sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
