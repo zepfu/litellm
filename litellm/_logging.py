@@ -165,6 +165,7 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "litellm_call_id",
     "callback_name",
     "callback_phase",
+    "handler_branch",
     "langfuse_failure_class",
 )
 
