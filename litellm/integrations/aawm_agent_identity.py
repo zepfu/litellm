@@ -7392,6 +7392,48 @@ def _grok_billing_model(
     ) or "grok-build"
 
 
+def _grok_billing_request_contract_evidence(
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    fingerprint = _clean_non_empty_string(
+        metadata.get("grok_billing_passthrough_request_contract_fingerprint")
+    )
+    if not fingerprint:
+        return {}
+
+    evidence: Dict[str, Any] = {
+        "request_contract_fingerprint": fingerprint,
+    }
+    for metadata_key, evidence_key in (
+        ("grok_billing_passthrough_http_client", "request_contract_http_client"),
+        ("grok_billing_passthrough_request_method", "request_contract_method"),
+        ("grok_billing_passthrough_target_host", "request_contract_target_host"),
+        ("grok_billing_passthrough_target_path", "request_contract_target_path"),
+        ("grok_billing_passthrough_user_agent", "request_contract_user_agent"),
+    ):
+        value = _clean_non_empty_string(metadata.get(metadata_key))
+        if value:
+            evidence[evidence_key] = value
+
+    for metadata_key, evidence_key in (
+        ("grok_billing_passthrough_query_keys", "request_contract_query_keys"),
+        ("grok_billing_passthrough_header_names", "request_contract_header_names"),
+    ):
+        value = metadata.get(metadata_key)
+        if isinstance(value, list):
+            evidence[evidence_key] = [
+                str(item)
+                for item in value
+                if isinstance(item, (str, int, float)) and str(item)
+            ]
+
+    configured = metadata.get("grok_billing_passthrough_x_xai_token_auth_configured")
+    if configured is not None:
+        evidence["request_contract_x_xai_token_auth_configured"] = bool(configured)
+
+    return evidence
+
+
 def _extract_grok_billing_observations(
     kwargs: Dict[str, Any],
     result: Any,
@@ -7407,6 +7449,7 @@ def _extract_grok_billing_observations(
         observed_at,
         "grok_billing",
     )
+    request_contract_evidence = _grok_billing_request_contract_evidence(metadata)
     observations: List[Dict[str, Any]] = []
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         config = _extract_grok_billing_config(candidate)
@@ -7471,6 +7514,7 @@ def _extract_grok_billing_observations(
                                 "Grok billing does not label used.val; observed tool "
                                 "traffic behaves request-like."
                             ),
+                            **request_contract_evidence,
                         },
                     },
                     context,
@@ -7532,6 +7576,7 @@ def _extract_grok_billing_observations(
                             "Grok billing provided percentage-only credit usage; "
                             "absolute quota counts are intentionally left null."
                         ),
+                        **request_contract_evidence,
                     },
                 },
                 context,

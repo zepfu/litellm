@@ -141,3 +141,16 @@ client secrets, account identity values (`user_id`, `team_id`, `email`, or the
 derived `x-userid`, `x-grok-user-id`, `x-teamid`, and `x-email` headers), or the
 full billing credential payload. Billing poll failures are logged and do not
 raise out of the sidecar loop.
+
+Successful native Grok billing passthrough calls also record comparable
+request-contract metadata in Langfuse/session-history metadata and copy the
+fingerprint into `rate_limit_observations.evidence` when a Grok billing payload
+is extracted. Those fields are prefixed with
+`grok_billing_passthrough_` and include the HTTP client, method, target
+host/path, query key names, outbound header names, user-agent, whether
+`x-xai-token-auth` was configured, and a non-secret request-contract
+fingerprint. They intentionally omit authorization tokens, account identity
+values, raw auth payloads, resolved IP addresses, and the configured
+`x-xai-token-auth` value. Compare that passthrough fingerprint with the
+sidecar `request_contract_fingerprint` when investigating sidecar billing poll
+parity.

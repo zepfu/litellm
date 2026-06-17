@@ -41,6 +41,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _direct_capture_xai_passthrough_failure,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
     _is_known_grok_billing_passthrough_timeout_cancel_response,
+    _record_grok_billing_passthrough_request_contract,
     _record_passthrough_hidden_retry_metadata,
     _should_log_passthrough_terminal_failure_without_traceback,
     emit_aawm_route_access_log,
@@ -2941,6 +2942,53 @@ async def test_pass_through_request_adds_xai_context_on_failure_logging():
     assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
     assert metadata["grok_model_override"] == "grok-build"
     assert metadata["xai_cli_chat_proxy"] is True
+
+
+def test_record_grok_billing_passthrough_request_contract_redacts_header_values():
+    request = MagicMock(spec=Request)
+    request.method = "GET"
+    request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+    metadata = {
+        "passthrough_route_family": "grok_cli_chat_proxy",
+        "user_api_key_request_route": "/grok/v1/billing",
+    }
+
+    _record_grok_billing_passthrough_request_contract(
+        request=request,
+        url=httpx.URL("https://cli-chat-proxy.grok.com/v1/billing"),
+        headers={
+            "authorization": "Bearer oidc-token-secret",
+            "content-type": "application/json",
+            "user-agent": "grok-pager/0.2.55 grok-shell/0.2.55 (linux; x86_64)",
+            "x-email": "user@example.com",
+            "x-grok-user-id": "user_123",
+            "x-teamid": "team_123",
+            "x-userid": "user_123",
+            "x-xai-token-auth": "xai-grok-cli",
+        },
+        requested_query_params={"format": "credits"},
+        metadata=metadata,
+        custom_llm_provider="xai",
+    )
+
+    assert metadata["grok_billing_passthrough_http_client"] == "httpx"
+    assert metadata["grok_billing_passthrough_request_method"] == "GET"
+    assert metadata["grok_billing_passthrough_target_host"] == (
+        "cli-chat-proxy.grok.com"
+    )
+    assert metadata["grok_billing_passthrough_target_path"] == "/v1/billing"
+    assert metadata["grok_billing_passthrough_query_keys"] == ["format"]
+    assert metadata["grok_billing_passthrough_query_present"] is True
+    assert metadata["grok_billing_passthrough_x_xai_token_auth_configured"] is True
+    assert "authorization" in metadata["grok_billing_passthrough_header_names"]
+    assert "x-email" in metadata["grok_billing_passthrough_header_names"]
+    assert len(metadata["grok_billing_passthrough_request_contract_fingerprint"]) == 64
+    dumped = json.dumps(metadata)
+    assert "oidc-token-secret" not in dumped
+    assert "xai-grok-cli" not in dumped
+    assert "user@example.com" not in dumped
+    assert "user_123" not in dumped
+    assert "team_123" not in dumped
 
 
 @pytest.mark.asyncio
