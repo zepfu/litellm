@@ -98,6 +98,8 @@ Relevant environment variables:
 - `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
 - `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
 - `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
+- `AAWM_GROK_BILLING_HTTP_METHOD`: HTTP method used for billing poll requests.
+  Defaults to `GET`.
 - `AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE`: when true, include native
   Grok billing request-shape headers on billing poll requests:
   `content-type: application/json` and `x-grok-model-override` using
@@ -120,10 +122,22 @@ for that scheduled run.
 Each due attempt emits a separate `grok_billing_poll` JSON line with sanitized
 status fields such as `attempted`, `persisted`, `skipped`, `auth_file`,
 `billing_url`, `client_version`, `model`, `status_code`, `attempt_count`,
-`retry_count`, `observation_count`,
-`inserted_count`, `error_class`, and `error_message`. The event must not emit
-dedicated identity fields or raw auth headers. It must not contain access
-tokens, refresh tokens, id tokens, client secrets, account identity values
-(`user_id`, `team_id`, `email`, or the derived `x-userid`, `x-grok-user-id`,
-`x-teamid`, and `x-email` headers), or the full billing credential payload.
-Billing poll failures are logged and do not raise out of the sidecar loop.
+`retry_count`, `observation_count`, `inserted_count`, `error_class`, and
+`error_message`. For D1-304 debugging, the event also includes compact
+request/transport diagnostics such as `http_client`, `request_method`,
+`billing_host`, `billing_path`, `billing_query_keys`, `billing_query_present`,
+`header_names`, `include_model_override`, `model_override_configured`,
+`client_identifier`, `x_xai_token_auth_configured`, and
+`request_contract_fingerprint`.
+
+The fingerprint is derived from the non-secret request contract only: HTTP
+method, billing host/path, query key names, configured client version and
+identifier, whether `x-xai-token-auth` is configured, model-override flags, and
+header names. It must not include authorization tokens, account identity values,
+raw auth payloads, resolved IP addresses, or the configured
+`x-xai-token-auth` value. The event must not emit dedicated identity fields or
+raw auth headers. It must not contain access tokens, refresh tokens, id tokens,
+client secrets, account identity values (`user_id`, `team_id`, `email`, or the
+derived `x-userid`, `x-grok-user-id`, `x-teamid`, and `x-email` headers), or the
+full billing credential payload. Billing poll failures are logged and do not
+raise out of the sidecar loop.
