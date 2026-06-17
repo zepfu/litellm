@@ -142,6 +142,13 @@ derived `x-userid`, `x-grok-user-id`, `x-teamid`, and `x-email` headers), or the
 full billing credential payload. Billing poll failures are logged and do not
 raise out of the sidecar loop.
 
+Successful sidecar billing polls copy the same safe request-contract evidence
+into `rate_limit_observations.evidence` with
+`request_contract_source=grok_billing_sidecar_poll`. This lets later DB-only
+investigations distinguish snapshots inserted by the scheduled sidecar from
+snapshots extracted from Grok passthrough/manual traffic without storing auth
+tokens or account identity values.
+
 Successful native Grok billing passthrough calls also record comparable
 request-contract metadata in Langfuse/session-history metadata and copy the
 fingerprint into `rate_limit_observations.evidence` when a Grok billing payload

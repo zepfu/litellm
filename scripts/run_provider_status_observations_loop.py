@@ -216,7 +216,8 @@ WHERE NOT EXISTS (
             latest.quota_remaining,
             latest.billing_period_start_at,
             latest.billing_period_end_at,
-            latest.raw_provider_fields
+            latest.raw_provider_fields,
+            latest.evidence
         FROM public.rate_limit_observations AS latest
         WHERE latest.provider = candidate.provider
           AND latest.quota_key = candidate.quota_key
@@ -244,6 +245,7 @@ WHERE NOT EXISTS (
       AND latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at
       AND latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at
       AND latest.raw_provider_fields IS NOT DISTINCT FROM COALESCE(candidate.raw_provider_fields, '{}'::jsonb)
+      AND latest.evidence IS NOT DISTINCT FROM COALESCE(candidate.evidence, '{}'::jsonb)
 )
 """
 
@@ -1328,11 +1330,53 @@ def _grok_billing_config(response_body: Dict[str, Any]) -> Dict[str, Any]:
     return response_body
 
 
+def _grok_billing_sidecar_request_contract_evidence(
+    config: ProviderStatusLoopConfig,
+    *,
+    identity_headers: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    summary = _grok_billing_request_contract_summary(
+        config,
+        identity_headers=identity_headers,
+    )
+    evidence: Dict[str, Any] = {
+        "request_contract_fingerprint": summary["request_contract_fingerprint"],
+        "request_contract_source": "grok_billing_sidecar_poll",
+    }
+    for summary_key, evidence_key in (
+        ("http_client", "request_contract_http_client"),
+        ("request_method", "request_contract_method"),
+        ("billing_host", "request_contract_target_host"),
+        ("billing_path", "request_contract_target_path"),
+        ("billing_query_keys", "request_contract_query_keys"),
+        ("header_names", "request_contract_header_names"),
+        ("client_identifier", "request_contract_client_identifier"),
+        ("client_version", "request_contract_client_version"),
+    ):
+        value = summary.get(summary_key)
+        if value is not None and value != "" and value != []:
+            evidence[evidence_key] = value
+    for summary_key, evidence_key in (
+        ("billing_query_present", "request_contract_query_present"),
+        ("include_model_override", "request_contract_include_model_override"),
+        ("model_override_configured", "request_contract_model_override_configured"),
+        ("x_xai_token_auth_configured", "request_contract_x_xai_token_auth_configured"),
+    ):
+        value = summary.get(summary_key)
+        if value is not None:
+            evidence[evidence_key] = value
+    user_agent = f"grok/{config.grok_billing_client_version}"
+    if user_agent:
+        evidence["request_contract_user_agent"] = user_agent
+    return evidence
+
+
 def _build_grok_billing_rate_limit_payload(
     config: ProviderStatusLoopConfig,
     *,
     observed_at: datetime,
     response_body: Dict[str, Any],
+    identity_headers: Optional[Mapping[str, str]] = None,
 ) -> tuple[Any, ...]:
     billing_config = _grok_billing_config(response_body)
     billing_period_start_at = _parse_grok_billing_timestamp(
@@ -1420,6 +1464,17 @@ def _build_grok_billing_rate_limit_payload(
         quota_used = None
         quota_remaining = None
 
+    evidence.update(
+        _grok_billing_sidecar_request_contract_evidence(
+            config,
+            identity_headers=identity_headers,
+        )
+    )
+
+    signals = evidence.setdefault("signals", [])
+    if "grok_billing_sidecar_request_contract" not in signals:
+        signals.append("grok_billing_sidecar_request_contract")
+
     return (
         observed_at,
         "grok-build",
@@ -1451,11 +1506,13 @@ def _persist_grok_billing_observations(
     *,
     observed_at: datetime,
     response_body: Dict[str, Any],
+    identity_headers: Optional[Mapping[str, str]] = None,
 ) -> tuple[int, int]:
     payload = _build_grok_billing_rate_limit_payload(
         config,
         observed_at=observed_at,
         response_body=response_body,
+        identity_headers=identity_headers,
     )
     dsn = _resolve_dsn(config)
     try:
@@ -1505,11 +1562,13 @@ def _build_grok_billing_observations_for_dry_run(
     *,
     observed_at: datetime,
     response_body: Dict[str, Any],
+    identity_headers: Optional[Mapping[str, str]] = None,
 ) -> int:
     _build_grok_billing_rate_limit_payload(
         config,
         observed_at=observed_at,
         response_body=response_body,
+        identity_headers=identity_headers,
     )
     return 1
 
@@ -1643,6 +1702,7 @@ def _run_grok_billing_poll_task(
                 config,
                 observed_at=observed_at,
                 response_body=fetched["payload"],
+                identity_headers=auth_context.get("identity_headers"),
             )
             summary["observation_count"] = observation_count
             summary["inserted_count"] = inserted_count
@@ -1652,6 +1712,7 @@ def _run_grok_billing_poll_task(
                 config,
                 observed_at=observed_at,
                 response_body=fetched["payload"],
+                identity_headers=auth_context.get("identity_headers"),
             )
             summary["persisted"] = False
     except Exception as exc:
