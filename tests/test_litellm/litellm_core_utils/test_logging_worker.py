@@ -3,6 +3,9 @@ Tests for the LoggingWorker class to ensure graceful shutdown handling.
 """
 
 import asyncio
+from datetime import datetime
+import json
+import logging
 import contextvars
 from unittest.mock import AsyncMock, patch
 
@@ -114,8 +117,8 @@ class TestLoggingWorker:
     async def test_clear_queue_with_time_limit(self, logging_worker):
         """Test that clear_queue respects the time limit."""
         # Create several mock coroutines that take time to complete
-        slow_coro = AsyncMock()
-        slow_coro.return_value = asyncio.sleep(0.5)  # Takes 500ms
+        async def slow_coro():
+            await asyncio.sleep(0.5)
 
         # Initialize the worker and add items
         logging_worker._ensure_queue()
@@ -137,22 +140,44 @@ class TestLoggingWorker:
         small_worker = LoggingWorker(timeout=1.0, max_queue_size=2)
         small_worker._ensure_queue()
 
+        async def queue_full_coro():
+            await asyncio.sleep(0)
+
+        queued_coroutines = [queue_full_coro(), queue_full_coro()]
+        assert small_worker._queue is not None
+        for coroutine in queued_coroutines:
+            small_worker._queue.put_nowait(
+                {
+                    "coroutine": coroutine,
+                    "context": contextvars.copy_context(),
+                    "metadata": {},
+                }
+            )
+
         # Mock verbose_logger to capture exception messages
         with patch(
             "litellm.litellm_core_utils.logging_worker.verbose_logger"
-        ) as mock_logger:
-            # Fill the queue beyond capacity
-            mock_coro = AsyncMock()
-            for _ in range(5):  # More than max_queue_size of 2
-                small_worker.enqueue(mock_coro())
+        ) as mock_logger, patch.object(
+            small_worker,
+            "_handle_queue_full",
+            side_effect=lambda task: task["coroutine"].close(),
+        ):
+            try:
+                small_worker.enqueue(queue_full_coro())
 
-            # Should have logged queue full exceptions
-            exception_calls = [
-                call
-                for call in mock_logger.exception.call_args_list
-                if "queue is full" in str(call)
-            ]
-            assert len(exception_calls) > 0
+                # Should have logged queue full exceptions
+                exception_calls = [
+                    call
+                    for call in mock_logger.exception.call_args_list
+                    if "queue is full" in str(call)
+                ]
+                assert len(exception_calls) > 0
+            finally:
+                await small_worker.stop()
+                while small_worker._queue is not None and not small_worker._queue.empty():
+                    task = small_worker._queue.get_nowait()
+                    task["coroutine"].close()
+                    small_worker._queue.task_done()
 
     @pytest.mark.asyncio
     async def test_context_propagation(self, logging_worker):
@@ -360,3 +385,253 @@ class TestLoggingWorker:
         assert worker2._bound_loop is not None
 
         await worker2.stop()
+
+
+class TestLoggingWorkerDiagnostics:
+    @pytest.mark.asyncio
+    async def test_worker_timeout_emits_actionable_safe_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        from litellm._logging import AawmErrorLogFileHandler
+
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        worker = LoggingWorker(timeout=0.05, max_queue_size=4, concurrency=1)
+        worker.start()
+
+        from litellm.litellm_core_utils.logging_worker import (
+            set_logging_worker_active_callback,
+        )
+
+        async def slow_async_success_handler():
+            set_logging_worker_active_callback(
+                callback_name="langfuse",
+                callback_phase="async_success_handler",
+            )
+            await asyncio.sleep(1)
+
+        metadata = {
+            "source": "logging_worker",
+            "event_type": "async_success",
+            "callback_name": "async_success_handler",
+            "callback_phase": "async_success_handler",
+            "trace_id": "trace-123",
+            "litellm_call_id": "call-456",
+            "model": "gpt-test",
+            "model_alias": "aawm-codex-agent-auto",
+            "provider": "openai",
+            "custom_llm_provider": "openai",
+            "route_family": "codex_responses",
+            "api_key": "sk-should-not-appear",
+            "messages": [{"role": "user", "content": "secret prompt"}],
+        }
+
+        handler = AawmErrorLogFileHandler()
+        test_logger = logging.getLogger("litellm-test-logging-worker")
+        test_logger.handlers = [handler]
+        test_logger.setLevel(logging.ERROR)
+
+        with patch(
+            "litellm.litellm_core_utils.logging_worker.verbose_logger", test_logger
+        ):
+            worker.enqueue(slow_async_success_handler(), metadata=metadata)
+            await asyncio.sleep(0.2)
+            await worker.stop()
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        assert error_log_path.exists()
+        record = json.loads(error_log_path.read_text().strip())
+        context = record["context"]
+
+        assert "LoggingWorker timed out" in record["message"]
+        assert context["source"] == "logging_worker"
+        assert context["event_type"] == "async_success"
+        assert context["callback_name"] == "langfuse"
+        assert context["callback_phase"] == "async_success_handler"
+        assert context["trace_id"] == "trace-123"
+        assert context["litellm_call_id"] == "call-456"
+        assert context["model"] == "gpt-test"
+        assert context["model_alias"] == "aawm-codex-agent-auto"
+        assert context["route_family"] == "codex_responses"
+        assert context["worker_delivery_state"] == "timed_out"
+        assert context["worker_timeout_seconds"] == "0.05"
+        assert context["queue_maxsize"] == "4"
+        assert context["coroutine_name"] == "slow_async_success_handler"
+        assert "sk-should-not-appear" not in record["raw_text"]
+        assert "secret prompt" not in record["raw_text"]
+
+    @pytest.mark.asyncio
+    async def test_worker_non_timeout_failure_emits_safe_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        from litellm._logging import AawmErrorLogFileHandler
+
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        worker = LoggingWorker(timeout=1.0, max_queue_size=4, concurrency=1)
+        worker.start()
+
+        async def failing_async_success_handler():
+            raise RuntimeError("callback exploded")
+
+        handler = AawmErrorLogFileHandler()
+        test_logger = logging.getLogger("litellm-test-logging-worker-failure")
+        test_logger.handlers = [handler]
+        test_logger.setLevel(logging.ERROR)
+
+        with patch(
+            "litellm.litellm_core_utils.logging_worker.verbose_logger", test_logger
+        ):
+            worker.enqueue(
+                failing_async_success_handler(),
+                metadata={
+                    "source": "logging_worker",
+                    "event_type": "async_success",
+                    "callback_phase": "async_success_handler",
+                    "litellm_call_id": "call-fail-1",
+                },
+            )
+            await asyncio.sleep(0.2)
+            await worker.stop()
+
+        record = json.loads((tmp_path / "dev-error.jsonl").read_text().strip())
+        context = record["context"]
+        assert "LoggingWorker failed while delivering" in record["message"]
+        assert context["worker_delivery_state"] == "failed"
+        assert context["callback_phase"] == "async_success_handler"
+        assert context["litellm_call_id"] == "call-fail-1"
+        assert context["coroutine_name"] == "failing_async_success_handler"
+
+    def test_build_async_success_logging_worker_metadata_uses_safe_fields(self):
+        from litellm.litellm_core_utils.logging_worker import (
+            build_async_success_logging_worker_metadata,
+        )
+
+        class _FakeLoggingObj:
+            litellm_trace_id = "trace-safe"
+            litellm_call_id = "call-safe"
+            model = "gpt-safe"
+            custom_llm_provider = "openai"
+            litellm_params = {
+                "metadata": {
+                    "requested_model_alias": "aawm-codex-agent-auto",
+                    "route_family": "codex_responses",
+                    "user_api_key": "sk-redacted-should-not-emit",
+                }
+            }
+
+        metadata = build_async_success_logging_worker_metadata(_FakeLoggingObj())
+
+        assert metadata == {
+            "source": "logging_worker",
+            "event_type": "async_success",
+            "callback_name": "async_success_handler",
+            "callback_phase": "async_success_handler",
+            "trace_id": "trace-safe",
+            "litellm_call_id": "call-safe",
+            "model": "gpt-safe",
+            "model_alias": "aawm-codex-agent-auto",
+            "provider": "openai",
+            "custom_llm_provider": "openai",
+            "route_family": "codex_responses",
+        }
+
+    @pytest.mark.asyncio
+    async def test_real_async_success_handler_timeout_reports_active_callback(
+        self, monkeypatch, tmp_path
+    ):
+        from litellm._logging import AawmErrorLogFileHandler
+        from litellm.integrations.custom_logger import CustomLogger
+        from litellm.litellm_core_utils.litellm_logging import Logging
+
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        callback_reached = asyncio.Event()
+
+        class SlowLogger(CustomLogger):
+            async def async_log_success_event(self, **kwargs):
+                callback_reached.set()
+                await asyncio.sleep(1)
+
+        slow_logger = SlowLogger()
+        logging_obj = Logging(
+            model="gpt-real-path",
+            messages=[{"role": "user", "content": "secret real prompt"}],
+            stream=False,
+            call_type="completion",
+            start_time=datetime.now(),
+            litellm_call_id="call-real-path",
+            function_id="function-real-path",
+            dynamic_success_callbacks=[],
+            dynamic_async_success_callbacks=[slow_logger],
+            litellm_trace_id="trace-real-path",
+        )
+        logging_obj.custom_llm_provider = "openai"
+        logging_obj.litellm_params = {
+            "metadata": {
+                "requested_model_alias": "aawm-code",
+                "passthrough_route_family": "codex_responses",
+                "user_api_key": "sk-real-path-secret",
+            }
+        }
+        logging_obj.model_call_details = {
+            "model": "gpt-real-path",
+            "litellm_call_id": "call-real-path",
+            "litellm_params": logging_obj.litellm_params,
+            "standard_logging_object": {"metadata": {}, "request_tags": []},
+            "messages": [{"role": "user", "content": "secret real prompt"}],
+        }
+
+        worker = LoggingWorker(timeout=0.05, max_queue_size=4, concurrency=1)
+        worker.start()
+
+        handler = AawmErrorLogFileHandler()
+        test_logger = logging.getLogger("litellm-test-real-logging-worker")
+        test_logger.handlers = [handler]
+        test_logger.setLevel(logging.ERROR)
+        test_logger.propagate = False
+
+        from litellm.litellm_core_utils.logging_worker import (
+            build_async_success_logging_worker_metadata,
+        )
+
+        with patch(
+            "litellm.litellm_core_utils.logging_worker.verbose_logger", test_logger
+        ), patch.object(
+            logging_obj,
+            "get_combined_callback_list",
+            return_value=[slow_logger],
+        ):
+            worker.enqueue(
+                logging_obj.async_success_handler(
+                    result={},
+                    start_time=datetime.now(),
+                    end_time=datetime.now(),
+                    cache_hit=False,
+                ),
+                metadata=build_async_success_logging_worker_metadata(logging_obj),
+            )
+            await asyncio.wait_for(callback_reached.wait(), timeout=1)
+            await asyncio.sleep(0.2)
+            await worker.stop()
+
+        record = json.loads((tmp_path / "dev-error.jsonl").read_text().strip())
+        context = record["context"]
+
+        assert "LoggingWorker timed out" in record["message"]
+        assert context["callback_name"] == "SlowLogger"
+        assert context["callback_phase"] == "async_success_handler"
+        assert context["litellm_call_id"] == "call-real-path"
+        assert context["trace_id"] == "trace-real-path"
+        assert context["model"] == "gpt-real-path"
+        assert context["model_alias"] == "aawm-code"
+        assert context["route_family"] == "codex_responses"
+        assert context["worker_delivery_state"] == "timed_out"
+        assert "secret real prompt" not in json.dumps(record)
+        assert "sk-real-path-secret" not in json.dumps(record)

@@ -2765,57 +2765,6 @@ run the documented prod readiness, log, and harness gates.
 
 ---
 
-### aawm.77 — D1-272/D1-274 Grok compaction-state prod promotion
-
-**What changed:** The fork release line now includes the post-`aawm.76` core
-proxy fixes for session-history agent-id trace scoring, ChatGPT Codex
-`usage_limit_reached` passthrough shaping, and Grok/xAI adapter compaction-state
-handling. Adapter-managed `oa_xai/*` and Grok native OAuth routes strip
-provider-bound `previous_response_id` and encrypted Responses reasoning items
-before xAI/Grok egress, while direct `/grok` passthrough continues preserving
-native Grok compact response state for same-client continuation.
-
-**Why:** Prod logged Grok/xAI Responses 400s with `Could not decode the
-compaction blob` after a request reached both `cli-chat-proxy.grok.com` and
-`api.x.ai`. Those compact blobs are provider/session-bound; replaying them
-through an adapter or failover route can strand a worker on an upstream
-invalid-argument error. The release also carries the already-pushed structured
-ChatGPT Codex `usage_limit_reached` handling and agent-id trace-score fix so
-prod is not promoted with only part of the current dev-verified source set.
-
-**Why not upstream:** This is AAWM-specific operational behavior for local
-Codex/Grok/xAI alias routing, prod error-log intake, and session-history
-observability.
-
-**Validation status:** Focused dev validation for D1-272 passed the Grok/xAI
-passthrough test cluster (`70 passed`), `ruff`, `py_compile`, `git diff
---check`, and a `litellm-dev` restart/readiness check. Production promotion
-requires publishing `v1.82.3-aawm.77`, rebuilding/restarting `aawm-litellm` from
-that pinned base, verifying the prod runtime contains
-`_strip_xai_adapter_compaction_state_from_request_body`, and archiving or
-deleting the active `.analysis/prod-error.log` after the fixed runtime is
-healthy.
-
-### aawm.78 — D1-276/D1-279 Grok OIDC refresh and Langfuse payload-size logging
-
-**What changed:** The fork release line now includes the post-`aawm.77` Grok native OIDC refresh and candidate-selection fixes plus the Langfuse under-limit payload-size log severity fix. Grok/xAI passthrough and OAuth handling now force credential refresh after auth-shaped upstream failures, keep Composer OIDC and managed xAI OAuth cooldown lanes distinct, and prefer durable managed refresh credentials over seed mtime or access-token expiry alone when selecting Grok OIDC candidates. Langfuse payload-size auditing now logs successful under-limit fits at debug severity instead of warning when the event is below the SDK size threshold.
-
-**Why:** Grok native OIDC failover could keep retrying stale or misclassified candidates after upstream 401/403 or quota-shaped failures, and Langfuse under-limit payload-size messages were noisy enough to look like real ingestion risk during normal large-session traffic.
-
-**Why not upstream:** These changes are AAWM-specific operational behavior for local Grok/xAI alias routing, managed OAuth seed handling, and Langfuse/session-history observability.
-
-**Validation status:** Focused validation for D1-276 and D1-279 passed the Grok OIDC refresh/candidate-selection tests, Langfuse payload-size audit tests, `ruff`, `py_compile`, and `git diff --check`. Production promotion requires publishing `v1.82.3-aawm.78`, rebuilding/restarting `aawm-litellm` from that pinned base, and rerunning the documented prod readiness and harness gates.
-
-### aawm.79 — D1-296 Grok OIDC sidecar refresh ownership
-
-**What changed:** The fork release line now moves Grok native OIDC refresh ownership out of foreground LiteLLM model requests and into the provider-status/health sidecar. LiteLLM reads the Grok CLI `auth.json` directly as a read-only consumer, no longer copies seed credentials into a managed Grok auth file, no longer force-refreshes Grok credentials after auth-shaped upstream failures, and surfaces sidecar/relogin guidance when the credential is missing, expired, near expiry, or lacks an access token. Managed `oa_xai/*` OAuth remains separate and continues to use the LiteLLM-owned refresh path.
-
-**Why:** Manual Grok OIDC reauth was recurring after idle windows because foreground request handling had become a second credential writer and did not give a durable owner for hourly refresh. The intended production shape is one writable sidecar/CLI credential owner and read-only LiteLLM consumers, so Composer and Grok Build can keep using the declared alias order without LiteLLM racing or replacing the host credential during model dispatch.
-
-**Why not upstream:** This is AAWM-specific local Grok CLI/OIDC operational behavior, provider-status sidecar wiring, and alias failover ergonomics for the AAWM deployment.
-
-**Validation status:** Focused validation passed the xAI/Grok harness subset (`16 passed`), Grok passthrough candidate subset (`6 passed`), sidecar/script tests (`28 passed`), `ruff`, `py_compile`, and `git diff --check`. Production promotion requires publishing `v1.82.3-aawm.79`, adding the corresponding prod provider-status/Grok OIDC writer sidecar in `aawm-infrastructure`, rebuilding/restarting `aawm-litellm` from that pinned base, and verifying the prod LiteLLM container mounts `.grok` read-only while the sidecar owns refresh writes.
-
 ### aawm.80 — Grok OIDC sidecar ownership and side-channel continuity hardening
 
 **What changed:** Native Grok OIDC credential refresh ownership is hardened so
@@ -2851,9 +2800,52 @@ and running the documented prod readiness/log gates.
 
 ---
 
-### cb-v0.0.50 — Callback overlay parity for durable JSONL session-history spool
+### aawm.81 — Passthrough retry classification and Grok billing evidence hardening
 
-**Status:** AAWM callback overlay release candidate.
+**What changed:** The fork release line now includes the post-`aawm.80` fixes
+for runtime error classification and Grok quota evidence. ChatGPT Codex
+passthrough `503` connection-termination responses are covered by the
+pre-first-byte hidden retry path and have a regression test that proves the
+5/15/30/60/120 second retry schedule, final
+`expected_upstream_capacity_or_internal` classification, and no old traceback
+terminal log path. Known Grok billing timeout/cancel responses are downgraded
+to degraded telemetry instead of active traceback intake. The provider-status
+sidecar now records safe Grok billing request-contract diagnostics on
+successful `rate_limit_observations` rows, including a stable fingerprint,
+source `grok_billing_sidecar_poll`, method, host/path, query keys, client
+identifier/version, model-override booleans, `x-xai-token-auth` configured
+boolean, user-agent, and header names only. The sidecar dedupe SQL now includes
+`evidence` so the first upgraded evidence-bearing snapshot can land even when
+quota values are unchanged.
+
+**Why:** Prod was still running an older passthrough path that emitted a
+traceback-style active error log for an expected upstream Codex `503` transport
+failure. Separately, successful Grok billing sidecar rows were ambiguous in the
+database because the row evidence did not identify the sidecar request contract,
+which made manual-versus-container billing comparisons repeat-prone.
+
+**Why not upstream:** This is AAWM-specific provider routing, runtime
+error-intake policy, Grok CLI/OIDC sidecar polling, and local
+`aawm_tristore.rate_limit_observations` evidence semantics.
+
+**Validation status:** Focused pytest coverage passed for the Codex passthrough
+`503` hidden-retry regression, the broader passthrough hidden-retry subset, and
+the Grok billing sidecar evidence path. Dev provider-status sidecar validation
+rebuilt and recreated `aawm-provider-status-observations:dev`, confirmed the
+running container contains the sidecar evidence and dedupe SQL patches, forced a
+live Grok billing poll with HTTP `200`, and verified DB row id `184547` includes
+`request_contract_source='grok_billing_sidecar_poll'` and fingerprint
+`d3f3858fb59887901db82e1895900c3f5ced2cba736da7ef8a01231dfc3d5d60`.
+Production promotion requires publishing `v1.82.3-aawm.81`,
+rebuilding/restarting `aawm-litellm`, verifying prod has the hidden-retry
+symbols, and archiving the old `.analysis/prod-error.log` intake after
+verification.
+
+---
+
+### cb-v0.0.51 — Callback overlay parity for durable JSONL session-history spool
+
+**Status:** AAWM callback overlay release.
 
 **What changed:** The callback wheel source under
 `.wheel-build/aawm_litellm_callbacks/agent_identity.py` is synced with the
@@ -2875,9 +2867,10 @@ spooling.
 
 **Validation status:** Source and overlay callback files are kept in parity.
 Focused tests cover JSONL write/load/replay behavior and legacy `.json`
-loading. Production promotion requires publishing `cb-v0.0.50`, rebuilding the
-production image so it installs that wheel, and rerunning the prod-safe spool
-write/load/replay cleanup proof.
+loading. `cb-v0.0.51` was published manually after GitHub-created tag
+suppression left the autobumped tag without a release asset. Production was
+rebuilt on base `1.82.3+aawm.80` with callback overlay `0.0.51`, and the
+prod-safe spool write/load/replay cleanup proof returned `wrote_jsonl=true`.
 
 ---
 

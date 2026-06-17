@@ -26,30 +26,6 @@ for reporting and grouping by requested alias.
 Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
-## Agent Identity Capture
-
-`public.session_history` and `public.session_history_tool_activity` include a
-nullable `agent_id` text column. This is an opaque client-provided dispatch,
-task, or subagent identifier. It is separate from `agent_name`, which remains the
-stable human-readable role or display name such as `orchestrator`, `researcher`,
-or `Planck`.
-
-The callback accepts explicit ID fields from bounded metadata/body/header sources
-such as `agent_id`, `aawm_agent_id`, `subagent_id`, `task_id`,
-`x-aawm-agent-id`, `x-grok-agent-id`, `x-litellm-agent-id`, and `x-agent-id`.
-Values that match the session id, trace id, repository, tenant, or human
-`agent_name` are rejected rather than copied into `agent_id`.
-
-Codex main-session rows default `agent_name` to `orchestrator` when the request
-is a native Codex passthrough and no explicit role/name is available. Child or
-subagent rows should only use a child display name when the request or transcript
-provides one. Rows without a reliable opaque id keep `agent_id = NULL`.
-
-Historical rows written before this field existed may be `NULL` unless they are
-backfilled from a trustworthy source. Synthetic Codex transcript rows use the
-transcript session metadata id as `agent_id` when available and mark
-`metadata.agent_id_source = codex_transcript.session_meta.id`.
-
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing
@@ -75,12 +51,14 @@ signals, source fields, and interpretation notes that explain how the snapshot
 was classified. These JSONB fields must not contain credentials, account ids,
 authorization headers, prompt bodies, response text, or raw tool arguments.
 
-Grok monthly billing payloads populate `quota_limit`, `quota_used`,
-`quota_remaining`, both billing-period boundary columns, and a raw copy of the
-sanitized `monthlyLimit`, `used`, `onDemandCap`, and period fields. xAI OAuth
-rate-limit headers populate absolute request/token amounts and carry billing
-period ends when the provider config or managed subscription context exposes
-one.
+Grok monthly billing payloads with absolute counters populate `quota_limit`,
+`quota_used`, `quota_remaining`, both billing-period boundary columns, and a raw
+copy of the sanitized `monthlyLimit`, `used`, `onDemandCap`, and period fields.
+Newer Grok credit billing payloads may provide only `creditUsagePercent` and
+`productUsage`; those snapshots populate `remaining_pct` and leave absolute
+quota fields null rather than inventing counts. xAI OAuth rate-limit headers
+populate absolute request/token amounts and carry billing period ends when the
+provider config or managed subscription context exposes one.
 
 ## Session History Outage Spool
 
@@ -117,9 +95,9 @@ without waiting for a new failed batch. If the spool directory exists but
 cannot be listed temporarily, startup and replay summaries report
 `spool_pending=unknown` instead of `spool_pending=0`; future drainer triggers
 retry the listing rather than treating the backlog as empty. Missing directories
-still report `spool_pending=0`. Replay is at-least-once. The database insert
-path remains idempotent, so recovery tools and the in-process drainer should
-assume duplicates are possible after a crash or partial outage. The spool
+still report `spool_pending=0`. Replay is at-least-once. The database
+insert path remains idempotent, so recovery tools and the in-process drainer
+should assume duplicates are possible after a crash or partial outage. The spool
 contains local sensitive session metadata and must stay out of git, shared logs,
 and external artifacts unless it has been reviewed and sanitized.
 
@@ -142,13 +120,7 @@ Common keys include:
 
 For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the
-next configured usable candidate. The Codex `aawm-code` alias keeps
-`gpt-5.3-codex-spark` as its normal OpenAI/Codex Responses candidate and uses
-`gpt-5.5` as the OpenAI last-resort candidate with medium reasoning applied by
-default when the inbound request did not already provide a reasoning setting.
-Plain `gpt-5.3-codex` is intentionally not an `aawm-code` ChatGPT-account
-Codex Responses candidate because that account surface rejects it before work
-can start. For tool-bearing or stateful
+next configured usable candidate. For tool-bearing or stateful
 `aawm-code-anthropic` requests, every declared candidate route is treated as a
 Claude Code tool-contract route: if the alias declares Antigravity, OpenAI, xAI,
 native Anthropic, or another provider/model target, that target must preserve
@@ -159,29 +131,13 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
-## Antigravity Native OAuth Credentials
-
-Antigravity Code Assist routes use a LiteLLM-managed OAuth credential file for
-runtime access-token refreshes. The Antigravity CLI credential is treated as a
-seed, not as the long-term refresh target.
-
-The seed path comes from `LITELLM_ANTIGRAVITY_SEED_AUTH_FILE`, then legacy
-`LITELLM_ANTIGRAVITY_AUTH_FILE`, then the Antigravity CLI default token path.
-The managed path comes from `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` and defaults
-to `~/.litellm/antigravity/antigravity-oauth-token`.
-
-When the seed credential is newer than the managed credential, LiteLLM copies
-the seed into the managed file and invalidates the cached access token. Direct
-OAuth refreshes then write the new token data back to the managed file only. If
-direct refresh fails because the local OAuth client values are stale, LiteLLM can
-invoke `agy models` against the explicit seed path, reload the CLI-refreshed
-seed credential, and persist that refreshed data back into the managed file on
-the normal access-token load path.
-
-Prod and dev containers should mount the seed credential read-only when possible
-and mount the managed credential directory writable. Do not configure a single
-read-only Antigravity token file as the managed refresh target; doing so can
-leave the route pinned to stale credentials or make refresh persistence fail.
+The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate,
+not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejects the
+plain `gpt-5.3-codex` model. When that last-resort candidate is selected,
+LiteLLM applies medium reasoning by default if the request did not already set a
+reasoning effort. Stateful continuation requests keep the established candidate
+through session affinity, including last-resort `gpt-5.5`, until that candidate
+itself cools down or the session is redispatched.
 
 ## Grok Native OIDC Credentials
 
@@ -219,34 +175,17 @@ CLI credential. The explicit Grok billing poll should run from the same
 sidecar context so quota snapshots use the credential that the sidecar keeps
 fresh, not a second LiteLLM-managed copy.
 
-Grok OIDC access tokens can be short-lived even when the refresh credential is
-expected to remain usable for days. LiteLLM parses ISO expiry values as well as
-epoch seconds and milliseconds when evaluating whether a recorded token is still
-valid. If the Grok CLI proxy rejects a token with an auth-shaped 401/403 such as
-`Invalid or expired credentials` or `no auth context`, LiteLLM does not refresh
-the Grok CLI credential inline. The Grok native candidate becomes
-`candidate_unavailable` and alias failover continues after the sidecar-maintained
-credential is refreshed or the operator relogins with the Grok CLI.
-
-Codex/Anthropic alias routing records distinct xAI lane keys for the two xAI
-credential families: Grok native OIDC candidates use `xai_grok_oidc`, while
-managed `oa_xai/*` OAuth candidates use `xai_oauth`. They may share subscription
-quota, but auth failures and cooldowns should remain attributable to the
-credential family that actually failed.
-
-Grok native and `oa_xai/*` Responses candidates remove request fields and hosted
-tools that the selected Grok-family model declares unsupported. Direct native
-Grok passthrough preserves Responses `reasoning` input items that carry
-`encrypted_content`; those encrypted items are treated as provider-owned
-compacted session state and must round-trip unchanged rather than being removed
-as ordinary unsupported reasoning summaries. Adapter and alias-failover routes
-strip provider-bound compacted session state before xAI/Grok egress because a
-`previous_response_id` or encrypted reasoning blob from another route/session
-can trigger upstream `Could not decode the compaction blob` failures.
-If a Grok-family upstream still rejects a compacted request with `Could not
-decode the compaction blob`, alias-probe mode classifies that 400 as
-candidate-unavailable so the declared failover sequence can continue instead of
-stranding the worker on the rejecting candidate.
+Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
+tools, and `reasoning` input items that the selected Grok-family model declares
+unsupported. This includes `reasoning` items that carry `encrypted_content` from
+another provider's compacted Responses state; forwarding those blobs to Grok can
+trigger provider errors such as `Could not decode the compaction blob`. Ordinary
+non-reasoning continuation items, including `function_call` and
+`function_call_output`, remain in the outbound request. If a Grok-family
+upstream still rejects a compacted request with `Could not decode the compaction
+blob`, alias-probe mode classifies that 400 as candidate-unavailable so the
+declared failover sequence can continue instead of stranding the worker on the
+rejecting candidate.
 
 ## Access Log Display Semantics
 
@@ -258,51 +197,38 @@ path.
 The display shape is:
 
 ```text
-YYYYMMDD HH:MM:SS TYPE [Client/Version -] [agent[#agent_id]@repository.]model(alias) METHOD ip:port incoming -> outgoing
+YYYYMMDD HH:MM:SS [ROUTE] [client-name/version] - [agent-name[#agent-id][@repository][.model(alias)]] METHOD ip:port incoming -> outgoing
 ```
 
-The timestamp uses a 24-hour clock. `TYPE` is normally `ROUTE`, with lighter
-`EMBED` and `RERANK` forms for embedding/rerank traffic. TUI clients are
-normalized to common product names such as `Claude`, `Codex`, and `Grok`; other
-client products keep their parsed product name/version. Agent, agent id,
-repository, model alias, and client address segments are omitted when that
-metadata is unavailable or not relevant. Route logs print `#agent_id` only when
-a real client-provided opaque id is available before egress; they do not
-synthesize an agent id from `session_id`. The selected model is printed as
-`model(alias)` only when the inbound alias differs from the selected model.
-For TUI route traffic with a known repository but no explicit agent name,
-LiteLLM uses the same `orchestrator` default as `session_history`, so those rows
-display as `orchestrator@repository.model(alias)` instead of `repository.model`.
-Embedding and rerank route logs intentionally omit agent/repository identity
-unless the model label itself carries the needed operational context.
+The timestamp uses a 24-hour clock. Known TUI client products are normalized for
+display, for example `claude-cli/*` and `claude-code/*` become `Claude/*`,
+`codex-cli/*` and `codex-tui/*` become `Codex/*`, and `grok-*/*` becomes
+`Grok/*`. Client name/version, agent, agent id, repository, model alias, and
+client address segments are omitted when that metadata is unavailable. The
+selected model is printed as `model(alias)` only when the inbound alias differs
+from the selected model. When owner metadata is present, the route context is
+composed as `agent#id@repository.model(alias)`; missing subfields are omitted
+without inventing values.
 
 These lines are for live container-log triage, not durable reporting. Durable
 model and alias attribution still comes from `session_history.model` and
 `session_history.inbound_model_alias`. Route-log identity fields are conservative
 display tokens derived from normalized metadata or explicit headers such as
 `x-aawm-client-name`, `x-aawm-client-version`, `user-agent`,
-`x-aawm-agent-name`, `x-aawm-agent-id`, and `x-aawm-repository`; LiteLLM omits
-prompt-like, sentence-like, or punctuation-heavy identity values instead of
-printing raw request text. Repository lookup intentionally mirrors the
-`session_history` callback's safe source order where route logging has access to
-the same data: explicit request metadata, nested `litellm_metadata`, explicit
-headers, request-body workspace/cwd fields, and the bounded request-header
-tenant fallback used for repository-like tenant ids. If no repository token is
-available from those sources, LiteLLM may infer only the repository label from
-bounded, known workspace fields in the parsed request body, including
-`workspace_root`, `project_root`, `working_directory`, `cwd_path`, `cwdUri`,
-`request.metadata.repository`, and Claude/Codex cwd markers such as
-`<cwd>...</cwd>`. Body-derived repository values are normalized to a slug or
-`owner/repo` label, and worktree paths are trimmed back to the repository root
-before logging. LiteLLM does not print raw prompt text or raw tool arguments for
-the route log.
+`x-aawm-agent-name`, and `x-aawm-repository`. Repository display can also come
+from the same structured identity aliases used by `session_history`, including
+`repo`, `workspace_root`, `project_root`, `working_directory`, `cwd_path`,
+`cwd_uri`, and `aawm_claude_project`. LiteLLM omits prompt-like, sentence-like,
+or punctuation-heavy identity values instead of printing raw request text.
+LiteLLM intentionally does not inspect prompt text or raw tool arguments for the
+route log.
 
 Route logs must not include API keys, authorization headers, full request or
 response bodies, prompt content, tool arguments, or arbitrary query strings.
 Incoming endpoints preserve only known-safe routing query markers, and outgoing
 targets are logged as host plus path.
 
-For requests that emit this enriched route line, LiteLLM suppresses the
+For requests that emit this enriched `[ROUTE]` line, LiteLLM suppresses the
 matching native Uvicorn/Gunicorn access record for that request. Unrelated
 routes should continue to use the normal server access log.
 
@@ -316,25 +242,13 @@ continues through oversized `output`, `metadata`, `model_parameters`,
 event fits or all safe fields have been reduced.
 
 Structured metadata and model-parameter fields are replaced with compact
-omission markers instead of partial raw values.
-
-Before SDK enqueue, LiteLLM may emit a pre-enqueue size audit when the serialized
-generation is at or above 90% of the configured Langfuse event limit, or when
-input truncation already produced a truncation summary. The audit log line is
-`Langfuse event size audit below SDK limit before enqueue` at debug severity when
-fitting succeeded and `total_size_bytes` is at or below `max_event_size_bytes`,
-even if the payload is still above the 90% audit threshold. Use
-`Langfuse event near/exceeds size limit before SDK enqueue` at warning severity
-when fitting failed (`event_fit_failed`) or the final fitted event still
-exceeds `max_event_size_bytes`. This split keeps large-but-accepted events out
-of warning-level proxy logs while preserving warnings for events that may still
-fail Langfuse ingestion.
-
-Any emitted size summary reports only identifiers (`trace_id`, generation id/name,
-`model`, `call_type`), per-field byte counts (`input`, `output`, `metadata`,
-`model_parameters`, `total_size_bytes`), the largest metadata key sizes
-(`largest_metadata_keys`), omission/truncation counts, and `event_fit_failed`; it
-must not include prompt bodies, response text, tool arguments, credentials, or
+omission markers instead of partial raw values. Successful fitting that leaves
+the event safely below the warning threshold is debug-only telemetry. Warnings
+are reserved for raw near-limit events, events that remain near the warning
+threshold after fitting, or events that still cannot fit after all safe fields
+have been reduced. Any emitted size summary reports only identifiers, field
+names, byte counts, omission counts, and whether fitting still failed; it must
+not include prompt bodies, response text, tool arguments, credentials, or
 oversized raw metadata values.
 
 ## Tool Definition Snapshots
@@ -429,6 +343,12 @@ managed xAI Responses requests also drop `tool_choice` when the outgoing payload
 has no usable `tools` definitions, since xAI rejects `tool_choice` without
 tools.
 
+If the request carries a LiteLLM-encoded Responses `previous_response_id`, the
+xAI/Grok sanitizer decodes it back to the original upstream response id before
+egress. The encoded id is only for LiteLLM deployment affinity; xAI and Grok
+must receive the raw upstream id, otherwise compacted continuations can fail
+with provider errors such as `Could not decode the compaction blob`.
+
 For AAWM Codex aliases, hosted-tool support is evaluated again after the alias
 has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
 `oa_xai/grok-build`. This catches provider-invalid Codex tool variants, including
@@ -443,12 +363,13 @@ that target as candidate-unavailable so the declared alias sequence can continue
 to the next candidate instead of terminating the agent dispatch on the provider
 400.
 
-Adapter-managed xAI/Grok requests also remove provider-bound compacted
-continuation state before egress. This covers `previous_response_id` and
-Responses `reasoning` input items that contain `encrypted_content` when the
-request is being prepared for managed `oa_xai/*` or Grok native OAuth adapter
-routes. Direct `/grok` passthrough is excluded so native Grok clients can keep
-their own valid compact response state.
+Grok Composer and Grok Build candidates also remove unsupported Responses
+`reasoning` input items before egress, including encrypted compaction items from
+another provider. The sanitizer records only bounded metadata about the removal,
+for example the input index and whether `encrypted_content` was present; it does
+not record the encrypted blob value. Non-reasoning continuation items stay in the
+outbound `input` array so function-call state can continue without sending
+provider-invalid compaction state.
 
 Rows affected by this path may include:
 
@@ -460,8 +381,17 @@ Rows affected by this path may include:
   `namespace`, or `tool_search`.
 - `codex_unsupported_hosted_tool_choice_removed`: the removed `tool_choice` when
   it referenced a hosted tool removed by the selected model policy.
+- `codex_unsupported_input_item_removed_count`,
+  `codex_unsupported_input_item_types_removed`, and
+  `codex_unsupported_input_items_removed`: unsupported Responses input items
+  removed before egress. For Grok-family routes this includes `reasoning` input
+  items and records `encrypted_content=true` when an encrypted compaction blob
+  was removed without logging the blob.
 - `xai_responses_request_sanitized`: `true` when the outgoing request body was
   changed before xAI egress.
+- `xai_responses_previous_response_id_decoded`: `true` when a LiteLLM-encoded
+  `previous_response_id` was decoded back to the upstream response id before
+  egress.
 - `xai_responses_sanitized_removed_params`: normalized top-level field names
   removed from the request, for example `["instructions", "metadata"]`.
 - `xai_responses_sanitized_tool_count`: number of tool definitions whose
@@ -470,11 +400,6 @@ Rows affected by this path may include:
   shape changed, for example `["code_interpreter", "web_search", "x_search"]`.
 - `xai_responses_sanitized_tools`: bounded detail records keyed by tool index,
   type, and removed fields where available.
-- `xai_adapter_compaction_state_removed`: `true` when adapter/failover
-  preparation removed provider-bound compacted continuation state before
-  xAI/Grok egress.
-- `xai_adapter_compaction_state_removed_fields`: normalized field names removed
-  from the outgoing request, for example `["input", "previous_response_id"]`.
 - `xai_tool_choice_without_tools_removed`: the removed `tool_choice` value when
   no typed tool definitions were present in the outgoing payload.
 - `xai_tool_choice_without_tools_removed_reason`: currently `missing_tools`
@@ -505,11 +430,21 @@ excluded from usage reporting, but should still persist a non-`unknown`
 `model`/`model_group`; if no stronger model evidence exists, they are attributed
 to the generic Grok TUI client model `grok-build`.
 
-The native Grok privacy side-channel endpoint
-`/v1/privacy/coding-data-retention` requires `codingDataRetentionOptOut`.
-LiteLLM preserves explicit client values and supplies `true` when the field is
-omitted, so the CLI privacy probe does not fail open or produce recurring 422
-noise.
+Native Grok storage uploads are a local-only side channel. LiteLLM authenticates
+`/grok/*/storage` requests with the normal LiteLLM key path, records no raw
+storage body, does not forward those uploads to `cli-chat-proxy.grok.com`, and
+returns a benign local success response. These storage artifacts can contain
+session replay material, terminal output, tool calls/results, local config, and
+compressed session state, so they must not enter pass-through logs, Langfuse,
+session history, or upstream xAI storage.
+
+Native Grok coding-data-retention probes are also local-only. LiteLLM
+authenticates `/grok/*/privacy/coding-data-retention` requests with the normal
+LiteLLM key path, clears any parsed request body before auth/logging hooks, does
+not forward the probe to `cli-chat-proxy.grok.com`, and returns a benign local
+success response. This avoids upstream 422 noise for empty probes while keeping
+privacy preference payloads out of logs, Langfuse, session history, and upstream
+storage unless a future route explicitly implements a validated translation.
 
 Grok session mutation side channels such as `/grok/v1/sessions/register` and
 `/grok/v1/sessions/{id}/replicas/update` attach redacted request-shape metadata

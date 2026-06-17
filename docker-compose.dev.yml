@@ -28,7 +28,6 @@ services:
       - ./litellm/main.py:/app/litellm/main.py
       - ./litellm/utils.py:/app/litellm/utils.py
       - ./litellm/litellm_core_utils/get_model_cost_map.py:/app/litellm/litellm_core_utils/get_model_cost_map.py
-      - ./litellm/litellm_core_utils/exception_mapping_utils.py:/app/litellm/litellm_core_utils/exception_mapping_utils.py
       - ./litellm/litellm_core_utils/prompt_templates/factory.py:/app/litellm/litellm_core_utils/prompt_templates/factory.py
       - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json
       - ./litellm/types/llms/anthropic.py:/app/litellm/types/llms/anthropic.py
@@ -56,6 +55,7 @@ services:
       - ./litellm/rerank_api/main.py:/app/litellm/rerank_api/main.py
       - ./litellm/proxy/aawm_route_logging.py:/app/litellm/proxy/aawm_route_logging.py
       - ./litellm/proxy/common_request_processing.py:/app/litellm/proxy/common_request_processing.py
+      - ./litellm/proxy/proxy_server.py:/app/litellm/proxy/proxy_server.py
       - ./litellm/proxy/pass_through_endpoints/pass_through_endpoints.py:/app/litellm/proxy/pass_through_endpoints/pass_through_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/streaming_handler.py:/app/litellm/proxy/pass_through_endpoints/streaming_handler.py
       - ./litellm/proxy/pass_through_endpoints/success_handler.py:/app/litellm/proxy/pass_through_endpoints/success_handler.py
@@ -75,8 +75,6 @@ services:
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
       # Repo-local error intake for managed LiteLLM runtime errors.
       - ./.analysis:/app/.analysis
-      # Durable retry spool for session_history records during DB outages.
-      - ./.analysis/session_history:/mnt/e/litellm/session_history
       # Claude persisted-output files for local expansion
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
       # Claude agent specs for subagent model resolution
@@ -85,10 +83,8 @@ services:
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
       # OpenCode Zen auth for native OpenCode and Codex/Claude adapter testing
       - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
-      # Gemini OAuth tokens and Antigravity CLI seed tokens for adapter testing.
+      # Gemini and Antigravity OAuth tokens for adapter testing; refresh persists updated tokens.
       - /home/zepfu/.gemini:/home/zepfu/.gemini
-      # LiteLLM-owned Antigravity OAuth credential; refresh persists updated tokens here.
-      - /home/zepfu/.litellm/antigravity:/home/zepfu/.litellm/antigravity
       # Grok CLI OAuth tokens for native Grok OIDC passthrough. LiteLLM reads only;
       # provider-status-observations owns scheduled refresh writes.
       - /home/zepfu/.grok:/home/zepfu/.grok:ro
@@ -102,6 +98,8 @@ services:
       - /home/zepfu/.local/bin/agy:/home/zepfu/.local/bin/agy:ro
       # Capture output — written to /tmp/captures inside container, visible on host
       - ./captures:/tmp/captures
+      # Durable session_history outage spool for replay after DB outages.
+      - /mnt/e/litellm/session_history:/mnt/e/litellm/session_history
     environment:
       # Langfuse — read from host env or set defaults
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
@@ -127,8 +125,8 @@ services:
       - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore?application_name=aawm-litellm-session-history}
       - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
       - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=${LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME:-aawm-litellm-session-history}
+      - AAWM_SESSION_HISTORY_SPOOL_DIR=${AAWM_SESSION_HISTORY_SPOOL_DIR:-/mnt/e/litellm/session_history}
       - AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE=${LITELLM_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE:-0}
-      - AAWM_SESSION_HISTORY_SPOOL_DIR=${LITELLM_AAWM_SESSION_HISTORY_SPOOL_DIR:-/mnt/e/litellm/session_history}
       - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME:-aawm-litellm-dynamic-injection}
       - PGAPPNAME=${LITELLM_AAWM_DB_APPLICATION_NAME:-aawm-litellm-runtime}
       - AAWM_POSTGRES_SERVER=${LITELLM_AAWM_POSTGRES_SERVER:-}
@@ -158,8 +156,6 @@ services:
       - LITELLM_GEMINI_OAUTH_CLIENT_ID=${LITELLM_GEMINI_OAUTH_CLIENT_ID:-}
       - LITELLM_GEMINI_OAUTH_CLIENT_SECRET=${LITELLM_GEMINI_OAUTH_CLIENT_SECRET:-}
       - LITELLM_GEMINI_CLI_BUNDLE_PATH=${LITELLM_GEMINI_CLI_BUNDLE_PATH:-}
-      - LITELLM_ANTIGRAVITY_SEED_AUTH_FILE=${LITELLM_ANTIGRAVITY_SEED_AUTH_FILE:-/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token}
-      - LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE=${LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE:-/home/zepfu/.litellm/antigravity/antigravity-oauth-token}
       - AAWM_NVIDIA_API_KEY=${AAWM_NVIDIA_API_KEY:-}
       - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
@@ -241,6 +237,18 @@ services:
       - AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=${AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS:-300}
       - AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}
       - AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS:-30}
+      - AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}
+      - AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=${AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS:-3600}
+      - AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS:-30}
+      - AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS=${AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS:-3}
+      - AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS=${AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS:-0.5}
+      - AAWM_GROK_BILLING_URL=${AAWM_GROK_BILLING_URL:-https://cli-chat-proxy.grok.com/v1/billing?format=credits}
+      - AAWM_GROK_BILLING_CLIENT_VERSION=${AAWM_GROK_BILLING_CLIENT_VERSION:-0.2.55}
+      - AAWM_GROK_BILLING_CLIENT_IDENTIFIER=${AAWM_GROK_BILLING_CLIENT_IDENTIFIER:-grok-cli}
+      - AAWM_GROK_BILLING_XAI_TOKEN_AUTH=${AAWM_GROK_BILLING_XAI_TOKEN_AUTH:-xai-grok-cli}
+      - AAWM_GROK_BILLING_MODEL=${AAWM_GROK_BILLING_MODEL:-grok-build}
+      - AAWM_GROK_BILLING_HTTP_METHOD=${AAWM_GROK_BILLING_HTTP_METHOD:-GET}
+      - AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE=${AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE:-1}
     networks:
       - default
       - aawm_default

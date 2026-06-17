@@ -648,6 +648,69 @@ async def test_aaaproxy_startup_master_key(mock_prisma, monkeypatch, tmp_path):
         assert master_key == test_resolved_key
 
 
+@pytest.mark.asyncio
+async def test_load_config_master_key_from_general_settings_does_not_warn(
+    monkeypatch, tmp_path
+):
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+    test_master_key = "sk-config-master-key"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.dump({"general_settings": {"master_key": test_master_key}}),
+        encoding="utf-8",
+    )
+
+    proxy_config = ProxyConfig()
+    with patch(
+        "litellm.proxy.proxy_server.verbose_proxy_logger.warning"
+    ) as mock_warning, patch(
+        "litellm.proxy.proxy_server.verbose_proxy_logger.critical"
+    ) as mock_critical:
+        await proxy_config.load_config(router=None, config_file_path=str(config_path))
+
+    from litellm.proxy.proxy_server import master_key
+
+    assert master_key == test_master_key
+    mock_warning.assert_not_called()
+    mock_critical.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_load_config_missing_resolved_master_key_warns_without_critical(
+    monkeypatch, tmp_path
+):
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.dump({"general_settings": {"store_model_in_db": False}}),
+        encoding="utf-8",
+    )
+
+    proxy_config = ProxyConfig()
+    with patch(
+        "litellm.proxy.proxy_server.verbose_proxy_logger.warning"
+    ) as mock_warning, patch(
+        "litellm.proxy.proxy_server.verbose_proxy_logger.critical"
+    ) as mock_critical:
+        await proxy_config.load_config(router=None, config_file_path=str(config_path))
+
+    from litellm.proxy.proxy_server import litellm_master_key_hash, master_key
+
+    warning_messages = [call.args[0] for call in mock_warning.call_args_list]
+    assert master_key is None
+    assert litellm_master_key_hash is None
+    assert any(
+        "No resolved LiteLLM master key found from either LITELLM_MASTER_KEY or general_settings.master_key"
+        in message
+        for message in warning_messages
+    )
+    mock_critical.assert_not_called()
+
+
 def test_team_info_masking():
     """
     Test that sensitive team information is properly masked

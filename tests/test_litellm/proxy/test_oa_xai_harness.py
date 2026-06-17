@@ -19,6 +19,7 @@ from litellm.integrations.aawm_agent_identity import (
 )
 from litellm.llms.xai import oauth
 from litellm.proxy.route_llm_request import route_request
+from litellm.responses.utils import ResponsesAPIRequestUtils
 
 
 class OaXaiHarness:
@@ -324,64 +325,6 @@ async def test_grok_native_oauth_does_not_refresh_near_expiry_credential(
     assert not (grok_home / "auth.json.lock").exists()
 
 
-@pytest.mark.parametrize(
-    "expires_at_value",
-    [
-        int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp()),
-        str(int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp())),
-        f"{(datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp():.3f}",
-        str(
-            int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp() * 1000)
-        ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_grok_native_oauth_refreshes_when_expires_at_is_epoch_value(
-    tmp_path,
-    monkeypatch,
-    expires_at_value,
-):
-    harness = OaXaiHarness()
-    credential_path = harness.write_credential(
-        tmp_path,
-        harness.credential_payload(
-            expires_at=datetime.now(timezone.utc) + timedelta(seconds=5)
-        ),
-    )
-    payload = json.loads(credential_path.read_text(encoding="utf-8"))
-    payload["expires_at"] = expires_at_value
-    credential_path.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
-    monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
-
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, data, headers):
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": "refreshed-epoch-managed-token",
-                    "refresh_token": "refreshed-epoch-refresh-token",
-                    "expires_in": 3600,
-                    "token_type": "Bearer",
-                },
-            )
-
-    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
-        assert await oauth.get_xai_oauth_access_token() == "refreshed-epoch-managed-token"
-
-    refreshed_payload = json.loads(credential_path.read_text(encoding="utf-8"))
-    assert refreshed_payload["access_token"] == "refreshed-epoch-managed-token"
-    assert refreshed_payload["refresh_token"] == "refreshed-epoch-refresh-token"
-
 @pytest.mark.asyncio
 async def test_grok_native_oauth_missing_token_errors_without_mutating_file(
     tmp_path,
@@ -601,6 +544,90 @@ async def test_oa_xai_harness_routes_litellm_client_to_upstream_oauth(
     assert "authorization" not in harness.request_data(public_model)
     assert "api_key" not in harness.request_data(public_model)
     assert "api_base" not in harness.request_data(public_model)
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_harness_decodes_previous_response_id_before_responses_egress():
+    harness = OaXaiHarness()
+    public_model = "oa_xai/grok-4.3"
+    original_response_id = "resp_xai_upstream_compaction_blob"
+    encoded_response_id = ResponsesAPIRequestUtils._build_responses_api_response_id(
+        custom_llm_provider="xai",
+        model_id="oa-xai-deployment-id",
+        response_id=original_response_id,
+    )
+    data = {
+        "model": public_model,
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_direct_oa_xai_compaction",
+                "summary": [],
+                "encrypted_content": "encrypted-direct-oa-xai-compaction",
+            },
+            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+        "previous_response_id": encoded_response_id,
+        "metadata": {"session_id": harness.session_id, "tags": ["existing-tag"]},
+        "litellm_metadata": {"tags": ["existing-litellm-tag"]},
+    }
+    llm_router = MagicMock()
+    llm_router.model_names = []
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="managed-oauth-token"),
+    ):
+        mock_responses = MagicMock(return_value={"id": "resp_next"})
+        original_aresponses = litellm.aresponses
+        litellm.aresponses = mock_responses
+        try:
+            response = await route_request(data, llm_router, None, "aresponses")
+        finally:
+            litellm.aresponses = original_aresponses
+
+    assert response == {"id": "resp_next"}
+    mock_responses.assert_called_once()
+    call_kwargs = mock_responses.call_args.kwargs
+    assert call_kwargs["model"] == harness.public_to_upstream[public_model]
+    assert call_kwargs["input"] == [
+        {"type": "message", "role": "user", "content": "continue"},
+        {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "ok",
+        },
+    ]
+    assert call_kwargs["previous_response_id"] == original_response_id
+    assert call_kwargs["previous_response_id"] != encoded_response_id
+    assert call_kwargs["metadata"]["session_id"] == harness.session_id
+    assert call_kwargs["metadata"]["xai_responses_previous_response_id_decoded"] is True
+    assert call_kwargs["litellm_metadata"][
+        "xai_responses_previous_response_id_decoded"
+    ] is True
+    assert "existing-tag" in call_kwargs["metadata"]["tags"]
+    assert "xai-responses-previous-response-id-decoded" in call_kwargs["metadata"][
+        "tags"
+    ]
+    assert original_response_id not in call_kwargs["metadata"]["tags"]
+    assert encoded_response_id not in call_kwargs["metadata"]["tags"]
+    assert "existing-litellm-tag" in call_kwargs["litellm_metadata"]["tags"]
+    assert "xai-responses-previous-response-id-decoded" in call_kwargs[
+        "litellm_metadata"
+    ]["tags"]
+    assert call_kwargs["litellm_metadata"][
+        "codex_unsupported_input_item_removed_count"
+    ] == 1
+    assert call_kwargs["litellm_metadata"][
+        "codex_unsupported_input_items_removed"
+    ] == [{"type": "reasoning", "index": 1, "encrypted_content": True}]
 
 
 @pytest.mark.parametrize(

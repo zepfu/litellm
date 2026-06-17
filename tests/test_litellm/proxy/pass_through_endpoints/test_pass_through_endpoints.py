@@ -22,21 +22,28 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 from litellm._logging import (
+    AawmErrorLogFileHandler,
+    _build_aawm_error_log_record,
     AawmRouteAccessLogReplacementFilter,
     clear_aawm_route_access_log_replacements,
     get_egress_guard_alert_state,
     register_aawm_route_access_log_replacement,
     reset_egress_guard_alert_state,
     verbose_aawm_route_logger,
+    verbose_proxy_logger,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
-    _build_http_exception_from_upstream_status_error,
     build_aawm_route_access_log_line,
     _direct_capture_xai_passthrough_failure,
+    _execute_passthrough_pre_first_byte_with_hidden_retries,
+    _is_known_grok_billing_passthrough_timeout_cancel_response,
+    _record_grok_billing_passthrough_request_contract,
+    _record_passthrough_hidden_retry_metadata,
+    _should_log_passthrough_terminal_failure_without_traceback,
     emit_aawm_route_access_log,
     pass_through_request,
 )
@@ -92,51 +99,6 @@ def _build_uvicorn_access_record(
     )
 
 
-def test_build_http_exception_structures_chatgpt_codex_usage_limit() -> None:
-    request = httpx.Request(
-        "POST",
-        "https://chatgpt.com/backend-api/codex/responses",
-    )
-    response = httpx.Response(
-        429,
-        request=request,
-        content=json.dumps(
-            {
-                "error": {
-                    "type": "usage_limit_reached",
-                    "message": "The usage limit has been reached",
-                    "plan_type": "pro",
-                    "resets_at": 1781750798,
-                    "eligible_promo": None,
-                    "resets_in_seconds": 193472,
-                }
-            }
-        ).encode("utf-8"),
-    )
-    upstream_error = httpx.HTTPStatusError(
-        "429 Too Many Requests",
-        request=request,
-        response=response,
-    )
-
-    exc = _build_http_exception_from_upstream_status_error(
-        upstream_error,
-        response.content,
-    )
-
-    assert exc.status_code == 429
-    assert exc.detail["error"]["type"] == "rate_limit_error"
-    assert exc.detail["error"]["code"] == "usage_limit_reached"
-    assert exc.detail["error"]["upstream_type"] == "usage_limit_reached"
-    assert exc.detail["quota"]["plan_type"] == "pro"
-    assert exc.detail["quota"]["resets_at"] == 1781750798
-    assert exc.detail["quota"]["resets_in_seconds"] == 193472
-    assert exc.detail["retry_after_seconds"] == 193472
-    assert exc.detail["failover_disposition"] == "usage_limit_reached"
-    assert exc.headers is not None
-    assert exc.headers["Retry-After"] == "193472"
-
-
 @contextmanager
 def _capture_aawm_route_logs(caplog):
     logger = logging.getLogger("LiteLLM AAWM Route")
@@ -160,7 +122,7 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
         "model": "grok-composer-2.5-fast",
         "litellm_metadata": {
             "agent_name": "W4 engineer",
-            "agent_id": "a9150f66743e0f185",
+            "agent_id": "019ed4f2",
             "repository": "dashboard-shell",
             "requested_model_alias": "aawm-code",
         },
@@ -174,10 +136,9 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
     )
 
     assert line == (
-        "20260614 19:31:05 ROUTE Claude/1.2.3 - "
-        "W4 engineer#a9150f66743e0f185@dashboard-shell."
-        "grok-composer-2.5-fast(aawm-code) POST 172.19.0.1:52834 "
-        "/anthropic/v1/messages?beta=true -> "
+        "20260614 19:31:05 [ROUTE] Claude/1.2.3 - "
+        "W4 engineer#019ed4f2@dashboard-shell.grok-composer-2.5-fast(aawm-code) "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses"
     )
     assert "api_key" not in line
@@ -200,7 +161,7 @@ def test_build_aawm_route_access_log_line_omits_missing_optional_context() -> No
     )
 
     assert line == (
-        "20260614 19:31:05 ROUTE GET 127.0.0.1:44780 "
+        "20260614 19:31:05 [ROUTE] GET 127.0.0.1:44780 "
         "/openai_passthrough/responses -> api.openai.com/v1/responses"
     )
     assert "secret" not in line
@@ -225,8 +186,9 @@ def test_build_aawm_route_access_log_line_omits_alias_when_same_as_model() -> No
     )
 
     assert line == (
-        "20260614 19:31:05 ROUTE aawm-code POST 172.19.0.1:52834 "
-        "/anthropic/v1/messages?beta=true -> api.anthropic.com/v1/messages"
+        "20260614 19:31:05 [ROUTE] - aawm-code "
+        "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
+        "api.anthropic.com/v1/messages"
     )
     assert "aawm-code(aawm-code)" not in line
 
@@ -255,7 +217,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
     )
 
     assert line == (
-        "20260614 19:31:05 ROUTE gpt-5.5(aawm-code) "
+        "20260614 19:31:05 [ROUTE] - gpt-5.5(aawm-code) "
         "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses"
     )
@@ -280,7 +242,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_headers() ->
     )
 
     assert line == (
-        "20260614 19:31:05 ROUTE gpt-5.3-codex-spark "
+        "20260614 19:31:05 [ROUTE] - gpt-5.3-codex-spark "
         "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
         "api.openai.com/v1/responses"
     )
@@ -306,161 +268,8 @@ def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
     )
 
     assert line.startswith(
-        "20260614 19:31:05 ROUTE W4 engineer@dashboard-shell."
+        "20260614 19:31:05 [ROUTE] - W4 engineer@dashboard-shell."
     )
-    assert "/home/zepfu/projects" not in line
-
-
-def test_build_aawm_route_access_log_line_infers_repository_from_claude_cwd() -> None:
-    request = _build_aawm_route_log_request(
-        headers={"user-agent": "claude-cli/2.1.177"}
-    )
-    request_body = {
-        "model": "grok-composer-2.5-fast",
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "<environment_context>\n"
-                    "<cwd>/home/zepfu/projects/dashboard-shell</cwd>\n"
-                    "</environment_context>"
-                ),
-            }
-        ],
-        "litellm_metadata": {
-            "agent_name": "engineer",
-            "requested_model_alias": "aawm-code-anthropic",
-        },
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://cli-chat-proxy.grok.com/v1/responses",
-        request_body=request_body,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line.startswith(
-        "20260614 19:31:05 ROUTE Claude/2.1.177 - "
-        "engineer@dashboard-shell.grok-composer-2.5-fast(aawm-code-anthropic) "
-    )
-    assert "/home/zepfu/projects" not in line
-    assert "<cwd>" not in line
-
-
-def test_build_aawm_route_access_log_line_normalizes_worktree_cwd_to_repo() -> None:
-    request = _build_aawm_route_log_request()
-    request_body = {
-        "model": "claude-sonnet-4-6",
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "cwd: "
-                    "/home/zepfu/projects/dashboard-shell/.claude/worktrees/agent-123"
-                ),
-            }
-        ],
-        "litellm_metadata": {"agent_name": "engineer"},
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://api.anthropic.com/v1/messages",
-        request_body=request_body,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line.startswith(
-        "20260614 19:31:05 ROUTE engineer@dashboard-shell."
-    )
-    assert "worktrees" not in line
-    assert "agent-123" not in line
-    assert "/home/zepfu/projects" not in line
-
-
-def test_build_aawm_route_access_log_line_infers_codex_workspace_repository() -> None:
-    request = _build_aawm_route_log_request(
-        url="http://127.0.0.1:4001/openai_passthrough/responses",
-        headers={"user-agent": "codex-tui/0.139.0"},
-    )
-    request_body = {
-        "model": "gpt-5.5",
-        "input": "hello",
-        "workspace_root": "/home/zepfu/projects/litellm",
-        "litellm_metadata": {
-            "agent_name": "orchestrator",
-            "requested_model_alias": "aawm-code",
-        },
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://chatgpt.com/backend-api/codex/responses",
-        request_body=request_body,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line.startswith(
-        "20260614 19:31:05 ROUTE Codex/0.139.0 - "
-        "orchestrator@litellm.gpt-5.5(aawm-code) "
-    )
-    assert "/home/zepfu/projects" not in line
-
-
-def test_build_aawm_route_access_log_line_defaults_tui_repo_agent_to_orchestrator() -> None:
-    request = _build_aawm_route_log_request(
-        url="http://127.0.0.1:4001/openai_passthrough/responses",
-        headers={"user-agent": "codex-tui/0.139.0"},
-    )
-    request_body = {
-        "model": "gpt-5.5",
-        "workspace_root": "/home/zepfu/projects/aawm-tap",
-        "litellm_metadata": {
-            "requested_model_alias": "aawm-code",
-        },
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://chatgpt.com/backend-api/codex/responses",
-        request_body=request_body,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line == (
-        "20260614 19:31:05 ROUTE Codex/0.139.0 - "
-        "orchestrator@aawm-tap.gpt-5.5(aawm-code) "
-        "POST 172.19.0.1:52834 /openai_passthrough/responses -> "
-        "chatgpt.com/backend-api/codex/responses"
-    )
-    assert "aawm-tap.gpt-5.5" in line
-    assert " - aawm-tap.gpt-5.5" not in line
-
-
-def test_build_aawm_route_access_log_line_omits_alias_with_body_repository() -> None:
-    request = _build_aawm_route_log_request(
-        url="http://127.0.0.1:4001/openai_passthrough/responses",
-        headers={"user-agent": "codex-tui/0.139.0"},
-    )
-    request_body = {
-        "model": "gpt-5.5",
-        "request": {"metadata": {"workspace_root": "/home/zepfu/projects/litellm"}},
-        "litellm_metadata": {
-            "agent_name": "orchestrator",
-            "requested_model_alias": "gpt-5.5",
-        },
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://chatgpt.com/backend-api/codex/responses",
-        request_body=request_body,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert "orchestrator@litellm.gpt-5.5 " in line
-    assert "gpt-5.5(gpt-5.5)" not in line
     assert "/home/zepfu/projects" not in line
 
 
@@ -481,7 +290,52 @@ def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> N
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("20260614 19:31:05 ROUTE W4 engineer@zepfu/litellm.")
+    assert line.startswith(
+        "20260614 19:31:05 [ROUTE] - W4 engineer@zepfu/litellm."
+    )
+
+
+def test_build_aawm_route_access_log_line_uses_session_history_repo_aliases() -> None:
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "workspaceRoot": "/home/zepfu/projects/dashboard-shell",
+        "metadata": {
+            "agent_name": "orchestrator",
+            "trace_name": "claude-code.orchestrator",
+            "trace_user_id": "should-not-win",
+        },
+    }
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body=request_body,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(
+        "20260614 19:31:05 [ROUTE] - orchestrator@dashboard-shell."
+    )
+    assert "should-not-win" not in line
+
+
+def test_build_aawm_route_access_log_line_uses_trace_user_repo_when_structured_repo_missing() -> None:
+    request = _build_aawm_route_log_request(
+        headers={
+            "langfuse_trace_name": "claude-code.orchestrator",
+            "langfuse_trace_user_id": "aegis",
+        }
+    )
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.anthropic.com/v1/messages",
+        request_body={"model": "claude-opus-4-8"},
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith("20260614 19:31:05 [ROUTE] - aegis.claude-opus-4-8 ")
 
 
 def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
@@ -500,7 +354,7 @@ def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
     )
 
     assert line.startswith(
-        "20260614 19:31:05 ROUTE Codex/0.119.0-alpha.29 - "
+        "20260614 19:31:05 [ROUTE] Codex/0.119.0-alpha.29 - "
     )
 
 
@@ -519,9 +373,36 @@ def test_build_aawm_route_access_log_line_rejects_freeform_client_identity() -> 
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith("20260614 19:31:05 ROUTE curl/8.0 - ")
+    assert line.startswith("20260614 19:31:05 [ROUTE] curl/8.0 - ")
     assert "prompt-like" not in line
     assert "unrelated command" not in line
+
+
+@pytest.mark.parametrize(
+    ("route_type", "url", "expected_log_type"),
+    (
+        ("aembedding", "http://127.0.0.1:4001/v1/embeddings", "EMBED"),
+        ("arerank", "http://127.0.0.1:4001/v1/rerank", "RERANK"),
+        (None, "http://127.0.0.1:4001/v1/embeddings", "EMBED"),
+        (None, "http://127.0.0.1:4001/v1/rerank", "RERANK"),
+    ),
+)
+def test_build_aawm_route_access_log_line_classifies_route_type(
+    route_type: Optional[str],
+    url: str,
+    expected_log_type: str,
+) -> None:
+    request = _build_aawm_route_log_request(url=url)
+
+    line = build_aawm_route_access_log_line(
+        request=request,
+        target="https://api.openai.com/v1/responses",
+        request_body={"model": "test-model"},
+        route_type=route_type,
+        now=datetime(2026, 6, 14, 19, 31, 5),
+    )
+
+    assert line.startswith(f"20260614 19:31:05 [{expected_log_type}] - test-model ")
 
 
 def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
@@ -564,15 +445,64 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if " ROUTE " in record.getMessage()
+        if " [ROUTE] " in record.getMessage()
     ]
     assert len(route_records) == 1
     assert re.fullmatch(
-        r"\d{8} \d{2}:\d{2}:\d{2} ROUTE "
+        r"\d{8} \d{2}:\d{2}:\d{2} \[ROUTE\] - "
         r"claude-sonnet-4-6\(aawm-code-anthropic\) "
         r"POST 172\.19\.0\.1:52834 /anthropic/v1/messages\?beta=true "
         r"-> api\.anthropic\.com/v1/messages",
         route_records[0],
+    )
+
+
+def test_emit_aawm_route_access_log_refreshes_suppression_for_same_scope(
+    caplog,
+) -> None:
+    clear_aawm_route_access_log_replacements()
+    request = _build_aawm_route_log_request()
+    request_body = {
+        "model": "gpt-5.3-codex-spark",
+        "metadata": {"model_alias_label": "aawm-code-anthropic"},
+    }
+
+    with _capture_aawm_route_logs(caplog):
+        emit_aawm_route_access_log(
+            request=request,
+            target="https://chatgpt.com/backend-api/codex/responses",
+            request_body=request_body,
+        )
+        request.scope["query_string"] = (
+            b"beta=true -> cli-chat-proxy.grok.com/v1/responses"
+        )
+        emit_aawm_route_access_log(
+            request=request,
+            target="https://cli-chat-proxy.grok.com/v1/responses",
+            request_body={
+                **request_body,
+                "model": "grok-composer-2.5-fast",
+            },
+        )
+
+    route_records = [
+        record.getMessage()
+        for record in caplog.records
+        if " [ROUTE] " in record.getMessage()
+    ]
+    assert len(route_records) == 1
+
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path=(
+                    "/anthropic/v1/messages?beta=true%20-%3E%20"
+                    "cli-chat-proxy.grok.com/v1/responses"
+                ),
+            )
+        )
+        is False
     )
 
 
@@ -607,6 +537,45 @@ def test_aawm_route_access_log_filter_suppresses_matching_access_record_once() -
         access_filter.filter(
             _build_uvicorn_access_record(
                 full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is True
+    )
+
+
+def test_aawm_route_access_log_filter_suppresses_escaped_adapted_paths() -> None:
+    clear_aawm_route_access_log_replacements()
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    register_aawm_route_access_log_replacement(
+        client_addr="172.19.0.1:41278",
+        method="POST",
+        full_path=(
+            "/anthropic/v1/messages?beta=true -> "
+            "cli-chat-proxy.grok.com/v1/responses"
+        ),
+        http_version="1.1",
+    )
+
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                client_addr="172.19.0.1:41278",
+                full_path=(
+                    "/anthropic/v1/messages?beta=true%20-%3E%20"
+                    "cli-chat-proxy.grok.com/v1/responses"
+                ),
+            )
+        )
+        is False
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                client_addr="172.19.0.1:41278",
+                full_path=(
+                    "/anthropic/v1/messages?beta=true%20-%3E%20"
+                    "cli-chat-proxy.grok.com/v1/responses"
+                ),
             )
         )
         is True
@@ -743,11 +712,11 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
     route_records = [
         record.getMessage()
         for record in caplog.records
-        if " ROUTE " in record.getMessage()
+        if " [ROUTE] " in record.getMessage()
     ]
     assert len(route_records) == 1
     assert re.fullmatch(
-        r"\d{8} \d{2}:\d{2}:\d{2} ROUTE Codex/0\.119\.0-alpha\.29 - "
+        r"\d{8} \d{2}:\d{2}:\d{2} \[ROUTE\] Codex/0\.119\.0-alpha\.29 - "
         r"W2 tester@litellm\.gpt-5\.3-codex-spark\(aawm-code\) "
         r"POST 172\.19\.0\.1:44766 /openai_passthrough/responses\?stream=false "
         r"-> api\.openai\.com/v1/responses",
@@ -755,127 +724,6 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
     )
     assert "redacted" not in route_records[0]
     assert "api_key" not in route_records[0]
-
-
-def test_build_aawm_route_access_log_line_uses_nested_litellm_params_repository() -> None:
-    request = _build_aawm_route_log_request(
-        headers={
-            "user-agent": "claude-cli/2.1.177",
-            "x-aawm-agent-id": "a9150f66743e0f185",
-        }
-    )
-    kwargs = {
-        "litellm_params": {
-            "proxy_server_request": {
-                "headers": {},
-                "body": {
-                    "litellm_metadata": {
-                        "agent_name": "engineer",
-                        "repository": "dashboard-shell",
-                    }
-                },
-            }
-        }
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://api.anthropic.com/v1/messages",
-        request_body={"model": "claude-sonnet-4-6"},
-        kwargs=kwargs,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line.startswith(
-        "20260614 19:31:05 ROUTE Claude/2.1.177 - "
-        "engineer#a9150f66743e0f185@dashboard-shell.claude-sonnet-4-6 "
-    )
-
-
-def test_build_aawm_route_access_log_line_uses_request_header_tenant_repository_fallback() -> None:
-    request = _build_aawm_route_log_request(
-        headers={"user-agent": "claude-cli/2.1.177"}
-    )
-    kwargs = {
-        "litellm_params": {
-            "metadata": {
-                "agent_name": "ops",
-                "tenant_id_source": "request_headers",
-                "tenant_id": "dashboard-shell",
-            }
-        }
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://api.anthropic.com/v1/messages",
-        request_body={"model": "claude-sonnet-4-6"},
-        kwargs=kwargs,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line.startswith(
-        "20260614 19:31:05 ROUTE Claude/2.1.177 - "
-        "ops@dashboard-shell.claude-sonnet-4-6 "
-    )
-
-
-def test_build_aawm_route_access_log_line_normalizes_grok_client_identity() -> None:
-    request = _build_aawm_route_log_request(
-        url="http://127.0.0.1:4001/grok/v1/responses",
-        headers={"user-agent": "grok-build/0.4.2"},
-    )
-    request_body = {
-        "model": "grok-composer-2.5-fast",
-        "litellm_metadata": {
-            "agent_name": "engineer",
-            "agent_id": "grok-session-abc123",
-            "repository": "dashboard-shell",
-        },
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="https://cli-chat-proxy.grok.com/v1/responses",
-        request_body=request_body,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line == (
-        "20260614 19:31:05 ROUTE Grok/0.4.2 - "
-        "engineer#grok-session-abc123@dashboard-shell.grok-composer-2.5-fast "
-        "POST 172.19.0.1:52834 /grok/v1/responses -> "
-        "cli-chat-proxy.grok.com/v1/responses"
-    )
-
-
-def test_build_aawm_route_access_log_line_uses_rerank_type_without_agent_context() -> None:
-    request = _build_aawm_route_log_request(
-        url="http://127.0.0.1:4001/v1/rerank",
-        headers={"user-agent": "python-httpx/0.28.1"},
-    )
-    request_body = {
-        "model": "tei-reranker",
-        "litellm_metadata": {
-            "agent_name": "ranking worker",
-            "repository": "litellm",
-        },
-    }
-
-    line = build_aawm_route_access_log_line(
-        request=request,
-        target="http://172.20.0.1:8080/rerank",
-        request_body=request_body,
-        now=datetime(2026, 6, 14, 19, 31, 5),
-    )
-
-    assert line == (
-        "20260614 19:31:05 RERANK python-httpx/0.28.1 - "
-        "tei-reranker POST 172.19.0.1:52834 /v1/rerank -> "
-        "172.20.0.1/rerank"
-    )
-    assert "ranking worker" not in line
-    assert "litellm." not in line
 
 
 # Test is_multipart
@@ -3096,6 +2944,53 @@ async def test_pass_through_request_adds_xai_context_on_failure_logging():
     assert metadata["xai_cli_chat_proxy"] is True
 
 
+def test_record_grok_billing_passthrough_request_contract_redacts_header_values():
+    request = MagicMock(spec=Request)
+    request.method = "GET"
+    request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+    metadata = {
+        "passthrough_route_family": "grok_cli_chat_proxy",
+        "user_api_key_request_route": "/grok/v1/billing",
+    }
+
+    _record_grok_billing_passthrough_request_contract(
+        request=request,
+        url=httpx.URL("https://cli-chat-proxy.grok.com/v1/billing"),
+        headers={
+            "authorization": "Bearer oidc-token-secret",
+            "content-type": "application/json",
+            "user-agent": "grok-pager/0.2.55 grok-shell/0.2.55 (linux; x86_64)",
+            "x-email": "user@example.com",
+            "x-grok-user-id": "user_123",
+            "x-teamid": "team_123",
+            "x-userid": "user_123",
+            "x-xai-token-auth": "xai-grok-cli",
+        },
+        requested_query_params={"format": "credits"},
+        metadata=metadata,
+        custom_llm_provider="xai",
+    )
+
+    assert metadata["grok_billing_passthrough_http_client"] == "httpx"
+    assert metadata["grok_billing_passthrough_request_method"] == "GET"
+    assert metadata["grok_billing_passthrough_target_host"] == (
+        "cli-chat-proxy.grok.com"
+    )
+    assert metadata["grok_billing_passthrough_target_path"] == "/v1/billing"
+    assert metadata["grok_billing_passthrough_query_keys"] == ["format"]
+    assert metadata["grok_billing_passthrough_query_present"] is True
+    assert metadata["grok_billing_passthrough_x_xai_token_auth_configured"] is True
+    assert "authorization" in metadata["grok_billing_passthrough_header_names"]
+    assert "x-email" in metadata["grok_billing_passthrough_header_names"]
+    assert len(metadata["grok_billing_passthrough_request_contract_fingerprint"]) == 64
+    dumped = json.dumps(metadata)
+    assert "oidc-token-secret" not in dumped
+    assert "xai-grok-cli" not in dumped
+    assert "user@example.com" not in dumped
+    assert "user_123" not in dumped
+    assert "team_123" not in dumped
+
+
 @pytest.mark.asyncio
 async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallback():
     direct_capture_mock = AsyncMock()
@@ -3134,6 +3029,1256 @@ async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallba
         request_data=request_payload,
         traceback_str="traceback",
     )
+
+
+class TestGrokBillingPassthroughTimeoutLogging:
+    def test_classifier_matches_known_billing_timeout_cancel_body(self):
+        request = MagicMock(spec=Request)
+        request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        assert _is_known_grok_billing_passthrough_timeout_cancel_response(
+            request=request,
+            url=httpx.URL(
+                "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+            ),
+            custom_llm_provider="xai",
+            status_code=400,
+            exc=HTTPException(
+                status_code=400,
+                detail='{"code":"The operation was cancelled","error":"Timeout expired"}',
+            ),
+        )
+
+    def test_classifier_rejects_unexpected_billing_400_body(self):
+        request = MagicMock(spec=Request)
+        request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        assert not _is_known_grok_billing_passthrough_timeout_cancel_response(
+            request=request,
+            url=httpx.URL(
+                "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+            ),
+            custom_llm_provider="xai",
+            status_code=400,
+            exc=HTTPException(
+                status_code=400,
+                detail='{"error":"billing unavailable"}',
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_known_billing_timeout_warns_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"format": "credits"}
+        mock_request.body = AsyncMock(return_value=b"")
+
+        target_url = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=(
+                b'{"code":"The operation was cancelled",'
+                b'"error":"Timeout expired"}'
+            ),
+            request=httpx.Request("GET", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        saved_handlers, saved_level, saved_propagate = (
+            TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
+                tmp_path,
+                monkeypatch,
+            )
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch.object(
+                verbose_proxy_logger,
+                "warning",
+            ) as mock_warning:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value={})
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "400"
+                assert handler.await_count == 1
+                mock_warning.assert_called_once()
+                assert (
+                    mock_warning.call_args.kwargs["extra"]["failure_kind"]
+                    == "degraded_grok_billing_timeout"
+                )
+                mock_logging_obj.post_call_failure_hook.assert_not_awaited()
+        finally:
+            TestPassThroughTerminalFailureLogging._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert not (tmp_path / "dev-error.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_unexpected_billing_400_keeps_exception_logging(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"format": "credits"}
+        mock_request.body = AsyncMock(return_value=b"")
+
+        target_url = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=b'{"error":"billing unavailable"}',
+            request=httpx.Request("GET", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        saved_handlers, saved_level, saved_propagate = (
+            TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
+                tmp_path,
+                monkeypatch,
+            )
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value={})
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "400"
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    "billing unavailable"
+                    in mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                )
+        finally:
+            TestPassThroughTerminalFailureLogging._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "pass_through_endpoint" in item["message"]
+        )
+        assert payload["context"]["endpoint"] == "/grok/v1/billing"
+        assert payload["context"]["status_code"] == 400
+        assert "billing unavailable" in payload["message"]
+        assert payload.get("traceback")
+
+
+class TestPassThroughTerminalFailureLogging:
+    @staticmethod
+    def _install_aawm_error_log_handler(tmp_path, monkeypatch):
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        handler = AawmErrorLogFileHandler()
+        saved_handlers = verbose_proxy_logger.handlers[:]
+        saved_level = verbose_proxy_logger.level
+        saved_propagate = verbose_proxy_logger.propagate
+        verbose_proxy_logger.handlers.clear()
+        verbose_proxy_logger.addHandler(handler)
+        verbose_proxy_logger.setLevel(logging.ERROR)
+        verbose_proxy_logger.propagate = False
+
+        return saved_handlers, saved_level, saved_propagate
+
+    @staticmethod
+    def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        verbose_proxy_logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            verbose_proxy_logger.addHandler(saved_handler)
+        verbose_proxy_logger.setLevel(saved_level)
+        verbose_proxy_logger.propagate = saved_propagate
+
+    def test_terminal_failure_classifier_matches_exhausted_hidden_retry_status(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "aawm_passthrough_hidden_retry_final_outcome": "failed_after_retry",
+                    "aawm_passthrough_hidden_retry_failure_classification": None,
+                    "aawm_passthrough_hidden_retry_count": 6,
+                }
+            }
+        }
+
+        assert _should_log_passthrough_terminal_failure_without_traceback(
+            exc=HTTPException(status_code=529, detail="overloaded"),
+            kwargs=kwargs,
+            status_code=529,
+        )
+
+    def test_terminal_failure_classifier_keeps_auth_errors_exceptional(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "aawm_passthrough_hidden_retry_final_outcome": "failed_without_retry",
+                }
+            }
+        }
+
+        assert not _should_log_passthrough_terminal_failure_without_traceback(
+            exc=HTTPException(status_code=401, detail="unauthorized"),
+            kwargs=kwargs,
+            status_code=401,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_exhausted_529_logs_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=529,
+            content=b'{"error":"overloaded"}',
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "claude-sonnet-4-6"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(),
+            ):
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "claude-sonnet-4-6"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "529"
+                assert handler.await_count == 6
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "exhausted hidden retries for upstream failure" in item["message"]
+        )
+
+        assert payload["context"]["status_code"] == 529
+        assert payload["context"]["model"] == "claude-sonnet-4-6"
+        assert "final_outcome=failed_after_retry" in payload["message"]
+        assert "retry_count=6" in payload["message"]
+        assert payload.get("traceback") in (None, "")
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_429_warns_without_error_intake_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"beta": "true"}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=429,
+            content=(
+                b'{"type":"error","error":{"type":"rate_limit_error",'
+                b'"message":"Rate limited"},"request_id":"req_test"}'
+            ),
+            headers={"retry-after": "17"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "claude-opus-4-8"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(),
+            ) as mock_sleep, patch.object(
+                verbose_proxy_logger,
+                "warning",
+            ) as mock_warning:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "claude-opus-4-8"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "429"
+                assert handler.await_count == 1
+                mock_sleep.assert_not_awaited()
+                mock_warning.assert_called_once()
+                assert (
+                    mock_warning.call_args.kwargs["extra"]["failure_kind"]
+                    == "expected_provider_rate_limit"
+                )
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert not (tmp_path / "dev-error.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_exhausted_chatgpt_codex_503_logs_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = (
+            "http://localhost:4001/openai_passthrough/codex/responses"
+        )
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        upstream_detail = (
+            b"upstream connect error or disconnect/reset before headers. "
+            b"reset reason: connection termination"
+        )
+        upstream_response = httpx.Response(
+            status_code=503,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "gpt-5.4"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(side_effect=fake_sleep),
+            ), patch.object(
+                verbose_proxy_logger,
+                "exception",
+            ) as mock_exception:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "gpt-5.4"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        custom_llm_provider="openai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "503"
+                assert handler.await_count == 6
+                assert sleep_calls == [5.0, 15.0, 30.0, 60.0, 120.0]
+                mock_exception.assert_not_called()
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "exhausted hidden retries for upstream failure" in item["message"]
+        )
+
+        assert payload["context"]["status_code"] == 503
+        assert payload["context"]["upstream_url"] == target_url
+        assert payload["context"]["failure_kind"] == (
+            "expected_upstream_capacity_or_internal"
+        )
+        assert payload["context"]["hidden_retry_final_outcome"] == (
+            "failed_after_retry"
+        )
+        assert payload["context"]["hidden_retry_count"] == 6
+        assert "final_outcome=failed_after_retry" in payload["message"]
+        assert "retry_count=6" in payload["message"]
+        assert "connection termination" in payload["message"]
+        assert payload.get("traceback") in (None, "")
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_exhausted_dns_failure_uses_503_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"beta": "true"}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        dns_error = httpx.ConnectError(
+            "Cannot connect to host api.anthropic.com:443 "
+            "[Temporary failure in name resolution]",
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(side_effect=dns_error)
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "claude-opus-4-8"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(side_effect=fake_sleep),
+            ):
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "claude-opus-4-8"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "503"
+                assert handler.await_count == 6
+                assert sleep_calls == [5.0, 15.0, 30.0, 60.0, 120.0]
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "exhausted hidden retries for upstream failure" in item["message"]
+        )
+
+        assert payload["context"]["status_code"] == 503
+        assert payload["context"]["failure_kind"] == "transient_provider_connectivity"
+        assert payload["context"]["hidden_retry_final_outcome"] == (
+            "failed_after_retry"
+        )
+        assert payload["context"]["hidden_retry_failure_classification"] == (
+            "transport_dns_failure"
+        )
+        assert payload["context"]["hidden_retry_count"] == 6
+        assert payload.get("traceback") in (None, "")
+
+    def test_terminal_failure_log_record_includes_hidden_retry_context_fields(self):
+        metadata = {
+            "aawm_passthrough_hidden_retry_final_outcome": "failed_after_retry",
+            "aawm_passthrough_hidden_retry_failure_classification": "upstream_connectivity_failure",
+            "aawm_passthrough_hidden_retry_count": 6,
+        }
+        kwargs = {"litellm_params": {"metadata": metadata}}
+        hidden_retry_metadata = kwargs["litellm_params"]["metadata"]
+        terminal_failure_context = {
+            "status_code": 529,
+            "model": "claude-sonnet-4-6",
+            "failure_kind": "transient_provider_connectivity",
+            "hidden_retry_final_outcome": hidden_retry_metadata.get(
+                "aawm_passthrough_hidden_retry_final_outcome"
+            ),
+            "hidden_retry_failure_classification": hidden_retry_metadata.get(
+                "aawm_passthrough_hidden_retry_failure_classification"
+            ),
+            "hidden_retry_count": hidden_retry_metadata.get(
+                "aawm_passthrough_hidden_retry_count"
+            ),
+        }
+
+        record = logging.LogRecord(
+            name="LiteLLM Proxy",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg=(
+                "Pass through endpoint exhausted hidden retries for upstream failure "
+                "status=%s error=%s final_outcome=%s retry_count=%s"
+            ),
+            args=(529, "overloaded", "failed_after_retry", 6),
+            exc_info=None,
+        )
+        for key, value in terminal_failure_context.items():
+            setattr(record, key, value)
+
+        payload = _build_aawm_error_log_record(
+            record,
+            formatter=logging.Formatter(),
+        )
+
+        assert getattr(record, "failure_kind") == "transient_provider_connectivity"
+        assert getattr(record, "hidden_retry_final_outcome") == "failed_after_retry"
+        assert (
+            getattr(record, "hidden_retry_failure_classification")
+            == "upstream_connectivity_failure"
+        )
+        assert getattr(record, "hidden_retry_count") == 6
+        assert payload["context"]["status_code"] == 529
+        assert payload["context"]["model"] == "claude-sonnet-4-6"
+        for field, expected in (
+            ("failure_kind", "transient_provider_connectivity"),
+            ("hidden_retry_final_outcome", "failed_after_retry"),
+            (
+                "hidden_retry_failure_classification",
+                "upstream_connectivity_failure",
+            ),
+            ("hidden_retry_count", 6),
+        ):
+            assert getattr(record, field) == expected
+            assert payload["context"].get(field) == expected
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_non_classified_failure_keeps_exception_logging(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        handler = AsyncMock(side_effect=RuntimeError("unexpected passthrough failure"))
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "claude-sonnet-4-6"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "claude-sonnet-4-6"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                    )
+                assert "unexpected passthrough failure" in str(exc_info.value.message)
+
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    "unexpected passthrough failure"
+                    in mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Exception occured - unexpected passthrough failure" in item["message"]
+        )
+        assert "RuntimeError: unexpected passthrough failure" in payload["traceback"]
+
+
+class TestPassThroughHiddenRetry:
+    def test_hidden_retry_metadata_initializes_empty_metadata(self):
+        kwargs: dict = {}
+
+        _record_passthrough_hidden_retry_metadata(
+            kwargs,
+            attempt_number=1,
+            max_attempts=6,
+            status_code=529,
+            failure_class="http_status_529",
+            wait_seconds=5.0,
+            failure_classification=None,
+        )
+
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 1
+        assert metadata["aawm_passthrough_hidden_retry_attempts"] == [
+            {
+                "attempt": 1,
+                "max_attempts": 6,
+                "failure_class": "http_status_529",
+                "wait_seconds": 5.0,
+                "status_code": 529,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_attempt_progress_logs_info_not_warning(self):
+        kwargs: dict = {}
+        operation = AsyncMock(
+            side_effect=[
+                HTTPException(status_code=529, detail="overloaded"),
+                "ok",
+            ]
+        )
+
+        with patch.object(verbose_proxy_logger, "info") as mock_info, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ):
+            result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs=kwargs,
+                operation_name="non_stream_pre_first_byte",
+                operation=operation,
+                caller_managed_hidden_retry=False,
+            )
+
+        assert result == "ok"
+        mock_info.assert_called_once()
+        assert "hidden retry attempt" in mock_info.call_args.args[0]
+        mock_warning.assert_not_called()
+
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+    @pytest.mark.asyncio
+    async def test_pass_through_request_retries_non_stream_transient_status_then_succeeds(
+        self,
+        status_code,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        failing_response = httpx.Response(
+            status_code=status_code,
+            content=b'{"error":"internal"}',
+            request=httpx.Request("POST", target_url),
+        )
+        success_response = httpx.Response(
+            status_code=200,
+            content=b'{"id":"msg_1"}',
+            headers={"content-type": "application/json"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(side_effect=[failing_response, success_response])
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(side_effect=fake_sleep),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ) as mock_success_handler:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=False,
+            )
+
+        assert response.status_code == 200
+        assert handler.await_count == 2
+        assert sleep_calls == [5.0]
+        metadata = mock_success_handler.call_args.kwargs["litellm_params"][
+            "metadata"
+        ]
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "success_after_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_attempts"][0][
+            "status_code"
+        ] == status_code
+        assert metadata["aawm_passthrough_hidden_retry_attempts"][-1][
+            "failure_class"
+        ] == "success"
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_retries_transport_dns_failure(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        success_response = httpx.Response(
+            status_code=200,
+            content=b'{"id":"msg_1"}',
+            headers={"content-type": "application/json"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(
+            side_effect=[
+                httpx.ConnectError(
+                    "Temporary failure in name resolution",
+                    request=httpx.Request("POST", target_url),
+                ),
+                success_response,
+            ]
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ):
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=False,
+            )
+
+        assert response.status_code == 200
+        assert handler.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_exhausts_timeout_failures_with_metadata(self):
+        kwargs: dict = {}
+        target_url = "https://api.anthropic.com/v1/messages"
+        operation = AsyncMock(
+            side_effect=httpx.ReadTimeout(
+                "read timed out",
+                request=httpx.Request("POST", target_url),
+            )
+        )
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(side_effect=fake_sleep),
+        ):
+            with pytest.raises(httpx.ReadTimeout):
+                await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                    kwargs=kwargs,
+                    operation_name="test_operation",
+                    operation=operation,
+                    caller_managed_hidden_retry=False,
+                )
+
+        assert operation.await_count == 6
+        assert sleep_calls == [5.0, 15.0, 30.0, 60.0, 120.0]
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "failed_after_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_failure_classification"] == (
+            "upstream_connectivity_failure"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 6
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_does_not_retry_429(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=429,
+            content=b'{"error":"throttled"}',
+            headers={"retry-after": "17"},
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_sleep:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "429"
+        assert handler.await_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_retries_stream_pre_yield_status(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        req = httpx.Request("POST", target_url)
+        failing_response = httpx.Response(
+            status_code=529,
+            content=b'{"error":"overloaded"}',
+            request=req,
+        )
+        success_response = httpx.Response(
+            status_code=200,
+            content=b"event: message_start\n\ndata: {}\n\n",
+            headers={"content-type": "text/event-stream"},
+            request=req,
+        )
+
+        async def fake_send(request, stream=True):
+            if fake_send.calls == 0:
+                fake_send.calls += 1
+                return failing_response
+            fake_send.calls += 1
+            return success_response
+
+        fake_send.calls = 0
+
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=req)
+        mock_client.send = AsyncMock(side_effect=fake_send)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6", "stream": True},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.PassThroughStreamingHandler.chunk_processor",
+            return_value=iter([b"chunk"]),
+        ):
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6", "stream": True}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=True,
+            )
+
+        assert response.status_code == 200
+        assert mock_client.send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_does_not_retry_after_streaming_response_returned(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        req = httpx.Request("POST", target_url)
+        success_response = httpx.Response(
+            status_code=200,
+            content=b"event: message_start\n\ndata: {}\n\n",
+            headers={"content-type": "text/event-stream"},
+            request=req,
+        )
+
+        async def post_first_byte_failure():
+            yield b"event: message_start\n\n"
+            raise RuntimeError("post-first-byte stream failure")
+
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=req)
+        mock_client.send = AsyncMock(return_value=success_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6", "stream": True},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_sleep, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.PassThroughStreamingHandler.chunk_processor",
+            return_value=post_first_byte_failure(),
+        ):
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6", "stream": True}
+            )
+
+            response = await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=True,
+            )
+            with pytest.raises(RuntimeError, match="post-first-byte stream failure"):
+                async for _chunk in response.body_iterator:
+                    pass
+
+        assert mock_client.send.await_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_opt_out_skips_hidden_retry(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=500,
+            content=b'{"error":"internal"}',
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "claude-sonnet-4-6"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_sleep:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "claude-sonnet-4-6"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException):
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    stream=False,
+                    caller_managed_hidden_retry=True,
+                )
+
+        assert handler.await_count == 1
+        mock_sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio

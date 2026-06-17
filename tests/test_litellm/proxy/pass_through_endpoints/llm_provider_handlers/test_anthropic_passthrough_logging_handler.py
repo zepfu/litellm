@@ -270,6 +270,116 @@ class TestAnthropicStreamingMetadataPreservation:
         assert logging_obj.model_call_details["custom_llm_provider"] == "anthropic"
 
 
+class TestAnthropicUpstreamStreamErrorLogging:
+    _OVERLOADED_SSE = (
+        'event: error\ndata: {"type":"error","error":{"type":"overloaded_error",'
+        '"message":"Overloaded"}}\n\n'
+    )
+    _MESSAGE_START_SSE = (
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1",'
+        '"type":"message","role":"assistant","model":"claude-3-5-sonnet-20240620",'
+        '"content":[],"stop_reason":null,"stop_sequence":null,'
+        '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    )
+
+    def test_build_complete_streaming_response_skips_sse_error_events(self):
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {}
+
+        result = AnthropicPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=[self._MESSAGE_START_SSE, self._OVERLOADED_SSE],
+            litellm_logging_obj=logging_obj,
+            model="claude-3-5-sonnet-20240620",
+        )
+
+        assert result is not None
+
+    def test_handle_logging_records_degraded_metadata_without_success_payload(self):
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {}
+        kwargs = {"litellm_params": {"metadata": {}}}
+
+        result = AnthropicPassthroughLoggingHandler._handle_logging_anthropic_collected_chunks(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=MagicMock(),
+            url_route="/anthropic/v1/messages",
+            request_body={"model": "claude-3-5-sonnet-20240620"},
+            endpoint_type=EndpointType.ANTHROPIC,
+            start_time=datetime.now(),
+            all_chunks=[self._OVERLOADED_SSE],
+            end_time=datetime.now(),
+            kwargs=kwargs,
+        )
+
+        assert result["result"] is None
+        metadata = result["kwargs"]["litellm_params"]["metadata"]
+        assert metadata["aawm_upstream_stream_degraded"] is True
+        assert metadata["aawm_upstream_stream_error_message"] == "Overloaded"
+        assert metadata["aawm_upstream_stream_errors"][0]["code"] == "overloaded_error"
+
+    def test_handle_logging_mixed_stream_skips_error_events_without_parser_traceback(self):
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {}
+        kwargs = {"litellm_params": {"metadata": {}}}
+
+        result = AnthropicPassthroughLoggingHandler._handle_logging_anthropic_collected_chunks(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=MagicMock(),
+            url_route="/anthropic/v1/messages",
+            request_body={"model": "claude-3-5-sonnet-20240620"},
+            endpoint_type=EndpointType.ANTHROPIC,
+            start_time=datetime.now(),
+            all_chunks=[self._MESSAGE_START_SSE, self._OVERLOADED_SSE],
+            end_time=datetime.now(),
+            kwargs=kwargs,
+        )
+
+        assert result["result"] is None
+        metadata = result["kwargs"]["litellm_params"]["metadata"]
+        assert metadata["aawm_upstream_stream_degraded"] is True
+        assert metadata["aawm_upstream_stream_errors"][0]["code"] == "overloaded_error"
+
+    def test_collect_streaming_logging_result_exits_early_for_degraded_anthropic_stream(self):
+        from litellm.proxy.pass_through_endpoints.streaming_handler import (
+            PassThroughStreamingHandler,
+        )
+
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "anthropic-degraded-stream"
+        logging_obj.model_call_details = {}
+        kwargs = {"litellm_params": {"metadata": {}}}
+
+        (
+            standard_logging_response_object,
+            updated_kwargs,
+            handler_branch,
+            early_exit,
+        ) = PassThroughStreamingHandler._collect_streaming_logging_result(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=MagicMock(),
+            response=MagicMock(),
+            url_route="/anthropic/v1/messages",
+            request_body={"model": "claude-3-5-sonnet-20240620"},
+            endpoint_type=EndpointType.ANTHROPIC,
+            start_time=datetime.now(),
+            all_chunks=[self._MESSAGE_START_SSE, self._OVERLOADED_SSE],
+            raw_bytes=[self._MESSAGE_START_SSE.encode("utf-8"), self._OVERLOADED_SSE.encode("utf-8")],
+            end_time=datetime.now(),
+            model="claude-3-5-sonnet-20240620",
+            passthrough_logging_payload=None,
+            custom_llm_provider="anthropic",
+            kwargs=kwargs,
+            handler_branch_state=["initial"],
+        )
+
+        assert early_exit is True
+        assert standard_logging_response_object is None
+        assert handler_branch == "anthropic"
+        metadata = updated_kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_upstream_stream_degraded"] is True
+        assert metadata["aawm_upstream_stream_errors"][0]["code"] == "overloaded_error"
+
+
 class TestAzureAnthropicCostCalculation:
     """Test the custom_llm_provider cost calculation logic for Azure AI Anthropic."""
 

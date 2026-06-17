@@ -65,6 +65,9 @@ from litellm.litellm_core_utils.llm_cost_calc.tool_call_cost_tracking import (
     StandardBuiltInToolCostTracking,
 )
 from litellm.litellm_core_utils.logging_utils import truncate_base64_in_messages
+from litellm.litellm_core_utils.logging_worker import (
+    set_logging_worker_active_callback,
+)
 from litellm.litellm_core_utils.model_param_helper import ModelParamHelper
 from litellm.litellm_core_utils.redact_messages import (
     redact_message_input_output_from_custom_logger,
@@ -2417,6 +2420,10 @@ class Logging(LiteLLMLoggingBaseClass):
             event_type="async_success"
         ):  # prevent double logging
             return
+        set_logging_worker_active_callback(
+            callback_name="async_success_handler",
+            callback_phase="async_success_handler",
+        )
 
         ## CALCULATE COST FOR BATCH JOBS
         if self.call_type == CallTypes.aretrieve_batch.value and isinstance(
@@ -2589,12 +2596,24 @@ class Logging(LiteLLMLoggingBaseClass):
                 ):
                     continue
 
+                set_logging_worker_active_callback(
+                    callback_name=self._get_callback_name(callback),
+                    callback_phase="async_success_logging_hook",
+                )
                 self.model_call_details, result = await callback.async_logging_hook(
                     kwargs=self.model_call_details,
                     result=result,
                     call_type=self.call_type,
                 )
+                set_logging_worker_active_callback(
+                    callback_name="async_success_handler",
+                    callback_phase="async_success_handler",
+                )
             elif isinstance(callback, CustomLogger):
+                set_logging_worker_active_callback(
+                    callback_name=self._get_callback_name(callback),
+                    callback_phase="async_success_logging_hook",
+                )
                 result = redact_message_input_output_from_custom_logger(
                     result=result, litellm_logging_obj=self, custom_logger=callback
                 )
@@ -2602,6 +2621,10 @@ class Logging(LiteLLMLoggingBaseClass):
                     kwargs=self.model_call_details,
                     result=result,
                     call_type=self.call_type,
+                )
+                set_logging_worker_active_callback(
+                    callback_name="async_success_handler",
+                    callback_phase="async_success_handler",
                 )
 
         self.has_run_logging(event_type="async_success")
@@ -2616,6 +2639,10 @@ class Logging(LiteLLMLoggingBaseClass):
             )
             if not should_run:
                 continue
+            set_logging_worker_active_callback(
+                callback_name=self._get_callback_name(callback),
+                callback_phase="async_success_handler",
+            )
             try:
                 if callback == "openmeter" and openMeterLogger is not None:
                     if self.stream is True:
@@ -2745,6 +2772,10 @@ class Logging(LiteLLMLoggingBaseClass):
                 )
                 self._handle_callback_failure(callback=callback)
                 pass
+            set_logging_worker_active_callback(
+                callback_name="async_success_handler",
+                callback_phase="async_success_handler",
+            )
 
     def _handle_callback_failure(self, callback: Any):
         """

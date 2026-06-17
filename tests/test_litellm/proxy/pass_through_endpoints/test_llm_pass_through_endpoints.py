@@ -2,6 +2,7 @@ import asyncio
 import base64
 import copy
 import json
+import logging
 import os
 import re
 import sys
@@ -24,6 +25,7 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 import litellm
+from litellm._logging import AawmErrorLogFileHandler, verbose_proxy_logger
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     _add_anthropic_auto_agent_alias_metadata,
@@ -64,10 +66,6 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _anthropic_auto_agent_session_affinity_by_key,
     _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-    _CODEX_AAWM_CODE_CANDIDATES,
-    _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY,
-    _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
-    _build_codex_auto_agent_candidate_states,
     _get_google_adapter_rate_limit_key,
     _get_or_load_google_code_assist_project,
     _get_google_code_assist_prime_cache_key,
@@ -125,6 +123,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
     _prepare_oa_xai_passthrough_request,
+    _sanitize_xai_responses_request_body,
     _resolve_google_adapter_session_id,
     _resolve_codex_google_code_assist_adapter_model,
     _resolve_codex_opencode_zen_adapter_model,
@@ -140,8 +139,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_codex_auto_agent_error_tokens,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
+    _log_grok_forward_header_compare,
     _prepare_anthropic_request_body_for_passthrough,
-    _prepare_grok_native_oauth_passthrough_request,
     _prepare_grok_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
     _handle_anthropic_google_completion_adapter_route,
@@ -171,7 +170,9 @@ from litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrou
 )
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    _build_passthrough_error_log_context,
 )
+from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
@@ -5178,6 +5179,656 @@ class TestGoogleAdapterRequestShapePolicy:
 
 
 class TestPassThroughRequestRetryableFailures:
+    @staticmethod
+    def _install_aawm_error_log_handler(tmp_path, monkeypatch):
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        handler = AawmErrorLogFileHandler()
+        saved_handlers = verbose_proxy_logger.handlers[:]
+        saved_level = verbose_proxy_logger.level
+        saved_propagate = verbose_proxy_logger.propagate
+        verbose_proxy_logger.handlers.clear()
+        verbose_proxy_logger.addHandler(handler)
+        verbose_proxy_logger.setLevel(logging.ERROR)
+        verbose_proxy_logger.propagate = False
+
+        return saved_handlers, saved_level, saved_propagate
+
+    @staticmethod
+    def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        verbose_proxy_logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            verbose_proxy_logger.addHandler(saved_handler)
+        verbose_proxy_logger.setLevel(saved_level)
+        verbose_proxy_logger.propagate = saved_propagate
+
+    def test_build_passthrough_error_log_context_uses_safe_metadata(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true&api_key=secret"
+        mock_request.query_params = {
+            "beta": "true",
+            "api_key": "secret",
+        }
+
+        parsed_body = {
+            "model": "claude-sonnet-4-6",
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "anthropic_grok_native_responses_adapter",
+                "trace_id": "trace-123",
+                "provider": "anthropic",
+                "grok_side_channel": True,
+                "grok_side_channel_endpoint_type": "sessions_register",
+                "grok_side_channel_endpoint_path_template": "/sessions/body-secret",
+                "grok_side_channel_request_body_sha256": "deadbeef",
+                "grok_side_channel_request_body_byte_length": 999,
+                "grok_side_channel_request_top_level_key_types": {
+                    "session_id": "string",
+                    "api_key": "string",
+                },
+            },
+        }
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "grok_model_override": "grok-composer-2.5-fast",
+                    "custom_llm_provider": "xai",
+                    "passthrough_route_family": "grok_cli_chat_proxy",
+                    "trace_id": "trace-456",
+                    "grok_side_channel": True,
+                    "grok_side_channel_endpoint_type": "traces",
+                    "grok_side_channel_endpoint_path_template": "/grok/v1/traces/{trace_id}",
+                    "grok_side_channel_request_content_type": "application/json",
+                    "grok_side_channel_request_body_byte_length": 128,
+                    "grok_side_channel_request_body_digest_source": "raw_body",
+                    "grok_side_channel_request_json_container_type": "object",
+                    "grok_side_channel_request_array_length": 3,
+                    "grok_side_channel_request_body_sha256": "should-not-appear",
+                }
+            }
+        }
+
+        context = _build_passthrough_error_log_context(
+            request=mock_request,
+            url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses?api_key=secret"),
+            parsed_body=parsed_body,
+            kwargs=kwargs,
+            passthrough_logging_metadata={
+                "grok_side_channel": True,
+                "grok_side_channel_endpoint_type": "traces",
+                "grok_side_channel_endpoint_path_template": "/traces",
+                "grok_side_channel_request_content_type": "application/json",
+                "grok_side_channel_request_body_byte_length": 128,
+                "grok_side_channel_request_body_digest_source": "raw_body",
+                "grok_side_channel_request_json_container_type": "object",
+                "grok_side_channel_request_array_length": 3,
+                "grok_side_channel_request_body_sha256": "should-not-appear",
+                "grok_side_channel_request_top_level_key_types": {
+                    "session_id": "string",
+                    "api_key": "string",
+                },
+            },
+            custom_llm_provider="xai",
+            status_code=400,
+            litellm_call_id="call-123",
+        )
+
+        assert context == {
+            "source": "pass_through_endpoint",
+            "container": mock.ANY,
+            "endpoint": "/anthropic/v1/messages?beta=true",
+            "upstream_url": "https://cli-chat-proxy.grok.com/v1/responses",
+            "provider": "xai",
+            "model": "claude-sonnet-4-6",
+            "model_alias": "aawm-code-anthropic",
+            "route_family": "grok_cli_chat_proxy",
+            "status_code": 400,
+            "trace_id": "trace-456",
+            "litellm_call_id": "call-123",
+            "grok_side_channel": True,
+            "grok_side_channel_endpoint_type": "traces",
+            "grok_side_channel_endpoint_path_template": "/traces",
+            "grok_side_channel_request_content_type": "application/json",
+            "grok_side_channel_request_body_byte_length": 128,
+            "grok_side_channel_request_body_digest_source": "raw_body",
+            "grok_side_channel_request_json_container_type": "object",
+            "grok_side_channel_request_array_length": 3,
+        }
+
+        serialized_context = json.dumps(context)
+        assert "deadbeef" not in serialized_context
+        assert "should-not-appear" not in serialized_context
+        assert "session_id" not in serialized_context
+        assert "api_key" not in serialized_context
+        assert "/sessions/body-secret" not in serialized_context
+        assert "999" not in serialized_context
+
+    def test_build_passthrough_error_log_context_redacts_upstream_userinfo(self):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.query_params = {"beta": "true"}
+
+        context = _build_passthrough_error_log_context(
+            request=mock_request,
+            url=httpx.URL(
+                "https://user:password@cli-chat-proxy.grok.com:8443/v1/responses?api_key=secret"
+            ),
+            parsed_body={"model": "grok-composer-2.5-fast"},
+            kwargs={},
+            passthrough_logging_metadata=None,
+            custom_llm_provider="xai",
+            status_code=400,
+            litellm_call_id="call-123",
+        )
+
+        assert (
+            context["upstream_url"]
+            == "https://cli-chat-proxy.grok.com:8443/v1/responses"
+        )
+        serialized_context = json.dumps(context)
+        assert "user" not in serialized_context
+        assert "password" not in serialized_context
+        assert "api_key=secret" not in serialized_context
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_error_jsonl_includes_route_context(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = (
+            "http://localhost:4001/anthropic/v1/messages?beta=true&api_key=secret"
+        )
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {
+            "beta": "true",
+            "api_key": "secret",
+        }
+        custom_body = {
+            "model": "grok-composer-2.5-fast",
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "grok_cli_chat_proxy",
+                "trace_id": "trace-xyz",
+                "custom_llm_provider": "xai",
+            },
+        }
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=b'{"error":"bad request"}',
+            request=httpx.Request("POST", target_url),
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=AsyncMock(return_value=upstream_response),
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException):
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_body=custom_body,
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "pass_through_endpoint" in item["message"]
+        )
+        assert payload["context"]["source"] == "pass_through_endpoint"
+        assert payload["context"]["endpoint"] == "/anthropic/v1/messages?beta=true"
+        assert payload["context"]["upstream_url"] == target_url
+        assert payload["context"]["provider"] == "xai"
+        assert payload["context"]["model"] == "grok-composer-2.5-fast"
+        assert payload["context"]["model_alias"] == "aawm-code-anthropic"
+        assert payload["context"]["route_family"] == "grok_cli_chat_proxy"
+        assert payload["context"]["status_code"] == 400
+        assert payload["context"]["trace_id"] == "trace-xyz"
+        assert payload["context"]["litellm_call_id"]
+        assert "api_key=secret" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_streaming_timeout_error_jsonl_includes_route_context(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/anthropic/v1/messages?beta=true",
+            "upstream_url": target_url,
+            "provider": "xai",
+            "model": "grok-composer-2.5-fast",
+            "model_alias": "aawm-code-anthropic",
+            "route_family": "grok_cli_chat_proxy",
+            "status_code": None,
+            "trace_id": "trace-stream-timeout",
+            "litellm_call_id": "call-stream-timeout",
+        }
+
+        class FailingStreamingResponse:
+            headers = httpx.Headers({})
+
+            async def aiter_bytes(self):
+                raise httpx.ReadTimeout(
+                    "Timeout on reading data from socket",
+                    request=httpx.Request("POST", target_url),
+                )
+                yield b""
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with pytest.raises(httpx.ReadTimeout):
+                async for _ in PassThroughStreamingHandler.chunk_processor(
+                    response=FailingStreamingResponse(),  # type: ignore[arg-type]
+                    request_body={"model": "grok-composer-2.5-fast"},
+                    litellm_logging_obj=MagicMock(),
+                    endpoint_type=EndpointType.OPENAI,
+                    start_time=datetime.now(),
+                    passthrough_success_handler_obj=MagicMock(),
+                    url_route=target_url,
+                    custom_llm_provider="xai",
+                    success_handler_kwargs={"litellm_params": {"metadata": {}}},
+                    error_log_context=error_context,
+                ):
+                    pass
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Error in chunk_processor" in item["message"]
+        )
+
+        assert payload["message"] == (
+            "Error in chunk_processor: Timeout on reading data from socket"
+        )
+        for key, value in error_context.items():
+            assert payload["context"][key] == value
+        assert "ReadTimeout" in payload["traceback"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_post_response_logging_error_jsonl_includes_context(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/openai_passthrough/responses",
+            "upstream_url": target_url,
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "model_alias": "aawm-code",
+            "route_family": "codex_responses",
+            "status_code": None,
+            "trace_id": "trace-stream-logging",
+            "litellm_call_id": "call-stream-logging",
+        }
+        success_handler_kwargs = {
+            "litellm_call_id": "call-stream-logging",
+            "litellm_params": {
+                "metadata": {
+                    "requested_model_alias": "aawm-code",
+                    "passthrough_route_family": "codex_responses",
+                }
+            },
+            "standard_logging_object": {"metadata": {}, "request_tags": []},
+        }
+        logging_obj = MagicMock()
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.streaming_handler.OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks",
+                side_effect=RuntimeError("Overloaded"),
+            ):
+                await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                    litellm_logging_obj=logging_obj,
+                    passthrough_success_handler_obj=MagicMock(
+                        spec=PassThroughEndpointLogging
+                    ),
+                    response=httpx.Response(
+                        200,
+                        request=httpx.Request("POST", target_url),
+                    ),
+                    url_route=target_url,
+                    request_body={
+                        "model": "gpt-5.5",
+                        "messages": [{"role": "user", "content": "do not log"}],
+                    },
+                    endpoint_type=EndpointType.OPENAI,
+                    start_time=datetime.now() - timedelta(milliseconds=10),
+                    raw_bytes=[b"data: {}\n\n"],
+                    end_time=datetime.now(),
+                    custom_llm_provider="openai",
+                    success_handler_kwargs=success_handler_kwargs,
+                    error_log_context=error_context,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Error in _route_streaming_logging_to_handler" in item["message"]
+        )
+
+        assert payload["message"] == (
+            "Error in _route_streaming_logging_to_handler: Overloaded"
+        )
+        for key, value in error_context.items():
+            if key == "status_code":
+                assert payload["context"][key] == 200
+            else:
+                assert payload["context"][key] == value
+        assert payload["context"]["callback_name"] == "pass_through_streaming"
+        assert payload["context"]["callback_phase"] == "post_response_stream_logging"
+        assert payload["context"]["handler_branch"] == "openai"
+        assert "RuntimeError: Overloaded" in payload["traceback"]
+        assert "do not log" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_streaming_overloaded_sse_does_not_log_internal_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://api.anthropic.com/v1/messages"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/anthropic/v1/messages",
+            "upstream_url": target_url,
+            "provider": "anthropic",
+            "model": "claude-3-5-sonnet-20240620",
+            "model_alias": "aawm-code-anthropic",
+            "route_family": "anthropic",
+            "status_code": None,
+            "trace_id": "trace-anthropic-overload",
+            "litellm_call_id": "call-anthropic-overload",
+        }
+        success_handler_kwargs = {
+            "litellm_call_id": "call-anthropic-overload",
+            "litellm_params": {"metadata": {}},
+            "standard_logging_object": {"metadata": {}, "request_tags": []},
+        }
+        logging_obj = MagicMock()
+        logging_obj.async_success_handler = AsyncMock()
+        logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
+
+        overloaded_chunk = (
+            'event: error\ndata: {"type":"error","error":{"type":"overloaded_error",'
+            '"message":"Overloaded"}}\n\n'
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                litellm_logging_obj=logging_obj,
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                response=httpx.Response(
+                    200,
+                    request=httpx.Request("POST", target_url),
+                ),
+                url_route=target_url,
+                request_body={"model": "claude-3-5-sonnet-20240620"},
+                endpoint_type=EndpointType.ANTHROPIC,
+                start_time=datetime.now() - timedelta(milliseconds=10),
+                raw_bytes=[overloaded_chunk.encode("utf-8")],
+                end_time=datetime.now(),
+                custom_llm_provider="anthropic",
+                success_handler_kwargs=success_handler_kwargs,
+                error_log_context=error_context,
+            )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        logging_obj.async_success_handler.assert_not_awaited()
+        metadata = success_handler_kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_upstream_stream_degraded"] is True
+        assert metadata["aawm_upstream_stream_error_message"] == "Overloaded"
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        if error_log_path.exists():
+            payloads = [
+                json.loads(line)
+                for line in error_log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            assert not any(
+                "Error in _route_streaming_logging_to_handler" in item.get("message", "")
+                for item in payloads
+            )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_read_timeout_jsonl_uses_504_status(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"beta": "true"}
+        custom_body = {
+            "model": "grok-composer-2.5-fast",
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "grok_cli_chat_proxy",
+                "trace_id": "trace-timeout",
+                "custom_llm_provider": "xai",
+            },
+        }
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+        timeout_exc = httpx.ReadTimeout(
+            "Timeout on reading data from socket",
+            request=httpx.Request("POST", target_url),
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=AsyncMock(side_effect=timeout_exc),
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+                new=AsyncMock(),
+            ), patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_body=custom_body,
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "504"
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Timeout on reading data from socket" in item["message"]
+        )
+
+        assert payload["context"]["status_code"] == 504
+        assert payload["context"]["provider"] == "xai"
+        assert payload["context"]["model"] == "grok-composer-2.5-fast"
+        assert payload["context"]["model_alias"] == "aawm-code-anthropic"
+        assert payload["context"]["route_family"] == "grok_cli_chat_proxy"
+        assert "ReadTimeout" in payload["traceback"]
+
+    @pytest.mark.asyncio
+    async def test_stream_setup_read_timeout_uses_504_proxy_code(self):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"beta": "true"}
+        custom_body = {
+            "model": "grok-composer-2.5-fast",
+            "stream": True,
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-code-anthropic",
+                "passthrough_route_family": "grok_cli_chat_proxy",
+                "trace_id": "trace-stream-setup-timeout",
+                "custom_llm_provider": "xai",
+            },
+        }
+        target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+
+        mock_client = MagicMock()
+        mock_client.build_request.return_value = httpx.Request("POST", target_url)
+        mock_client.send = AsyncMock(
+            side_effect=httpx.ReadTimeout(
+                "Timeout on reading data from socket",
+                request=httpx.Request("POST", target_url),
+            )
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={},
+                    user_api_key_dict=MagicMock(),
+                    custom_body=custom_body,
+                    custom_llm_provider="xai",
+                    stream=True,
+                )
+
+        assert exc_info.value.code == "504"
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_pass_through_request_preserves_retry_headers_and_skips_failure_hook(
         self,
@@ -6445,6 +7096,60 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert mock_pass_through.await_args.kwargs[
             "retryable_upstream_status_codes"
         ] == [429]
+        assert (
+            mock_pass_through.await_args.kwargs["caller_managed_hidden_retry"]
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_adapter_probe_disables_shared_hidden_retry(
+        self,
+    ):
+        request = MagicMock(spec=Request)
+        request.headers = {"x-pass-authorization": "Bearer codex-token"}
+        request.method = "POST"
+        request.url = MagicMock()
+        request.url.path = "/anthropic/v1/messages"
+        request.query_params = {}
+        upstream_response = Response(
+            content='{"id":"resp_test","output":[]}',
+            media_type="application/json",
+        )
+        translated_response = Response(
+            content='{"id":"msg_test","content":[]}',
+            media_type="application/json",
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(return_value=upstream_response),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+            return_value=translated_response,
+        ):
+            response = await _handle_anthropic_openai_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body={
+                    "model": "gpt-5.3-codex-spark",
+                    "max_tokens": 16,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "ping"}],
+                        }
+                    ],
+                },
+                adapter_model="gpt-5.3-codex-spark",
+                use_alias_candidate_probe=True,
+            )
+
+        assert response is translated_response
+        assert mock_pass_through.await_args.kwargs[
+            "caller_managed_hidden_retry"
+        ] is True
 
     @pytest.mark.asyncio
     async def test_openrouter_responses_adapter_preserves_agent_project_litellm_metadata(
@@ -14964,6 +15669,42 @@ def test_grok_direct_passthrough_removes_unsupported_reasoning_request_params():
     ]
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+    ],
+)
+def test_xai_responses_sanitizer_decodes_litellm_previous_response_id(model):
+    encoded_previous_response_id = (
+        ResponsesAPIRequestUtils._build_responses_api_response_id(
+            custom_llm_provider="xai",
+            model_id=model,
+            response_id="resp_original_upstream",
+        )
+    )
+    request_body = {
+        "model": model,
+        "input": "continue",
+        "previous_response_id": encoded_previous_response_id,
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+
+    updated_body, removed_params, tool_changes = _sanitize_xai_responses_request_body(
+        request_body
+    )
+
+    assert removed_params == []
+    assert tool_changes == []
+    assert updated_body["previous_response_id"] == "resp_original_upstream"
+    assert updated_body["previous_response_id"] != encoded_previous_response_id
+    metadata = updated_body["litellm_metadata"]
+    assert "existing-tag" in metadata["tags"]
+    assert "xai-responses-previous-response-id-decoded" in metadata["tags"]
+    assert metadata["xai_responses_previous_response_id_decoded"] is True
+
+
 @pytest.mark.asyncio
 async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_params(
     monkeypatch,
@@ -14971,7 +15712,21 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
     request_body = {
         "model": "oa_xai/grok-build",
-        "input": "hello",
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_prepare_compaction",
+                "summary": [],
+                "encrypted_content": "encrypted-prepare-compaction",
+            },
+            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
         "reasoning": {"effort": "medium"},
         "reasoning_effort": "medium",
         "reasoningEffort": "medium",
@@ -14994,6 +15749,15 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
     assert "reasoning" not in request_body
     assert "reasoning_effort" not in request_body
     assert "reasoningEffort" not in request_body
+    assert request_body["input"] == [
+        {"type": "message", "role": "user", "content": "continue"},
+        {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "ok",
+        },
+    ]
     if "output_config" in request_body:
         assert request_body["output_config"] == {"verbosity": "low"}
     metadata = request_body["litellm_metadata"]
@@ -15003,6 +15767,11 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
         "reasoning",
         "reasoning_effort",
         "reasoningeffort",
+    ]
+    assert metadata["codex_unsupported_input_item_removed_count"] == 1
+    assert metadata["codex_unsupported_input_item_types_removed"] == ["reasoning"]
+    assert metadata["codex_unsupported_input_items_removed"] == [
+        {"type": "reasoning", "index": 1, "encrypted_content": True}
     ]
 
 
@@ -15066,7 +15835,7 @@ def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
     "model",
     ["oa_xai/grok-4.3", "grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
 )
-def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
+def test_grok_responses_removes_encrypted_reasoning_compaction_item(model):
     request_body = {
         "model": model,
         "input": [
@@ -15077,6 +15846,12 @@ def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
                 "summary": [],
                 "encrypted_content": "encrypted-compaction-fixture",
             },
+            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
         ],
     }
 
@@ -15084,146 +15859,18 @@ def test_grok_responses_preserves_encrypted_reasoning_compaction_item(model):
         _drop_unsupported_codex_input_items_from_request_body(request_body)
     )
 
-    assert updated_body is request_body
-    assert removed_items == []
-    assert updated_body["input"][1]["encrypted_content"] == (
-        "encrypted-compaction-fixture"
-    )
-
-
-def test_grok_direct_passthrough_preserves_encrypted_reasoning_compaction_item():
-    request_body = {
-        "model": "grok-composer-2.5-fast",
-        "input": [
-            {"type": "message", "role": "user", "content": "continue"},
-            {
-                "type": "reasoning",
-                "id": "rs_grok",
-                "summary": [],
-                "encrypted_content": "native-grok-compaction-fixture",
-            },
-        ],
-        "previous_response_id": "resp_grok_previous",
-    }
-    request = MagicMock(spec=Request)
-    request.headers = {
-        "content-type": "application/json",
-        "x-grok-model-override": "grok-composer-2.5-fast",
-        "x-grok-session-id": "grok-session",
-    }
-    request.query_params = {}
-    request.scope = {}
-
-    prepared_body = _prepare_grok_request_body_for_passthrough(
-        request=request,
-        request_body=request_body,
-    )
-
-    assert prepared_body["previous_response_id"] == "resp_grok_previous"
-    assert prepared_body["input"][1]["encrypted_content"] == (
-        "native-grok-compaction-fixture"
-    )
-    assert "xai_adapter_compaction_state_removed" not in prepared_body[
-        "litellm_metadata"
+    assert removed_items == [
+        {"type": "reasoning", "index": 1, "encrypted_content": True}
     ]
-
-
-@pytest.mark.asyncio
-async def test_oa_xai_adapter_strips_provider_bound_compaction_state(monkeypatch):
-    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
-    request_body = {
-        "model": "oa_xai/grok-build",
-        "input": [
-            {"type": "message", "role": "user", "content": "continue"},
-            {
-                "type": "reasoning",
-                "id": "rs_foreign",
-                "summary": [],
-                "encrypted_content": "foreign-compaction-blob",
-            },
-            {"type": "message", "role": "user", "content": "next"},
-        ],
-        "previous_response_id": "resp_foreign_previous",
-    }
-
-    with patch(
-        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
-        new=AsyncMock(return_value="xai-oauth-token"),
-    ):
-        prepared, target_base, api_key = await _prepare_oa_xai_passthrough_request(
-            request_body,
-            sanitize_responses_request=True,
-        )
-
-    assert prepared is True
-    assert target_base == "https://api.x.ai/v1"
-    assert api_key == "xai-oauth-token"
-    assert request_body["input"] == [
-        {"type": "message", "role": "user", "content": "continue"},
-        {"type": "message", "role": "user", "content": "next"},
+    assert updated_body["input"] == [
+        request_body["input"][0],
+        request_body["input"][2],
+        request_body["input"][3],
     ]
-    assert "previous_response_id" not in request_body
-    metadata = request_body["litellm_metadata"]
-    assert metadata["xai_adapter_compaction_state_removed"] is True
-    assert metadata["xai_adapter_compaction_state_removed_count"] == 2
-    assert metadata["xai_adapter_compaction_state_removed_fields"] == [
-        "input",
-        "previous_response_id",
-    ]
-    assert "xai-adapter-compaction-state-removed" in metadata["tags"]
-
-
-@pytest.mark.asyncio
-async def test_grok_native_adapter_strips_provider_bound_compaction_state(monkeypatch):
-    monkeypatch.setenv(
-        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
-        "https://cli-chat-proxy.grok.com",
-    )
-    request_body = {
-        "model": "grok-composer-2.5-fast",
-        "input": [
-            {"type": "message", "role": "user", "content": "continue"},
-            {
-                "type": "reasoning",
-                "id": "rs_foreign",
-                "summary": [],
-                "encrypted_content": "foreign-compaction-blob",
-            },
-        ],
-        "previous_response_id": "resp_foreign_previous",
-        "litellm_metadata": {"session_id": "adapter-session"},
-    }
-    request = MagicMock(spec=Request)
-    request.headers = {"content-type": "application/json"}
-    request.query_params = {}
-    request.scope = {}
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
-        new=AsyncMock(return_value="grok-oidc-token"),
-    ):
-        prepared, target_base, headers, prepared_body = (
-            await _prepare_grok_native_oauth_passthrough_request(
-                request_body,
-                request=request,
-            )
-        )
-
-    assert prepared is True
-    assert target_base == "https://cli-chat-proxy.grok.com"
-    assert headers["authorization"] == "Bearer grok-oidc-token"
-    assert prepared_body["input"] == [
-        {"type": "message", "role": "user", "content": "continue"}
-    ]
-    assert "previous_response_id" not in prepared_body
-    metadata = prepared_body["litellm_metadata"]
-    assert metadata["xai_adapter_compaction_state_removed"] is True
-    assert metadata["xai_adapter_compaction_state_removed_count"] == 2
-    assert metadata["xai_adapter_compaction_state_removed_fields"] == [
-        "input",
-        "previous_response_id",
-    ]
-    assert "xai-adapter-compaction-state-removed" in metadata["tags"]
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["codex_unsupported_input_item_removed_count"] == 1
+    assert metadata["codex_unsupported_input_item_types_removed"] == ["reasoning"]
+    assert metadata["codex_unsupported_input_items_removed"] == removed_items
 
 
 def _assert_xai_responses_body_sanitized(custom_body: dict[str, Any]) -> None:
@@ -15355,105 +16002,6 @@ def test_aawm_alias_candidate_maps_exclude_google_and_retired_free_deepseek():
                 violations.append(f"{alias} exposes retired free DeepSeek lane")
 
     assert violations == []
-
-
-def test_codex_aawm_code_candidates_do_not_include_rejected_codex_model():
-    candidates_by_model = {
-        candidate["model"]: candidate for candidate in _CODEX_AAWM_CODE_CANDIDATES
-    }
-
-    assert set(candidates_by_model) == {
-        "claude-sonnet-4-6",
-        "gpt-5.3-codex-spark",
-        "grok-composer-2.5-fast",
-        "oa_xai/grok-build",
-        "gpt-5.5",
-    }
-    assert "gpt-5.3-codex" not in candidates_by_model
-    assert candidates_by_model["gpt-5.5"]["last_resort"] is True
-    assert candidates_by_model["gpt-5.5"]["request_defaults"] == {
-        "reasoning": {"effort": "medium"}
-    }
-
-
-def test_codex_aawm_code_gpt55_last_resort_applies_medium_reasoning_default():
-    request = _build_codex_auto_agent_request()
-    gpt55_candidate = next(
-        candidate
-        for candidate in _CODEX_AAWM_CODE_CANDIDATES
-        if candidate["model"] == "gpt-5.5"
-    )
-
-    updated_body = _add_codex_auto_agent_alias_metadata(
-        {
-            "model": "aawm-code",
-            "input": "hello",
-            "litellm_metadata": {"tags": ["existing-tag"]},
-        },
-        request=request,
-        selection={
-            "candidate": gpt55_candidate,
-            "selection_reason": "last_resort",
-            "lane_key": "__default__",
-            "skipped": [],
-        },
-        attempts=[],
-    )
-
-    assert updated_body["model"] == "gpt-5.5"
-    assert updated_body["reasoning"] == {"effort": "medium"}
-    metadata = updated_body["litellm_metadata"]
-    assert metadata["codex_auto_agent_request_defaults_applied"] == ["reasoning"]
-    assert "existing-tag" in metadata["tags"]
-    assert "codex-auto-agent-default:reasoning" in metadata["tags"]
-    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.5"
-    assert metadata["codex_auto_agent_selected_last_resort"] is True
-
-
-@pytest.mark.parametrize(
-    "reasoning_field",
-    [
-        {"reasoning": {"effort": "high"}},
-        {"reasoning_effort": "high"},
-        {"reasoningEffort": "high"},
-        {"output_config": {"effort": "high"}},
-    ],
-)
-def test_codex_aawm_code_gpt55_last_resort_preserves_explicit_reasoning(
-    reasoning_field,
-):
-    request = _build_codex_auto_agent_request()
-    gpt55_candidate = next(
-        candidate
-        for candidate in _CODEX_AAWM_CODE_CANDIDATES
-        if candidate["model"] == "gpt-5.5"
-    )
-    request_body = {
-        "model": "aawm-code",
-        "input": "hello",
-        **copy.deepcopy(reasoning_field),
-    }
-
-    updated_body = _add_codex_auto_agent_alias_metadata(
-        request_body,
-        request=request,
-        selection={
-            "candidate": gpt55_candidate,
-            "selection_reason": "last_resort",
-            "lane_key": "__default__",
-            "skipped": [],
-        },
-        attempts=[],
-    )
-
-    for key, value in reasoning_field.items():
-        assert updated_body[key] == value
-    assert updated_body["model"] == "gpt-5.5"
-    if "reasoning" not in reasoning_field:
-        assert "reasoning" not in updated_body
-    metadata = updated_body["litellm_metadata"]
-    assert "codex_auto_agent_request_defaults_applied" not in metadata
-    assert "codex-auto-agent-default:reasoning" not in metadata["tags"]
 
 
 @pytest.mark.parametrize(
@@ -16231,78 +16779,6 @@ def test_grok_candidate_unavailable_detail_matches_compaction_blob_decode_error(
     )
 
 
-def test_grok_candidate_unavailable_detail_matches_grok_proxy_auth_401():
-    auth_error = HTTPException(
-        status_code=401,
-        detail=(
-            "Invalid or expired credentials "
-            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
-            "upstream=PermissionDenied, reason=no auth context)"
-        ),
-    )
-
-    assert _grok_native_candidate_unavailable_detail(auth_error) == auth_error.detail
-
-
-def test_grok_candidate_unavailable_detail_matches_grok_proxy_auth_403():
-    auth_error = HTTPException(
-        status_code=403,
-        detail=(
-            "Forbidden: invalid or expired credentials "
-            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
-            "upstream=PermissionDenied, reason=no auth context)"
-        ),
-    )
-
-    assert _grok_native_candidate_unavailable_detail(auth_error) == auth_error.detail
-
-
-
-def test_grok_candidate_unavailable_detail_ignores_usage_limit_quota():
-    quota_error = HTTPException(
-        status_code=429,
-        detail='{"error":{"message":"usage_limit_reached","code":"usage_limit_reached"}}',
-    )
-
-    assert _grok_native_candidate_unavailable_detail(quota_error) is None
-    assert _xai_oauth_candidate_unavailable_detail(quota_error) is None
-
-
-@pytest.mark.asyncio
-async def test_codex_aawm_code_xai_lane_keys_distinguish_composer_oidc_and_managed_oauth():
-    request = _build_codex_auto_agent_request()
-
-    states = await _build_codex_auto_agent_candidate_states(
-        request=request,
-        alias_model="aawm-code",
-    )
-    xai_states = [
-        state
-        for state in states
-        if state["candidate"]["provider"] == "xai"
-    ]
-
-    assert [
-        (
-            state["candidate"]["model"],
-            state["lane_key"],
-            state["cooldown_key"],
-        )
-        for state in xai_states
-    ] == [
-        (
-            "grok-composer-2.5-fast",
-            _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY,
-            "xai:grok-composer-2.5-fast:xai_grok_oidc",
-        ),
-        (
-            "oa_xai/grok-build",
-            _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
-            "xai:oa_xai/grok-build:xai_oauth",
-        ),
-    ]
-
-
 @pytest.mark.asyncio
 async def test_anthropic_antigravity_completion_adapter_direct_preserves_not_logged_in_error():
     request = _build_anthropic_auto_agent_request()
@@ -16415,6 +16891,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
     assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
     assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
     assert mock_spark.await_args.kwargs["adapter_model"] == "gpt-5.3-codex-spark"
+    assert mock_spark.await_args.kwargs["use_alias_candidate_probe"] is True
     spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
     metadata = spark_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
@@ -16710,8 +17187,8 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_
     for cooldown_key in (
         "antigravity:claude-sonnet-4-6:antigravity-lane",
         "openai:gpt-5.3-codex-spark:__default__",
-        "xai:grok-composer-2.5-fast:xai_grok_oidc",
-        "xai:oa_xai/grok-build:xai_oauth",
+        "xai:grok-composer-2.5-fast:xai_grok_native",
+        "xai:oa_xai/grok-build:xai_grok_native",
     ):
         await _set_anthropic_auto_agent_cooldown(cooldown_key, 60.0)
 
@@ -18548,6 +19025,7 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
             assert candidate["last_resort"] is last_resort
             if last_resort:
                 assert selection["selection_reason"] == "last_resort"
+                assert candidate["default_reasoning_effort"] == "medium"
             else:
                 assert selection["selection_reason"] == "first_available"
             if index < len(expected_candidates) - 1:
@@ -18555,6 +19033,95 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
                     selection["cooldown_key"],
                     60.0,
                 )
+
+
+def test_codex_auto_agent_alias_last_resort_sets_default_medium_reasoning():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        request=request,
+        selection={
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "route_family": "codex_responses",
+                "last_resort": True,
+                "default_reasoning_effort": "medium",
+            },
+            "selection_reason": "last_resort",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    assert updated_body["model"] == "gpt-5.5"
+    assert updated_body["reasoning"] == {"effort": "medium"}
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_default_reasoning_effort"] == "medium"
+    assert metadata["codex_reasoning_effort"] == "medium"
+    assert "codex-auto-agent-default-effort:medium" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-code:codex-session:session:codex-session"
+    ] = {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "route_family": "codex_responses",
+        "last_resort": True,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    mock_pass_through.assert_awaited_once()
+    candidate_body = mock_pass_through.await_args.kwargs["custom_body"]
+    assert candidate_body["model"] == "gpt-5.5"
+    assert candidate_body["reasoning"] == {"effort": "medium"}
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_last_resort"] is True
+    assert metadata["codex_auto_agent_selection_reason"] == "session_affinity"
+    assert metadata["codex_auto_agent_default_reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio
@@ -18803,6 +19370,17 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_deepseek_tool_mismatch
     assert "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in _extract_codex_auto_agent_error_tokens(
         exc
     )
+
+
+def test_codex_auto_agent_retryable_exhaustion_classifies_timeout_status():
+    exc = ProxyException(
+        message="Timeout on reading data from socket",
+        type="None",
+        param="None",
+        code=504,
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_timeout"
 
 
 @pytest.mark.asyncio
@@ -19185,195 +19763,6 @@ async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_silent_a
         "aawm_codex_auto_agent_candidate_unavailable"
         in first_attempt["error_tokens"]
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("auth_status_code", [401, 403])
-async def test_codex_auto_agent_alias_code_retries_grok_composer_after_auth_401_or_403(
-    monkeypatch,
-    auth_status_code,
-):
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "aawm-code",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    antigravity_error = ProxyException(
-        message="antigravity unavailable",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    antigravity_error.detail = {
-        "error": {
-            "message": "Antigravity credential unavailable",
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
-    spark_error = ProxyException(
-        message="spark usage limit",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    spark_error.detail = {
-        "error": {
-            "message": "usage_limit_reached",
-            "code": "usage_limit_reached",
-        }
-    }
-    grok_auth_error = HTTPException(
-        status_code=auth_status_code,
-        detail=(
-            "Invalid or expired credentials "
-            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
-            "upstream=PermissionDenied, reason=no auth context)"
-        ),
-    )
-    grok_success = Response(
-        content='{"ok": true}', media_type="application/json"
-    )
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=[spark_error, grok_auth_error, grok_success]),
-    ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
-        new=AsyncMock(side_effect=["stale-grok-token", "fresh-grok-token"]),
-    ) as mock_grok_token, patch(
-        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
-        new=AsyncMock(return_value="xai-oauth-token"),
-    ) as mock_xai_token:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    assert response is grok_success
-    assert mock_pass_through.await_count == 3
-    assert mock_grok_token.await_args_list[0].kwargs == {"force_refresh": False}
-    assert mock_grok_token.await_args_list[1].kwargs == {"force_refresh": True}
-    mock_xai_token.assert_not_awaited()
-    grok_retry_call = mock_pass_through.await_args_list[2].kwargs
-    assert grok_retry_call["target"] == "https://cli-chat-proxy.grok.com/v1/responses"
-    assert grok_retry_call["custom_headers"]["authorization"] == (
-        "Bearer fresh-grok-token"
-    )
-    final_body = grok_retry_call["custom_body"]
-    assert final_body["model"] == "grok-composer-2.5-fast"
-    metadata = final_body["litellm_metadata"]
-    assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
-    assert metadata["grok_native_oauth_forced_refresh"] is True
-    assert "grok-native-oauth-forced-refresh" in metadata["tags"]
-    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
-        "claude-sonnet-4-6",
-        "gpt-5.3-codex-spark",
-        "grok-composer-2.5-fast",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_retries_grok_composer_after_auth_403(
-    monkeypatch,
-):
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "aawm-code",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    antigravity_error = ProxyException(
-        message="antigravity unavailable",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    antigravity_error.detail = {
-        "error": {
-            "message": "Antigravity credential unavailable",
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
-    spark_error = ProxyException(
-        message="spark usage limit",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    spark_error.detail = {
-        "error": {
-            "message": "usage_limit_reached",
-            "code": "usage_limit_reached",
-        }
-    }
-    grok_auth_error = HTTPException(
-        status_code=403,
-        detail=(
-            "Forbidden: invalid or expired credentials "
-            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
-            "upstream=PermissionDenied, reason=no auth context)"
-        ),
-    )
-    grok_success = Response(
-        content='{"ok": true}', media_type="application/json"
-    )
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=[spark_error, grok_auth_error, grok_success]),
-    ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
-        new=AsyncMock(side_effect=["stale-grok-token", "fresh-grok-token"]),
-    ) as mock_grok_token, patch(
-        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
-        new=AsyncMock(return_value="xai-oauth-token"),
-    ) as mock_xai_token:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    assert response is grok_success
-    assert mock_pass_through.await_count == 3
-    assert mock_grok_token.await_args_list[0].kwargs == {"force_refresh": False}
-    assert mock_grok_token.await_args_list[1].kwargs == {"force_refresh": True}
-    mock_xai_token.assert_not_awaited()
-    grok_retry_call = mock_pass_through.await_args_list[2].kwargs
-    assert grok_retry_call["custom_headers"]["authorization"] == (
-        "Bearer fresh-grok-token"
-    )
-    metadata = grok_retry_call["custom_body"]["litellm_metadata"]
-    assert metadata["grok_native_oauth_forced_refresh"] is True
-    assert "grok-native-oauth-forced-refresh" in metadata["tags"]
-
-
 
 
 @pytest.mark.asyncio
@@ -21378,9 +21767,7 @@ async def test_openai_passthrough_codex_spark_drops_image_generation_tool(
 async def test_load_valid_local_antigravity_access_token_from_env(
     tmp_path, monkeypatch
 ):
-    _antigravity_oauth_access_token_cache.clear()
     token_path = tmp_path / "antigravity-oauth-token"
-    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path.write_text(
         json.dumps(
             {
@@ -21395,123 +21782,11 @@ async def test_load_valid_local_antigravity_access_token_from_env(
         )
     )
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN_FILE", raising=False)
 
     assert await _load_valid_local_antigravity_access_token() == (
         "test-antigravity-token"
     )
-    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
-        "access_token"
-    ] == "test-antigravity-token"
-    assert managed_path.stat().st_mode & 0o777 == 0o600
-
-
-@pytest.mark.asyncio
-async def test_load_valid_local_antigravity_access_token_newer_seed_invalidates_cache(
-    tmp_path, monkeypatch
-):
-    _antigravity_oauth_access_token_cache.clear()
-    seed_path = tmp_path / "seed" / "antigravity-oauth-token"
-    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
-    seed_path.parent.mkdir(parents=True)
-    managed_path.parent.mkdir(parents=True)
-    managed_path.write_text(
-        json.dumps(
-            {
-                "auth_method": "consumer",
-                "token": {
-                    "access_token": "managed-old-token",
-                    "expiry": "2099-01-01T00:00:00Z",
-                    "refresh_token": "managed-refresh-token",
-                    "token_type": "Bearer",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    seed_path.write_text(
-        json.dumps(
-            {
-                "auth_method": "consumer",
-                "token": {
-                    "access_token": "seed-new-token",
-                    "expiry": "2099-01-01T00:00:00Z",
-                    "refresh_token": "seed-refresh-token",
-                    "token_type": "Bearer",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.utime(managed_path, ns=(1_000_000_000, 1_000_000_000))
-    os.utime(seed_path, ns=(2_000_000_000, 2_000_000_000))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(seed_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
-    _antigravity_oauth_access_token_cache[str(managed_path.expanduser())] = (
-        "cached-old-token",
-        int(datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp() * 1000),
-    )
-
-    assert await _load_valid_local_antigravity_access_token() == "seed-new-token"
-    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
-        "access_token"
-    ] == "seed-new-token"
-
-
-@pytest.mark.asyncio
-async def test_load_valid_local_antigravity_access_token_equal_mtime_seed_invalidates_cache(
-    tmp_path, monkeypatch
-):
-    _antigravity_oauth_access_token_cache.clear()
-    seed_path = tmp_path / "seed" / "antigravity-oauth-token"
-    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
-    seed_path.parent.mkdir(parents=True)
-    managed_path.parent.mkdir(parents=True)
-    managed_path.write_text(
-        json.dumps(
-            {
-                "auth_method": "consumer",
-                "token": {
-                    "access_token": "managed-old-token",
-                    "expiry": "2099-01-01T00:00:00Z",
-                    "refresh_token": "managed-refresh-token",
-                    "token_type": "Bearer",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    seed_path.write_text(
-        json.dumps(
-            {
-                "auth_method": "consumer",
-                "token": {
-                    "access_token": "seed-equal-mtime-token",
-                    "expiry": "2099-01-01T00:00:00Z",
-                    "refresh_token": "seed-refresh-token",
-                    "token_type": "Bearer",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.utime(managed_path, ns=(1_000_000_000, 1_000_000_000))
-    os.utime(seed_path, ns=(1_000_000_000, 1_000_000_000))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(seed_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
-    _antigravity_oauth_access_token_cache[str(managed_path.expanduser())] = (
-        "cached-old-token",
-        int(datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp() * 1000),
-    )
-
-    assert (
-        await _load_valid_local_antigravity_access_token()
-        == "seed-equal-mtime-token"
-    )
-    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
-        "access_token"
-    ] == "seed-equal-mtime-token"
 
 
 def test_load_antigravity_oauth_client_values_from_local_cli_binary(
@@ -21707,7 +21982,6 @@ async def test_load_valid_local_antigravity_access_token_persists_refresh(
 ):
     _antigravity_oauth_access_token_cache.clear()
     token_path = tmp_path / "antigravity-oauth-token"
-    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path.write_text(
         json.dumps(
             {
@@ -21724,7 +21998,6 @@ async def test_load_valid_local_antigravity_access_token_persists_refresh(
     )
     token_path.chmod(0o600)
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
         "222222222222-client.apps.googleusercontent.com",
@@ -21745,15 +22018,14 @@ async def test_load_valid_local_antigravity_access_token_persists_refresh(
     ):
         token = await _load_valid_local_antigravity_access_token()
 
-    persisted = json.loads(managed_path.read_text(encoding="utf-8"))
-    seed = json.loads(token_path.read_text(encoding="utf-8"))
+    persisted = json.loads(token_path.read_text(encoding="utf-8"))
     assert token == "ya29.refreshed-antigravity"
     assert persisted["auth_method"] == "consumer"
     assert persisted["token"]["access_token"] == "ya29.refreshed-antigravity"
     assert persisted["token"]["refresh_token"] == "refresh-token-123"
     assert persisted["token"]["token_type"] == "Bearer"
     assert isinstance(persisted["token"]["expiry"], str)
-    assert seed["token"]["access_token"] == "ya29.expired-antigravity"
+    assert token_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio
@@ -21762,7 +22034,6 @@ async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallbac
 ):
     _antigravity_oauth_access_token_cache.clear()
     home_path = tmp_path / "home"
-    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path = (
         home_path
         / ".gemini"
@@ -21789,7 +22060,6 @@ async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallbac
     cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     cli_path.chmod(0o755)
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
@@ -21836,111 +22106,15 @@ async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallbac
     ):
         token = await _load_valid_local_antigravity_access_token()
 
-    managed = json.loads(managed_path.read_text(encoding="utf-8"))
     persisted = json.loads(token_path.read_text(encoding="utf-8"))
     assert token == "ya29.refreshed-via-agy"
-    assert managed["token"]["access_token"] == "ya29.refreshed-via-agy"
     assert persisted["token"]["access_token"] == "ya29.refreshed-via-agy"
     assert persisted["token"]["refresh_token"] == "refresh-token-123"
     assert subprocess_calls
 
 
 @pytest.mark.asyncio
-async def test_load_valid_local_antigravity_access_token_cli_fallback_recreates_seed_and_persists_managed(
-    tmp_path, monkeypatch
-):
-    _antigravity_oauth_access_token_cache.clear()
-    seed_home = tmp_path / "seed-home"
-    seed_path = (
-        seed_home
-        / ".gemini"
-        / "antigravity-cli"
-        / "antigravity-oauth-token"
-    )
-    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
-    managed_path.parent.mkdir(parents=True)
-    managed_path.write_text(
-        json.dumps(
-            {
-                "auth_method": "consumer",
-                "token": {
-                    "access_token": "ya29.managed-expired",
-                    "expiry": "2026-01-01T00:00:00Z",
-                    "refresh_token": "managed-refresh-token",
-                    "token_type": "Bearer",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    cli_path = tmp_path / "agy"
-    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    cli_path.chmod(0o755)
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(seed_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
-    monkeypatch.setenv(
-        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
-        "222222222222-client.apps.googleusercontent.com",
-    )
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
-    mock_client = AsyncMock()
-    mock_client.post.return_value = httpx.Response(
-        401,
-        json={"error": "invalid_client"},
-    )
-    mock_context = AsyncMock()
-    mock_context.__aenter__.return_value = mock_client
-    mock_context.__aexit__.return_value = False
-
-    class FakeProcess:
-        returncode = 0
-
-        async def communicate(self):
-            seed_path.parent.mkdir(parents=True)
-            seed_path.write_text(
-                json.dumps(
-                    {
-                        "auth_method": "consumer",
-                        "token": {
-                            "access_token": "ya29.recreated-seed",
-                            "expiry": (
-                                datetime.now(timezone.utc) + timedelta(hours=1)
-                            ).isoformat(),
-                            "refresh_token": "seed-refresh-token",
-                            "token_type": "Bearer",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return b"", b""
-
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        assert args[-1] == "models"
-        assert kwargs["env"]["HOME"] == str(seed_home)
-        return FakeProcess()
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
-        return_value=mock_context,
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.create_subprocess_exec",
-        new=fake_create_subprocess_exec,
-    ):
-        token = await _load_valid_local_antigravity_access_token()
-
-    assert token == "ya29.recreated-seed"
-    assert json.loads(managed_path.read_text(encoding="utf-8"))["token"][
-        "access_token"
-    ] == "ya29.recreated-seed"
-    assert json.loads(seed_path.read_text(encoding="utf-8"))["token"][
-        "access_token"
-    ] == "ya29.recreated-seed"
-
-
-@pytest.mark.asyncio
-async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_seed_auth_path(
+async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_passed_auth_path(
     tmp_path, monkeypatch
 ):
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -22013,17 +22187,17 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_s
         returncode = 0
 
         async def communicate(self):
-            refreshed = json.loads(env_path.read_text(encoding="utf-8"))
-            refreshed["token"]["access_token"] = "ya29.refreshed-seed"
+            refreshed = json.loads(target_path.read_text(encoding="utf-8"))
+            refreshed["token"]["access_token"] = "ya29.refreshed-target"
             refreshed["token"]["expiry"] = (
                 datetime.now(timezone.utc) + timedelta(hours=1)
             ).isoformat()
-            env_path.write_text(json.dumps(refreshed), encoding="utf-8")
+            target_path.write_text(json.dumps(refreshed), encoding="utf-8")
             return b"", b""
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         assert args[-1] == "models"
-        assert kwargs["env"]["HOME"] == str(env_home)
+        assert kwargs["env"]["HOME"] == str(target_home)
         return FakeProcess()
 
     with patch(
@@ -22038,41 +22212,10 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_fallback_reloads_s
             target_path,
         )
 
-    assert refreshed["token"]["access_token"] == "ya29.refreshed-seed"
-    assert json.loads(target_path.read_text(encoding="utf-8"))["token"][
-        "access_token"
-    ] == "ya29.target-expired"
+    assert refreshed["token"]["access_token"] == "ya29.refreshed-target"
     assert json.loads(env_path.read_text(encoding="utf-8"))["token"][
         "access_token"
-    ] == "ya29.refreshed-seed"
-
-
-def test_write_antigravity_oauth_token_data_atomic_wraps_parent_creation_failure(
-    tmp_path,
-):
-    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-        _write_antigravity_oauth_token_data_atomic,
-    )
-
-    parent_file = tmp_path / "not-a-directory"
-    parent_file.write_text("", encoding="utf-8")
-
-    with pytest.raises(
-        HTTPException,
-        match="Failed to persist refreshed Antigravity OAuth token auth data",
-    ):
-        _write_antigravity_oauth_token_data_atomic(
-            parent_file / "antigravity-oauth-token",
-            {
-                "auth_method": "consumer",
-                "token": {
-                    "access_token": "token",
-                    "expiry": "2099-01-01T00:00:00Z",
-                    "refresh_token": "refresh",
-                    "token_type": "Bearer",
-                },
-            },
-        )
+    ] == "ya29.env-token"
 
 
 @pytest.mark.asyncio
@@ -22107,7 +22250,6 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_noop_accepts_unexp
     cli_path = tmp_path / "agy"
     cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     cli_path.chmod(0o755)
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(target_path))
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
@@ -22186,7 +22328,6 @@ async def test_refresh_local_antigravity_oauth_token_data_cli_noop_rejects_expir
     cli_path = tmp_path / "agy"
     cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     cli_path.chmod(0o755)
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(target_path))
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
     monkeypatch.setenv(
         "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
@@ -22341,7 +22482,6 @@ async def test_load_valid_local_antigravity_access_token_caches_concurrent_refre
 ):
     _antigravity_oauth_access_token_cache.clear()
     token_path = tmp_path / "antigravity-oauth-token"
-    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
     token_path.write_text(
         json.dumps(
             {
@@ -22356,7 +22496,6 @@ async def test_load_valid_local_antigravity_access_token_caches_concurrent_refre
         )
     )
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
     future_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
 
     async def refresh_token_data(_token_data, _auth_path=None):
@@ -25602,7 +25741,12 @@ class TestOpenAIPassthroughRoute:
             "model": public_model,
             "input": [
                 {"type": "message", "role": "user", "content": "hello"},
-                {"type": "reasoning", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "rs_oa_xai_compaction",
+                    "summary": [],
+                    "encrypted_content": "encrypted-oa-xai-compaction",
+                },
                 {
                     "type": "function_call",
                     "name": "exec_command",
@@ -25711,6 +25855,9 @@ class TestOpenAIPassthroughRoute:
         assert prepared_body["litellm_metadata"][
             "codex_unsupported_input_item_types_removed"
         ] == ["reasoning"]
+        assert prepared_body["litellm_metadata"][
+            "codex_unsupported_input_items_removed"
+        ] == [{"type": "reasoning", "index": 1, "encrypted_content": True}]
         assert prepared_body["litellm_metadata"]["xai_oauth_public_model"] == public_model
         assert prepared_body["litellm_metadata"]["xai_oauth_upstream_model"] == (
             f"xai/{upstream_model}"
@@ -25815,7 +25962,12 @@ class TestOpenAIPassthroughRoute:
             "model": model,
             "input": [
                 {"type": "message", "role": "user", "content": "hello"},
-                {"type": "reasoning", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "rs_grok_compaction",
+                    "summary": [],
+                    "encrypted_content": "encrypted-grok-compaction",
+                },
                 {
                     "type": "function_call",
                     "name": "exec_command",
@@ -25942,6 +26094,9 @@ class TestOpenAIPassthroughRoute:
         assert metadata["codex_unsupported_input_item_removed_count"] == 1
         assert metadata["codex_unsupported_input_item_types_removed"] == [
             "reasoning"
+        ]
+        assert metadata["codex_unsupported_input_items_removed"] == [
+            {"type": "reasoning", "index": 1, "encrypted_content": True}
         ]
         assert "route:grok_cli_chat_proxy" in metadata["tags"]
         assert "openai-grok-native-responses-adapter" in metadata["tags"]
@@ -26388,6 +26543,82 @@ class TestGrokProxyRoute:
         assert call_kwargs["passthrough_logging_metadata"] == metadata
 
     @pytest.mark.asyncio
+    async def test_grok_proxy_route_removes_encrypted_reasoning_compaction_item(self):
+        """should remove invalid encrypted reasoning compaction while preserving function calls"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/responses"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": "0.2.50",
+            "x-grok-session-id": "session_123",
+            "x-grok-model-override": "grok-build",
+            "user-agent": "grok-shell/0.2.50 (linux; x86_64)",
+            "content-type": "application/json",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        request_body = {
+            "model": "grok-build",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_grok_direct_compaction",
+                    "summary": [],
+                    "encrypted_content": "encrypted-grok-direct-compaction",
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        call_kwargs = mock_pass_through.await_args.kwargs
+        prepared_body = call_kwargs["custom_body"]
+        assert prepared_body["input"] == [
+            request_body["input"][0],
+            request_body["input"][2],
+            request_body["input"][3],
+        ]
+        metadata = prepared_body["litellm_metadata"]
+        assert metadata["codex_unsupported_input_item_removed_count"] == 1
+        assert metadata["codex_unsupported_input_item_types_removed"] == [
+            "reasoning"
+        ]
+        assert metadata["codex_unsupported_input_items_removed"] == [
+            {"type": "reasoning", "index": 1, "encrypted_content": True}
+        ]
+        assert call_kwargs["passthrough_logging_metadata"] == metadata
+
+    @pytest.mark.asyncio
     async def test_grok_proxy_route_avoids_double_v1_for_custom_upstream_base(self):
         """should not duplicate /v1 when the configured upstream base already includes it"""
         mock_request = MagicMock(spec=Request)
@@ -26487,6 +26718,118 @@ class TestGrokProxyRoute:
         assert "grok-side-channel" in metadata["tags"]
         assert "x-grok-client-version" in call_kwargs["allowed_forward_headers"]
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["privacy/coding-data-retention", "v1/privacy/coding-data-retention"],
+    )
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_suppresses_coding_data_retention_without_body_parse(
+        self,
+        endpoint,
+    ):
+        """should sink Grok coding-data-retention privacy side channels locally without parsing or forwarding raw payloads"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = f"http://localhost:4000/grok/{endpoint}"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "content-type": "application/json",
+            "user-agent": "grok/0.2.55",
+        }
+        mock_request.query_params = {"key": "query-litellm-key"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        async def assert_coding_data_retention_body_sanitized_before_auth(**kwargs):
+            assert mock_set_parsed_body.called
+            return mock_user_api_key_dict
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(side_effect=assert_coding_data_retention_body_sanitized_before_auth),
+        ) as mock_auth, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(
+                return_value={
+                    "codingDataRetentionOptOut": True,
+                    "workspaceId": "workspace-secret",
+                }
+            ),
+        ) as mock_get_request_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"unexpected": True}),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body:
+            result = await grok_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {
+            "ok": True,
+            "suppressed": True,
+            "endpoint": "grok_coding_data_retention",
+        }
+        assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-test-key"
+        mock_set_parsed_body.assert_called_once_with(mock_request, {})
+        mock_get_request_body.assert_not_awaited()
+        mock_pass_through.assert_not_awaited()
+
+    @pytest.mark.parametrize("endpoint", ["storage", "v1/storage", "v1/storage/blob"])
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_suppresses_storage_upload_without_body_parse(
+        self,
+        endpoint,
+    ):
+        """should sink Grok storage uploads locally without parsing or forwarding raw artifacts"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = f"http://localhost:4000/grok/{endpoint}"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "content-type": "application/json",
+            "user-agent": "grok/0.2.55",
+        }
+        mock_request.query_params = {"key": "query-litellm-key"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        async def assert_storage_body_sanitized_before_auth(**kwargs):
+            assert mock_set_parsed_body.called
+            return mock_user_api_key_dict
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(side_effect=assert_storage_body_sanitized_before_auth),
+        ) as mock_auth, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=[{"role": "user", "content": "do not parse"}]),
+        ) as mock_get_request_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"unexpected": True}),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body:
+            result = await grok_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {
+            "ok": True,
+            "suppressed": True,
+            "endpoint": "grok_storage",
+        }
+        assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-test-key"
+        mock_set_parsed_body.assert_called_once_with(mock_request, {})
+        mock_get_request_body.assert_not_awaited()
+        mock_pass_through.assert_not_awaited()
+
     def test_build_grok_side_channel_request_shape_metadata_redacts_body_values(self):
         """should expose only non-secret request shape metadata for Grok session side channels"""
         mock_request = MagicMock(spec=Request)
@@ -26543,6 +26886,139 @@ class TestGrokProxyRoute:
         }
         rendered = json.dumps(shape)
         assert "secret" not in rendered
+
+    def test_log_grok_forward_header_compare_ignores_tracing_headers(self):
+        """should not warn when only expected tracing headers are stripped"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "traceparent": "00-traceparent-value",
+            "tracestate": "vendor=state",
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+        ) as mock_warning:
+            _log_grok_forward_header_compare(
+                endpoint="v1/sessions/register",
+                request=mock_request,
+            )
+
+        mock_warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_side_channel_shape_logs_debug_by_default(self):
+        """should keep side-channel shape metadata while logging at debug by default"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/sessions/register"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "content-type": "application/json",
+            "user-agent": "grok/0.1",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value={"sessionId": "session_123"}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+        ) as mock_info, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.debug"
+        ) as mock_debug:
+            result = await grok_proxy_route(
+                endpoint="v1/sessions/register",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        mock_info.assert_not_called()
+        shape_debug_calls = [
+            call
+            for call in mock_debug.call_args_list
+            if call.args
+            and call.args[0]
+            == "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s"
+        ]
+        assert len(shape_debug_calls) == 1
+        metadata = mock_pass_through.await_args.kwargs["passthrough_logging_metadata"]
+        assert metadata["grok_side_channel_endpoint_type"] == "sessions_register"
+        assert metadata["grok_side_channel_request_body_sha256"]
+        assert metadata["grok_side_channel_request_top_level_key_types"] == {
+            "sessionId": "str",
+        }
+        assert "grok-side-channel" in metadata["tags"]
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_side_channel_shape_logs_info_when_debug_enabled(
+        self,
+        monkeypatch,
+    ):
+        """should emit info-level side-channel shape logs when Grok route debug is enabled"""
+        monkeypatch.setenv("AAWM_GROK_ROUTE_DEBUG", "1")
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/sessions/register"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "content-type": "application/json",
+            "user-agent": "grok/0.1",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value={"sessionId": "session_123"}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+        ) as mock_info, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.debug"
+        ) as mock_debug:
+            result = await grok_proxy_route(
+                endpoint="v1/sessions/register",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        shape_debug_calls = [
+            call
+            for call in mock_debug.call_args_list
+            if call.args
+            and call.args[0]
+            == "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s"
+        ]
+        assert shape_debug_calls == []
+        shape_info_calls = [
+            call
+            for call in mock_info.call_args_list
+            if call.args
+            and call.args[0]
+            == "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s"
+        ]
+        assert len(shape_info_calls) == 1
 
     @pytest.mark.parametrize(
         "endpoint,expected_target,expected_endpoint_type",
@@ -26620,6 +27096,7 @@ class TestGrokProxyRoute:
             503,
             504,
         ]
+        assert call_kwargs["caller_managed_hidden_retry"] is True
         metadata = call_kwargs["passthrough_logging_metadata"]
         assert metadata["grok_side_channel"] is True
         assert metadata["grok_side_channel_endpoint_type"] == expected_endpoint_type
