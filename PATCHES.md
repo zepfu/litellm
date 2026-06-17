@@ -2800,6 +2800,49 @@ and running the documented prod readiness/log gates.
 
 ---
 
+### aawm.81 — Passthrough retry classification and Grok billing evidence hardening
+
+**What changed:** The fork release line now includes the post-`aawm.80` fixes
+for runtime error classification and Grok quota evidence. ChatGPT Codex
+passthrough `503` connection-termination responses are covered by the
+pre-first-byte hidden retry path and have a regression test that proves the
+5/15/30/60/120 second retry schedule, final
+`expected_upstream_capacity_or_internal` classification, and no old traceback
+terminal log path. Known Grok billing timeout/cancel responses are downgraded
+to degraded telemetry instead of active traceback intake. The provider-status
+sidecar now records safe Grok billing request-contract diagnostics on
+successful `rate_limit_observations` rows, including a stable fingerprint,
+source `grok_billing_sidecar_poll`, method, host/path, query keys, client
+identifier/version, model-override booleans, `x-xai-token-auth` configured
+boolean, user-agent, and header names only. The sidecar dedupe SQL now includes
+`evidence` so the first upgraded evidence-bearing snapshot can land even when
+quota values are unchanged.
+
+**Why:** Prod was still running an older passthrough path that emitted a
+traceback-style active error log for an expected upstream Codex `503` transport
+failure. Separately, successful Grok billing sidecar rows were ambiguous in the
+database because the row evidence did not identify the sidecar request contract,
+which made manual-versus-container billing comparisons repeat-prone.
+
+**Why not upstream:** This is AAWM-specific provider routing, runtime
+error-intake policy, Grok CLI/OIDC sidecar polling, and local
+`aawm_tristore.rate_limit_observations` evidence semantics.
+
+**Validation status:** Focused pytest coverage passed for the Codex passthrough
+`503` hidden-retry regression, the broader passthrough hidden-retry subset, and
+the Grok billing sidecar evidence path. Dev provider-status sidecar validation
+rebuilt and recreated `aawm-provider-status-observations:dev`, confirmed the
+running container contains the sidecar evidence and dedupe SQL patches, forced a
+live Grok billing poll with HTTP `200`, and verified DB row id `184547` includes
+`request_contract_source='grok_billing_sidecar_poll'` and fingerprint
+`d3f3858fb59887901db82e1895900c3f5ced2cba736da7ef8a01231dfc3d5d60`.
+Production promotion requires publishing `v1.82.3-aawm.81`,
+rebuilding/restarting `aawm-litellm`, verifying prod has the hidden-retry
+symbols, and archiving the old `.analysis/prod-error.log` intake after
+verification.
+
+---
+
 ### cb-v0.0.51 — Callback overlay parity for durable JSONL session-history spool
 
 **Status:** AAWM callback overlay release.
