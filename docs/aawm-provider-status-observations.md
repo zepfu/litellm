@@ -95,10 +95,21 @@ Relevant environment variables:
 - `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
 - `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
 - `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
+- `AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS`: maximum billing poll attempts per
+  scheduled run, including retries.
+- `AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS`: base backoff seconds between
+  retryable billing poll failures.
+
+The billing poll retries only transient transport/capacity failures and the
+known Grok `400` timeout/cancel response (`The operation was cancelled` /
+`Timeout expired`). Auth failures and provider rate limits (`401`, `403`, and
+`429`) are not retried; they are surfaced as a single degraded telemetry event
+for that scheduled run.
 
 Each due attempt emits a separate `grok_billing_poll` JSON line with sanitized
 status fields such as `attempted`, `persisted`, `skipped`, `auth_file`,
-`billing_url`, `client_version`, `model`, `status_code`, `observation_count`,
+`billing_url`, `client_version`, `model`, `status_code`, `attempt_count`,
+`retry_count`, `observation_count`,
 `inserted_count`, `error_class`, and `error_message`. The event must not contain
 access tokens, refresh tokens, id tokens, client secrets, raw auth headers, or
 the full billing credential payload. Billing poll failures are logged and do not
