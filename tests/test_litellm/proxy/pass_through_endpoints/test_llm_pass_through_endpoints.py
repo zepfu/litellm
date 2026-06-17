@@ -17916,7 +17916,7 @@ async def test_anthropic_proxy_route_routes_grok_native_models_to_responses_adap
 
 
 @pytest.mark.asyncio
-async def test_anthropic_grok_native_alias_probe_invalid_grant_is_candidate_unavailable(
+async def test_anthropic_grok_native_alias_probe_sidecar_refresh_required_is_candidate_unavailable(
     monkeypatch,
 ):
     monkeypatch.setenv(
@@ -17932,8 +17932,9 @@ async def test_anthropic_grok_native_alias_probe_invalid_grant_is_candidate_unav
         "litellm_metadata": {"session_id": "claude-grok-session"},
     }
     grok_refresh_error = ValueError(
-        "Grok OIDC credential refresh failed (invalid_grant). Reseed or relogin "
-        "the Grok OIDC credential."
+        "Grok OIDC credential is missing, expired, or near expiry. Run the "
+        "health/provider-status sidecar Grok OIDC refresh or relogin with the "
+        "Grok CLI before Grok native traffic can proceed."
     )
 
     with patch(
@@ -19481,7 +19482,7 @@ async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_silent_a
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invalid_grant(
+async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sidecar_refresh_required(
     monkeypatch,
 ):
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
@@ -19526,8 +19527,9 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         }
     }
     grok_refresh_error = ValueError(
-        "Grok OIDC credential refresh failed (invalid_grant). Reseed or relogin "
-        "the Grok OIDC credential."
+        "Grok OIDC credential is missing, expired, or near expiry. Run the "
+        "health/provider-status sidecar Grok OIDC refresh or relogin with the "
+        "Grok CLI before Grok native traffic can proceed."
     )
     managed_xai_success = Response(
         content='{"ok": true}', media_type="application/json"
