@@ -2839,10 +2839,39 @@ live Grok billing poll with HTTP `200`, and verified DB row id `184547` includes
 The `v1.82.3-aawm.81` tag was cut from the pre-autobump release merge and
 failed the image publisher's current-`main` reachability gate after the
 artifact autobump advanced `main`; see `aawm.82` for the replacement tag.
-Production promotion requires publishing `v1.82.3-aawm.82`,
-rebuilding/restarting `aawm-litellm`, verifying prod has the hidden-retry
-symbols, and archiving the old `.analysis/prod-error.log` intake after
-verification.
+Production promotion is superseded by `v1.82.3-aawm.83`, which carries this
+hidden-retry behavior plus the later Grok billing sidecar drift fix.
+
+---
+
+### aawm.83 — Grok billing sidecar auth-path drift hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.83` and includes
+the D1-308 provider-status sidecar hardening after `aawm.82`. The Grok billing
+sidecar now resolves the Grok auth file with sidecar override first and native
+Grok env fallback (`LITELLM_XAI_GROK_AUTH_FILE`,
+`LITELLM_XAI_OAUTH_GROK_AUTH_FILE`, `GROK_AUTH_FILE`, `GROK_HOME/auth.json`,
+then `/home/zepfu/.grok/auth.json`). Billing client-version fallback now also
+checks `GROK_CLIENT_VERSION`, the disabled model-override branch keeps
+`content-type: application/json` while omitting only `x-grok-model-override`,
+and billing poll logs include safe diagnostics for resolved auth path source and
+attempt budget.
+
+**Why:** After D1-307 proved the containerized billing path could succeed, D1-308
+identified remaining request/auth drift that could make future manual,
+passthrough, forced sidecar, and scheduled sidecar comparisons ambiguous. The
+release also carries the `aawm.82` hidden-retry Codex passthrough behavior that
+prod still needs for D1-305.
+
+**Why not upstream:** This is AAWM-specific provider-status sidecar behavior and
+local Grok OIDC credential ownership.
+
+**Validation status:** Focused sidecar tests passed (`56 passed`), ruff passed
+for touched Python files, the dev provider-status sidecar was rebuilt and
+recreated, and the restarted sidecar persisted DB row `184984` from a successful
+HTTP `200` Grok billing poll with the new safe diagnostics. Publish
+`v1.82.3-aawm.83`, then promote through the normal prod `:4000` process and
+verify D1-305 hidden-retry symbols before archiving `.analysis/prod-error.log`.
 
 ---
 
