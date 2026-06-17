@@ -2836,10 +2836,36 @@ running container contains the sidecar evidence and dedupe SQL patches, forced a
 live Grok billing poll with HTTP `200`, and verified DB row id `184547` includes
 `request_contract_source='grok_billing_sidecar_poll'` and fingerprint
 `d3f3858fb59887901db82e1895900c3f5ced2cba736da7ef8a01231dfc3d5d60`.
-Production promotion requires publishing `v1.82.3-aawm.81`,
+The `v1.82.3-aawm.81` tag was cut from the pre-autobump release merge and
+failed the image publisher's current-`main` reachability gate after the
+artifact autobump advanced `main`; see `aawm.82` for the replacement tag.
+Production promotion requires publishing `v1.82.3-aawm.82`,
 rebuilding/restarting `aawm-litellm`, verifying prod has the hidden-retry
 symbols, and archiving the old `.analysis/prod-error.log` intake after
 verification.
+
+---
+
+### aawm.82 — Post-callback-autobump release candidate retag
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.82` on top of the
+post-`aawm.81` callback artifact autobump. The code behavior is the same
+passthrough retry classification and Grok billing evidence hardening described
+in `aawm.81`, with callback overlay metadata advanced to `cb-v0.0.52`.
+
+**Why:** The `v1.82.3-aawm.81` tag was created before the automatic callback
+artifact bump moved `main` to `feb1bb6f6b`. The guarded fork image publisher
+requires the tagged commit to be reachable from current `main`, so `aawm.81`
+failed at the release gate. Per the release runbook, the old tag is preserved
+and a new fork image tag is cut from current `main`.
+
+**Why not upstream:** This is AAWM release-line bookkeeping for fork image tags
+and independently published overlay artifact versions.
+
+**Validation status:** Release metadata-only retag on top of the tested
+`aawm.81` content and callback overlay autobump. After `main` and `develop`
+are converged, publish `v1.82.3-aawm.82`, verify the fork image workflow, then
+promote through the normal prod `:4000` process.
 
 ---
 
