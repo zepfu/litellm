@@ -19240,17 +19240,174 @@ def _is_grok_storage_endpoint(endpoint: str) -> bool:
     return endpoint_path == "/storage" or endpoint_path.startswith("/storage/")
 
 
-def _get_grok_side_channel_retryable_status_codes(endpoint: str) -> list[int]:
+def _normalize_grok_endpoint_path(endpoint: str) -> str:
     endpoint_path = httpx.URL(endpoint).path
     if not endpoint_path.startswith("/"):
         endpoint_path = "/" + endpoint_path
     if endpoint_path.startswith("/v1/"):
         endpoint_path = endpoint_path[len("/v1") :]
+    return endpoint_path
 
+
+def _get_grok_session_side_channel_endpoint_type(endpoint: str) -> Optional[str]:
+    endpoint_path = _normalize_grok_endpoint_path(endpoint)
+    if endpoint_path == "/sessions/register":
+        return "sessions_register"
+    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith(
+        "/replicas/update"
+    ):
+        return "sessions_replicas_update"
+    return None
+
+
+def _get_grok_session_side_channel_endpoint_path_template(
+    endpoint_type: str,
+) -> Optional[str]:
+    if endpoint_type == "sessions_register":
+        return "/sessions/register"
+    if endpoint_type == "sessions_replicas_update":
+        return "/sessions/{session_id}/replicas/update"
+    return None
+
+
+def _json_shape_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _extract_redacted_grok_json_request_shape(parsed_body: Any) -> dict[str, Any]:
+    if isinstance(parsed_body, dict):
+        top_level_key_types = {
+            str(key): _json_shape_type_name(parsed_body.get(key))
+            for key in sorted(parsed_body.keys(), key=str)
+            if str(key) != "litellm_metadata"
+        }
+        return {
+            "json_container_type": "object",
+            "top_level_key_types": top_level_key_types,
+        }
+    if isinstance(parsed_body, list):
+        return {
+            "json_container_type": "array",
+            "array_length": len(parsed_body),
+        }
+    if parsed_body is None:
+        return {"json_container_type": "null"}
+    return {"json_container_type": _json_shape_type_name(parsed_body)}
+
+
+def _stable_grok_side_channel_body_digest(
+    *,
+    parsed_body: Any = None,
+    raw_body: Optional[bytes] = None,
+) -> tuple[int, str, str]:
+    if raw_body is not None:
+        body_bytes = raw_body
+        digest_source = "raw_body"
+    elif isinstance(parsed_body, dict):
+        upstream_body = {
+            key: value
+            for key, value in parsed_body.items()
+            if str(key) != "litellm_metadata"
+        }
+        body_bytes = json.dumps(
+            upstream_body,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        digest_source = "canonical_json_without_litellm_metadata"
+    elif isinstance(parsed_body, list):
+        body_bytes = json.dumps(
+            parsed_body,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        digest_source = "canonical_json"
+    else:
+        body_bytes = b""
+        digest_source = "empty_body"
+
+    return len(body_bytes), hashlib.sha256(body_bytes).hexdigest(), digest_source
+
+
+def _build_grok_side_channel_request_shape_metadata(
+    *,
+    endpoint: str,
+    request: Request,
+    parsed_body: Any = None,
+    raw_body: Optional[bytes] = None,
+) -> Optional[dict[str, Any]]:
+    endpoint_type = _get_grok_session_side_channel_endpoint_type(endpoint)
+    if endpoint_type is None:
+        return None
+
+    content_type = request.headers.get("content-type")
+    body_byte_length, body_sha256, digest_source = (
+        _stable_grok_side_channel_body_digest(
+            parsed_body=parsed_body,
+            raw_body=raw_body,
+        )
+    )
+    json_shape = _extract_redacted_grok_json_request_shape(parsed_body)
+
+    metadata: dict[str, Any] = {
+        "grok_side_channel": True,
+        "grok_side_channel_endpoint_type": endpoint_type,
+        "grok_side_channel_endpoint_path_template": (
+            _get_grok_session_side_channel_endpoint_path_template(endpoint_type)
+        ),
+        "grok_side_channel_request_content_type": content_type,
+        "grok_side_channel_request_body_byte_length": body_byte_length,
+        "grok_side_channel_request_body_sha256": body_sha256,
+        "grok_side_channel_request_body_digest_source": digest_source,
+        "grok_side_channel_request_json_container_type": json_shape.get(
+            "json_container_type"
+        ),
+    }
+    if "top_level_key_types" in json_shape:
+        metadata["grok_side_channel_request_top_level_key_types"] = json_shape[
+            "top_level_key_types"
+        ]
+    if "array_length" in json_shape:
+        metadata["grok_side_channel_request_array_length"] = json_shape["array_length"]
+
+    return metadata
+
+
+def _merge_grok_side_channel_shape_into_passthrough_logging_metadata(
+    passthrough_logging_metadata: dict[str, Any],
+    *,
+    shape_metadata: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not shape_metadata:
+        return passthrough_logging_metadata
+    merged = dict(passthrough_logging_metadata)
+    merged.update(shape_metadata)
+    tags = list(merged.get("tags") or [])
+    if "grok-side-channel" not in tags:
+        tags.append("grok-side-channel")
+    merged["tags"] = tags
+    return merged
+
+
+def _get_grok_side_channel_retryable_status_codes(endpoint: str) -> list[int]:
     is_session_side_channel = (
-        endpoint_path == "/sessions/register"
-        or endpoint_path.startswith("/sessions/")
-        and endpoint_path.endswith("/replicas/update")
+        _get_grok_session_side_channel_endpoint_type(endpoint) is not None
     )
     if not is_session_side_channel:
         return []
@@ -19765,9 +19922,12 @@ async def grok_proxy_route(
     custom_body: Optional[dict[str, Any]] = None
     custom_headers: dict[str, str] = {}
     passthrough_logging_metadata = _get_grok_passthrough_logging_metadata(request)
+    upstream_request_body_for_shape: Any = None
+    upstream_raw_body_for_shape: Optional[bytes] = None
     if request.method in {"POST", "PUT", "PATCH"}:
         if not raw_body_passthrough:
             request_body = await get_request_body(request)
+            upstream_request_body_for_shape = request_body
             if isinstance(request_body, dict):
                 custom_body = _prepare_grok_request_body_for_passthrough(
                     request=request,
@@ -19789,6 +19949,36 @@ async def grok_proxy_route(
                         )
                     ):
                         custom_headers["x-grok-model-override"] = grok_model_override
+        elif _get_grok_session_side_channel_endpoint_type(endpoint) is not None:
+            upstream_raw_body_for_shape = await request.body()
+
+    side_channel_shape_metadata = _build_grok_side_channel_request_shape_metadata(
+        endpoint=endpoint,
+        request=request,
+        parsed_body=upstream_request_body_for_shape,
+        raw_body=upstream_raw_body_for_shape,
+    )
+    if side_channel_shape_metadata:
+        passthrough_logging_metadata = (
+            _merge_grok_side_channel_shape_into_passthrough_logging_metadata(
+                passthrough_logging_metadata,
+                shape_metadata=side_channel_shape_metadata,
+            )
+        )
+        verbose_proxy_logger.info(
+            "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s",
+            side_channel_shape_metadata.get("grok_side_channel_endpoint_type"),
+            side_channel_shape_metadata.get(
+                "grok_side_channel_request_body_byte_length"
+            ),
+            side_channel_shape_metadata.get("grok_side_channel_request_body_sha256"),
+            side_channel_shape_metadata.get(
+                "grok_side_channel_request_json_container_type"
+            ),
+            side_channel_shape_metadata.get(
+                "grok_side_channel_request_top_level_key_types"
+            ),
+        )
 
     query_params = {
         key: value
