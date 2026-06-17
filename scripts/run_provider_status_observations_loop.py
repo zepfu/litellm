@@ -1173,6 +1173,41 @@ def _run_grok_oidc_refresh_task(
     }
 
 
+def _run_grok_oidc_metadata_repair_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    del state, now_monotonic
+    if not config.grok_oidc_refresh_enabled:
+        return None
+
+    try:
+        summary = grok_oidc_refresh.repair_grok_oidc_auth_file_metadata(
+            config.grok_oidc_auth_file,
+            lock_file=config.grok_oidc_lock_file,
+        )
+    except Exception as exc:
+        summary = {
+            "attempted": True,
+            "repaired": False,
+            "auth_file": config.grok_oidc_auth_file,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+
+    if not summary.get("repaired") and not summary.get("error_class"):
+        return None
+
+    return {
+        "event": "grok_oidc_metadata_repair",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        **summary,
+    }
+
+
 def _run_grok_billing_poll_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -1244,6 +1279,7 @@ def run_due_sidecar_tasks(
     now = time.monotonic() if now_monotonic is None else now_monotonic
     events: list[Dict[str, Any]] = []
     for runner, event_name in (
+        (_run_grok_oidc_metadata_repair_task, "grok_oidc_metadata_repair"),
         (_run_grok_oidc_refresh_task, "grok_oidc_refresh"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
     ):
