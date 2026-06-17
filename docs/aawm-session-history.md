@@ -193,30 +193,38 @@ path.
 The display shape is:
 
 ```text
-ROUTE: [client-name/version -] YYYY-MM-DD HH:MM:SS - [agent@repository -] [model(alias) -] [ip:port -] METHOD incoming -> outgoing PROTOCOL
+YYYYMMDD HH:MM:SS [ROUTE] [client-name/version] - [agent-name[#agent-id][@repository][.model(alias)]] METHOD ip:port incoming -> outgoing
 ```
 
-The timestamp uses a 24-hour clock. Client name/version, agent, repository,
-model alias, and client address segments are omitted when that metadata is
-unavailable. The selected model is printed as `model(alias)` only when the
-inbound alias differs from the selected model.
+The timestamp uses a 24-hour clock. Known TUI client products are normalized for
+display, for example `claude-cli/*` and `claude-code/*` become `Claude/*`,
+`codex-cli/*` and `codex-tui/*` become `Codex/*`, and `grok-*/*` becomes
+`Grok/*`. Client name/version, agent, agent id, repository, model alias, and
+client address segments are omitted when that metadata is unavailable. The
+selected model is printed as `model(alias)` only when the inbound alias differs
+from the selected model. When owner metadata is present, the route context is
+composed as `agent#id@repository.model(alias)`; missing subfields are omitted
+without inventing values.
 
 These lines are for live container-log triage, not durable reporting. Durable
 model and alias attribution still comes from `session_history.model` and
 `session_history.inbound_model_alias`. Route-log identity fields are conservative
 display tokens derived from normalized metadata or explicit headers such as
 `x-aawm-client-name`, `x-aawm-client-version`, `user-agent`,
-`x-aawm-agent-name`, and `x-aawm-repository`; LiteLLM omits prompt-like,
-sentence-like, or punctuation-heavy identity values instead of printing raw
-request text. LiteLLM intentionally does not inspect prompt text or raw tool
-arguments for the route log.
+`x-aawm-agent-name`, and `x-aawm-repository`. Repository display can also come
+from the same structured identity aliases used by `session_history`, including
+`repo`, `workspace_root`, `project_root`, `working_directory`, `cwd_path`,
+`cwd_uri`, and `aawm_claude_project`. LiteLLM omits prompt-like, sentence-like,
+or punctuation-heavy identity values instead of printing raw request text.
+LiteLLM intentionally does not inspect prompt text or raw tool arguments for the
+route log.
 
 Route logs must not include API keys, authorization headers, full request or
 response bodies, prompt content, tool arguments, or arbitrary query strings.
 Incoming endpoints preserve only known-safe routing query markers, and outgoing
 targets are logged as host plus path.
 
-For requests that emit this enriched `ROUTE:` line, LiteLLM suppresses the
+For requests that emit this enriched `[ROUTE]` line, LiteLLM suppresses the
 matching native Uvicorn/Gunicorn access record for that request. Unrelated
 routes should continue to use the normal server access log.
 

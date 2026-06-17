@@ -29,24 +29,63 @@ _AAWM_ROUTE_LOG_AGENT_METADATA_KEYS = (
     "aawm_agent_name",
     "aawm_claude_agent_name",
 )
+_AAWM_ROUTE_LOG_AGENT_ID_METADATA_KEYS = (
+    "agent_id",
+    "aawm_agent_id",
+    "aawm_claude_agent_id",
+    "claude_agent_id",
+    "codex_agent_id",
+)
 _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS = (
     "x-aawm-agent-name",
     "x-litellm-agent-name",
     "x-agent-name",
 )
+_AAWM_ROUTE_LOG_AGENT_ID_HEADER_KEYS = (
+    "x-aawm-agent-id",
+    "x-litellm-agent-id",
+    "x-agent-id",
+    "x-claude-agent-id",
+    "x-codex-agent-id",
+)
 _AAWM_ROUTE_LOG_REPOSITORY_METADATA_KEYS = (
     "repository",
     "aawm_repository",
     "source_repository",
+    "repo",
+    "repo_name",
     "repository_name",
     "git_repository",
     "vcs_repository",
+    "workspace_root",
+    "workspaceRoot",
+    "project_root",
+    "projectRoot",
+    "root_path",
+    "rootPath",
+    "working_directory",
+    "workingDirectory",
+    "cwd_path",
+    "cwdPath",
+    "cwd_uri",
+    "cwdUri",
+    "aawm_claude_project",
 )
 _AAWM_ROUTE_LOG_REPOSITORY_HEADER_KEYS = (
     "x-aawm-repository",
     "x-litellm-repository",
     "x-repository",
     "x-git-repository",
+)
+_AAWM_ROUTE_LOG_REPOSITORY_TENANT_HEADER_KEYS = (
+    "x-aawm-tenant-id",
+    "x-litellm-tenant-id",
+    "x-litellm-organization-id",
+    "x-litellm-org-id",
+    "x-organization-id",
+    "x-org-id",
+    "x-litellm-team-id",
+    "x-team-id",
 )
 _AAWM_ROUTE_LOG_CLIENT_LABEL_METADATA_KEYS = (
     "client_name_version",
@@ -99,6 +138,38 @@ _AAWM_ROUTE_LOG_SELECTED_MODEL_METADATA_KEYS = (
     "xai_oauth_upstream_model",
     "grok_model_override",
 )
+_AAWM_ROUTE_LOG_TOP_LEVEL_METADATA_KEYS = (
+    _AAWM_ROUTE_LOG_AGENT_METADATA_KEYS
+    + _AAWM_ROUTE_LOG_AGENT_ID_METADATA_KEYS
+    + _AAWM_ROUTE_LOG_REPOSITORY_METADATA_KEYS
+    + _AAWM_ROUTE_LOG_CLIENT_LABEL_METADATA_KEYS
+    + _AAWM_ROUTE_LOG_CLIENT_NAME_METADATA_KEYS
+    + _AAWM_ROUTE_LOG_CLIENT_VERSION_METADATA_KEYS
+    + _AAWM_ROUTE_LOG_MODEL_ALIAS_METADATA_KEYS
+    + _AAWM_ROUTE_LOG_SELECTED_MODEL_METADATA_KEYS
+    + ("trace_name", "trace_user_id")
+)
+_AAWM_ROUTE_LOG_TENANT_REPOSITORY_FRAGMENTS = (
+    "harness",
+    "validation",
+)
+
+
+def _normalize_aawm_route_log_type(
+    route_type: Optional[str],
+    incoming_endpoint: Optional[str] = None,
+) -> str:
+    route_type_label = (route_type or "").lower().strip()
+    endpoint_label = (incoming_endpoint or "").lower()
+    if route_type_label in {"aembedding", "embedding", "embeddings"}:
+        return "EMBED"
+    if route_type_label in {"arerank", "rerank"}:
+        return "RERANK"
+    if "/embeddings" in endpoint_label:
+        return "EMBED"
+    if "/rerank" in endpoint_label:
+        return "RERANK"
+    return _AAWM_ROUTE_ACCESS_LOG_TYPE
 
 
 def _clean_aawm_route_log_field(value: Any) -> Optional[str]:
@@ -148,6 +219,15 @@ def _normalize_aawm_route_log_agent_label(value: Any) -> Optional[str]:
     return cleaned
 
 
+def _normalize_aawm_route_log_agent_id(value: Any) -> Optional[str]:
+    cleaned = _clean_aawm_route_log_field(value)
+    if not cleaned or len(cleaned) > _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS:
+        return None
+    if _is_aawm_route_log_slug(cleaned):
+        return cleaned
+    return None
+
+
 def _normalize_aawm_route_log_repository_label(value: Any) -> Optional[str]:
     cleaned = _clean_aawm_route_log_field(value)
     if not cleaned or len(cleaned) > _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS:
@@ -174,6 +254,39 @@ def _normalize_aawm_route_log_repository_label(value: Any) -> Optional[str]:
     return None
 
 
+def _normalize_aawm_route_log_tenant_repository_label(value: Any) -> Optional[str]:
+    repository = _normalize_aawm_route_log_repository_label(value)
+    if repository is None:
+        return None
+
+    normalized = repository.lower()
+    if any(
+        fragment in normalized
+        for fragment in _AAWM_ROUTE_LOG_TENANT_REPOSITORY_FRAGMENTS
+    ):
+        return "litellm"
+    if normalized.endswith("-dev") or "tenant" in normalized:
+        return None
+    return repository
+
+
+def _normalize_aawm_route_log_known_client_name(name: str) -> str:
+    normalized_name = name.lower().replace("_", "-")
+    if normalized_name in {"claude", "claude-cli", "claude-code"}:
+        return "Claude"
+    if normalized_name in {"codex", "codex-cli", "codex-tui", "codex-cli-rs"}:
+        return "Codex"
+    if normalized_name in {"grok", "grok-build", "grok-pager"}:
+        return "Grok"
+    if normalized_name in {"gemini", "gemini-cli"}:
+        return "Gemini"
+    if normalized_name in {"opencode", "opencode-tui"}:
+        return "OpenCode"
+    if normalized_name in {"cursor", "cursor-cli"}:
+        return "Cursor"
+    return name
+
+
 def _normalize_aawm_route_log_client_product(value: Any) -> Optional[str]:
     cleaned = _clean_aawm_route_log_field(value)
     if not cleaned or len(cleaned) > _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS:
@@ -185,10 +298,10 @@ def _normalize_aawm_route_log_client_product(value: Any) -> Optional[str]:
     if "/" in product:
         name, version = product.split("/", 1)
         if _is_aawm_route_log_slug(name) and _is_aawm_route_log_slug(version):
-            return f"{name}/{version}"
+            return f"{_normalize_aawm_route_log_known_client_name(name)}/{version}"
         return None
     if _is_aawm_route_log_slug(product):
-        return product
+        return _normalize_aawm_route_log_known_client_name(product)
     return None
 
 
@@ -213,10 +326,19 @@ def _extract_aawm_route_log_metadata(
 ) -> dict[str, Any]:
     body_metadata: dict[str, Any] = {}
     if isinstance(request_body, dict):
+        for key in _AAWM_ROUTE_LOG_TOP_LEVEL_METADATA_KEYS:
+            if key in request_body:
+                body_metadata[key] = request_body[key]
         for metadata_key in ("litellm_metadata", "metadata"):
             metadata_value = request_body.get(metadata_key)
             if isinstance(metadata_value, dict):
-                body_metadata.update(metadata_value)
+                body_metadata.update(
+                    {
+                        key: value
+                        for key, value in metadata_value.items()
+                        if key in _AAWM_ROUTE_LOG_TOP_LEVEL_METADATA_KEYS
+                    }
+                )
 
     kwargs_metadata: dict[str, Any] = {}
     if isinstance(kwargs, dict):
@@ -329,15 +451,6 @@ def _get_aawm_route_client_label(request: Request) -> Optional[str]:
     return None
 
 
-def _get_aawm_route_protocol_label(request: Request) -> str:
-    scope = getattr(request, "scope", None)
-    http_version = scope.get("http_version") if isinstance(scope, dict) else None
-    version = _clean_aawm_route_log_field(http_version)
-    if not version:
-        return "HTTP"
-    return f"HTTP/{version}"
-
-
 def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
@@ -403,12 +516,67 @@ def _get_aawm_route_log_model_label(
     return model or alias
 
 
+def _get_aawm_route_log_context_label(
+    *,
+    agent_name: Optional[str],
+    agent_id: Optional[str],
+    repository: Optional[str],
+    model_label: Optional[str],
+) -> Optional[str]:
+    agent_label = agent_name
+    if agent_label and agent_id:
+        agent_label = f"{agent_label}#{agent_id}"
+    elif agent_id:
+        agent_label = f"#{agent_id}"
+
+    if agent_label and repository:
+        owner_label = f"{agent_label}@{repository}"
+    else:
+        owner_label = agent_label or repository
+
+    if owner_label and model_label:
+        return f"{owner_label}.{model_label}"
+    return owner_label or model_label
+
+
+def _get_aawm_route_log_trace_user_repository(
+    metadata: dict[str, Any],
+    headers: dict[str, Any],
+) -> Optional[str]:
+    trace_name = _first_aawm_route_log_value(
+        metadata,
+        keys=("trace_name",),
+    ) or _get_case_insensitive_header_value(
+        headers,
+        ("langfuse_trace_name",),
+    )
+    if not trace_name:
+        return None
+
+    normalized_trace_name = trace_name.lower()
+    if not normalized_trace_name.startswith(
+        ("claude-code", "codex", "grok-build", "grok")
+    ):
+        return None
+
+    return _first_aawm_route_log_value(
+        metadata,
+        keys=("trace_user_id",),
+        normalizer=_normalize_aawm_route_log_repository_label,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        ("langfuse_trace_user_id",),
+        normalizer=_normalize_aawm_route_log_repository_label,
+    )
+
+
 def build_aawm_route_access_log_line(
     *,
     request: Request,
     target: Union[str, httpx.URL],
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
+    route_type: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> str:
     metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
@@ -426,6 +594,15 @@ def build_aawm_route_access_log_line(
         _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_agent_label,
     )
+    agent_id = _first_aawm_route_log_value(
+        metadata,
+        keys=_AAWM_ROUTE_LOG_AGENT_ID_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_log_agent_id,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_LOG_AGENT_ID_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_log_agent_id,
+    )
     repository = _first_aawm_route_log_value(
         metadata,
         keys=_AAWM_ROUTE_LOG_REPOSITORY_METADATA_KEYS,
@@ -434,31 +611,37 @@ def build_aawm_route_access_log_line(
         headers,
         _AAWM_ROUTE_LOG_REPOSITORY_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_repository_label,
+    ) or _get_aawm_route_log_trace_user_repository(
+        metadata,
+        headers,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_LOG_REPOSITORY_TENANT_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_log_tenant_repository_label,
     )
     model_label = _get_aawm_route_log_model_label(request_body, metadata)
+    context_label = _get_aawm_route_log_context_label(
+        agent_name=agent_name,
+        agent_id=agent_id,
+        repository=repository,
+        model_label=model_label,
+    )
     client_label = _get_aawm_route_client_label(request)
     method = _clean_aawm_route_log_field(getattr(request, "method", None)) or "REQUEST"
     incoming_endpoint = _safe_aawm_route_endpoint_label(request)
+    log_type = _normalize_aawm_route_log_type(route_type, incoming_endpoint)
     outgoing_target = _safe_aawm_route_target_label(target)
-    protocol = _get_aawm_route_protocol_label(request)
-    timestamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = (now or datetime.now()).strftime("%Y%m%d %H:%M:%S")
 
-    segments: list[str] = [f"{_AAWM_ROUTE_ACCESS_LOG_TYPE}:"]
+    segments: list[str] = [timestamp, f"[{log_type}]"]
     if client_product_label:
-        segments.append(f"{client_product_label} -")
-    segments.append(f"{timestamp} -")
-    if agent_name and repository:
-        segments.append(f"{agent_name}@{repository} -")
-    elif agent_name:
-        segments.append(f"{agent_name} -")
-    elif repository:
-        segments.append(f"{repository} -")
-
-    if model_label:
-        segments.append(f"{model_label} -")
+        segments.append(client_product_label)
+    if context_label:
+        segments.append(f"- {context_label}")
+    segments.append(method)
     if client_label:
-        segments.append(f"{client_label} -")
-    segments.append(f"{method} {incoming_endpoint} -> {outgoing_target} {protocol}")
+        segments.append(client_label)
+    segments.append(f"{incoming_endpoint} -> {outgoing_target}")
     return " ".join(segments)
 
 
@@ -468,10 +651,12 @@ def emit_aawm_route_access_log(
     target: Union[str, httpx.URL],
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
+    route_type: Optional[str] = None,
 ) -> None:
     scope = getattr(request, "scope", None)
     if isinstance(scope, dict):
         if scope.get(_AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY):
+            _register_aawm_route_access_log_replacement(request)
             return
         scope[_AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY] = True
 
@@ -480,6 +665,7 @@ def emit_aawm_route_access_log(
         target=target,
         request_body=request_body,
         kwargs=kwargs,
+        route_type=route_type,
     )
     _register_aawm_route_access_log_replacement(request)
     logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info("%s", line)
