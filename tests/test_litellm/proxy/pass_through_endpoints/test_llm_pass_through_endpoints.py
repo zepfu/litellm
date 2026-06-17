@@ -26668,6 +26668,66 @@ class TestGrokProxyRoute:
         assert "grok-side-channel" in metadata["tags"]
         assert "x-grok-client-version" in call_kwargs["allowed_forward_headers"]
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["privacy/coding-data-retention", "v1/privacy/coding-data-retention"],
+    )
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_suppresses_coding_data_retention_without_body_parse(
+        self,
+        endpoint,
+    ):
+        """should sink Grok coding-data-retention privacy side channels locally without parsing or forwarding raw payloads"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = f"http://localhost:4000/grok/{endpoint}"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "content-type": "application/json",
+            "user-agent": "grok/0.2.55",
+        }
+        mock_request.query_params = {"key": "query-litellm-key"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        async def assert_coding_data_retention_body_sanitized_before_auth(**kwargs):
+            assert mock_set_parsed_body.called
+            return mock_user_api_key_dict
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(side_effect=assert_coding_data_retention_body_sanitized_before_auth),
+        ) as mock_auth, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(
+                return_value={
+                    "codingDataRetentionOptOut": True,
+                    "workspaceId": "workspace-secret",
+                }
+            ),
+        ) as mock_get_request_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"unexpected": True}),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body:
+            result = await grok_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {
+            "ok": True,
+            "suppressed": True,
+            "endpoint": "grok_coding_data_retention",
+        }
+        assert mock_auth.await_args.kwargs["api_key"] == "Bearer litellm-test-key"
+        mock_set_parsed_body.assert_called_once_with(mock_request, {})
+        mock_get_request_body.assert_not_awaited()
+        mock_pass_through.assert_not_awaited()
+
     @pytest.mark.parametrize("endpoint", ["storage", "v1/storage", "v1/storage/blob"])
     @pytest.mark.asyncio
     async def test_grok_proxy_route_suppresses_storage_upload_without_body_parse(
