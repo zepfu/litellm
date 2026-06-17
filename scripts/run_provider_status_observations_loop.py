@@ -285,7 +285,7 @@ class ProviderStatusLoopConfig:
     grok_billing_client_identifier: str = DEFAULT_GROK_BILLING_CLIENT_IDENTIFIER
     grok_billing_xai_token_auth: str = DEFAULT_GROK_BILLING_XAI_TOKEN_AUTH
     grok_billing_model: str = DEFAULT_GROK_BILLING_MODEL
-    grok_billing_include_model_override: bool = False
+    grok_billing_include_model_override: bool = True
     grok_billing_poll_max_attempts: int = DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS
     grok_billing_poll_retry_backoff_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
@@ -616,11 +616,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=_env_bool(
             "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE",
-            False,
+            True,
         ),
         help=(
-            "Include x-grok-model-override on Grok billing poll requests. "
-            "Defaults to AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE or false."
+            "Include native Grok billing request-shape headers on billing poll "
+            "requests. Defaults to AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE or "
+            "true."
         ),
     )
     billing_override_group.add_argument(
@@ -965,6 +966,7 @@ def _build_grok_billing_request_headers(
     headers = {
         "accept": "application/json",
         "authorization": f"Bearer {access_token}",
+        "content-type": "application/json",
         "user-agent": f"grok/{config.grok_billing_client_version}",
         "x-grok-client-identifier": config.grok_billing_client_identifier,
         "x-grok-client-version": config.grok_billing_client_version,
@@ -973,7 +975,9 @@ def _build_grok_billing_request_headers(
         "x-xai-token-auth": config.grok_billing_xai_token_auth,
     }
     model_override = str(config.grok_billing_model).strip()
-    if config.grok_billing_include_model_override and model_override:
+    if not config.grok_billing_include_model_override:
+        headers.pop("content-type", None)
+    elif model_override:
         headers["x-grok-model-override"] = model_override
     if identity_headers:
         for header_name, _credential_field in GROK_BILLING_IDENTITY_HEADER_FIELDS:
