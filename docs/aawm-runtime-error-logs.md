@@ -113,6 +113,15 @@ attempt numbers, status/failure class, and wait seconds only; they must not
 contain raw request bodies, response bodies, headers, prompts, tool arguments,
 or credentials.
 
+Intermediate hidden-retry attempts are progress events, not terminal runtime
+failures, and are logged at `INFO`. When all attempts are exhausted for an
+expected capacity, internal, timeout, or connectivity failure, the final
+pass-through error remains visible at `ERROR` but is logged as a concise
+terminal upstream failure instead of a repeated internal traceback. The JSONL
+context includes `failure_kind`, `hidden_retry_final_outcome`,
+`hidden_retry_failure_classification`, and `hidden_retry_count` so operators can
+distinguish retry exhaustion from unexpected LiteLLM exceptions.
+
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact
 support: https://langfuse.com/support.`), LiteLLM keeps the original message and

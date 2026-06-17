@@ -22,12 +22,15 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 from litellm._logging import (
+    AawmErrorLogFileHandler,
+    _build_aawm_error_log_record,
     AawmRouteAccessLogReplacementFilter,
     clear_aawm_route_access_log_replacements,
     get_egress_guard_alert_state,
     register_aawm_route_access_log_replacement,
     reset_egress_guard_alert_state,
     verbose_aawm_route_logger,
+    verbose_proxy_logger,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import ProxyException
@@ -38,6 +41,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _direct_capture_xai_passthrough_failure,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
     _record_passthrough_hidden_retry_metadata,
+    _should_log_passthrough_terminal_failure_without_traceback,
     emit_aawm_route_access_log,
     pass_through_request,
 )
@@ -2819,6 +2823,294 @@ async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallba
     )
 
 
+class TestPassThroughTerminalFailureLogging:
+    @staticmethod
+    def _install_aawm_error_log_handler(tmp_path, monkeypatch):
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        handler = AawmErrorLogFileHandler()
+        saved_handlers = verbose_proxy_logger.handlers[:]
+        saved_level = verbose_proxy_logger.level
+        saved_propagate = verbose_proxy_logger.propagate
+        verbose_proxy_logger.handlers.clear()
+        verbose_proxy_logger.addHandler(handler)
+        verbose_proxy_logger.setLevel(logging.ERROR)
+        verbose_proxy_logger.propagate = False
+
+        return saved_handlers, saved_level, saved_propagate
+
+    @staticmethod
+    def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        verbose_proxy_logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            verbose_proxy_logger.addHandler(saved_handler)
+        verbose_proxy_logger.setLevel(saved_level)
+        verbose_proxy_logger.propagate = saved_propagate
+
+    def test_terminal_failure_classifier_matches_exhausted_hidden_retry_status(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "aawm_passthrough_hidden_retry_final_outcome": "failed_after_retry",
+                    "aawm_passthrough_hidden_retry_failure_classification": None,
+                    "aawm_passthrough_hidden_retry_count": 6,
+                }
+            }
+        }
+
+        assert _should_log_passthrough_terminal_failure_without_traceback(
+            exc=HTTPException(status_code=529, detail="overloaded"),
+            kwargs=kwargs,
+            status_code=529,
+        )
+
+    def test_terminal_failure_classifier_keeps_auth_errors_exceptional(self):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "aawm_passthrough_hidden_retry_final_outcome": "failed_without_retry",
+                }
+            }
+        }
+
+        assert not _should_log_passthrough_terminal_failure_without_traceback(
+            exc=HTTPException(status_code=401, detail="unauthorized"),
+            kwargs=kwargs,
+            status_code=401,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_exhausted_529_logs_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=529,
+            content=b'{"error":"overloaded"}',
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "claude-sonnet-4-6"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(),
+            ):
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "claude-sonnet-4-6"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "529"
+                assert handler.await_count == 6
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "exhausted hidden retries for upstream failure" in item["message"]
+        )
+
+        assert payload["context"]["status_code"] == 529
+        assert payload["context"]["model"] == "claude-sonnet-4-6"
+        assert "final_outcome=failed_after_retry" in payload["message"]
+        assert "retry_count=6" in payload["message"]
+        assert payload.get("traceback") in (None, "")
+
+    def test_terminal_failure_log_record_includes_hidden_retry_context_fields(self):
+        metadata = {
+            "aawm_passthrough_hidden_retry_final_outcome": "failed_after_retry",
+            "aawm_passthrough_hidden_retry_failure_classification": "upstream_connectivity_failure",
+            "aawm_passthrough_hidden_retry_count": 6,
+        }
+        kwargs = {"litellm_params": {"metadata": metadata}}
+        hidden_retry_metadata = kwargs["litellm_params"]["metadata"]
+        terminal_failure_context = {
+            "status_code": 529,
+            "model": "claude-sonnet-4-6",
+            "failure_kind": "expected_upstream_capacity_or_internal",
+            "hidden_retry_final_outcome": hidden_retry_metadata.get(
+                "aawm_passthrough_hidden_retry_final_outcome"
+            ),
+            "hidden_retry_failure_classification": hidden_retry_metadata.get(
+                "aawm_passthrough_hidden_retry_failure_classification"
+            ),
+            "hidden_retry_count": hidden_retry_metadata.get(
+                "aawm_passthrough_hidden_retry_count"
+            ),
+        }
+
+        record = logging.LogRecord(
+            name="LiteLLM Proxy",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg=(
+                "Pass through endpoint exhausted hidden retries for upstream failure "
+                "status=%s error=%s final_outcome=%s retry_count=%s"
+            ),
+            args=(529, "overloaded", "failed_after_retry", 6),
+            exc_info=None,
+        )
+        for key, value in terminal_failure_context.items():
+            setattr(record, key, value)
+
+        payload = _build_aawm_error_log_record(
+            record,
+            formatter=logging.Formatter(),
+        )
+
+        assert getattr(record, "failure_kind") == "expected_upstream_capacity_or_internal"
+        assert getattr(record, "hidden_retry_final_outcome") == "failed_after_retry"
+        assert (
+            getattr(record, "hidden_retry_failure_classification")
+            == "upstream_connectivity_failure"
+        )
+        assert getattr(record, "hidden_retry_count") == 6
+        assert payload["context"]["status_code"] == 529
+        assert payload["context"]["model"] == "claude-sonnet-4-6"
+        for field, expected in (
+            ("failure_kind", "expected_upstream_capacity_or_internal"),
+            ("hidden_retry_final_outcome", "failed_after_retry"),
+            (
+                "hidden_retry_failure_classification",
+                "upstream_connectivity_failure",
+            ),
+            ("hidden_retry_count", 6),
+        ):
+            assert getattr(record, field) == expected
+            assert payload["context"].get(field) == expected
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_non_classified_failure_keeps_exception_logging(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        handler = AsyncMock(side_effect=RuntimeError("unexpected passthrough failure"))
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "claude-sonnet-4-6"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "claude-sonnet-4-6"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                    )
+                assert "unexpected passthrough failure" in str(exc_info.value.message)
+
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    "unexpected passthrough failure"
+                    in mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Exception occured - unexpected passthrough failure" in item["message"]
+        )
+        assert "RuntimeError: unexpected passthrough failure" in payload["traceback"]
+
+
 class TestPassThroughHiddenRetry:
     def test_hidden_retry_metadata_initializes_empty_metadata(self):
         kwargs: dict = {}
@@ -2844,6 +3136,35 @@ class TestPassThroughHiddenRetry:
                 "status_code": 529,
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_attempt_progress_logs_info_not_warning(self):
+        kwargs: dict = {}
+        operation = AsyncMock(
+            side_effect=[
+                HTTPException(status_code=529, detail="overloaded"),
+                "ok",
+            ]
+        )
+
+        with patch.object(verbose_proxy_logger, "info") as mock_info, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ):
+            result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs=kwargs,
+                operation_name="non_stream_pre_first_byte",
+                operation=operation,
+                caller_managed_hidden_retry=False,
+            )
+
+        assert result == "ok"
+        mock_info.assert_called_once()
+        assert "hidden retry attempt" in mock_info.call_args.args[0]
+        mock_warning.assert_not_called()
 
     @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
     @pytest.mark.asyncio

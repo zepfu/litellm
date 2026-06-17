@@ -238,6 +238,8 @@ _GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE = frozenset(
     {
         "content-length",
         "host",
+        "traceparent",
+        "tracestate",
         "x-litellm-api-key",
     }
 )
@@ -19991,7 +19993,12 @@ async def grok_proxy_route(
                 shape_metadata=side_channel_shape_metadata,
             )
         )
-        verbose_proxy_logger.info(
+        side_channel_shape_log = (
+            verbose_proxy_logger.info
+            if os.getenv("AAWM_GROK_ROUTE_DEBUG") == "1"
+            else verbose_proxy_logger.debug
+        )
+        side_channel_shape_log(
             "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s",
             side_channel_shape_metadata.get("grok_side_channel_endpoint_type"),
             side_channel_shape_metadata.get(

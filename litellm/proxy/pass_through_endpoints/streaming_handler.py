@@ -806,6 +806,9 @@ class PassThroughStreamingHandler:
                 anthropic_passthrough_logging_handler_result["result"]
             )
             kwargs.update(anthropic_passthrough_logging_handler_result["kwargs"])
+            metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
+            if metadata.get("aawm_upstream_stream_degraded") is True:
+                return None, kwargs, handler_branch, True
         elif endpoint_type == EndpointType.VERTEX_AI:
             handler_branch = set_branch(handler_branch_state, "vertex")
             vertex_passthrough_logging_handler_result = (
