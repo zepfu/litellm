@@ -1,8 +1,10 @@
 import json
+from io import BytesIO
 from argparse import Namespace
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import TimeoutExpired
+from urllib import error as urllib_error
 
 import pytest
 
@@ -342,6 +344,8 @@ def _grok_billing_poll_config(**overrides):
         grok_billing_client_identifier="grok-cli",
         grok_billing_xai_token_auth="xai-grok-cli",
         grok_billing_model="grok-build",
+        grok_billing_poll_max_attempts=3,
+        grok_billing_poll_retry_backoff_seconds=0.5,
     )
     if overrides:
         config = replace(config, **overrides)
@@ -386,6 +390,8 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_GROK_BILLING_CLIENT_IDENTIFIER",
         "AAWM_GROK_BILLING_XAI_TOKEN_AUTH",
         "AAWM_GROK_BILLING_MODEL",
+        "AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS",
+        "AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS",
         "LITELLM_XAI_GROK_CLIENT_VERSION",
         "LITELLM_XAI_GROK_CLIENT_IDENTIFIER",
         "LITELLM_XAI_GROK_XAI_TOKEN_AUTH",
@@ -418,6 +424,8 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.grok_billing_client_identifier == "grok-cli"
     assert config.grok_billing_xai_token_auth == "xai-grok-cli"
     assert config.grok_billing_model == "grok-build"
+    assert config.grok_billing_poll_max_attempts == 3
+    assert config.grok_billing_poll_retry_backoff_seconds == 0.5
 
 
 def test_loop_config_uses_explicit_direct_schema_dsn(monkeypatch) -> None:
@@ -509,6 +517,14 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     )
     assert (
         "AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS:-30}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS=${AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS:-3}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS=${AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS:-0.5}"
         in compose_text
     )
     assert (
@@ -1103,6 +1119,8 @@ def test_loop_config_reads_grok_billing_poll_env_defaults(monkeypatch) -> None:
     monkeypatch.setenv("AAWM_GROK_BILLING_CLIENT_IDENTIFIER", "grok-cli-dev")
     monkeypatch.setenv("AAWM_GROK_BILLING_XAI_TOKEN_AUTH", "xai-grok-cli-dev")
     monkeypatch.setenv("AAWM_GROK_BILLING_MODEL", "grok-composer-2.5-fast")
+    monkeypatch.setenv("AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS", "1.25")
 
     config = loop.parse_config([])
 
@@ -1117,6 +1135,8 @@ def test_loop_config_reads_grok_billing_poll_env_defaults(monkeypatch) -> None:
     assert config.grok_billing_client_identifier == "grok-cli-dev"
     assert config.grok_billing_xai_token_auth == "xai-grok-cli-dev"
     assert config.grok_billing_model == "grok-composer-2.5-fast"
+    assert config.grok_billing_poll_max_attempts == 5
+    assert config.grok_billing_poll_retry_backoff_seconds == 1.25
 
 
 def test_run_due_sidecar_tasks_skips_when_grok_billing_poll_disabled(monkeypatch) -> None:
@@ -1306,3 +1326,248 @@ def test_persist_grok_billing_observations_uses_sidecar_db_path(monkeypatch) -> 
     assert insert_payload[11] is None
     assert insert_payload[12] is None
     assert insert_payload[13] is None
+
+
+def test_fetch_grok_billing_payload_retries_cancelled_timeout_then_succeeds(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_max_attempts=3,
+        grok_billing_poll_retry_backoff_seconds=0.5,
+    )
+    sleeps: list[float] = []
+    attempts = {"count": 0}
+
+    def fake_load(_auth_file: str) -> str:
+        return "access-token-secret"
+
+    def fake_urlopen(_request, timeout):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            body = (
+                '{"code":"The operation was cancelled",'
+                '"error":"Timeout expired"}'
+            )
+            raise urllib_error.HTTPError(
+                config.grok_billing_url,
+                400,
+                "Bad Request",
+                hdrs=None,
+                fp=BytesIO(body.encode("utf-8")),
+            )
+        return type(
+            "Resp",
+            (),
+            {
+                "status": 200,
+                "getcode": lambda self: 200,
+                "read": lambda self: json.dumps(_grok_billing_payload()).encode(),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            },
+        )()
+
+    monkeypatch.setattr(loop, "_load_grok_billing_access_token", fake_load)
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        loop,
+        "GROK_BILLING_POLL_SLEEP_FN",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    fetched = loop._fetch_grok_billing_payload(config)
+
+    assert attempts["count"] == 3
+    assert sleeps == [0.5, 1.0]
+    assert fetched["status_code"] == 200
+    assert fetched["attempt_count"] == 3
+    assert fetched["retry_count"] == 2
+    assert fetched["payload"] == _grok_billing_payload()
+
+
+def test_build_grok_billing_request_headers_uses_grok_cli_get_shape() -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_client_version="0.2.55",
+        grok_billing_client_identifier="grok-cli",
+        grok_billing_xai_token_auth="xai-grok-cli",
+        grok_billing_model="grok-composer-2.5-fast",
+    )
+
+    headers = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+
+    assert headers["accept"] == "application/json"
+    assert headers["authorization"] == "Bearer access-token-secret"
+    assert headers["user-agent"] == "grok/0.2.55"
+    assert headers["x-grok-client-identifier"] == "grok-cli"
+    assert headers["x-grok-client-version"] == "0.2.55"
+    assert headers["x-grok-model-override"] == "grok-composer-2.5-fast"
+    assert headers["x-xai-token-auth"] == "xai-grok-cli"
+    assert headers["x-grok-req-id"] == headers["x-request-id"]
+    assert "content-type" not in headers
+
+
+def test_fetch_grok_billing_payload_does_not_retry_auth_failure(monkeypatch) -> None:
+    config = _grok_billing_poll_config(grok_billing_poll_max_attempts=3)
+    attempts = {"count": 0}
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(loop, "_load_grok_billing_access_token", lambda _p: "token")
+    monkeypatch.setattr(
+        loop,
+        "GROK_BILLING_POLL_SLEEP_FN",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    def fake_urlopen(_request, timeout):
+        attempts["count"] += 1
+        body = '{"error":"invalid_token"}'
+        raise urllib_error.HTTPError(
+            config.grok_billing_url,
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=BytesIO(body.encode("utf-8")),
+        )
+
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    with pytest.raises(ValueError, match="HTTP 401"):
+        loop._fetch_grok_billing_payload(config)
+
+    assert attempts["count"] == 1
+    assert sleeps == []
+
+
+def test_fetch_grok_billing_payload_does_not_retry_rate_limit(monkeypatch) -> None:
+    config = _grok_billing_poll_config(grok_billing_poll_max_attempts=3)
+    attempts = {"count": 0}
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(loop, "_load_grok_billing_access_token", lambda _p: "token")
+    monkeypatch.setattr(
+        loop,
+        "GROK_BILLING_POLL_SLEEP_FN",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    def fake_urlopen(_request, timeout):
+        attempts["count"] += 1
+        body = '{"error":"usage_limit_reached"}'
+        raise urllib_error.HTTPError(
+            config.grok_billing_url,
+            429,
+            "Too Many Requests",
+            hdrs=None,
+            fp=BytesIO(body.encode("utf-8")),
+        )
+
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    with pytest.raises(loop.GrokBillingPollError, match="HTTP 429") as exc_info:
+        loop._fetch_grok_billing_payload(config)
+
+    assert attempts["count"] == 1
+    assert sleeps == []
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.attempt_count == 1
+    assert exc_info.value.retry_count == 0
+
+
+def test_fetch_grok_billing_payload_does_not_retry_rate_limit_timeout_hint(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config(grok_billing_poll_max_attempts=3)
+    attempts = {"count": 0}
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(loop, "_load_grok_billing_access_token", lambda _p: "token")
+    monkeypatch.setattr(
+        loop,
+        "GROK_BILLING_POLL_SLEEP_FN",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    def fake_urlopen(_request, timeout):
+        attempts["count"] += 1
+        body = '{"code":"rate_limited","error":"Timeout expired"}'
+        raise urllib_error.HTTPError(
+            config.grok_billing_url,
+            429,
+            "Too Many Requests",
+            hdrs=None,
+            fp=BytesIO(body.encode("utf-8")),
+        )
+
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    with pytest.raises(loop.GrokBillingPollError, match="HTTP 429") as exc_info:
+        loop._fetch_grok_billing_payload(config)
+
+    assert attempts["count"] == 1
+    assert sleeps == []
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.attempt_count == 1
+    assert exc_info.value.retry_count == 0
+
+
+def test_run_due_sidecar_tasks_reports_grok_billing_final_failure_status(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config(grok_billing_poll_max_attempts=2)
+
+    def fake_fetch(_config):
+        raise loop.GrokBillingPollError(
+            "Grok billing poll failed with HTTP 400 (Timeout expired) "
+            "and Authorization=Bearer secret-token",
+            status_code=400,
+            attempt_count=2,
+            retry_count=1,
+        )
+
+    monkeypatch.setattr(loop, "_fetch_grok_billing_payload", fake_fetch)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    assert events[0]["event"] == "grok_billing_poll"
+    assert events[0]["status_code"] == 400
+    assert events[0]["attempt_count"] == 2
+    assert events[0]["retry_count"] == 1
+    assert events[0]["error_class"] == "GrokBillingPollError"
+    assert "HTTP 400" in events[0]["error_message"]
+    assert "REDACTED" in events[0]["error_message"]
+    assert "secret-token" not in json.dumps(events)
+
+
+def test_run_due_sidecar_tasks_reports_grok_billing_auth_failure_once(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config(grok_billing_poll_max_attempts=3)
+
+    def fake_fetch(_config):
+        raise loop.GrokBillingPollError(
+            "Grok billing poll failed with HTTP 401 (invalid_token).",
+            status_code=401,
+            attempt_count=1,
+            retry_count=0,
+        )
+
+    monkeypatch.setattr(loop, "_fetch_grok_billing_payload", fake_fetch)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    assert events[0]["event"] == "grok_billing_poll"
+    assert events[0]["status_code"] == 401
+    assert events[0]["attempt_count"] == 1
+    assert events[0]["retry_count"] == 0
+    assert events[0]["error_class"] == "GrokBillingPollError"

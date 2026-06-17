@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit
@@ -51,6 +51,24 @@ DEFAULT_GROK_BILLING_CLIENT_VERSION = "0.2.55"
 DEFAULT_GROK_BILLING_CLIENT_IDENTIFIER = "grok-cli"
 DEFAULT_GROK_BILLING_XAI_TOKEN_AUTH = "xai-grok-cli"
 DEFAULT_GROK_BILLING_MODEL = "grok-build"
+DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS = 3
+DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
+GROK_BILLING_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 500, 502, 503, 504}
+GROK_BILLING_NON_RETRYABLE_HTTP_STATUS_CODES = {
+    400,
+    401,
+    403,
+    404,
+    405,
+    409,
+    422,
+    429,
+}
+GROK_BILLING_RETRYABLE_ERROR_HINTS = (
+    "operation was cancelled",
+    "timeout expired",
+)
+GROK_BILLING_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
 PROVIDER_FAILURE_SECRET_RE = re.compile(
     "|".join(
         (
@@ -67,6 +85,23 @@ PROVIDER_FAILURE_SECRET_RE = re.compile(
     ),
     re.IGNORECASE,
 )
+
+
+class GrokBillingPollError(ValueError):
+    """Sanitized billing poll failure with retry metadata for sidecar events."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int],
+        attempt_count: int,
+        retry_count: int,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.attempt_count = max(1, attempt_count)
+        self.retry_count = max(0, retry_count)
 
 GROK_BILLING_RATE_LIMIT_INSERT_SQL = """
 WITH candidate AS (
@@ -243,6 +278,10 @@ class ProviderStatusLoopConfig:
     grok_billing_client_identifier: str = DEFAULT_GROK_BILLING_CLIENT_IDENTIFIER
     grok_billing_xai_token_auth: str = DEFAULT_GROK_BILLING_XAI_TOKEN_AUTH
     grok_billing_model: str = DEFAULT_GROK_BILLING_MODEL
+    grok_billing_poll_max_attempts: int = DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS
+    grok_billing_poll_retry_backoff_seconds: float = (
+        DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
+    )
 
 
 @dataclass
@@ -562,6 +601,30 @@ def _build_parser() -> argparse.ArgumentParser:
             "AAWM_GROK_BILLING_MODEL or grok-build."
         ),
     )
+    parser.add_argument(
+        "--grok-billing-poll-max-attempts",
+        type=int,
+        default=_env_int(
+            "AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS",
+            DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS,
+        ),
+        help=(
+            "Maximum Grok billing poll attempts per scheduled run, including "
+            "retries. Defaults to AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS or 3."
+        ),
+    )
+    parser.add_argument(
+        "--grok-billing-poll-retry-backoff-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS",
+            DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS,
+        ),
+        help=(
+            "Base backoff seconds between retryable Grok billing poll failures. "
+            "Defaults to AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS or 0.5."
+        ),
+    )
     return parser
 
 
@@ -599,6 +662,12 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         raise SystemExit("--grok-billing-xai-token-auth must not be empty")
     if not str(args.grok_billing_model).strip():
         raise SystemExit("--grok-billing-model must not be empty")
+    if args.grok_billing_poll_max_attempts <= 0:
+        raise SystemExit("--grok-billing-poll-max-attempts must be greater than 0")
+    if args.grok_billing_poll_retry_backoff_seconds < 0:
+        raise SystemExit(
+            "--grok-billing-poll-retry-backoff-seconds must be non-negative"
+        )
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -630,6 +699,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_client_identifier=args.grok_billing_client_identifier,
         grok_billing_xai_token_auth=args.grok_billing_xai_token_auth,
         grok_billing_model=args.grok_billing_model,
+        grok_billing_poll_max_attempts=args.grok_billing_poll_max_attempts,
+        grok_billing_poll_retry_backoff_seconds=(
+            args.grok_billing_poll_retry_backoff_seconds
+        ),
     )
 
 
@@ -835,7 +908,6 @@ def _build_grok_billing_request_headers(
     return {
         "accept": "application/json",
         "authorization": f"Bearer {access_token}",
-        "content-type": "application/json",
         "user-agent": f"grok/{config.grok_billing_client_version}",
         "x-grok-client-identifier": config.grok_billing_client_identifier,
         "x-grok-client-version": config.grok_billing_client_version,
@@ -844,6 +916,92 @@ def _build_grok_billing_request_headers(
         "x-request-id": request_id,
         "x-xai-token-auth": config.grok_billing_xai_token_auth,
     }
+
+
+def _grok_billing_poll_sleep(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    GROK_BILLING_POLL_SLEEP_FN(seconds)
+
+
+def _grok_billing_http_error_hint(exc: urllib_error.HTTPError) -> Optional[str]:
+    try:
+        response_body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    error_hint = grok_oidc_refresh._extract_oauth_error_hint(response_body)
+    if error_hint:
+        return error_hint
+    try:
+        payload = json.loads(response_body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if isinstance(code, str) and code.strip():
+        return grok_oidc_refresh._sanitize_error_message(code.strip())
+    return None
+
+
+def _grok_billing_retryable_http_error(
+    exc: urllib_error.HTTPError,
+    *,
+    error_hint: Optional[str],
+) -> bool:
+    status_code = exc.code
+    if status_code in {401, 403, 429}:
+        return False
+    normalized_hint = (error_hint or "").strip().lower()
+    if status_code == 400 and normalized_hint and any(
+        hint in normalized_hint for hint in GROK_BILLING_RETRYABLE_ERROR_HINTS
+    ):
+        return True
+    if status_code in GROK_BILLING_NON_RETRYABLE_HTTP_STATUS_CODES:
+        return False
+    if status_code in GROK_BILLING_RETRYABLE_HTTP_STATUS_CODES:
+        return True
+    return False
+
+
+def _grok_billing_retryable_url_error(exc: urllib_error.URLError) -> bool:
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, TimeoutError):
+        return True
+    if isinstance(reason, OSError) and getattr(reason, "errno", None) in {
+        110,
+        111,
+        113,
+    }:
+        return True
+    message = str(reason or exc).strip().lower()
+    return any(hint in message for hint in GROK_BILLING_RETRYABLE_ERROR_HINTS)
+
+
+def _grok_billing_poll_backoff_seconds(
+    config: ProviderStatusLoopConfig,
+    *,
+    retry_count: int,
+) -> float:
+    if config.grok_billing_poll_retry_backoff_seconds <= 0:
+        return 0.0
+    return config.grok_billing_poll_retry_backoff_seconds * retry_count
+
+
+def _grok_billing_poll_failure_message(
+    *,
+    status_code: Optional[int],
+    error_hint: Optional[str],
+    fallback_message: str,
+) -> str:
+    message = "Grok billing poll failed"
+    if status_code is not None:
+        message += f" with HTTP {status_code}"
+    if error_hint:
+        message += f" ({error_hint})"
+    elif fallback_message:
+        message += f" ({fallback_message})"
+    return message + "."
 
 
 def _fetch_grok_billing_payload(
@@ -858,38 +1016,102 @@ def _fetch_grok_billing_payload(
         ),
         method="GET",
     )
-    try:
-        with urllib_request.urlopen(
-            request,
-            timeout=config.grok_billing_poll_http_timeout_seconds,
-        ) as response:
-            status_code = getattr(response, "status", None) or response.getcode()
-            response_body = response.read().decode("utf-8")
-    except urllib_error.HTTPError as exc:
-        error_hint = grok_oidc_refresh._extract_oauth_error_hint(
-            exc.read().decode("utf-8", errors="replace")
-        )
-        raise ValueError(
-            "Grok billing poll failed"
-            + (f" with HTTP {exc.code}" if exc.code else "")
-            + (f" ({error_hint})" if error_hint else "")
-            + "."
-        ) from exc
-    except urllib_error.URLError as exc:
-        raise ValueError(
-            "Grok billing poll failed while contacting the billing endpoint."
-        ) from exc
+    max_attempts = max(1, config.grok_billing_poll_max_attempts)
+    attempt_count = 0
+    retry_count = 0
+    last_status_code: Optional[int] = None
+    last_error_hint: Optional[str] = None
+    last_error_message = "Grok billing poll failed."
 
-    try:
-        payload = json.loads(response_body)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Grok billing endpoint returned invalid JSON.") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("Grok billing endpoint returned a non-object payload.")
-    return {
-        "status_code": int(status_code),
-        "payload": payload,
-    }
+    while attempt_count < max_attempts:
+        attempt_count += 1
+        try:
+            with urllib_request.urlopen(
+                request,
+                timeout=config.grok_billing_poll_http_timeout_seconds,
+            ) as response:
+                status_code = getattr(response, "status", None) or response.getcode()
+                response_body = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            last_status_code = exc.code
+            last_error_hint = _grok_billing_http_error_hint(exc)
+            last_error_message = _grok_billing_poll_failure_message(
+                status_code=last_status_code,
+                error_hint=last_error_hint,
+                fallback_message="",
+            )
+            if (
+                attempt_count < max_attempts
+                and _grok_billing_retryable_http_error(
+                    exc,
+                    error_hint=last_error_hint,
+                )
+            ):
+                retry_count += 1
+                _grok_billing_poll_sleep(
+                    _grok_billing_poll_backoff_seconds(
+                        config,
+                        retry_count=retry_count,
+                    )
+                )
+                continue
+            raise GrokBillingPollError(
+                last_error_message,
+                status_code=last_status_code,
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            ) from exc
+        except urllib_error.URLError as exc:
+            last_status_code = None
+            last_error_hint = None
+            last_error_message = (
+                "Grok billing poll failed while contacting the billing endpoint."
+            )
+            if attempt_count < max_attempts and _grok_billing_retryable_url_error(exc):
+                retry_count += 1
+                _grok_billing_poll_sleep(
+                    _grok_billing_poll_backoff_seconds(
+                        config,
+                        retry_count=retry_count,
+                    )
+                )
+                continue
+            raise GrokBillingPollError(
+                last_error_message,
+                status_code=last_status_code,
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            ) from exc
+
+        try:
+            payload = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise GrokBillingPollError(
+                "Grok billing endpoint returned invalid JSON.",
+                status_code=int(status_code),
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise GrokBillingPollError(
+                "Grok billing endpoint returned a non-object payload.",
+                status_code=int(status_code),
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            )
+        return {
+            "status_code": int(status_code),
+            "payload": payload,
+            "attempt_count": attempt_count,
+            "retry_count": retry_count,
+        }
+
+    raise GrokBillingPollError(
+        last_error_message,
+        status_code=last_status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+    )
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -1236,12 +1458,16 @@ def _run_grok_billing_poll_task(
         "observation_count": 0,
         "inserted_count": 0,
         "status_code": None,
+        "attempt_count": 0,
+        "retry_count": 0,
         "error_class": None,
         "error_message": None,
     }
     try:
         fetched = _fetch_grok_billing_payload(config)
         summary["status_code"] = fetched["status_code"]
+        summary["attempt_count"] = fetched.get("attempt_count", 1)
+        summary["retry_count"] = fetched.get("retry_count", 0)
         if config.apply:
             observation_count, inserted_count = _persist_grok_billing_observations(
                 config,
@@ -1261,6 +1487,16 @@ def _run_grok_billing_poll_task(
     except Exception as exc:
         summary["error_class"] = exc.__class__.__name__
         summary["error_message"] = _redacted_failure_message(str(exc))
+        if isinstance(exc, GrokBillingPollError):
+            summary["status_code"] = exc.status_code
+            summary["attempt_count"] = exc.attempt_count
+            summary["retry_count"] = exc.retry_count
+        elif summary["status_code"] is None:
+            status_match = re.search(r"with HTTP (\d{3})", str(exc))
+            if status_match is not None:
+                summary["status_code"] = int(status_match.group(1))
+        if summary["attempt_count"] == 0:
+            summary["attempt_count"] = 1
 
     return {
         "event": "grok_billing_poll",
