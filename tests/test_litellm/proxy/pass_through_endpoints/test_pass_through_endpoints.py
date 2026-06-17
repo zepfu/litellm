@@ -40,6 +40,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     build_aawm_route_access_log_line,
     _direct_capture_xai_passthrough_failure,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
+    _is_known_grok_billing_passthrough_timeout_cancel_response,
     _record_passthrough_hidden_retry_metadata,
     _should_log_passthrough_terminal_failure_without_traceback,
     emit_aawm_route_access_log,
@@ -2980,6 +2981,199 @@ async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallba
         request_data=request_payload,
         traceback_str="traceback",
     )
+
+
+class TestGrokBillingPassthroughTimeoutLogging:
+    def test_classifier_matches_known_billing_timeout_cancel_body(self):
+        request = MagicMock(spec=Request)
+        request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        assert _is_known_grok_billing_passthrough_timeout_cancel_response(
+            request=request,
+            url=httpx.URL(
+                "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+            ),
+            custom_llm_provider="xai",
+            status_code=400,
+            exc=HTTPException(
+                status_code=400,
+                detail='{"code":"The operation was cancelled","error":"Timeout expired"}',
+            ),
+        )
+
+    def test_classifier_rejects_unexpected_billing_400_body(self):
+        request = MagicMock(spec=Request)
+        request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        assert not _is_known_grok_billing_passthrough_timeout_cancel_response(
+            request=request,
+            url=httpx.URL(
+                "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+            ),
+            custom_llm_provider="xai",
+            status_code=400,
+            exc=HTTPException(
+                status_code=400,
+                detail='{"error":"billing unavailable"}',
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_known_billing_timeout_warns_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"format": "credits"}
+        mock_request.body = AsyncMock(return_value=b"")
+
+        target_url = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=(
+                b'{"code":"The operation was cancelled",'
+                b'"error":"Timeout expired"}'
+            ),
+            request=httpx.Request("GET", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        saved_handlers, saved_level, saved_propagate = (
+            TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
+                tmp_path,
+                monkeypatch,
+            )
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch.object(
+                verbose_proxy_logger,
+                "warning",
+            ) as mock_warning:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value={})
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "400"
+                assert handler.await_count == 1
+                mock_warning.assert_called_once()
+                assert (
+                    mock_warning.call_args.kwargs["extra"]["failure_kind"]
+                    == "degraded_grok_billing_timeout"
+                )
+                mock_logging_obj.post_call_failure_hook.assert_not_awaited()
+        finally:
+            TestPassThroughTerminalFailureLogging._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert not (tmp_path / "dev-error.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_unexpected_billing_400_keeps_exception_logging(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.url = "http://localhost:4001/grok/v1/billing?format=credits"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"format": "credits"}
+        mock_request.body = AsyncMock(return_value=b"")
+
+        target_url = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=b'{"error":"billing unavailable"}',
+            request=httpx.Request("GET", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        saved_handlers, saved_level, saved_propagate = (
+            TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
+                tmp_path,
+                monkeypatch,
+            )
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(return_value={})
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={},
+                        user_api_key_dict=MagicMock(),
+                        custom_llm_provider="xai",
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "400"
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    "billing unavailable"
+                    in mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                )
+        finally:
+            TestPassThroughTerminalFailureLogging._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "pass_through_endpoint" in item["message"]
+        )
+        assert payload["context"]["endpoint"] == "/grok/v1/billing"
+        assert payload["context"]["status_code"] == 400
+        assert "billing unavailable" in payload["message"]
+        assert payload.get("traceback")
 
 
 class TestPassThroughTerminalFailureLogging:

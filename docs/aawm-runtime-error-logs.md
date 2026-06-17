@@ -98,6 +98,14 @@ callbacks with sanitized context, but they do not create active
 `.analysis/*-error.jsonl` exception-intake rows unless a separate callback or
 logging failure occurs.
 
+The direct Grok billing passthrough endpoint has one additional degraded
+telemetry class. When `/grok/v1/billing` receives the known upstream `400`
+timeout/cancel body (`The operation was cancelled` / `Timeout expired`), the
+proxy logs a warning with `failure_kind=degraded_grok_billing_timeout` and does
+not create traceback-style active error intake. Unexpected Grok billing `400`
+bodies, auth failures, and provider `429` responses remain visible through
+their normal failure paths.
+
 The retry wrapper intentionally stops at the pre-first-byte boundary. Once a
 streaming response has been handed to the client, midstream failures remain
 terminal for that stream and are recorded through the streaming error context
