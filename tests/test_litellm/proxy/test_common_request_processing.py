@@ -324,13 +324,14 @@ class TestProxyBaseLLMRequestProcessing:
         route_records = [
             record.getMessage()
             for record in caplog.records
-            if " EMBED " in record.getMessage()
+            if " [EMBED] " in record.getMessage()
         ]
         assert len(route_records) == 1
         assert re.fullmatch(
-            r"\d{8} \d{2}:\d{2}:\d{2} EMBED Codex/0\.119\.0-alpha\.29 - "
-            r"text-embedding-3-small\(aawm-mini\) POST 172\.19\.0\.1:52834 "
-            r"/v1/embeddings -> api\.openai\.com/v1/embeddings",
+            r"\d{8} \d{2}:\d{2}:\d{2} \[EMBED\] Codex/0\.119\.0-alpha\.29 - "
+            r"embed worker@litellm\.text-embedding-3-small\(aawm-mini\) "
+            r"POST 172\.19\.0\.1:52834 /v1/embeddings -> "
+            r"api\.openai\.com/v1/embeddings",
             route_records[0],
         )
         assert "api_key" not in route_records[0]
@@ -338,6 +339,115 @@ class TestProxyBaseLLMRequestProcessing:
         access_filter = AawmRouteAccessLogReplacementFilter()
         assert access_filter.filter(_build_uvicorn_access_record()) is False
         assert access_filter.filter(_build_uvicorn_access_record()) is True
+
+    @pytest.mark.asyncio
+    async def test_base_process_llm_request_emits_aawm_route_log_for_rerank(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        data = {
+            "model": "tei-reranker",
+            "query": "hello",
+            "documents": ["world"],
+            "api_base": "https://rerank.example.com/rerank?api_key=secret",
+            "metadata": {
+                "agent_name": "rerank worker",
+                "repository": "litellm",
+                "requested_model_alias": "tei-reranker",
+            },
+        }
+        processing_obj = ProxyBaseLLMRequestProcessing(data=data)
+        mock_request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/rerank",
+            headers={"user-agent": "codex-cli/0.119.0-alpha.29"},
+        )
+        mock_fastapi_response = MagicMock()
+        mock_fastapi_response.headers = {}
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.tpm_limit = None
+        mock_user_api_key_dict.rpm_limit = None
+        mock_user_api_key_dict.max_budget = None
+        mock_user_api_key_dict.spend = 0
+        mock_user_api_key_dict.allowed_model_region = None
+        mock_proxy_config = MagicMock(spec=ProxyConfig)
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "test-call-id"
+
+        processing_obj.common_processing_pre_call_logic = AsyncMock(
+            return_value=(data, logging_obj)
+        )
+
+        async def mock_provider_response():
+            response = MagicMock()
+            response._hidden_params = {
+                "api_base": "https://rerank.example.com/rerank?api_key=secret",
+            }
+            return response
+
+        async def mock_route_request(*args, **kwargs):
+            return asyncio.create_task(mock_provider_response())
+
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing,
+            "route_request",
+            mock_route_request,
+        )
+
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.during_call_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.update_request_status = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_success_hook = AsyncMock(
+            side_effect=lambda *, response, **kwargs: response
+        )
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value={}
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                response = await processing_obj.base_process_llm_request(
+                    request=mock_request,
+                    fastapi_response=mock_fastapi_response,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    route_type="arerank",
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                    general_settings={},
+                    proxy_config=mock_proxy_config,
+                )
+        finally:
+            route_logger.removeHandler(caplog.handler)
+
+        assert response._hidden_params["api_base"].startswith(
+            "https://rerank.example.com/rerank"
+        )
+        route_records = [
+            record.getMessage()
+            for record in caplog.records
+            if " [RERANK] " in record.getMessage()
+        ]
+        assert len(route_records) == 1
+        assert re.fullmatch(
+            r"\d{8} \d{2}:\d{2}:\d{2} \[RERANK\] Codex/0\.119\.0-alpha\.29 - "
+            r"rerank worker@litellm\.tei-reranker "
+            r"POST 172\.19\.0\.1:52834 /rerank -> "
+            r"rerank\.example\.com/rerank",
+            route_records[0],
+        )
+        assert "api_key" not in route_records[0]
+        assert "hello" not in route_records[0]
+        assert "world" not in route_records[0]
+
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        assert access_filter.filter(
+            _build_uvicorn_access_record(full_path="/rerank")
+        ) is False
+        assert access_filter.filter(
+            _build_uvicorn_access_record(full_path="/rerank")
+        ) is True
 
     @pytest.mark.asyncio
     async def test_stream_timeout_header_processing(self):
@@ -1478,6 +1588,22 @@ class TestOverrideOpenAIResponseModel:
 
         # Verify the model WAS overridden to requested model
         assert response_obj.model == requested_model
+
+    def test_override_model_skips_response_without_model_field(self, caplog):
+        """
+        Test that response types without OpenAI-compatible model fields are skipped
+        without emitting an error.
+        """
+        response_obj = object()
+
+        with caplog.at_level(logging.ERROR):
+            _override_openai_response_model(
+                response_obj=response_obj,
+                requested_model="tei-reranker",
+                log_context="test_context",
+            )
+
+        assert not caplog.records
 
     def test_override_model_no_requested_model(self):
         """

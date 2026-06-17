@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -286,6 +287,153 @@ class PassThroughStreamingHandler:
                 model_call_details[key] = kwargs[key]
 
     @staticmethod
+    def _clean_streaming_logging_context_value(value: Any) -> Optional[str]:
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            return None
+        if not isinstance(value, (str, int, float)):
+            return None
+
+        cleaned = "".join(
+            char if char.isprintable() and char not in "\r\n\t" else " "
+            for char in str(value).strip()
+        )
+        cleaned = " ".join(cleaned.split())
+        if not cleaned:
+            return None
+        if cleaned.lower().startswith(("bearer ", "sk-", "pk-", "xai-", "ya29.")):
+            return None
+        if len(cleaned) > 240:
+            cleaned = cleaned[:237] + "..."
+        return cleaned
+
+    @staticmethod
+    def _safe_streaming_logging_url(value: Any) -> Optional[str]:
+        cleaned = PassThroughStreamingHandler._clean_streaming_logging_context_value(
+            value
+        )
+        if not cleaned:
+            return None
+        parsed = urlparse(cleaned)
+        if parsed.scheme and parsed.hostname:
+            host = parsed.hostname
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            return f"{parsed.scheme}://{host}{parsed.path or '/'}"
+        return cleaned
+
+    @staticmethod
+    def _first_streaming_logging_context_value(
+        *values: Any,
+    ) -> Optional[str]:
+        for value in values:
+            cleaned = PassThroughStreamingHandler._clean_streaming_logging_context_value(
+                value
+            )
+            if cleaned:
+                return cleaned
+        return None
+
+    @staticmethod
+    def _build_streaming_logging_error_context(
+        *,
+        litellm_logging_obj: LiteLLMLoggingObj,
+        response: httpx.Response,
+        url_route: str,
+        request_body: dict,
+        endpoint_type: EndpointType,
+        custom_llm_provider: Optional[str],
+        success_handler_kwargs: Optional[Dict[str, Any]],
+        error_log_context: Optional[Dict[str, Any]],
+        handler_branch: str,
+    ) -> Dict[str, Any]:
+        context = dict(error_log_context or {})
+        kwargs = success_handler_kwargs if isinstance(success_handler_kwargs, dict) else {}
+        litellm_params = kwargs.get("litellm_params")
+        kwargs_metadata = (
+            litellm_params.get("metadata")
+            if isinstance(litellm_params, dict)
+            else None
+        )
+        metadata: Dict[str, Any] = {}
+        if isinstance(request_body, dict):
+            for metadata_key in ("litellm_metadata", "metadata"):
+                metadata_value = request_body.get(metadata_key)
+                if isinstance(metadata_value, dict):
+                    metadata.update(metadata_value)
+        if isinstance(kwargs_metadata, dict):
+            metadata.update(kwargs_metadata)
+
+        model_call_details = getattr(litellm_logging_obj, "model_call_details", None)
+        if not isinstance(model_call_details, dict):
+            model_call_details = {}
+
+        def set_default(key: str, value: Any) -> None:
+            if context.get(key) is not None:
+                return
+            if key in {"upstream_url"}:
+                cleaned_value = PassThroughStreamingHandler._safe_streaming_logging_url(
+                    value
+                )
+            else:
+                cleaned_value = PassThroughStreamingHandler._clean_streaming_logging_context_value(
+                    value
+                )
+            if cleaned_value is not None:
+                context[key] = cleaned_value
+
+        set_default("source", "pass_through_streaming_logging")
+        set_default("endpoint", url_route)
+        set_default("upstream_url", url_route)
+        set_default("provider", custom_llm_provider or endpoint_type.value)
+        set_default(
+            "model",
+            PassThroughStreamingHandler._first_streaming_logging_context_value(
+                request_body.get("model") if isinstance(request_body, dict) else None,
+                model_call_details.get("model"),
+                metadata.get("anthropic_auto_agent_selected_model"),
+                metadata.get("codex_auto_agent_selected_model"),
+                metadata.get("model"),
+            ),
+        )
+        set_default(
+            "model_alias",
+            PassThroughStreamingHandler._first_streaming_logging_context_value(
+                metadata.get("requested_model_alias"),
+                metadata.get("model_alias_label"),
+                metadata.get("inbound_model_alias"),
+            ),
+        )
+        set_default(
+            "route_family",
+            PassThroughStreamingHandler._first_streaming_logging_context_value(
+                metadata.get("passthrough_route_family"),
+                metadata.get("route_family"),
+                metadata.get("openai_passthrough_route_family"),
+            ),
+        )
+        if context.get("status_code") is None:
+            context["status_code"] = response.status_code
+        set_default(
+            "trace_id",
+            PassThroughStreamingHandler._first_streaming_logging_context_value(
+                metadata.get("trace_id"),
+                model_call_details.get("trace_id"),
+            ),
+        )
+        set_default(
+            "litellm_call_id",
+            PassThroughStreamingHandler._first_streaming_logging_context_value(
+                kwargs.get("litellm_call_id"),
+                getattr(litellm_logging_obj, "litellm_call_id", None),
+                model_call_details.get("litellm_call_id"),
+            ),
+        )
+        set_default("callback_name", "pass_through_streaming")
+        set_default("callback_phase", "post_response_stream_logging")
+        set_default("handler_branch", handler_branch)
+        return context
+
+    @staticmethod
     def _capture_stream_shape(
         *,
         response: httpx.Response,
@@ -350,6 +498,7 @@ class PassThroughStreamingHandler:
         upstream_wait_started_at: Optional[datetime] = None,
         upstream_wait_completed_at: Optional[datetime] = None,
         local_prepare_ms: Optional[float] = None,
+        error_log_context: Optional[Dict[str, Any]] = None,
     ):
         """
         - Yields chunks from the response
@@ -497,11 +646,263 @@ class PassThroughStreamingHandler:
                     custom_llm_provider=custom_llm_provider,
                     success_handler_kwargs=success_handler_kwargs,
                     local_prepare_ms=local_prepare_ms,
+                    error_log_context=error_log_context,
                 )
             )
         except Exception as e:
-            verbose_proxy_logger.error(f"Error in chunk_processor: {str(e)}")
+            verbose_proxy_logger.exception(
+                "Error in chunk_processor: %s",
+                str(e),
+                extra=error_log_context or {},
+            )
             raise
+
+    @staticmethod
+    def _set_streaming_handler_branch(
+        handler_branch_state: List[str],
+        handler_branch: str,
+    ) -> str:
+        handler_branch_state[0] = handler_branch
+        return handler_branch
+
+    @staticmethod
+    def _collect_streaming_logging_result(
+        *,
+        litellm_logging_obj: LiteLLMLoggingObj,
+        passthrough_success_handler_obj: PassThroughEndpointLogging,
+        response: httpx.Response,
+        url_route: str,
+        request_body: dict,
+        endpoint_type: EndpointType,
+        start_time: datetime,
+        all_chunks: List[str],
+        raw_bytes: List[bytes],
+        end_time: datetime,
+        model: Optional[str],
+        passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload],
+        custom_llm_provider: Optional[str],
+        kwargs: Dict[str, Any],
+        handler_branch_state: List[str],
+    ) -> tuple[
+        Optional[PassThroughEndpointLoggingResultValues],
+        Dict[str, Any],
+        str,
+        bool,
+    ]:
+        set_branch = PassThroughStreamingHandler._set_streaming_handler_branch
+        handler_branch = set_branch(handler_branch_state, "initial")
+        standard_logging_response_object: Optional[
+            PassThroughEndpointLoggingResultValues
+        ] = None
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
+        PassThroughStreamingHandler._annotate_stream_logging_metadata(
+            metadata,
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            custom_llm_provider=custom_llm_provider,
+        )
+        PassThroughStreamingHandler._capture_stream_shape(
+            response=response,
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            request_body=request_body,
+            raw_bytes=raw_bytes,
+            all_chunks=all_chunks,
+            metadata=metadata,
+            custom_llm_provider=custom_llm_provider,
+            litellm_call_id=kwargs.get("litellm_call_id")
+            or getattr(litellm_logging_obj, "litellm_call_id", None),
+        )
+
+        if custom_llm_provider in {"gemini", "antigravity"}:
+            if not passthrough_success_handler_obj.is_gemini_route(
+                url_route, custom_llm_provider
+            ):
+                handler_branch = set_branch(
+                    handler_branch_state,
+                    "google_code_assist_control_plane",
+                )
+                if "retrieveUserQuota" not in url_route:
+                    return None, kwargs, handler_branch, True
+                handler_branch = set_branch(
+                    handler_branch_state,
+                    "google_code_assist_quota",
+                )
+                quota_source = (
+                    "antigravity_retrieve_user_quota"
+                    if custom_llm_provider == "antigravity"
+                    else "google_retrieve_user_quota"
+                )
+                sanitized_quota = (
+                    PassThroughStreamingHandler._extract_google_code_assist_streaming_quota(
+                        all_chunks,
+                        source=quota_source,
+                    )
+                )
+                if not sanitized_quota:
+                    return None, kwargs, handler_branch, True
+                metadata["google_retrieve_user_quota"] = sanitized_quota
+                metadata["aawm_rate_limit_observation_only"] = True
+                standard_logging_response_object = StandardPassThroughResponseObject(
+                    response="\n".join(all_chunks)
+                )
+            else:
+                handler_branch = set_branch(handler_branch_state, "gemini")
+                gemini_passthrough_logging_handler_result = (
+                    GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
+                        litellm_logging_obj=litellm_logging_obj,
+                        passthrough_success_handler_obj=passthrough_success_handler_obj,
+                        url_route=url_route,
+                        request_body=request_body,
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        all_chunks=all_chunks,
+                        model=model,
+                        end_time=end_time,
+                        kwargs=kwargs,
+                        custom_llm_provider=custom_llm_provider or "gemini",
+                    )
+                )
+                standard_logging_response_object = (
+                    gemini_passthrough_logging_handler_result["result"]
+                )
+                kwargs.update(gemini_passthrough_logging_handler_result["kwargs"])
+        elif endpoint_type == EndpointType.OPENAI:
+            handler_branch = set_branch(handler_branch_state, "openai")
+            openai_passthrough_logging_handler_result = (
+                OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+                    litellm_logging_obj=litellm_logging_obj,
+                    passthrough_success_handler_obj=passthrough_success_handler_obj,
+                    url_route=url_route,
+                    request_body=request_body,
+                    endpoint_type=endpoint_type,
+                    start_time=start_time,
+                    all_chunks=all_chunks,
+                    end_time=end_time,
+                    kwargs=kwargs,
+                )
+            )
+            standard_logging_response_object = (
+                openai_passthrough_logging_handler_result["result"]
+            )
+            kwargs.update(openai_passthrough_logging_handler_result["kwargs"])
+        elif endpoint_type == EndpointType.ANTHROPIC:
+            handler_branch = set_branch(handler_branch_state, "anthropic")
+            anthropic_passthrough_logging_handler_result = (
+                AnthropicPassthroughLoggingHandler._handle_logging_anthropic_collected_chunks(
+                    litellm_logging_obj=litellm_logging_obj,
+                    passthrough_success_handler_obj=passthrough_success_handler_obj,
+                    url_route=url_route,
+                    request_body=request_body,
+                    endpoint_type=endpoint_type,
+                    start_time=start_time,
+                    all_chunks=all_chunks,
+                    end_time=end_time,
+                    passthrough_logging_payload=passthrough_logging_payload,
+                    kwargs=kwargs,
+                )
+            )
+            standard_logging_response_object = (
+                anthropic_passthrough_logging_handler_result["result"]
+            )
+            kwargs.update(anthropic_passthrough_logging_handler_result["kwargs"])
+            metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
+            if metadata.get("aawm_upstream_stream_degraded") is True:
+                return None, kwargs, handler_branch, True
+        elif endpoint_type == EndpointType.VERTEX_AI:
+            handler_branch = set_branch(handler_branch_state, "vertex")
+            vertex_passthrough_logging_handler_result = (
+                VertexPassthroughLoggingHandler._handle_logging_vertex_collected_chunks(
+                    litellm_logging_obj=litellm_logging_obj,
+                    passthrough_success_handler_obj=passthrough_success_handler_obj,
+                    url_route=url_route,
+                    request_body=request_body,
+                    endpoint_type=endpoint_type,
+                    start_time=start_time,
+                    all_chunks=all_chunks,
+                    end_time=end_time,
+                    model=model,
+                )
+            )
+            standard_logging_response_object = (
+                vertex_passthrough_logging_handler_result["result"]
+            )
+            kwargs.update(vertex_passthrough_logging_handler_result["kwargs"])
+
+        return standard_logging_response_object, kwargs, handler_branch, False
+
+    @staticmethod
+    def _record_streaming_finalize_metrics(
+        *,
+        kwargs: Dict[str, Any],
+        finalize_started_at: datetime,
+        local_prepare_ms: Optional[float],
+    ) -> datetime:
+        finalize_completed_at = datetime.now()
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
+        local_stream_finalize_ms = round(
+            max(
+                0.0,
+                (finalize_completed_at - finalize_started_at).total_seconds() * 1000.0,
+            ),
+            3,
+        )
+        metadata["aawm_local_stream_finalize_ms"] = local_stream_finalize_ms
+        metadata["aawm_total_proxy_overhead_ms"] = round(
+            (local_prepare_ms or 0.0)
+            + float(metadata.get("aawm_stream_emit_gap_ms") or 0.0)
+            + local_stream_finalize_ms,
+            3,
+        )
+        PassThroughStreamingHandler._append_stream_span(
+            kwargs,
+            name="proxy.post_response_finalize",
+            start_time=finalize_started_at,
+            end_time=finalize_completed_at,
+            span_metadata={
+                "duration_ms": local_stream_finalize_ms,
+                "stream": True,
+            },
+        )
+        return finalize_completed_at
+
+    @staticmethod
+    async def _dispatch_streaming_success_callbacks(
+        *,
+        litellm_logging_obj: LiteLLMLoggingObj,
+        standard_logging_response_object: PassThroughEndpointLoggingResultValues,
+        start_time: datetime,
+        end_time: datetime,
+        kwargs: Dict[str, Any],
+        handler_branch_state: List[str],
+    ) -> str:
+        handler_branch = PassThroughStreamingHandler._set_streaming_handler_branch(
+            handler_branch_state,
+            "async_success_handler",
+        )
+        await litellm_logging_obj.async_success_handler(
+            result=standard_logging_response_object,
+            start_time=start_time,
+            end_time=end_time,
+            cache_hit=False,
+            **kwargs,
+        )
+        if litellm_logging_obj._should_run_sync_callbacks_for_async_calls() is False:
+            return handler_branch
+
+        handler_branch = PassThroughStreamingHandler._set_streaming_handler_branch(
+            handler_branch_state,
+            "sync_success_handler_submit",
+        )
+        executor.submit(
+            litellm_logging_obj.success_handler,
+            result=standard_logging_response_object,
+            end_time=end_time,
+            cache_hit=False,
+            start_time=start_time,
+            **kwargs,
+        )
+        return handler_branch
 
     @staticmethod
     async def _route_streaming_logging_to_handler(
@@ -519,6 +920,7 @@ class PassThroughStreamingHandler:
         custom_llm_provider: Optional[str] = None,
         success_handler_kwargs: Optional[Dict[str, Any]] = None,
         local_prepare_ms: Optional[float] = None,
+        error_log_context: Optional[Dict[str, Any]] = None,
     ):
         """
         Route the logging for the collected chunks to the appropriate handler
@@ -528,185 +930,82 @@ class PassThroughStreamingHandler:
         - Vertex AI
         - OpenAI
         """
+        handler_branch_state = ["initial"]
+        handler_branch = handler_branch_state[0]
         try:
             finalize_started_at = datetime.now()
             all_chunks = PassThroughStreamingHandler._convert_raw_bytes_to_str_lines(
                 raw_bytes
             )
-            standard_logging_response_object: Optional[
-                PassThroughEndpointLoggingResultValues
-            ] = None
             kwargs: dict = (
                 success_handler_kwargs
                 if isinstance(success_handler_kwargs, dict)
                 else {}
             )
-            metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
-            PassThroughStreamingHandler._annotate_stream_logging_metadata(
-                metadata,
-                endpoint_type=endpoint_type,
-                url_route=url_route,
-                custom_llm_provider=custom_llm_provider,
-            )
-            PassThroughStreamingHandler._capture_stream_shape(
+            (
+                standard_logging_response_object,
+                kwargs,
+                handler_branch,
+                early_exit,
+            ) = PassThroughStreamingHandler._collect_streaming_logging_result(
+                litellm_logging_obj=litellm_logging_obj,
+                passthrough_success_handler_obj=passthrough_success_handler_obj,
                 response=response,
-                endpoint_type=endpoint_type,
                 url_route=url_route,
                 request_body=request_body,
-                raw_bytes=raw_bytes,
+                endpoint_type=endpoint_type,
+                start_time=start_time,
                 all_chunks=all_chunks,
-                metadata=metadata,
+                raw_bytes=raw_bytes,
+                end_time=end_time,
+                model=model,
+                passthrough_logging_payload=passthrough_logging_payload,
                 custom_llm_provider=custom_llm_provider,
-                litellm_call_id=kwargs.get("litellm_call_id")
-                or getattr(litellm_logging_obj, "litellm_call_id", None),
+                kwargs=kwargs,
+                handler_branch_state=handler_branch_state,
             )
-            if custom_llm_provider in {"gemini", "antigravity"}:
-                if not passthrough_success_handler_obj.is_gemini_route(
-                    url_route, custom_llm_provider
-                ):
-                    if "retrieveUserQuota" not in url_route:
-                        return
-                    quota_source = (
-                        "antigravity_retrieve_user_quota"
-                        if custom_llm_provider == "antigravity"
-                        else "google_retrieve_user_quota"
-                    )
-                    sanitized_quota = PassThroughStreamingHandler._extract_google_code_assist_streaming_quota(
-                        all_chunks,
-                        source=quota_source,
-                    )
-                    if not sanitized_quota:
-                        return
-                    metadata["google_retrieve_user_quota"] = sanitized_quota
-                    metadata["aawm_rate_limit_observation_only"] = True
-                    standard_logging_response_object = StandardPassThroughResponseObject(
-                        response="\n".join(all_chunks)
-                    )
-                else:
-                    gemini_passthrough_logging_handler_result = GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
-                        litellm_logging_obj=litellm_logging_obj,
-                        passthrough_success_handler_obj=passthrough_success_handler_obj,
-                        url_route=url_route,
-                        request_body=request_body,
-                        endpoint_type=endpoint_type,
-                        start_time=start_time,
-                        all_chunks=all_chunks,
-                        model=model,
-                        end_time=end_time,
-                        kwargs=kwargs,
-                        custom_llm_provider=custom_llm_provider or "gemini",
-                    )
-                    standard_logging_response_object = (
-                        gemini_passthrough_logging_handler_result["result"]
-                    )
-                    kwargs.update(gemini_passthrough_logging_handler_result["kwargs"])
-            elif endpoint_type == EndpointType.OPENAI:
-                openai_passthrough_logging_handler_result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
-                    litellm_logging_obj=litellm_logging_obj,
-                    passthrough_success_handler_obj=passthrough_success_handler_obj,
-                    url_route=url_route,
-                    request_body=request_body,
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    all_chunks=all_chunks,
-                    end_time=end_time,
-                    kwargs=kwargs,
-                )
-                standard_logging_response_object = (
-                    openai_passthrough_logging_handler_result["result"]
-                )
-                kwargs.update(openai_passthrough_logging_handler_result["kwargs"])
-            elif endpoint_type == EndpointType.ANTHROPIC:
-                anthropic_passthrough_logging_handler_result = AnthropicPassthroughLoggingHandler._handle_logging_anthropic_collected_chunks(
-                    litellm_logging_obj=litellm_logging_obj,
-                    passthrough_success_handler_obj=passthrough_success_handler_obj,
-                    url_route=url_route,
-                    request_body=request_body,
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    all_chunks=all_chunks,
-                    end_time=end_time,
-                    passthrough_logging_payload=passthrough_logging_payload,
-                    kwargs=kwargs,
-                )
-                standard_logging_response_object = (
-                    anthropic_passthrough_logging_handler_result["result"]
-                )
-                kwargs.update(anthropic_passthrough_logging_handler_result["kwargs"])
-            elif endpoint_type == EndpointType.VERTEX_AI:
-                vertex_passthrough_logging_handler_result = VertexPassthroughLoggingHandler._handle_logging_vertex_collected_chunks(
-                    litellm_logging_obj=litellm_logging_obj,
-                    passthrough_success_handler_obj=passthrough_success_handler_obj,
-                    url_route=url_route,
-                    request_body=request_body,
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    all_chunks=all_chunks,
-                    end_time=end_time,
-                    model=model,
-                )
-                standard_logging_response_object = (
-                    vertex_passthrough_logging_handler_result["result"]
-                )
-                kwargs.update(vertex_passthrough_logging_handler_result["kwargs"])
+            if early_exit:
+                return
             if standard_logging_response_object is None:
                 standard_logging_response_object = StandardPassThroughResponseObject(
                     response=f"cannot parse chunks to standard response object. Chunks={all_chunks}"
                 )
-            finalize_completed_at = datetime.now()
-            metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
-            local_stream_finalize_ms = round(
-                max(
-                    0.0,
-                    (finalize_completed_at - finalize_started_at).total_seconds() * 1000.0,
-                ),
-                3,
-            )
-            metadata["aawm_local_stream_finalize_ms"] = local_stream_finalize_ms
-            metadata["aawm_total_proxy_overhead_ms"] = round(
-                (local_prepare_ms or 0.0)
-                + float(metadata.get("aawm_stream_emit_gap_ms") or 0.0)
-                + local_stream_finalize_ms,
-                3,
-            )
-            PassThroughStreamingHandler._append_stream_span(
-                kwargs,
-                name="proxy.post_response_finalize",
-                start_time=finalize_started_at,
-                end_time=finalize_completed_at,
-                span_metadata={
-                    "duration_ms": local_stream_finalize_ms,
-                    "stream": True,
-                },
+            PassThroughStreamingHandler._record_streaming_finalize_metrics(
+                kwargs=kwargs,
+                finalize_started_at=finalize_started_at,
+                local_prepare_ms=local_prepare_ms,
             )
             PassThroughStreamingHandler._sync_logging_obj_model_call_details_from_kwargs(
                 litellm_logging_obj,
                 kwargs,
             )
-            await litellm_logging_obj.async_success_handler(
-                result=standard_logging_response_object,
-                start_time=start_time,
-                end_time=end_time,
-                cache_hit=False,
-                **kwargs,
-            )
-            if (
-                litellm_logging_obj._should_run_sync_callbacks_for_async_calls()
-                is False
-            ):
-                return
-
-            executor.submit(
-                litellm_logging_obj.success_handler,
-                result=standard_logging_response_object,
-                end_time=end_time,
-                cache_hit=False,
-                start_time=start_time,
-                **kwargs,
+            handler_branch = (
+                await PassThroughStreamingHandler._dispatch_streaming_success_callbacks(
+                    litellm_logging_obj=litellm_logging_obj,
+                    standard_logging_response_object=standard_logging_response_object,
+                    start_time=start_time,
+                    end_time=end_time,
+                    kwargs=kwargs,
+                    handler_branch_state=handler_branch_state,
+                )
             )
         except Exception as e:
-            verbose_proxy_logger.error(
-                f"Error in _route_streaming_logging_to_handler: {str(e)}"
+            handler_branch = handler_branch_state[0]
+            context = PassThroughStreamingHandler._build_streaming_logging_error_context(
+                litellm_logging_obj=litellm_logging_obj,
+                response=response,
+                url_route=url_route,
+                request_body=request_body,
+                endpoint_type=endpoint_type,
+                custom_llm_provider=custom_llm_provider,
+                success_handler_kwargs=success_handler_kwargs,
+                error_log_context=error_log_context,
+                handler_branch=handler_branch,
+            )
+            verbose_proxy_logger.exception(
+                "Error in _route_streaming_logging_to_handler: %s",
+                str(e),
+                extra=context,
             )
 
     @staticmethod

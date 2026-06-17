@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 from io import StringIO
@@ -9,6 +10,7 @@ from litellm._logging import (
     AawmErrorLogFileHandler,
     JsonFormatter,
     _get_aawm_error_log_path,
+    _get_aawm_legacy_error_log_path,
     _redact_string,
     _secret_filter,
     _setup_json_exception_handlers,
@@ -217,6 +219,12 @@ def test_json_excepthook_redacts_traceback_secrets():
     assert "REDACTED" in output
 
 
+def _read_aawm_error_jsonl(path):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    return json.loads(lines[0])
+
+
 def test_aawm_error_log_handler_writes_redacted_traceback(monkeypatch, tmp_path):
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
@@ -244,13 +252,90 @@ def test_aawm_error_log_handler_writes_redacted_traceback(monkeypatch, tmp_path)
         logger.setLevel(saved_level)
         logger.propagate = saved_propagate
 
-    error_log = tmp_path / "dev-error.log"
-    output = error_log.read_text(encoding="utf-8")
-    assert "test-aawm-error-log-handler:ERROR" in output
-    assert "Traceback (most recent call last)" in output
-    assert "RuntimeError" in output
-    assert SECRET not in output
-    assert "REDACTED" in output
+    payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+    assert payload["schema_version"] == 1
+    assert payload["environment"] == "dev"
+    assert payload["logger"] == "test-aawm-error-log-handler"
+    assert payload["level"] == "ERROR"
+    assert "managed error" in payload["message"]
+    assert "REDACTED" in payload["message"]
+    assert "Traceback (most recent call last)" in payload["traceback_text"]
+    assert "RuntimeError" in payload["raw_text"]
+    assert payload["traceback_lines"]
+    assert payload["fingerprint"]
+    assert payload["context"]["provider"] is None
+    assert SECRET not in json.dumps(payload)
+    assert "REDACTED" in payload["raw_text"]
+
+
+def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    handler = AawmErrorLogFileHandler()
+    logger = logging.getLogger("test-aawm-error-log-context")
+    saved_handlers = logger.handlers[:]
+    saved_level = logger.level
+    saved_propagate = logger.propagate
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+
+    try:
+        try:
+            raise RuntimeError("provider failure")
+        except RuntimeError:
+            logger.exception(
+                "upstream error",
+                extra={
+                    "source": "pass_through_endpoint",
+                    "container": "litellm-dev",
+                    "endpoint": "/anthropic/v1/messages",
+                    "upstream_url": "https://api.example.test/v1/messages",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "model_alias": "aawm-code-anthropic",
+                    "route_family": "anthropic_messages",
+                    "status_code": 529,
+                    "trace_id": "trace-123",
+                    "litellm_call_id": f"call-{SECRET}",
+                },
+            )
+    finally:
+        logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            logger.addHandler(saved_handler)
+        logger.setLevel(saved_level)
+        logger.propagate = saved_propagate
+
+    payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+    assert payload["observed_at"].endswith("+00:00")
+    assert payload["context"] == {
+        "source": "pass_through_endpoint",
+        "container": "litellm-dev",
+        "endpoint": "/anthropic/v1/messages",
+        "upstream_url": "https://api.example.test/v1/messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "model_alias": "aawm-code-anthropic",
+        "route_family": "anthropic_messages",
+        "status_code": 529,
+        "trace_id": "trace-123",
+        "litellm_call_id": "call-REDACTED",
+        "callback_name": None,
+        "callback_phase": None,
+        "handler_branch": None,
+        "langfuse_failure_class": None,
+        "event_type": None,
+        "worker_timeout_seconds": None,
+        "queue_depth": None,
+        "queue_maxsize": None,
+        "coroutine_name": None,
+        "worker_delivery_state": None,
+    }
+    assert SECRET not in json.dumps(payload)
 
 
 def test_aawm_error_log_path_uses_sanitized_environment(monkeypatch, tmp_path):
@@ -258,7 +343,52 @@ def test_aawm_error_log_path_uses_sanitized_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "Dev Env/With Spaces")
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
 
-    assert _get_aawm_error_log_path() == str(tmp_path / "dev-env-with-spaces-error.log")
+    assert _get_aawm_error_log_path() == str(
+        tmp_path / "dev-env-with-spaces-error.jsonl"
+    )
+    assert _get_aawm_legacy_error_log_path() == str(
+        tmp_path / "dev-env-with-spaces-error.log"
+    )
+
+
+def test_aawm_error_log_handler_groups_identical_events_by_fingerprint(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    handler = AawmErrorLogFileHandler()
+    logger = logging.getLogger("test-aawm-error-log-fingerprint")
+    saved_handlers = logger.handlers[:]
+    saved_level = logger.level
+    saved_propagate = logger.propagate
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+
+    try:
+        for _ in range(2):
+            try:
+                raise RuntimeError("same failure")
+            except RuntimeError:
+                logger.exception("managed error")
+    finally:
+        logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            logger.addHandler(saved_handler)
+        logger.setLevel(saved_level)
+        logger.propagate = saved_propagate
+
+    payloads = [
+        json.loads(line)
+        for line in (tmp_path / "dev-error.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(payloads) == 2
+    assert payloads[0]["fingerprint"] == payloads[1]["fingerprint"]
 
 
 def test_aawm_error_log_handler_ignores_non_exception_critical_notice(
@@ -281,6 +411,7 @@ def test_aawm_error_log_handler_ignores_non_exception_critical_notice(
 
     handler.handle(record)
 
+    assert not (tmp_path / "dev-error.jsonl").exists()
     assert not (tmp_path / "dev-error.log").exists()
 
 
@@ -300,8 +431,8 @@ def test_json_exception_hook_writes_aawm_error_log(monkeypatch, tmp_path):
     finally:
         sys.excepthook = original_excepthook
 
-    output = (tmp_path / "dev-error.log").read_text(encoding="utf-8")
-    assert "uncaught path key" in output
-    assert "Traceback (most recent call last)" in output
-    assert SECRET not in output
-    assert "REDACTED" in output
+    payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+    assert "uncaught path key" in payload["message"]
+    assert "Traceback (most recent call last)" in payload["traceback_text"]
+    assert SECRET not in json.dumps(payload)
+    assert "REDACTED" in payload["raw_text"]

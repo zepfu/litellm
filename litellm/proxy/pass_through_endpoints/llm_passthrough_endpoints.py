@@ -113,6 +113,7 @@ from litellm.proxy.utils import is_known_model
 from litellm.proxy.vector_store_endpoints.utils import (
     is_allowed_to_call_vector_store_endpoint,
 )
+from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues, ResponsesAPIOptionalRequestParams
 from litellm.types.utils import LlmProviders
@@ -147,17 +148,6 @@ _ANTIGRAVITY_CLIENT_HEADER_DEFAULT = "antigravity-cli/1.0.4"
 _ANTIGRAVITY_AUTH_FILE_ENV_VARS = (
     "LITELLM_ANTIGRAVITY_AUTH_FILE",
     "ANTIGRAVITY_OAUTH_TOKEN_FILE",
-)
-_ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS = (
-    "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE",
-    "ANTIGRAVITY_MANAGED_OAUTH_TOKEN_FILE",
-)
-_ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS = (
-    "LITELLM_ANTIGRAVITY_SEED_AUTH_FILE",
-    "ANTIGRAVITY_SEED_OAUTH_TOKEN_FILE",
-)
-_ANTIGRAVITY_DEFAULT_MANAGED_AUTH_PATH = (
-    "~/.litellm/antigravity/antigravity-oauth-token"
 )
 _ANTIGRAVITY_DEFAULT_AUTH_PATHS = (
     "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token",
@@ -248,6 +238,8 @@ _GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE = frozenset(
     {
         "content-length",
         "host",
+        "traceparent",
+        "tracestate",
         "x-litellm-api-key",
     }
 )
@@ -385,11 +377,7 @@ _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = "openrouter"
 _CODEX_AUTO_AGENT_XAI_PROVIDER = "xai"
 _CODEX_AUTO_AGENT_OPENCODE_PROVIDER = _OPENCODE_ZEN_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
-_CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY = "xai_grok_oidc"
-_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = "xai_oauth"
-# Backward-compatible alias for older tests and notes that referred to the
-# shared xAI lane before Composer OIDC and managed OAuth were split.
-_CODEX_AUTO_AGENT_XAI_LANE_KEY = _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY
+_CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
 _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _OPENCODE_ZEN_PROVIDER
 _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
@@ -453,7 +441,7 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "model": "gpt-5.5",
         "route_family": "codex_responses",
         "last_resort": True,
-        "request_defaults": {"reasoning": {"effort": "medium"}},
+        "default_reasoning_effort": "medium",
     },
 )
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -1259,7 +1247,18 @@ def _sanitize_xai_responses_request_body(
         request_body.get("tools"),
         sanitized_body.get("tools"),
     )
-    if not removed_params and not tool_changes:
+    decoded_previous_response_id = False
+    previous_response_id = sanitized_body.get("previous_response_id")
+    if isinstance(previous_response_id, str) and previous_response_id:
+        decoded = ResponsesAPIRequestUtils.decode_previous_response_id_to_original_previous_response_id(
+            previous_response_id
+        )
+        if decoded != previous_response_id:
+            sanitized_body = dict(sanitized_body)
+            sanitized_body["previous_response_id"] = decoded
+            decoded_previous_response_id = True
+
+    if not removed_params and not tool_changes and not decoded_previous_response_id:
         return request_body, [], []
 
     tool_types = _dedupe_sorted_str_list(
@@ -1281,6 +1280,11 @@ def _sanitize_xai_responses_request_body(
         tags_to_add=[
             "xai-responses-request-sanitized",
             *(
+                ["xai-responses-previous-response-id-decoded"]
+                if decoded_previous_response_id
+                else []
+            ),
+            *(
                 f"xai-responses-removed-param:{param}"
                 for param in normalized_removed_params
             ),
@@ -1292,6 +1296,9 @@ def _sanitize_xai_responses_request_body(
             "xai_responses_sanitized_tool_count": len(tool_changes),
             "xai_responses_sanitized_tool_types": tool_types,
             "xai_responses_sanitized_tools": tool_changes,
+            "xai_responses_previous_response_id_decoded": (
+                decoded_previous_response_id
+            ),
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
                     name="xai.responses_request_sanitized",
@@ -1299,6 +1306,9 @@ def _sanitize_xai_responses_request_body(
                         "removed_params": normalized_removed_params,
                         "tool_count": len(tool_changes),
                         "tool_types": tool_types,
+                        "previous_response_id_decoded": (
+                            decoded_previous_response_id
+                        ),
                     },
                 )
             ],
@@ -1317,81 +1327,6 @@ def _sanitize_xai_responses_request_body_in_place(
         request_body.clear()
         request_body.update(updated_body)
     return removed_params, tool_changes
-
-
-def _strip_xai_adapter_compaction_state_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    removed_items: list[dict[str, Any]] = []
-    updated_body: Optional[dict[str, Any]] = None
-
-    if request_body.get("previous_response_id") is not None:
-        updated_body = dict(request_body)
-        updated_body.pop("previous_response_id", None)
-        removed_items.append({"field": "previous_response_id"})
-
-    input_items = request_body.get("input")
-    if isinstance(input_items, list):
-        updated_input_items: list[Any] = []
-        for index, item in enumerate(input_items):
-            if (
-                isinstance(item, dict)
-                and _normalize_low_cardinality_tag_value(item.get("type"))
-                == "reasoning"
-                and isinstance(item.get("encrypted_content"), str)
-            ):
-                removed_items.append(
-                    {
-                        "field": "input",
-                        "index": index,
-                        "type": "reasoning",
-                        "reason": "encrypted_content",
-                    }
-                )
-                continue
-            updated_input_items.append(item)
-
-        if len(updated_input_items) != len(input_items):
-            if updated_body is None:
-                updated_body = dict(request_body)
-            updated_body["input"] = updated_input_items
-
-    if not removed_items or updated_body is None:
-        return request_body, []
-
-    removed_fields = _dedupe_sorted_str_list(
-        [
-            str(item["field"])
-            for item in removed_items
-            if isinstance(item.get("field"), str)
-        ]
-    )
-    updated_body = _merge_litellm_metadata(
-        updated_body,
-        tags_to_add=[
-            "xai-adapter-compaction-state-removed",
-            *(
-                f"xai-adapter-compaction-state:{field}"
-                for field in removed_fields
-            ),
-        ],
-        extra_fields={
-            "xai_adapter_compaction_state_removed": True,
-            "xai_adapter_compaction_state_removed_count": len(removed_items),
-            "xai_adapter_compaction_state_removed_fields": removed_fields,
-            "xai_adapter_compaction_state_removed_items": removed_items,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="xai.adapter_compaction_state_removed",
-                    metadata={
-                        "removed_count": len(removed_items),
-                        "removed_fields": removed_fields,
-                    },
-                )
-            ],
-        },
-    )
-    return updated_body, removed_items
 
 
 async def _prepare_oa_xai_passthrough_request(
@@ -1420,8 +1355,8 @@ async def _prepare_oa_xai_passthrough_request(
         if updated_body is not request_body:
             request_body.clear()
             request_body.update(updated_body)
-        updated_body, _xai_compaction_state_removed = (
-            _strip_xai_adapter_compaction_state_from_request_body(request_body)
+        updated_body, _xai_unsupported_input_items = (
+            _drop_unsupported_codex_input_items_from_request_body(request_body)
         )
         if updated_body is not request_body:
             request_body.clear()
@@ -1560,16 +1495,13 @@ async def _prepare_grok_native_oauth_passthrough_request(
     if model is None:
         return False, None, {}, request_body
 
-    merged_tags_to_add = list(tags_to_add or [])
-    merged_extra_fields = dict(extra_fields or {})
-
     prepared_body = dict(request_body)
     prepared_body["model"] = model
     prepared_body = _add_grok_native_oauth_metadata(
         prepared_body,
         model=model,
-        tags_to_add=merged_tags_to_add,
-        extra_fields=merged_extra_fields,
+        tags_to_add=tags_to_add,
+        extra_fields=extra_fields,
     )
     prepared_body, _grok_unsupported_hosted_tools = (
         _drop_unsupported_codex_hosted_tools_from_request_body(prepared_body)
@@ -1577,8 +1509,8 @@ async def _prepare_grok_native_oauth_passthrough_request(
     prepared_body, _grok_unsupported_request_params = (
         _drop_unsupported_codex_request_params_from_request_body(prepared_body)
     )
-    prepared_body, _grok_compaction_state_removed = (
-        _strip_xai_adapter_compaction_state_from_request_body(prepared_body)
+    prepared_body, _grok_unsupported_input_items = (
+        _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
     _sanitize_xai_responses_request_body_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
@@ -2038,48 +1970,6 @@ def _resolve_codex_auto_agent_session_key(
         f"{alias_model}:{session_id}:"
         f"{_resolve_codex_auto_agent_openai_lane_key(request)}"
     )
-
-
-def _is_xai_quota_or_usage_exhaustion_detail(normalized_detail: str) -> bool:
-    if any(
-        marker in normalized_detail
-        for marker in (
-            "usage_limit_reached",
-            "quota exhausted",
-            "exhausted your capacity",
-            "resource_exhausted",
-            "resource exhausted",
-            "rate limit exceeded",
-            "too many requests",
-        )
-    ):
-        return True
-    if "quota" in normalized_detail and any(
-        marker in normalized_detail
-        for marker in ("exhaust", "limit", "reset", "usage")
-    ):
-        return True
-    return False
-
-
-def _extract_candidate_exception_detail_text(exc: Exception) -> str:
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, (dict, list)):
-        return json.dumps(detail, sort_keys=True, default=str)
-    if detail is not None:
-        return str(detail)
-    return str(exc)
-
-
-def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
-    route_family = str(candidate.get("route_family") or "").lower()
-    if route_family in {
-        "codex_xai_oauth_responses_adapter",
-        "anthropic_xai_oauth_responses_adapter",
-        "anthropic_xai_oauth_completion_adapter",
-    }:
-        return _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
-    return _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY
 
 
 def _codex_auto_agent_candidate_key(
@@ -2546,7 +2436,7 @@ async def _build_codex_auto_agent_candidate_states(
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-            lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
+            lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
         else:
@@ -2822,6 +2712,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "rate_limited"
     if status_code in {503, 529}:
         return "upstream_overloaded"
+    if status_code == 504:
+        return "upstream_timeout"
     return None
 
 
@@ -2921,55 +2813,6 @@ def _update_codex_auto_agent_retryable_attempt_record(
     return error_tokens
 
 
-def _codex_auto_agent_request_has_reasoning_setting(
-    request_body: dict[str, Any],
-) -> bool:
-    if "reasoning" in request_body:
-        return True
-    if "reasoning_effort" in request_body or "reasoningEffort" in request_body:
-        return True
-    output_config = request_body.get("output_config")
-    return isinstance(output_config, dict) and "effort" in output_config
-
-
-def _apply_codex_auto_agent_candidate_request_defaults(
-    request_body: dict[str, Any],
-    candidate: dict[str, Any],
-) -> dict[str, Any]:
-    request_defaults = candidate.get("request_defaults")
-    if not isinstance(request_defaults, dict) or not request_defaults:
-        return request_body
-
-    updated_body = request_body
-    applied_defaults: list[str] = []
-    for key, value in request_defaults.items():
-        if not isinstance(key, str) or not key:
-            continue
-        if key == "reasoning" and _codex_auto_agent_request_has_reasoning_setting(
-            updated_body
-        ):
-            continue
-        if key in updated_body:
-            continue
-        if updated_body is request_body:
-            updated_body = copy.deepcopy(request_body)
-        updated_body[key] = copy.deepcopy(value)
-        applied_defaults.append(key)
-
-    if not applied_defaults:
-        return request_body
-
-    return _merge_litellm_metadata(
-        updated_body,
-        tags_to_add=[
-            f"codex-auto-agent-default:{field}" for field in applied_defaults
-        ],
-        extra_fields={
-            "codex_auto_agent_request_defaults_applied": applied_defaults,
-        },
-    )
-
-
 def _add_codex_auto_agent_alias_metadata(
     request_body: dict[str, Any],
     *,
@@ -2986,10 +2829,21 @@ def _add_codex_auto_agent_alias_metadata(
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
-    updated_body = _apply_codex_auto_agent_candidate_request_defaults(
-        updated_body,
-        candidate,
+    default_reasoning_effort = _normalize_low_cardinality_tag_value(
+        candidate.get("default_reasoning_effort")
     )
+    default_reasoning_applied = False
+    if default_reasoning_effort and "reasoning_effort" not in updated_body:
+        reasoning = updated_body.get("reasoning")
+        if not isinstance(reasoning, dict):
+            updated_body["reasoning"] = {"effort": default_reasoning_effort}
+            default_reasoning_applied = True
+        elif not reasoning.get("effort"):
+            updated_body["reasoning"] = {
+                **reasoning,
+                "effort": default_reasoning_effort,
+            }
+            default_reasoning_applied = True
     skipped = selection.get("skipped") or []
     audit_events = _build_auto_agent_alias_audit_events(
         alias_family="codex_auto_agent",
@@ -3011,6 +2865,11 @@ def _add_codex_auto_agent_alias_metadata(
                 if candidate.get("last_resort")
                 else []
             ),
+            *(
+                [f"codex-auto-agent-default-effort:{default_reasoning_effort}"]
+                if default_reasoning_applied
+                else []
+            ),
             f"codex-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
@@ -3022,6 +2881,16 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_selected_route_family": candidate["route_family"],
             "codex_auto_agent_selected_last_resort": bool(
                 candidate.get("last_resort")
+            ),
+            **(
+                {
+                    "codex_auto_agent_default_reasoning_effort": (
+                        default_reasoning_effort
+                    ),
+                    "codex_reasoning_effort": default_reasoning_effort,
+                }
+                if default_reasoning_applied
+                else {}
             ),
             "codex_auto_agent_selection_reason": selection.get("selection_reason"),
             "codex_auto_agent_lane_key": selection.get("lane_key"),
@@ -3217,7 +3086,7 @@ async def _build_anthropic_auto_agent_candidate_states(
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-            lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
+            lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
         elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
@@ -5415,6 +5284,7 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
         await _wait_for_google_adapter_cooldown_if_needed(rate_limit_key)
         try:
             passthrough_kwargs["retryable_upstream_status_codes"] = [429]
+            passthrough_kwargs["caller_managed_hidden_retry"] = True
             return await pass_through_request(**passthrough_kwargs)
         except Exception as exc:
             status_code = _extract_google_adapter_exception_status_code(exc)
@@ -5939,6 +5809,7 @@ async def _perform_openrouter_adapter_pass_through_request(
             result = await pass_through_request(
                 **kwargs,
                 retryable_upstream_status_codes=[429, 500, 502, 503, 504],
+                caller_managed_hidden_retry=True,
             )
             _clear_openrouter_adapter_failure_circuit(adapter_model)
             return result
@@ -9868,110 +9739,51 @@ def _is_grok_unsupported_reasoning_parameter_detail(normalized_detail: str) -> b
 
 
 def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    detail_text = _extract_candidate_exception_detail_text(exc)
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        detail_text = json.dumps(detail, sort_keys=True, default=str)
+    elif detail is not None:
+        detail_text = str(detail)
+    else:
+        detail_text = str(exc)
     normalized = detail_text.lower()
     if _is_grok_unsupported_reasoning_parameter_detail(normalized):
         return detail_text
     if "could not decode the compaction blob" in normalized:
         return detail_text
-    if _is_xai_quota_or_usage_exhaustion_detail(normalized):
-        return None
-    if _grok_native_auth_failure_detail(exc) is not None:
-        return detail_text
-    if any(
-        marker in normalized
-        for marker in (
-            "xai oauth credential",
-            "grok oidc credential",
-            "grok native",
-            "grok oidc credential refresh failed",
-            "invalid_grant",
-        )
+    if (
+        "xai oauth credential" not in normalized
+        and "grok oidc credential" not in normalized
+        and "grok native" not in normalized
     ):
-        return detail_text
-    return None
-
-
-def _grok_native_auth_failure_detail(exc: Exception) -> Optional[str]:
-    detail_text = _extract_candidate_exception_detail_text(exc)
-    normalized = detail_text.lower()
-    if _is_xai_quota_or_usage_exhaustion_detail(normalized):
         return None
-    if any(
-        marker in normalized
-        for marker in (
-            "invalid or expired credentials",
-            "permissiondenied",
-            "no auth context",
-            "x_xai_token_auth=xai-grok-cli",
-            "auth_kind=bearer",
-        )
-    ):
-        return detail_text
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    if status_code not in {401, 403}:
-        return None
-    if any(
-        marker in normalized
-        for marker in (
-            "credential",
-            "credentials",
-            "authentication",
-            "authorization",
-            "unauthorized",
-            "forbidden",
-            "invalid_grant",
-            "oauth",
-            "oidc",
-            "token",
-            "auth context",
-            "x_xai_token_auth",
-            "xai-grok-cli",
-        )
-    ):
-        return detail_text
-    return None
+    return detail_text
 
 
 def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    detail_text = _extract_candidate_exception_detail_text(exc)
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, (dict, list)):
+        detail_text = json.dumps(detail, sort_keys=True, default=str)
+    elif detail is not None:
+        detail_text = str(detail)
+    else:
+        detail_text = str(exc)
     normalized = detail_text.lower()
     if _is_grok_unsupported_reasoning_parameter_detail(normalized):
         return detail_text
     if "could not decode the compaction blob" in normalized:
         return detail_text
-    if _is_xai_quota_or_usage_exhaustion_detail(normalized):
-        return None
-    if any(
+    if not any(
         marker in normalized
         for marker in (
             "xai oauth credential",
             "xai oauth-managed",
             "managed xai oauth",
             "litellm_xai_oauth_auth_file",
-            "invalid or expired credentials",
-            "permissiondenied",
-            "no auth context",
         )
     ):
-        return detail_text
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    if status_code in {401, 403} and any(
-        marker in normalized
-        for marker in (
-            "credential",
-            "credentials",
-            "authentication",
-            "authorization",
-            "unauthorized",
-            "forbidden",
-            "oauth",
-            "token",
-            "auth context",
-        )
-    ):
-        return detail_text
-    return None
+        return None
+    return detail_text
 
 
 def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> None:
@@ -10886,14 +10698,13 @@ def _write_json_file_atomic(
 ) -> None:
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(data, indent=2) + "\n"
         tmp_path.write_text(payload, encoding="utf-8")
         try:
             current_mode = path.stat().st_mode & 0o777
+            os.chmod(tmp_path, current_mode)
         except OSError:
-            current_mode = 0o600
-        os.chmod(tmp_path, current_mode)
+            pass
         os.replace(tmp_path, path)
     except (OSError, TypeError, ValueError) as exc:
         try:
@@ -12923,6 +12734,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
     local_codex_headers = None
@@ -13042,6 +12854,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
         egress_credential_family="openai" if local_codex_headers is not None else None,
         expected_target_family="openai",
         retryable_upstream_status_codes=[429],
+        caller_managed_hidden_retry=use_alias_candidate_probe,
     )
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
@@ -13191,6 +13004,7 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
         if (
@@ -13292,54 +13106,52 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
         )
     )
 
-    async def _prepare_and_send_grok_native() -> Response:
-        nonlocal translated_request_body
-        try:
-            (
-                prepared_grok_native,
-                target_base_url,
-                grok_headers,
-                translated_request_body,
-            ) = await _prepare_grok_native_oauth_passthrough_request(
-                translated_request_body,
-                request=request,
-                tags_to_add=[
-                    "anthropic-grok-native-responses-adapter-entrypoint",
-                ],
-                extra_fields={
-                    "anthropic_grok_native_requested_model": prepared_request_body.get(
-                        "model"
-                    ),
-                    "anthropic_grok_native_adapter_model": adapter_model,
-                    "anthropic_adapter_target_endpoint": "xai:/v1/responses",
-                    "grok_native_entrypoint": "anthropic_messages",
-                },
-            )
-        except Exception as exc:
-            if (
-                use_alias_candidate_probe
-                and _grok_native_candidate_unavailable_detail(exc) is not None
-            ):
-                _raise_grok_native_auto_agent_candidate_unavailable(exc)
-            raise
-        if not prepared_grok_native or target_base_url is None:
-            if use_alias_candidate_probe:
-                _raise_grok_native_auto_agent_candidate_unavailable(
-                    Exception(
-                        "Anthropic adapter requests for Grok native OAuth models "
-                        "require a Grok OIDC credential."
-                    )
-                )
-            raise Exception(
-                "Anthropic adapter requests for Grok native OAuth models require a Grok OIDC credential."
-            )
-
-        target_url = _join_grok_passthrough_url(
-            base_target_url=target_base_url,
-            endpoint="/v1/responses",
+    try:
+        (
+            prepared_grok_native,
+            target_base_url,
+            grok_headers,
+            translated_request_body,
+        ) = await _prepare_grok_native_oauth_passthrough_request(
+            translated_request_body,
+            request=request,
+            tags_to_add=[
+                "anthropic-grok-native-responses-adapter-entrypoint",
+            ],
+            extra_fields={
+                "anthropic_grok_native_requested_model": prepared_request_body.get("model"),
+                "anthropic_grok_native_adapter_model": adapter_model,
+                "anthropic_adapter_target_endpoint": "xai:/v1/responses",
+                "grok_native_entrypoint": "anthropic_messages",
+            },
         )
-        _annotate_request_scope_for_adapted_access_log(request, target_url)
-        return await pass_through_request(
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _grok_native_candidate_unavailable_detail(exc) is not None
+        ):
+            _raise_grok_native_auto_agent_candidate_unavailable(exc)
+        raise
+    if not prepared_grok_native or target_base_url is None:
+        if use_alias_candidate_probe:
+            _raise_grok_native_auto_agent_candidate_unavailable(
+                Exception(
+                    "Anthropic adapter requests for Grok native OAuth models "
+                    "require a Grok OIDC credential."
+                )
+            )
+        raise Exception(
+            "Anthropic adapter requests for Grok native OAuth models require a Grok OIDC credential."
+        )
+
+    target_url = _join_grok_passthrough_url(
+        base_target_url=target_base_url,
+        endpoint="/v1/responses",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
+
+    try:
+        upstream_response = await pass_through_request(
             request=request,
             target=str(target_url),
             custom_headers=grok_headers,
@@ -13350,10 +13162,8 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            caller_managed_hidden_retry=use_alias_candidate_probe,
         )
-
-    try:
-        upstream_response = await _prepare_and_send_grok_native()
     except Exception as exc:
         if (
             use_alias_candidate_probe
@@ -13998,6 +13808,7 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
             custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
             egress_credential_family="opencode",
             expected_target_family="opencode",
+            caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
         if (
@@ -16656,17 +16467,15 @@ def _drop_unsupported_codex_input_items_from_request_body(
 
         item_type = _normalize_low_cardinality_tag_value(item.get("type"))
         if item_type in unsupported_input_item_types:
+            removed_item: dict[str, Any] = {
+                "type": item_type,
+                "index": index,
+            }
             if item_type == "reasoning" and isinstance(
                 item.get("encrypted_content"), str
             ):
-                updated_input_items.append(item)
-                continue
-            removed_items.append(
-                {
-                    "type": item_type,
-                    "index": index,
-                }
-            )
+                removed_item["encrypted_content"] = True
+            removed_items.append(removed_item)
             continue
 
         updated_input_items.append(item)
@@ -18602,11 +18411,8 @@ def _get_gemini_passthrough_target_base(
     return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
 
 
-def _get_existing_antigravity_auth_file_path(
-    env_var_names: tuple[str, ...],
-    default_paths: tuple[str, ...] = (),
-) -> Optional[Path]:
-    for env_name in env_var_names:
+def _get_antigravity_auth_file_path() -> Optional[Path]:
+    for env_name in _ANTIGRAVITY_AUTH_FILE_ENV_VARS:
         raw_value = _clean_codex_auth_value(os.getenv(env_name))
         if not raw_value:
             continue
@@ -18614,48 +18420,12 @@ def _get_existing_antigravity_auth_file_path(
         if path.exists():
             return path
 
-    for candidate_str in default_paths:
+    for candidate_str in _ANTIGRAVITY_DEFAULT_AUTH_PATHS:
         candidate = Path(candidate_str).expanduser()
         if candidate.exists():
             return candidate
 
     return None
-
-
-def _get_antigravity_seed_auth_file_path(
-    *,
-    allow_missing_explicit: bool = False,
-) -> Optional[Path]:
-    for env_var_names in (
-        _ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS,
-        _ANTIGRAVITY_AUTH_FILE_ENV_VARS,
-    ):
-        for env_name in env_var_names:
-            raw_value = _clean_codex_auth_value(os.getenv(env_name))
-            if not raw_value:
-                continue
-            path = Path(raw_value).expanduser()
-            if allow_missing_explicit or path.exists():
-                return path
-
-    return _get_existing_antigravity_auth_file_path(
-        (),
-        _ANTIGRAVITY_DEFAULT_AUTH_PATHS,
-    )
-
-
-def _get_antigravity_managed_auth_file_path() -> Path:
-    for env_name in _ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS:
-        raw_value = _clean_codex_auth_value(os.getenv(env_name))
-        if raw_value:
-            return Path(raw_value).expanduser()
-    return Path(_ANTIGRAVITY_DEFAULT_MANAGED_AUTH_PATH).expanduser()
-
-
-def _antigravity_auth_paths_match(left: Path, right: Path) -> bool:
-    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(
-        strict=False
-    )
 
 
 async def _load_antigravity_oauth_token_data_from_path(
@@ -18678,71 +18448,15 @@ async def _load_antigravity_oauth_token_data_from_path(
     return token_data
 
 
-async def _sync_antigravity_seed_oauth_token_data(
-    managed_auth_path: Path,
-) -> None:
-    seed_auth_path = _get_antigravity_seed_auth_file_path()
-    if seed_auth_path is None or _antigravity_auth_paths_match(
-        managed_auth_path,
-        seed_auth_path,
-    ):
-        return
-
-    try:
-        seed_stat = seed_auth_path.stat()
-    except FileNotFoundError:
-        return
-
-    seed_token_data: Optional[AntigravityOAuthTokenData] = None
-    try:
-        managed_stat = managed_auth_path.stat()
-    except FileNotFoundError:
-        should_sync = True
-    else:
-        if seed_stat.st_mtime_ns > managed_stat.st_mtime_ns:
-            should_sync = True
-        elif seed_stat.st_mtime_ns == managed_stat.st_mtime_ns:
-            seed_token_data = await _load_antigravity_oauth_token_data_from_path(
-                seed_auth_path
-            )
-            try:
-                managed_token_data = await _load_antigravity_oauth_token_data_from_path(
-                    managed_auth_path
-                )
-            except HTTPException:
-                should_sync = True
-            else:
-                should_sync = seed_token_data != managed_token_data
-        else:
-            should_sync = False
-
-    if not should_sync:
-        return
-
-    if seed_token_data is None:
-        seed_token_data = await _load_antigravity_oauth_token_data_from_path(
-            seed_auth_path
-        )
-    _write_antigravity_oauth_token_data_atomic(managed_auth_path, seed_token_data)
-    _antigravity_oauth_access_token_cache.pop(
-        str(managed_auth_path.expanduser()),
-        None,
-    )
-
-
 async def _load_local_antigravity_oauth_token_data() -> tuple[AntigravityOAuthTokenData, Path]:
-    auth_path = _get_antigravity_managed_auth_file_path()
-    await _sync_antigravity_seed_oauth_token_data(auth_path)
-    if not auth_path.exists():
+    auth_path = _get_antigravity_auth_file_path()
+    if auth_path is None:
         raise HTTPException(
             status_code=500,
             detail=(
-                "Antigravity passthrough requires a LiteLLM-managed writable "
-                "OAuth token file at 'LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE' "
-                f"or '{_ANTIGRAVITY_DEFAULT_MANAGED_AUTH_PATH}', seeded from "
-                "'LITELLM_ANTIGRAVITY_SEED_AUTH_FILE', "
-                "'LITELLM_ANTIGRAVITY_AUTH_FILE', or the Antigravity CLI "
-                "default token path."
+                "Antigravity passthrough requires local OAuth token data at "
+                "'~/.gemini/antigravity-cli/antigravity-oauth-token' or "
+                "'LITELLM_ANTIGRAVITY_AUTH_FILE'."
             ),
         )
 
@@ -19175,12 +18889,8 @@ async def _refresh_local_antigravity_oauth_token_data(
             and _get_oauth_token_error_code(response)
             in {"invalid_client", "invalid_grant", "unauthorized_client"}
         ):
-            cli_auth_path = (
-                _get_antigravity_seed_auth_file_path(allow_missing_explicit=True)
-                or auth_path
-            )
             return await _refresh_local_antigravity_oauth_token_data_via_cli(
-                cli_auth_path,
+                auth_path,
                 token_data,
             )
         raise HTTPException(
@@ -19486,18 +19196,16 @@ def _prepare_grok_request_body_for_passthrough(
     *,
     request: Request,
     request_body: dict[str, Any],
-    endpoint: str = "",
 ) -> dict[str, Any]:
-    request_body = _prepare_grok_privacy_coding_data_retention_body(
-        endpoint=endpoint,
-        request_body=request_body,
-    )
     prepared_body = _prepare_grok_logging_body_for_passthrough(
         request=request,
         request_body=request_body,
     )
     prepared_body, _grok_unsupported_request_params = (
         _drop_unsupported_codex_request_params_from_request_body(prepared_body)
+    )
+    prepared_body, _grok_unsupported_input_items = (
+        _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
@@ -19525,28 +19233,18 @@ def _is_grok_json_request(request: Request) -> bool:
     )
 
 
-def _is_grok_privacy_coding_data_retention_endpoint(endpoint: str) -> bool:
+def _is_grok_storage_endpoint(endpoint: str) -> bool:
     endpoint_path = httpx.URL(endpoint).path
     if not endpoint_path.startswith("/"):
         endpoint_path = "/" + endpoint_path
     if endpoint_path.startswith("/v1/"):
         endpoint_path = endpoint_path[len("/v1") :]
+    return endpoint_path == "/storage" or endpoint_path.startswith("/storage/")
+
+
+def _is_grok_coding_data_retention_endpoint(endpoint: str) -> bool:
+    endpoint_path = _normalize_grok_endpoint_path(endpoint)
     return endpoint_path == "/privacy/coding-data-retention"
-
-
-def _prepare_grok_privacy_coding_data_retention_body(
-    *,
-    endpoint: str,
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    if not _is_grok_privacy_coding_data_retention_endpoint(endpoint):
-        return request_body
-    if "codingDataRetentionOptOut" in request_body:
-        return request_body
-
-    updated_body = copy.deepcopy(request_body)
-    updated_body["codingDataRetentionOptOut"] = True
-    return updated_body
 
 
 def _normalize_grok_endpoint_path(endpoint: str) -> str:
@@ -20227,8 +19925,14 @@ async def grok_proxy_route(
     LiteLLM auth should be supplied separately with `x-litellm-api-key` or a
     `key` query parameter so the upstream Authorization header can remain intact.
     """
-    raw_body_passthrough = (
-        request.method in {"POST", "PUT", "PATCH"} and not _is_grok_json_request(request)
+    is_storage_endpoint = _is_grok_storage_endpoint(endpoint)
+    is_coding_data_retention_endpoint = (
+        _is_grok_coding_data_retention_endpoint(endpoint)
+    )
+    raw_body_passthrough = request.method in {"POST", "PUT", "PATCH"} and (
+        is_storage_endpoint
+        or is_coding_data_retention_endpoint
+        or not _is_grok_json_request(request)
     )
     if raw_body_passthrough:
         _safe_set_request_parsed_body(request, {})
@@ -20237,6 +19941,20 @@ async def grok_proxy_route(
         request=request,
         api_key=_get_grok_litellm_auth_header(request),
     )
+
+    if is_storage_endpoint:
+        return {
+            "ok": True,
+            "suppressed": True,
+            "endpoint": "grok_storage",
+        }
+
+    if is_coding_data_retention_endpoint:
+        return {
+            "ok": True,
+            "suppressed": True,
+            "endpoint": "grok_coding_data_retention",
+        }
 
     base_target_url = _get_grok_passthrough_target_base()
     target_url = _join_grok_passthrough_url(
@@ -20259,7 +19977,6 @@ async def grok_proxy_route(
                 custom_body = _prepare_grok_request_body_for_passthrough(
                     request=request,
                     request_body=request_body,
-                    endpoint=endpoint,
                 )
                 if custom_body is not request_body:
                     _safe_set_request_parsed_body(request, custom_body)
@@ -20293,7 +20010,12 @@ async def grok_proxy_route(
                 shape_metadata=side_channel_shape_metadata,
             )
         )
-        verbose_proxy_logger.info(
+        side_channel_shape_log = (
+            verbose_proxy_logger.info
+            if os.getenv("AAWM_GROK_ROUTE_DEBUG") == "1"
+            else verbose_proxy_logger.debug
+        )
+        side_channel_shape_log(
             "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s",
             side_channel_shape_metadata.get("grok_side_channel_endpoint_type"),
             side_channel_shape_metadata.get(
@@ -20313,6 +20035,9 @@ async def grok_proxy_route(
         for key, value in dict(request.query_params).items()
         if str(key).lower() != "key"
     }
+    grok_side_channel_retryable_status_codes = (
+        _get_grok_side_channel_retryable_status_codes(endpoint)
+    )
 
     return await pass_through_request(
         request=request,
@@ -20329,9 +20054,8 @@ async def grok_proxy_route(
         allowed_forward_headers=list(_GROK_CLI_FORWARD_HEADER_ALLOWLIST),
         raw_body_passthrough=raw_body_passthrough,
         passthrough_logging_metadata=passthrough_logging_metadata,
-        retryable_upstream_status_codes=_get_grok_side_channel_retryable_status_codes(
-            endpoint
-        ),
+        retryable_upstream_status_codes=grok_side_channel_retryable_status_codes,
+        caller_managed_hidden_retry=bool(grok_side_channel_retryable_status_codes),
     )
 
 
@@ -20711,6 +20435,7 @@ async def _handle_anthropic_auto_agent_alias_route(
                     user_api_key_dict=user_api_key_dict,
                     prepared_request_body=candidate_body,
                     adapter_model=candidate["model"],
+                    use_alias_candidate_probe=True,
                 )
             elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
                 response = await _handle_anthropic_google_completion_adapter_route(
@@ -22636,6 +22361,7 @@ async def _perform_codex_auto_agent_native_openai_request(
         egress_credential_family="openai" if forward_headers else None,
         expected_target_family="openai",
         retryable_upstream_status_codes=[429],
+        caller_managed_hidden_retry=True,
     )
 
 
@@ -22646,27 +22372,27 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     user_api_key_dict: UserAPIKeyAuth,
     request_body: dict[str, Any],
 ) -> Response:
-    async def _send_grok_native_request() -> Response:
-        try:
-            grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
-                endpoint=endpoint,
-                request=request,
-                request_body=request_body,
-                extra_headers={},
+    try:
+        grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
+            endpoint=endpoint,
+            request=request,
+            request_body=request_body,
+            extra_headers={},
+        )
+    except Exception as exc:
+        if _grok_native_candidate_unavailable_detail(exc) is not None:
+            _raise_grok_native_auto_agent_candidate_unavailable(exc)
+        raise
+    if grok_context is None:
+        _raise_grok_native_auto_agent_candidate_unavailable(
+            Exception(
+                "Grok native Codex auto-agent candidate requires a managed "
+                "Grok OIDC credential."
             )
-        except Exception as exc:
-            if _grok_native_candidate_unavailable_detail(exc) is not None:
-                _raise_grok_native_auto_agent_candidate_unavailable(exc)
-            raise
-        if grok_context is None:
-            _raise_grok_native_auto_agent_candidate_unavailable(
-                Exception(
-                    "Grok native Codex auto-agent candidate requires a managed "
-                    "Grok OIDC credential."
-                )
-            )
-        assert grok_context is not None
-        _, grok_headers, grok_prepared_body, updated_url = grok_context
+        )
+    assert grok_context is not None
+    _, grok_headers, grok_prepared_body, updated_url = grok_context
+    try:
         return await pass_through_request(
             request=request,
             target=updated_url,
@@ -22679,10 +22405,8 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             egress_credential_family="xai",
             expected_target_family="xai",
             retryable_upstream_status_codes=[429],
+            caller_managed_hidden_retry=True,
         )
-
-    try:
-        return await _send_grok_native_request()
     except Exception as exc:
         if _grok_native_candidate_unavailable_detail(exc) is not None:
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
@@ -22732,6 +22456,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             egress_credential_family="xai",
             expected_target_family="xai",
             retryable_upstream_status_codes=[429],
+            caller_managed_hidden_retry=True,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
@@ -23887,6 +23612,7 @@ async def cursor_proxy_route(
         target=str(updated_url),
         custom_headers={"Authorization": f"Basic {auth_value}"},
         custom_llm_provider="cursor",
+        caller_managed_hidden_retry=True,
     )
     received_value = await endpoint_func(
         request,
