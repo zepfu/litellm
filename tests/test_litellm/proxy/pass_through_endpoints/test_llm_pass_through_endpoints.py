@@ -5451,6 +5451,101 @@ class TestPassThroughRequestRetryableFailures:
         assert "ReadTimeout" in payload["traceback"]
 
     @pytest.mark.asyncio
+    async def test_streaming_post_response_logging_error_jsonl_includes_context(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/openai_passthrough/responses",
+            "upstream_url": target_url,
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "model_alias": "aawm-code",
+            "route_family": "codex_responses",
+            "status_code": None,
+            "trace_id": "trace-stream-logging",
+            "litellm_call_id": "call-stream-logging",
+        }
+        success_handler_kwargs = {
+            "litellm_call_id": "call-stream-logging",
+            "litellm_params": {
+                "metadata": {
+                    "requested_model_alias": "aawm-code",
+                    "passthrough_route_family": "codex_responses",
+                }
+            },
+            "standard_logging_object": {"metadata": {}, "request_tags": []},
+        }
+        logging_obj = MagicMock()
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.streaming_handler.OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks",
+                side_effect=RuntimeError("Overloaded"),
+            ):
+                await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                    litellm_logging_obj=logging_obj,
+                    passthrough_success_handler_obj=MagicMock(
+                        spec=PassThroughEndpointLogging
+                    ),
+                    response=httpx.Response(
+                        200,
+                        request=httpx.Request("POST", target_url),
+                    ),
+                    url_route=target_url,
+                    request_body={
+                        "model": "gpt-5.5",
+                        "messages": [{"role": "user", "content": "do not log"}],
+                    },
+                    endpoint_type=EndpointType.OPENAI,
+                    start_time=datetime.now() - timedelta(milliseconds=10),
+                    raw_bytes=[b"data: {}\n\n"],
+                    end_time=datetime.now(),
+                    custom_llm_provider="openai",
+                    success_handler_kwargs=success_handler_kwargs,
+                    error_log_context=error_context,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Error in _route_streaming_logging_to_handler" in item["message"]
+        )
+
+        assert payload["message"] == (
+            "Error in _route_streaming_logging_to_handler: Overloaded"
+        )
+        for key, value in error_context.items():
+            if key == "status_code":
+                assert payload["context"][key] == 200
+            else:
+                assert payload["context"][key] == value
+        assert payload["context"]["callback_name"] == "pass_through_streaming"
+        assert payload["context"]["callback_phase"] == "post_response_stream_logging"
+        assert payload["context"]["handler_branch"] == "openai"
+        assert "RuntimeError: Overloaded" in payload["traceback"]
+        assert "do not log" not in json.dumps(payload)
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_read_timeout_jsonl_uses_504_status(
         self,
         monkeypatch,
