@@ -413,6 +413,18 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert (
+        "AAWM_GROK_OIDC_AUTH_FILE_UID=${AAWM_GROK_OIDC_AUTH_FILE_UID:-1000}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_OIDC_AUTH_FILE_GID=${AAWM_GROK_OIDC_AUTH_FILE_GID:-1000}"
+        in compose_text
+    )
+    assert (
+        "AAWM_GROK_OIDC_AUTH_FILE_MODE=${AAWM_GROK_OIDC_AUTH_FILE_MODE:-0o600}"
+        in compose_text
+    )
+    assert (
         "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=${AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS:-3600}"
         in compose_text
     )
@@ -512,6 +524,11 @@ def test_run_due_sidecar_tasks_skips_when_grok_oidc_refresh_disabled(monkeypatch
         "refresh_grok_oidc_auth_file",
         lambda *_args, **_kwargs: pytest.fail("Grok OIDC refresh should not run"),
     )
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "repair_grok_oidc_auth_file_metadata",
+        lambda *_args, **_kwargs: pytest.fail("Grok OIDC metadata repair should not run"),
+    )
 
     assert loop.run_due_sidecar_tasks(
         config,
@@ -562,6 +579,17 @@ def test_run_due_sidecar_tasks_runs_grok_oidc_refresh_when_due(monkeypatch) -> N
         "refresh_grok_oidc_auth_file",
         fake_refresh,
     )
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "repair_grok_oidc_auth_file_metadata",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "repaired": False,
+            "auth_file": "/home/zepfu/.grok/auth.json",
+            "error_class": None,
+            "error_message": None,
+        },
+    )
 
     state = loop.SidecarTaskState()
     events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
@@ -584,6 +612,85 @@ def test_run_due_sidecar_tasks_runs_grok_oidc_refresh_when_due(monkeypatch) -> N
     assert "access-token" not in str(events)
     assert second_events == []
     assert third_events[0]["event"] == "grok_oidc_refresh"
+
+
+def test_run_due_sidecar_tasks_repairs_grok_oidc_metadata_each_cycle(
+    monkeypatch,
+) -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=False,
+        dsn=None,
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+        grok_oidc_refresh_enabled=True,
+        grok_oidc_auth_file="/home/zepfu/.grok/auth.json",
+        grok_oidc_lock_file="/home/zepfu/.grok/auth.json.lock",
+        grok_oidc_refresh_interval_seconds=3600.0,
+        grok_oidc_refresh_buffer_seconds=300,
+        grok_oidc_force_refresh=True,
+        grok_oidc_http_timeout_seconds=30.0,
+    )
+    repair_calls = []
+
+    def fake_repair(*args, **kwargs):
+        repair_calls.append((args, kwargs))
+        return {
+            "attempted": True,
+            "repaired": True,
+            "auth_file": "/home/zepfu/.grok/auth.json",
+            "error_class": None,
+            "error_message": None,
+        }
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "repair_grok_oidc_auth_file_metadata",
+        fake_repair,
+    )
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "refresh_grok_oidc_auth_file",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "auth_file": "/home/zepfu/.grok/auth.json",
+            "scope": "scope",
+            "expires_at": "2026-06-16T22:00:00Z",
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+
+    state = loop.SidecarTaskState(grok_oidc_last_attempt_monotonic=100.0)
+    events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
+
+    assert repair_calls == [
+        (
+            ("/home/zepfu/.grok/auth.json",),
+            {"lock_file": "/home/zepfu/.grok/auth.json.lock"},
+        )
+    ]
+    assert events == [
+        {
+            "event": "grok_oidc_metadata_repair",
+            "observed_at": events[0]["observed_at"],
+            "environment": "dev",
+            "attempted": True,
+            "repaired": True,
+            "auth_file": "/home/zepfu/.grok/auth.json",
+            "error_class": None,
+            "error_message": None,
+        }
+    ]
 
 
 def test_run_cycle_requires_dsn_when_apply_enabled(monkeypatch) -> None:

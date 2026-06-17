@@ -529,6 +529,41 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     return summary
 
 
+def _run_grok_oidc_metadata_repair_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    del state, now_monotonic
+    if not config.grok_oidc_refresh_enabled:
+        return None
+
+    try:
+        summary = grok_oidc_refresh.repair_grok_oidc_auth_file_metadata(
+            config.grok_oidc_auth_file,
+            lock_file=config.grok_oidc_lock_file,
+        )
+    except Exception as exc:
+        summary = {
+            "attempted": True,
+            "repaired": False,
+            "auth_file": config.grok_oidc_auth_file,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+
+    if not summary.get("repaired") and not summary.get("error_class"):
+        return None
+
+    return {
+        "event": "grok_oidc_metadata_repair",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        **summary,
+    }
+
+
 def run_due_sidecar_tasks(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -539,12 +574,22 @@ def run_due_sidecar_tasks(
         return []
 
     now = time.monotonic() if now_monotonic is None else now_monotonic
+    events: list[Dict[str, Any]] = []
+
+    metadata_repair_event = _run_grok_oidc_metadata_repair_task(
+        config,
+        state,
+        now_monotonic=now,
+    )
+    if metadata_repair_event is not None:
+        events.append(metadata_repair_event)
+
     last_attempt = state.grok_oidc_last_attempt_monotonic
     if (
         last_attempt is not None
         and now - last_attempt < config.grok_oidc_refresh_interval_seconds
     ):
-        return []
+        return events
 
     state.grok_oidc_last_attempt_monotonic = now
     try:
@@ -566,14 +611,15 @@ def run_due_sidecar_tasks(
             "error_message": _redacted_failure_message(str(exc)),
         }
 
-    return [
+    events.append(
         {
             "event": "grok_oidc_refresh",
             "observed_at": _utc_timestamp(),
             "environment": config.environment,
             **summary,
         }
-    ]
+    )
+    return events
 
 
 def _emit(payload: Dict[str, Any]) -> None:

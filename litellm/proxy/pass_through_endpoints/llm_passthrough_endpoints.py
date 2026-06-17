@@ -19558,7 +19558,7 @@ def _normalize_grok_endpoint_path(endpoint: str) -> str:
     return endpoint_path
 
 
-def _get_grok_session_side_channel_endpoint_type(endpoint: str) -> Optional[str]:
+def _get_grok_side_channel_endpoint_type(endpoint: str) -> Optional[str]:
     endpoint_path = _normalize_grok_endpoint_path(endpoint)
     if endpoint_path == "/sessions/register":
         return "sessions_register"
@@ -19566,17 +19566,43 @@ def _get_grok_session_side_channel_endpoint_type(endpoint: str) -> Optional[str]
         "/replicas/update"
     ):
         return "sessions_replicas_update"
+    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith(
+        "/signals"
+    ):
+        return "sessions_signals"
+    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith(
+        "/turn-deltas"
+    ):
+        return "sessions_turn_deltas"
+    if endpoint_path == "/traces":
+        return "traces"
     return None
 
 
-def _get_grok_session_side_channel_endpoint_path_template(
+def _get_grok_session_side_channel_endpoint_type(endpoint: str) -> Optional[str]:
+    return _get_grok_side_channel_endpoint_type(endpoint)
+
+
+def _get_grok_side_channel_endpoint_path_template(
     endpoint_type: str,
 ) -> Optional[str]:
     if endpoint_type == "sessions_register":
         return "/sessions/register"
     if endpoint_type == "sessions_replicas_update":
         return "/sessions/{session_id}/replicas/update"
+    if endpoint_type == "sessions_signals":
+        return "/sessions/{session_id}/signals"
+    if endpoint_type == "sessions_turn_deltas":
+        return "/sessions/{session_id}/turn-deltas"
+    if endpoint_type == "traces":
+        return "/traces"
     return None
+
+
+def _get_grok_session_side_channel_endpoint_path_template(
+    endpoint_type: str,
+) -> Optional[str]:
+    return _get_grok_side_channel_endpoint_path_template(endpoint_type)
 
 
 def _json_shape_type_name(value: Any) -> str:
@@ -19661,7 +19687,7 @@ def _build_grok_side_channel_request_shape_metadata(
     parsed_body: Any = None,
     raw_body: Optional[bytes] = None,
 ) -> Optional[dict[str, Any]]:
-    endpoint_type = _get_grok_session_side_channel_endpoint_type(endpoint)
+    endpoint_type = _get_grok_side_channel_endpoint_type(endpoint)
     if endpoint_type is None:
         return None
 
@@ -19678,7 +19704,7 @@ def _build_grok_side_channel_request_shape_metadata(
         "grok_side_channel": True,
         "grok_side_channel_endpoint_type": endpoint_type,
         "grok_side_channel_endpoint_path_template": (
-            _get_grok_session_side_channel_endpoint_path_template(endpoint_type)
+            _get_grok_side_channel_endpoint_path_template(endpoint_type)
         ),
         "grok_side_channel_request_content_type": content_type,
         "grok_side_channel_request_body_byte_length": body_byte_length,
@@ -19716,7 +19742,7 @@ def _merge_grok_side_channel_shape_into_passthrough_logging_metadata(
 
 def _get_grok_side_channel_retryable_status_codes(endpoint: str) -> list[int]:
     is_session_side_channel = (
-        _get_grok_session_side_channel_endpoint_type(endpoint) is not None
+        _get_grok_side_channel_endpoint_type(endpoint) is not None
     )
     if not is_session_side_channel:
         return []
@@ -20251,7 +20277,7 @@ async def grok_proxy_route(
                         )
                     ):
                         custom_headers["x-grok-model-override"] = grok_model_override
-        elif _get_grok_session_side_channel_endpoint_type(endpoint) is not None:
+        elif _get_grok_side_channel_endpoint_type(endpoint) is not None:
             upstream_raw_body_for_shape = await request.body()
 
     side_channel_shape_metadata = _build_grok_side_channel_request_shape_metadata(
