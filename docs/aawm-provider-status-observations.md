@@ -77,12 +77,15 @@ shared auth file with container-owned metadata between hourly refreshes.
 
 The same sidecar can also run an explicit hourly Grok billing poll. This is
 telemetry-only and separate from the five-minute provider front-door probes and
-the Grok OIDC refresh task. The poll reads the current OIDC access token from
-`AAWM_GROK_OIDC_AUTH_FILE`, calls
+the Grok OIDC refresh task. The poll reads the current OIDC credential from
+`AAWM_GROK_OIDC_AUTH_FILE`, derives the Grok account identity headers from the
+scoped credential record, and calls
 `https://cli-chat-proxy.grok.com/v1/billing?format=credits` with Grok CLI-style
-headers, and persists the returned billing snapshot as a sanitized
-`rate_limit_observations` row using the same stored field shape and dedupe guard
-as the LiteLLM callback path.
+headers. The request includes the OIDC bearer token plus `x-userid`,
+`x-grok-user-id`, `x-teamid`, and `x-email` derived from the credential
+`user_id`, `team_id`, and `email` fields. The poll persists the returned billing
+snapshot as a sanitized `rate_limit_observations` row using the same stored field
+shape and dedupe guard as the LiteLLM callback path.
 
 Relevant environment variables:
 
@@ -95,6 +98,11 @@ Relevant environment variables:
 - `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
 - `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
 - `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
+- `AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE`: when true, include
+  `x-grok-model-override` on billing poll requests. Defaults to false; billing
+  is not model-specific and successful native captures did not require this
+  header. The model label is still persisted on `rate_limit_observations.model`
+  regardless of this setting.
 - `AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS`: maximum billing poll attempts per
   scheduled run, including retries.
 - `AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS`: base backoff seconds between
@@ -110,7 +118,9 @@ Each due attempt emits a separate `grok_billing_poll` JSON line with sanitized
 status fields such as `attempted`, `persisted`, `skipped`, `auth_file`,
 `billing_url`, `client_version`, `model`, `status_code`, `attempt_count`,
 `retry_count`, `observation_count`,
-`inserted_count`, `error_class`, and `error_message`. The event must not contain
-access tokens, refresh tokens, id tokens, client secrets, raw auth headers, or
-the full billing credential payload. Billing poll failures are logged and do not
-raise out of the sidecar loop.
+`inserted_count`, `error_class`, and `error_message`. The event must not emit
+dedicated identity fields or raw auth headers. It must not contain access
+tokens, refresh tokens, id tokens, client secrets, account identity values
+(`user_id`, `team_id`, `email`, or the derived `x-userid`, `x-grok-user-id`,
+`x-teamid`, and `x-email` headers), or the full billing credential payload.
+Billing poll failures are logged and do not raise out of the sidecar loop.

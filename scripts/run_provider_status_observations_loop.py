@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit
@@ -53,6 +53,12 @@ DEFAULT_GROK_BILLING_XAI_TOKEN_AUTH = "xai-grok-cli"
 DEFAULT_GROK_BILLING_MODEL = "grok-build"
 DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS = 3
 DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
+GROK_BILLING_IDENTITY_HEADER_FIELDS = (
+    ("x-userid", "user_id"),
+    ("x-grok-user-id", "user_id"),
+    ("x-teamid", "team_id"),
+    ("x-email", "email"),
+)
 GROK_BILLING_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 500, 502, 503, 504}
 GROK_BILLING_NON_RETRYABLE_HTTP_STATUS_CODES = {
     400,
@@ -76,7 +82,8 @@ PROVIDER_FAILURE_SECRET_RE = re.compile(
             r"Basic\s+[A-Za-z0-9+/]{10,}={0,2}",
             r"sk-[A-Za-z0-9\-_]{20,}",
             r"(?:api[_-]?key|x-api-key|api-key|token|password|passwd|secret|"
-            r"x[_-]?xai[_-]?token[_-]?auth)"
+            r"x[_-]?xai[_-]?token[_-]?auth|x[_-]?userid|x[_-]?grok[_-]?user[_-]?id|"
+            r"x[_-]?teamid|x[_-]?email)"
             r"['\"]?\s*[:=]\s*['\"]?[^\s,'\"})\]{}>]+",
             r"(?<=://)[^\s'\"]*:[^\s'\"@]+(?=@)",
             r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
@@ -278,6 +285,7 @@ class ProviderStatusLoopConfig:
     grok_billing_client_identifier: str = DEFAULT_GROK_BILLING_CLIENT_IDENTIFIER
     grok_billing_xai_token_auth: str = DEFAULT_GROK_BILLING_XAI_TOKEN_AUTH
     grok_billing_model: str = DEFAULT_GROK_BILLING_MODEL
+    grok_billing_include_model_override: bool = False
     grok_billing_poll_max_attempts: int = DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS
     grok_billing_poll_retry_backoff_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
@@ -601,6 +609,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "AAWM_GROK_BILLING_MODEL or grok-build."
         ),
     )
+    billing_override_group = parser.add_mutually_exclusive_group()
+    billing_override_group.add_argument(
+        "--grok-billing-include-model-override",
+        dest="grok_billing_include_model_override",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE",
+            False,
+        ),
+        help=(
+            "Include x-grok-model-override on Grok billing poll requests. "
+            "Defaults to AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE or false."
+        ),
+    )
+    billing_override_group.add_argument(
+        "--no-grok-billing-include-model-override",
+        dest="grok_billing_include_model_override",
+        action="store_false",
+        help="Omit x-grok-model-override from Grok billing poll requests.",
+    )
     parser.add_argument(
         "--grok-billing-poll-max-attempts",
         type=int,
@@ -699,6 +727,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_client_identifier=args.grok_billing_client_identifier,
         grok_billing_xai_token_auth=args.grok_billing_xai_token_auth,
         grok_billing_model=args.grok_billing_model,
+        grok_billing_include_model_override=args.grok_billing_include_model_override,
         grok_billing_poll_max_attempts=args.grok_billing_poll_max_attempts,
         grok_billing_poll_retry_backoff_seconds=(
             args.grok_billing_poll_retry_backoff_seconds
@@ -887,35 +916,71 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
 
 
 def _load_grok_billing_access_token(auth_file: str) -> str:
+    return _load_grok_billing_auth_context(auth_file)["access_token"]
+
+
+def _load_grok_billing_auth_context(auth_file: str) -> Dict[str, Any]:
     payload = grok_oidc_refresh._read_credential_payload(Path(auth_file).expanduser())
     scope = grok_oidc_refresh._resolve_scope(None)
     credential = grok_oidc_refresh._select_credential_record(payload, scope)
     for field_name in ("access_token", "key"):
         token = credential.get(field_name)
         if isinstance(token, str) and token.strip():
-            return token.strip()
+            return {
+                "access_token": token.strip(),
+                "identity_headers": _grok_billing_identity_headers(credential),
+            }
     raise ValueError(
         "Grok OIDC auth file does not contain a usable access token for billing poll."
     )
+
+
+def _grok_billing_identity_headers(
+    credential: Mapping[str, Any],
+) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    missing_fields: list[str] = []
+    for header_name, credential_field in GROK_BILLING_IDENTITY_HEADER_FIELDS:
+        value = credential.get(credential_field)
+        if isinstance(value, str) and value.strip():
+            headers[header_name] = value.strip()
+        elif credential_field not in missing_fields:
+            missing_fields.append(credential_field)
+    if missing_fields:
+        joined_fields = ", ".join(sorted(missing_fields))
+        raise ValueError(
+            "Grok OIDC auth file does not contain required billing identity "
+            f"fields: {joined_fields}."
+        )
+    return headers
 
 
 def _build_grok_billing_request_headers(
     config: ProviderStatusLoopConfig,
     *,
     access_token: str,
+    identity_headers: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
     request_id = str(uuid.uuid4())
-    return {
+    headers = {
         "accept": "application/json",
         "authorization": f"Bearer {access_token}",
         "user-agent": f"grok/{config.grok_billing_client_version}",
         "x-grok-client-identifier": config.grok_billing_client_identifier,
         "x-grok-client-version": config.grok_billing_client_version,
-        "x-grok-model-override": config.grok_billing_model,
         "x-grok-req-id": request_id,
         "x-request-id": request_id,
         "x-xai-token-auth": config.grok_billing_xai_token_auth,
     }
+    model_override = str(config.grok_billing_model).strip()
+    if config.grok_billing_include_model_override and model_override:
+        headers["x-grok-model-override"] = model_override
+    if identity_headers:
+        for header_name, _credential_field in GROK_BILLING_IDENTITY_HEADER_FIELDS:
+            value = identity_headers.get(header_name)
+            if isinstance(value, str) and value.strip():
+                headers[header_name] = value.strip()
+    return headers
 
 
 def _grok_billing_poll_sleep(seconds: float) -> None:
@@ -1007,12 +1072,13 @@ def _grok_billing_poll_failure_message(
 def _fetch_grok_billing_payload(
     config: ProviderStatusLoopConfig,
 ) -> Dict[str, Any]:
-    access_token = _load_grok_billing_access_token(config.grok_oidc_auth_file)
+    auth_context = _load_grok_billing_auth_context(config.grok_oidc_auth_file)
     request = urllib_request.Request(
         config.grok_billing_url,
         headers=_build_grok_billing_request_headers(
             config,
-            access_token=access_token,
+            access_token=auth_context["access_token"],
+            identity_headers=auth_context["identity_headers"],
         ),
         method="GET",
     )
