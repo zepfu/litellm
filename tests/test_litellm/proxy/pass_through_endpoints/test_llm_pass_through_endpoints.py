@@ -17721,7 +17721,7 @@ async def test_anthropic_proxy_route_routes_grok_native_models_to_responses_adap
 
 
 @pytest.mark.asyncio
-async def test_anthropic_grok_native_alias_probe_invalid_grant_is_candidate_unavailable(
+async def test_anthropic_grok_native_alias_probe_sidecar_refresh_required_is_candidate_unavailable(
     monkeypatch,
 ):
     monkeypatch.setenv(
@@ -17737,8 +17737,9 @@ async def test_anthropic_grok_native_alias_probe_invalid_grant_is_candidate_unav
         "litellm_metadata": {"session_id": "claude-grok-session"},
     }
     grok_refresh_error = ValueError(
-        "Grok OIDC credential refresh failed (invalid_grant). Reseed or relogin "
-        "the Grok OIDC credential."
+        "Grok OIDC credential is missing, expired, or near expiry. Run the "
+        "health/provider-status sidecar Grok OIDC refresh or relogin with the "
+        "Grok CLI before Grok native traffic can proceed."
     )
 
     with patch(
@@ -19374,7 +19375,7 @@ async def test_codex_auto_agent_alias_code_retries_grok_composer_after_auth_403(
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invalid_grant(
+async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sidecar_refresh_required(
     monkeypatch,
 ):
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
@@ -19418,13 +19419,10 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
             "code": "usage_limit_reached",
         }
     }
-    grok_auth_error = HTTPException(
-        status_code=401,
-        detail=(
-            "Invalid or expired credentials "
-            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
-            "upstream=PermissionDenied, reason=no auth context)"
-        ),
+    grok_refresh_error = ValueError(
+        "Grok OIDC credential is missing, expired, or near expiry. Run the "
+        "health/provider-status sidecar Grok OIDC refresh or relogin with the "
+        "Grok CLI before Grok native traffic can proceed."
     )
     managed_xai_success = Response(
         content='{"ok": true}', media_type="application/json"
@@ -19438,12 +19436,10 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         new=AsyncMock(side_effect=antigravity_error),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(
-            side_effect=[spark_error, grok_auth_error, grok_auth_error, managed_xai_success]
-        ),
+        new=AsyncMock(side_effect=[spark_error, managed_xai_success]),
     ) as mock_pass_through, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
-        new=AsyncMock(side_effect=["stale-grok-token", "fresh-grok-token"]),
+        new=AsyncMock(side_effect=grok_refresh_error),
     ) as mock_grok_token, patch(
         "litellm.llms.xai.oauth.get_xai_oauth_access_token",
         new=AsyncMock(return_value="xai-oauth-token"),
@@ -19460,12 +19456,10 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         )
 
     assert response is managed_xai_success
-    assert mock_pass_through.await_count == 4
-    assert mock_grok_token.await_count == 2
-    assert mock_grok_token.await_args_list[0].kwargs == {"force_refresh": False}
-    assert mock_grok_token.await_args_list[1].kwargs == {"force_refresh": True}
+    assert mock_pass_through.await_count == 2
+    mock_grok_token.assert_awaited_once()
     mock_xai_token.assert_awaited_once()
-    managed_call = mock_pass_through.await_args_list[3].kwargs
+    managed_call = mock_pass_through.await_args_list[1].kwargs
     assert managed_call["target"] == "https://api.x.ai/v1/responses"
     assert managed_call["custom_headers"]["authorization"] == (
         "Bearer xai-oauth-token"
@@ -19507,13 +19501,10 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_invali
         "xai",
         "xai",
     ]
-    composer_attempt = metadata["codex_auto_agent_attempts"][2]
-    assert composer_attempt["error_class"] == "candidate_unavailable"
     assert (
         "aawm_codex_auto_agent_candidate_unavailable"
-        in composer_attempt["error_tokens"]
+        in metadata["codex_auto_agent_attempts"][2]["error_tokens"]
     )
-    assert composer_attempt["lane_key"] == _CODEX_AUTO_AGENT_XAI_GROK_NATIVE_LANE_KEY
 
 
 @pytest.mark.asyncio

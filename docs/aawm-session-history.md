@@ -178,36 +178,38 @@ leave the route pinned to stale credentials or make refresh persistence fail.
 
 `xai/grok-composer-2.5-fast`, `xai/grok-build`, and
 `xai/grok-build-0.1` use the Grok native OIDC credential path, not the managed
-`oa_xai/*` OAuth credential file. In `litellm-dev`, `LITELLM_XAI_GROK_AUTH_FILE`
-defaults to `/home/zepfu/.litellm/xai/grok-auth.json`, while the personal Grok
-CLI credential at `/home/zepfu/.grok/auth.json` is mounted read-only and exposed
-only as `LITELLM_XAI_GROK_SEED_AUTH_FILE`.
+`oa_xai/*` OAuth credential file. `LITELLM_XAI_GROK_AUTH_FILE` should point
+directly at the Grok CLI credential, normally `/home/zepfu/.grok/auth.json`.
 
-The Grok native refresh path updates the configured credential by writing a
-temporary file beside it and then atomically replacing the original file. The
-configured refresh target must therefore live on writable LiteLLM-owned storage.
-Mounting the configured target read-only makes Composer and other Grok native
-candidates fail as `candidate_unavailable` during token refresh, which breaks the
-declared alias failover order. Keep `grok-auth.json` separate from the managed
-`oa_xai/*` `oauth-auth.json` file so the two credential families remain
-auditable.
+LiteLLM is a read-only consumer of that file. It selects a valid access token
+from the configured Grok OIDC credential and fails the Grok native candidate as
+`candidate_unavailable` when the file is missing, lacks an access token, or is
+expired/near expiry. LiteLLM must not copy, seed, refresh, atomically replace,
+or otherwise mutate the Grok CLI credential during model requests.
 
-LiteLLM uses the read-only Grok CLI seed as bootstrap input, not as the
-long-term refresh target. If the managed Grok credential is missing or invalid,
-LiteLLM copies the seed into the managed path. If both files contain usable
-credential records, seed replacement is decided by credential semantics such as
-parsed expiry and refresh-token availability, not by file mtime alone. A seed
-with a newer timestamp must not overwrite a longer-lived managed credential just
-because the personal CLI file was touched.
+The provider-status sidecar is the scheduled writer. It mounts
+`/home/zepfu/.grok` writable, takes a file lock, refreshes the credential on the
+configured cadence, and writes the updated JSON atomically with file mode
+`0600`. In dev compose the sidecar runs with
+`AAWM_GROK_OIDC_REFRESH_ENABLED=1`,
+`AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/.grok/auth.json`, and a one-hour refresh
+interval. The dev LiteLLM container mounts the same host directory read-only.
+
+Keep the Grok CLI/OIDC credential separate from the managed `oa_xai/*`
+`oauth-auth.json` file. Managed `oa_xai/*` routes still use LiteLLM-owned OAuth
+refresh/write behavior, while native Grok routes rely on the sidecar-maintained
+CLI credential. The explicit Grok billing poll should run from the same
+sidecar context so quota snapshots use the credential that the sidecar keeps
+fresh, not a second LiteLLM-managed copy.
 
 Grok OIDC access tokens can be short-lived even when the refresh credential is
 expected to remain usable for days. LiteLLM parses ISO expiry values as well as
-epoch seconds and milliseconds so it refreshes near-expiry credentials
-reliably. If the Grok CLI proxy rejects a still-recorded-valid token with an
-auth-shaped 401/403 such as `Invalid or expired credentials` or `no auth
-context`, the Grok native adapter forces one refresh of the managed credential
-and retries the same Composer/Grok candidate once before marking that candidate
-unavailable and advancing through the declared alias order.
+epoch seconds and milliseconds when evaluating whether a recorded token is still
+valid. If the Grok CLI proxy rejects a token with an auth-shaped 401/403 such as
+`Invalid or expired credentials` or `no auth context`, LiteLLM does not refresh
+the Grok CLI credential inline. The Grok native candidate becomes
+`candidate_unavailable` and alias failover continues after the sidecar-maintained
+credential is refreshed or the operator relogins with the Grok CLI.
 
 Codex/Anthropic alias routing records distinct xAI lane keys for the two xAI
 credential families: Grok native OIDC candidates use `xai_grok_oidc`, while

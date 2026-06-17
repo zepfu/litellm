@@ -1555,7 +1555,6 @@ async def _prepare_grok_native_oauth_passthrough_request(
     request: Request,
     tags_to_add: Optional[list[str]] = None,
     extra_fields: Optional[dict[str, Any]] = None,
-    force_refresh: bool = False,
 ) -> tuple[bool, Optional[str], dict[str, Any], dict[str, Any]]:
     model = normalize_grok_native_oauth_model(request_body.get("model"))
     if model is None:
@@ -1563,9 +1562,6 @@ async def _prepare_grok_native_oauth_passthrough_request(
 
     merged_tags_to_add = list(tags_to_add or [])
     merged_extra_fields = dict(extra_fields or {})
-    if force_refresh:
-        merged_tags_to_add.append("grok-native-oauth-forced-refresh")
-        merged_extra_fields["grok_native_oauth_forced_refresh"] = True
 
     prepared_body = dict(request_body)
     prepared_body["model"] = model
@@ -1588,7 +1584,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
     )
-    access_token = await get_grok_native_oauth_access_token(force_refresh=force_refresh)
+    access_token = await get_grok_native_oauth_access_token()
     headers = _build_grok_native_oauth_headers(
         access_token=access_token,
         model=model,
@@ -13296,10 +13292,7 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
         )
     )
 
-    async def _prepare_and_send_grok_native(
-        *,
-        force_refresh: bool = False,
-    ) -> Response:
+    async def _prepare_and_send_grok_native() -> Response:
         nonlocal translated_request_body
         try:
             (
@@ -13321,7 +13314,6 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
                     "anthropic_adapter_target_endpoint": "xai:/v1/responses",
                     "grok_native_entrypoint": "anthropic_messages",
                 },
-                force_refresh=force_refresh,
             )
         except Exception as exc:
             if (
@@ -13363,26 +13355,12 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
     try:
         upstream_response = await _prepare_and_send_grok_native()
     except Exception as exc:
-        if _grok_native_auth_failure_detail(exc) is not None:
-            try:
-                upstream_response = await _prepare_and_send_grok_native(
-                    force_refresh=True,
-                )
-            except Exception as retry_exc:
-                if (
-                    use_alias_candidate_probe
-                    and _grok_native_candidate_unavailable_detail(retry_exc)
-                    is not None
-                ):
-                    _raise_grok_native_auto_agent_candidate_unavailable(retry_exc)
-                raise
-        elif (
+        if (
             use_alias_candidate_probe
             and _grok_native_candidate_unavailable_detail(exc) is not None
         ):
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
-        else:
-            raise
+        raise
 
     if isinstance(upstream_response, StreamingResponse):
         if not client_requested_stream:
@@ -22452,14 +22430,13 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     user_api_key_dict: UserAPIKeyAuth,
     request_body: dict[str, Any],
 ) -> Response:
-    async def _send_grok_native_request(*, force_refresh: bool = False) -> Response:
+    async def _send_grok_native_request() -> Response:
         try:
             grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
                 endpoint=endpoint,
                 request=request,
                 request_body=request_body,
                 extra_headers={},
-                force_refresh=force_refresh,
             )
         except Exception as exc:
             if _grok_native_candidate_unavailable_detail(exc) is not None:
@@ -22491,13 +22468,6 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     try:
         return await _send_grok_native_request()
     except Exception as exc:
-        if _grok_native_auth_failure_detail(exc) is not None:
-            try:
-                return await _send_grok_native_request(force_refresh=True)
-            except Exception as retry_exc:
-                if _grok_native_candidate_unavailable_detail(retry_exc) is not None:
-                    _raise_grok_native_auto_agent_candidate_unavailable(retry_exc)
-                raise
         if _grok_native_candidate_unavailable_detail(exc) is not None:
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
         raise
@@ -23258,7 +23228,6 @@ class BaseOpenAIPassThroughHandler:
         request: Request,
         request_body: dict[str, Any],
         extra_headers: Optional[dict],
-        force_refresh: bool = False,
     ) -> Optional[tuple[str, dict[str, Any], dict[str, Any], str]]:
         (
             prepared_grok_native,
@@ -23277,7 +23246,6 @@ class BaseOpenAIPassThroughHandler:
                 ),
                 "grok_native_entrypoint": "openai_responses",
             },
-            force_refresh=force_refresh,
         )
         if not prepared_grok_native:
             return None
