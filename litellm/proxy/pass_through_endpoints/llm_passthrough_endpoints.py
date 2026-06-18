@@ -75,10 +75,15 @@ from litellm.proxy.common_utils.http_parsing_utils import (
 from litellm.proxy.pass_through_endpoints.common_utils import get_litellm_virtual_key
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS,
+    PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES,
     create_pass_through_route,
     create_websocket_passthrough_route,
     pass_through_request,
     websocket_passthrough_request,
+    _classify_passthrough_hidden_retry_failure,
+    _get_passthrough_hidden_retry_wait_seconds,
+    _record_passthrough_hidden_retry_metadata,
 )
 from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
     sanitize_google_code_assist_quota_for_logging as _sanitize_google_code_assist_quota_for_logging,
@@ -5825,6 +5830,222 @@ def _get_google_adapter_hidden_retry_budget_seconds() -> float:
     except Exception:
         return 0.0
     return max(0.0, parsed)
+
+
+_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset(
+    PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
+)
+
+
+def _get_google_adapter_transient_retry_max_attempts() -> int:
+    return len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS) + 1
+
+
+def _get_google_adapter_transient_backoff_seconds(attempt: int) -> float:
+    return _get_passthrough_hidden_retry_wait_seconds(max(0, attempt - 1))
+
+
+def _is_google_adapter_transient_retryable_failure(
+    exc: Any,
+    *,
+    status_code: Optional[int],
+    error_reason: Optional[str],
+) -> bool:
+    if status_code == 429 or error_reason in {
+        "MODEL_CAPACITY_EXHAUSTED",
+        "RATE_LIMIT_EXCEEDED",
+    }:
+        return False
+    if status_code in _GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES:
+        return True
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        return True
+    _status_code, failure_class, _failure_classification = (
+        _classify_passthrough_hidden_retry_failure(exc)
+    )
+    return failure_class in {
+        "upstream_connectivity_failure",
+        "transport_dns_failure",
+    }
+
+
+def _google_adapter_hidden_retry_kwargs_from_passthrough_kwargs(
+    passthrough_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    custom_body = passthrough_kwargs.get("custom_body")
+    if not isinstance(custom_body, dict):
+        return {}
+    metadata = custom_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        custom_body["litellm_metadata"] = metadata
+    return {"litellm_params": {"metadata": metadata}}
+
+
+def _record_google_adapter_hidden_retry_metadata(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    attempt_number: int,
+    max_attempts: int,
+    status_code: Optional[int],
+    failure_class: str,
+    wait_seconds: float,
+    final_outcome: Optional[str] = None,
+    failure_classification: Optional[str] = None,
+) -> None:
+    kwargs = _google_adapter_hidden_retry_kwargs_from_passthrough_kwargs(
+        passthrough_kwargs
+    )
+    if not kwargs:
+        return
+    _record_passthrough_hidden_retry_metadata(
+        kwargs,
+        attempt_number=attempt_number,
+        max_attempts=max_attempts,
+        status_code=status_code,
+        failure_class=failure_class,
+        wait_seconds=wait_seconds,
+        final_outcome=final_outcome,
+        failure_classification=failure_classification,
+    )
+
+
+def _record_google_adapter_terminal_transient_failure_metadata(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    exc: Any,
+    attempt: int,
+    max_attempts: int,
+    status_code: Optional[int],
+    error_reason: Optional[str],
+    failure_class: str,
+    failure_classification: Optional[str],
+) -> None:
+    _record_google_adapter_error_for_logging(
+        passthrough_kwargs,
+        exc=exc,
+        status_code=status_code,
+        error_reason=error_reason,
+        attempt=attempt,
+        wait_seconds=0.0,
+    )
+    _record_google_adapter_hidden_retry_metadata(
+        passthrough_kwargs,
+        attempt_number=attempt,
+        max_attempts=max_attempts,
+        status_code=status_code,
+        failure_class=failure_class,
+        wait_seconds=0.0,
+        final_outcome=(
+            "failed_after_retry" if attempt > 1 else "failed_without_retry"
+        ),
+        failure_classification=failure_classification,
+    )
+
+
+def _google_adapter_hidden_retry_metadata(
+    passthrough_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    custom_body = passthrough_kwargs.get("custom_body")
+    if not isinstance(custom_body, dict):
+        return {}
+    metadata = custom_body.get("litellm_metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _record_google_adapter_success_after_transient_retry(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> None:
+    metadata = _google_adapter_hidden_retry_metadata(passthrough_kwargs)
+    if not metadata.get("aawm_passthrough_hidden_retry_count"):
+        return
+    if metadata.get("aawm_passthrough_hidden_retry_final_outcome"):
+        return
+    _record_google_adapter_hidden_retry_metadata(
+        passthrough_kwargs,
+        attempt_number=attempt,
+        max_attempts=max_attempts,
+        status_code=None,
+        failure_class="success",
+        wait_seconds=0.0,
+        final_outcome="success_after_retry",
+    )
+
+
+def _build_google_adapter_terminal_error_log_context(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    status_code: Optional[int],
+    failure_classification: Optional[str],
+) -> dict[str, Any]:
+    metadata = _google_adapter_hidden_retry_metadata(passthrough_kwargs)
+    request = passthrough_kwargs.get("request")
+    endpoint = None
+    if request is not None:
+        try:
+            endpoint = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
+                request
+            )
+        except Exception:
+            endpoint = None
+    custom_body = passthrough_kwargs.get("custom_body")
+    model = None
+    if isinstance(custom_body, dict):
+        model = custom_body.get("model")
+    return {
+        "source": "google_code_assist_adapter",
+        "endpoint": endpoint,
+        "upstream_url": passthrough_kwargs.get("target"),
+        "provider": passthrough_kwargs.get("custom_llm_provider")
+        or metadata.get("custom_llm_provider"),
+        "model": model or metadata.get("model_group"),
+        "model_alias": metadata.get("requested_model_alias"),
+        "route_family": metadata.get("passthrough_route_family"),
+        "status_code": status_code,
+        "failure_kind": (
+            "transient_provider_connectivity"
+            if failure_classification
+            in {"transport_dns_failure", "upstream_connectivity_failure"}
+            else "expected_upstream_capacity_or_internal"
+        ),
+        "hidden_retry_final_outcome": metadata.get(
+            "aawm_passthrough_hidden_retry_final_outcome"
+        ),
+        "hidden_retry_failure_classification": failure_classification,
+        "hidden_retry_count": metadata.get("aawm_passthrough_hidden_retry_count"),
+        "trace_id": metadata.get("trace_id"),
+    }
+
+
+def _log_google_adapter_terminal_transient_failure(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    exc: Any,
+    status_code: Optional[int],
+    failure_classification: Optional[str],
+) -> None:
+    metadata = _google_adapter_hidden_retry_metadata(passthrough_kwargs)
+    verbose_proxy_logger.error(
+        (
+            "Google adapter exhausted hidden retries for transient upstream "
+            "failure status=%s error=%s final_outcome=%s retry_count=%s"
+        ),
+        status_code,
+        str(exc),
+        metadata.get("aawm_passthrough_hidden_retry_final_outcome"),
+        metadata.get("aawm_passthrough_hidden_retry_count"),
+        extra=_build_google_adapter_terminal_error_log_context(
+            passthrough_kwargs,
+            status_code=status_code,
+            failure_classification=failure_classification,
+        ),
+        exc_info=True,
+    )
+
+
 async def _wait_for_google_adapter_cooldown_if_needed(rate_limit_key: str) -> None:
     async with _google_adapter_rate_limit_lock:
         now = time.monotonic()
@@ -5844,6 +6065,127 @@ async def _set_google_adapter_cooldown(rate_limit_key: str, wait_seconds: float)
         current_until = _google_adapter_rate_limit_until_monotonic_by_key.get(rate_limit_key, 0.0)
         if until > current_until:
             _google_adapter_rate_limit_until_monotonic_by_key[rate_limit_key] = until
+
+
+async def _handle_google_adapter_rate_limit_failure(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    exc: Any,
+    status_code: Optional[int],
+    error_reason: Optional[str],
+    attempt: int,
+    retry_limit: int,
+    wait_seconds: float,
+    rate_limit_key: str,
+    accumulated_hidden_wait_seconds: float,
+    hidden_retry_budget_seconds: float,
+    is_capacity_retry: bool,
+) -> float:
+    _record_google_adapter_error_for_logging(
+        passthrough_kwargs,
+        exc=exc,
+        status_code=status_code,
+        error_reason=error_reason,
+        attempt=attempt,
+        wait_seconds=wait_seconds,
+    )
+    projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
+    within_hidden_budget = (
+        hidden_retry_budget_seconds > 0
+        and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
+    )
+    if attempt >= retry_limit and not within_hidden_budget:
+        verbose_proxy_logger.warning(
+            "Google adapter upstream attempt %s failed with %s (%s, reason=%s) and will not be retried",
+            attempt,
+            status_code,
+            exc.__class__.__name__,
+            error_reason,
+        )
+        raise exc
+    if attempt >= retry_limit and within_hidden_budget:
+        verbose_proxy_logger.warning(
+            "Google adapter keeping 429 hidden from client for %s; hidden retry wait %.1fs/%.1fs (reason=%s)",
+            rate_limit_key,
+            projected_hidden_wait_seconds,
+            hidden_retry_budget_seconds,
+            error_reason,
+        )
+    if is_capacity_retry:
+        verbose_proxy_logger.warning(
+            "Google adapter upstream attempt %s hit 429 (%s, reason=%s); exponential backoff %.1fs",
+            attempt,
+            exc.__class__.__name__,
+            error_reason,
+            wait_seconds,
+        )
+    else:
+        verbose_proxy_logger.warning(
+            "Google adapter upstream attempt %s hit 429 (%s, reason=%s); parsed reset %.1fs",
+            attempt,
+            exc.__class__.__name__,
+            error_reason,
+            wait_seconds,
+        )
+    await _set_google_adapter_cooldown(rate_limit_key, wait_seconds + 1.0)
+    return projected_hidden_wait_seconds
+
+
+async def _handle_google_adapter_transient_failure(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    exc: Any,
+    status_code: Optional[int],
+    error_reason: Optional[str],
+    attempt: int,
+    transient_retry_max_attempts: int,
+    failure_class: str,
+    failure_classification: Optional[str],
+) -> None:
+    transient_wait_seconds = _get_google_adapter_transient_backoff_seconds(attempt)
+    if attempt >= transient_retry_max_attempts:
+        _record_google_adapter_terminal_transient_failure_metadata(
+            passthrough_kwargs,
+            exc=exc,
+            attempt=attempt,
+            max_attempts=transient_retry_max_attempts,
+            status_code=status_code,
+            error_reason=error_reason,
+            failure_class=failure_class,
+            failure_classification=failure_classification,
+        )
+        verbose_proxy_logger.warning(
+            "Google adapter upstream attempt %s failed with transient %s (%s, reason=%s) and will not be retried",
+            attempt,
+            status_code,
+            exc.__class__.__name__,
+            error_reason,
+        )
+        _log_google_adapter_terminal_transient_failure(
+            passthrough_kwargs,
+            exc=exc,
+            status_code=status_code,
+            failure_classification=failure_classification,
+        )
+        raise exc
+    verbose_proxy_logger.warning(
+        "Google adapter upstream attempt %s hit transient %s (%s, reason=%s); hidden retry wait %.1fs",
+        attempt,
+        status_code,
+        exc.__class__.__name__,
+        error_reason,
+        transient_wait_seconds,
+    )
+    _record_google_adapter_hidden_retry_metadata(
+        passthrough_kwargs,
+        attempt_number=attempt,
+        max_attempts=transient_retry_max_attempts,
+        status_code=status_code,
+        failure_class=failure_class,
+        wait_seconds=transient_wait_seconds,
+        failure_classification=failure_classification,
+    )
+    await asyncio.sleep(transient_wait_seconds)
 
 
 async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Response:
@@ -5866,6 +6208,7 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
     )
     accumulated_hidden_wait_seconds = 0.0
     rate_limit_key = _get_google_adapter_rate_limit_key_from_kwargs(kwargs)
+    transient_retry_max_attempts = _get_google_adapter_transient_retry_max_attempts()
     passthrough_kwargs.pop("google_access_token", None)
     passthrough_kwargs.pop("google_adapter_rate_limit_key", None)
     attempt = 0
@@ -5874,74 +6217,82 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
         verbose_proxy_logger.debug(
             "Google adapter upstream attempt %s/%s",
             attempt,
-            max(total_attempts, capacity_total_attempts),
+            max(total_attempts, capacity_total_attempts, transient_retry_max_attempts),
         )
         await _wait_for_google_adapter_cooldown_if_needed(rate_limit_key)
         try:
-            passthrough_kwargs["retryable_upstream_status_codes"] = [429]
+            passthrough_kwargs["retryable_upstream_status_codes"] = sorted(
+                {429, *_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES}
+            )
             passthrough_kwargs["caller_managed_hidden_retry"] = True
-            return await pass_through_request(**passthrough_kwargs)
+            response = await pass_through_request(**passthrough_kwargs)
+            _record_google_adapter_success_after_transient_retry(
+                passthrough_kwargs,
+                attempt=attempt,
+                max_attempts=transient_retry_max_attempts,
+            )
+            return response
         except Exception as exc:
             status_code = _extract_google_adapter_exception_status_code(exc)
             error_reason = _extract_google_adapter_error_reason(exc)
             is_capacity_retry = error_reason == "MODEL_CAPACITY_EXHAUSTED"
+            is_rate_limit_retry = status_code == 429 or error_reason in {
+                "MODEL_CAPACITY_EXHAUSTED",
+                "RATE_LIMIT_EXCEEDED",
+            }
+            is_transient_retry = _is_google_adapter_transient_retryable_failure(
+                exc,
+                status_code=status_code,
+                error_reason=error_reason,
+            )
+            failure_class = exc.__class__.__name__
+            failure_classification: Optional[str] = None
+            if is_transient_retry:
+                _status_code, failure_class, failure_classification = (
+                    _classify_passthrough_hidden_retry_failure(exc)
+                )
+                if _status_code is not None and status_code is None:
+                    status_code = _status_code
             retry_limit = capacity_total_attempts if is_capacity_retry else total_attempts
             if is_capacity_retry:
                 wait_seconds = _get_google_adapter_capacity_backoff_seconds(attempt)
             else:
                 wait_seconds = _parse_google_rate_limit_reset_seconds(exc)
-            if status_code == 429 or error_reason in {
-                "MODEL_CAPACITY_EXHAUSTED",
-                "RATE_LIMIT_EXCEEDED",
-            }:
-                _record_google_adapter_error_for_logging(
+            if is_rate_limit_retry:
+                accumulated_hidden_wait_seconds = await _handle_google_adapter_rate_limit_failure(
                     passthrough_kwargs,
                     exc=exc,
                     status_code=status_code,
                     error_reason=error_reason,
                     attempt=attempt,
+                    retry_limit=retry_limit,
                     wait_seconds=wait_seconds,
+                    rate_limit_key=rate_limit_key,
+                    accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
+                    hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+                    is_capacity_retry=is_capacity_retry,
                 )
-            projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
-            within_hidden_budget = (
-                hidden_retry_budget_seconds > 0
-                and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
+                continue
+            if is_transient_retry:
+                await _handle_google_adapter_transient_failure(
+                    passthrough_kwargs,
+                    exc=exc,
+                    status_code=status_code,
+                    error_reason=error_reason,
+                    attempt=attempt,
+                    transient_retry_max_attempts=transient_retry_max_attempts,
+                    failure_class=failure_class,
+                    failure_classification=failure_classification,
+                )
+                continue
+            verbose_proxy_logger.warning(
+                "Google adapter upstream attempt %s failed with %s (%s, reason=%s) and will not be retried",
+                attempt,
+                status_code,
+                exc.__class__.__name__,
+                error_reason,
             )
-            if status_code != 429 or (attempt >= retry_limit and not within_hidden_budget):
-                verbose_proxy_logger.warning(
-                    "Google adapter upstream attempt %s failed with %s (%s, reason=%s) and will not be retried",
-                    attempt,
-                    status_code,
-                    exc.__class__.__name__,
-                    error_reason,
-                )
-                raise
-            if attempt >= retry_limit and within_hidden_budget:
-                verbose_proxy_logger.warning(
-                    "Google adapter keeping 429 hidden from client for %s; hidden retry wait %.1fs/%.1fs (reason=%s)",
-                    rate_limit_key,
-                    projected_hidden_wait_seconds,
-                    hidden_retry_budget_seconds,
-                    error_reason,
-                )
-            if is_capacity_retry:
-                verbose_proxy_logger.warning(
-                    "Google adapter upstream attempt %s hit 429 (%s, reason=%s); exponential backoff %.1fs",
-                    attempt,
-                    exc.__class__.__name__,
-                    error_reason,
-                    wait_seconds,
-                )
-            else:
-                verbose_proxy_logger.warning(
-                    "Google adapter upstream attempt %s hit 429 (%s, reason=%s); parsed reset %.1fs",
-                    attempt,
-                    exc.__class__.__name__,
-                    error_reason,
-                    wait_seconds,
-                )
-            accumulated_hidden_wait_seconds = projected_hidden_wait_seconds
-            await _set_google_adapter_cooldown(rate_limit_key, wait_seconds + 1.0)
+            raise
 
 
 def _get_openrouter_adapter_rate_limit_key(model: Optional[str]) -> str:
