@@ -2241,6 +2241,131 @@ class TestGoogleAdapterRequestShapePolicy:
         assert changes["retained_followup_reminder_only_context_count"] == 1
         assert changes["compacted_pure_context_text_parts_cap"] == 6000
 
+    def test_repairs_function_call_after_consecutive_model_turn(self):
+        payload = {
+            "request": {
+                "contents": [
+                    {"role": "user", "parts": [{"text": "run a command"}]},
+                    {"role": "model", "parts": [{"text": "planning"}]},
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "exec_command",
+                                    "args": {"cmd": "pwd"},
+                                    "id": "call_exec",
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "id": "call_exec",
+                                    "name": "exec_command",
+                                    "response": {
+                                        "output": "/repo",
+                                        "tool_use_id": "call_exec",
+                                    },
+                                }
+                            }
+                        ],
+                    },
+                ],
+                "generationConfig": {
+                    "thinkingConfig": {
+                        "includeThoughts": False,
+                        "thinkingLevel": "low",
+                    }
+                },
+            }
+        }
+
+        changes = _apply_google_adapter_request_shape_policy(payload)
+
+        contents = payload["request"]["contents"]
+        assert changes == {
+            "repaired_function_call_adjacency_merged_model_turn_count": 1
+        }
+        assert [content["role"] for content in contents] == ["user", "model", "user"]
+        assert contents[1]["parts"] == [
+            {"text": "planning"},
+            {
+                "functionCall": {
+                    "name": "exec_command",
+                    "args": {"cmd": "pwd"},
+                    "id": "call_exec",
+                }
+            },
+        ]
+        assert contents[2]["parts"][0]["functionResponse"]["id"] == "call_exec"
+
+    def test_repairs_leading_function_call_turn_after_prior_window_trim(self):
+        payload = {
+            "request": {
+                "contents": [
+                    {"role": "model", "parts": [{"text": "historical note"}]},
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "exec_command",
+                                    "args": {"cmd": "pwd"},
+                                    "id": "call_exec",
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "id": "call_exec",
+                                    "name": "exec_command",
+                                    "response": {
+                                        "output": "/repo",
+                                        "tool_use_id": "call_exec",
+                                    },
+                                }
+                            }
+                        ],
+                    },
+                ],
+                "generationConfig": {
+                    "thinkingConfig": {
+                        "includeThoughts": False,
+                        "thinkingLevel": "low",
+                    }
+                },
+            }
+        }
+
+        changes = _apply_google_adapter_request_shape_policy(payload)
+
+        contents = payload["request"]["contents"]
+        assert (
+            changes["repaired_function_call_adjacency_merged_model_turn_count"]
+            == 1
+        )
+        assert (
+            changes["repaired_function_call_adjacency_inserted_user_anchor_count"]
+            == 1
+        )
+        assert [content["role"] for content in contents] == ["user", "model", "user"]
+        assert (
+            contents[0]["parts"][0]["text"]
+            == "[Gemini adapter inserted a conversation boundary before "
+            "a preserved historical tool call.]"
+        )
+        assert contents[1]["parts"][0]["text"] == "historical note"
+        assert contents[1]["parts"][1]["functionCall"]["id"] == "call_exec"
+        assert contents[2]["parts"][0]["functionResponse"]["id"] == "call_exec"
+
     def test_compacts_subagent_context_more_aggressively_on_first_turn(self, monkeypatch):
         monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP", raising=False)
         monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP", "9000")
