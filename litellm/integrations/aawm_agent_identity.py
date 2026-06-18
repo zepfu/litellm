@@ -8816,6 +8816,14 @@ def _build_provider_error_observation(
         "shared_quota_family",
         "grok_subscription_quota_shared",
         "passthrough_route_family",
+        "grok_side_channel",
+        "grok_side_channel_endpoint_type",
+        "grok_side_channel_endpoint_path_template",
+        "grok_side_channel_request_content_type",
+        "grok_side_channel_request_body_byte_length",
+        "grok_side_channel_request_body_digest_source",
+        "grok_side_channel_request_json_container_type",
+        "grok_side_channel_request_array_length",
     ):
         value = metadata.get(key)
         if value is not None:

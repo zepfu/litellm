@@ -8980,6 +8980,20 @@ def test_build_provider_error_observation_classifies_grok_auth_failure() -> None
             "session_id": "session-grok-provider-error",
             "passthrough_route_family": "grok_cli_chat_proxy",
             "grok_model_override": "grok-build",
+            "grok_side_channel": True,
+            "grok_side_channel_endpoint_type": "sessions_signals",
+            "grok_side_channel_endpoint_path_template": (
+                "/sessions/{session_id}/signals"
+            ),
+            "grok_side_channel_request_content_type": "application/json",
+            "grok_side_channel_request_body_byte_length": 64,
+            "grok_side_channel_request_body_digest_source": "raw_body",
+            "grok_side_channel_request_json_container_type": "array",
+            "grok_side_channel_request_array_length": 3,
+            "grok_side_channel_request_body_sha256": "should-not-persist",
+            "grok_side_channel_request_top_level_key_types": {
+                "secretField": "str",
+            },
         }
     )
     kwargs["litellm_params"]["proxy_server_request"] = {
@@ -9010,6 +9024,29 @@ def test_build_provider_error_observation_classifies_grok_auth_failure() -> None
     assert observation["route_family"] == "grok_cli_chat_proxy"
     assert observation["status_code"] == 401
     assert observation["error_class"] == "auth_failed"
+    assert observation["metadata"]["grok_side_channel"] is True
+    assert observation["metadata"]["grok_side_channel_endpoint_type"] == "sessions_signals"
+    assert (
+        observation["metadata"]["grok_side_channel_endpoint_path_template"]
+        == "/sessions/{session_id}/signals"
+    )
+    assert (
+        observation["metadata"]["grok_side_channel_request_content_type"]
+        == "application/json"
+    )
+    assert observation["metadata"]["grok_side_channel_request_body_byte_length"] == 64
+    assert (
+        observation["metadata"]["grok_side_channel_request_body_digest_source"]
+        == "raw_body"
+    )
+    assert (
+        observation["metadata"]["grok_side_channel_request_json_container_type"]
+        == "array"
+    )
+    assert observation["metadata"]["grok_side_channel_request_array_length"] == 3
+    serialized_observation = json.dumps(observation, default=str)
+    assert "should-not-persist" not in serialized_observation
+    assert "secretField" not in serialized_observation
 
 
 def test_build_provider_error_observation_preserves_oa_xai_oauth_metadata() -> None:
