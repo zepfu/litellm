@@ -768,6 +768,66 @@ class TestGeminiPassthroughLoggingHandler:
             not in caplog.text
         )
 
+    def test_handle_logging_antigravity_gemini_3_5_flash_low_prices_with_real_cost_table(
+        self, caplog
+    ):
+        import logging
+
+        caplog.set_level(logging.WARNING)
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            {
+                "traceId": "trace-antigravity-gemini-low-real-cost",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": "antigravity gemini low"}],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 3,
+                        "totalTokenCount": 13,
+                    },
+                },
+            }
+        )
+
+        result = GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route="https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            request_body={"model": "gemini-3.5-flash-low"},
+            endpoint_type=MagicMock(),
+            start_time=self.start_time,
+            all_chunks=[chunk, "data: [DONE]"],
+            model="gemini-3.5-flash-low",
+            end_time=self.end_time,
+            custom_llm_provider="antigravity",
+        )
+
+        assert result["result"] is not None
+        assert result["kwargs"]["model"] == "gemini-3.5-flash-low"
+        assert result["kwargs"]["custom_llm_provider"] == "antigravity"
+        assert result["kwargs"]["response_cost"] == pytest.approx(0.000042)
+        assert mock_logging_obj.model_call_details["model"] == "gemini-3.5-flash-low"
+        assert (
+            mock_logging_obj.model_call_details["custom_llm_provider"]
+            == "antigravity"
+        )
+        assert mock_logging_obj.model_call_details[
+            "response_cost"
+        ] == pytest.approx(0.000042)
+        assert (
+            "Gemini-shaped passthrough cost calculation failed"
+            not in caplog.text
+        )
+
     @patch("litellm.completion_cost")
     def test_handle_logging_antigravity_collected_chunks_preserves_usage_and_cost(
         self, mock_completion_cost
