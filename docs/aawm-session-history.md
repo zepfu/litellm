@@ -335,6 +335,19 @@ inventories, tool arguments, or compaction audit detail inside each Langfuse
 event. They do not eliminate Langfuse size warnings where the request `input`
 field itself is already close to the configured Langfuse event-size threshold.
 
+## Diagnostic Payload Capture Boundary
+
+Opt-in pass-through diagnostic payload capture writes local JSON artifacts under
+`/tmp/captures/diagnostic_payloads` by default. It is intentionally outside
+`session_history`, provider-error observations, Langfuse metadata, and runtime
+error JSONL intake.
+
+The capture manifest records safe routing context, endpoint templates, byte
+counts, hashes, and omitted-field descriptions for scoped investigations. Raw
+headers, request bodies, response bodies, stream chunks, prompts, tool
+arguments, OAuth tokens, API keys, cookies, concrete session ids, and local file
+content must not be copied into `session_history.metadata`.
+
 ## Codex Tool-Description Patches
 
 AAWM Codex and Claude Code adapter paths may patch advertised tool descriptions
