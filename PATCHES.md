@@ -2908,9 +2908,34 @@ error-intake hygiene.
 classification, Codex native OpenAI shared transient retry wiring, Gemini
 function-call adjacency repair, Gemini public-cost fallback, and Google adapter
 transient `503` retry metadata. Dev `litellm-dev` was recreated after the
-D1-329/D1-331 fixes and reported healthy on `:4001`. Publish
-`v1.82.3-aawm.84`, then promote through the normal prod `:4000` process and
-verify prod error-intake cleanup for the D1-329 ChatGPT/Codex records.
+D1-329/D1-331 fixes and reported healthy on `:4001`. The
+`v1.82.3-aawm.84` tag was cut before the automatic artifact-version bump moved
+`main`, so the guarded fork image publisher failed its current-`main`
+reachability gate. Production promotion is superseded by `v1.82.3-aawm.85`.
+
+---
+
+### aawm.85 — Post-artifact-autobump release candidate retag
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.85` on top of the
+post-`aawm.84` artifact autobump. The behavior is the passthrough error
+classification and Gemini adapter hardening described in `aawm.84`, with
+callback overlay metadata advanced to `cb-v0.0.53`, model-config metadata to
+`cfg-v0.0.18`, and harness metadata to `h-v0.0.35`.
+
+**Why:** The `v1.82.3-aawm.84` tag was created before the automatic artifact
+version bump moved `main` to `4b4c44c971`. The guarded fork image publisher
+requires the tagged commit to be reachable from current `main`, so `.84`
+failed at the release gate. Per the release runbook, the old tag is preserved
+and this replacement tag is cut from current `main`.
+
+**Why not upstream:** This is AAWM release-line bookkeeping for fork image tags
+and independently published overlay artifact versions.
+
+**Validation status:** Metadata-only retag on top of the tested `aawm.84`
+content and artifact autobump. Publish `v1.82.3-aawm.85`, then promote through
+the normal prod `:4000` process and verify prod error-intake cleanup for the
+D1-329 ChatGPT/Codex records.
 
 ---
 
