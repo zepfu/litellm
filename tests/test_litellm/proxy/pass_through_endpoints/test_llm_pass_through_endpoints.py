@@ -5207,7 +5207,9 @@ class TestPassThroughRequestRetryableFailures:
     def test_build_passthrough_error_log_context_uses_safe_metadata(self):
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
-        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true&api_key=secret"
+        mock_request.url = (
+            "http://localhost:4001/grok/v1/traces?beta=true&api_key=secret"
+        )
         mock_request.query_params = {
             "beta": "true",
             "api_key": "secret",
@@ -5253,7 +5255,7 @@ class TestPassThroughRequestRetryableFailures:
 
         context = _build_passthrough_error_log_context(
             request=mock_request,
-            url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses?api_key=secret"),
+            url=httpx.URL("https://cli-chat-proxy.grok.com/v1/traces?api_key=secret"),
             parsed_body=parsed_body,
             kwargs=kwargs,
             passthrough_logging_metadata={
@@ -5279,8 +5281,8 @@ class TestPassThroughRequestRetryableFailures:
         assert context == {
             "source": "pass_through_endpoint",
             "container": mock.ANY,
-            "endpoint": "/anthropic/v1/messages?beta=true",
-            "upstream_url": "https://cli-chat-proxy.grok.com/v1/responses",
+            "endpoint": "/grok/v1/traces?beta=true",
+            "upstream_url": "https://cli-chat-proxy.grok.com/v1/traces",
             "provider": "xai",
             "model": "claude-sonnet-4-6",
             "model_alias": "aawm-code-anthropic",
@@ -5305,6 +5307,63 @@ class TestPassThroughRequestRetryableFailures:
         assert "api_key" not in serialized_context
         assert "/sessions/body-secret" not in serialized_context
         assert "999" not in serialized_context
+
+    def test_build_passthrough_error_log_context_redacts_grok_side_channel_session_ids(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = (
+            "http://localhost:4001/grok/v1/sessions/session-secret/signals?key=secret"
+        )
+        mock_request.query_params = {"key": "secret"}
+
+        context = _build_passthrough_error_log_context(
+            request=mock_request,
+            url=httpx.URL(
+                "https://cli-chat-proxy.grok.com/v1/sessions/session-secret/signals?key=secret"
+            ),
+            parsed_body=None,
+            kwargs={},
+            passthrough_logging_metadata={
+                "grok_side_channel": True,
+                "grok_side_channel_endpoint_type": "sessions_signals",
+                "grok_side_channel_endpoint_path_template": (
+                    "/sessions/{session_id}/signals"
+                ),
+                "grok_side_channel_request_content_type": "application/json",
+                "grok_side_channel_request_body_byte_length": 17,
+                "grok_side_channel_request_body_digest_source": "raw_body",
+                "grok_side_channel_request_json_container_type": "array",
+                "grok_side_channel_request_array_length": 2,
+                "grok_side_channel_request_body_sha256": "body-hash",
+                "grok_side_channel_request_top_level_key_types": {
+                    "secretField": "str",
+                },
+            },
+            custom_llm_provider="xai",
+            status_code=401,
+            litellm_call_id="call-123",
+        )
+
+        assert context["endpoint"] == "/grok/v1/sessions/{session_id}/signals"
+        assert (
+            context["upstream_url"]
+            == "https://cli-chat-proxy.grok.com/v1/sessions/{session_id}/signals"
+        )
+        assert context["grok_side_channel"] is True
+        assert context["grok_side_channel_endpoint_type"] == "sessions_signals"
+        assert (
+            context["grok_side_channel_endpoint_path_template"]
+            == "/sessions/{session_id}/signals"
+        )
+        assert context["grok_side_channel_request_body_byte_length"] == 17
+        assert context["grok_side_channel_request_array_length"] == 2
+        serialized_context = json.dumps(context)
+        assert "session-secret" not in serialized_context
+        assert "key=secret" not in serialized_context
+        assert "body-hash" not in serialized_context
+        assert "secretField" not in serialized_context
 
     def test_build_passthrough_error_log_context_redacts_upstream_userinfo(self):
         mock_request = MagicMock(spec=Request)

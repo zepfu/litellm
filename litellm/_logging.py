@@ -178,6 +178,14 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "queue_maxsize",
     "coroutine_name",
     "worker_delivery_state",
+    "grok_side_channel",
+    "grok_side_channel_endpoint_type",
+    "grok_side_channel_endpoint_path_template",
+    "grok_side_channel_request_content_type",
+    "grok_side_channel_request_body_byte_length",
+    "grok_side_channel_request_body_digest_source",
+    "grok_side_channel_request_json_container_type",
+    "grok_side_channel_request_array_length",
 )
 
 

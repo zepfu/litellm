@@ -301,6 +301,16 @@ def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
                     "status_code": 529,
                     "trace_id": "trace-123",
                     "litellm_call_id": f"call-{SECRET}",
+                    "grok_side_channel": True,
+                    "grok_side_channel_endpoint_type": "sessions_signals",
+                    "grok_side_channel_endpoint_path_template": (
+                        "/sessions/{session_id}/signals"
+                    ),
+                    "grok_side_channel_request_content_type": "application/json",
+                    "grok_side_channel_request_body_byte_length": 42,
+                    "grok_side_channel_request_body_digest_source": "raw_body",
+                    "grok_side_channel_request_json_container_type": "array",
+                    "grok_side_channel_request_array_length": 2,
                 },
             )
     finally:
@@ -322,6 +332,10 @@ def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
         "model_alias": "aawm-code-anthropic",
         "route_family": "anthropic_messages",
         "status_code": 529,
+        "failure_kind": None,
+        "hidden_retry_final_outcome": None,
+        "hidden_retry_failure_classification": None,
+        "hidden_retry_count": None,
         "trace_id": "trace-123",
         "litellm_call_id": "call-REDACTED",
         "callback_name": None,
@@ -334,6 +348,14 @@ def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
         "queue_maxsize": None,
         "coroutine_name": None,
         "worker_delivery_state": None,
+        "grok_side_channel": True,
+        "grok_side_channel_endpoint_type": "sessions_signals",
+        "grok_side_channel_endpoint_path_template": "/sessions/{session_id}/signals",
+        "grok_side_channel_request_content_type": "application/json",
+        "grok_side_channel_request_body_byte_length": 42,
+        "grok_side_channel_request_body_digest_source": "raw_body",
+        "grok_side_channel_request_json_container_type": "array",
+        "grok_side_channel_request_array_length": 2,
     }
     assert SECRET not in json.dumps(payload)
 
