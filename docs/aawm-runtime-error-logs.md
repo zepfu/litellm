@@ -245,6 +245,44 @@ Pass-through diagnostic payload capture is disabled by default. It is separate
 from runtime error JSONL, `session_history`, provider-error observations, and
 Langfuse metadata.
 
+## Opt-in Langfuse input shape/hash summary
+
+Langfuse event fitting still uses budget-aware head/tail truncation for oversized
+`input` by default. For stronger privacy on large request bodies, enable:
+
+```text
+AAWM_LANGFUSE_INPUT_SHAPE_HASH_ONLY=1
+```
+
+Accepted truthy values include `1`, `true`, `yes`, and `on`. When enabled and an
+event must be fitted because it exceeds the Langfuse fit target, oversized
+`input` is replaced with a bounded `litellm_langfuse_input_summary` object
+instead of retained raw head/tail text. The summary records a stable hash,
+original and final byte sizes, container type, item counts, role counts,
+content-block type counts, bounded shape-only head/tail samples, omitted counts,
+and `raw_reconstruction` status. Dict keys are summarized with bounded
+non-reconstructive descriptors (`key_index`, `key_hash`, `key_length`, and
+category) rather than raw user-controlled key names. Identifier-like values such
+as `id`, `call_id`, `tool_call_id`, and `name` are shape-only or hashed/length
+only, not previewed. Non-primitive or user-controlled scalar values are not
+rendered via raw `str(value)` previews. It must not include raw prompts, tool
+arguments, tool names, local file paths or content, source snippets, API keys,
+cookies, authorization headers, or raw key names.
+
+`raw_reconstruction.source` is one of:
+
+- `not_available_by_default` when no durable raw-body lookup is configured.
+- `cold_storage_object_key` when generation metadata includes
+  `cold_storage_object_key` and cold-storage retrieval is configured.
+- `full_payload_capture_required` when pass-through full-payload capture is
+  enabled; that remains a deliberate short-lived investigation opt-in, not
+  routine telemetry.
+
+This mode is not the same as per-call `mask_input` (which redacts Langfuse input
+entirely) or raw request/response logging knobs (which send raw material to
+observability sinks when explicitly enabled). Metadata compactors from D1-238
+and D1-314 are unchanged.
+
 Enable the scoped diagnostic manifest writer with:
 
 ```text
