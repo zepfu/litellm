@@ -23587,7 +23587,7 @@ async def _perform_codex_auto_agent_native_openai_request(
         egress_credential_family="openai" if forward_headers else None,
         expected_target_family="openai",
         retryable_upstream_status_codes=[429],
-        caller_managed_hidden_retry=True,
+        caller_managed_hidden_retry=False,
     )
 
 

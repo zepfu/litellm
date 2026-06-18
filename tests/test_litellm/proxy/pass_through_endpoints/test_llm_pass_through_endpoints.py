@@ -112,6 +112,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _is_codex_google_code_assist_empty_success_model_response,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
+    _perform_codex_auto_agent_native_openai_request,
     _resolve_anthropic_auto_agent_alias_model,
     _resolve_anthropic_antigravity_code_assist_adapter_model,
     _resolve_anthropic_opencode_zen_adapter_model,
@@ -20311,6 +20312,38 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
                     selection["cooldown_key"],
                     60.0,
                 )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabled():
+    request = _build_codex_auto_agent_request()
+    request_body = {
+        "model": "gpt-5.3-codex-spark",
+        "input": "hello",
+        "litellm_metadata": {"requested_model_alias": "aawm-code"},
+    }
+    upstream_response = Response(content='{"id":"resp_123"}')
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through:
+        response = await _perform_codex_auto_agent_native_openai_request(
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+            request_body=request_body,
+        )
+
+    assert response is upstream_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["retryable_upstream_status_codes"] == [429]
+    assert call_kwargs["caller_managed_hidden_retry"] is False
+    assert call_kwargs["expected_target_family"] == "openai"
+    assert call_kwargs["egress_credential_family"] == "openai"
 
 
 def test_codex_auto_agent_alias_last_resort_sets_default_medium_reasoning():
