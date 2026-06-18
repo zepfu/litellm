@@ -283,6 +283,42 @@ control file. That mode intentionally persists raw upstream request/response
 headers and bodies for short-lived manual investigations and should not be used
 as default telemetry.
 
+Google Code Assist / Antigravity bootstrap preflight calls in
+`litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py` also call
+`capture_passthrough_shape()` directly for `v1internal:loadCodeAssist` and the
+`retrieveUserQuota` / `fetchAdminControls` / `listExperiments` prime path. Those
+direct preflight captures use the same exact-scope gate as other diagnostic
+manifest writes: they stay local-only under
+`/tmp/captures/diagnostic_payloads` by default and persist shape/hash manifest
+data only unless the separate full-payload capture opt-in is enabled.
+
+Native `/rerank` proxy requests use a separate rerank diagnostic manifest
+wrapper rather than the pass-through HTTP response helper. The route family is
+`rerank`, the endpoint template is `/rerank`, and the artifact records only
+request/response shape, byte counts, hashes, and omitted-field descriptions.
+Rerank query text, input documents, and returned document text are private
+content and must remain summarized as shapes unless a separate full-payload
+capture mode is explicitly added and enabled for a short-lived investigation.
+
+Diagnostic manifest coverage by route family:
+
+- OpenAI, Anthropic, Gemini, Vertex, Cohere, and Cursor pass-through HTTP
+  handlers use the shared pass-through capture hooks for nonstreaming,
+  streaming, and error-shape manifests.
+- Google Code Assist / Antigravity bootstrap preflight calls use direct
+  `capture_passthrough_shape()` calls because they run before the normal shared
+  pass-through response handler.
+- Native `/rerank` proxy calls use the rerank wrapper described above because
+  they flow through `base_process_llm_request(route_type="arerank")`, not the
+  pass-through HTTP stack.
+- AssemblyAI transcript polling is intentionally not captured per poll. The
+  initial pass-through request remains covered by the shared hooks; terminal
+  transcript capture should be added only with a transcript-specific manifest
+  that emits once per completed transcript and keeps transcript text summarized.
+- Vertex AI Live websocket sessions are intentionally not forced into the HTTP
+  diagnostic manifest shape. They need a websocket lifecycle manifest with
+  explicit open/message/close boundaries before capture should be enabled.
+
 ## ChatGPT Codex quota errors
 
 When ChatGPT Codex passthrough returns HTTP 429 with

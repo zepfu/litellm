@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import datetime
+import json
 import logging
 import re
 from typing import AsyncGenerator, Optional
@@ -30,6 +31,7 @@ from litellm.proxy.common_request_processing import (
 )
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.utils import ProxyLogging
+from litellm.types.rerank import RerankResponse
 
 
 def _build_aawm_route_log_request(
@@ -75,6 +77,74 @@ def _build_uvicorn_access_record(
         args=(client_addr, method, full_path, http_version, status_code),
         exc_info=None,
     )
+
+
+def _assert_rerank_diagnostic_artifact(
+    artifact: dict,
+    *,
+    rendered: str,
+) -> None:
+    manifest = artifact["manifest"]
+    assert artifact["capture_kind"] == "aawm_diagnostic_payload_capture"
+    assert manifest["environment"] == "aawm-dev"
+    assert manifest["route_family"] == "rerank"
+    assert manifest["endpoint_template"] == "/rerank"
+    assert manifest["litellm_call_id"] == "test-call-id"
+    assert manifest["mode"] == "nonstream"
+    assert manifest["redaction_mode"] == "shape_hash_manifest"
+    assert manifest["byte_counts"]["request_body_bytes"] > 0
+    assert manifest["byte_counts"]["response_body_bytes"] > 0
+    assert manifest["hashes"]["request_body_sha256"]
+    assert manifest["hashes"]["response_body_sha256"]
+    assert "request.body.raw" in manifest["omitted_fields"]
+    assert artifact["metadata"]["custom_llm_provider"] == "cohere"
+    assert artifact["request"]["body_shape"]["query"].startswith("<str len=")
+    assert artifact["request"]["body_shape"]["documents"][0].startswith("<str len=")
+    assert (
+        artifact["response"]["body"]["shape"]["results"][0]["document"]["text"]
+        == "<str len=33>"
+    )
+    assert "customer secret query" not in rendered
+    assert "customer secret document" not in rendered
+    assert "customer secret returned document" not in rendered
+
+
+def _assert_rerank_route_record(caplog) -> None:
+    route_records = [
+        record.getMessage()
+        for record in caplog.records
+        if " [RERANK] " in record.getMessage()
+    ]
+    assert len(route_records) == 1
+    assert re.fullmatch(
+        r"\d{8} \d{2}:\d{2}:\d{2} \[RERANK\] Codex/0\.119\.0-alpha\.29 - "
+        r"rerank worker@litellm\.tei-reranker "
+        r"POST 172\.19\.0\.1:52834 /rerank -> "
+        r"rerank\.example\.com/rerank",
+        route_records[0],
+    )
+    assert "api_key" not in route_records[0]
+    assert "customer secret query" not in route_records[0]
+    assert "customer secret document" not in route_records[0]
+
+
+def _build_rerank_user_api_key_auth() -> MagicMock:
+    mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+    mock_user_api_key_dict.tpm_limit = None
+    mock_user_api_key_dict.rpm_limit = None
+    mock_user_api_key_dict.max_budget = None
+    mock_user_api_key_dict.spend = 0
+    mock_user_api_key_dict.allowed_model_region = None
+    return mock_user_api_key_dict
+
+
+def _enable_rerank_diagnostic_capture(monkeypatch, diagnostic_dir) -> None:
+    monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+    monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+    monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", "1")
+    monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ROUTE_FAMILIES", "rerank")
+    monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR", str(diagnostic_dir))
+    monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENVIRONMENT", "aawm-dev")
 
 
 class TestProxyBaseLLMRequestProcessing:
@@ -263,12 +333,7 @@ class TestProxyBaseLLMRequestProcessing:
         )
         mock_fastapi_response = MagicMock()
         mock_fastapi_response.headers = {}
-        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
-        mock_user_api_key_dict.tpm_limit = None
-        mock_user_api_key_dict.rpm_limit = None
-        mock_user_api_key_dict.max_budget = None
-        mock_user_api_key_dict.spend = 0
-        mock_user_api_key_dict.allowed_model_region = None
+        mock_user_api_key_dict = _build_rerank_user_api_key_auth()
         mock_proxy_config = MagicMock(spec=ProxyConfig)
         logging_obj = MagicMock()
         logging_obj.litellm_call_id = "test-call-id"
@@ -345,12 +410,15 @@ class TestProxyBaseLLMRequestProcessing:
         self,
         caplog,
         monkeypatch,
+        tmp_path,
     ):
         clear_aawm_route_access_log_replacements()
+        diagnostic_dir = tmp_path / "diagnostic"
+        _enable_rerank_diagnostic_capture(monkeypatch, diagnostic_dir)
         data = {
             "model": "tei-reranker",
-            "query": "hello",
-            "documents": ["world"],
+            "query": "customer secret query",
+            "documents": ["customer secret document"],
             "api_base": "https://rerank.example.com/rerank?api_key=secret",
             "metadata": {
                 "agent_name": "rerank worker",
@@ -380,9 +448,19 @@ class TestProxyBaseLLMRequestProcessing:
         )
 
         async def mock_provider_response():
-            response = MagicMock()
+            response = RerankResponse(
+                results=[
+                    {
+                        "index": 0,
+                        "relevance_score": 0.91,
+                        "document": {"text": "customer secret returned document"},
+                    }
+                ],
+                meta={"billed_units": {"search_units": 1}},
+            )
             response._hidden_params = {
                 "api_base": "https://rerank.example.com/rerank?api_key=secret",
+                "custom_llm_provider": "cohere",
             }
             return response
 
@@ -424,22 +502,13 @@ class TestProxyBaseLLMRequestProcessing:
         assert response._hidden_params["api_base"].startswith(
             "https://rerank.example.com/rerank"
         )
-        route_records = [
-            record.getMessage()
-            for record in caplog.records
-            if " [RERANK] " in record.getMessage()
-        ]
-        assert len(route_records) == 1
-        assert re.fullmatch(
-            r"\d{8} \d{2}:\d{2}:\d{2} \[RERANK\] Codex/0\.119\.0-alpha\.29 - "
-            r"rerank worker@litellm\.tei-reranker "
-            r"POST 172\.19\.0\.1:52834 /rerank -> "
-            r"rerank\.example\.com/rerank",
-            route_records[0],
-        )
-        assert "api_key" not in route_records[0]
-        assert "hello" not in route_records[0]
-        assert "world" not in route_records[0]
+        _assert_rerank_route_record(caplog)
+
+        artifacts = sorted(diagnostic_dir.glob("*.json"))
+        assert len(artifacts) == 1
+        artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        rendered = json.dumps(artifact)
+        _assert_rerank_diagnostic_artifact(artifact, rendered=rendered)
 
         access_filter = AawmRouteAccessLogReplacementFilter()
         assert access_filter.filter(

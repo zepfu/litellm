@@ -18,6 +18,15 @@ LiteLLM Follows the [cohere api request / response for the rerank api](https://c
 | Guardrails | ✅                                                                                                   | Applies to input query only (not documents) |
 | Supported Providers | Cohere, Together AI, Azure AI, DeepInfra, Nvidia NIM, Infinity, Fireworks AI, Voyage AI, watsonx.ai | |
 
+:::note
+
+When LiteLLM diagnostic payload capture is explicitly enabled for proxy
+investigations, `/rerank` writes only a local shape/hash manifest. Query text,
+documents, and returned document text are summarized by shape and size; raw
+rerank content is not written to the diagnostic manifest by default.
+
+:::
+
 ## **LiteLLM Python SDK Usage**
 ### Quick Start 
 
@@ -137,4 +146,4 @@ curl http://0.0.0.0:4000/rerank \
 | Vertex AI                | [Usage](../docs/providers/vertex#rerank-api)         |
 | Fireworks AI             | [Usage](../docs/providers/fireworks_ai#rerank-endpoint) |
 | Voyage AI                | [Usage](../docs/providers/voyage#rerank)             |  
-| IBM watsonx.ai           | [Usage](../docs/providers/watsonx/rerank)            |  
+| IBM watsonx.ai           | [Usage](../docs/providers/watsonx/rerank)            |

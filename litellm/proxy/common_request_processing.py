@@ -36,6 +36,7 @@ from litellm.litellm_core_utils.llm_response_utils.get_headers import (
     get_response_headers,
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
+from litellm.integrations.aawm_passthrough_shape_capture import capture_rerank_shape
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.aawm_route_logging import emit_aawm_route_access_log
 from litellm.proxy.auth.auth_utils import check_response_size_is_safe
@@ -670,6 +671,7 @@ class ProxyBaseLLMRequestProcessing:
             "aget_run",
             "acancel_run",
             "adelete_run",
+            "arerank",
         ],
         version: Optional[str] = None,
         user_model: Optional[str] = None,
@@ -841,7 +843,7 @@ class ProxyBaseLLMRequestProcessing:
                 json.dumps(self.data, indent=4, default=str),
             )
 
-    async def base_process_llm_request(
+    async def base_process_llm_request(  # noqa: PLR0915
         self,
         request: Request,
         fastapi_response: Response,
@@ -1121,6 +1123,17 @@ class ProxyBaseLLMRequestProcessing:
         response = await proxy_logging_obj.post_call_success_hook(
             data=self.data, user_api_key_dict=user_api_key_dict, response=response
         )
+        if route_type == "arerank":
+            capture_rerank_shape(
+                url_route=str(request.url),
+                request_body=self.data,
+                response_body=response,
+                litellm_call_id=getattr(logging_obj, "litellm_call_id", None),
+                extra_metadata={
+                    "custom_llm_provider": hidden_params.get("custom_llm_provider"),
+                    "model": self.data.get("model") if isinstance(self.data, dict) else None,
+                },
+            )
 
         # Always return the client-requested model name (not provider-prefixed internal identifiers)
         # for OpenAI-compatible responses.
