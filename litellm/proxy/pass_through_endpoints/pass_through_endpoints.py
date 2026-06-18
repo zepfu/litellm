@@ -155,6 +155,11 @@ _AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS = (
 )
 _GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_CODE = "the operation was cancelled"
 _GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_ERROR = "timeout expired"
+_GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS = (
+    "invalid or expired credentials",
+    "x_xai_token_auth=xai-grok-cli",
+    "no auth context",
+)
 
 
 def get_response_body(response: httpx.Response) -> Optional[dict]:
@@ -527,6 +532,52 @@ def _is_known_grok_billing_passthrough_timeout_cancel_response(
     )
 
 
+def _is_grok_signals_path(path: str) -> bool:
+    normalized_path = path.rstrip("/")
+    return (
+        normalized_path.startswith("/grok/v1/sessions/")
+        and normalized_path.endswith("/signals")
+    ) or (
+        normalized_path.startswith("/v1/sessions/")
+        and normalized_path.endswith("/signals")
+    )
+
+
+def _is_known_grok_signals_auth_context_response(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_401_UNAUTHORIZED:
+        return False
+
+    if not _is_xai_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return False
+
+    request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
+        request
+    )
+    upstream_path = urlparse(str(url or "")).path
+    if not (_is_grok_signals_path(request_path) or _is_grok_signals_path(upstream_path)):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if not detail:
+        return False
+
+    normalized_detail = str(detail).strip().lower()
+    return all(
+        marker in normalized_detail
+        for marker in _GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS
+    )
+
+
 def _get_case_insensitive_mapping_value(
     values: Optional[dict],
     key_name: str,
@@ -893,6 +944,10 @@ def _get_passthrough_terminal_failure_kind(
 
 def _get_passthrough_grok_billing_timeout_failure_kind() -> str:
     return "degraded_grok_billing_timeout"
+
+
+def _get_passthrough_grok_signals_auth_context_failure_kind() -> str:
+    return "degraded_grok_signals_auth_context"
 
 
 def _record_passthrough_hidden_retry_metadata(
@@ -2778,6 +2833,15 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_grok_signals_auth_context_traceback = (
+            _is_known_grok_signals_auth_context_response(
+                request=request,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
@@ -2801,6 +2865,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": _get_passthrough_grok_billing_timeout_failure_kind(),
+                },
+            )
+        elif suppress_grok_signals_auth_context_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced known Grok signals auth-context status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": _get_passthrough_grok_signals_auth_context_failure_kind(),
                 },
             )
         elif suppress_terminal_failure_traceback:
@@ -2871,11 +2945,16 @@ async def pass_through_request(  # noqa: PLR0915
             not suppress_terminal_failure_traceback
             and not suppress_provider_rate_limit_traceback
             and not suppress_grok_billing_timeout_traceback
+            and not suppress_grok_signals_auth_context_traceback
         ):
             traceback_str = traceback.format_exc(
                 limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
             )
-        if not suppress_retryable_failure_logging and not suppress_grok_billing_timeout_traceback:
+        if (
+            not suppress_retryable_failure_logging
+            and not suppress_grok_billing_timeout_traceback
+            and not suppress_grok_signals_auth_context_traceback
+        ):
             try:
                 await proxy_logging_obj.post_call_failure_hook(
                     user_api_key_dict=user_api_key_dict,
