@@ -62,7 +62,11 @@
     "native_openai_passthrough_responses_codex",
     "native_openai_passthrough_responses_codex_tool_activity",
     "native_grok_cli_passthrough_grok_build",
-    "native_grok_cli_passthrough_grok_composer"
+    "native_grok_cli_passthrough_grok_composer",
+    "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
+    "native_openai_passthrough_responses_codex_aawm_low_tool_activity",
+    "claude_adapter_openrouter_north_mini_completion_adapter_smoke",
+    "claude_adapter_openrouter_owl_alpha_completion_adapter_smoke"
   ],
   "cases": {
     "native_anthropic_passthrough_claude": {
@@ -6433,6 +6437,579 @@
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"
       }
+    },
+    "claude_adapter_openrouter_north_mini_completion_adapter_smoke": {
+      "verification_alias": "aawm-low-anthropic",
+      "verification_candidate_order": 1,
+      "verification_candidate_label": "direct-openrouter-completion-adapter",
+      "http_request": {
+        "method": "POST",
+        "path": "/anthropic/v1/messages",
+        "headers": {
+          "user-agent": "AnthropicAdapterHarness/0.1",
+          "x-aawm-tenant-id": "adapter-harness-tenant"
+        },
+        "json": {
+          "model": "openrouter/cohere/north-mini-code:free",
+          "max_tokens": 24,
+          "system": "Reply with exactly three words: north mini ok",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with exactly three words: north mini ok"
+            }
+          ]
+        }
+      },
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openrouter_completion_adapter",
+        "anthropic-openrouter-completion-adapter",
+        "anthropic-adapter-model:cohere/north-mini-code:free",
+        "anthropic-adapter-target:openrouter:/v1/chat/completions"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "status_code": 200
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openrouter",
+        "expected_model": "openrouter/cohere/north-mini-code:free",
+        "expected_tenant_id": "adapter-harness-tenant",
+        "metadata_required_equals": {
+          "tenant_id": "adapter-harness-tenant",
+          "anthropic_adapter_model": "cohere/north-mini-code:free",
+          "anthropic_adapter_original_model": "openrouter/cohere/north-mini-code:free",
+          "anthropic_adapter_target_endpoint": "openrouter:/v1/chat/completions",
+          "passthrough_route_family": "anthropic_openrouter_completion_adapter"
+        },
+        "metadata_required_truthy": [
+          "tenant_id_source"
+        ],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "allow_zero_cost": true,
+      "skip_generation_quality_checks": true,
+      "retry_on_api_error_statuses": [
+        429,
+        503
+      ],
+      "retry_max_attempts": 3,
+      "retry_backoff_seconds": 25,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_openrouter_owl_alpha_completion_adapter_smoke": {
+      "verification_alias": "aawm-low-anthropic",
+      "verification_candidate_order": 2,
+      "verification_candidate_label": "direct-openrouter-completion-adapter",
+      "http_request": {
+        "method": "POST",
+        "path": "/anthropic/v1/messages",
+        "headers": {
+          "user-agent": "AnthropicAdapterHarness/0.1",
+          "x-aawm-tenant-id": "adapter-harness-tenant"
+        },
+        "json": {
+          "model": "openrouter/owl-alpha",
+          "max_tokens": 24,
+          "system": "Reply with exactly three words: owl alpha ok",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with exactly three words: owl alpha ok"
+            }
+          ]
+        }
+      },
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_openrouter_completion_adapter",
+        "anthropic-openrouter-completion-adapter",
+        "anthropic-adapter-model:owl-alpha",
+        "anthropic-adapter-target:openrouter:/v1/chat/completions"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "status_code": 200
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "expected_provider": "openrouter",
+        "expected_model": "openrouter/owl-alpha",
+        "expected_tenant_id": "adapter-harness-tenant",
+        "metadata_required_equals": {
+          "tenant_id": "adapter-harness-tenant",
+          "anthropic_adapter_model": "owl-alpha",
+          "anthropic_adapter_original_model": "openrouter/owl-alpha",
+          "anthropic_adapter_target_endpoint": "openrouter:/v1/chat/completions",
+          "passthrough_route_family": "anthropic_openrouter_completion_adapter"
+        },
+        "metadata_required_truthy": [
+          "tenant_id_source"
+        ],
+        "minimums": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 1
+        }
+      },
+      "allow_zero_cost": true,
+      "skip_generation_quality_checks": true,
+      "retry_on_api_error_statuses": [
+        429,
+        503
+      ],
+      "retry_max_attempts": 3,
+      "retry_backoff_seconds": 25,
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 90,
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      }
+    },
+    "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools": {
+      "verification_alias": "aawm-low-anthropic",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "alias-replay",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "antigravity",
+          "model": "gemini-3.5-flash-low",
+          "route_family": "anthropic_antigravity_completion_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "openrouter",
+          "model": "openrouter/cohere/north-mini-code:free",
+          "route_family": "anthropic_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 2,
+          "provider": "openrouter",
+          "model": "openrouter/owl-alpha",
+          "route_family": "anthropic_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 3,
+          "provider": "opencode_zen",
+          "model": "deepseek-v4-flash",
+          "route_family": "anthropic_opencode_zen_responses_adapter"
+        },
+        {
+          "candidate_order": 4,
+          "provider": "opencode_zen",
+          "model": "big-pickle",
+          "route_family": "anthropic_opencode_zen_completion_adapter"
+        },
+        {
+          "candidate_order": 5,
+          "provider": "anthropic",
+          "model": "claude-haiku-4-5-20251001",
+          "route_family": "anthropic_messages"
+        }
+      ],
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the harness-aawm-low-anthropic-alias-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read /home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from /home/zepfu/projects/litellm, and Grep pattern exactly `sequential-core-tools-grep` with path exactly `/home/zepfu/projects/litellm/scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: AAWM LOW ANTHROPIC ALIAS PARALLEL TOOLS PASSED",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "harness-aawm-low-anthropic-alias-parallel-read-tools": {
+          "description": "Acceptance harness child for aawm-low-anthropic default low-alias parallel read-tool proof.",
+          "model": "aawm-low-anthropic",
+          "effort": "high",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, return only the caller's exact final line."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.harness-aawm-low-anthropic-alias-parallel-read-tools"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.harness-aawm-low-anthropic-alias-parallel-read-tools": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_contains": {
+          "result": "AAWM LOW ANTHROPIC ALIAS PARALLEL TOOLS PASSED"
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "antigravity",
+                "openrouter",
+                "opencode_zen",
+                "anthropic"
+              ],
+              "model": [
+                "gemini-3.5-flash-low",
+                "openrouter/cohere/north-mini-code:free",
+                "openrouter/owl-alpha",
+                "deepseek-v4-flash",
+                "big-pickle",
+                "claude-haiku-4-5-20251001"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-low-anthropic",
+              "requested_model_alias": "aawm-low-anthropic",
+              "anthropic_auto_agent_alias": "aawm-low-anthropic"
+            },
+            "metadata_required_truthy": [
+              "anthropic_auto_agent_selected_provider",
+              "anthropic_auto_agent_selected_model",
+              "anthropic_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1
+          },
+          {
+            "provider": "antigravity",
+            "model": "gemini-3.5-flash-low",
+            "tool_name": "read_file",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "antigravity",
+            "model": "gemini-3.5-flash-low",
+            "tool_name": "glob",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "scripts/local-ci/sequential_core_tools_fixture.txt"
+          },
+          {
+            "provider": "antigravity",
+            "model": "gemini-3.5-flash-low",
+            "tool_name": "grep_search",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential-core-tools-grep"
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "harness-aawm-low-anthropic-alias-parallel-read-tools",
+            "expected_tool_counts": {
+              "Read": 1,
+              "Glob": 1,
+              "Grep": 1
+            },
+            "minimum_total_tool_uses": 3,
+            "maximum_total_tool_uses": 3,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 90,
+      "allow_zero_cost": true,
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "model-alias:aawm-low-anthropic",
+        "anthropic-auto-agent-alias:aawm-low-anthropic"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "max_tokens",
+          "tools"
+        ]
+      }
+    },
+    "native_openai_passthrough_responses_codex_aawm_low_tool_activity": {
+      "verification_alias": "aawm-low",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "alias-replay",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "antigravity",
+          "model": "gemini-3.5-flash-low",
+          "route_family": "codex_antigravity_code_assist_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "openrouter",
+          "model": "openrouter/cohere/north-mini-code:free",
+          "route_family": "codex_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 2,
+          "provider": "openrouter",
+          "model": "openrouter/owl-alpha",
+          "route_family": "codex_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 3,
+          "provider": "opencode_zen",
+          "model": "deepseek-v4-flash",
+          "route_family": "codex_opencode_zen_adapter"
+        },
+        {
+          "candidate_order": 4,
+          "provider": "opencode_zen",
+          "model": "big-pickle",
+          "route_family": "codex_opencode_zen_adapter"
+        },
+        {
+          "candidate_order": 5,
+          "provider": "openai",
+          "model": "gpt-5.4-mini",
+          "route_family": "codex_responses"
+        }
+      ],
+      "cli_passthrough": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "-p",
+        "{codex_profile}",
+        "-m",
+        "aawm-low",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-litellm-end-user-id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_user_id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "Use the shell tool exactly once to run pwd. Return only the working directory path."
+      ],
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": false,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses"
+      ],
+      "required_trace_tags": [
+        "model-alias:aawm-low",
+        "codex-auto-agent-alias:aawm-low"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family"
+      ],
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "antigravity",
+                "openrouter",
+                "opencode_zen",
+                "openai"
+              ],
+              "model": [
+                "gemini-3.5-flash-low",
+                "openrouter/cohere/north-mini-code:free",
+                "openrouter/owl-alpha",
+                "deepseek-v4-flash",
+                "big-pickle",
+                "gpt-5.4-mini"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-low",
+              "requested_model_alias": "aawm-low",
+              "codex_auto_agent_alias": "aawm-low"
+            },
+            "metadata_required_truthy": [
+              "codex_auto_agent_selected_provider",
+              "codex_auto_agent_selected_model",
+              "codex_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "required_contains": {
+              "repository": "litellm"
+            },
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "antigravity",
+                "openrouter",
+                "opencode_zen",
+                "openai"
+              ],
+              "model": [
+                "gemini-3.5-flash-low",
+                "openrouter/cohere/north-mini-code:free",
+                "openrouter/owl-alpha",
+                "deepseek-v4-flash",
+                "big-pickle",
+                "gpt-5.4-mini"
+              ]
+            },
+            "tool_name": "exec_command",
+            "tool_kind": "command",
+            "minimum_count": 1,
+            "command_text_contains": "pwd"
+          }
+        ]
+      },
+      "timeout_seconds": 180,
+      "langfuse_poll_timeout_seconds": 60,
+      "allow_zero_cost": true
     }
   }
 }

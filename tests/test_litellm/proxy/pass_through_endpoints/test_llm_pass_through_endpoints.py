@@ -8414,6 +8414,116 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         )
 
     @pytest.mark.asyncio
+    async def test_codex_google_code_assist_builder_converts_unsupported_orphan_tool_result(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-unsupported-tool-result"}
+        _codex_google_code_assist_tool_call_name_cache.clear()
+        _codex_google_code_assist_tool_call_arguments_cache.clear()
+
+        try:
+            wrapped_request, _, completion_messages, _, _, changes = (
+                await _build_google_code_assist_request_from_completion_kwargs(
+                    completion_kwargs={
+                        "model": "gemini-3.5-flash-low",
+                        "messages": [
+                            {"role": "user", "content": "List files in the repo"},
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": ""}],
+                            },
+                            {
+                                "role": "tool",
+                                "tool_call_id": "call_xxx__thought__sig",
+                                "content": "unsupported call: ls",
+                            },
+                        ],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "exec_command",
+                                    "description": "run a command",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "cmd": {"type": "string"}
+                                        },
+                                        "required": ["cmd"],
+                                    },
+                                },
+                            },
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "description": "read a file",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "path": {"type": "string"}
+                                        },
+                                        "required": ["path"],
+                                    },
+                                },
+                            },
+                        ],
+                        "tool_choice": "auto",
+                        "max_tokens": 64,
+                        "stream": True,
+                        "metadata": {
+                            "passthrough_route_family": (
+                                "codex_google_code_assist_adapter"
+                            )
+                        },
+                    },
+                    adapter_model="gemini-3.5-flash-low",
+                    project="project_123",
+                    request=mock_request,
+                    completion_kwargs_are_openai_chat=True,
+                )
+            )
+        finally:
+            _codex_google_code_assist_tool_call_name_cache.clear()
+            _codex_google_code_assist_tool_call_arguments_cache.clear()
+
+        request_parts = [
+            part
+            for content in wrapped_request["request"]["contents"]
+            for part in content.get("parts", [])
+            if isinstance(part, dict)
+        ]
+
+        assert completion_messages[0]["role"] == "system"
+        assert "Codex tool contract:" in completion_messages[0]["content"]
+        assert completion_messages[1] == {
+            "role": "user",
+            "content": (
+                "List files in the repo\n\n"
+                "Previous tool result context (unmapped tool call "
+                "call_xxx):\n"
+                "unsupported call: ls"
+            ),
+        }
+        assert all("functionResponse" not in part for part in request_parts)
+        assert all("functionCall" not in part for part in request_parts)
+        assert (
+            changes["google_adapter_codex_converted_orphan_tool_result_count"]
+            == 1
+        )
+        assert changes["google_adapter_codex_converted_orphan_tool_result_ids"] == [
+            "call_xxx"
+        ]
+        assert (
+            changes[
+                "google_adapter_codex_removed_blank_assistant_before_orphan_tool_result_count"
+            ]
+            == 1
+        )
+        assert "google_adapter_codex_repaired_missing_tool_call_count" not in changes
+
+    @pytest.mark.asyncio
     async def test_codex_google_code_assist_builder_repairs_cached_tool_result_pair(
         self,
     ):
@@ -10516,6 +10626,11 @@ class TestClaudePersistedOutputExpansion:
                 "openrouter/deepseek/deepseek-v4-flash:free",
                 "deepseek/deepseek-v4-flash:free",
             ),
+            (
+                "openrouter/cohere/north-mini-code:free",
+                "cohere/north-mini-code:free",
+            ),
+            ("openrouter/owl-alpha", "owl-alpha"),
         ],
     )
     def test_resolve_anthropic_openrouter_completion_adapter_model_supports_chat_shape_models(
@@ -16958,10 +17073,8 @@ async def test_anthropic_auto_agent_alias_uses_haiku_only_as_last_resort(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_low_keeps_existing_order_by_default(
-    monkeypatch,
+async def test_anthropic_auto_agent_alias_low_uses_default_low_candidates(
 ):
-    monkeypatch.delenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", raising=False)
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
@@ -16971,25 +17084,24 @@ async def test_anthropic_auto_agent_alias_low_keeps_existing_order_by_default(
         request_body=body,
     )
 
-    assert selection["candidate"]["provider"] == "opencode_zen"
-    assert selection["candidate"]["model"] == "deepseek-v4-flash"
+    assert selection["candidate"]["provider"] == "antigravity"
+    assert selection["candidate"]["model"] == "gemini-3.5-flash-low"
     assert selection["candidate"]["route_family"] == (
-        "anthropic_opencode_zen_responses_adapter"
+        "anthropic_antigravity_completion_adapter"
     )
     candidates = _get_anthropic_auto_agent_candidates_for_alias("aawm-low-anthropic")
-    candidate_models = {candidate["model"] for candidate in candidates}
-    assert {
+    candidate_models = [candidate["model"] for candidate in candidates]
+    assert candidate_models[:3] == [
+        "gemini-3.5-flash-low",
         "openrouter/cohere/north-mini-code:free",
         "openrouter/owl-alpha",
-        "gemini-3.5-flash-low",
-    }.isdisjoint(candidate_models)
+    ]
 
 
 @pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
     monkeypatch,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
@@ -17060,10 +17172,8 @@ async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_order_unchanged_when_low_staging_enabled(
-    monkeypatch,
+async def test_anthropic_auto_agent_alias_code_order_unchanged_with_low_defaults(
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
@@ -18142,7 +18252,6 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
 async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haiku(
     monkeypatch,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
@@ -18236,7 +18345,6 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
 async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_errors(
     monkeypatch,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
@@ -18393,7 +18501,6 @@ async def test_anthropic_auto_agent_alias_low_routes_big_pickle_through_completi
 async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrouter_completion_adapter(
     monkeypatch,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
@@ -18449,7 +18556,6 @@ async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrout
 async def test_anthropic_auto_agent_alias_low_routes_gemini_through_antigravity_completion_adapter(
     monkeypatch,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
@@ -19943,10 +20049,8 @@ async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55()
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_low_keeps_existing_order_by_default(
-    monkeypatch,
+async def test_codex_auto_agent_alias_low_uses_default_low_candidates(
 ):
-    monkeypatch.delenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", raising=False)
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-low",
@@ -19958,23 +20062,24 @@ async def test_codex_auto_agent_alias_low_keeps_existing_order_by_default(
         request_body=body,
     )
 
-    assert selection["candidate"]["provider"] == "opencode_zen"
-    assert selection["candidate"]["model"] == "deepseek-v4-flash"
-    assert selection["candidate"]["route_family"] == "codex_opencode_zen_adapter"
+    assert selection["candidate"]["provider"] == "antigravity"
+    assert selection["candidate"]["model"] == "gemini-3.5-flash-low"
+    assert selection["candidate"]["route_family"] == (
+        "codex_antigravity_code_assist_adapter"
+    )
     candidates = _get_codex_auto_agent_candidates_for_alias("aawm-low")
-    candidate_models = {candidate["model"] for candidate in candidates}
-    assert {
+    candidate_models = [candidate["model"] for candidate in candidates]
+    assert candidate_models[:3] == [
+        "gemini-3.5-flash-low",
         "openrouter/cohere/north-mini-code:free",
         "openrouter/owl-alpha",
-        "gemini-3.5-flash-low",
-    }.isdisjoint(candidate_models)
+    ]
 
 
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
     monkeypatch,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-low",
@@ -20045,10 +20150,8 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_order_unchanged_when_low_staging_enabled(
-    monkeypatch,
+async def test_codex_auto_agent_alias_code_order_unchanged_with_low_defaults(
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-code",
@@ -20816,7 +20919,6 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
 async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     monkeypatch,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-low",
@@ -21039,8 +21141,23 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
         "litellm_metadata": {"session_id": "codex-session"},
     }
     mini_success = Response(content='{"ok": true}', media_type="application/json")
+    await _set_codex_auto_agent_cooldown(
+        "antigravity:gemini-3.5-flash-low:antigravity-lane",
+        60.0,
+    )
+    await _set_codex_auto_agent_cooldown(
+        "openrouter:openrouter/cohere/north-mini-code:free:openrouter",
+        60.0,
+    )
+    await _set_codex_auto_agent_cooldown(
+        "openrouter:openrouter/owl-alpha:openrouter",
+        60.0,
+    )
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
         new=AsyncMock(return_value="opencode-test-key"),
     ) as mock_load_opencode_key, patch(
@@ -21085,6 +21202,9 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
     }
+    assert "gemini-3.5-flash-low" in skipped_models
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
+    assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
     return opencode_attempts
@@ -21635,7 +21755,6 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
     upstream_model,
     cooldown_keys,
 ):
-    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
     monkeypatch.delenv("OPENROUTER_API_BASE", raising=False)
     request = _build_codex_auto_agent_request()

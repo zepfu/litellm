@@ -403,9 +403,6 @@ _CODEX_AAWM_READ_ALIAS = "aawm-read"
 _CODEX_AAWM_SOTA_ALIAS = "aawm-sota"
 _CODEX_AAWM_CODE_ALIAS = "aawm-code"
 _CODEX_AAWM_LOW_ALIAS = "aawm-low"
-_AAWM_LOW_OPENROUTER_CANDIDATES_ENV = (
-    "AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES"
-)
 _CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -447,7 +444,7 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "default_reasoning_effort": "medium",
     },
 )
-_CODEX_AAWM_LOW_OPENROUTER_CANDIDATES: tuple[dict[str, Any], ...] = (
+_CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
         "model": "gemini-3.5-flash-low",
@@ -466,8 +463,6 @@ _CODEX_AAWM_LOW_OPENROUTER_CANDIDATES: tuple[dict[str, Any], ...] = (
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     },
-)
-_CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
         "model": "deepseek-v4-flash",
@@ -561,7 +556,7 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
-_ANTHROPIC_AAWM_LOW_OPENROUTER_CANDIDATES: tuple[dict[str, Any], ...] = (
+_ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
         "model": "gemini-3.5-flash-low",
@@ -580,8 +575,6 @@ _ANTHROPIC_AAWM_LOW_OPENROUTER_CANDIDATES: tuple[dict[str, Any], ...] = (
         "route_family": "anthropic_openrouter_completion_adapter",
         "last_resort": False,
     },
-)
-_ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
         "model": "deepseek-v4-flash",
@@ -612,11 +605,6 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[
 }
 
 
-def _aawm_low_openrouter_candidates_enabled() -> bool:
-    value = os.getenv(_AAWM_LOW_OPENROUTER_CANDIDATES_ENV, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _get_codex_auto_agent_candidates_for_alias(
     alias_model: str,
 ) -> tuple[dict[str, Any], ...]:
@@ -624,11 +612,6 @@ def _get_codex_auto_agent_candidates_for_alias(
         alias_model,
         _CODEX_AUTO_AGENT_CANDIDATES,
     )
-    if (
-        alias_model == _CODEX_AAWM_LOW_ALIAS
-        and _aawm_low_openrouter_candidates_enabled()
-    ):
-        return _CODEX_AAWM_LOW_OPENROUTER_CANDIDATES + candidates
     return candidates
 
 
@@ -639,11 +622,6 @@ def _get_anthropic_auto_agent_candidates_for_alias(
         alias_model,
         _ANTHROPIC_AUTO_AGENT_CANDIDATES,
     )
-    if (
-        alias_model == _ANTHROPIC_AAWM_LOW_ALIAS
-        and _aawm_low_openrouter_candidates_enabled()
-    ):
-        return _ANTHROPIC_AAWM_LOW_OPENROUTER_CANDIDATES + candidates
     return candidates
 
 
@@ -979,9 +957,11 @@ _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
 )
 _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = frozenset(
     {
+        "cohere/north-mini-code:free",
         "deepseek/deepseek-v4-flash:free",
         "openrouter/elephant-alpha",
         "inclusionai/ling-2.6-flash",
+        "owl-alpha",
     }
 )
 _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES = (
@@ -7803,6 +7783,187 @@ def _build_codex_google_code_assist_tool_pair_repair_changes(
     return changes
 
 
+def _codex_google_code_assist_tool_result_message_content(
+    message: dict[str, Any],
+) -> str:
+    return str(
+        _codex_google_code_assist_tool_result_content_to_openai_content(
+            message.get("content")
+        )
+        or ""
+    ).strip()
+
+
+def _codex_google_code_assist_orphan_tool_result_context_text(
+    *,
+    tool_call_id: str,
+    content: str,
+) -> str:
+    normalized_content = content.strip()
+    if not normalized_content:
+        return (
+            "Previous tool result context (unmapped tool call "
+            f"{tool_call_id}): no output was recorded."
+        )
+    return (
+        "Previous tool result context (unmapped tool call "
+        f"{tool_call_id}):\n{normalized_content}"
+    )
+
+
+def _codex_google_code_assist_display_tool_call_id(tool_call_id: str) -> str:
+    return tool_call_id.split("__thought__", 1)[0]
+
+
+def _append_codex_google_code_assist_orphan_tool_result_context(
+    *,
+    messages: list[Any],
+    index: int,
+    context_text: str,
+) -> None:
+    if index > 0:
+        previous_message = messages[index - 1]
+        if (
+            isinstance(previous_message, dict)
+            and previous_message.get("role") == "user"
+            and not _completion_message_has_tool_result(previous_message)
+        ):
+            updated_previous = dict(previous_message)
+            previous_content = updated_previous.get("content")
+            if isinstance(previous_content, str):
+                if previous_content.strip():
+                    updated_previous["content"] = (
+                        f"{previous_content.rstrip()}\n\n{context_text}"
+                    )
+                else:
+                    updated_previous["content"] = context_text
+            elif previous_content is None:
+                updated_previous["content"] = context_text
+            else:
+                updated_previous["content"] = context_text
+            messages[index - 1] = updated_previous
+            return
+
+    messages.insert(
+        index,
+        {
+            "role": "user",
+            "content": context_text,
+        },
+    )
+
+
+def _sanitize_codex_google_code_assist_orphan_tool_results(  # noqa: PLR0915
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return completion_kwargs, {}
+
+    updated_messages = list(messages)
+    converted_count = 0
+    removed_blank_assistant_count = 0
+    converted_tool_call_ids: list[str] = []
+    processed_tool_call_ids: set[str] = set()
+    fallback_tool_name = _infer_single_codex_google_code_assist_function_tool_name(
+        completion_kwargs.get("tools")
+    )
+
+    index = 0
+    while index < len(updated_messages):
+        message = updated_messages[index]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            index += 1
+            continue
+
+        tool_call_id = message.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            index += 1
+            continue
+
+        previous_assistant_index = _previous_codex_google_code_assist_assistant_index(
+            updated_messages,
+            before_index=index,
+        )
+        previous_assistant = (
+            updated_messages[previous_assistant_index]
+            if previous_assistant_index is not None
+            else None
+        )
+        existing_tool_call_ids = (
+            _completion_message_tool_call_ids(previous_assistant)
+            if isinstance(previous_assistant, dict)
+            else set()
+        )
+        if tool_call_id in existing_tool_call_ids:
+            index += 1
+            continue
+
+        function_name = (
+            _lookup_codex_google_code_assist_tool_call_name(tool_call_id)
+            or fallback_tool_name
+        )
+        if function_name:
+            index += 1
+            continue
+
+        normalized_tool_call_id = _codex_google_code_assist_display_tool_call_id(
+            tool_call_id
+        )
+        if normalized_tool_call_id in processed_tool_call_ids:
+            updated_messages.pop(index)
+            converted_count += 1
+            converted_tool_call_ids.append(normalized_tool_call_id)
+            continue
+
+        context_text = _codex_google_code_assist_orphan_tool_result_context_text(
+            tool_call_id=normalized_tool_call_id,
+            content=_codex_google_code_assist_tool_result_message_content(message),
+        )
+        updated_messages.pop(index)
+        converted_count += 1
+        converted_tool_call_ids.append(normalized_tool_call_id)
+        processed_tool_call_ids.add(normalized_tool_call_id)
+
+        if (
+            previous_assistant_index is not None
+            and isinstance(previous_assistant, dict)
+            and previous_assistant.get("role") == "assistant"
+            and not _completion_message_tool_call_ids(previous_assistant)
+            and _is_codex_google_code_assist_empty_text_content(
+                previous_assistant.get("content")
+            )
+        ):
+            if previous_assistant_index < index:
+                index -= 1
+            updated_messages.pop(previous_assistant_index)
+            removed_blank_assistant_count += 1
+
+        _append_codex_google_code_assist_orphan_tool_result_context(
+            messages=updated_messages,
+            index=index,
+            context_text=context_text,
+        )
+        index += 1
+
+    if converted_count == 0:
+        return completion_kwargs, {}
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["messages"] = updated_messages
+    changes: dict[str, Any] = {
+        "google_adapter_codex_converted_orphan_tool_result_count": converted_count,
+        "google_adapter_codex_converted_orphan_tool_result_ids": sorted(
+            converted_tool_call_ids
+        ),
+    }
+    if removed_blank_assistant_count:
+        changes[
+            "google_adapter_codex_removed_blank_assistant_before_orphan_tool_result_count"
+        ] = removed_blank_assistant_count
+    return updated_kwargs, changes
+
+
 def _ensure_codex_google_code_assist_tool_results_have_calls(
     completion_kwargs: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -7933,6 +8094,12 @@ async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR
         )
         (
             completion_kwargs,
+            codex_orphan_tool_result_changes,
+        ) = _sanitize_codex_google_code_assist_orphan_tool_results(
+            completion_kwargs
+        )
+        (
+            completion_kwargs,
             codex_tool_pair_changes,
         ) = _ensure_codex_google_code_assist_tool_results_have_calls(
             completion_kwargs
@@ -7987,6 +8154,7 @@ async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR
         )
         openai_chat_shape_changes = {}
         codex_tool_pair_changes = {}
+        codex_orphan_tool_result_changes = {}
         codex_anthropic_tool_replay_changes = {}
         codex_openai_tool_call_id_changes = {}
     completion_kwargs, thinking_max_tokens_changes = _normalize_google_code_assist_thinking_max_tokens(
@@ -8129,6 +8297,7 @@ async def _build_google_code_assist_request_from_completion_kwargs(  # noqa: PLR
         **openai_chat_shape_changes,
         **codex_anthropic_tool_replay_changes,
         **codex_openai_tool_call_id_changes,
+        **codex_orphan_tool_result_changes,
         **codex_tool_pair_changes,
         **anthropic_native_tool_replay_changes,
         **reasoning_effort_policy_changes,
