@@ -637,36 +637,28 @@ class TestGeminiPassthroughLoggingHandler:
             "cacheCreationInputTokens"
         ] == 5
 
-    def test_antigravity_gemini_3_5_flash_low_uses_code_assist_quota(self):
-        assert (
-            GeminiPassthroughLoggingHandler._uses_antigravity_code_assist_quota(
-                model="gemini-3.5-flash-low",
-                custom_llm_provider="antigravity",
-            )
-            is True
-        )
-        assert (
-            GeminiPassthroughLoggingHandler._uses_antigravity_code_assist_quota(
-                model="claude-sonnet-4-6",
-                custom_llm_provider="antigravity",
-            )
-            is False
-        )
-        assert (
-            GeminiPassthroughLoggingHandler._uses_antigravity_code_assist_quota(
-                model="gemini-3.5-flash-low",
-                custom_llm_provider="gemini",
-            )
-            is False
-        )
+    def test_get_cost_lookup_model_provider_antigravity_mappings(self):
+        assert GeminiPassthroughLoggingHandler._get_cost_lookup_model_provider(
+            model="gemini-3.5-flash-low",
+            custom_llm_provider="antigravity",
+        ) == ("gemini-3.5-flash", "gemini")
+        assert GeminiPassthroughLoggingHandler._get_cost_lookup_model_provider(
+            model="claude-sonnet-4-6",
+            custom_llm_provider="antigravity",
+        ) == ("vertex_ai/claude-sonnet-4-6", "vertex_ai")
+        assert GeminiPassthroughLoggingHandler._get_cost_lookup_model_provider(
+            model="gemini-1.5-flash",
+            custom_llm_provider="gemini",
+        ) == ("gemini-1.5-flash", "gemini")
 
     @patch("litellm.completion_cost")
-    def test_handle_logging_antigravity_gemini_3_5_flash_low_no_cost_warning(
+    def test_handle_logging_antigravity_gemini_3_5_flash_low_uses_public_gemini_cost(
         self, mock_completion_cost, caplog
     ):
         import logging
 
         caplog.set_level(logging.WARNING)
+        mock_completion_cost.return_value = 0.000027
         mock_logging_obj = self._create_mock_logging_obj()
         chunk = "data: " + json.dumps(
             {
@@ -707,12 +699,19 @@ class TestGeminiPassthroughLoggingHandler:
         assert result["result"] is not None
         assert result["kwargs"]["model"] == "gemini-3.5-flash-low"
         assert result["kwargs"]["custom_llm_provider"] == "antigravity"
-        assert result["kwargs"]["response_cost"] == 0.0
+        assert result["kwargs"]["response_cost"] == 0.000027
         assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
             "totalTokenCount"
         ] == 13
-        assert mock_logging_obj.model_call_details["response_cost"] == 0.0
-        mock_completion_cost.assert_not_called()
+        assert mock_logging_obj.model_call_details["model"] == "gemini-3.5-flash-low"
+        assert (
+            mock_logging_obj.model_call_details["custom_llm_provider"]
+            == "antigravity"
+        )
+        assert mock_logging_obj.model_call_details["response_cost"] == 0.000027
+        mock_completion_cost.assert_called_once()
+        assert mock_completion_cost.call_args.kwargs["model"] == "gemini-3.5-flash"
+        assert mock_completion_cost.call_args.kwargs["custom_llm_provider"] == "gemini"
         assert (
             "Gemini-shaped passthrough cost calculation failed"
             not in caplog.text
