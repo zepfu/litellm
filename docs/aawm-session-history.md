@@ -483,3 +483,9 @@ Interpret this sanitizer as request-shape repair, not proof of model quality.
 Successful closure still requires the final provider status, token usage, and
 absence of provider error or rate-limit observation rows for the same
 `trace_id`/`session_id`.
+
+Codex/OpenCode and Codex/OpenRouter adapter probes call `litellm.acompletion`
+directly instead of routing through the proxy's common `route_request` helper.
+Those direct calls should still pass the proxy-owned shared aiohttp session when
+one is available, including candidate-unavailable and rate-limited probe paths,
+so failed candidate attempts do not create orphan per-request client sessions.
