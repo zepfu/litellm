@@ -637,6 +637,57 @@ class TestGeminiPassthroughLoggingHandler:
             "cacheCreationInputTokens"
         ] == 5
 
+    def test_build_complete_response_from_gemini_stream_chunks_uses_required_iterator_args(self):
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "gemini streamed"}],
+                            "role": "model",
+                        },
+                        "finishReason": "STOP",
+                        "index": 0,
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 2,
+                    "totalTokenCount": 12,
+                },
+            }
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrough_logging_handler.GeminiModelResponseIterator"
+        ) as mock_iterator_cls:
+            mock_iterator = MagicMock()
+            mock_stream_chunk = MagicMock()
+            mock_iterator._common_chunk_parsing_logic.return_value = mock_stream_chunk
+            mock_iterator.pending_model_response_chunks = []
+            mock_iterator.chunk_type = "valid_json"
+            mock_iterator.accumulated_json = ""
+            mock_iterator_cls.return_value = mock_iterator
+
+            with patch(
+                "litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrough_logging_handler.litellm.stream_chunk_builder",
+                return_value=MagicMock(),
+            ) as mock_stream_chunk_builder:
+                result = GeminiPassthroughLoggingHandler._build_complete_response_from_gemini_stream_chunks(
+                    all_chunks=[chunk, "data: [DONE]"],
+                    litellm_logging_obj=mock_logging_obj,
+                )
+
+        assert result is not None
+        mock_iterator_cls.assert_called_once_with(
+            streaming_response=None,
+            sync_stream=False,
+            logging_obj=mock_logging_obj,
+        )
+        assert mock_stream_chunk_builder.call_count == 1
+        assert len(mock_stream_chunk_builder.call_args.kwargs["chunks"]) >= 1
+
     def test_get_cost_lookup_model_provider_antigravity_mappings(self):
         assert GeminiPassthroughLoggingHandler._get_cost_lookup_model_provider(
             model="gemini-3.5-flash-low",
