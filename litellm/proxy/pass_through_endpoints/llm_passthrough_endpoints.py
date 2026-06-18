@@ -12117,6 +12117,18 @@ def _annotate_request_scope_for_adapted_access_log(
     scope["query_string"] = annotated_query.encode("utf-8", errors="replace")
 
 
+def _get_proxy_shared_aiohttp_session() -> Optional[Any]:
+    try:
+        from litellm.proxy.proxy_server import shared_aiohttp_session
+    except Exception:
+        return None
+    if shared_aiohttp_session is None:
+        return None
+    if getattr(shared_aiohttp_session, "closed", False):
+        return None
+    return shared_aiohttp_session
+
+
 def _serialize_anthropic_adapter_response(response_obj: Any) -> str:
     if hasattr(response_obj, "model_dump_json"):
         return response_obj.model_dump_json(exclude_none=True)
@@ -22732,6 +22744,7 @@ async def _handle_codex_opencode_zen_adapter_route(
                 "headers": dict(request.headers),
                 "body": request_body,
             },
+            shared_session=_get_proxy_shared_aiohttp_session(),
         )
     except Exception as exc:
         if (
@@ -22883,6 +22896,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
                 "headers": dict(request.headers),
                 "body": request_body,
             },
+            shared_session=_get_proxy_shared_aiohttp_session(),
         ),
     )
     if bool(request_body.get("stream")):

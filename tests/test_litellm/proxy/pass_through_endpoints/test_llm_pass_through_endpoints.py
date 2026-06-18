@@ -20226,6 +20226,45 @@ async def test_codex_opencode_zen_direct_route_keeps_billing_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_codex_opencode_zen_alias_probe_uses_proxy_shared_session(monkeypatch):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "opencode/deepseek-v4-flash",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    shared_session = object()
+    opencode_error = _build_opencode_zen_billing_error()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+        new=AsyncMock(return_value="opencode-test-key"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_proxy_shared_aiohttp_session",
+        return_value=shared_session,
+    ), patch(
+        "litellm.acompletion",
+        new=AsyncMock(side_effect=opencode_error),
+    ) as mock_completion:
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_codex_opencode_zen_adapter_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="deepseek-v4-flash",
+                use_alias_candidate_probe=True,
+            )
+
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    assert mock_completion.await_args.kwargs["shared_session"] is shared_session
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_factory",
     (
@@ -20576,6 +20615,7 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
         ],
         "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
     }
+    shared_session = object()
 
     async def fake_openrouter_completion_operation(*, adapter_model, operation):
         assert adapter_model == "deepseek/deepseek-v4-flash"
@@ -20588,6 +20628,9 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
         "litellm.acompletion",
         new=AsyncMock(return_value=success),
     ) as mock_acompletion, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_proxy_shared_aiohttp_session",
+        return_value=shared_session,
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
     ):
         response = await _handle_codex_auto_agent_alias_route(
@@ -20612,6 +20655,7 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
     assert acompletion_kwargs["model"] == "deepseek/deepseek-v4-flash"
     assert acompletion_kwargs["custom_llm_provider"] == "openrouter"
     assert acompletion_kwargs["api_base"] == "https://openrouter.ai/api/v1"
+    assert acompletion_kwargs["shared_session"] is shared_session
     assert acompletion_kwargs["messages"][0]["content"] == "hello"
     assert acompletion_kwargs["litellm_metadata"]["passthrough_route_family"] == (
         "codex_openrouter_completion_adapter"

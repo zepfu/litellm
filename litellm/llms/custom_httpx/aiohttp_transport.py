@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import inspect
 import os
 import ssl
 import typing
@@ -162,6 +163,59 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         if callable(client):
             self._client_factory = client
 
+    def _create_replacement_client_session(self) -> ClientSession:
+        if hasattr(self, "_client_factory") and callable(self._client_factory):
+            return self._client_factory()
+        self._owns_session = True
+        return ClientSession()
+
+    async def _close_owned_replaced_session(self, session: Any) -> None:
+        if not self._owns_session or getattr(session, "closed", False):
+            return
+        close = getattr(session, "close", None)
+        if not callable(close):
+            return
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            verbose_logger.debug(f"Error closing old session: {e}")
+
+    async def _get_valid_client_session_for_request(self) -> ClientSession:
+        """
+        Async request-path variant that awaits cleanup before replacing sessions.
+        """
+        if not isinstance(self.client, ClientSession):
+            self.client = self._create_replacement_client_session()
+
+        if self.client.closed:
+            verbose_logger.debug("Session is closed, creating new session")
+            old_session = self.client
+            await self._close_owned_replaced_session(old_session)
+            self.client = self._create_replacement_client_session()
+            return self.client
+
+        try:
+            session_loop = getattr(self.client, "_loop", None)
+            current_loop = asyncio.get_running_loop()
+
+            if (
+                session_loop is None
+                or session_loop != current_loop
+                or session_loop.is_closed()
+            ):
+                old_session = self.client
+                await self._close_owned_replaced_session(old_session)
+                self.client = self._create_replacement_client_session()
+
+        except (RuntimeError, AttributeError):
+            old_session = self.client
+            await self._close_owned_replaced_session(old_session)
+            self.client = self._create_replacement_client_session()
+
+        return self.client
+
     def _get_valid_client_session(self) -> ClientSession:
         """
         Helper to get a valid ClientSession for the current event loop.
@@ -173,20 +227,14 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
 
         # If we don't have a client or it's not a ClientSession, create one
         if not isinstance(self.client, ClientSession):
-            if hasattr(self, "_client_factory") and callable(self._client_factory):
-                self.client = self._client_factory()
-            else:
-                self.client = ClientSession()
+            self.client = self._create_replacement_client_session()
             # Don't return yet - check if the newly created session is valid
 
         # Check if the session itself is closed
         if self.client.closed:
             verbose_logger.debug("Session is closed, creating new session")
             # Create a new session
-            if hasattr(self, "_client_factory") and callable(self._client_factory):
-                self.client = self._client_factory()
-            else:
-                self.client = ClientSession()
+            self.client = self._create_replacement_client_session()
             return self.client
 
         # Check if the existing session is still valid for the current event loop
@@ -202,30 +250,25 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
             ):
                 # Close old session to prevent leaks
                 old_session = self.client
-                try:
-                    if not old_session.closed:
-                        try:
-                            asyncio.create_task(old_session.close())
-                        except RuntimeError:
-                            # Different event loop - can't schedule task, rely on GC
-                            verbose_logger.debug(
-                                "Old session from different loop, relying on GC"
-                            )
-                except Exception as e:
-                    verbose_logger.debug(f"Error closing old session: {e}")
+                if self._owns_session:
+                    try:
+                        if not old_session.closed:
+                            try:
+                                asyncio.create_task(old_session.close())
+                            except RuntimeError:
+                                # Different event loop - can't schedule task, rely on GC
+                                verbose_logger.debug(
+                                    "Old session from different loop, relying on GC"
+                                )
+                    except Exception as e:
+                        verbose_logger.debug(f"Error closing old session: {e}")
 
                 # Create a new session in the current event loop
-                if hasattr(self, "_client_factory") and callable(self._client_factory):
-                    self.client = self._client_factory()
-                else:
-                    self.client = ClientSession()
+                self.client = self._create_replacement_client_session()
 
         except (RuntimeError, AttributeError):
             # If we can't check the loop or session is invalid, recreate it
-            if hasattr(self, "_client_factory") and callable(self._client_factory):
-                self.client = self._client_factory()
-            else:
-                self.client = ClientSession()
+            self.client = self._create_replacement_client_session()
 
         return self.client
 
@@ -294,7 +337,7 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         sni_hostname = request.extensions.get("sni_hostname")
 
         # Use helper to ensure we have a valid session for the current event loop
-        client_session = self._get_valid_client_session()
+        client_session = await self._get_valid_client_session_for_request()
 
         # Resolve proxy settings from environment variables
         proxy = await self._get_proxy_settings(request)
@@ -319,10 +362,8 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                     f"Session closed during request, retrying with new session: {e}"
                 )
                 # Force creation of a new session
-                if hasattr(self, "_client_factory") and callable(self._client_factory):
-                    self.client = self._client_factory()
-                else:
-                    self.client = ClientSession()
+                await self._close_owned_replaced_session(self.client)
+                self.client = self._create_replacement_client_session()
                 client_session = self.client
 
                 # Retry the request with the new session

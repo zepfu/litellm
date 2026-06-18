@@ -124,7 +124,6 @@ async def test_transfer_encoding_error_no_httpx_read_error():
     # It should handle the error gracefully and just return what was received
     async for chunk in stream:
         received_chunks.append(chunk)
-    print(f"received_chunks: {received_chunks}")
 
     # Should have received the first chunk before the error
     assert received_chunks == [b"chunk1"]
@@ -513,6 +512,48 @@ async def test_handle_closed_session_before_request():
     response = await transport.handle_async_request(httpx.Request("GET", "http://example.com"))
 
     assert counts["sessions"] == 2  # Created 2 sessions: closed one, then open one
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_handle_stale_owned_session_awaits_close_before_replacement():
+    """Stale owned sessions should be closed before a replacement is used."""
+    old_session = aiohttp.ClientSession()
+    old_session._loop = object()  # type: ignore[attr-defined]
+    created = {"sessions": 0}
+    close_state = {"old_closed_before_replacement_request": None}
+
+    class ReplacementSession:
+        def __init__(self):
+            self.closed = False
+            self._loop = asyncio.get_running_loop()
+
+        def request(self, *args, **kwargs):
+            close_state["old_closed_before_replacement_request"] = old_session.closed
+            return _make_mock_response()
+
+        async def close(self):
+            self.closed = True
+
+    def factory():
+        created["sessions"] += 1
+        return ReplacementSession()
+
+    transport = LiteLLMAiohttpTransport(client=old_session)
+    transport._client_factory = factory
+
+    try:
+        response = await transport.handle_async_request(
+            httpx.Request("GET", "http://example.com")
+        )
+    finally:
+        await transport.aclose()
+        if not old_session.closed:
+            await old_session.close()
+
+    assert created["sessions"] == 1
+    assert close_state["old_closed_before_replacement_request"] is True
+    assert old_session.closed
     assert response.status_code == 200
 
 
