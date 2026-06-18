@@ -1269,6 +1269,65 @@ def capture_passthrough_shape(
     return _write_artifact(artifact) or diagnostic_path
 
 
+def _json_shape_payload(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_shape_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_shape_payload(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(exclude_none=True)
+            if isinstance(dumped, (Mapping, list, str, int, float, bool)) or dumped is None:
+                return _json_shape_payload(dumped)
+        except Exception:
+            pass
+    dict_method = getattr(value, "dict", None)
+    if callable(dict_method):
+        try:
+            dumped = dict_method(exclude_none=True)
+            if isinstance(dumped, (Mapping, list, str, int, float, bool)) or dumped is None:
+                return _json_shape_payload(dumped)
+        except Exception:
+            pass
+    return {"type": type(value).__name__}
+
+
+def capture_rerank_shape(
+    *,
+    url_route: Optional[str] = None,
+    request_body: Any = None,
+    response_body: Any = None,
+    litellm_call_id: Optional[str] = None,
+    extra_metadata: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    if not diagnostic_payload_capture_enabled():
+        return None
+    metadata: Dict[str, Any] = dict(extra_metadata or {})
+    metadata.setdefault("route_family", "rerank")
+    metadata.setdefault("endpoint_template", "/rerank")
+    response_payload = _json_shape_payload(response_body)
+    return _write_diagnostic_payload_artifact(
+        _diagnostic_payload_artifact(
+            mode="nonstream",
+            provider=str(metadata.get("custom_llm_provider") or "rerank"),
+            endpoint_type="rerank",
+            url_route=url_route,
+            request_body=request_body,
+            response=None,
+            upstream_request=None,
+            response_body=response_payload,
+            response_content=None,
+            all_chunks=None,
+            raw_bytes=None,
+            litellm_call_id=litellm_call_id,
+            extra_metadata=metadata,
+        )
+    )
+
+
 def capture_passthrough_stream_shape(
     *,
     provider: Optional[str],

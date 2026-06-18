@@ -1821,6 +1821,150 @@ class TestGoogleCodeAssistPrimeCache:
         assert mock_client.post.await_count == 3
 
 
+class TestGoogleCodeAssistDirectPreflightDiagnosticCapture:
+    @pytest.mark.asyncio
+    async def test_google_code_assist_load_project_writes_scoped_manifest(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        diagnostic_dir = tmp_path / "diagnostic"
+        _google_code_assist_project_cache.clear()
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", "1")
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENDPOINT_TEMPLATES",
+            "/v1internal:loadCodeAssist",
+        )
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR", str(diagnostic_dir))
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENVIRONMENT", "aawm-dev"
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post.return_value = httpx.Response(
+            200,
+            json={"cloudaicompanionProject": "raw-companion-project"},
+        )
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = mock_client
+        mock_context.__aexit__.return_value = False
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+            return_value=mock_context,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ):
+            project = await _get_or_load_google_code_assist_project(
+                "ya29.secret-access-token",
+                adapter_provider="gemini",
+            )
+
+        assert project == "raw-companion-project"
+        artifacts = sorted(diagnostic_dir.glob("*.json"))
+        assert len(artifacts) == 1
+        artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        rendered = json.dumps(artifact)
+        manifest = artifact["manifest"]
+        assert artifact["capture_kind"] == "aawm_diagnostic_payload_capture"
+        assert manifest["environment"] == "aawm-dev"
+        assert manifest["route_family"] == "gemini"
+        assert manifest["endpoint_template"] == "/v1internal:loadCodeAssist"
+        assert manifest["mode"] == "google_code_assist_loadCodeAssist"
+        assert manifest["redaction_mode"] == "shape_hash_manifest"
+        assert manifest["byte_counts"]["request_body_bytes"] > 0
+        assert manifest["byte_counts"]["response_content_bytes"] > 0
+        assert manifest["hashes"]["request_body_sha256"]
+        assert manifest["hashes"]["response_body_sha256"]
+        assert "request.body.raw" in manifest["omitted_fields"]
+        assert artifact["metadata"]["direct_google_code_assist_preflight"] is True
+        assert artifact["metadata"]["code_assist_adapter_provider"] == "gemini"
+        assert "raw-companion-project" not in rendered
+        assert "ya29.secret-access-token" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_google_code_assist_prime_preflight_writes_scoped_manifests(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        diagnostic_dir = tmp_path / "diagnostic"
+        _google_code_assist_prime_until_monotonic_by_key.clear()
+        _google_code_assist_prime_quota_by_key.clear()
+        monkeypatch.setenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS", "300")
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", "1")
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ROUTE_FAMILIES", "antigravity"
+        )
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR", str(diagnostic_dir))
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENVIRONMENT", "aawm-dev"
+        )
+
+        async def post_response(url, *_args, **_kwargs):
+            if "retrieveUserQuota" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "remainingRequests": 1499,
+                        "totalRequests": 1500,
+                        "project": "raw-project-id",
+                    },
+                )
+            return httpx.Response(200, json={"status": "ok"})
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = post_response
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = mock_client
+        mock_context.__aexit__.return_value = False
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
+            return_value=mock_context,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+        ):
+            quota = await _prime_google_code_assist_session(
+                "agy-secret-access-token",
+                "raw-companion-project",
+                adapter_provider="antigravity",
+            )
+
+        assert quota == {
+            "remainingRequests": 1499,
+            "totalRequests": 1500,
+            "source": "antigravity_retrieve_user_quota",
+        }
+        artifacts = sorted(diagnostic_dir.glob("*.json"))
+        assert len(artifacts) == 3
+        for artifact_path in artifacts:
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            rendered = json.dumps(artifact)
+            manifest = artifact["manifest"]
+            assert artifact["capture_kind"] == "aawm_diagnostic_payload_capture"
+            assert manifest["environment"] == "aawm-dev"
+            assert manifest["route_family"] == "antigravity"
+            assert manifest["mode"] == "google_code_assist_preflight"
+            assert manifest["redaction_mode"] == "shape_hash_manifest"
+            assert manifest["hashes"]["request_body_sha256"]
+            assert manifest["hashes"]["response_body_sha256"]
+            assert artifact["metadata"]["direct_google_code_assist_preflight"] is True
+            assert artifact["metadata"]["code_assist_adapter_provider"] == "antigravity"
+            assert artifact["metadata"]["preflight_endpoint"] in {
+                "retrieveUserQuota",
+                "fetchAdminControls",
+                "listExperiments",
+            }
+            assert "raw-project-id" not in rendered
+            assert "agy-secret-access-token" not in rendered
+            assert "raw-companion-project" not in rendered
+
+
 class TestGoogleCodeAssistProjectCache:
     @pytest.mark.asyncio
     async def test_google_code_assist_project_cache_serializes_concurrent_loads(
