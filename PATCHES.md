@@ -2875,6 +2875,45 @@ verify D1-305 hidden-retry symbols before archiving `.analysis/prod-error.log`.
 
 ---
 
+### aawm.84 — Passthrough error classification and Gemini adapter hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.84` and includes
+the post-`aawm.83` passthrough hardening batch. Native OpenAI/Codex
+passthrough now classifies ChatGPT/Codex HTML block pages as
+`openai_chatgpt_codex_block_page` and suppresses the oversized traceback
+payload for that known provider-side response. The Codex auto-agent native
+OpenAI path now leaves transient pre-first-byte retry handling to the shared
+pass-through retry loop while still exposing `429` as the retryable upstream
+status. Antigravity Gemini Code Assist paths now price `gemini-3.5-flash-low`
+against public Gemini 3.5 Flash cost metadata, repair final Google
+function-call turn adjacency before egress, and own transient
+`500/502/503/504/529` hidden retries when the adapter must bypass the shared
+pass-through retry loop. This line also carries the low-alias routing,
+Langfuse compaction, diagnostic capture, and Grok side-channel error-context
+commits already landed on `develop` after `aawm.83`.
+
+**Why:** Prod error intake showed ChatGPT/Codex HTML block pages and Codex read
+timeouts as generic active traceback failures. Dev error intake also showed
+Antigravity Gemini pricing gaps, streaming iterator regressions,
+function-call adjacency `400`s, and a `503 UNAVAILABLE` that needed
+adapter-owned retry metadata because Code Assist paths set
+`caller_managed_hidden_retry`.
+
+**Why not upstream:** This is AAWM-specific pass-through classification,
+ChatGPT/Codex account-route handling, Antigravity Gemini Code Assist request
+repair, local cost attribution, Langfuse/event fitting policy, and runtime
+error-intake hygiene.
+
+**Validation status:** Focused dev tests passed for ChatGPT/Codex block-page
+classification, Codex native OpenAI shared transient retry wiring, Gemini
+function-call adjacency repair, Gemini public-cost fallback, and Google adapter
+transient `503` retry metadata. Dev `litellm-dev` was recreated after the
+D1-329/D1-331 fixes and reported healthy on `:4001`. Publish
+`v1.82.3-aawm.84`, then promote through the normal prod `:4000` process and
+verify prod error-intake cleanup for the D1-329 ChatGPT/Codex records.
+
+---
+
 ### aawm.82 — Post-callback-autobump release candidate retag
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.82` on top of the
