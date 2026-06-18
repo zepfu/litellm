@@ -3810,18 +3810,8 @@ class TestPassThroughTerminalFailureLogging:
         )
         assert "RuntimeError: unexpected passthrough failure" in payload["traceback"]
 
-    @pytest.mark.asyncio
-    async def test_pass_through_request_grok_signals_401_writes_redacted_jsonl_intake_d1_311(  # noqa: PLR0915
-        self,
-        monkeypatch,
-        tmp_path,
-    ):
+    def _build_grok_signals_401_fixture(self, upstream_detail: str):
         session_id = "019ed451-dddf-70d3-a2f9-9e3547b93358"
-        upstream_detail = (
-            '{"error":"Invalid or expired credentials '
-            '(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, '
-            'upstream=PermissionDenied, reason=no auth context)"}'
-        )
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
         mock_request.url = (
@@ -3844,7 +3834,6 @@ class TestPassThroughTerminalFailureLogging:
             content=upstream_detail.encode("utf-8"),
             request=httpx.Request("POST", target_url),
         )
-        handler = AsyncMock(return_value=upstream_response)
         passthrough_logging_metadata = {
             "client_name": "grok-build",
             "passthrough_route_family": "grok_cli_chat_proxy",
@@ -3864,7 +3853,102 @@ class TestPassThroughTerminalFailureLogging:
                 "secretField": "str",
             },
         }
+        return {
+            "session_id": session_id,
+            "request": mock_request,
+            "raw_body_length": raw_body_length,
+            "target_url": target_url,
+            "upstream_response": upstream_response,
+            "passthrough_logging_metadata": passthrough_logging_metadata,
+        }
 
+    @pytest.mark.asyncio
+    async def test_pass_through_request_known_grok_signals_auth_context_warns_without_traceback(  # noqa: PLR0915
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        upstream_detail = (
+            '{"error":"Invalid or expired credentials '
+            '(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, '
+            'upstream=PermissionDenied, reason=no auth context)"}'
+        )
+        fixture = self._build_grok_signals_401_fixture(upstream_detail)
+        handler = AsyncMock(return_value=fixture["upstream_response"])
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(),
+            ) as mock_sleep, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+                new=AsyncMock(),
+            ) as mock_direct_capture, patch.object(
+                verbose_proxy_logger,
+                "warning",
+            ) as mock_warning:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    side_effect=lambda **kwargs: kwargs["data"]
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=fixture["request"],
+                        target=fixture["target_url"],
+                        custom_headers={"authorization": "Bearer stale-grok-token"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                        custom_llm_provider="xai",
+                        caller_managed_hidden_retry=True,
+                        retryable_upstream_status_codes=[500, 502, 503, 504],
+                        raw_body_passthrough=True,
+                        passthrough_logging_metadata=fixture[
+                            "passthrough_logging_metadata"
+                        ],
+                    )
+
+                assert exc_info.value.code == "401"
+                assert handler.await_count == 1
+                mock_sleep.assert_not_awaited()
+                mock_logging_obj.post_call_failure_hook.assert_not_awaited()
+                mock_direct_capture.assert_not_awaited()
+                mock_warning.assert_called_once()
+                assert (
+                    mock_warning.call_args.kwargs["extra"]["failure_kind"]
+                    == "degraded_grok_signals_auth_context"
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert not (tmp_path / "dev-error.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_unexpected_grok_signals_401_keeps_redacted_jsonl_intake(  # noqa: PLR0915
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        upstream_detail = '{"error":"grok signals authorization failed"}'
+        fixture = self._build_grok_signals_401_fixture(upstream_detail)
+        handler = AsyncMock(return_value=fixture["upstream_response"])
         saved_handlers, saved_level, saved_propagate = (
             self._install_aawm_error_log_handler(tmp_path, monkeypatch)
         )
@@ -3894,8 +3978,8 @@ class TestPassThroughTerminalFailureLogging:
 
                 with pytest.raises(ProxyException) as exc_info:
                     await pass_through_request(
-                        request=mock_request,
-                        target=target_url,
+                        request=fixture["request"],
+                        target=fixture["target_url"],
                         custom_headers={"authorization": "Bearer stale-grok-token"},
                         user_api_key_dict=MagicMock(),
                         stream=False,
@@ -3903,7 +3987,9 @@ class TestPassThroughTerminalFailureLogging:
                         caller_managed_hidden_retry=True,
                         retryable_upstream_status_codes=[500, 502, 503, 504],
                         raw_body_passthrough=True,
-                        passthrough_logging_metadata=passthrough_logging_metadata,
+                        passthrough_logging_metadata=fixture[
+                            "passthrough_logging_metadata"
+                        ],
                     )
 
                 assert exc_info.value.code == "401"
@@ -3952,22 +4038,21 @@ class TestPassThroughTerminalFailureLogging:
             context["grok_side_channel_request_content_type"]
             == "application/json"
         )
-        assert context["grok_side_channel_request_body_byte_length"] == raw_body_length
         assert (
-            context["grok_side_channel_request_body_digest_source"] == "raw_body"
+            context["grok_side_channel_request_body_byte_length"]
+            == fixture["raw_body_length"]
         )
-        assert (
-            context["grok_side_channel_request_json_container_type"] == "array"
-        )
+        assert context["grok_side_channel_request_body_digest_source"] == "raw_body"
+        assert context["grok_side_channel_request_json_container_type"] == "array"
         assert context["grok_side_channel_request_array_length"] == 2
 
         serialized_context = json.dumps(context)
-        assert session_id not in serialized_context
+        assert fixture["session_id"] not in serialized_context
         assert "body-hash-should-not-log" not in serialized_context
         assert "secretField" not in serialized_context
         assert "grok_side_channel_request_body_sha256" not in serialized_context
         assert "grok_side_channel_request_top_level_key_types" not in serialized_context
-        assert "no auth context" in payload["message"]
+        assert "grok signals authorization failed" in payload["message"]
 
 
 class TestPassThroughHiddenRetry:
