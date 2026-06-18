@@ -171,6 +171,21 @@ instead of the concrete Grok session URL. For example, a failed
 `/grok/v1/sessions/{session_id}/signals` and
 `https://cli-chat-proxy.grok.com/v1/sessions/{session_id}/signals`.
 
+Known Grok Build `/signals` auth-context `401` responses are a
+separate degraded telemetry class. When the upstream body contains all of:
+`Invalid or expired credentials`, `x_xai_token_auth=xai-grok-cli`, and
+`no auth context`, LiteLLM still returns the upstream `401` to the client but
+logs a warning with `failure_kind=degraded_grok_signals_auth_context` instead of
+emitting traceback-style active error intake. This is intentional operational
+policy: the side-channel call is often stale or missing native Grok CLI auth
+context and should not keep reopening `.analysis/*-error.jsonl` for the same
+fingerprint.
+
+Unexpected `/signals` `401` bodies, other Grok side-channel `401`/`404`
+failures, and any data-bearing side-channel error that does not match that known
+auth-context shape still use the normal failure logging path and remain visible
+for triage.
+
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact
 support: https://langfuse.com/support.`), LiteLLM keeps the original message and
