@@ -637,6 +637,87 @@ class TestGeminiPassthroughLoggingHandler:
             "cacheCreationInputTokens"
         ] == 5
 
+    def test_antigravity_gemini_3_5_flash_low_uses_code_assist_quota(self):
+        assert (
+            GeminiPassthroughLoggingHandler._uses_antigravity_code_assist_quota(
+                model="gemini-3.5-flash-low",
+                custom_llm_provider="antigravity",
+            )
+            is True
+        )
+        assert (
+            GeminiPassthroughLoggingHandler._uses_antigravity_code_assist_quota(
+                model="claude-sonnet-4-6",
+                custom_llm_provider="antigravity",
+            )
+            is False
+        )
+        assert (
+            GeminiPassthroughLoggingHandler._uses_antigravity_code_assist_quota(
+                model="gemini-3.5-flash-low",
+                custom_llm_provider="gemini",
+            )
+            is False
+        )
+
+    @patch("litellm.completion_cost")
+    def test_handle_logging_antigravity_gemini_3_5_flash_low_no_cost_warning(
+        self, mock_completion_cost, caplog
+    ):
+        import logging
+
+        caplog.set_level(logging.WARNING)
+        mock_logging_obj = self._create_mock_logging_obj()
+        chunk = "data: " + json.dumps(
+            {
+                "traceId": "trace-antigravity-gemini-low",
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": "antigravity gemini low"}],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 3,
+                        "totalTokenCount": 13,
+                    },
+                },
+            }
+        )
+
+        result = GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route="https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            request_body={"model": "gemini-3.5-flash-low"},
+            endpoint_type=MagicMock(),
+            start_time=self.start_time,
+            all_chunks=[chunk, "data: [DONE]"],
+            model="gemini-3.5-flash-low",
+            end_time=self.end_time,
+            custom_llm_provider="antigravity",
+        )
+
+        assert result["result"] is not None
+        assert result["kwargs"]["model"] == "gemini-3.5-flash-low"
+        assert result["kwargs"]["custom_llm_provider"] == "antigravity"
+        assert result["kwargs"]["response_cost"] == 0.0
+        assert result["kwargs"]["litellm_params"]["metadata"]["usage_object"][
+            "totalTokenCount"
+        ] == 13
+        assert mock_logging_obj.model_call_details["response_cost"] == 0.0
+        mock_completion_cost.assert_not_called()
+        assert (
+            "Gemini-shaped passthrough cost calculation failed"
+            not in caplog.text
+        )
+
     @patch("litellm.completion_cost")
     def test_handle_logging_antigravity_collected_chunks_preserves_usage_and_cost(
         self, mock_completion_cost
