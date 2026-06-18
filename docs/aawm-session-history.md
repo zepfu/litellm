@@ -348,6 +348,25 @@ headers, request bodies, response bodies, stream chunks, prompts, tool
 arguments, OAuth tokens, API keys, cookies, concrete session ids, and local file
 content must not be copied into `session_history.metadata`.
 
+Google Code Assist / Antigravity bootstrap preflight calls in
+`litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py` already use
+that same direct diagnostic capture path for `v1internal:loadCodeAssist` and the
+prime preflight endpoints. Those artifacts are exact-scope gated, local-only,
+and shape/hash-only unless the separate full-payload capture opt-in is enabled.
+They must not be treated as `session_history` rows or copied into
+`session_history.metadata`.
+
+Native `/rerank` diagnostic manifests use route family `rerank` and endpoint
+template `/rerank`. They are local scoped artifacts only; rerank query text,
+input documents, returned document text, raw headers, and raw bodies must not be
+copied into `session_history.metadata`.
+
+AssemblyAI transcript polling and Vertex AI Live websocket diagnostics require
+route-specific manifests before they can be durable enough for investigation.
+Do not copy polling transcript text, websocket messages, or raw websocket
+lifecycle payloads into `session_history.metadata`; only store explicit
+shape/hash summaries after those route-specific capture surfaces exist.
+
 ## Codex Tool-Description Patches
 
 AAWM Codex and Claude Code adapter paths may patch advertised tool descriptions
