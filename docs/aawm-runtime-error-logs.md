@@ -65,6 +65,14 @@ Practical `context` fields to inspect are:
 - `queue_maxsize`
 - `coroutine_name`
 - `worker_delivery_state`
+- `grok_side_channel`
+- `grok_side_channel_endpoint_type`
+- `grok_side_channel_endpoint_path_template`
+- `grok_side_channel_request_content_type`
+- `grok_side_channel_request_body_byte_length`
+- `grok_side_channel_request_body_digest_source`
+- `grok_side_channel_request_json_container_type`
+- `grok_side_channel_request_array_length`
 
 Pass-through upstream failures populate this context from safe route metadata.
 For both main pass-through exceptions and streaming chunk-processor exceptions,
@@ -155,6 +163,13 @@ safe scalar side-channel descriptors from passthrough metadata, such as
 body digests, top-level key maps, auth headers, credential payloads, and concrete
 session ids so stale-session and no-auth-context errors remain diagnosable
 without leaking client state.
+
+When `grok_side_channel_endpoint_path_template` is available, generic
+`endpoint` and `upstream_url` values in JSONL context use the template path
+instead of the concrete Grok session URL. For example, a failed
+`/grok/v1/sessions/<id>/signals` request records
+`/grok/v1/sessions/{session_id}/signals` and
+`https://cli-chat-proxy.grok.com/v1/sessions/{session_id}/signals`.
 
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact

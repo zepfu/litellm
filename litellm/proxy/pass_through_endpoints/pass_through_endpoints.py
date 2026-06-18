@@ -1067,7 +1067,11 @@ def _build_passthrough_error_log_grok_side_channel_context(
     return context
 
 
-def _build_passthrough_error_log_endpoint(request: Request) -> Optional[str]:
+def _build_passthrough_error_log_endpoint(
+    request: Request,
+    *,
+    grok_side_channel_endpoint_path_template: Optional[str] = None,
+) -> Optional[str]:
     request_url = getattr(request, "url", None)
     parsed_url = urlparse(str(request_url or ""))
     path = parsed_url.path
@@ -1077,6 +1081,14 @@ def _build_passthrough_error_log_endpoint(request: Request) -> Optional[str]:
             getattr(request_url, "path", None)
         )
         path = direct_path or "/"
+
+    if grok_side_channel_endpoint_path_template:
+        if path.startswith("/grok/v1/"):
+            path = f"/grok/v1{grok_side_channel_endpoint_path_template}"
+        elif path.startswith("/v1/"):
+            path = f"/v1{grok_side_channel_endpoint_path_template}"
+        else:
+            path = grok_side_channel_endpoint_path_template
 
     safe_query_pairs: list[tuple[str, str]] = []
     for key, value in dict(getattr(request, "query_params", {}) or {}).items():
@@ -1095,6 +1107,8 @@ def _build_passthrough_error_log_endpoint(request: Request) -> Optional[str]:
 
 def _build_passthrough_error_log_upstream_url(
     url: Optional[httpx.URL],
+    *,
+    grok_side_channel_endpoint_path_template: Optional[str] = None,
 ) -> Optional[str]:
     if url is None:
         return None
@@ -1104,7 +1118,13 @@ def _build_passthrough_error_log_upstream_url(
         host = parsed_url.hostname
         if parsed_url.port is not None:
             host = f"{host}:{parsed_url.port}"
-        return f"{parsed_url.scheme}://{host}{parsed_url.path or '/'}"
+        path = parsed_url.path or "/"
+        if grok_side_channel_endpoint_path_template:
+            if path.startswith("/v1/"):
+                path = f"/v1{grok_side_channel_endpoint_path_template}"
+            else:
+                path = grok_side_channel_endpoint_path_template
+        return f"{parsed_url.scheme}://{host}{path}"
     return _clean_passthrough_error_context_value(str(url))
 
 
@@ -1148,11 +1168,26 @@ def _build_passthrough_error_log_context(
         _AAWM_PASSTHROUGH_ERROR_LOG_PROVIDER_METADATA_KEYS,
     )
 
+    grok_side_channel_context: Dict[str, Any] = {}
+    if isinstance(passthrough_logging_metadata, dict):
+        grok_side_channel_context = _build_passthrough_error_log_grok_side_channel_context(
+            passthrough_logging_metadata
+        )
+    grok_side_channel_endpoint_path_template = _clean_passthrough_error_context_value(
+        grok_side_channel_context.get("grok_side_channel_endpoint_path_template")
+    )
+
     context = {
         "source": "pass_through_endpoint",
         "container": _clean_passthrough_error_context_value(os.getenv("HOSTNAME")),
-        "endpoint": _build_passthrough_error_log_endpoint(request),
-        "upstream_url": _build_passthrough_error_log_upstream_url(url),
+        "endpoint": _build_passthrough_error_log_endpoint(
+            request,
+            grok_side_channel_endpoint_path_template=grok_side_channel_endpoint_path_template,
+        ),
+        "upstream_url": _build_passthrough_error_log_upstream_url(
+            url,
+            grok_side_channel_endpoint_path_template=grok_side_channel_endpoint_path_template,
+        ),
         "provider": provider,
         "model": model,
         "model_alias": _first_passthrough_error_context_value(
@@ -1172,12 +1207,7 @@ def _build_passthrough_error_log_context(
             litellm_call_id
         ),
     }
-    if isinstance(passthrough_logging_metadata, dict):
-        context.update(
-            _build_passthrough_error_log_grok_side_channel_context(
-                passthrough_logging_metadata
-            )
-        )
+    context.update(grok_side_channel_context)
     return context
 
 
