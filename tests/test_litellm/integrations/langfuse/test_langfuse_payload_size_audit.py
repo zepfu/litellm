@@ -1,7 +1,11 @@
+import json
 import logging
 from copy import deepcopy
 
 from litellm.integrations.langfuse.langfuse import (
+    _LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV,
+    _LANGFUSE_INPUT_SUMMARY_TYPE,
+    _build_langfuse_input_shape_hash_summary,
     _build_langfuse_payload_size_summary,
     _fit_langfuse_generation_params_to_event_size,
     _json_size_bytes,
@@ -717,3 +721,323 @@ def test_langfuse_still_too_large_after_fitting_reports_fail_closed(caplog) -> N
     assert "event_fit_failed" in logged_text
     assert "generation-fail-closed-core" not in logged_text
     assert "small input" not in logged_text
+
+def _build_sensitive_langfuse_input_samples():
+    return {
+        "string": "start-secret prompt text " + ("x" * 1200) + " end",
+        "list": [
+            {
+                "role": "system",
+                "content": "system prompt with /home/zepfu/projects/litellm/secret.py",
+            },
+            *[
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": [
+                        {"type": "text", "text": "user prompt secret text " + ("x" * 320)},
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "arguments": {"command": "cat /etc/passwd"},
+                        },
+                    ],
+                }
+                for index in range(24)
+            ],
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": "tool output secret text",
+                    }
+                ],
+            },
+        ],
+        "dict": {
+            "instructions": "dict prompt secret text " + ("y" * 2000),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "message secret text " + ("z" * 1500),
+                }
+                for _ in range(12)
+            ],
+            "headers": {
+                "authorization": "Bearer sk-secret-token",
+                "cookie": "session=secret-cookie",
+                "api_key": "sk-secret-api-key",
+            },
+            "source": "def secret_function():\n    return 'source secret'",
+            "file_content": "local file secret content",
+        },
+    }
+
+
+def test_langfuse_input_shape_hash_mode_disabled_keeps_default_truncation(monkeypatch) -> None:
+    monkeypatch.delenv(_LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV, raising=False)
+    samples = {
+        "string": "start-" + ("secret prompt text " * 500) + "-end",
+        "list": [
+            {"role": "system", "content": "system marker"},
+            *[
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": f"list item {index} " + ("x" * 320),
+                }
+                for index in range(24)
+            ],
+            {"role": "assistant", "content": "tail marker"},
+        ],
+        "dict": {
+            "instructions": "dict prompt secret text " + ("y" * 2000),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "message secret text " + ("z" * 1500),
+                }
+                for _ in range(12)
+            ],
+        },
+    }
+
+    for container_type, original_input in samples.items():
+        generation_params = {
+            "id": f"generation-default-fit-{container_type}",
+            "name": "aawm.large",
+            "model": "gpt-test",
+            "input": original_input,
+            "output": {"content": "output survives unchanged"},
+            "metadata": {"route": "aawm-code"},
+        }
+        max_event_size_bytes = {
+            "string": 1_200,
+            "list": 2_000,
+            "dict": 1_200,
+        }[container_type]
+
+        fitted_params, truncation_summary = _fit_langfuse_generation_params_to_event_size(
+            generation_params,
+            max_event_size_bytes=max_event_size_bytes,
+        )
+
+        assert truncation_summary is not None
+        assert truncation_summary["input_truncated"] is True
+        assert truncation_summary.get("input_shape_hash_summary") is not True
+        fitted_input = fitted_params["input"]
+        if container_type == "string":
+            assert isinstance(fitted_input, str)
+            assert "litellm_langfuse_input_truncated" in fitted_input
+        elif container_type == "list":
+            assert isinstance(fitted_input, list)
+            assert any(
+                isinstance(item, dict)
+                and item.get("type") == "litellm_langfuse_input_truncated"
+                for item in fitted_input
+            )
+        else:
+            assert isinstance(fitted_input, dict)
+            assert fitted_input.get("type") == "litellm_langfuse_input_truncated"
+
+
+def test_langfuse_input_shape_hash_mode_replaces_string_list_and_dict_inputs(monkeypatch) -> None:
+    monkeypatch.setenv(_LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV, "1")
+    samples = _build_sensitive_langfuse_input_samples()
+
+    for container_type, original_input in samples.items():
+        generation_params = {
+            "id": f"generation-shape-{container_type}",
+            "name": "aawm.large",
+            "model": "gpt-test",
+            "input": original_input,
+            "output": "small output",
+            "metadata": {"route": "aawm-code"},
+        }
+
+        max_event_size_bytes = {
+            "string": 700,
+            "list": 2_000,
+            "dict": 1_200,
+        }[container_type]
+        fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+            generation_params,
+            max_event_size_bytes=max_event_size_bytes,
+        )
+
+        assert fit_summary is not None
+        summary_input = fitted_params["input"]
+        assert isinstance(summary_input, dict)
+        assert summary_input["type"] == _LANGFUSE_INPUT_SUMMARY_TYPE
+        assert summary_input["container_type"] == container_type
+        assert summary_input["hash"]
+        assert summary_input["original_size_bytes"] > summary_input["final_size_bytes"]
+        assert summary_input["item_count"] > 0
+        assert summary_input["omitted_items"] >= 0
+        assert summary_input["raw_reconstruction"]["source"] == "not_available_by_default"
+        assert fit_summary["input_shape_hash_summary"] is True
+        assert fit_summary["input_truncated"] is False
+
+        summary_text = str(summary_input)
+        assert "secret prompt text" not in summary_text
+        assert "user prompt secret text" not in summary_text
+        assert "tool output secret text" not in summary_text
+        assert "dict prompt secret text" not in summary_text
+        assert "message secret text" not in summary_text
+        assert "local file secret content" not in summary_text
+        assert "source secret" not in summary_text
+        assert "sk-secret-token" not in summary_text
+        assert "secret-cookie" not in summary_text
+        assert "sk-secret-api-key" not in summary_text
+        assert "/home/zepfu/projects/litellm/secret.py" not in summary_text
+        assert "instructions" not in summary_text
+        assert "messages" not in summary_text
+        assert "file_content" not in summary_text
+        assert "authorization" not in summary_text
+        assert "Bash" not in summary_text
+        assert "call-0" not in summary_text
+        assert "call_id" not in summary_text
+        if container_type in {"list", "dict"}:
+            assert "key_descriptor" in summary_text
+            assert "key_hash" in summary_text
+
+
+def test_langfuse_input_shape_hash_mode_logs_do_not_leak_raw_input(caplog, monkeypatch) -> None:
+    monkeypatch.setenv(_LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV, "1")
+    generation_params = {
+        "id": "generation-shape-log",
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": "raw input should not appear" + ("x" * 5_000),
+        "output": "small output",
+        "metadata": {"repository": "litellm"},
+    }
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        generation_params,
+        max_event_size_bytes=1_000,
+    )
+
+    assert fit_summary is not None
+    with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
+        _log_langfuse_payload_size_if_needed(
+            fitted_params,
+            trace_id="trace-shape-log",
+            call_type="completion",
+            input_truncation_summary=fit_summary,
+        )
+
+    logged_text = '\n'.join(record.getMessage() for record in caplog.records)
+    assert "Langfuse event size audit below SDK limit before enqueue" in logged_text
+    assert "input_shape_hash_summary" in logged_text
+    assert "raw input should not appear" not in logged_text
+
+
+class _CustomReprObject:
+    def __repr__(self) -> str:
+        return "CUSTOM_REPR_SECRET_VALUE"
+
+
+def test_langfuse_input_shape_hash_summary_omits_raw_keys_identifiers_and_repr(monkeypatch) -> None:
+    monkeypatch.setenv(_LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV, "1")
+    original_input = {
+        "instructions": "dict prompt secret text " + ("y" * 2000),
+        "messages": [
+            {
+                "role": "user",
+                "id": "message-id-secret-123",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "call_id": "call-secret-456",
+                        "arguments": {"command": "cat /etc/passwd"},
+                    }
+                ],
+            }
+        ],
+        "custom_object": _CustomReprObject(),
+    }
+    summary = _build_langfuse_input_shape_hash_summary(
+        original_input,
+        original_input_size_bytes=_json_size_bytes(original_input),
+        metadata=None,
+    )
+    summary_text = str(summary)
+
+    assert summary["type"] == _LANGFUSE_INPUT_SUMMARY_TYPE
+    assert "instructions" not in summary_text
+    assert "messages" not in summary_text
+    assert "Bash" not in summary_text
+    assert "message-id-secret-123" not in summary_text
+    assert "call-secret-456" not in summary_text
+    assert "CUSTOM_REPR_SECRET_VALUE" not in summary_text
+    assert "key_descriptor" in summary_text
+    assert "key_hash" in summary_text
+    assert '"preview"' not in json.dumps(summary, default=str, sort_keys=True)
+
+    generation_params = {
+        "id": "generation-shape-privacy",
+        "name": "aawm.large",
+        "model": "gpt-test",
+        "input": original_input,
+        "output": "small output",
+        "metadata": {"repository": "litellm"},
+    }
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        generation_params,
+        max_event_size_bytes=1_200,
+    )
+    assert fit_summary is not None
+    assert fit_summary["input_shape_hash_summary"] is True
+    fitted_text = str(fitted_params["input"])
+    assert "Bash" not in fitted_text
+    assert "call-secret-456" not in fitted_text
+    assert "CUSTOM_REPR_SECRET_VALUE" not in fitted_text
+
+
+def test_langfuse_input_shape_hash_summary_handles_single_key_dict(monkeypatch) -> None:
+    monkeypatch.setenv(_LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV, "1")
+    original_input = {"one_secret_key": "one secret value"}
+
+    summary = _build_langfuse_input_shape_hash_summary(
+        original_input,
+        original_input_size_bytes=_json_size_bytes(original_input),
+        metadata=None,
+    )
+
+    assert summary["type"] == _LANGFUSE_INPUT_SUMMARY_TYPE
+    assert summary["head"]
+    assert summary["tail"]
+    summary_text = str(summary)
+    assert "one_secret_key" not in summary_text
+    assert "one secret value" not in summary_text
+
+
+def test_langfuse_input_shape_hash_reconstruction_status_variants(monkeypatch) -> None:
+    samples = _build_sensitive_langfuse_input_samples()
+    original_input = samples["list"]
+
+    default_summary = _build_langfuse_input_shape_hash_summary(
+        original_input,
+        original_input_size_bytes=_json_size_bytes(original_input),
+        metadata=None,
+    )
+    assert default_summary["raw_reconstruction"]["source"] == "not_available_by_default"
+    assert default_summary["raw_reconstruction"]["cold_storage_object_key_present"] is False
+    assert default_summary["raw_reconstruction"]["full_payload_capture_required"] is False
+
+    cold_storage_summary = _build_langfuse_input_shape_hash_summary(
+        original_input,
+        original_input_size_bytes=_json_size_bytes(original_input),
+        metadata={"cold_storage_object_key": "s3://bucket/object.json"},
+    )
+    assert cold_storage_summary["raw_reconstruction"]["source"] == "cold_storage_object_key"
+    assert cold_storage_summary["raw_reconstruction"]["cold_storage_object_key_present"] is True
+
+    monkeypatch.setenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", "1")
+    full_payload_summary = _build_langfuse_input_shape_hash_summary(
+        original_input,
+        original_input_size_bytes=_json_size_bytes(original_input),
+        metadata=None,
+    )
+    assert full_payload_summary["raw_reconstruction"]["source"] == "full_payload_capture_required"
+    assert full_payload_summary["raw_reconstruction"]["full_payload_capture_required"] is True
