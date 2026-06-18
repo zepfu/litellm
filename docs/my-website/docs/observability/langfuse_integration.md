@@ -69,6 +69,23 @@ response = litellm.completion(
 )
 ```
 
+### AAWM compaction savings telemetry
+
+LiteLLM can emit bounded Langfuse payload-size audit logs before SDK enqueue.
+Those logs may include `compaction_savings_audit`, which summarizes measured
+pre/post byte savings per compaction family without logging raw request content.
+
+Interpret the audit like this:
+
+- `already_handled`: metadata already compacted by the D1-238/D1-314 guardrails.
+- `remaining_candidate`: a generation field still had to be fitted to the
+  Langfuse event-size limit, usually `input`.
+- `no_op`: unchanged or non-candidate fields.
+
+This is diagnostic telemetry for operators and maintainers. It is not a raw
+payload capture surface and does not include prompts, tool arguments, header
+values, or local file content.
+
 ### Advanced
 #### Set Custom Generation Names, pass Metadata
 

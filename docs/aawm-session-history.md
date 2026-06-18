@@ -388,11 +388,25 @@ field itself is already close to the configured Langfuse event-size threshold.
 
 The Langfuse payload-size regression tests include a post-D1-314 guardrail
 fixture that classifies event pressure into `already_handled`,
-`remaining_candidate`, and `unchanged` buckets. That fixture is an
-observability guardrail for the current compaction contract: the already-handled
-metadata fields should stay compact, unchanged small fields should remain
-unchanged, and any residual oversized pressure in the representative fixture
-should be attributed to `input` rather than re-expanded metadata.
+`remaining_candidate`, and `no_op` buckets via
+`_build_langfuse_compaction_savings_audit()`. That helper is bounded diagnostic
+telemetry only: each entry reports `family`, `field`, `original_size_bytes`,
+`final_size_bytes`, `saved_bytes`, `saved_ratio`, `mode`, `strategy`, and
+`classification` without raw prompts, tool arguments, header values, or local
+file content.
+
+Read the audit as follows:
+
+- `already_handled`: D1-238/D1-314 metadata compactors already reduced the field.
+  These savings are expected and should not be reopened as new compaction TODOs.
+- `remaining_candidate`: oversized generation fields still reduced by the
+  event-size fitter, usually `input` after metadata compaction.
+- `no_op`: unchanged or non-candidate fields with no measured savings.
+
+When a Langfuse payload-size audit log is emitted, the JSON summary may include
+`compaction_savings_audit` with `classification_counts`, `totals`, and bounded
+`entries`. Use it to tell whether a warning is input-dominated or a metadata
+regression, not to recover raw request content.
 
 ## Diagnostic Payload Capture Boundary
 

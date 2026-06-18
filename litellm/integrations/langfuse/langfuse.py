@@ -788,6 +788,375 @@ def _compact_langfuse_claude_tool_compaction_events(value: Any) -> Dict[str, Any
     return summary
 
 
+_LANGFUSE_METADATA_COMPACTOR_FIELD_NAMES = (
+    "prompt_overhead_component_paths",
+    "prompt_overhead_excluded_component_paths",
+    "codex_response_headers",
+    "responses_stream_tool_state",
+    "claude_tool_advertisement_compaction_events",
+)
+_LANGFUSE_COMPACTION_SAVINGS_AUDIT_ENTRY_LIMIT = 32
+
+
+def _langfuse_compaction_saved_ratio(
+    *, original_size_bytes: int, final_size_bytes: int
+) -> Optional[float]:
+    if original_size_bytes <= 0:
+        return None
+    saved_bytes = max(0, original_size_bytes - final_size_bytes)
+    if saved_bytes <= 0:
+        return 0.0
+    return round(saved_bytes / original_size_bytes, 4)
+
+
+def _langfuse_compaction_savings_entry(
+    *,
+    family: str,
+    field: str,
+    original_size_bytes: int,
+    final_size_bytes: int,
+    classification: str,
+    mode: str,
+    strategy: Optional[str] = None,
+) -> Dict[str, Any]:
+    saved_bytes = max(0, original_size_bytes - final_size_bytes)
+    entry: Dict[str, Any] = {
+        "family": family,
+        "field": field,
+        "original_size_bytes": original_size_bytes,
+        "final_size_bytes": final_size_bytes,
+        "saved_bytes": saved_bytes,
+        "saved_ratio": _langfuse_compaction_saved_ratio(
+            original_size_bytes=original_size_bytes,
+            final_size_bytes=final_size_bytes,
+        ),
+        "mode": mode,
+        "classification": classification,
+    }
+    if strategy is not None:
+        entry["strategy"] = strategy
+    return entry
+
+
+def _langfuse_metadata_compactors() -> Dict[str, Callable[[Any], Any]]:
+    return {
+        "prompt_overhead_component_paths": lambda value: _compact_langfuse_path_list_metadata(
+            field_name="prompt_overhead_component_paths",
+            value=value,
+        ),
+        "prompt_overhead_excluded_component_paths": lambda value: _compact_langfuse_path_list_metadata(
+            field_name="prompt_overhead_excluded_component_paths",
+            value=value,
+        ),
+        "codex_response_headers": _compact_langfuse_codex_response_headers,
+        "responses_stream_tool_state": _compact_langfuse_responses_stream_tool_state,
+        "claude_tool_advertisement_compaction_events": _compact_langfuse_claude_tool_compaction_events,
+    }
+
+
+def _is_langfuse_metadata_compacted_summary(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("type") == _AAWM_LANGFUSE_METADATA_COMPACTED_TYPE
+    )
+
+
+def _compact_langfuse_generation_metadata_for_enqueue(metadata: Any) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+
+    compacted_metadata = dict(metadata)
+    compacted_metadata.pop(_AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY, None)
+
+    compactors = _langfuse_metadata_compactors()
+    for metadata_key, compactor in compactors.items():
+        if metadata_key in compacted_metadata:
+            if _is_langfuse_metadata_compacted_summary(compacted_metadata[metadata_key]):
+                continue
+            compacted_metadata[metadata_key] = compactor(
+                compacted_metadata[metadata_key]
+            )
+
+    return compacted_metadata
+
+
+def _langfuse_metadata_compaction_field_entry(
+    *,
+    field_name: str,
+    original_value: Any,
+    compactor: Callable[[Any], Any],
+) -> Dict[str, Any]:
+    if _is_langfuse_metadata_compacted_summary(original_value):
+        raw_original_size = original_value.get("original_size_bytes")
+        original_size_bytes = (
+            int(raw_original_size)
+            if isinstance(raw_original_size, (int, float))
+            else _json_size_bytes(original_value)
+        )
+        final_size_bytes = _json_size_bytes(original_value)
+        classification = (
+            "already_handled"
+            if final_size_bytes < original_size_bytes
+            else "no_op"
+        )
+        return _langfuse_compaction_savings_entry(
+            family=f"metadata.{field_name}",
+            field=field_name,
+            original_size_bytes=original_size_bytes,
+            final_size_bytes=final_size_bytes,
+            classification=classification,
+            mode="metadata_compaction",
+            strategy=str(original_value.get("type")),
+        )
+
+    compacted_value = compactor(original_value)
+    original_size_bytes = _json_size_bytes(original_value)
+    final_size_bytes = _json_size_bytes(compacted_value)
+    if final_size_bytes >= original_size_bytes:
+        classification = "no_op"
+        strategy = "unchanged"
+    else:
+        classification = "already_handled"
+        strategy = (
+            compacted_value.get("type")
+            if isinstance(compacted_value, dict)
+            else _AAWM_LANGFUSE_METADATA_COMPACTED_TYPE
+        )
+    return _langfuse_compaction_savings_entry(
+        family=f"metadata.{field_name}",
+        field=field_name,
+        original_size_bytes=original_size_bytes,
+        final_size_bytes=final_size_bytes,
+        classification=classification,
+        mode="metadata_compaction",
+        strategy=strategy,
+    )
+
+
+def _langfuse_compaction_audit_identifiers(
+    generation_params: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = generation_params.get("metadata")
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    identifiers: Dict[str, Any] = {
+        "generation_id": _langfuse_summary_identifier(generation_params.get("id")),
+        "generation_name": _langfuse_summary_identifier(generation_params.get("name")),
+        "model": _langfuse_summary_identifier(generation_params.get("model")),
+    }
+    for metadata_key in (
+        "custom_llm_provider",
+        "user_api_key_alias",
+        "user_api_key_team_alias",
+        "route_family",
+        "model_alias",
+        "litellm_model_name",
+    ):
+        value = metadata_dict.get(metadata_key)
+        if value is not None and value != "":
+            identifiers[metadata_key] = _langfuse_summary_identifier(value)
+    return identifiers
+
+
+def _build_langfuse_compaction_savings_audit(  # noqa: PLR0915
+    generation_params: Dict[str, Any],
+    *,
+    trace_id: Optional[str] = None,
+    call_type: Optional[str] = None,
+    fit_summary: Optional[Dict[str, Any]] = None,
+    max_event_size_bytes: Optional[int] = None,
+    input_shape_hash_only: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Return bounded compaction savings evidence without raw payload values."""
+
+    original_metadata = generation_params.get("metadata")
+    original_metadata_dict = (
+        original_metadata if isinstance(original_metadata, dict) else {}
+    )
+    compacted_metadata = _compact_langfuse_generation_metadata_for_enqueue(
+        original_metadata_dict
+    )
+    compacted_params = {
+        **generation_params,
+        "metadata": compacted_metadata,
+    }
+
+    fitted_params = compacted_params
+    resolved_fit_summary = fit_summary
+    if resolved_fit_summary is None:
+        fitted_params, resolved_fit_summary = _fit_langfuse_generation_params_to_event_size(
+            compacted_params,
+            max_event_size_bytes=max_event_size_bytes,
+            input_shape_hash_only=input_shape_hash_only,
+        )
+
+    entries: List[Dict[str, Any]] = []
+    classification_counts = {
+        "already_handled": 0,
+        "remaining_candidate": 0,
+        "no_op": 0,
+    }
+    totals = {
+        "already_handled_saved_bytes": 0,
+        "remaining_candidate_saved_bytes": 0,
+    }
+    entry_count = 0
+
+    def append_entry(entry: Dict[str, Any]) -> None:
+        nonlocal entry_count
+        entry_count += 1
+        classification = str(entry.get("classification"))
+        if classification in classification_counts:
+            classification_counts[classification] += 1
+        saved_bytes = int(entry.get("saved_bytes") or 0)
+        if classification == "already_handled":
+            totals["already_handled_saved_bytes"] += saved_bytes
+        elif classification == "remaining_candidate":
+            totals["remaining_candidate_saved_bytes"] += saved_bytes
+        if len(entries) >= _LANGFUSE_COMPACTION_SAVINGS_AUDIT_ENTRY_LIMIT:
+            return
+        entries.append(entry)
+
+    original_metadata_size = _json_size_bytes(original_metadata_dict)
+    compacted_metadata_size = _json_size_bytes(compacted_metadata)
+    metadata_classification = (
+        "already_handled"
+        if compacted_metadata_size < original_metadata_size
+        else "no_op"
+    )
+    append_entry(
+        _langfuse_compaction_savings_entry(
+            family="metadata",
+            field="metadata",
+            original_size_bytes=original_metadata_size,
+            final_size_bytes=compacted_metadata_size,
+            classification=metadata_classification,
+            mode="metadata_compaction",
+            strategy=(
+                _AAWM_LANGFUSE_METADATA_COMPACTED_TYPE
+                if metadata_classification == "already_handled"
+                else "unchanged"
+            ),
+        )
+    )
+
+    compactors = _langfuse_metadata_compactors()
+    for field_name in _LANGFUSE_METADATA_COMPACTOR_FIELD_NAMES:
+        if field_name not in original_metadata_dict:
+            continue
+        append_entry(
+            _langfuse_metadata_compaction_field_entry(
+                field_name=field_name,
+                original_value=original_metadata_dict[field_name],
+                compactor=compactors[field_name],
+            )
+        )
+
+    handled_metadata_fields = set(_LANGFUSE_METADATA_COMPACTOR_FIELD_NAMES)
+    for field_name, field_value in original_metadata_dict.items():
+        if field_name in handled_metadata_fields:
+            continue
+        original_size_bytes = _json_size_bytes(field_value)
+        final_size_bytes = _json_size_bytes(compacted_metadata.get(field_name))
+        if final_size_bytes != original_size_bytes:
+            continue
+        append_entry(
+            _langfuse_compaction_savings_entry(
+                family=f"metadata.{field_name}",
+                field=field_name,
+                original_size_bytes=original_size_bytes,
+                final_size_bytes=final_size_bytes,
+                classification="no_op",
+                mode="metadata_passthrough",
+                strategy="unchanged",
+            )
+        )
+
+    field_truncations = (
+        resolved_fit_summary.get("field_truncations", [])
+        if isinstance(resolved_fit_summary, dict)
+        else []
+    )
+    for field_summary in field_truncations:
+        if not isinstance(field_summary, dict):
+            continue
+        field_name = str(field_summary.get("field") or "")
+        if not field_name:
+            continue
+        original_size_bytes = int(field_summary.get("original_size_bytes") or 0)
+        final_size_bytes = int(field_summary.get("final_size_bytes") or 0)
+        strategy = str(field_summary.get("strategy") or "truncated")
+        if field_name == "input":
+            classification = "remaining_candidate"
+            mode = "event_size_fit"
+        elif field_name in {"metadata", "model_parameters"}:
+            classification = "remaining_candidate"
+            mode = "event_size_fit"
+        else:
+            classification = (
+                "remaining_candidate"
+                if final_size_bytes < original_size_bytes
+                else "no_op"
+            )
+            mode = "event_size_fit"
+        append_entry(
+            _langfuse_compaction_savings_entry(
+                family=field_name,
+                field=field_name,
+                original_size_bytes=original_size_bytes,
+                final_size_bytes=final_size_bytes,
+                classification=classification,
+                mode=mode,
+                strategy=strategy,
+            )
+        )
+
+    if not field_truncations:
+        original_input_size = _json_size_bytes(generation_params.get("input"))
+        final_input_size = _json_size_bytes(fitted_params.get("input"))
+        if original_input_size > 0:
+            classification = (
+                "remaining_candidate"
+                if final_input_size < original_input_size
+                else "no_op"
+            )
+            append_entry(
+                _langfuse_compaction_savings_entry(
+                    family="input",
+                    field="input",
+                    original_size_bytes=original_input_size,
+                    final_size_bytes=final_input_size,
+                    classification=classification,
+                    mode="event_size_fit",
+                    strategy="unchanged" if classification == "no_op" else None,
+                )
+            )
+
+    audit = {
+        "trace_id": trace_id,
+        "call_type": call_type,
+        "identifiers": _langfuse_compaction_audit_identifiers(generation_params),
+        "classification_counts": classification_counts,
+        "totals": totals,
+        "entries": entries,
+        "entry_count": entry_count,
+        "retained_entry_count": len(entries),
+        "dropped_entry_count": max(0, entry_count - len(entries)),
+        "entries_truncated": entry_count > len(entries),
+        "event_fit_failed": bool(
+            isinstance(resolved_fit_summary, dict)
+            and resolved_fit_summary.get("event_fit_failed")
+        ),
+    }
+    if isinstance(resolved_fit_summary, dict):
+        audit["event_fit_target_bytes"] = resolved_fit_summary.get(
+            "event_fit_target_bytes"
+        )
+        audit["final_total_size_bytes"] = resolved_fit_summary.get(
+            "final_total_size_bytes"
+        )
+    return audit
+
+
 def _sanitize_metadata_key_for_size_audit(key: Any) -> str:
     key_text = str(key)
     key_lower = key_text.lower()
@@ -1335,6 +1704,15 @@ def _build_langfuse_payload_size_summary(
     }
     if input_truncation_summary is not None:
         summary.update(input_truncation_summary)
+
+    if total_size_bytes >= threshold_bytes or input_truncation_summary is not None:
+        summary["compaction_savings_audit"] = _build_langfuse_compaction_savings_audit(
+            generation_params,
+            trace_id=trace_id,
+            call_type=call_type,
+            fit_summary=input_truncation_summary,
+            max_event_size_bytes=max_bytes,
+        )
     return summary
 
 
@@ -2762,27 +3140,4 @@ def log_requester_metadata(clean_metadata: dict):
 def _strip_langfuse_generation_metadata(full_metadata: dict) -> dict:
     """Return Langfuse generation metadata without bulky durable snapshots."""
 
-    if not isinstance(full_metadata, dict):
-        return {}
-
-    compacted_metadata = dict(full_metadata)
-    compacted_metadata.pop(_AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY, None)
-
-    compactors = {
-        "prompt_overhead_component_paths": lambda value: _compact_langfuse_path_list_metadata(
-            field_name="prompt_overhead_component_paths",
-            value=value,
-        ),
-        "prompt_overhead_excluded_component_paths": lambda value: _compact_langfuse_path_list_metadata(
-            field_name="prompt_overhead_excluded_component_paths",
-            value=value,
-        ),
-        "codex_response_headers": _compact_langfuse_codex_response_headers,
-        "responses_stream_tool_state": _compact_langfuse_responses_stream_tool_state,
-        "claude_tool_advertisement_compaction_events": _compact_langfuse_claude_tool_compaction_events,
-    }
-    for metadata_key, compactor in compactors.items():
-        if metadata_key in compacted_metadata:
-            compacted_metadata[metadata_key] = compactor(compacted_metadata[metadata_key])
-
-    return compacted_metadata
+    return _compact_langfuse_generation_metadata_for_enqueue(full_metadata)
