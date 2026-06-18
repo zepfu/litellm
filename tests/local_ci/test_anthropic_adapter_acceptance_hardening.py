@@ -188,6 +188,48 @@ D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
     ("anthropic", "claude-sonnet-4-6"),
 }
 
+D1322_LOW_ALIAS_REPLAY_CASES = (
+    "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
+    "native_openai_passthrough_responses_codex_aawm_low_tool_activity",
+)
+D1322_OPENROUTER_COMPLETION_CASES = {
+    "claude_adapter_openrouter_north_mini_completion_adapter_smoke": {
+        "requested_model": "openrouter/cohere/north-mini-code:free",
+        "adapter_model": "cohere/north-mini-code:free",
+        "candidate_order": 1,
+    },
+    "claude_adapter_openrouter_owl_alpha_completion_adapter_smoke": {
+        "requested_model": "openrouter/owl-alpha",
+        "adapter_model": "owl-alpha",
+        "candidate_order": 2,
+    },
+}
+D1322_LOW_ANTHROPIC_ALIAS_REPLAY_CASE = (
+    "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools"
+)
+D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT = (
+    "harness-aawm-low-anthropic-alias-parallel-read-tools"
+)
+D1322_CODEX_LOW_ALIAS_REPLAY_CASE = (
+    "native_openai_passthrough_responses_codex_aawm_low_tool_activity"
+)
+D1322_AAWM_LOW_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
+    ("antigravity", "gemini-3.5-flash-low"),
+    ("openrouter", "openrouter/cohere/north-mini-code:free"),
+    ("openrouter", "openrouter/owl-alpha"),
+    ("opencode_zen", "deepseek-v4-flash"),
+    ("opencode_zen", "big-pickle"),
+    ("anthropic", "claude-haiku-4-5-20251001"),
+}
+D1322_AAWM_LOW_CODEX_DECLARED_PROVIDER_MODELS = {
+    ("antigravity", "gemini-3.5-flash-low"),
+    ("openrouter", "openrouter/cohere/north-mini-code:free"),
+    ("openrouter", "openrouter/owl-alpha"),
+    ("opencode_zen", "deepseek-v4-flash"),
+    ("opencode_zen", "big-pickle"),
+    ("openai", "gpt-5.4-mini"),
+}
+
 REMOVED_GEMINI_HARNESS_CASES = {
     "native_gemini_passthrough_generate_content",
     "native_gemini_passthrough_stream_generate_content",
@@ -1578,7 +1620,12 @@ def test_anthropic_adapter_config_removes_gemini_harness_cases():
 
     assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["cases"])
     assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["default_excluded_cases"])
-    serialized_cases = json.dumps(config["cases"]).lower()
+    cases_without_d1322_antigravity_low = {
+        name: case_config
+        for name, case_config in config["cases"].items()
+        if name not in D1322_LOW_ALIAS_REPLAY_CASES
+    }
+    serialized_cases = json.dumps(cases_without_d1322_antigravity_low).lower()
     serialized_excluded_cases = json.dumps(config["default_excluded_cases"]).lower()
     for forbidden_selector in ("gemini", "google/gemma", "google_code_assist"):
         assert forbidden_selector not in serialized_cases
@@ -1589,6 +1636,14 @@ def test_active_anthropic_adapter_harness_surfaces_do_not_include_gemini_paths()
     violations = []
     for path in ACTIVE_ANTHROPIC_HARNESS_SURFACES:
         text = path.read_text(encoding="utf-8").lower()
+        if path == ANTHROPIC_ADAPTER_CONFIG_PATH:
+            config = json.loads(path.read_text(encoding="utf-8"))
+            config["cases"] = {
+                name: case_config
+                for name, case_config in config["cases"].items()
+                if name not in D1322_LOW_ALIAS_REPLAY_CASES
+            }
+            text = json.dumps(config).lower()
         for snippet in FORBIDDEN_ACTIVE_GEMINI_HARNESS_SNIPPETS:
             if snippet in text:
                 violations.append(f"{path.relative_to(ROOT)} contains {snippet}")
@@ -2136,6 +2191,191 @@ def test_d1251_parallel_read_cases_cover_expected_aawm_anthropic_target_matrix()
                 in required_tags
             )
 
+
+
+
+def test_d1322_low_alias_replay_cases_are_opt_in_and_do_not_require_staging_env():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name in D1322_LOW_ALIAS_REPLAY_CASES:
+        assert case_name in config["cases"]
+        assert case_name in config["default_excluded_cases"]
+        assert "required_env" not in config["cases"][case_name]
+
+
+def test_d1322_openrouter_completion_adapter_cases_are_opt_in_and_target_chat_completions():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name, expected in D1322_OPENROUTER_COMPLETION_CASES.items():
+        assert case_name in config["cases"]
+        assert case_name in config["default_excluded_cases"]
+        case_config = config["cases"][case_name]
+        assert case_config["verification_alias"] == "aawm-low-anthropic"
+        assert case_config["verification_candidate_order"] == expected[
+            "candidate_order"
+        ]
+        assert (
+            case_config["verification_candidate_label"]
+            == "direct-openrouter-completion-adapter"
+        )
+        assert (
+            case_config["http_request"]["json"]["model"]
+            == expected["requested_model"]
+        )
+        assert set(case_config["required_trace_tags"]) >= {
+            "route:anthropic_messages",
+            "route:anthropic_openrouter_completion_adapter",
+            "anthropic-openrouter-completion-adapter",
+            f"anthropic-adapter-model:{expected['adapter_model']}",
+            "anthropic-adapter-target:openrouter:/v1/chat/completions",
+        }
+        session_history = case_config["session_history_validation"]
+        assert session_history["expected_provider"] == "openrouter"
+        assert session_history["expected_model"] == expected["requested_model"]
+        assert session_history["metadata_required_equals"] == {
+            "tenant_id": "adapter-harness-tenant",
+            "anthropic_adapter_model": expected["adapter_model"],
+            "anthropic_adapter_original_model": expected["requested_model"],
+            "anthropic_adapter_target_endpoint": "openrouter:/v1/chat/completions",
+            "passthrough_route_family": "anthropic_openrouter_completion_adapter",
+        }
+        assert case_config["allow_zero_cost"] is True
+        assert case_config["skip_generation_quality_checks"] is True
+
+
+def test_d1322_low_anthropic_alias_replay_case_uses_aawm_low_anthropic_child_model_and_declared_targets():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][D1322_LOW_ANTHROPIC_ALIAS_REPLAY_CASE]
+
+    _assert_parallel_read_common_case(
+        config=config,
+        case_name=D1322_LOW_ANTHROPIC_ALIAS_REPLAY_CASE,
+        case_config=case_config,
+        agent_name=D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT,
+        provider="antigravity",
+        model="gemini-3.5-flash-low",
+        durable_tool_names={"read_file", "glob", "grep_search"},
+    )
+
+    agent_config = case_config["claude_agents"][D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT]
+    assert agent_config["model"] == "aawm-low-anthropic"
+    assert case_config["verification_alias"] == "aawm-low-anthropic"
+    assert case_config["verification_candidate_order"] == -1
+    assert case_config["verification_candidate_label"] == "alias-replay"
+    declared_candidates = case_config["verification_declared_candidates"]
+    assert {
+        (row["provider"], row["model"]) for row in declared_candidates
+    } == D1322_AAWM_LOW_ANTHROPIC_DECLARED_PROVIDER_MODELS
+    assert [row["candidate_order"] for row in declared_candidates] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert set(case_config["required_trace_tags"]) >= {
+        "route:anthropic_messages",
+        "model-alias:aawm-low-anthropic",
+        "anthropic-auto-agent-alias:aawm-low-anthropic",
+    }
+    assert "passthrough_route_family" in case_config[
+        "required_generation_metadata_truthy"
+    ]
+    assert case_config["allow_zero_cost"] is True
+
+    session_expected_rows = case_config["session_history_validation"]["expected_rows"]
+    assert len(session_expected_rows) == 1
+    assert session_expected_rows[0]["metadata_required_equals"] == {
+        "model_alias_label": "aawm-low-anthropic",
+        "requested_model_alias": "aawm-low-anthropic",
+        "anthropic_auto_agent_alias": "aawm-low-anthropic",
+    }
+    assert set(session_expected_rows[0]["metadata_required_truthy"]) == {
+        "anthropic_auto_agent_selected_provider",
+        "anthropic_auto_agent_selected_model",
+        "anthropic_auto_agent_selected_route_family",
+        "aawm_alias_routing_audit_events",
+    }
+    declared_provider_values = set(
+        session_expected_rows[0]["required_one_of"]["provider"]
+    )
+    declared_model_values = set(session_expected_rows[0]["required_one_of"]["model"])
+    assert declared_provider_values == {
+        provider for provider, _ in D1322_AAWM_LOW_ANTHROPIC_DECLARED_PROVIDER_MODELS
+    }
+    assert declared_model_values == {
+        model for _, model in D1322_AAWM_LOW_ANTHROPIC_DECLARED_PROVIDER_MODELS
+    }
+
+
+def test_d1322_codex_low_alias_replay_case_uses_aawm_low_and_declared_targets():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_name = D1322_CODEX_LOW_ALIAS_REPLAY_CASE
+    case_config = config["cases"][case_name]
+
+    assert case_name in config["default_excluded_cases"]
+    assert case_config["cli_passthrough"] == "codex"
+    assert case_config["verification_alias"] == "aawm-low"
+    assert case_config["verification_candidate_order"] == -1
+    assert case_config["verification_candidate_label"] == "alias-replay"
+    declared_candidates = case_config["verification_declared_candidates"]
+    assert {
+        (row["provider"], row["model"]) for row in declared_candidates
+    } == D1322_AAWM_LOW_CODEX_DECLARED_PROVIDER_MODELS
+    assert [row["candidate_order"] for row in declared_candidates] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+
+    command = case_config["command"]
+    model_index = command.index("-m") + 1
+    assert command[model_index] == "aawm-low"
+    assert "pwd" in command[-1]
+    assert case_config["match_trace_session_id_from_stdout"] is False
+    assert set(case_config["required_trace_tags"]) == {
+        "model-alias:aawm-low",
+        "codex-auto-agent-alias:aawm-low",
+    }
+    assert case_config["required_generation_metadata_truthy"] == [
+        "passthrough_route_family"
+    ]
+    assert case_config["allow_zero_cost"] is True
+
+    session_expected_rows = case_config["session_history_validation"]["expected_rows"]
+    assert len(session_expected_rows) == 1
+    assert session_expected_rows[0]["metadata_required_equals"] == {
+        "model_alias_label": "aawm-low",
+        "requested_model_alias": "aawm-low",
+        "codex_auto_agent_alias": "aawm-low",
+    }
+    assert set(session_expected_rows[0]["metadata_required_truthy"]) == {
+        "codex_auto_agent_selected_provider",
+        "codex_auto_agent_selected_model",
+        "codex_auto_agent_selected_route_family",
+        "aawm_alias_routing_audit_events",
+    }
+    assert session_expected_rows[0]["required_contains"] == {"repository": "litellm"}
+    declared_provider_values = set(
+        session_expected_rows[0]["required_one_of"]["provider"]
+    )
+    declared_model_values = set(session_expected_rows[0]["required_one_of"]["model"])
+    assert declared_provider_values == {
+        provider for provider, _ in D1322_AAWM_LOW_CODEX_DECLARED_PROVIDER_MODELS
+    }
+    assert declared_model_values == {
+        model for _, model in D1322_AAWM_LOW_CODEX_DECLARED_PROVIDER_MODELS
+    }
+
+    tool_row = case_config["tool_activity_validation"]["expected_rows"][0]
+    assert tool_row["tool_name"] == "exec_command"
+    assert tool_row["command_text_contains"] == "pwd"
+    assert set(tool_row["required_one_of"]["provider"]) == declared_provider_values
+    assert set(tool_row["required_one_of"]["model"]) == declared_model_values
 
 def test_d1256_alias_replay_case_uses_aawm_code_anthropic_child_model_and_declared_targets():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))

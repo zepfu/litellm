@@ -499,26 +499,32 @@ class GeminiPassthroughLoggingHandler:
         )
 
         response_cost = None
-        try:
-            cost_model, cost_provider = (
-                GeminiPassthroughLoggingHandler._get_cost_lookup_model_provider(
-                    model=model,
-                    custom_llm_provider=custom_llm_provider,
+        if GeminiPassthroughLoggingHandler._uses_antigravity_code_assist_quota(
+            model=model,
+            custom_llm_provider=custom_llm_provider,
+        ):
+            response_cost = 0.0
+        else:
+            try:
+                cost_model, cost_provider = (
+                    GeminiPassthroughLoggingHandler._get_cost_lookup_model_provider(
+                        model=model,
+                        custom_llm_provider=custom_llm_provider,
+                    )
                 )
-            )
-            response_cost = litellm.completion_cost(
-                completion_response=litellm_model_response,
-                model=cost_model,
-                custom_llm_provider=cost_provider,
-            )
-        except Exception as exc:
-            verbose_proxy_logger.warning(
-                "Gemini-shaped passthrough cost calculation failed for "
-                "model=%s custom_llm_provider=%s: %s",
-                model,
-                custom_llm_provider,
-                exc,
-            )
+                response_cost = litellm.completion_cost(
+                    completion_response=litellm_model_response,
+                    model=cost_model,
+                    custom_llm_provider=cost_provider,
+                )
+            except Exception as exc:
+                verbose_proxy_logger.warning(
+                    "Gemini-shaped passthrough cost calculation failed for "
+                    "model=%s custom_llm_provider=%s: %s",
+                    model,
+                    custom_llm_provider,
+                    exc,
+                )
 
         apply_passthrough_logging_contract(
             litellm_response=litellm_model_response,
@@ -545,3 +551,11 @@ class GeminiPassthroughLoggingHandler:
         if custom_llm_provider == "antigravity" and model.startswith("claude-"):
             return f"vertex_ai/{model}", "vertex_ai"
         return model, "gemini"
+
+    @staticmethod
+    def _uses_antigravity_code_assist_quota(
+        *,
+        model: str,
+        custom_llm_provider: str,
+    ) -> bool:
+        return custom_llm_provider == "antigravity" and model.startswith("gemini-")
