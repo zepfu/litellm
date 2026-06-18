@@ -11,6 +11,137 @@ from litellm.integrations.langfuse.langfuse import (
 )
 
 
+def _build_candidate_heavy_langfuse_metadata() -> dict:
+    return {
+        "prompt_overhead_component_paths": {
+            "system": [f"input.instructions.{index}" for index in range(30)],
+            "tools": [f"tools.{index}.function.parameters" for index in range(60)],
+            "conversation": [f"input.messages.{index}.content" for index in range(40)],
+        },
+        "prompt_overhead_excluded_component_paths": [
+            f"metadata.hidden_state.{index}.payload" for index in range(80)
+        ],
+        "codex_response_headers": {
+            "source": "codex_response_headers",
+            "x-codex-active-limit": "codex",
+            "x-codex-bengalfox-limit-name": "gpt-5.5",
+            "x-request-id": "req-sensitive-id",
+            **{f"x-extra-header-{index}": "value" * 20 for index in range(40)},
+        },
+        "responses_stream_tool_state": [
+            {
+                "type": "function_call",
+                "name": "Bash",
+                "call_id": f"call-{index}",
+                "arguments": "secret argument text " * 100,
+            }
+            for index in range(20)
+        ],
+        "claude_tool_advertisement_compaction_events": [
+            {
+                "tool_name": "Bash",
+                "status": "compacted",
+                "cc_version": "1.2.3",
+                "original_chars": 3000,
+                "compacted_chars": 1000,
+                "saved_chars": 2000,
+                "details": "audit detail " * 200,
+            }
+            for _ in range(10)
+        ],
+        "tags": ["aawm", "codex", "langfuse-size-guardrail"],
+        "responses_stream_event_counts": {
+            "response.created": 1,
+            "response.output_item.added": 20,
+            "response.completed": 1,
+        },
+        "responses_stream_event_types": [
+            "response.created",
+            "response.output_item.added",
+            "response.completed",
+        ],
+    }
+
+
+def _build_post_d1_314_compaction_evidence(generation_params: dict) -> dict:
+    original_metadata = generation_params["metadata"]
+    compacted_metadata = _strip_langfuse_generation_metadata(original_metadata)
+    compacted_params = {
+        **generation_params,
+        "metadata": compacted_metadata,
+    }
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        compacted_params,
+        max_event_size_bytes=24_000,
+    )
+    handled_fields = (
+        "prompt_overhead_component_paths",
+        "prompt_overhead_excluded_component_paths",
+        "codex_response_headers",
+        "responses_stream_tool_state",
+        "claude_tool_advertisement_compaction_events",
+    )
+    unchanged_fields = (
+        "output",
+        "tags",
+        "responses_stream_event_counts",
+        "responses_stream_event_types",
+    )
+    return {
+        "already_handled": {
+            "metadata": {
+                "original_size_bytes": _json_size_bytes(original_metadata),
+                "final_size_bytes": _json_size_bytes(compacted_metadata),
+            },
+            **{
+                field: {
+                    "original_size_bytes": _json_size_bytes(
+                        original_metadata.get(field)
+                    ),
+                    "final_size_bytes": _json_size_bytes(
+                        compacted_metadata.get(field)
+                    ),
+                    "summary_type": (
+                        compacted_metadata.get(field, {}).get("type")
+                        if isinstance(compacted_metadata.get(field), dict)
+                        else None
+                    ),
+                }
+                for field in handled_fields
+            },
+        },
+        "remaining_candidate": {
+            "input": {
+                "original_size_bytes": _json_size_bytes(generation_params["input"]),
+                "final_size_bytes": _json_size_bytes(fitted_params["input"]),
+                "input_truncated": bool(
+                    fit_summary and fit_summary.get("input_truncated")
+                ),
+            }
+        },
+        "unchanged": {
+            field: {
+                "original_size_bytes": _json_size_bytes(
+                    (
+                        generation_params.get(field)
+                        if field == "output"
+                        else original_metadata.get(field)
+                    )
+                ),
+                "final_size_bytes": _json_size_bytes(
+                    (
+                        fitted_params.get(field)
+                        if field == "output"
+                        else compacted_metadata.get(field)
+                    )
+                ),
+            }
+            for field in unchanged_fields
+        },
+        "fit_summary": fit_summary,
+    }
+
+
 def test_langfuse_payload_size_summary_ignores_normal_payload() -> None:
     generation_params = {
         "id": "generation-small",
@@ -71,44 +202,7 @@ def test_langfuse_payload_size_summary_reports_identifiers_and_sizes() -> None:
 
 
 def test_langfuse_metadata_candidate_compaction_reduces_candidate_size() -> None:
-    metadata = {
-        "prompt_overhead_component_paths": {
-            "system": [f"input.instructions.{index}" for index in range(30)],
-            "tools": [f"tools.{index}.function.parameters" for index in range(60)],
-            "conversation": [f"input.messages.{index}.content" for index in range(40)],
-        },
-        "prompt_overhead_excluded_component_paths": [
-            f"metadata.hidden_state.{index}.payload" for index in range(80)
-        ],
-        "codex_response_headers": {
-            "source": "codex_response_headers",
-            "x-codex-active-limit": "codex",
-            "x-codex-bengalfox-limit-name": "gpt-5.5",
-            "x-request-id": "req-sensitive-id",
-            **{f"x-extra-header-{index}": "value" * 20 for index in range(40)},
-        },
-        "responses_stream_tool_state": [
-            {
-                "type": "function_call",
-                "name": "Bash",
-                "call_id": f"call-{index}",
-                "arguments": "secret argument text " * 100,
-            }
-            for index in range(20)
-        ],
-        "claude_tool_advertisement_compaction_events": [
-            {
-                "tool_name": "Bash",
-                "status": "compacted",
-                "cc_version": "1.2.3",
-                "original_chars": 3000,
-                "compacted_chars": 1000,
-                "saved_chars": 2000,
-                "details": "audit detail " * 200,
-            }
-            for _ in range(10)
-        ],
-    }
+    metadata = _build_candidate_heavy_langfuse_metadata()
 
     compacted_metadata = _strip_langfuse_generation_metadata(metadata)
 
@@ -140,6 +234,83 @@ def test_langfuse_metadata_candidate_compaction_reduces_candidate_size() -> None
     assert claude_summary["count"] == 10
     assert claude_summary["total_saved_chars"] == 20_000
     assert "audit detail" not in str(claude_summary)
+
+
+def test_langfuse_post_d1_314_compaction_evidence_classifies_pressure() -> None:
+    metadata = _build_candidate_heavy_langfuse_metadata()
+    generation_params = {
+        "id": "generation-d1-321",
+        "name": "aawm.post-d1-314",
+        "model": "gpt-test",
+        "input": [
+            {"role": "system", "content": "system shape marker"},
+            *[
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": f"conversation item {index} " + ("x" * 320),
+                }
+                for index in range(80)
+            ],
+            {"role": "assistant", "content": "tail shape marker"},
+        ],
+        "output": "small output",
+        "metadata": metadata,
+    }
+
+    evidence = _build_post_d1_314_compaction_evidence(generation_params)
+
+    assert set(evidence) == {
+        "already_handled",
+        "remaining_candidate",
+        "unchanged",
+        "fit_summary",
+    }
+    assert set(evidence["already_handled"]) == {
+        "metadata",
+        "prompt_overhead_component_paths",
+        "prompt_overhead_excluded_component_paths",
+        "codex_response_headers",
+        "responses_stream_tool_state",
+        "claude_tool_advertisement_compaction_events",
+    }
+    assert set(evidence["remaining_candidate"]) == {"input"}
+    assert set(evidence["unchanged"]) == {
+        "output",
+        "tags",
+        "responses_stream_event_counts",
+        "responses_stream_event_types",
+    }
+
+    for field, field_evidence in evidence["already_handled"].items():
+        assert field_evidence["final_size_bytes"] < field_evidence[
+            "original_size_bytes"
+        ], field
+        if field != "metadata":
+            assert (
+                field_evidence["summary_type"]
+                == "litellm_langfuse_metadata_compacted"
+            )
+
+    # Fixture guardrail: after D1-314 metadata compaction, the only oversized
+    # pressure this fixture should need to fit is the input payload.
+    fit_summary = evidence["fit_summary"]
+    assert fit_summary is not None
+    assert fit_summary["event_fit_failed"] is False
+    assert fit_summary["truncated_fields"] == ["input"]
+    assert evidence["remaining_candidate"]["input"]["input_truncated"] is True
+    assert evidence["remaining_candidate"]["input"]["final_size_bytes"] < evidence[
+        "remaining_candidate"
+    ]["input"]["original_size_bytes"]
+
+    for field, field_evidence in evidence["unchanged"].items():
+        assert field_evidence["final_size_bytes"] == field_evidence[
+            "original_size_bytes"
+        ], field
+
+    compacted_text = str(_strip_langfuse_generation_metadata(metadata))
+    assert "secret argument text" not in compacted_text
+    assert "audit detail" not in compacted_text
+    assert "req-sensitive-id" not in compacted_text
 
 
 def test_langfuse_payload_size_warning_is_sanitized(caplog, monkeypatch) -> None:

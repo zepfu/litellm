@@ -335,6 +335,14 @@ inventories, tool arguments, or compaction audit detail inside each Langfuse
 event. They do not eliminate Langfuse size warnings where the request `input`
 field itself is already close to the configured Langfuse event-size threshold.
 
+The Langfuse payload-size regression tests include a post-D1-314 guardrail
+fixture that classifies event pressure into `already_handled`,
+`remaining_candidate`, and `unchanged` buckets. That fixture is an
+observability guardrail for the current compaction contract: the already-handled
+metadata fields should stay compact, unchanged small fields should remain
+unchanged, and any residual oversized pressure in the representative fixture
+should be attributed to `input` rather than re-expanded metadata.
+
 ## Diagnostic Payload Capture Boundary
 
 Opt-in pass-through diagnostic payload capture writes local JSON artifacts under
