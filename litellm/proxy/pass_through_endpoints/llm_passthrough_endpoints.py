@@ -4713,6 +4713,22 @@ def _google_content_has_function_exchange(content_block: Any) -> bool:
     return False
 
 
+def _google_content_has_function_call(content_block: Any) -> bool:
+    if not isinstance(content_block, dict):
+        return False
+    parts = content_block.get("parts")
+    if not isinstance(parts, list):
+        return False
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if isinstance(part.get("functionCall"), dict) or isinstance(
+            part.get("function_call"), dict
+        ):
+            return True
+    return False
+
+
 def _google_content_function_call_ids(content_block: Any) -> set[str]:
     if not isinstance(content_block, dict):
         return set()
@@ -5040,6 +5056,106 @@ def _trim_google_adapter_followup_tools(request_block: dict[str, Any]) -> dict[s
     }
 
 
+def _is_google_function_call_allowed_predecessor(content_block: Any) -> bool:
+    if not isinstance(content_block, dict):
+        return False
+    if content_block.get("role") == "user":
+        return True
+    return bool(_google_content_function_response_ids(content_block))
+
+
+def _merge_google_model_content_parts(
+    first_content: dict[str, Any],
+    second_content: dict[str, Any],
+) -> dict[str, Any]:
+    first_parts = first_content.get("parts")
+    second_parts = second_content.get("parts")
+    merged = dict(first_content)
+    merged["parts"] = [
+        *(first_parts if isinstance(first_parts, list) else []),
+        *(second_parts if isinstance(second_parts, list) else []),
+    ]
+    return merged
+
+
+def _google_adapter_function_call_anchor_content() -> dict[str, Any]:
+    return {
+        "role": "user",
+        "parts": [
+            {
+                "text": (
+                    "[Gemini adapter inserted a conversation boundary before "
+                    "a preserved historical tool call.]"
+                )
+            }
+        ],
+    }
+
+
+def _repair_google_adapter_function_call_turn_adjacency(
+    request_block: dict[str, Any],
+) -> dict[str, Any]:
+    contents = request_block.get("contents")
+    if not isinstance(contents, list):
+        return {}
+
+    updated_contents: list[Any] = []
+    merged_model_turn_count = 0
+    inserted_anchor_count = 0
+    changed = False
+
+    for content in contents:
+        updated_contents.append(content)
+        if (
+            not isinstance(content, dict)
+            or content.get("role") != "model"
+            or not _google_content_has_function_call(content)
+        ):
+            continue
+
+        while (
+            len(updated_contents) >= 2
+            and isinstance(updated_contents[-1], dict)
+            and isinstance(updated_contents[-2], dict)
+            and updated_contents[-1].get("role") == "model"
+            and updated_contents[-2].get("role") == "model"
+        ):
+            updated_contents[-2] = _merge_google_model_content_parts(
+                updated_contents[-2],
+                updated_contents[-1],
+            )
+            updated_contents.pop()
+            merged_model_turn_count += 1
+            changed = True
+
+        current_index = len(updated_contents) - 1
+        predecessor = (
+            updated_contents[current_index - 1] if current_index > 0 else None
+        )
+        if not _is_google_function_call_allowed_predecessor(predecessor):
+            updated_contents.insert(
+                current_index,
+                _google_adapter_function_call_anchor_content(),
+            )
+            inserted_anchor_count += 1
+            changed = True
+
+    if not changed:
+        return {}
+
+    request_block["contents"] = updated_contents
+    changes: dict[str, Any] = {}
+    if merged_model_turn_count:
+        changes[
+            "repaired_function_call_adjacency_merged_model_turn_count"
+        ] = merged_model_turn_count
+    if inserted_anchor_count:
+        changes[
+            "repaired_function_call_adjacency_inserted_user_anchor_count"
+        ] = inserted_anchor_count
+    return changes
+
+
 def _split_google_adapter_inline_context_and_prompt(request_block: dict[str, Any]) -> dict[str, Any]:
     contents = request_block.get("contents")
     if not isinstance(contents, list):
@@ -5317,29 +5433,12 @@ def _apply_google_adapter_contents_window_policy(request_block: dict[str, Any]) 
     }
 
 
-def _apply_google_adapter_request_shape_policy(payload: dict[str, Any]) -> dict[str, Any]:
-    request_block = payload.get("request") if isinstance(payload.get("request"), dict) else None
-    if not isinstance(request_block, dict):
-        return {}
-
+def _apply_google_adapter_generation_config_policy(
+    request_block: dict[str, Any],
+    *,
+    model: Optional[str],
+) -> dict[str, Any]:
     changes: dict[str, Any] = {}
-    model = payload.get("model") if isinstance(payload.get("model"), str) else None
-    split_changes = _split_google_adapter_inline_context_and_prompt(request_block)
-    if split_changes:
-        changes.update(split_changes)
-    followup_content_changes = _compact_google_adapter_followup_request_contents(request_block)
-    if followup_content_changes:
-        changes.update(followup_content_changes)
-    followup_tool_changes = _trim_google_adapter_followup_tools(request_block)
-    if followup_tool_changes:
-        changes.update(followup_tool_changes)
-    oversized_text_changes = _compact_google_adapter_oversized_text_parts(request_block)
-    if oversized_text_changes:
-        changes.update(oversized_text_changes)
-    content_window_changes = _apply_google_adapter_contents_window_policy(request_block)
-    if content_window_changes:
-        changes.update(content_window_changes)
-
     generation_config = request_block.get("generationConfig")
     if not isinstance(generation_config, dict):
         generation_config = {}
@@ -5395,6 +5494,43 @@ def _apply_google_adapter_request_shape_policy(payload: dict[str, Any]) -> dict[
     if not generation_config:
         request_block.pop("generationConfig", None)
         changes["removed_empty_generation_config"] = True
+
+    return changes
+
+
+def _apply_google_adapter_request_shape_policy(payload: dict[str, Any]) -> dict[str, Any]:
+    request_block = payload.get("request") if isinstance(payload.get("request"), dict) else None
+    if not isinstance(request_block, dict):
+        return {}
+
+    changes: dict[str, Any] = {}
+    model = payload.get("model") if isinstance(payload.get("model"), str) else None
+    split_changes = _split_google_adapter_inline_context_and_prompt(request_block)
+    if split_changes:
+        changes.update(split_changes)
+    followup_content_changes = _compact_google_adapter_followup_request_contents(request_block)
+    if followup_content_changes:
+        changes.update(followup_content_changes)
+    followup_tool_changes = _trim_google_adapter_followup_tools(request_block)
+    if followup_tool_changes:
+        changes.update(followup_tool_changes)
+    oversized_text_changes = _compact_google_adapter_oversized_text_parts(request_block)
+    if oversized_text_changes:
+        changes.update(oversized_text_changes)
+    content_window_changes = _apply_google_adapter_contents_window_policy(request_block)
+    if content_window_changes:
+        changes.update(content_window_changes)
+    function_call_adjacency_changes = (
+        _repair_google_adapter_function_call_turn_adjacency(request_block)
+    )
+    if function_call_adjacency_changes:
+        changes.update(function_call_adjacency_changes)
+    generation_config_changes = _apply_google_adapter_generation_config_policy(
+        request_block,
+        model=model,
+    )
+    if generation_config_changes:
+        changes.update(generation_config_changes)
 
     return changes
 
