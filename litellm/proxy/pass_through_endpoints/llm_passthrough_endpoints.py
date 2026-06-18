@@ -7718,6 +7718,75 @@ def _previous_codex_google_code_assist_assistant_index(
     return None
 
 
+def _previous_codex_google_code_assist_contiguous_assistant_index(
+    messages: list[Any],
+    *,
+    before_index: int,
+) -> Optional[int]:
+    previous_assistant_index = _previous_codex_google_code_assist_assistant_index(
+        messages,
+        before_index=before_index,
+    )
+    if previous_assistant_index is None:
+        return None
+    for candidate_index in range(before_index - 1, previous_assistant_index, -1):
+        candidate = messages[candidate_index]
+        if not isinstance(candidate, dict) or candidate.get("role") != "tool":
+            return None
+    return previous_assistant_index
+
+
+def _previous_codex_google_code_assist_tool_call(
+    messages: list[Any],
+    *,
+    before_index: int,
+    tool_call_id: str,
+) -> Optional[dict[str, Any]]:
+    previous_assistant_index = _previous_codex_google_code_assist_assistant_index(
+        messages,
+        before_index=before_index,
+    )
+    if previous_assistant_index is None:
+        return None
+    previous_assistant = messages[previous_assistant_index]
+    if not isinstance(previous_assistant, dict):
+        return None
+    tool_calls = previous_assistant.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return None
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        if tool_call.get("id") == tool_call_id:
+            return tool_call
+    return None
+
+
+def _codex_google_code_assist_tool_call_function_name(
+    tool_call: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _codex_google_code_assist_tool_call_function_arguments(
+    tool_call: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return None
+    return _normalize_codex_google_code_assist_tool_call_arguments(
+        function.get("arguments")
+    )
+
+
 def _build_codex_google_code_assist_synthetic_tool_call(
     *,
     tool_call_id: str,
@@ -7990,20 +8059,31 @@ def _ensure_codex_google_code_assist_tool_results_have_calls(
         if not isinstance(tool_call_id, str) or not tool_call_id:
             index += 1
             continue
-        previous_assistant_index = _previous_codex_google_code_assist_assistant_index(
+        previous_assistant_index = (
+            _previous_codex_google_code_assist_contiguous_assistant_index(
+                updated_messages,
+                before_index=index,
+            )
+        )
+        previous_tool_call = _previous_codex_google_code_assist_tool_call(
             updated_messages,
             before_index=index,
+            tool_call_id=tool_call_id,
         )
 
         function_name = (
             _lookup_codex_google_code_assist_tool_call_name(tool_call_id)
             or fallback_tool_name
+            or _codex_google_code_assist_tool_call_function_name(previous_tool_call)
         )
         if not function_name:
             index += 1
             continue
         function_arguments = (
             _lookup_codex_google_code_assist_tool_call_arguments(tool_call_id)
+            or _codex_google_code_assist_tool_call_function_arguments(
+                previous_tool_call
+            )
             or "{}"
         )
         synthetic_tool_call = _build_codex_google_code_assist_synthetic_tool_call(
@@ -8017,7 +8097,6 @@ def _ensure_codex_google_code_assist_tool_results_have_calls(
                 index,
                 {
                     "role": "assistant",
-                    "content": None,
                     "tool_calls": [synthetic_tool_call],
                 },
             )

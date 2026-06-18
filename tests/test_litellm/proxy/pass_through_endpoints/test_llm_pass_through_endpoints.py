@@ -8524,6 +8524,128 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert "google_adapter_codex_repaired_missing_tool_call_count" not in changes
 
     @pytest.mark.asyncio
+    async def test_codex_google_code_assist_builder_inserts_adjacent_cached_tool_call_after_intervening_user_context(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {"session_id": "codex-gemini-intervening-tool-pair"}
+        _codex_google_code_assist_tool_call_name_cache.clear()
+        _codex_google_code_assist_tool_call_arguments_cache.clear()
+        _remember_codex_google_code_assist_tool_call_name(
+            "call_exec",
+            "exec_command",
+            '{"cmd":"printf codex-gemini-tool-smoke"}',
+        )
+
+        try:
+            wrapped_request, _, completion_messages, _, _, changes = (
+                await _build_google_code_assist_request_from_completion_kwargs(
+                    completion_kwargs={
+                        "model": "gemini-3.5-flash-low",
+                        "messages": [
+                            {"role": "user", "content": "run a shell command"},
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": ""}],
+                            },
+                            {
+                                "role": "user",
+                                "content": "intervening context before tool result",
+                            },
+                            {
+                                "role": "tool",
+                                "tool_call_id": "call_exec__thought__sig",
+                                "content": (
+                                    "Chunk ID: b8716b\n"
+                                    "Wall time: 0.0000 seconds\n"
+                                    "Process exited with code 0\n"
+                                    "Output:\n"
+                                    "codex-gemini-tool-smoke"
+                                ),
+                            },
+                        ],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "exec_command",
+                                    "description": "run a command",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "cmd": {"type": "string"}
+                                        },
+                                        "required": ["cmd"],
+                                    },
+                                },
+                            }
+                        ],
+                        "tool_choice": "auto",
+                        "max_tokens": 64,
+                        "stream": True,
+                        "metadata": {
+                            "passthrough_route_family": (
+                                "codex_antigravity_code_assist_adapter"
+                            )
+                        },
+                    },
+                    adapter_model="gemini-3.5-flash-low",
+                    project="project_123",
+                    request=mock_request,
+                    completion_kwargs_are_openai_chat=True,
+                )
+            )
+        finally:
+            _codex_google_code_assist_tool_call_name_cache.clear()
+            _codex_google_code_assist_tool_call_arguments_cache.clear()
+
+        contents = wrapped_request["request"]["contents"]
+        request_parts = [
+            part
+            for content in contents
+            for part in content.get("parts", [])
+            if isinstance(part, dict)
+        ]
+        function_calls = [
+            part["functionCall"] for part in request_parts if "functionCall" in part
+        ]
+        function_responses = [
+            part["functionResponse"]
+            for part in request_parts
+            if "functionResponse" in part
+        ]
+        assistant_messages = [
+            message
+            for message in completion_messages
+            if message.get("role") == "assistant"
+        ]
+
+        assert [content["role"] for content in contents[-2:]] == ["model", "user"]
+        assert function_calls[-1] == {
+            "name": "exec_command",
+            "args": {"cmd": "printf codex-gemini-tool-smoke"},
+        }
+        assert function_responses[-1]["name"] == "exec_command"
+        assert assistant_messages[-1]["tool_calls"] == [
+            {
+                "id": "call_exec__thought__sig",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"printf codex-gemini-tool-smoke"}',
+                },
+            }
+        ]
+        assert "content" not in assistant_messages[-1]
+        assert (
+            changes["google_adapter_codex_inserted_missing_tool_call_count"]
+            == 1
+        )
+        assert changes["google_adapter_codex_repaired_missing_tool_call_names"] == [
+            "exec_command"
+        ]
+
+    @pytest.mark.asyncio
     async def test_codex_google_code_assist_builder_repairs_cached_tool_result_pair(
         self,
     ):
