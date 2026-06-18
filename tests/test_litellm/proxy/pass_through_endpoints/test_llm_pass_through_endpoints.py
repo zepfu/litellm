@@ -192,6 +192,7 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
     capture_passthrough_stream_shape,
+    diagnostic_payload_capture_enabled,
     passthrough_full_payload_capture_enabled,
 )
 
@@ -4185,6 +4186,205 @@ class TestGoogleAdapterRequestShapePolicy:
             ]
             == 1777996982
         )
+
+    def test_diagnostic_payload_capture_requires_enable_flag_and_scope(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        diagnostic_dir = tmp_path / "diagnostic"
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+        monkeypatch.delenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", raising=False)
+        monkeypatch.delenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ROUTE_FAMILIES", raising=False
+        )
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR", str(diagnostic_dir))
+
+        assert diagnostic_payload_capture_enabled() is False
+        assert (
+            capture_passthrough_shape(
+                mode="nonstream",
+                provider="openai",
+                endpoint_type=EndpointType.OPENAI,
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.5", "input": "should not persist"},
+                response=httpx.Response(200),
+                response_content=b"{}",
+                litellm_call_id="call-disabled",
+            )
+            is None
+        )
+        assert list(diagnostic_dir.glob("*.json")) == []
+
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", "1")
+        assert diagnostic_payload_capture_enabled() is False
+        assert (
+            capture_passthrough_shape(
+                mode="nonstream",
+                provider="openai",
+                endpoint_type=EndpointType.OPENAI,
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.5", "input": "still no scope"},
+                response=httpx.Response(200),
+                response_content=b"{}",
+                litellm_call_id="call-no-scope",
+            )
+            is None
+        )
+        assert list(diagnostic_dir.glob("*.json")) == []
+
+    def test_diagnostic_payload_capture_writes_scoped_manifest_without_raw_payload(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        diagnostic_dir = tmp_path / "diagnostic"
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", "1")
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ROUTE_FAMILIES", "codex_responses"
+        )
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR", str(diagnostic_dir))
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENVIRONMENT", "aawm-dev"
+        )
+
+        upstream_request = httpx.Request(
+            "POST",
+            "https://chatgpt.com/backend-api/codex/responses",
+            headers={
+                "authorization": "Bearer should-not-appear",
+                "content-type": "application/json",
+            },
+            content=b'{"input":"upstream secret prompt"}',
+        )
+        artifact_path = capture_passthrough_shape(
+            mode="nonstream",
+            provider="openai",
+            endpoint_type=EndpointType.OPENAI,
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={
+                "model": "gpt-5.5",
+                "input": "local secret prompt",
+                "litellm_metadata": {
+                    "passthrough_route_family": "codex_responses",
+                    "trace_id": "trace-diagnostic",
+                },
+            },
+            response=httpx.Response(
+                200,
+                headers={
+                    "authorization": "Bearer response-token",
+                    "x-ratelimit-remaining-requests": "12",
+                },
+                content=b'{"output":"response secret text"}',
+                request=upstream_request,
+            ),
+            upstream_request=upstream_request,
+            response_body={"output": "response secret text"},
+            response_content=b'{"output":"response secret text"}',
+            litellm_call_id="call-diagnostic",
+            extra_metadata={"custom_llm_provider": "openai"},
+        )
+
+        assert artifact_path is not None
+        assert Path(artifact_path).parent == diagnostic_dir
+        artifact = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        rendered = json.dumps(artifact)
+        manifest = artifact["manifest"]
+        assert artifact["capture_kind"] == "aawm_diagnostic_payload_capture"
+        assert manifest["environment"] == "aawm-dev"
+        assert manifest["route_family"] == "codex_responses"
+        assert manifest["endpoint_template"] == "/backend-api/codex/responses"
+        assert manifest["trace_id"] == "trace-diagnostic"
+        assert manifest["litellm_call_id"] == "call-diagnostic"
+        assert manifest["redaction_mode"] == "shape_hash_manifest"
+        assert manifest["byte_counts"]["request_body_bytes"] > 0
+        assert manifest["byte_counts"]["response_content_bytes"] > 0
+        assert manifest["hashes"]["request_body_sha256"]
+        assert manifest["hashes"]["response_body_sha256"]
+        assert "request.body.raw" in manifest["omitted_fields"]
+        assert artifact["request"]["shape"]["model"] == "gpt-5.5"
+        assert artifact["request"]["body_shape"]["input"].startswith("<str len=")
+        assert artifact["response"]["headers"]["selected_values"][
+            "x-ratelimit-remaining-requests"
+        ] == "12"
+        assert "local secret prompt" not in rendered
+        assert "upstream secret prompt" not in rendered
+        assert "response secret text" not in rendered
+        assert "should-not-appear" not in rendered
+        assert "response-token" not in rendered
+
+    def test_diagnostic_payload_capture_respects_call_id_and_endpoint_scopes(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        diagnostic_dir = tmp_path / "diagnostic"
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_SHAPES", raising=False)
+        monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", "1")
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENDPOINT_TEMPLATES",
+            "/grok/v1/sessions/{session_id}/signals",
+        )
+        monkeypatch.setenv(
+            "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_LITELLM_CALL_IDS", "call-match"
+        )
+        monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR", str(diagnostic_dir))
+
+        assert (
+            capture_passthrough_shape(
+                mode="nonstream_error",
+                provider="xai",
+                endpoint_type=EndpointType.OPENAI,
+                url_route="https://cli-chat-proxy.grok.com/v1/sessions/019ed2fc71fa7d008b50aedb68dc14c0/signals",
+                request_body={
+                    "event": "secret signal",
+                    "litellm_metadata": {
+                        "grok_side_channel_endpoint_path_template": (
+                            "/grok/v1/sessions/{session_id}/signals"
+                        )
+                    },
+                },
+                response=httpx.Response(404, content=b'{"error":"not found"}'),
+                response_content=b'{"error":"not found"}',
+                litellm_call_id="call-miss",
+            )
+            is None
+        )
+        artifact_path = capture_passthrough_shape(
+            mode="nonstream_error",
+            provider="xai",
+            endpoint_type=EndpointType.OPENAI,
+            url_route="https://cli-chat-proxy.grok.com/v1/sessions/019ed2fc71fa7d008b50aedb68dc14c0/signals",
+            request_body={
+                "event": "secret signal",
+                "litellm_metadata": {
+                    "grok_side_channel_endpoint_path_template": (
+                        "/grok/v1/sessions/{session_id}/signals"
+                    )
+                },
+            },
+            response=httpx.Response(404, content=b'{"error":"not found"}'),
+            response_content=b'{"error":"not found"}',
+            litellm_call_id="call-match",
+        )
+
+        assert artifact_path is not None
+        artifact = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        assert artifact["manifest"]["endpoint_template"] == (
+            "/grok/v1/sessions/{session_id}/signals"
+        )
+        assert artifact["url"]["endpoint_template"] == (
+            "/grok/v1/sessions/{session_id}/signals"
+        )
+        assert artifact["manifest"]["litellm_call_id"] == "call-match"
+        rendered = json.dumps(artifact)
+        assert "secret signal" not in rendered
+        assert "019ed2fc71fa7d008b50aedb68dc14c0" not in rendered
 
     def test_passthrough_full_payload_capture_uses_runtime_control_file(
         self,

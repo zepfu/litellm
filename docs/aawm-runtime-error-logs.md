@@ -239,6 +239,50 @@ The sink reuses LiteLLM's secret-redaction filter and records traceback context
 without adding request bodies, prompt payloads, or tool arguments. Error-intake
 files are local sensitive artifacts and must not be committed or pushed.
 
+## Opt-in Diagnostic Payload Capture
+
+Pass-through diagnostic payload capture is disabled by default. It is separate
+from runtime error JSONL, `session_history`, provider-error observations, and
+Langfuse metadata.
+
+Enable the scoped diagnostic manifest writer with:
+
+```text
+AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE=1
+AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR=/tmp/captures/diagnostic_payloads
+```
+
+At least one exact-match scope must also be set, otherwise no artifact is
+written:
+
+```text
+AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ROUTE_FAMILIES=codex_responses
+AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENDPOINT_TEMPLATES=/grok/v1/sessions/{session_id}/signals
+AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_TRACE_IDS=<trace-id>
+AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_LITELLM_CALL_IDS=<litellm-call-id>
+```
+
+When multiple scope dimensions are set, all configured dimensions must match.
+Scope values are comma-separated exact strings; regex, substring, and wildcard
+matching are intentionally not supported. Use route family for broad but still
+bounded investigations, and trace id or LiteLLM call id for one-off captures.
+
+Artifacts are written as local JSON files under
+`/tmp/captures/diagnostic_payloads` by default and chmod'd to `0600`. Each
+artifact contains a manifest with environment, route family, endpoint template,
+trace id, LiteLLM call id, redaction mode, byte counts, hashes, and explicit
+omitted-field descriptions. The artifact keeps sanitized request/response
+shape data and selected safe header values only. It must not include raw
+headers, raw request bodies, raw response bodies, stream bytes, prompts, tool
+arguments, OAuth tokens, API keys, cookies, concrete Grok session ids, or local
+file content.
+
+The legacy full-payload pass-through capture remains a stronger separate
+operator opt-in through `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS` or its runtime
+control file. That mode intentionally persists raw upstream request/response
+headers and bodies for short-lived manual investigations and should not be used
+as default telemetry.
+
 ## ChatGPT Codex quota errors
 
 When ChatGPT Codex passthrough returns HTTP 429 with

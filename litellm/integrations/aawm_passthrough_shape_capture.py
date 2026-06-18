@@ -19,6 +19,7 @@ proxy process.
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -40,8 +41,19 @@ _FULL_PAYLOAD_ENV_FLAG = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS"
 _FULL_PAYLOAD_DIR_ENV = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR"
 _FULL_PAYLOAD_CONTROL_FILE_ENV = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE"
 _FULL_PAYLOAD_MAX_BYTES_ENV = "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_MAX_BYTES"
+_DIAGNOSTIC_ENV_FLAG = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE"
+_DIAGNOSTIC_DIR_ENV = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_DIR"
+_DIAGNOSTIC_ROUTE_FAMILIES_ENV = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ROUTE_FAMILIES"
+_DIAGNOSTIC_ENDPOINT_TEMPLATES_ENV = (
+    "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENDPOINT_TEMPLATES"
+)
+_DIAGNOSTIC_TRACE_IDS_ENV = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_TRACE_IDS"
+_DIAGNOSTIC_LITELLM_CALL_IDS_ENV = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_LITELLM_CALL_IDS"
+_DIAGNOSTIC_REDACTION_MODE_ENV = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_REDACTION_MODE"
+_DIAGNOSTIC_ENV_NAME_ENV = "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ENVIRONMENT"
 _DEFAULT_CAPTURE_DIR = Path("/tmp/captures/pass_through_shapes")
 _DEFAULT_FULL_PAYLOAD_CAPTURE_DIR = Path("/tmp/captures/pass_through_full_payloads")
+_DEFAULT_DIAGNOSTIC_CAPTURE_DIR = Path("/tmp/captures/diagnostic_payloads")
 _DEFAULT_FULL_PAYLOAD_CONTROL_FILE = Path(
     "/tmp/captures/pass_through_full_payloads.enabled"
 )
@@ -154,6 +166,33 @@ def passthrough_full_payload_capture_enabled() -> bool:
     return _is_truthy(os.environ.get(_FULL_PAYLOAD_ENV_FLAG, ""))
 
 
+def _split_scope_values(value: str) -> List[str]:
+    values: List[str] = []
+    for part in value.split(","):
+        stripped = part.strip()
+        if stripped:
+            values.append(stripped)
+    return values
+
+
+def _diagnostic_capture_scope_values(env_name: str) -> List[str]:
+    return _split_scope_values(os.environ.get(env_name, ""))
+
+
+def diagnostic_payload_capture_enabled() -> bool:
+    if not _is_truthy(os.environ.get(_DIAGNOSTIC_ENV_FLAG, "")):
+        return False
+    return any(
+        _diagnostic_capture_scope_values(env_name)
+        for env_name in (
+            _DIAGNOSTIC_ROUTE_FAMILIES_ENV,
+            _DIAGNOSTIC_ENDPOINT_TEMPLATES_ENV,
+            _DIAGNOSTIC_TRACE_IDS_ENV,
+            _DIAGNOSTIC_LITELLM_CALL_IDS_ENV,
+        )
+    )
+
+
 def _capture_dir() -> Path:
     configured = os.environ.get(_DIR_ENV)
     if configured:
@@ -166,6 +205,31 @@ def _full_payload_capture_dir() -> Path:
     if configured:
         return Path(configured)
     return _DEFAULT_FULL_PAYLOAD_CAPTURE_DIR
+
+
+def _diagnostic_capture_dir() -> Path:
+    configured = os.environ.get(_DIAGNOSTIC_DIR_ENV)
+    if configured:
+        return Path(configured)
+    return _DEFAULT_DIAGNOSTIC_CAPTURE_DIR
+
+
+def _diagnostic_environment_name() -> str:
+    for env_name in (
+        _DIAGNOSTIC_ENV_NAME_ENV,
+        "AAWM_ENVIRONMENT",
+        "LITELLM_ENVIRONMENT",
+        "ENVIRONMENT",
+    ):
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            return value.strip()
+    return "unknown"
+
+
+def _diagnostic_redaction_mode() -> str:
+    configured = os.environ.get(_DIAGNOSTIC_REDACTION_MODE_ENV, "").strip()
+    return configured or "shape_hash_manifest"
 
 
 def _full_payload_max_bytes() -> Optional[int]:
@@ -197,10 +261,171 @@ def _safe_enum_value(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _json_size_bytes(value: Any) -> int:
+    try:
+        serialized = json.dumps(
+            value,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except Exception:
+        serialized = f"<unserializable:{type(value).__name__}>"
+    return len(serialized.encode("utf-8"))
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace")
+    try:
+        return json.dumps(
+            value,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except Exception:
+        return str(value).encode("utf-8", errors="replace")
+
+
+def _sha256_hexdigest(value: Any) -> Optional[str]:
+    payload = _canonical_bytes(value)
+    if not payload:
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _sanitize_filename_part(value: Any) -> str:
     text = str(value or "unknown").lower()
     text = re.sub(r"[^a-z0-9_.-]+", "_", text)
     return text[:60] or "unknown"
+
+
+def _metadata_mapping_from_request_body(request_body: Any) -> Mapping[str, Any]:
+    if not isinstance(request_body, Mapping):
+        return {}
+    for key in ("litellm_metadata", "metadata"):
+        value = request_body.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _extract_context_value(
+    key: str,
+    *,
+    request_body: Any,
+    extra_metadata: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    if isinstance(extra_metadata, Mapping):
+        value = extra_metadata.get(key)
+        if value is not None:
+            return str(value)
+    metadata = _metadata_mapping_from_request_body(request_body)
+    value = metadata.get(key)
+    if value is not None:
+        return str(value)
+    return None
+
+
+def _diagnostic_route_family(
+    *,
+    provider: Optional[str],
+    endpoint_type: Any,
+    request_body: Any,
+    extra_metadata: Optional[Mapping[str, Any]],
+) -> str:
+    for key in ("passthrough_route_family", "route_family", "aawm_route_family"):
+        value = _extract_context_value(
+            key,
+            request_body=request_body,
+            extra_metadata=extra_metadata,
+        )
+        if value:
+            return value
+    if provider:
+        return str(provider)
+    endpoint_type_value = _safe_enum_value(endpoint_type)
+    return endpoint_type_value or "unknown"
+
+
+_UUIDISH_PATH_SEGMENT_RE = re.compile(
+    r"^(?:[0-9a-f]{8,}(?:-[0-9a-f]{4,}){2,}|[0-9a-f]{16,}|[A-Za-z0-9_-]{24,})$",
+    re.IGNORECASE,
+)
+
+
+def _endpoint_template_from_url(
+    url_route: Optional[str],
+    *,
+    request_body: Any,
+    extra_metadata: Optional[Mapping[str, Any]],
+) -> str:
+    for key in (
+        "endpoint_template",
+        "grok_side_channel_endpoint_path_template",
+        "aawm_endpoint_template",
+    ):
+        value = _extract_context_value(
+            key,
+            request_body=request_body,
+            extra_metadata=extra_metadata,
+        )
+        if value:
+            return value
+
+    parsed = urlparse(url_route or "")
+    path = parsed.path or "/"
+    templated_segments = []
+    for segment in path.split("/"):
+        if not segment:
+            templated_segments.append(segment)
+            continue
+        if _UUIDISH_PATH_SEGMENT_RE.match(segment):
+            templated_segments.append("{id}")
+        else:
+            templated_segments.append(segment)
+    return "/".join(templated_segments) or "/"
+
+
+def _matches_scope(actual: Optional[str], patterns: List[str], *, casefold: bool) -> bool:
+    if not patterns:
+        return True
+    if actual is None:
+        return False
+    actual_value = actual.lower() if casefold else actual
+    for pattern in patterns:
+        pattern_value = pattern.lower() if casefold else pattern
+        if actual_value == pattern_value:
+            return True
+    return False
+
+
+def _diagnostic_scope_matches(
+    *,
+    route_family: str,
+    endpoint_template: str,
+    trace_id: Optional[str],
+    litellm_call_id: Optional[str],
+) -> bool:
+    route_families = _diagnostic_capture_scope_values(_DIAGNOSTIC_ROUTE_FAMILIES_ENV)
+    endpoint_templates = _diagnostic_capture_scope_values(
+        _DIAGNOSTIC_ENDPOINT_TEMPLATES_ENV
+    )
+    trace_ids = _diagnostic_capture_scope_values(_DIAGNOSTIC_TRACE_IDS_ENV)
+    litellm_call_ids = _diagnostic_capture_scope_values(_DIAGNOSTIC_LITELLM_CALL_IDS_ENV)
+    return (
+        _matches_scope(route_family, route_families, casefold=True)
+        and _matches_scope(endpoint_template, endpoint_templates, casefold=False)
+        and _matches_scope(trace_id, trace_ids, casefold=False)
+        and _matches_scope(litellm_call_id, litellm_call_ids, casefold=False)
+    )
 
 
 def _redact_string(value: str) -> str:
@@ -357,6 +582,21 @@ def _url_shape(url_route: Optional[str]) -> Dict[str, Any]:
         "scheme": parsed.scheme or None,
         "host": parsed.hostname or None,
         "path": parsed.path or None,
+        "query_keys": query_keys,
+    }
+
+
+def _diagnostic_url_shape(
+    url_route: Optional[str],
+    *,
+    endpoint_template: str,
+) -> Dict[str, Any]:
+    parsed = urlparse(url_route or "")
+    query_keys = sorted({key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)})
+    return {
+        "scheme": parsed.scheme or None,
+        "host": parsed.hostname or None,
+        "endpoint_template": endpoint_template,
         "query_keys": query_keys,
     }
 
@@ -731,6 +971,176 @@ def _base_full_payload_artifact(
     return artifact
 
 
+def _diagnostic_payload_artifact(
+    *,
+    mode: str,
+    provider: Optional[str],
+    endpoint_type: Any,
+    url_route: Optional[str],
+    request_body: Any,
+    response: Optional[httpx.Response],
+    upstream_request: Optional[httpx.Request],
+    response_body: Any,
+    response_content: Optional[bytes],
+    all_chunks: Optional[Sequence[str]],
+    raw_bytes: Optional[Sequence[bytes]],
+    litellm_call_id: Optional[str],
+    extra_metadata: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not diagnostic_payload_capture_enabled():
+        return None
+
+    route_family = _diagnostic_route_family(
+        provider=provider,
+        endpoint_type=endpoint_type,
+        request_body=request_body,
+        extra_metadata=extra_metadata,
+    )
+    endpoint_template = _endpoint_template_from_url(
+        url_route,
+        request_body=request_body,
+        extra_metadata=extra_metadata,
+    )
+    trace_id = _extract_context_value(
+        "trace_id",
+        request_body=request_body,
+        extra_metadata=extra_metadata,
+    )
+    if trace_id is None:
+        trace_id = _extract_context_value(
+            "aawm_trace_id",
+            request_body=request_body,
+            extra_metadata=extra_metadata,
+        )
+
+    if not _diagnostic_scope_matches(
+        route_family=route_family,
+        endpoint_template=endpoint_template,
+        trace_id=trace_id,
+        litellm_call_id=litellm_call_id,
+    ):
+        return None
+
+    response_content_bytes = response_content or b""
+    stream_lines = list(all_chunks or [])
+    raw_stream_chunks = list(raw_bytes or [])
+    request_body_hash = _sha256_hexdigest(request_body)
+    response_body_hash = _sha256_hexdigest(response_body)
+    if response_body_hash is None and response_content_bytes:
+        response_body_hash = _sha256_hexdigest(response_content_bytes)
+    stream_lines_hash = _sha256_hexdigest(stream_lines)
+    raw_stream_hash = _sha256_hexdigest(b"".join(raw_stream_chunks))
+    upstream_request_content = _httpx_request_content(upstream_request)
+
+    manifest: Dict[str, Any] = {
+        "environment": _diagnostic_environment_name(),
+        "route_family": route_family,
+        "endpoint_template": endpoint_template,
+        "trace_id": trace_id,
+        "litellm_call_id": litellm_call_id,
+        "redaction_mode": _diagnostic_redaction_mode(),
+        "provider": provider,
+        "endpoint_type": _safe_enum_value(endpoint_type),
+        "mode": mode,
+        "byte_counts": {
+            "request_body_bytes": _json_size_bytes(request_body),
+            "upstream_request_body_bytes": (
+                len(upstream_request_content)
+                if upstream_request_content is not None
+                else None
+            ),
+            "response_body_bytes": _json_size_bytes(response_body),
+            "response_content_bytes": len(response_content_bytes),
+            "stream_line_count": len(stream_lines),
+            "stream_text_bytes": sum(len(str(line).encode("utf-8")) for line in stream_lines),
+            "raw_stream_chunk_count": len(raw_stream_chunks),
+            "raw_stream_bytes": sum(len(chunk) for chunk in raw_stream_chunks),
+        },
+        "hashes": {
+            "request_body_sha256": request_body_hash,
+            "upstream_request_body_sha256": (
+                _sha256_hexdigest(upstream_request_content)
+                if upstream_request_content is not None
+                else None
+            ),
+            "response_body_sha256": response_body_hash,
+            "stream_lines_sha256": stream_lines_hash,
+            "raw_stream_sha256": raw_stream_hash,
+        },
+        "omitted_fields": [
+            "request.headers.values",
+            "request.body.raw",
+            "upstream_request.headers.values",
+            "upstream_request.body.raw",
+            "response.headers.values",
+            "response.body.raw",
+            "response.stream.raw_lines",
+            "response.stream.raw_bytes",
+        ],
+    }
+
+    artifact: Dict[str, Any] = {
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "capture_kind": "aawm_diagnostic_payload_capture",
+        "manifest": manifest,
+        "url": _diagnostic_url_shape(
+            url_route,
+            endpoint_template=endpoint_template,
+        ),
+        "request": {
+            "shape": _request_shape(request_body),
+            "body_shape": _shape_value(request_body),
+            "headers": _sanitize_headers(
+                upstream_request.headers if upstream_request is not None else None
+            ),
+        },
+        "response": {
+            "status_code": response.status_code if response is not None else None,
+            "headers": _sanitize_headers(_response_headers(response)),
+        },
+    }
+    if response_body is not None or response_content is not None:
+        artifact["response"]["body"] = _body_shape(response_body, response_content)
+    if all_chunks is not None:
+        artifact["response"]["stream"] = _stream_shape(stream_lines)
+    if extra_metadata:
+        artifact["metadata"] = {
+            str(key): value
+            for key, value in extra_metadata.items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+    return artifact
+
+
+def _write_diagnostic_payload_artifact(artifact: Optional[Dict[str, Any]]) -> Optional[str]:
+    if artifact is None:
+        return None
+    try:
+        capture_dir = _diagnostic_capture_dir()
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        counter = _next_counter()
+        manifest = artifact.get("manifest") or {}
+        route_family = _sanitize_filename_part(manifest.get("route_family"))
+        mode = _sanitize_filename_part(manifest.get("mode"))
+        call_id = _sanitize_filename_part(manifest.get("litellm_call_id"))[:18]
+        path = capture_dir / f"{ts}_{counter:04d}_{route_family}_{mode}_{call_id}.json"
+        path.write_text(
+            json.dumps(artifact, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+        return str(path)
+    except Exception as exc:
+        verbose_proxy_logger.warning(
+            "AawmDiagnosticPayloadCapture: capture failed: %s", exc
+        )
+        return None
+
+
 def _write_artifact(artifact: Dict[str, Any]) -> Optional[str]:
     if not passthrough_shape_capture_enabled():
         return None
@@ -801,10 +1211,27 @@ def capture_passthrough_shape(
     litellm_call_id: Optional[str] = None,
     extra_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
+    diagnostic_path = _write_diagnostic_payload_artifact(
+        _diagnostic_payload_artifact(
+            mode=mode,
+            provider=provider,
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            request_body=request_body,
+            response=response,
+            upstream_request=upstream_request,
+            response_body=response_body,
+            response_content=response_content,
+            all_chunks=None,
+            raw_bytes=None,
+            litellm_call_id=litellm_call_id,
+            extra_metadata=extra_metadata,
+        )
+    )
     shape_enabled = passthrough_shape_capture_enabled()
     full_payload_enabled = passthrough_full_payload_capture_enabled()
     if not shape_enabled and not full_payload_enabled:
-        return None
+        return diagnostic_path
 
     full_payload_path: Optional[str] = None
     if full_payload_enabled:
@@ -826,7 +1253,7 @@ def capture_passthrough_shape(
         full_payload_path = _write_full_payload_artifact(full_payload_artifact)
 
     if not shape_enabled:
-        return full_payload_path
+        return full_payload_path or diagnostic_path
 
     artifact = _base_artifact(
         mode=mode,
@@ -839,7 +1266,7 @@ def capture_passthrough_shape(
         extra_metadata=extra_metadata,
     )
     artifact["response"]["body"] = _body_shape(response_body, response_content)
-    return _write_artifact(artifact)
+    return _write_artifact(artifact) or diagnostic_path
 
 
 def capture_passthrough_stream_shape(
@@ -855,10 +1282,27 @@ def capture_passthrough_stream_shape(
     litellm_call_id: Optional[str] = None,
     extra_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
+    diagnostic_path = _write_diagnostic_payload_artifact(
+        _diagnostic_payload_artifact(
+            mode="stream",
+            provider=provider,
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            request_body=request_body,
+            response=response,
+            upstream_request=upstream_request,
+            response_body=None,
+            response_content=None,
+            all_chunks=all_chunks,
+            raw_bytes=raw_bytes,
+            litellm_call_id=litellm_call_id,
+            extra_metadata=extra_metadata,
+        )
+    )
     shape_enabled = passthrough_shape_capture_enabled()
     full_payload_enabled = passthrough_full_payload_capture_enabled()
     if not shape_enabled and not full_payload_enabled:
-        return None
+        return diagnostic_path
 
     full_payload_path: Optional[str] = None
     if full_payload_enabled:
@@ -891,7 +1335,7 @@ def capture_passthrough_stream_shape(
         full_payload_path = _write_full_payload_artifact(full_payload_artifact)
 
     if not shape_enabled:
-        return full_payload_path
+        return full_payload_path or diagnostic_path
 
     artifact = _base_artifact(
         mode="stream",
@@ -904,4 +1348,4 @@ def capture_passthrough_stream_shape(
         extra_metadata=extra_metadata,
     )
     artifact["response"]["stream"] = _stream_shape(all_chunks)
-    return _write_artifact(artifact)
+    return _write_artifact(artifact) or diagnostic_path
