@@ -131,6 +131,25 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
+## Low Alias Candidates (D1-322)
+
+`AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES=1` is an explicit staging gate
+for prepending Antigravity `gemini-3.5-flash-low`,
+`openrouter/cohere/north-mini-code:free`, and `openrouter/owl-alpha` to the
+`aawm-low` and `aawm-low-anthropic` candidate sets, in that order.
+
+When this gate is off, production routing order for those aliases is unchanged.
+Default deployments should leave the gate unset/false until live proof and
+acceptance for the staged lane succeed.
+
+Alias-visible metadata (for example, route audit fields and session-history
+model keys) must keep the provider-prefixed names (`openrouter/...`) so
+operators can distinguish the declared OpenRouter candidates. The OpenRouter
+completion adapter must continue to send the provider-stripped model slug
+upstream (`cohere/north-mini-code:free`, `owl-alpha`) to match OpenRouter
+ingress expectations. Antigravity `gemini-3.5-flash-low` keeps the plain model
+slug and routes through the Antigravity completion adapters.
+
 The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate,
 not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejects the
 plain `gpt-5.3-codex` model. When that last-resort candidate is selected,

@@ -99,12 +99,15 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _handle_anthropic_opencode_zen_completion_adapter_route,
     _handle_anthropic_opencode_zen_responses_adapter_route,
     _handle_anthropic_openai_responses_adapter_route,
+    _handle_anthropic_openrouter_completion_adapter_route,
     _handle_anthropic_xai_oauth_completion_adapter_route,
     _handle_anthropic_xai_oauth_responses_adapter_route,
     _handle_anthropic_auto_agent_alias_route,
     _handle_codex_opencode_zen_adapter_route,
     _handle_codex_auto_agent_alias_route,
     _handle_codex_google_code_assist_adapter_route,
+    _get_anthropic_auto_agent_candidates_for_alias,
+    _get_codex_auto_agent_candidates_for_alias,
     _is_oa_xai_responses_model,
     _is_codex_google_code_assist_empty_success_model_response,
     _normalize_codex_google_code_assist_reasoning_effort,
@@ -2611,6 +2614,7 @@ class TestGoogleAdapterRequestShapePolicy:
             "trimmed_contents_max_window": 24,
             "trimmed_contents_max_text_chars": 12000,
             "trimmed_contents_preserved_text_entries": 2,
+            "trimmed_contents_preserved_function_exchange_entries": 0,
         }
         assert len(payload["request"]["contents"]) == 9
         assert payload["request"]["contents"][0]["parts"][0]["text"].startswith("block-21-")
@@ -6124,6 +6128,9 @@ class TestPassThroughRequestRetryableFailures:
                 "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
             ) as mock_get_client, patch(
                 "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+                new=AsyncMock(),
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
                 new=AsyncMock(),
             ), patch(
                 "litellm.proxy.proxy_server.proxy_logging_obj"
@@ -16399,7 +16406,18 @@ def test_aawm_alias_candidate_maps_exclude_google_and_retired_free_deepseek():
             haystack = f"{provider} {model} {route_family}"
             if provider == "google_code_assist":
                 violations.append(f"{alias} exposes google_code_assist:{model}")
-            if any(token in haystack for token in ("gemini", "gemma")):
+            if (
+                any(token in haystack for token in ("gemini", "gemma"))
+                and not (
+                    alias in {"aawm-low", "aawm-low-anthropic"}
+                    and provider == "antigravity"
+                    and model == "gemini-3.5-flash-low"
+                    and route_family in {
+                        "codex_antigravity_code_assist_adapter",
+                        "anthropic_antigravity_completion_adapter",
+                    }
+                )
+            ):
                 violations.append(f"{alias} exposes google-backed candidate:{model}")
             if model == "deepseek/deepseek-v4-flash:free":
                 violations.append(f"{alias} exposes retired free DeepSeek lane")
@@ -16885,34 +16903,136 @@ async def test_anthropic_auto_agent_alias_uses_haiku_only_as_last_resort(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates():
+async def test_anthropic_auto_agent_alias_low_keeps_existing_order_by_default(
+    monkeypatch,
+):
+    monkeypatch.delenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", raising=False)
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["provider"] == "opencode_zen"
+    assert selection["candidate"]["model"] == "deepseek-v4-flash"
+    assert selection["candidate"]["route_family"] == (
+        "anthropic_opencode_zen_responses_adapter"
+    )
+    candidates = _get_anthropic_auto_agent_candidates_for_alias("aawm-low-anthropic")
+    candidate_models = {candidate["model"] for candidate in candidates}
+    assert {
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+        "gemini-3.5-flash-low",
+    }.isdisjoint(candidate_models)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
     expected_candidates = [
-        ("opencode_zen", "deepseek-v4-flash", False),
-        ("opencode_zen", "big-pickle", False),
-        ("anthropic", "claude-haiku-4-5-20251001", True),
+        (
+            "antigravity",
+            "gemini-3.5-flash-low",
+            "anthropic_antigravity_completion_adapter",
+            False,
+        ),
+        (
+            "openrouter",
+            "openrouter/cohere/north-mini-code:free",
+            "anthropic_openrouter_completion_adapter",
+            False,
+        ),
+        (
+            "openrouter",
+            "openrouter/owl-alpha",
+            "anthropic_openrouter_completion_adapter",
+            False,
+        ),
+        (
+            "opencode_zen",
+            "deepseek-v4-flash",
+            "anthropic_opencode_zen_responses_adapter",
+            False,
+        ),
+        (
+            "opencode_zen",
+            "big-pickle",
+            "anthropic_opencode_zen_completion_adapter",
+            False,
+        ),
+        (
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+            "anthropic_messages",
+            True,
+        ),
     ]
 
-    for index, (provider, model, last_resort) in enumerate(expected_candidates):
-        selection = await _select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
-        candidate = selection["candidate"]
-        assert candidate["provider"] == provider
-        assert candidate["model"] == model
-        assert candidate["last_resort"] is last_resort
-        if last_resort:
-            assert selection["selection_reason"] == "last_resort"
-        else:
-            assert selection["selection_reason"] == "first_available"
-        if index < len(expected_candidates) - 1:
-            await _set_anthropic_auto_agent_cooldown(
-                selection["cooldown_key"],
-                60.0,
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ):
+        for index, (provider, model, route_family, last_resort) in enumerate(
+            expected_candidates
+        ):
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=body,
             )
+            candidate = selection["candidate"]
+            assert candidate["provider"] == provider
+            assert candidate["model"] == model
+            assert candidate["route_family"] == route_family
+            assert candidate["last_resort"] is last_resort
+            if last_resort:
+                assert selection["selection_reason"] == "last_resort"
+            else:
+                assert selection["selection_reason"] == "first_available"
+            if index < len(expected_candidates) - 1:
+                await _set_anthropic_auto_agent_cooldown(
+                    selection["cooldown_key"],
+                    60.0,
+                )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_order_unchanged_when_low_staging_enabled(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["provider"] == "antigravity"
+    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["candidate"]["route_family"] == (
+        "anthropic_antigravity_completion_adapter"
+    )
+    candidates = _get_anthropic_auto_agent_candidates_for_alias(
+        "aawm-code-anthropic"
+    )
+    assert [candidate["model"] for candidate in candidates] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+        "claude-sonnet-4-6",
+    ]
 
 
 @pytest.mark.asyncio
@@ -17967,12 +18087,23 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
 async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haiku(
     monkeypatch,
 ):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
+    await _set_anthropic_auto_agent_cooldown(
+        "antigravity:gemini-3.5-flash-low:antigravity-lane",
+        60.0,
+    )
     success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
+        return_value=None,
+    ) as mock_openrouter_key, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
         new=AsyncMock(side_effect=FileNotFoundError("missing opencode auth")),
     ) as mock_load_opencode_key, patch(
@@ -17992,6 +18123,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
         )
 
     assert response is success
+    assert mock_openrouter_key.call_count == 2
     assert mock_load_opencode_key.await_count == 2
     mock_native.assert_awaited_once()
     candidate_body = mock_set_body.call_args.args[1]
@@ -18002,6 +18134,24 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     assert metadata["anthropic_auto_agent_selected_last_resort"] is True
     assert metadata["anthropic_auto_agent_attempts"][-1]["model"] == (
         "claude-haiku-4-5-20251001"
+    )
+    openrouter_attempts = [
+        attempt
+        for attempt in metadata["anthropic_auto_agent_attempts"]
+        if attempt["provider"] == "openrouter"
+    ]
+    assert [attempt["model"] for attempt in openrouter_attempts] == [
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+    ]
+    assert all(attempt["status"] == "cooldown_set" for attempt in openrouter_attempts)
+    assert all(
+        attempt["error_class"] == "candidate_unavailable"
+        for attempt in openrouter_attempts
+    )
+    assert all(
+        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
+        for attempt in openrouter_attempts
     )
     opencode_attempts = [
         attempt
@@ -18021,6 +18171,8 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
         candidate["model"]
         for candidate in metadata["anthropic_auto_agent_skipped_candidates"]
     }
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
+    assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
 
@@ -18029,13 +18181,24 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
 async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_errors(
     monkeypatch,
 ):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
+    await _set_anthropic_auto_agent_cooldown(
+        "antigravity:gemini-3.5-flash-low:antigravity-lane",
+        60.0,
+    )
     free_usage_error = _build_opencode_zen_free_usage_limit_error()
     success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
+        return_value=None,
+    ) as mock_openrouter_key, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
         new=AsyncMock(return_value="opencode-test-key"),
     ) as mock_opencode_key, \
@@ -18065,6 +18228,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
         )
 
     assert response is success
+    assert mock_openrouter_key.call_count == 2
     assert mock_opencode_key.await_count == 2
     mock_pass_through.assert_awaited_once()
     mock_completion_handler.assert_awaited_once()
@@ -18075,6 +18239,24 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
     assert metadata["requested_model_alias"] == "aawm-low-anthropic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "anthropic"
     assert metadata["anthropic_auto_agent_selected_last_resort"] is True
+    openrouter_attempts = [
+        attempt
+        for attempt in metadata["anthropic_auto_agent_attempts"]
+        if attempt["provider"] == "openrouter"
+    ]
+    assert [attempt["model"] for attempt in openrouter_attempts] == [
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+    ]
+    assert all(attempt["status"] == "cooldown_set" for attempt in openrouter_attempts)
+    assert all(
+        attempt["error_class"] == "candidate_unavailable"
+        for attempt in openrouter_attempts
+    )
+    assert all(
+        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
+        for attempt in openrouter_attempts
+    )
     opencode_attempts = [
         attempt
         for attempt in metadata["anthropic_auto_agent_attempts"]
@@ -18093,6 +18275,8 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
         candidate["model"]
         for candidate in metadata["anthropic_auto_agent_skipped_candidates"]
     }
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
+    assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
 
@@ -18104,6 +18288,14 @@ async def test_anthropic_auto_agent_alias_low_routes_big_pickle_through_completi
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
+    await _set_anthropic_auto_agent_cooldown(
+        "openrouter:openrouter/cohere/north-mini-code:free:openrouter",
+        60.0,
+    )
+    await _set_anthropic_auto_agent_cooldown(
+        "openrouter:openrouter/owl-alpha:openrouter",
+        60.0,
+    )
     await _set_anthropic_auto_agent_cooldown(
         "opencode_zen:deepseek-v4-flash:opencode_zen",
         60.0,
@@ -18140,6 +18332,174 @@ async def test_anthropic_auto_agent_alias_low_routes_big_pickle_through_completi
         "anthropic_opencode_zen_completion_adapter"
     )
     assert metadata["anthropic_auto_agent_selected_last_resort"] is False
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrouter_completion_adapter(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+    await _set_anthropic_auto_agent_cooldown(
+        "antigravity:gemini-3.5-flash-low:antigravity-lane",
+        60.0,
+    )
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
+        new=AsyncMock(return_value=success),
+    ) as mock_openrouter_completion, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_opencode_zen_adapter_route",
+        new=AsyncMock(),
+    ) as mock_opencode:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    mock_openrouter_completion.assert_awaited_once()
+    mock_opencode.assert_not_awaited()
+    assert mock_openrouter_completion.await_args.kwargs["adapter_model"] == (
+        "openrouter/cohere/north-mini-code:free"
+    )
+    candidate_body = mock_openrouter_completion.await_args.kwargs[
+        "prepared_request_body"
+    ]
+    assert candidate_body["model"] == "openrouter/cohere/north-mini-code:free"
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "openrouter"
+    assert metadata["anthropic_auto_agent_selected_model"] == (
+        "openrouter/cohere/north-mini-code:free"
+    )
+    assert metadata["anthropic_auto_agent_selected_route_family"] == (
+        "anthropic_openrouter_completion_adapter"
+    )
+    assert metadata["anthropic_auto_agent_selected_last_resort"] is False
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_low_routes_gemini_through_antigravity_completion_adapter(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
+        new=AsyncMock(return_value=success),
+    ) as mock_antigravity, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
+        new=AsyncMock(),
+    ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_opencode_zen_adapter_route",
+        new=AsyncMock(),
+    ) as mock_opencode:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    mock_antigravity.assert_awaited_once()
+    assert mock_antigravity.await_args.kwargs["adapter_provider"] == (
+        "antigravity"
+    )
+    assert mock_antigravity.await_args.kwargs["adapter_model"] == (
+        "gemini-3.5-flash-low"
+    )
+    assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
+    mock_openrouter.assert_not_awaited()
+    mock_opencode.assert_not_awaited()
+    candidate_body = mock_antigravity.await_args.kwargs["prepared_request_body"]
+    assert candidate_body["model"] == "gemini-3.5-flash-low"
+    assert candidate_body["litellm_metadata"]["requested_model_alias"] == (
+        "aawm-low-anthropic"
+    )
+    assert (
+        candidate_body["litellm_metadata"]["anthropic_auto_agent_selected_route_family"]
+        == "anthropic_antigravity_completion_adapter"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter_model", "upstream_model"),
+    [
+        (
+            "openrouter/cohere/north-mini-code:free",
+            "cohere/north-mini-code:free",
+        ),
+        ("openrouter/owl-alpha", "owl-alpha"),
+    ],
+)
+async def test_anthropic_openrouter_completion_adapter_strips_provider_prefix_for_upstream(
+    monkeypatch,
+    adapter_model,
+    upstream_model,
+):
+    monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = adapter_model
+    success = {"ok": True}
+
+    async def fake_openrouter_completion_operation(*, adapter_model, operation):
+        assert adapter_model == upstream_model
+        return await operation()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
+        new=AsyncMock(side_effect=fake_openrouter_completion_operation),
+    ) as mock_openrouter, patch(
+        "litellm.llms.anthropic.experimental_pass_through.adapters.handler.LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler",
+        new=AsyncMock(return_value=success),
+    ) as mock_completion_handler, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_completion_adapter_response",
+        return_value=Response(content='{"ok": true}', media_type="application/json"),
+    ) as mock_build_response, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+    ):
+        response = await _handle_anthropic_openrouter_completion_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model=adapter_model,
+        )
+
+    assert response.body == b'{"ok": true}'
+    mock_openrouter.assert_awaited_once()
+    mock_completion_handler.assert_awaited_once()
+    completion_kwargs = mock_completion_handler.await_args.kwargs
+    assert completion_kwargs["model"] == upstream_model
+    assert completion_kwargs["custom_llm_provider"] == "openrouter"
+    assert completion_kwargs["api_base"].endswith("/v1")
+    mock_build_response.assert_called_once_with(success)
 
 
 @pytest.mark.asyncio
@@ -19528,23 +19888,87 @@ async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55()
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates():
+async def test_codex_auto_agent_alias_low_keeps_existing_order_by_default(
+    monkeypatch,
+):
+    monkeypatch.delenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", raising=False)
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    selection = await _select_codex_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["provider"] == "opencode_zen"
+    assert selection["candidate"]["model"] == "deepseek-v4-flash"
+    assert selection["candidate"]["route_family"] == "codex_opencode_zen_adapter"
+    candidates = _get_codex_auto_agent_candidates_for_alias("aawm-low")
+    candidate_models = {candidate["model"] for candidate in candidates}
+    assert {
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+        "gemini-3.5-flash-low",
+    }.isdisjoint(candidate_models)
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-low",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     expected_candidates = [
-        ("opencode_zen", "deepseek-v4-flash", False),
-        ("opencode_zen", "big-pickle", False),
-        ("openai", "gpt-5.4-mini", True),
+        (
+            "antigravity",
+            "gemini-3.5-flash-low",
+            "codex_antigravity_code_assist_adapter",
+            False,
+        ),
+        (
+            "openrouter",
+            "openrouter/cohere/north-mini-code:free",
+            "codex_openrouter_completion_adapter",
+            False,
+        ),
+        (
+            "openrouter",
+            "openrouter/owl-alpha",
+            "codex_openrouter_completion_adapter",
+            False,
+        ),
+        (
+            "opencode_zen",
+            "deepseek-v4-flash",
+            "codex_opencode_zen_adapter",
+            False,
+        ),
+        (
+            "opencode_zen",
+            "big-pickle",
+            "codex_opencode_zen_adapter",
+            False,
+        ),
+        ("openai", "gpt-5.4-mini", "codex_responses", True),
     ]
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
         new=AsyncMock(return_value="google-lane"),
     ):
-        for index, (provider, model, last_resort) in enumerate(expected_candidates):
+        for index, (provider, model, route_family, last_resort) in enumerate(
+            expected_candidates
+        ):
             selection = await _select_codex_auto_agent_candidate(
                 request=request,
                 request_body=body,
@@ -19552,6 +19976,7 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates():
             candidate = selection["candidate"]
             assert candidate["provider"] == provider
             assert candidate["model"] == model
+            assert candidate["route_family"] == route_family
             assert candidate["last_resort"] is last_resort
             if last_resort:
                 assert selection["selection_reason"] == "last_resort"
@@ -19560,8 +19985,39 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates():
             if index < len(expected_candidates) - 1:
                 await _set_codex_auto_agent_cooldown(
                     selection["cooldown_key"],
-                    60.0,
-                )
+                60.0,
+            )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_order_unchanged_when_low_staging_enabled(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    selection = await _select_codex_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["provider"] == "antigravity"
+    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["candidate"]["route_family"] == (
+        "codex_antigravity_code_assist_adapter"
+    )
+    candidates = _get_codex_auto_agent_candidates_for_alias("aawm-code")
+    assert [candidate["model"] for candidate in candidates] == [
+        "claude-sonnet-4-6",
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+        "gpt-5.5",
+    ]
 
 
 def test_codex_auto_agent_alias_metadata_uses_requested_alias():
@@ -20305,6 +20761,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
 async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     monkeypatch,
 ):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-low",
@@ -20312,9 +20769,19 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
+    await _set_codex_auto_agent_cooldown(
+        "antigravity:gemini-3.5-flash-low:antigravity-lane",
+        60.0,
+    )
     mini_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_api_key",
+        return_value=None,
+    ) as mock_openrouter_key, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
         new=AsyncMock(side_effect=FileNotFoundError("missing opencode auth")),
     ) as mock_load_opencode_key, patch(
@@ -20333,6 +20800,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         )
 
     assert response is mini_success
+    assert mock_openrouter_key.call_count == 2
     assert mock_load_opencode_key.await_count == 2
     mock_pass_through.assert_awaited_once()
     candidate_body = mock_pass_through.await_args.kwargs["custom_body"]
@@ -20342,6 +20810,24 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
     assert metadata["codex_auto_agent_selected_last_resort"] is True
+    openrouter_attempts = [
+        attempt
+        for attempt in metadata["codex_auto_agent_attempts"]
+        if attempt["provider"] == "openrouter"
+    ]
+    assert [attempt["model"] for attempt in openrouter_attempts] == [
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+    ]
+    assert all(attempt["status"] == "cooldown_set" for attempt in openrouter_attempts)
+    assert all(
+        attempt["error_class"] == "candidate_unavailable"
+        for attempt in openrouter_attempts
+    )
+    assert all(
+        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
+        for attempt in openrouter_attempts
+    )
     opencode_attempts = [
         attempt
         for attempt in metadata["codex_auto_agent_attempts"]
@@ -20360,6 +20846,8 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
     }
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
+    assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
 
@@ -21068,6 +21556,111 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
         "codex_openrouter_completion_adapter"
     )
     assert litellm_metadata["codex_auto_agent_selected_last_resort"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter_model", "upstream_model", "cooldown_keys"),
+    [
+        (
+            "openrouter/cohere/north-mini-code:free",
+            "cohere/north-mini-code:free",
+            [],
+        ),
+        (
+            "openrouter/owl-alpha",
+            "owl-alpha",
+            ["openrouter:openrouter/cohere/north-mini-code:free:openrouter"],
+        ),
+    ],
+)
+async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_preserves_prefixed_metadata_and_strips_upstream(
+    monkeypatch,
+    adapter_model,
+    upstream_model,
+    cooldown_keys,
+):
+    monkeypatch.setenv("AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES", "1")
+    monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+    monkeypatch.delenv("OPENROUTER_API_BASE", raising=False)
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "antigravity:gemini-3.5-flash-low:antigravity-lane",
+        60.0,
+    )
+    for cooldown_key in cooldown_keys:
+        await _set_codex_auto_agent_cooldown(cooldown_key, 60.0)
+    success = {
+        "id": "chatcmpl_low_openrouter",
+        "created": 1744974432,
+        "model": upstream_model,
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "openrouter ok"},
+            }
+        ],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+    }
+    shared_session = object()
+
+    async def fake_openrouter_completion_operation(*, adapter_model, operation):
+        assert adapter_model == upstream_model
+        return await operation()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
+        new=AsyncMock(side_effect=fake_openrouter_completion_operation),
+    ) as mock_openrouter, patch(
+        "litellm.acompletion",
+        new=AsyncMock(return_value=success),
+    ) as mock_acompletion, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_proxy_shared_aiohttp_session",
+        return_value=shared_session,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+    ):
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    translated = json.loads(response.body.decode("utf-8"))
+    assert translated["model"] == upstream_model
+    assert translated["output"][0]["content"][0]["text"] == "openrouter ok"
+    mock_openrouter.assert_awaited_once()
+    assert mock_openrouter.await_args.kwargs["adapter_model"] == upstream_model
+    mock_acompletion.assert_awaited_once()
+    acompletion_kwargs = mock_acompletion.await_args.kwargs
+    assert acompletion_kwargs["model"] == upstream_model
+    assert acompletion_kwargs["custom_llm_provider"] == "openrouter"
+    assert acompletion_kwargs["api_base"] == "https://openrouter.ai/api/v1"
+    assert acompletion_kwargs["shared_session"] is shared_session
+    litellm_metadata = acompletion_kwargs["litellm_metadata"]
+    assert litellm_metadata["requested_model_alias"] == "aawm-low"
+    assert litellm_metadata["codex_auto_agent_selected_provider"] == "openrouter"
+    assert litellm_metadata["codex_auto_agent_selected_model"] == adapter_model
+    assert litellm_metadata["codex_auto_agent_selected_route_family"] == (
+        "codex_openrouter_completion_adapter"
+    )
+    assert litellm_metadata["codex_adapter_model"] == adapter_model
 
 
 @pytest.mark.asyncio
