@@ -653,6 +653,166 @@ _codex_auto_agent_lock = asyncio.Lock()
 _anthropic_auto_agent_cooldown_until_monotonic_by_key: dict[str, float] = {}
 _anthropic_auto_agent_session_affinity_by_key: dict[str, dict[str, Any]] = {}
 _anthropic_auto_agent_lock = asyncio.Lock()
+_AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT = "aawm-routing-v1"
+_AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = "aawm:alias-routing"
+
+
+def _get_aawm_alias_routing_state_namespace() -> str:
+    raw = _clean_codex_auth_value(
+        os.getenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE")
+    )
+    if raw is not None:
+        return raw
+    return _AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT
+
+
+def _build_aawm_alias_routing_durable_cache_key(
+    *,
+    alias_family: str,
+    state_kind: str,
+    state_key: str,
+) -> str:
+    namespace = _get_aawm_alias_routing_state_namespace()
+    normalized_family = alias_family.strip().lower()
+    normalized_kind = state_kind.strip().lower()
+    return (
+        f"{_AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX}:{namespace}:"
+        f"{normalized_family}:{normalized_kind}:{state_key}"
+    )
+
+
+def _get_aawm_alias_routing_dual_cache() -> Optional[Any]:
+    try:
+        from litellm.proxy.proxy_server import proxy_logging_obj
+    except Exception:
+        return None
+    if proxy_logging_obj is None:
+        return None
+    internal_usage_cache = getattr(proxy_logging_obj, "internal_usage_cache", None)
+    if internal_usage_cache is None:
+        return None
+    dual_cache = getattr(internal_usage_cache, "dual_cache", None)
+    if dual_cache is None or getattr(dual_cache, "redis_cache", None) is None:
+        return None
+    return dual_cache
+
+
+def _parse_aawm_alias_routing_durable_expiry(
+    payload: Any,
+) -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    expires_at = payload.get("expires_at_epoch")
+    if not isinstance(expires_at, (int, float)):
+        return None
+    if float(expires_at) <= time.time():
+        return None
+    return float(expires_at)
+
+
+async def _read_aawm_alias_routing_durable_payload(
+    *,
+    alias_family: str,
+    state_kind: str,
+    state_key: str,
+) -> Optional[dict[str, Any]]:
+    dual_cache = _get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        return None
+    cache_key = _build_aawm_alias_routing_durable_cache_key(
+        alias_family=alias_family,
+        state_kind=state_kind,
+        state_key=state_key,
+    )
+    try:
+        payload = await dual_cache.async_get_cache(key=cache_key)
+    except Exception:
+        verbose_proxy_logger.warning(
+            "AAWM alias routing durable read failed for family=%s kind=%s",
+            alias_family,
+            state_kind,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if _parse_aawm_alias_routing_durable_expiry(payload) is None:
+        return None
+    return dict(payload)
+
+
+async def _write_aawm_alias_routing_durable_payload(
+    *,
+    alias_family: str,
+    state_kind: str,
+    state_key: str,
+    payload: dict[str, Any],
+    ttl_seconds: float,
+) -> bool:
+    dual_cache = _get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        return False
+    cache_key = _build_aawm_alias_routing_durable_cache_key(
+        alias_family=alias_family,
+        state_kind=state_kind,
+        state_key=state_key,
+    )
+    durable_payload = dict(payload)
+    durable_payload["expires_at_epoch"] = (
+        time.time() + max(0.0, float(ttl_seconds))
+    )
+    try:
+        await dual_cache.async_set_cache(
+            key=cache_key,
+            value=durable_payload,
+            ttl=max(1.0, float(ttl_seconds)),
+        )
+        return True
+    except Exception:
+        verbose_proxy_logger.warning(
+            "AAWM alias routing durable write failed for family=%s kind=%s",
+            alias_family,
+            state_kind,
+            exc_info=True,
+        )
+        return False
+
+
+def _hydrate_aawm_alias_routing_cooldown_memory(
+    *,
+    memory_map: dict[str, float],
+    cooldown_key: str,
+    expires_at_epoch: float,
+) -> None:
+    remaining = max(0.0, float(expires_at_epoch) - time.time())
+    if remaining <= 0:
+        return
+    until = time.monotonic() + remaining
+    current_until = memory_map.get(cooldown_key, 0.0)
+    if until > current_until:
+        memory_map[cooldown_key] = until
+
+
+def _hydrate_aawm_alias_routing_affinity_memory(
+    *,
+    memory_map: dict[str, dict[str, Any]],
+    session_key: str,
+    payload: dict[str, Any],
+    expires_at_epoch: float,
+) -> dict[str, Any]:
+    remaining = max(0.0, float(expires_at_epoch) - time.time())
+    if remaining <= 0:
+        return {}
+    affinity = {
+        "provider": payload.get("provider"),
+        "model": payload.get("model"),
+        "route_family": payload.get("route_family"),
+        "last_resort": bool(payload.get("last_resort")),
+        "expires_at_monotonic": time.monotonic() + remaining,
+    }
+    memory_map[session_key] = affinity
+    return dict(affinity)
+
 _GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = (
     "# Preserved Project And Safety Instructions"
 )
@@ -2443,33 +2603,72 @@ def _raise_codex_auto_agent_redispatch_required(
     )
 
 
-async def _get_codex_auto_agent_active_cooldown_seconds(
+async def _get_codex_auto_agent_active_cooldown_state(
     cooldown_key: str,
-) -> float:
+) -> tuple[float, str]:
     async with _codex_auto_agent_lock:
         now = time.monotonic()
         until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(
             cooldown_key, 0.0
         )
-        if until <= now:
-            _codex_auto_agent_cooldown_until_monotonic_by_key.pop(
-                cooldown_key, None
-            )
-            return 0.0
-        return max(0.0, until - now)
+        if until > now:
+            return max(0.0, until - now), "memory"
+        _codex_auto_agent_cooldown_until_monotonic_by_key.pop(
+            cooldown_key, None
+        )
+    dual_cache = _get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        return 0.0, "local_fallback"
+    durable_payload = await _read_aawm_alias_routing_durable_payload(
+        alias_family="codex",
+        state_kind="cooldown",
+        state_key=cooldown_key,
+    )
+    if durable_payload is None:
+        return 0.0, "local_fallback"
+    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
+    if expires_at_epoch is None:
+        return 0.0, "local_fallback"
+    async with _codex_auto_agent_lock:
+        _hydrate_aawm_alias_routing_cooldown_memory(
+            memory_map=_codex_auto_agent_cooldown_until_monotonic_by_key,
+            cooldown_key=cooldown_key,
+            expires_at_epoch=expires_at_epoch,
+        )
+        until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(
+            cooldown_key, 0.0
+        )
+        return max(0.0, until - time.monotonic()), "durable_cache"
+
+
+async def _get_codex_auto_agent_active_cooldown_seconds(
+    cooldown_key: str,
+) -> float:
+    seconds, _ = await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
+    return seconds
 
 
 async def _set_codex_auto_agent_cooldown(
     cooldown_key: str,
     cooldown_seconds: float,
 ) -> None:
+    ttl_seconds = max(0.0, float(cooldown_seconds))
     async with _codex_auto_agent_lock:
-        until = time.monotonic() + max(0.0, cooldown_seconds)
+        until = time.monotonic() + ttl_seconds
         current_until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(
             cooldown_key, 0.0
         )
         if until > current_until:
             _codex_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
+    if ttl_seconds <= 0:
+        return
+    await _write_aawm_alias_routing_durable_payload(
+        alias_family="codex",
+        state_kind="cooldown",
+        state_key=cooldown_key,
+        payload={"cooldown_key": cooldown_key},
+        ttl_seconds=ttl_seconds,
+    )
 
 
 async def _get_codex_auto_agent_session_affinity(
@@ -2479,12 +2678,38 @@ async def _get_codex_auto_agent_session_affinity(
         return None
     async with _codex_auto_agent_lock:
         affinity = _codex_auto_agent_session_affinity_by_key.get(session_key)
-        if not isinstance(affinity, dict):
-            return None
-        expires_at = affinity.get("expires_at_monotonic", 0.0)
-        if not isinstance(expires_at, (int, float)) or expires_at <= time.monotonic():
+        if isinstance(affinity, dict):
+            expires_at = affinity.get("expires_at_monotonic", 0.0)
+            if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
+                hydrated = dict(affinity)
+                hydrated["affinity_state_source"] = affinity.get(
+                    "affinity_state_source", "memory"
+                )
+                return hydrated
             _codex_auto_agent_session_affinity_by_key.pop(session_key, None)
+    dual_cache = _get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        return None
+    durable_payload = await _read_aawm_alias_routing_durable_payload(
+        alias_family="codex",
+        state_kind="affinity",
+        state_key=session_key,
+    )
+    if durable_payload is None:
+        return None
+    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
+    if expires_at_epoch is None:
+        return None
+    async with _codex_auto_agent_lock:
+        affinity = _hydrate_aawm_alias_routing_affinity_memory(
+            memory_map=_codex_auto_agent_session_affinity_by_key,
+            session_key=session_key,
+            payload=durable_payload,
+            expires_at_epoch=expires_at_epoch,
+        )
+        if not affinity:
             return None
+        affinity["affinity_state_source"] = "durable_cache"
         return dict(affinity)
 
 
@@ -2503,7 +2728,20 @@ async def _set_codex_auto_agent_session_affinity(
             "expires_at_monotonic": (
                 time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
             ),
+            "affinity_state_source": "memory",
         }
+    await _write_aawm_alias_routing_durable_payload(
+        alias_family="codex",
+        state_kind="affinity",
+        state_key=session_key,
+        payload={
+            "provider": candidate["provider"],
+            "model": candidate["model"],
+            "route_family": candidate["route_family"],
+            "last_resort": bool(candidate.get("last_resort")),
+        },
+        ttl_seconds=_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS,
+    )
 
 
 def _find_codex_auto_agent_candidate(
@@ -2550,8 +2788,8 @@ async def _build_codex_auto_agent_candidate_states(
         else:
             lane_key = openai_lane_key
         cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
-        cooldown_seconds = await _get_codex_auto_agent_active_cooldown_seconds(
-            cooldown_key
+        cooldown_seconds, cooldown_state_source = (
+            await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
         )
         states.append(
             {
@@ -2559,10 +2797,30 @@ async def _build_codex_auto_agent_candidate_states(
                 "lane_key": lane_key,
                 "cooldown_key": cooldown_key,
                 "cooldown_seconds": cooldown_seconds,
+                "cooldown_state_source": cooldown_state_source,
             }
         )
     return states
 
+
+
+
+def _attach_aawm_alias_routing_state_sources(
+    selection: dict[str, Any],
+    *,
+    affinity: Optional[dict[str, Any]] = None,
+    selected_state: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    enriched = dict(selection)
+    if affinity is not None:
+        enriched["affinity_state_source"] = affinity.get(
+            "affinity_state_source", "local_fallback"
+        )
+    if selected_state is not None:
+        enriched["cooldown_state_source"] = selected_state.get(
+            "cooldown_state_source", "local_fallback"
+        )
+    return enriched
 
 async def _select_codex_auto_agent_candidate(
     *,
@@ -2632,14 +2890,18 @@ async def _select_codex_auto_agent_candidate(
                         )
                     )
                 else:
-                    return {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": skipped,
-                        "in_flight_session": has_continuation_state,
-                    }
+                    return _attach_aawm_alias_routing_state_sources(
+                        {
+                            **affinity_state,
+                            "alias_model": alias_model,
+                            "session_key": session_key,
+                            "selection_reason": "session_affinity",
+                            "skipped": skipped,
+                            "in_flight_session": has_continuation_state,
+                        },
+                        affinity=affinity,
+                        selected_state=affinity_state,
+                    )
             preferred_available = any(
                 not state["candidate"].get("last_resort")
                 and state["cooldown_seconds"] <= 0
@@ -2653,35 +2915,45 @@ async def _select_codex_auto_agent_candidate(
                     or not preferred_available
                 )
             ):
-                return {
-                    **affinity_state,
-                    "alias_model": alias_model,
-                    "session_key": session_key,
-                    "selection_reason": "session_affinity",
-                    "skipped": skipped,
-                }
+                return _attach_aawm_alias_routing_state_sources(
+                    {
+                        **affinity_state,
+                        "alias_model": alias_model,
+                        "session_key": session_key,
+                        "selection_reason": "session_affinity",
+                        "skipped": skipped,
+                    },
+                    affinity=affinity,
+                    selected_state=affinity_state,
+                )
 
     for state in states:
         if state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
             continue
-        return {
-            **state,
-            "alias_model": alias_model,
-            "session_key": session_key,
-            "selection_reason": "first_available",
-            "skipped": skipped,
-        }
+        return _attach_aawm_alias_routing_state_sources(
+            {
+                **state,
+                "alias_model": alias_model,
+                "session_key": session_key,
+                "selection_reason": "first_available",
+                "skipped": skipped,
+            },
+            selected_state=state,
+        )
 
     for state in states:
         if not state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
             continue
-        return {
-            **state,
-            "alias_model": alias_model,
-            "session_key": session_key,
-            "selection_reason": "last_resort",
-            "skipped": skipped,
-        }
+        return _attach_aawm_alias_routing_state_sources(
+            {
+                **state,
+                "alias_model": alias_model,
+                "session_key": session_key,
+                "selection_reason": "last_resort",
+                "skipped": skipped,
+            },
+            selected_state=state,
+        )
 
     raise HTTPException(
         status_code=429,
@@ -3001,6 +3273,12 @@ def _add_codex_auto_agent_alias_metadata(
                 else {}
             ),
             "codex_auto_agent_selection_reason": selection.get("selection_reason"),
+            "codex_auto_agent_affinity_state_source": selection.get(
+                "affinity_state_source"
+            ),
+            "codex_auto_agent_cooldown_state_source": selection.get(
+                "cooldown_state_source"
+            ),
             "codex_auto_agent_lane_key": selection.get("lane_key"),
             "codex_auto_agent_attempts": attempts,
             "codex_auto_agent_skipped_candidates": skipped,
@@ -3088,33 +3366,72 @@ def _resolve_anthropic_auto_agent_session_key(
     )
 
 
-async def _get_anthropic_auto_agent_active_cooldown_seconds(
+async def _get_anthropic_auto_agent_active_cooldown_state(
     cooldown_key: str,
-) -> float:
+) -> tuple[float, str]:
     async with _anthropic_auto_agent_lock:
         now = time.monotonic()
         until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
             cooldown_key, 0.0
         )
-        if until <= now:
-            _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
-                cooldown_key, None
-            )
-            return 0.0
-        return max(0.0, until - now)
+        if until > now:
+            return max(0.0, until - now), "memory"
+        _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
+            cooldown_key, None
+        )
+    dual_cache = _get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        return 0.0, "local_fallback"
+    durable_payload = await _read_aawm_alias_routing_durable_payload(
+        alias_family="anthropic",
+        state_kind="cooldown",
+        state_key=cooldown_key,
+    )
+    if durable_payload is None:
+        return 0.0, "local_fallback"
+    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
+    if expires_at_epoch is None:
+        return 0.0, "local_fallback"
+    async with _anthropic_auto_agent_lock:
+        _hydrate_aawm_alias_routing_cooldown_memory(
+            memory_map=_anthropic_auto_agent_cooldown_until_monotonic_by_key,
+            cooldown_key=cooldown_key,
+            expires_at_epoch=expires_at_epoch,
+        )
+        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
+            cooldown_key, 0.0
+        )
+        return max(0.0, until - time.monotonic()), "durable_cache"
+
+
+async def _get_anthropic_auto_agent_active_cooldown_seconds(
+    cooldown_key: str,
+) -> float:
+    seconds, _ = await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+    return seconds
 
 
 async def _set_anthropic_auto_agent_cooldown(
     cooldown_key: str,
     cooldown_seconds: float,
 ) -> None:
+    ttl_seconds = max(0.0, float(cooldown_seconds))
     async with _anthropic_auto_agent_lock:
-        until = time.monotonic() + max(0.0, cooldown_seconds)
+        until = time.monotonic() + ttl_seconds
         current_until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
             cooldown_key, 0.0
         )
         if until > current_until:
             _anthropic_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
+    if ttl_seconds <= 0:
+        return
+    await _write_aawm_alias_routing_durable_payload(
+        alias_family="anthropic",
+        state_kind="cooldown",
+        state_key=cooldown_key,
+        payload={"cooldown_key": cooldown_key},
+        ttl_seconds=ttl_seconds,
+    )
 
 
 async def _get_anthropic_auto_agent_session_affinity(
@@ -3124,12 +3441,38 @@ async def _get_anthropic_auto_agent_session_affinity(
         return None
     async with _anthropic_auto_agent_lock:
         affinity = _anthropic_auto_agent_session_affinity_by_key.get(session_key)
-        if not isinstance(affinity, dict):
-            return None
-        expires_at = affinity.get("expires_at_monotonic", 0.0)
-        if not isinstance(expires_at, (int, float)) or expires_at <= time.monotonic():
+        if isinstance(affinity, dict):
+            expires_at = affinity.get("expires_at_monotonic", 0.0)
+            if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
+                hydrated = dict(affinity)
+                hydrated["affinity_state_source"] = affinity.get(
+                    "affinity_state_source", "memory"
+                )
+                return hydrated
             _anthropic_auto_agent_session_affinity_by_key.pop(session_key, None)
+    dual_cache = _get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        return None
+    durable_payload = await _read_aawm_alias_routing_durable_payload(
+        alias_family="anthropic",
+        state_kind="affinity",
+        state_key=session_key,
+    )
+    if durable_payload is None:
+        return None
+    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
+    if expires_at_epoch is None:
+        return None
+    async with _anthropic_auto_agent_lock:
+        affinity = _hydrate_aawm_alias_routing_affinity_memory(
+            memory_map=_anthropic_auto_agent_session_affinity_by_key,
+            session_key=session_key,
+            payload=durable_payload,
+            expires_at_epoch=expires_at_epoch,
+        )
+        if not affinity:
             return None
+        affinity["affinity_state_source"] = "durable_cache"
         return dict(affinity)
 
 
@@ -3148,7 +3491,20 @@ async def _set_anthropic_auto_agent_session_affinity(
             "expires_at_monotonic": (
                 time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
             ),
+            "affinity_state_source": "memory",
         }
+    await _write_aawm_alias_routing_durable_payload(
+        alias_family="anthropic",
+        state_kind="affinity",
+        state_key=session_key,
+        payload={
+            "provider": candidate["provider"],
+            "model": candidate["model"],
+            "route_family": candidate["route_family"],
+            "last_resort": bool(candidate.get("last_resort")),
+        },
+        ttl_seconds=_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS,
+    )
 
 
 def _find_anthropic_auto_agent_candidate(
@@ -3200,8 +3556,8 @@ async def _build_anthropic_auto_agent_candidate_states(
         else:
             lane_key = openai_lane_key
         cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
-        cooldown_seconds = await _get_anthropic_auto_agent_active_cooldown_seconds(
-            cooldown_key
+        cooldown_seconds, cooldown_state_source = (
+            await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
         )
         states.append(
             {
@@ -3209,6 +3565,7 @@ async def _build_anthropic_auto_agent_candidate_states(
                 "lane_key": lane_key,
                 "cooldown_key": cooldown_key,
                 "cooldown_seconds": cooldown_seconds,
+                "cooldown_state_source": cooldown_state_source,
             }
         )
     return states
@@ -3355,38 +3712,48 @@ async def _select_anthropic_auto_agent_candidate(
                         )
                     )
                 else:
-                    return {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": skipped,
-                        "in_flight_session": has_continuation_state,
-                    }
+                    return _attach_aawm_alias_routing_state_sources(
+                        {
+                            **affinity_state,
+                            "alias_model": alias_model,
+                            "session_key": session_key,
+                            "selection_reason": "session_affinity",
+                            "skipped": skipped,
+                            "in_flight_session": has_continuation_state,
+                        },
+                        affinity=affinity,
+                        selected_state=affinity_state,
+                    )
 
     for state in states:
         if state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
             continue
-        return {
-            **state,
-            "alias_model": alias_model,
-            "session_key": session_key,
-            "selection_reason": "first_available",
-            "skipped": skipped,
-            "in_flight_session": has_continuation_state,
-        }
+        return _attach_aawm_alias_routing_state_sources(
+            {
+                **state,
+                "alias_model": alias_model,
+                "session_key": session_key,
+                "selection_reason": "first_available",
+                "skipped": skipped,
+                "in_flight_session": has_continuation_state,
+            },
+            selected_state=state,
+        )
 
     for state in states:
         if not state["candidate"].get("last_resort") or state["cooldown_seconds"] > 0:
             continue
-        return {
-            **state,
-            "alias_model": alias_model,
-            "session_key": session_key,
-            "selection_reason": "last_resort",
-            "skipped": skipped,
-            "in_flight_session": has_continuation_state,
-        }
+        return _attach_aawm_alias_routing_state_sources(
+            {
+                **state,
+                "alias_model": alias_model,
+                "session_key": session_key,
+                "selection_reason": "last_resort",
+                "skipped": skipped,
+                "in_flight_session": has_continuation_state,
+            },
+            selected_state=state,
+        )
 
     raise HTTPException(
         status_code=429,
@@ -3454,6 +3821,12 @@ def _add_anthropic_auto_agent_alias_metadata(
             ),
             "anthropic_auto_agent_selection_reason": selection.get(
                 "selection_reason"
+            ),
+            "anthropic_auto_agent_affinity_state_source": selection.get(
+                "affinity_state_source"
+            ),
+            "anthropic_auto_agent_cooldown_state_source": selection.get(
+                "cooldown_state_source"
             ),
             "anthropic_auto_agent_lane_key": selection.get("lane_key"),
             "anthropic_auto_agent_attempts": attempts,

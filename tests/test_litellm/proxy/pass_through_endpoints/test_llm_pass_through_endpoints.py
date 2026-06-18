@@ -121,7 +121,14 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _select_anthropic_auto_agent_candidate,
     _select_codex_auto_agent_candidate,
     _set_anthropic_auto_agent_cooldown,
+    _set_anthropic_auto_agent_session_affinity,
     _set_codex_auto_agent_cooldown,
+    _set_codex_auto_agent_session_affinity,
+    _build_aawm_alias_routing_durable_cache_key,
+    _get_codex_auto_agent_active_cooldown_state,
+    _get_anthropic_auto_agent_active_cooldown_state,
+    _get_codex_auto_agent_session_affinity,
+    _get_anthropic_auto_agent_session_affinity,
     _perform_openrouter_adapter_pass_through_request,
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
@@ -16809,6 +16816,54 @@ def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_session_affinity_reports_routing_state_sources():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"].append(
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_existing",
+                    "name": "Read",
+                    "input": {"path": "/tmp/example"},
+                }
+            ],
+        }
+    )
+    session_key = "aawm-code-anthropic:claude-session:session:claude-session"
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
+        "last_resort": False,
+    }
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_anthropic_auto_agent_session_affinity(session_key, candidate)
+        _anthropic_auto_agent_session_affinity_by_key.clear()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+            new=AsyncMock(return_value="antigravity-lane"),
+        ):
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "session_affinity"
+    assert selection["affinity_state_source"] == "durable_cache"
+    assert selection["cooldown_state_source"] == "local_fallback"
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_fresh_dispatch_ignores_session_affinity(
     monkeypatch,
 ):
@@ -28341,3 +28396,233 @@ class TestCursorProxyRoute:
             assert call_args["target"] == "https://api.cursor.com/v0/agents"
             assert result["id"] == "bc_abc123"
             assert result["status"] == "CREATING"
+
+
+class _FakeAawmAliasRoutingDualCache:
+    redis_cache = object()
+
+    def __init__(self, *, fail_writes: bool = False) -> None:
+        self.fail_writes = fail_writes
+        self.store: dict[str, Any] = {}
+        self.set_calls: list[dict[str, Any]] = []
+
+    async def async_get_cache(self, key: str, **_: Any) -> Any:
+        return self.store.get(key)
+
+    async def async_set_cache(self, key: str, value: Any, **kwargs: Any) -> None:
+        if self.fail_writes:
+            raise RuntimeError("redis unavailable")
+        self.set_calls.append({"key": key, "value": value, "kwargs": kwargs})
+        self.store[key] = value
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_codex_affinity_recovers_after_memory_clear():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    session_key = "aawm-code:codex-session:session:codex-session"
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "route_family": "codex_responses",
+        "last_resort": True,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_session_affinity(session_key, candidate)
+        _codex_auto_agent_session_affinity_by_key.clear()
+        recovered = await _get_codex_auto_agent_session_affinity(session_key)
+
+    assert recovered is not None
+    assert recovered["provider"] == "openai"
+    assert recovered["model"] == "gpt-5.5"
+    assert recovered["affinity_state_source"] == "durable_cache"
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_anthropic_affinity_recovers_after_memory_clear():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    session_key = "aawm-code-anthropic:claude-session:session:claude-session"
+    candidate = {
+        "provider": "antigravity",
+        "model": "claude-sonnet-4-6",
+        "route_family": "anthropic_antigravity_completion_adapter",
+        "last_resort": False,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_anthropic_auto_agent_session_affinity(session_key, candidate)
+        _anthropic_auto_agent_session_affinity_by_key.clear()
+        recovered = await _get_anthropic_auto_agent_session_affinity(session_key)
+
+    assert recovered is not None
+    assert recovered["provider"] == "antigravity"
+    assert recovered["model"] == "claude-sonnet-4-6"
+    assert recovered["affinity_state_source"] == "durable_cache"
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_affinity_payload_is_sanitized():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    session_key = "aawm-code-anthropic:claude-session:session:claude-session"
+    candidate = {
+        "provider": "antigravity",
+        "model": "claude-sonnet-4-6",
+        "route_family": "anthropic_antigravity_completion_adapter",
+        "last_resort": False,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_anthropic_auto_agent_session_affinity(session_key, candidate)
+
+    assert len(dual_cache.set_calls) == 1
+    payload = dual_cache.set_calls[0]["value"]
+    assert set(payload.keys()) == {
+        "provider",
+        "model",
+        "route_family",
+        "last_resort",
+        "expires_at_epoch",
+    }
+    assert payload["provider"] == "antigravity"
+    assert payload["model"] == "claude-sonnet-4-6"
+    assert payload["route_family"] == "anthropic_antigravity_completion_adapter"
+    assert payload["last_resort"] is False
+    assert isinstance(payload["expires_at_epoch"], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_cooldown_payload_is_sanitized():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_cooldown(cooldown_key, 120.0)
+
+    assert len(dual_cache.set_calls) == 1
+    payload = dual_cache.set_calls[0]["value"]
+    assert set(payload.keys()) == {"cooldown_key", "expires_at_epoch"}
+    assert payload["cooldown_key"] == cooldown_key
+    assert isinstance(payload["expires_at_epoch"], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_codex_cooldown_blocks_after_memory_clear():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_cooldown(cooldown_key, 120.0)
+        _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+        seconds, source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+    assert seconds > 0
+    assert source == "durable_cache"
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_anthropic_paths_use_separate_family_keys():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    shared_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_cooldown(shared_cooldown_key, 90.0)
+        _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+        _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
+        codex_seconds, _ = await _get_codex_auto_agent_active_cooldown_state(
+            shared_cooldown_key
+        )
+        anthropic_seconds, anthropic_source = (
+            await _get_anthropic_auto_agent_active_cooldown_state(shared_cooldown_key)
+        )
+
+    assert codex_seconds > 0
+    assert anthropic_seconds == 0.0
+    assert anthropic_source == "local_fallback"
+    assert _build_aawm_alias_routing_durable_cache_key(
+        alias_family="codex",
+        state_kind="cooldown",
+        state_key=shared_cooldown_key,
+    ) != _build_aawm_alias_routing_durable_cache_key(
+        alias_family="anthropic",
+        state_kind="cooldown",
+        state_key=shared_cooldown_key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_namespace_controls_cooldown_recovery(monkeypatch):
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", "shared-routing-plane")
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_cooldown(cooldown_key, 120.0)
+        _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+        shared_seconds, shared_source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+        monkeypatch.setenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE", "isolated-routing-plane")
+        _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+        isolated_seconds, isolated_source = (
+            await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
+        )
+
+    assert shared_seconds > 0
+    assert shared_source == "durable_cache"
+    assert isolated_seconds == 0.0
+    assert isolated_source == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_selector_reports_local_fallback_without_durable_cache(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=None,
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["cooldown_state_source"] == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_write_failure_keeps_in_memory_cooldown():
+    dual_cache = _FakeAawmAliasRoutingDualCache(fail_writes=True)
+    cooldown_key = "openrouter:deepseek/deepseek-v4-flash:openrouter"
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_cooldown(cooldown_key, 45.0)
+        seconds, source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+    assert seconds > 0
+    assert source == "memory"

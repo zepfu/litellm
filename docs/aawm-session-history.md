@@ -101,6 +101,38 @@ should assume duplicates are possible after a crash or partial outage. The spool
 contains local sensitive session metadata and must stay out of git, shared logs,
 and external artifacts unless it has been reviewed and sanitized.
 
+## Durable Alias Routing State (D1-323)
+
+AAWM auto-agent alias selectors keep two kinds of process-local routing state:
+
+- session affinity: pins a calling session to a selected provider/model/route family
+- candidate cooldown: blocks retryable exhausted candidates for a bounded TTL
+
+LiteLLM now mirrors that state into the proxy Redis-backed `DualCache` so
+affinity and cooldown survive process restarts and can be shared across LiteLLM
+workers that use the same routing namespace. When Redis is not configured or is
+unavailable, selectors keep the existing process-local fallback and expose that
+state source in metadata rather than labeling it durable.
+
+Operational notes:
+
+- Namespace env: `AAWM_ALIAS_ROUTING_STATE_NAMESPACE` (default: `aawm-routing-v1`).
+  Prod and dev instances that should share routing state must use the same value.
+- Durable key shape:
+  `aawm:alias-routing:{namespace}:{family}:{kind}:{state_key}` where `family` is
+  `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.
+- Durable payloads store absolute wall-clock expiry (`expires_at_epoch` via
+  `time.time()`). Process-local maps still use monotonic expiry for the fast path.
+- Read order: memory first, then durable cache hydrate; if durable cache is absent
+  or unavailable, selectors keep the existing in-memory fallback without failing
+  the request.
+- Session-history / alias metadata may include lightweight source fields such as
+  `codex_auto_agent_affinity_state_source`, `codex_auto_agent_cooldown_state_source`,
+  `anthropic_auto_agent_affinity_state_source`, and
+  `anthropic_auto_agent_cooldown_state_source` with values `memory`,
+  `durable_cache`, or `local_fallback`. These fields do not store prompts, tools,
+  credentials, or raw session payloads.
+
 ## Alias Routing Audit Metadata
 
 AAWM auto-agent aliases attach bounded routing metadata to selected requests so
