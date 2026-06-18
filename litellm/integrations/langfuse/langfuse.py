@@ -62,6 +62,8 @@ _LANGFUSE_SIZE_AUDIT_THRESHOLD_RATIO = 0.9
 _LANGFUSE_SIZE_AUDIT_METADATA_KEY_LIMIT = 10
 _LANGFUSE_EVENT_FIT_TARGET_RATIO = 0.95
 _LANGFUSE_INPUT_TRUNCATION_MARKER_TYPE = "litellm_langfuse_input_truncated"
+_LANGFUSE_INPUT_SUMMARY_TYPE = "litellm_langfuse_input_summary"
+_LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV = "AAWM_LANGFUSE_INPUT_SHAPE_HASH_ONLY"
 _LANGFUSE_FIELD_TRUNCATION_MARKER_TYPE = "litellm_langfuse_field_truncated"
 _LANGFUSE_FIELD_OMISSION_MARKER_TYPE = "litellm_langfuse_field_omitted"
 _LANGFUSE_FIELD_FIT_PRIORITY = (
@@ -93,15 +95,57 @@ _AAWM_LANGFUSE_METADATA_COMPACTED_TYPE = "litellm_langfuse_metadata_compacted"
 _AAWM_LANGFUSE_METADATA_PATH_SAMPLE_LIMIT = 5
 _AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT = 20
 _AAWM_LANGFUSE_METADATA_STRING_LIMIT = 200
+_AAWM_LANGFUSE_INPUT_SHAPE_SAMPLE_LIMIT = 2
+_AAWM_LANGFUSE_INPUT_SHAPE_ROOT_SAMPLE_LIMIT = 1
+_AAWM_LANGFUSE_INPUT_SHAPE_STRING_LIMIT = 120
 _SENSITIVE_METADATA_KEY_FRAGMENTS = (
     "api_key",
     "apikey",
     "authorization",
     "bearer",
     "client_secret",
+    "cookie",
     "password",
     "secret",
     "token",
+)
+_LANGFUSE_INPUT_SENSITIVE_VALUE_KEYS = frozenset(
+    {
+        "content",
+        "text",
+        "instructions",
+        "prompt",
+        "arguments",
+        "input",
+        "source",
+        "snippet",
+        "file",
+        "file_content",
+        "path",
+        "local_path",
+        "headers",
+        "authorization",
+        "cookie",
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+    }
+)
+
+_LANGFUSE_INPUT_IDENTIFIER_VALUE_KEYS = frozenset(
+    {
+        "id",
+        "call_id",
+        "tool_call_id",
+        "name",
+    }
+)
+_LANGFUSE_INPUT_LOW_CARDINALITY_VALUE_KEYS = frozenset(
+    {
+        "role",
+        "type",
+    }
 )
 
 
@@ -114,6 +158,398 @@ def _get_langfuse_max_event_size_bytes() -> int:
     except ValueError:
         return _LANGFUSE_DEFAULT_MAX_EVENT_SIZE_BYTES
     return parsed_limit if parsed_limit > 0 else _LANGFUSE_DEFAULT_MAX_EVENT_SIZE_BYTES
+
+
+def _langfuse_input_shape_hash_only_enabled() -> bool:
+    raw_value = os.environ.get(_LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV)
+    if raw_value is None:
+        return False
+    parsed = str_to_bool(raw_value)
+    if parsed is not None:
+        return parsed
+    return raw_value.strip().lower() in {"1", "yes", "on"}
+
+
+def _langfuse_input_shape_string(value: Any) -> str:
+    value_text = str(value)
+    if len(value_text) <= _AAWM_LANGFUSE_INPUT_SHAPE_STRING_LIMIT:
+        return value_text
+    return value_text[: _AAWM_LANGFUSE_INPUT_SHAPE_STRING_LIMIT - 3] + "..."
+
+
+def _langfuse_input_shape_short_hash(value: Any) -> str:
+    return _stable_langfuse_metadata_hash(value)[:16]
+
+
+def _langfuse_input_shape_key_descriptor(key: Any, *, key_index: int) -> Dict[str, Any]:
+    key_text = str(key)
+    lowered_key = key_text.lower()
+    category = "sensitive" if any(
+        fragment in lowered_key for fragment in _SENSITIVE_METADATA_KEY_FRAGMENTS
+    ) else "standard"
+    return {
+        "key_index": key_index,
+        "key_hash": _langfuse_input_shape_short_hash(key_text),
+        "key_length": len(key_text),
+        "category": category,
+    }
+
+
+def _langfuse_input_shape_identifier_value(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "bool"}
+    if isinstance(value, int):
+        return {"type": "int", "magnitude_bytes": _json_size_bytes(value)}
+    if isinstance(value, float):
+        return {"type": "float", "magnitude_bytes": _json_size_bytes(value)}
+    if isinstance(value, str):
+        return {
+            "type": "string",
+            "length": len(value),
+            "hash": _langfuse_input_shape_short_hash(value),
+        }
+    return {
+        "type": type(value).__name__,
+        "hash": _langfuse_input_shape_short_hash(value),
+    }
+
+
+def _langfuse_input_shape_non_primitive_scalar(value: Any) -> Dict[str, Any]:
+    return {
+        "type": type(value).__name__,
+        "hash": _langfuse_input_shape_short_hash(value),
+    }
+
+
+def _langfuse_input_shape_scalar(
+    value: Any,
+    *,
+    redact_preview: bool = False,
+    identifier_like: bool = False,
+) -> Any:
+    if identifier_like:
+        return _langfuse_input_shape_identifier_value(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        shaped = {
+            "type": "string",
+            "length": len(value),
+        }
+        if not redact_preview:
+            shaped["hash"] = _langfuse_input_shape_short_hash(value)
+            shaped["preview"] = _langfuse_input_shape_string(value)
+        else:
+            shaped["hash"] = _langfuse_input_shape_short_hash(value)
+        return shaped
+    if isinstance(value, list):
+        return {
+            "type": "list",
+            "item_count": len(value),
+            "sample_item_shapes": [
+                _langfuse_input_shape_value(item, depth=1)
+                for item in value[:_AAWM_LANGFUSE_INPUT_SHAPE_SAMPLE_LIMIT]
+            ],
+        }
+    if isinstance(value, dict):
+        return _langfuse_input_shape_value(value)
+    return _langfuse_input_shape_non_primitive_scalar(value)
+
+
+def _langfuse_input_shape_entry_value(key: Any, item_value: Any) -> Any:
+    key_text = str(key)
+    lowered_key = key_text.lower()
+    if any(fragment in lowered_key for fragment in _SENSITIVE_METADATA_KEY_FRAGMENTS):
+        return {"type": "redacted"}
+    if lowered_key in _LANGFUSE_INPUT_IDENTIFIER_VALUE_KEYS:
+        return _langfuse_input_shape_identifier_value(item_value)
+    if lowered_key in _LANGFUSE_INPUT_SENSITIVE_VALUE_KEYS:
+        return {
+            "type": "redacted",
+            "container_type": _langfuse_input_container_type(item_value),
+            "item_count": _langfuse_input_item_count(item_value),
+            "hash": _langfuse_input_shape_short_hash(item_value),
+        }
+    redact_preview = lowered_key not in _LANGFUSE_INPUT_LOW_CARDINALITY_VALUE_KEYS
+    if isinstance(item_value, dict):
+        return {
+            "type": "dict",
+            "key_count": len(item_value),
+            "hash": _langfuse_input_shape_short_hash(item_value),
+        }
+    if isinstance(item_value, list):
+        return {
+            "type": "list",
+            "item_count": len(item_value),
+            "hash": _langfuse_input_shape_short_hash(item_value),
+        }
+    return _langfuse_input_shape_scalar(
+        item_value,
+        redact_preview=redact_preview,
+    )
+
+
+def _langfuse_input_shape_compact_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return {"type": type(value).__name__ if value is not None else "null"}
+    if isinstance(value, str):
+        return {
+            "type": "string",
+            "length": len(value),
+            "hash": _langfuse_input_shape_short_hash(value),
+        }
+    if isinstance(value, list):
+        return {
+            "type": "list",
+            "item_count": len(value),
+            "hash": _langfuse_input_shape_short_hash(value),
+        }
+    if isinstance(value, dict):
+        return {
+            "type": "dict",
+            "key_count": len(value),
+            "hash": _langfuse_input_shape_short_hash(value),
+        }
+    return _langfuse_input_shape_non_primitive_scalar(value)
+
+
+def _langfuse_input_shape_conversation_item(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return _langfuse_input_shape_compact_value(item)
+
+    entries: List[Dict[str, Any]] = []
+    for key_index, (key, item_value) in enumerate(item.items()):
+        key_text = str(key)
+        lowered_key = key_text.lower()
+        if lowered_key in _LANGFUSE_INPUT_LOW_CARDINALITY_VALUE_KEYS:
+            value_shape: Any = _langfuse_input_shape_compact_value(item_value)
+        elif lowered_key in _LANGFUSE_INPUT_IDENTIFIER_VALUE_KEYS:
+            value_shape = _langfuse_input_shape_identifier_value(item_value)
+        elif lowered_key in _LANGFUSE_INPUT_SENSITIVE_VALUE_KEYS or lowered_key == "content":
+            value_shape = {
+                "type": "redacted",
+                "container_type": _langfuse_input_container_type(item_value),
+                "item_count": _langfuse_input_item_count(item_value),
+                "content_block_type_counts": _langfuse_input_content_block_type_counts(
+                    item_value
+                ),
+            }
+        else:
+            value_shape = _langfuse_input_shape_compact_value(item_value)
+        entries.append(
+            {
+                "key_descriptor": _langfuse_input_shape_key_descriptor(
+                    key,
+                    key_index=key_index,
+                ),
+                "value_shape": value_shape,
+            }
+        )
+    return {
+        "type": "dict",
+        "key_count": len(item),
+        "sample_entries": entries[:_AAWM_LANGFUSE_INPUT_SHAPE_ROOT_SAMPLE_LIMIT],
+    }
+
+
+def _langfuse_input_shape_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 1:
+        if isinstance(value, dict):
+            return _langfuse_input_shape_conversation_item(value)
+        return _langfuse_input_shape_compact_value(value)
+    if isinstance(value, dict):
+        entries: List[Dict[str, Any]] = []
+        for key_index, (key, item_value) in enumerate(value.items()):
+            entries.append(
+                {
+                    "key_descriptor": _langfuse_input_shape_key_descriptor(
+                        key,
+                        key_index=key_index,
+                    ),
+                    "value_shape": _langfuse_input_shape_entry_value(key, item_value),
+                }
+            )
+        return {
+            "type": "dict",
+            "key_count": len(value),
+            "sample_entries": entries[:_AAWM_LANGFUSE_INPUT_SHAPE_ROOT_SAMPLE_LIMIT],
+        }
+    return _langfuse_input_shape_scalar(value, redact_preview=True)
+
+
+def _langfuse_input_container_type(value: Any) -> str:
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "dict"
+    return type(value).__name__
+
+
+def _langfuse_input_item_count(value: Any) -> int:
+    if isinstance(value, str):
+        return 1
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    if value is None:
+        return 0
+    return 1
+
+
+def _langfuse_input_role_counts(value: Any) -> Dict[str, int]:
+    role_counts: Dict[str, int] = {}
+    if not isinstance(value, list):
+        return role_counts
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role is None:
+            continue
+        role_name = str(role)
+        role_counts[role_name] = role_counts.get(role_name, 0) + 1
+    return role_counts
+
+
+def _langfuse_input_content_block_type_counts(value: Any) -> Dict[str, int]:
+    block_counts: Dict[str, int] = {}
+
+    def _record_block_type(block_type: Any) -> None:
+        if block_type is None:
+            return
+        block_name = str(block_type)
+        block_counts[block_name] = block_counts.get(block_name, 0) + 1
+
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if "type" in item:
+                _record_block_type(item.get("type"))
+            content = item.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        _record_block_type(block.get("type"))
+            elif isinstance(content, dict):
+                _record_block_type(content.get("type"))
+    elif isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    _record_block_type(block.get("type"))
+        elif isinstance(content, dict):
+            _record_block_type(content.get("type"))
+    return block_counts
+
+
+def _langfuse_input_shape_samples(value: Any) -> Tuple[List[Any], List[Any]]:
+    if isinstance(value, str):
+        return [], []
+    if isinstance(value, list):
+        if not value:
+            return [], []
+        head = [
+            _langfuse_input_shape_conversation_item(item)
+            for item in value[:_AAWM_LANGFUSE_INPUT_SHAPE_ROOT_SAMPLE_LIMIT]
+        ]
+        tail = [
+            _langfuse_input_shape_conversation_item(item)
+            for item in value[-_AAWM_LANGFUSE_INPUT_SHAPE_ROOT_SAMPLE_LIMIT :]
+        ]
+        return head, tail
+    if isinstance(value, dict):
+        entries = list(value.items())
+        head_entries = entries[:_AAWM_LANGFUSE_INPUT_SHAPE_ROOT_SAMPLE_LIMIT]
+        tail_entries = entries[-_AAWM_LANGFUSE_INPUT_SHAPE_ROOT_SAMPLE_LIMIT :]
+        head = [
+            {
+                "key_descriptor": _langfuse_input_shape_key_descriptor(
+                    key,
+                    key_index=index,
+                ),
+                "value_shape": _langfuse_input_shape_entry_value(key, item_value),
+            }
+            for index, (key, item_value) in enumerate(head_entries)
+        ]
+        tail = [
+            {
+                "key_descriptor": _langfuse_input_shape_key_descriptor(
+                    key,
+                    key_index=len(entries) - len(tail_entries) + offset,
+                ),
+                "value_shape": _langfuse_input_shape_entry_value(key, item_value),
+            }
+            for offset, (key, item_value) in enumerate(tail_entries)
+        ]
+        return head, tail
+    return [_langfuse_input_shape_scalar(value, redact_preview=True)], []
+
+
+def _langfuse_input_reconstruction_status(
+    metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    cold_storage_object_key_present = False
+    if isinstance(metadata, dict):
+        cold_storage_object_key_present = bool(
+            metadata.get("cold_storage_object_key")
+        )
+
+    full_payload_capture_required = False
+    try:
+        from litellm.integrations.aawm_passthrough_shape_capture import (
+            passthrough_full_payload_capture_enabled,
+        )
+
+        full_payload_capture_required = passthrough_full_payload_capture_enabled()
+    except Exception:
+        full_payload_capture_required = False
+
+    if cold_storage_object_key_present:
+        source = "cold_storage_object_key"
+    elif full_payload_capture_required:
+        source = "full_payload_capture_required"
+    else:
+        source = "not_available_by_default"
+
+    return {
+        "source": source,
+        "cold_storage_object_key_present": cold_storage_object_key_present,
+        "full_payload_capture_required": full_payload_capture_required,
+    }
+
+
+def _build_langfuse_input_shape_hash_summary(
+    input_value: Any,
+    *,
+    original_input_size_bytes: int,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    item_count = _langfuse_input_item_count(input_value)
+    head, tail = _langfuse_input_shape_samples(input_value)
+    omitted_items = max(0, item_count - len(head) - len(tail))
+    summary = {
+        "type": _LANGFUSE_INPUT_SUMMARY_TYPE,
+        "hash": _stable_langfuse_metadata_hash(input_value),
+        "original_size_bytes": original_input_size_bytes,
+        "container_type": _langfuse_input_container_type(input_value),
+        "item_count": item_count,
+        "role_counts": _langfuse_input_role_counts(input_value),
+        "content_block_type_counts": _langfuse_input_content_block_type_counts(
+            input_value
+        ),
+        "head": head,
+        "tail": tail,
+        "omitted_items": omitted_items,
+        "omitted_bytes_estimate": max(0, original_input_size_bytes),
+        "raw_reconstruction": _langfuse_input_reconstruction_status(metadata),
+    }
+    summary["final_size_bytes"] = _json_size_bytes(summary)
+    return summary
 
 
 def _json_size_bytes(value: Any) -> int:
@@ -698,6 +1134,7 @@ def _fit_langfuse_generation_field_to_event_size(
     *,
     field_name: str,
     target_bytes: int,
+    input_shape_hash_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if field_name not in fitted_generation_params:
         return None
@@ -726,6 +1163,22 @@ def _fit_langfuse_generation_field_to_event_size(
         final_size_bytes = omission_marker_size_bytes
         omitted_count = _langfuse_field_omitted_count(original_value)
         strategy = "omitted"
+    elif field_name == "input" and input_shape_hash_only:
+        metadata = fitted_generation_params.get("metadata")
+        metadata_dict = metadata if isinstance(metadata, dict) else None
+        truncated_value = _build_langfuse_input_shape_hash_summary(
+            original_value,
+            original_input_size_bytes=original_size_bytes,
+            metadata=metadata_dict,
+        )
+        final_size_bytes = _json_size_bytes(truncated_value)
+        omitted_count = max(0, _langfuse_input_item_count(original_value) - len(truncated_value.get("head", [])) - len(truncated_value.get("tail", [])))
+        strategy = "shape_hash_summary"
+        if not fits_event(truncated_value):
+            truncated_value = omission_marker
+            final_size_bytes = omission_marker_size_bytes
+            omitted_count = _langfuse_field_omitted_count(original_value)
+            strategy = "omitted"
     else:
         truncated_value, omitted_count = _truncate_langfuse_input_to_fit_event(
             original_value,
@@ -788,13 +1241,17 @@ def _build_langfuse_generation_fit_summary(
     if input_summary is not None:
         summary.update(
             {
-                "input_truncated": True,
+                "input_truncated": input_summary.get("strategy") != "shape_hash_summary",
+                "input_shape_hash_summary": input_summary.get("strategy")
+                == "shape_hash_summary",
                 "original_input_size_bytes": input_summary["original_size_bytes"],
                 "final_input_size_bytes": input_summary["final_size_bytes"],
                 "truncated_input_bytes": input_summary["truncated_bytes"],
                 "omitted_input_count": input_summary["omitted_count"],
             }
         )
+        if input_summary.get("strategy") == "shape_hash_summary":
+            summary["input_summary_type"] = _LANGFUSE_INPUT_SUMMARY_TYPE
     return summary
 
 
@@ -802,6 +1259,7 @@ def _fit_langfuse_generation_params_to_event_size(
     generation_params: Dict[str, Any],
     *,
     max_event_size_bytes: Optional[int] = None,
+    input_shape_hash_only: Optional[bool] = None,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     max_bytes = max_event_size_bytes or _get_langfuse_max_event_size_bytes()
     target_bytes = _langfuse_event_fit_target_bytes(max_bytes)
@@ -810,6 +1268,11 @@ def _fit_langfuse_generation_params_to_event_size(
 
     fitted_generation_params = dict(generation_params)
     field_summaries: List[Dict[str, Any]] = []
+    use_input_shape_hash_only = (
+        _langfuse_input_shape_hash_only_enabled()
+        if input_shape_hash_only is None
+        else input_shape_hash_only
+    )
 
     for field_name in _langfuse_generation_field_fit_order(fitted_generation_params):
         if _json_size_bytes(fitted_generation_params) <= target_bytes:
@@ -819,6 +1282,7 @@ def _fit_langfuse_generation_params_to_event_size(
             fitted_generation_params,
             field_name=field_name,
             target_bytes=target_bytes,
+            input_shape_hash_only=use_input_shape_hash_only,
         )
         if field_summary is not None:
             field_summaries.append(field_summary)
