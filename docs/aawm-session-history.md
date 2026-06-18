@@ -187,8 +187,11 @@ slug and routes through the Antigravity completion adapters.
 Antigravity Gemini Code Assist candidates, including
 `gemini-3.5-flash-low`, are quota-backed Antigravity traffic rather than public
 Gemini API spend. Gemini passthrough logging must still preserve native usage
-metadata for those responses, but records `response_cost` as `0.0` instead of
-attempting public Gemini cost-map lookup.
+metadata and Antigravity route/quota identity for those responses, while cost
+attribution uses the public Gemini model pricing key. For example,
+`gemini-3.5-flash-low` keeps the logged model/provider identity but looks up
+cost using public `gemini-3.5-flash` rates so `session_history.response_cost_usd`
+reflects token usage instead of being forced to zero.
 
 The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate,
 not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejects the

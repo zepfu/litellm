@@ -12867,6 +12867,61 @@ def test_build_session_history_record_preserves_antigravity_provider_over_google
     assert record["total_tokens"] == 13
 
 
+def test_build_session_history_record_persists_antigravity_gemini_public_cost() -> None:
+    kwargs = _base_kwargs("orchestrator")
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-antigravity-gemini-cost",
+            "passthrough_route_family": "antigravity_code_assist",
+            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            "aawm_stream_logging_custom_llm_provider": "antigravity",
+            "usage_object": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 13,
+            },
+        }
+    )
+    kwargs["standard_logging_object"]["metadata"] = dict(
+        kwargs["litellm_params"]["metadata"]
+    )
+    kwargs["standard_logging_object"]["api_base"] = (
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+    )
+    kwargs["custom_llm_provider"] = "antigravity"
+    kwargs["model"] = "gemini-3.5-flash-low"
+    kwargs["response_cost"] = 0.000027
+    result = {
+        "id": "provider-response-antigravity-gemini-cost",
+        "model": "gemini-3.5-flash-low",
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "antigravity gemini cost result",
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-18T20:00:00Z",
+        end_time="2026-06-18T20:00:02Z",
+    )
+
+    assert record is not None
+    assert record["provider"] == "antigravity"
+    assert record["model"] == "gemini-3.5-flash-low"
+    assert record["response_cost_usd"] == pytest.approx(0.000027)
+
+
 def test_build_session_history_record_recovers_codex_antigravity_over_openai_provider() -> None:
     kwargs = _base_kwargs("codex")
     kwargs["litellm_params"]["metadata"].update(
