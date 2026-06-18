@@ -7,6 +7,7 @@ from litellm.integrations.langfuse.langfuse import (
     _json_size_bytes,
     _langfuse_event_fit_target_bytes,
     _log_langfuse_payload_size_if_needed,
+    _strip_langfuse_generation_metadata,
 )
 
 
@@ -67,6 +68,78 @@ def test_langfuse_payload_size_summary_reports_identifiers_and_sizes() -> None:
         "large_blob",
         "<redacted-key>",
     }
+
+
+def test_langfuse_metadata_candidate_compaction_reduces_candidate_size() -> None:
+    metadata = {
+        "prompt_overhead_component_paths": {
+            "system": [f"input.instructions.{index}" for index in range(30)],
+            "tools": [f"tools.{index}.function.parameters" for index in range(60)],
+            "conversation": [f"input.messages.{index}.content" for index in range(40)],
+        },
+        "prompt_overhead_excluded_component_paths": [
+            f"metadata.hidden_state.{index}.payload" for index in range(80)
+        ],
+        "codex_response_headers": {
+            "source": "codex_response_headers",
+            "x-codex-active-limit": "codex",
+            "x-codex-bengalfox-limit-name": "gpt-5.5",
+            "x-request-id": "req-sensitive-id",
+            **{f"x-extra-header-{index}": "value" * 20 for index in range(40)},
+        },
+        "responses_stream_tool_state": [
+            {
+                "type": "function_call",
+                "name": "Bash",
+                "call_id": f"call-{index}",
+                "arguments": "secret argument text " * 100,
+            }
+            for index in range(20)
+        ],
+        "claude_tool_advertisement_compaction_events": [
+            {
+                "tool_name": "Bash",
+                "status": "compacted",
+                "cc_version": "1.2.3",
+                "original_chars": 3000,
+                "compacted_chars": 1000,
+                "saved_chars": 2000,
+                "details": "audit detail " * 200,
+            }
+            for _ in range(10)
+        ],
+    }
+
+    compacted_metadata = _strip_langfuse_generation_metadata(metadata)
+
+    assert _json_size_bytes(compacted_metadata) < _json_size_bytes(metadata) / 2
+    component_summary = compacted_metadata["prompt_overhead_component_paths"]
+    assert component_summary["type"] == "litellm_langfuse_metadata_compacted"
+    assert component_summary["count"] == 130
+    assert component_summary["bucket_counts"] == {
+        "system": 30,
+        "tools": 60,
+        "conversation": 40,
+    }
+    assert len(component_summary["sample_paths"]["tools"]) == 5
+    excluded_summary = compacted_metadata["prompt_overhead_excluded_component_paths"]
+    assert excluded_summary["count"] == 80
+    assert "hash" in excluded_summary
+    header_summary = compacted_metadata["codex_response_headers"]
+    assert header_summary["source"] == "codex_response_headers"
+    assert header_summary["header_count"] == 43
+    assert "x-codex-active-limit" in header_summary["rate_limit_header_names"]
+    assert header_summary["request_id_present"] is True
+    assert "req-sensitive-id" not in str(header_summary)
+    tool_state_summary = compacted_metadata["responses_stream_tool_state"]
+    assert tool_state_summary["tool_call_count"] == 20
+    assert tool_state_summary["tool_names"] == ["Bash"]
+    assert "arguments_hash" in tool_state_summary["sample_tool_calls"][0]
+    assert "secret argument text" not in str(tool_state_summary)
+    claude_summary = compacted_metadata["claude_tool_advertisement_compaction_events"]
+    assert claude_summary["count"] == 10
+    assert claude_summary["total_saved_chars"] == 20_000
+    assert "audit detail" not in str(claude_summary)
 
 
 def test_langfuse_payload_size_warning_is_sanitized(caplog, monkeypatch) -> None:

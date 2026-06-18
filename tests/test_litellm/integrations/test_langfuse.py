@@ -650,6 +650,39 @@ class TestLangfuseUsageDetails(unittest.TestCase):
             ],
             "aawm_tool_definition_snapshot_hash": "hash-tool-definition",
             "aawm_tool_definition_snapshot_truncated": False,
+            "prompt_overhead_component_paths": {
+                "system": ["input.instructions", "input.safety"],
+                "tools": [f"tools.{index}.function" for index in range(8)],
+                "conversation": ["input.messages.0", "input.messages.1"],
+            },
+            "prompt_overhead_excluded_component_paths": [
+                "metadata.internal_state.large_blob",
+                "metadata.internal_state.secret_context",
+            ],
+            "codex_response_headers": {
+                "source": "codex_response_headers",
+                "x-codex-active-limit": "codex-limits",
+                "x-codex-bengalfox-limit-name": "gpt-5.5",
+                "x-request-id": "req-secret-request-id",
+            },
+            "responses_stream_tool_state": [
+                {
+                    "type": "function_call",
+                    "name": "run_command",
+                    "call_id": "call-123",
+                    "arguments": '{"command":"print secret-tool-argument"}',
+                }
+            ],
+            "claude_tool_advertisement_compaction_events": [
+                {
+                    "tool_name": "Bash",
+                    "status": "compacted",
+                    "cc_version": "1.2.3",
+                    "original_chars": 1000,
+                    "compacted_chars": 400,
+                    "saved_chars": 600,
+                }
+            ],
             "requester_metadata": {"some_requester_key": "some_requester_value"},
         }
         kwargs = {
@@ -695,6 +728,44 @@ class TestLangfuseUsageDetails(unittest.TestCase):
             "hash-tool-definition",
         )
         self.assertIn("requester_metadata", generation_kwargs["metadata"])
+        compacted_component_paths = generation_kwargs["metadata"][
+            "prompt_overhead_component_paths"
+        ]
+        self.assertEqual(
+            compacted_component_paths["type"], "litellm_langfuse_metadata_compacted"
+        )
+        self.assertEqual(compacted_component_paths["count"], 12)
+        self.assertEqual(
+            compacted_component_paths["bucket_counts"],
+            {"system": 2, "tools": 8, "conversation": 2},
+        )
+        self.assertEqual(len(compacted_component_paths["sample_paths"]["tools"]), 5)
+        compacted_excluded_paths = generation_kwargs["metadata"][
+            "prompt_overhead_excluded_component_paths"
+        ]
+        self.assertEqual(compacted_excluded_paths["count"], 2)
+        self.assertIn("hash", compacted_excluded_paths)
+        compacted_headers = generation_kwargs["metadata"]["codex_response_headers"]
+        self.assertEqual(compacted_headers["source"], "codex_response_headers")
+        self.assertEqual(compacted_headers["header_count"], 3)
+        self.assertIn(
+            "x-codex-active-limit", compacted_headers["rate_limit_header_names"]
+        )
+        self.assertTrue(compacted_headers["request_id_present"])
+        self.assertNotIn("req-secret-request-id", str(compacted_headers))
+        compacted_tool_state = generation_kwargs["metadata"][
+            "responses_stream_tool_state"
+        ]
+        self.assertEqual(compacted_tool_state["tool_call_count"], 1)
+        self.assertEqual(compacted_tool_state["tool_names"], ["run_command"])
+        self.assertIn("arguments_hash", compacted_tool_state["sample_tool_calls"][0])
+        self.assertNotIn("secret-tool-argument", str(compacted_tool_state))
+        compacted_claude_events = generation_kwargs["metadata"][
+            "claude_tool_advertisement_compaction_events"
+        ]
+        self.assertEqual(compacted_claude_events["count"], 1)
+        self.assertEqual(compacted_claude_events["total_saved_chars"], 600)
+        self.assertEqual(compacted_claude_events["tool_names"], ["Bash"])
 
     def _build_standard_logging_payload(self, trace_id: Optional[str] = None):
         payload = {

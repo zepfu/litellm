@@ -1,5 +1,6 @@
 #### What this does ####
 #    On success, logs events to Langfuse
+import hashlib
 import json
 import os
 import traceback
@@ -88,6 +89,10 @@ _LANGFUSE_FIELD_FIT_EXCLUDED_KEYS = frozenset(
     }
 )
 _AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY = "aawm_tool_definition_snapshot"
+_AAWM_LANGFUSE_METADATA_COMPACTED_TYPE = "litellm_langfuse_metadata_compacted"
+_AAWM_LANGFUSE_METADATA_PATH_SAMPLE_LIMIT = 5
+_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT = 20
+_AAWM_LANGFUSE_METADATA_STRING_LIMIT = 200
 _SENSITIVE_METADATA_KEY_FRAGMENTS = (
     "api_key",
     "apikey",
@@ -122,6 +127,229 @@ def _json_size_bytes(value: Any) -> int:
     except Exception:
         serialized_value = f"<unserializable:{type(value).__name__}>"
     return len(serialized_value.encode("utf-8"))
+
+
+def _stable_langfuse_metadata_hash(value: Any) -> str:
+    try:
+        serialized_value = json.dumps(
+            value,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except Exception:
+        serialized_value = f"<unserializable:{type(value).__name__}>"
+    return hashlib.sha256(serialized_value.encode("utf-8")).hexdigest()
+
+
+def _bounded_langfuse_metadata_string(value: Any) -> str:
+    value_text = str(value)
+    if len(value_text) <= _AAWM_LANGFUSE_METADATA_STRING_LIMIT:
+        return value_text
+    return value_text[: _AAWM_LANGFUSE_METADATA_STRING_LIMIT - 3] + "..."
+
+
+def _base_langfuse_metadata_compaction_summary(
+    *, field_name: str, value: Any
+) -> Dict[str, Any]:
+    return {
+        "type": _AAWM_LANGFUSE_METADATA_COMPACTED_TYPE,
+        "field": field_name,
+        "hash": _stable_langfuse_metadata_hash(value),
+        "original_size_bytes": _json_size_bytes(value),
+    }
+
+
+def _compact_langfuse_path_list_metadata(
+    *,
+    field_name: str,
+    value: Any,
+) -> Dict[str, Any]:
+    summary = _base_langfuse_metadata_compaction_summary(
+        field_name=field_name,
+        value=value,
+    )
+    if isinstance(value, dict):
+        bucket_counts: Dict[str, int] = {}
+        sample_paths_by_bucket: Dict[str, List[str]] = {}
+        total_count = 0
+        for bucket, bucket_value in value.items():
+            bucket_name = _bounded_langfuse_metadata_string(bucket)
+            path_values = bucket_value if isinstance(bucket_value, list) else [bucket_value]
+            paths = [
+                _bounded_langfuse_metadata_string(path)
+                for path in path_values
+                if path is not None
+            ]
+            bucket_counts[bucket_name] = len(paths)
+            total_count += len(paths)
+            if paths:
+                sample_paths_by_bucket[bucket_name] = paths[
+                    :_AAWM_LANGFUSE_METADATA_PATH_SAMPLE_LIMIT
+                ]
+        summary.update(
+            {
+                "count": total_count,
+                "bucket_counts": bucket_counts,
+                "sample_paths": sample_paths_by_bucket,
+            }
+        )
+        return summary
+
+    path_values = value if isinstance(value, list) else [value]
+    paths = [
+        _bounded_langfuse_metadata_string(path)
+        for path in path_values
+        if path is not None
+    ]
+    summary.update(
+        {
+            "count": len(paths),
+            "sample_paths": paths[:_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT],
+        }
+    )
+    return summary
+
+
+def _compact_langfuse_codex_response_headers(value: Any) -> Dict[str, Any]:
+    summary = _base_langfuse_metadata_compaction_summary(
+        field_name="codex_response_headers",
+        value=value,
+    )
+    if not isinstance(value, dict):
+        summary.update({"header_count": 0, "source": None})
+        return summary
+
+    header_names = sorted(str(key).lower() for key in value.keys() if key != "source")
+    rate_limit_header_names = [
+        name
+        for name in header_names
+        if name.startswith("x-codex-") or name.startswith("x-ratelimit-")
+    ]
+    request_id_present = any("request-id" in name for name in header_names)
+    summary.update(
+        {
+            "source": value.get("source"),
+            "header_count": len(header_names),
+            "header_names": header_names[:_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT],
+            "rate_limit_header_names": rate_limit_header_names[
+                :_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT
+            ],
+            "request_id_present": request_id_present,
+        }
+    )
+    return summary
+
+
+def _compact_langfuse_responses_stream_tool_state(value: Any) -> Dict[str, Any]:
+    summary = _base_langfuse_metadata_compaction_summary(
+        field_name="responses_stream_tool_state",
+        value=value,
+    )
+    tool_entries = value if isinstance(value, list) else []
+    tool_names: List[str] = []
+    type_counts: Dict[str, int] = {}
+    sample_tool_calls: List[Dict[str, Any]] = []
+    for item in tool_entries:
+        if not isinstance(item, dict):
+            continue
+        item_type = _bounded_langfuse_metadata_string(item.get("type") or "unknown")
+        item_name = _bounded_langfuse_metadata_string(item.get("name") or item_type)
+        if item_name not in tool_names:
+            tool_names.append(item_name)
+        type_counts[item_type] = type_counts.get(item_type, 0) + 1
+        if len(sample_tool_calls) >= _AAWM_LANGFUSE_METADATA_PATH_SAMPLE_LIMIT:
+            continue
+        argument_value = item.get("arguments")
+        argument_hash = item.get("arguments_hash")
+        if argument_hash is None and argument_value is not None:
+            argument_hash = _stable_langfuse_metadata_hash(argument_value)
+        argument_size_bytes = item.get("arguments_size_bytes")
+        if argument_size_bytes is None and argument_value is not None:
+            argument_size_bytes = _json_size_bytes(argument_value)
+        sample_entry = {
+            "type": item_type,
+            "name": item_name,
+            "call_id": _bounded_langfuse_metadata_string(
+                item.get("call_id") or item.get("id") or ""
+            ),
+        }
+        if argument_hash is not None:
+            sample_entry["arguments_hash"] = argument_hash
+        if argument_size_bytes is not None:
+            sample_entry["arguments_size_bytes"] = argument_size_bytes
+        sample_tool_calls.append(sample_entry)
+
+    summary.update(
+        {
+            "tool_call_count": len(tool_entries),
+            "tool_names": tool_names[:_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT],
+            "tool_type_counts": type_counts,
+            "sample_tool_calls": sample_tool_calls,
+        }
+    )
+    return summary
+
+
+def _compact_langfuse_claude_tool_compaction_events(value: Any) -> Dict[str, Any]:
+    summary = _base_langfuse_metadata_compaction_summary(
+        field_name="claude_tool_advertisement_compaction_events",
+        value=value,
+    )
+    events = value if isinstance(value, list) else []
+    tool_names: List[str] = []
+    statuses: List[str] = []
+    cc_versions: List[str] = []
+    total_original_chars = 0
+    total_compacted_chars = 0
+    total_saved_chars = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        tool_name = event.get("tool_name") or event.get("name")
+        if tool_name is not None:
+            bounded_tool_name = _bounded_langfuse_metadata_string(tool_name)
+            if bounded_tool_name not in tool_names:
+                tool_names.append(bounded_tool_name)
+        status = event.get("status")
+        if status is not None:
+            bounded_status = _bounded_langfuse_metadata_string(status)
+            if bounded_status not in statuses:
+                statuses.append(bounded_status)
+        cc_version = event.get("cc_version") or event.get("claude_code_version")
+        if cc_version is not None:
+            bounded_cc_version = _bounded_langfuse_metadata_string(cc_version)
+            if bounded_cc_version not in cc_versions:
+                cc_versions.append(bounded_cc_version)
+        for source_key, total_key in (
+            ("original_chars", "total_original_chars"),
+            ("compacted_chars", "total_compacted_chars"),
+            ("saved_chars", "total_saved_chars"),
+        ):
+            try:
+                value_int = int(event.get(source_key) or 0)
+            except (TypeError, ValueError):
+                value_int = 0
+            if total_key == "total_original_chars":
+                total_original_chars += value_int
+            elif total_key == "total_compacted_chars":
+                total_compacted_chars += value_int
+            else:
+                total_saved_chars += value_int
+
+    summary.update(
+        {
+            "count": len(events),
+            "tool_names": tool_names[:_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT],
+            "statuses": statuses[:_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT],
+            "cc_versions": cc_versions[:_AAWM_LANGFUSE_METADATA_VALUE_SAMPLE_LIMIT],
+            "total_original_chars": total_original_chars,
+            "total_compacted_chars": total_compacted_chars,
+            "total_saved_chars": total_saved_chars,
+        }
+    )
+    return summary
 
 
 def _sanitize_metadata_key_for_size_audit(key: Any) -> str:
@@ -2068,16 +2296,29 @@ def log_requester_metadata(clean_metadata: dict):
 
 
 def _strip_langfuse_generation_metadata(full_metadata: dict) -> dict:
-    """Return Langfuse generation metadata without durable session-history snapshots."""
+    """Return Langfuse generation metadata without bulky durable snapshots."""
 
     if not isinstance(full_metadata, dict):
         return {}
 
-    if _AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY not in full_metadata:
-        return full_metadata
+    compacted_metadata = dict(full_metadata)
+    compacted_metadata.pop(_AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY, None)
 
-    return {
-        k: v
-        for k, v in full_metadata.items()
-        if k != _AAWM_TOOL_DEFINITION_METADATA_SNAPSHOT_KEY
+    compactors = {
+        "prompt_overhead_component_paths": lambda value: _compact_langfuse_path_list_metadata(
+            field_name="prompt_overhead_component_paths",
+            value=value,
+        ),
+        "prompt_overhead_excluded_component_paths": lambda value: _compact_langfuse_path_list_metadata(
+            field_name="prompt_overhead_excluded_component_paths",
+            value=value,
+        ),
+        "codex_response_headers": _compact_langfuse_codex_response_headers,
+        "responses_stream_tool_state": _compact_langfuse_responses_stream_tool_state,
+        "claude_tool_advertisement_compaction_events": _compact_langfuse_claude_tool_compaction_events,
     }
+    for metadata_key, compactor in compactors.items():
+        if metadata_key in compacted_metadata:
+            compacted_metadata[metadata_key] = compactor(compacted_metadata[metadata_key])
+
+    return compacted_metadata

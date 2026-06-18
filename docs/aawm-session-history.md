@@ -304,6 +304,37 @@ fields when present, but the durable table is populated only by runtime
 session-history ingestion or by older Langfuse rows that still carried the
 inline `aawm_tool_definition_snapshot` value.
 
+## Langfuse Metadata Compaction
+
+Langfuse generation metadata is intentionally more compact than
+`session_history.metadata`. Session history remains the operational drill-down
+surface, while Langfuse keeps bounded summaries for high-cardinality fields that
+otherwise recur on every generation event.
+
+Before Langfuse SDK enqueue, LiteLLM strips
+`aawm_tool_definition_snapshot` and compacts these metadata fields:
+
+- `prompt_overhead_component_paths`: replaced with a stable hash, total count,
+  bucket counts, original byte size, and bounded path samples by bucket.
+- `prompt_overhead_excluded_component_paths`: replaced with a stable hash,
+  total count, original byte size, and bounded path samples.
+- `codex_response_headers`: replaced with a stable hash, source, header count,
+  bounded header-name samples, rate-limit header names, and request-id
+  presence. Header values are not kept inline in Langfuse metadata.
+- `responses_stream_tool_state`: replaced with a stable hash, tool-call count,
+  tool names, tool type counts, and bounded per-tool samples containing
+  `type`, `name`, `call_id`, `arguments_hash`, and `arguments_size_bytes`.
+  Raw tool arguments are not kept inline.
+- `claude_tool_advertisement_compaction_events`: replaced with a stable hash,
+  event count, tool names, statuses, Claude Code versions, and aggregate
+  original/compacted/saved character counts. This does not re-expand or
+  double-count the already-compacted Claude tool definitions.
+
+These summaries reduce metadata size and avoid repeating raw headers, path
+inventories, tool arguments, or compaction audit detail inside each Langfuse
+event. They do not eliminate Langfuse size warnings where the request `input`
+field itself is already close to the configured Langfuse event-size threshold.
+
 ## Codex Tool-Description Patches
 
 AAWM Codex and Claude Code adapter paths may patch advertised tool descriptions
