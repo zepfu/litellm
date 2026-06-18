@@ -5653,9 +5653,116 @@ class TestGoogleAdapterRequestShapePolicy:
             mock_pass_through.await_args_list[0].kwargs[
                 "retryable_upstream_status_codes"
             ]
-            == [429]
+            == [429, 500, 502, 503, 504, 529]
         )
         set_cooldown.assert_awaited_once_with("__default__", 10.0)
+
+
+    @pytest.mark.asyncio
+    async def test_google_adapter_request_retries_transient_503_unavailable(self):
+        first_error = ProxyException(
+            message="The service is currently unavailable",
+            type="None",
+            param="None",
+            code=503,
+        )
+        first_error.detail = """503: b'{
+  "error": {
+    "code": 503,
+    "message": "The service is currently unavailable",
+    "status": "UNAVAILABLE"
+  }
+}
+'"""
+        successful_response = Response(
+            content='{"ok": true}', media_type="application/json"
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(side_effect=[first_error, successful_response]),
+        ) as mock_pass_through, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_google_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+            new=AsyncMock(),
+        ) as mock_sleep:
+            result = await _perform_google_adapter_pass_through_request(
+                request=MagicMock(),
+                custom_body={"litellm_metadata": {}},
+            )
+
+        assert result is successful_response
+        assert mock_pass_through.await_count == 2
+        assert mock_pass_through.await_args_list[0].kwargs[
+            "retryable_upstream_status_codes"
+        ] == [429, 500, 502, 503, 504, 529]
+        mock_sleep.assert_awaited_once_with(5.0)
+        metadata = mock_pass_through.await_args_list[0].kwargs["custom_body"][
+            "litellm_metadata"
+        ]
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "success_after_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_google_adapter_terminal_503_records_hidden_retry_metadata(self):
+        terminal_error = ProxyException(
+            message="The service is currently unavailable",
+            type="None",
+            param="None",
+            code=503,
+        )
+        terminal_error.detail = """503: b'{
+  "error": {
+    "code": 503,
+    "message": "The service is currently unavailable",
+    "status": "UNAVAILABLE"
+  }
+}
+'"""
+        custom_body = {"litellm_metadata": {}}
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(side_effect=terminal_error),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_google_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_google_adapter_transient_retry_max_attempts",
+            return_value=1,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+            new=AsyncMock(),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.error"
+        ) as mock_error:
+            with pytest.raises(ProxyException):
+                await _perform_google_adapter_pass_through_request(
+                    request=MagicMock(),
+                    custom_body=custom_body,
+                )
+
+        metadata = custom_body["litellm_metadata"]
+        error_payload = metadata["google_generate_content_error"]
+        assert error_payload["source"] == "google_generate_content_error"
+        assert error_payload["adapter_attempt"] == 1
+        assert error_payload["error"]["status"] == "UNAVAILABLE"
+        assert metadata["google_generate_content_error_count"] == 1
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 1
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "failed_without_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_attempts"][0]["status_code"] == 503
+        mock_error.assert_called_once()
+        assert mock_error.call_args.kwargs["extra"]["status_code"] == 503
+        assert (
+            mock_error.call_args.kwargs["extra"]["hidden_retry_final_outcome"]
+            == "failed_without_retry"
+        )
 
 
 class TestPassThroughRequestRetryableFailures:
