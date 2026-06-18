@@ -160,6 +160,10 @@ _GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS = (
     "x_xai_token_auth=xai-grok-cli",
     "no auth context",
 )
+_CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
+    "unable to load site",
+    "cdn-cgi/challenge-platform",
+)
 
 
 def get_response_body(response: httpx.Response) -> Optional[dict]:
@@ -575,6 +579,32 @@ def _is_known_grok_signals_auth_context_response(
     return all(
         marker in normalized_detail
         for marker in _GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS
+    )
+
+
+def _is_known_chatgpt_codex_block_page_response(
+    *,
+    url: Optional[httpx.URL],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_403_FORBIDDEN:
+        return False
+
+    parsed_url = urlparse(str(url or ""))
+    if (
+        str(parsed_url.hostname or "").lower() != "chatgpt.com"
+        or "/backend-api/codex/" not in str(parsed_url.path or "").lower()
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if not detail:
+        return False
+
+    normalized_detail = str(detail).lower()
+    return any(
+        marker in normalized_detail for marker in _CHATGPT_CODEX_BLOCK_PAGE_MARKERS
     )
 
 
@@ -2842,6 +2872,13 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_chatgpt_codex_block_page_traceback = (
+            _is_known_chatgpt_codex_block_page_response(
+                url=url,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
@@ -2877,6 +2914,16 @@ async def pass_through_request(  # noqa: PLR0915
                     "failure_kind": _get_passthrough_grok_signals_auth_context_failure_kind(),
                 },
             )
+        elif suppress_chatgpt_codex_block_page_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced ChatGPT Codex block page status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": "openai_chatgpt_codex_block_page",
+                },
+            )
         elif suppress_terminal_failure_traceback:
             hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)
             hidden_retry_failure_classification = hidden_retry_metadata.get(
@@ -2905,7 +2952,7 @@ async def pass_through_request(  # noqa: PLR0915
                 hidden_retry_metadata.get("aawm_passthrough_hidden_retry_final_outcome"),
                 hidden_retry_metadata.get("aawm_passthrough_hidden_retry_count"),
                 extra=terminal_failure_context,
-                exc_info=True,
+                exc_info=False,
             )
         else:
             verbose_proxy_logger.exception(
@@ -2946,6 +2993,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_provider_rate_limit_traceback
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
+            and not suppress_chatgpt_codex_block_page_traceback
         ):
             traceback_str = traceback.format_exc(
                 limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,

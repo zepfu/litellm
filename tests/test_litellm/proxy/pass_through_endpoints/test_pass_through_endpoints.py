@@ -3459,6 +3459,79 @@ class TestPassThroughTerminalFailureLogging:
         assert not (tmp_path / "dev-error.jsonl").exists()
 
     @pytest.mark.asyncio
+    async def test_pass_through_request_chatgpt_codex_block_page_warns_with_failure_kind(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        upstream_response = httpx.Response(
+            status_code=403,
+            content=(
+                b"<html><body><p>Unable to load site</p>"
+                b"<script src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'>"
+                b"</script></body></html>"
+            ),
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "gpt-5.5"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch.object(
+            verbose_proxy_logger,
+            "exception",
+        ) as mock_exception:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value={"model": "gpt-5.5"})
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "403"
+        mock_exception.assert_not_called()
+        block_warning = next(
+            call
+            for call in mock_warning.call_args_list
+            if "ChatGPT Codex block page" in str(call.args[0])
+        )
+        assert (
+            block_warning.kwargs["extra"]["failure_kind"]
+            == "openai_chatgpt_codex_block_page"
+        )
+        assert block_warning.kwargs["extra"]["upstream_url"] == target_url
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
+            is None
+        )
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_exhausted_chatgpt_codex_503_logs_without_traceback(
         self,
         monkeypatch,
