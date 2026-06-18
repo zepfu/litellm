@@ -403,6 +403,9 @@ _CODEX_AAWM_READ_ALIAS = "aawm-read"
 _CODEX_AAWM_SOTA_ALIAS = "aawm-sota"
 _CODEX_AAWM_CODE_ALIAS = "aawm-code"
 _CODEX_AAWM_LOW_ALIAS = "aawm-low"
+_AAWM_LOW_OPENROUTER_CANDIDATES_ENV = (
+    "AAWM_ENABLE_OPENROUTER_LOW_ALIAS_CANDIDATES"
+)
 _CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -442,6 +445,26 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "route_family": "codex_responses",
         "last_resort": True,
         "default_reasoning_effort": "medium",
+    },
+)
+_CODEX_AAWM_LOW_OPENROUTER_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
+        "model": "gemini-3.5-flash-low",
+        "route_family": "codex_antigravity_code_assist_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "openrouter/cohere/north-mini-code:free",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "openrouter/owl-alpha",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
     },
 )
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -538,6 +561,26 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
+_ANTHROPIC_AAWM_LOW_OPENROUTER_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
+        "model": "gemini-3.5-flash-low",
+        "route_family": "anthropic_antigravity_completion_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "openrouter/cohere/north-mini-code:free",
+        "route_family": "anthropic_openrouter_completion_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": "openrouter/owl-alpha",
+        "route_family": "anthropic_openrouter_completion_adapter",
+        "last_resort": False,
+    },
+)
 _ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
@@ -567,6 +610,43 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[
     _ANTHROPIC_AAWM_CODE_ALIAS: _ANTHROPIC_AAWM_CODE_CANDIDATES,
     _ANTHROPIC_AAWM_LOW_ALIAS: _ANTHROPIC_AAWM_LOW_CANDIDATES,
 }
+
+
+def _aawm_low_openrouter_candidates_enabled() -> bool:
+    value = os.getenv(_AAWM_LOW_OPENROUTER_CANDIDATES_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_codex_auto_agent_candidates_for_alias(
+    alias_model: str,
+) -> tuple[dict[str, Any], ...]:
+    candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+        alias_model,
+        _CODEX_AUTO_AGENT_CANDIDATES,
+    )
+    if (
+        alias_model == _CODEX_AAWM_LOW_ALIAS
+        and _aawm_low_openrouter_candidates_enabled()
+    ):
+        return _CODEX_AAWM_LOW_OPENROUTER_CANDIDATES + candidates
+    return candidates
+
+
+def _get_anthropic_auto_agent_candidates_for_alias(
+    alias_model: str,
+) -> tuple[dict[str, Any], ...]:
+    candidates = _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+        alias_model,
+        _ANTHROPIC_AUTO_AGENT_CANDIDATES,
+    )
+    if (
+        alias_model == _ANTHROPIC_AAWM_LOW_ALIAS
+        and _aawm_low_openrouter_candidates_enabled()
+    ):
+        return _ANTHROPIC_AAWM_LOW_OPENROUTER_CANDIDATES + candidates
+    return candidates
+
+
 _codex_auto_agent_cooldown_until_monotonic_by_key: dict[str, float] = {}
 _codex_auto_agent_session_affinity_by_key: dict[str, dict[str, Any]] = {}
 _codex_auto_agent_lock = asyncio.Lock()
@@ -1708,6 +1788,36 @@ def _normalize_anthropic_openrouter_adapter_model_name(
     return normalized_candidate or None
 
 
+def _get_openrouter_completion_adapter_upstream_model(
+    model: Any,
+) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider == "openrouter" and candidate is not None:
+        candidate = candidate.strip()
+        return candidate or None
+    return _normalize_anthropic_adapter_model_name(model)
+
+
+def _raise_openrouter_auto_agent_candidate_unavailable(message: str) -> None:
+    exc = ProxyException(
+        message=message,
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
+    raise exc
+
+
 def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
     explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
     if explicit_provider != _OPENCODE_ZEN_PROVIDER or candidate is None:
@@ -2402,9 +2512,7 @@ def _find_codex_auto_agent_candidate(
     *,
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[dict[str, Any]]:
-    for candidate in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-        alias_model, _CODEX_AUTO_AGENT_CANDIDATES
-    ):
+    for candidate in _get_codex_auto_agent_candidates_for_alias(alias_model):
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
@@ -2419,8 +2527,8 @@ async def _build_codex_auto_agent_candidate_states(
     google_lane_key: Optional[str] = None
     antigravity_lane_key: Optional[str] = None
     states: list[dict[str, Any]] = []
-    for candidate_template in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-        alias_model, _CODEX_AUTO_AGENT_CANDIDATES
+    for candidate_template in _get_codex_auto_agent_candidates_for_alias(
+        alias_model
     ):
         candidate = dict(candidate_template)
         if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
@@ -3049,9 +3157,7 @@ def _find_anthropic_auto_agent_candidate(
     *,
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[dict[str, Any]]:
-    for candidate in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-        alias_model, _ANTHROPIC_AUTO_AGENT_CANDIDATES
-    ):
+    for candidate in _get_anthropic_auto_agent_candidates_for_alias(alias_model):
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
@@ -3069,8 +3175,8 @@ async def _build_anthropic_auto_agent_candidate_states(
     google_lane_key: Optional[str] = None
     antigravity_lane_key: Optional[str] = None
     states: list[dict[str, Any]] = []
-    for candidate_template in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-        alias_model, _ANTHROPIC_AUTO_AGENT_CANDIDATES
+    for candidate_template in _get_anthropic_auto_agent_candidates_for_alias(
+        alias_model
     ):
         candidate = dict(candidate_template)
         if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
@@ -13478,6 +13584,10 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
     requested_model = prepared_request_body.get("model")
     route_family = "anthropic_openrouter_completion_adapter"
     target_endpoint_label = "openrouter:/v1/chat/completions"
+    upstream_adapter_model = (
+        _get_openrouter_completion_adapter_upstream_model(adapter_model)
+        or adapter_model
+    )
 
     prepared_request_body = _merge_litellm_metadata(
         _add_route_family_logging_metadata(prepared_request_body, route_family),
@@ -13513,7 +13623,7 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
 
     openrouter_api_key = _get_anthropic_adapter_openrouter_api_key()
     if openrouter_api_key is None:
-        raise Exception(
+        _raise_openrouter_auto_agent_candidate_unavailable(
             "Anthropic adapter requests for OpenRouter models require 'AAWM_OPENROUTER_API_KEY' or 'OPENROUTER_API_KEY' in environment."
         )
 
@@ -13540,11 +13650,11 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
     completion_response = await _perform_openrouter_completion_adapter_operation(
-        adapter_model=adapter_model,
+        adapter_model=upstream_adapter_model,
         operation=lambda: LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
             max_tokens=int(prepared_request_body.get("max_tokens") or 1024),
             messages=prepared_request_body.get("messages") or [],
-            model=adapter_model,
+            model=upstream_adapter_model,
             metadata=_build_completion_adapter_metadata(prepared_request_body),
             stop_sequences=prepared_request_body.get("stop_sequences"),
             stream=client_requested_stream,
@@ -13642,7 +13752,7 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
 
     openrouter_api_key = _get_anthropic_adapter_openrouter_api_key()
     if openrouter_api_key is None:
-        raise Exception(
+        _raise_openrouter_auto_agent_candidate_unavailable(
             "Anthropic adapter requests for OpenRouter models require 'AAWM_OPENROUTER_API_KEY' or 'OPENROUTER_API_KEY' in environment."
         )
 
@@ -20414,11 +20524,7 @@ async def _handle_anthropic_auto_agent_alias_route(
     )
 
     for _attempt_number in range(
-        len(
-            _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-                alias_model, _ANTHROPIC_AUTO_AGENT_CANDIDATES
-            )
-        )
+        len(_get_anthropic_auto_agent_candidates_for_alias(alias_model))
     ):
         selection = await _select_anthropic_auto_agent_candidate(
             request=request,
@@ -22824,6 +22930,10 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         raise exc
 
     requested_model = request_body.get("model")
+    upstream_adapter_model = (
+        _get_openrouter_completion_adapter_upstream_model(adapter_model)
+        or adapter_model
+    )
     route_family = "codex_openrouter_completion_adapter"
     request_body = _merge_litellm_metadata(
         _add_route_family_logging_metadata(request_body, route_family),
@@ -22861,7 +22971,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     )
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
-        model=adapter_model,
+        model=upstream_adapter_model,
         input=request_input,
         responses_api_request=responses_api_request,
         custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
@@ -22885,7 +22995,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
 
     completion_response = await _perform_openrouter_completion_adapter_operation(
-        adapter_model=adapter_model,
+        adapter_model=upstream_adapter_model,
         operation=lambda: litellm.acompletion(
             **completion_kwargs,
             api_key=openrouter_api_key,
@@ -22907,7 +23017,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         return StreamingResponse(
             _responses_sse_from_iterator(
                 LiteLLMCompletionStreamingIterator(
-                    model=adapter_model,
+                    model=upstream_adapter_model,
                     litellm_custom_stream_wrapper=completion_response,
                     request_input=request_input,
                     responses_api_request=responses_api_request,
@@ -22958,11 +23068,7 @@ async def _handle_codex_auto_agent_alias_route(
     )
 
     for _attempt_number in range(
-        len(
-            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-                alias_model, _CODEX_AUTO_AGENT_CANDIDATES
-            )
-        )
+        len(_get_codex_auto_agent_candidates_for_alias(alias_model))
     ):
         selection = await _select_codex_auto_agent_candidate(
             request=request,

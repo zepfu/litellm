@@ -2831,6 +2831,7 @@ async def pass_through_request(  # noqa: PLR0915
                 hidden_retry_metadata.get("aawm_passthrough_hidden_retry_final_outcome"),
                 hidden_retry_metadata.get("aawm_passthrough_hidden_retry_count"),
                 extra=terminal_failure_context,
+                exc_info=True,
             )
         else:
             verbose_proxy_logger.exception(
