@@ -346,6 +346,27 @@ Found under `kwargs["standard_logging_object"]`. This is a standard payload, log
 
 ## Langfuse
 
+### AAWM compaction savings telemetry
+
+Before Langfuse SDK enqueue, LiteLLM compacts selected high-cardinality
+generation metadata fields and may fit oversized generation payloads to the
+configured Langfuse event-size limit. When payload-size audit logging runs, the
+log JSON can include a bounded `compaction_savings_audit` object.
+
+Use that object to interpret warnings without reading raw prompts or tool
+arguments:
+
+- `classification: already_handled` means an existing metadata compactor already
+  saved bytes for that family.
+- `classification: remaining_candidate` means the event-size fitter still had to
+  shrink a generation field, most often `input`.
+- `classification: no_op` means the field was unchanged or not a savings
+  candidate.
+
+Each entry only reports byte counts, ratios, mode/strategy, and safe identifiers
+such as model or alias when present. It does not include raw header values,
+tool arguments, prompts, or local file content.
+
 We will use the `--config` to set `litellm.success_callback = ["langfuse"]` this will log all successful LLM calls to langfuse. Make sure to set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in your environment
 
 **Step 1** Install langfuse

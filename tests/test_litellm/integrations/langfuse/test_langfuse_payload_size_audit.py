@@ -5,6 +5,7 @@ from copy import deepcopy
 from litellm.integrations.langfuse.langfuse import (
     _LANGFUSE_INPUT_SHAPE_HASH_ONLY_ENV,
     _LANGFUSE_INPUT_SUMMARY_TYPE,
+    _build_langfuse_compaction_savings_audit,
     _build_langfuse_input_shape_hash_summary,
     _build_langfuse_payload_size_summary,
     _fit_langfuse_generation_params_to_event_size,
@@ -67,82 +68,11 @@ def _build_candidate_heavy_langfuse_metadata() -> dict:
     }
 
 
-def _build_post_d1_314_compaction_evidence(generation_params: dict) -> dict:
-    original_metadata = generation_params["metadata"]
-    compacted_metadata = _strip_langfuse_generation_metadata(original_metadata)
-    compacted_params = {
-        **generation_params,
-        "metadata": compacted_metadata,
-    }
-    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
-        compacted_params,
-        max_event_size_bytes=24_000,
-    )
-    handled_fields = (
-        "prompt_overhead_component_paths",
-        "prompt_overhead_excluded_component_paths",
-        "codex_response_headers",
-        "responses_stream_tool_state",
-        "claude_tool_advertisement_compaction_events",
-    )
-    unchanged_fields = (
-        "output",
-        "tags",
-        "responses_stream_event_counts",
-        "responses_stream_event_types",
-    )
+def _classification_map(audit: dict) -> dict[str, str]:
     return {
-        "already_handled": {
-            "metadata": {
-                "original_size_bytes": _json_size_bytes(original_metadata),
-                "final_size_bytes": _json_size_bytes(compacted_metadata),
-            },
-            **{
-                field: {
-                    "original_size_bytes": _json_size_bytes(
-                        original_metadata.get(field)
-                    ),
-                    "final_size_bytes": _json_size_bytes(
-                        compacted_metadata.get(field)
-                    ),
-                    "summary_type": (
-                        compacted_metadata.get(field, {}).get("type")
-                        if isinstance(compacted_metadata.get(field), dict)
-                        else None
-                    ),
-                }
-                for field in handled_fields
-            },
-        },
-        "remaining_candidate": {
-            "input": {
-                "original_size_bytes": _json_size_bytes(generation_params["input"]),
-                "final_size_bytes": _json_size_bytes(fitted_params["input"]),
-                "input_truncated": bool(
-                    fit_summary and fit_summary.get("input_truncated")
-                ),
-            }
-        },
-        "unchanged": {
-            field: {
-                "original_size_bytes": _json_size_bytes(
-                    (
-                        generation_params.get(field)
-                        if field == "output"
-                        else original_metadata.get(field)
-                    )
-                ),
-                "final_size_bytes": _json_size_bytes(
-                    (
-                        fitted_params.get(field)
-                        if field == "output"
-                        else compacted_metadata.get(field)
-                    )
-                ),
-            }
-            for field in unchanged_fields
-        },
-        "fit_summary": fit_summary,
+        str(entry["field"]): str(entry["classification"])
+        for entry in audit.get("entries", [])
+        if isinstance(entry, dict) and entry.get("field") is not None
     }
 
 
@@ -240,10 +170,10 @@ def test_langfuse_metadata_candidate_compaction_reduces_candidate_size() -> None
     assert "audit detail" not in str(claude_summary)
 
 
-def test_langfuse_post_d1_314_compaction_evidence_classifies_pressure() -> None:
+def test_langfuse_compaction_savings_audit_classifies_candidate_heavy_fixture() -> None:
     metadata = _build_candidate_heavy_langfuse_metadata()
     generation_params = {
-        "id": "generation-d1-321",
+        "id": "generation-d1-325",
         "name": "aawm.post-d1-314",
         "model": "gpt-test",
         "input": [
@@ -261,15 +191,15 @@ def test_langfuse_post_d1_314_compaction_evidence_classifies_pressure() -> None:
         "metadata": metadata,
     }
 
-    evidence = _build_post_d1_314_compaction_evidence(generation_params)
+    audit = _build_langfuse_compaction_savings_audit(
+        generation_params,
+        trace_id="trace-d1-325",
+        call_type="completion",
+        max_event_size_bytes=24_000,
+    )
+    classifications = _classification_map(audit)
 
-    assert set(evidence) == {
-        "already_handled",
-        "remaining_candidate",
-        "unchanged",
-        "fit_summary",
-    }
-    assert set(evidence["already_handled"]) == {
+    handled_fields = {
         "metadata",
         "prompt_overhead_component_paths",
         "prompt_overhead_excluded_component_paths",
@@ -277,44 +207,160 @@ def test_langfuse_post_d1_314_compaction_evidence_classifies_pressure() -> None:
         "responses_stream_tool_state",
         "claude_tool_advertisement_compaction_events",
     }
-    assert set(evidence["remaining_candidate"]) == {"input"}
-    assert set(evidence["unchanged"]) == {
-        "output",
+    assert handled_fields.issubset(set(classifications))
+    for field in handled_fields:
+        assert classifications[field] == "already_handled", field
+        entry = next(
+            item for item in audit["entries"] if item.get("field") == field
+        )
+        assert entry["saved_bytes"] > 0
+        assert entry["saved_ratio"] > 0
+
+    assert classifications["input"] == "remaining_candidate"
+    input_entry = next(
+        item for item in audit["entries"] if item.get("field") == "input"
+    )
+    assert input_entry["saved_bytes"] > 0
+    assert input_entry["mode"] == "event_size_fit"
+
+    for field in (
         "tags",
         "responses_stream_event_counts",
         "responses_stream_event_types",
+    ):
+        assert classifications[field] == "no_op", field
+
+    assert audit["classification_counts"]["already_handled"] >= len(handled_fields)
+    assert audit["classification_counts"]["remaining_candidate"] >= 1
+    assert audit["event_fit_failed"] is False
+    assert audit["totals"]["already_handled_saved_bytes"] > 0
+    assert audit["totals"]["remaining_candidate_saved_bytes"] > 0
+
+    audit_text = json.dumps(audit, sort_keys=True)
+    assert "secret argument text" not in audit_text
+    assert "audit detail" not in audit_text
+    assert "req-sensitive-id" not in audit_text
+    assert "conversation item" not in audit_text
+
+
+def test_langfuse_compaction_savings_audit_reports_no_op_when_metadata_already_compact() -> None:
+    generation_params = {
+        "id": "generation-no-op",
+        "name": "aawm.compact",
+        "model": "gpt-test",
+        "input": "small input",
+        "output": "small output",
+        "metadata": {"repository": "litellm", "tags": ["aawm"]},
     }
 
-    for field, field_evidence in evidence["already_handled"].items():
-        assert field_evidence["final_size_bytes"] < field_evidence[
-            "original_size_bytes"
-        ], field
-        if field != "metadata":
-            assert (
-                field_evidence["summary_type"]
-                == "litellm_langfuse_metadata_compacted"
-            )
+    audit = _build_langfuse_compaction_savings_audit(generation_params)
 
-    # Fixture guardrail: after D1-314 metadata compaction, the only oversized
-    # pressure this fixture should need to fit is the input payload.
-    fit_summary = evidence["fit_summary"]
-    assert fit_summary is not None
-    assert fit_summary["event_fit_failed"] is False
-    assert fit_summary["truncated_fields"] == ["input"]
-    assert evidence["remaining_candidate"]["input"]["input_truncated"] is True
-    assert evidence["remaining_candidate"]["input"]["final_size_bytes"] < evidence[
-        "remaining_candidate"
-    ]["input"]["original_size_bytes"]
+    classifications = _classification_map(audit)
+    assert classifications["metadata"] == "no_op"
+    assert classifications["tags"] == "no_op"
+    assert classifications["input"] == "no_op"
+    assert audit["classification_counts"]["already_handled"] == 0
+    assert audit["totals"]["already_handled_saved_bytes"] == 0
 
-    for field, field_evidence in evidence["unchanged"].items():
-        assert field_evidence["final_size_bytes"] == field_evidence[
-            "original_size_bytes"
-        ], field
 
-    compacted_text = str(_strip_langfuse_generation_metadata(metadata))
-    assert "secret argument text" not in compacted_text
-    assert "audit detail" not in compacted_text
-    assert "req-sensitive-id" not in compacted_text
+def test_langfuse_compaction_savings_audit_counts_truncated_entries() -> None:
+    metadata = {f"metadata_field_{index}": index for index in range(48)}
+    generation_params = {
+        "id": "generation-many-noop",
+        "name": "aawm.many-noop",
+        "model": "gpt-test",
+        "input": "small input",
+        "output": "small output",
+        "metadata": metadata,
+    }
+
+    audit = _build_langfuse_compaction_savings_audit(generation_params)
+
+    assert audit["entries_truncated"] is True
+    assert audit["entry_count"] > audit["retained_entry_count"]
+    assert audit["retained_entry_count"] == len(audit["entries"])
+    assert audit["dropped_entry_count"] == audit["entry_count"] - len(
+        audit["entries"]
+    )
+    assert audit["classification_counts"]["no_op"] == audit["entry_count"]
+    assert audit["classification_counts"]["no_op"] > len(audit["entries"])
+
+
+def test_langfuse_compaction_savings_audit_recognizes_already_compacted_metadata() -> None:
+    metadata = _build_candidate_heavy_langfuse_metadata()
+    compacted_metadata = _strip_langfuse_generation_metadata(metadata)
+    compacted_again = _strip_langfuse_generation_metadata(compacted_metadata)
+    generation_params = {
+        "id": "generation-already-compact",
+        "name": "aawm.already-compact",
+        "model": "gpt-test",
+        "input": "small input",
+        "output": "x" * 2_000,
+        "metadata": compacted_metadata,
+    }
+
+    audit = _build_langfuse_compaction_savings_audit(
+        generation_params,
+        max_event_size_bytes=1_000,
+    )
+    summary = _build_langfuse_payload_size_summary(
+        generation_params,
+        trace_id="trace-already-compact",
+        call_type="completion",
+        max_event_size_bytes=1_000,
+    )
+    classifications = _classification_map(audit)
+
+    assert compacted_again == compacted_metadata
+    assert classifications["prompt_overhead_component_paths"] == "already_handled"
+    assert classifications["prompt_overhead_excluded_component_paths"] == "already_handled"
+    assert classifications["codex_response_headers"] == "already_handled"
+    assert classifications["responses_stream_tool_state"] == "already_handled"
+    assert (
+        classifications["claude_tool_advertisement_compaction_events"]
+        == "already_handled"
+    )
+    assert audit["totals"]["already_handled_saved_bytes"] > 0
+    assert summary is not None
+    assert (
+        summary["compaction_savings_audit"]["classification_counts"][
+            "already_handled"
+        ]
+        >= 5
+    )
+    audit_text = json.dumps(summary["compaction_savings_audit"], sort_keys=True)
+    assert "secret argument text" not in audit_text
+    assert "audit detail" not in audit_text
+    assert "req-sensitive-id" not in audit_text
+
+
+def test_langfuse_payload_size_summary_includes_bounded_compaction_savings_audit() -> None:
+    metadata = _build_candidate_heavy_langfuse_metadata()
+    generation_params = {
+        "id": "generation-large",
+        "name": "aawm.large",
+        "model": "openrouter/example",
+        "input": "input text is intentionally not logged",
+        "output": "x" * 800,
+        "model_parameters": {"temperature": 0},
+        "metadata": metadata,
+    }
+
+    summary = _build_langfuse_payload_size_summary(
+        generation_params,
+        trace_id="trace-large",
+        call_type="completion",
+        max_event_size_bytes=1_000,
+    )
+
+    assert summary is not None
+    audit = summary["compaction_savings_audit"]
+    assert audit["trace_id"] == "trace-large"
+    assert audit["identifiers"]["model"] == "openrouter/example"
+    assert audit["classification_counts"]["already_handled"] >= 1
+    summary_text = json.dumps(summary, sort_keys=True)
+    assert "secret argument text" not in summary_text
+    assert "input text is intentionally not logged" not in summary_text
 
 
 def test_langfuse_payload_size_warning_is_sanitized(caplog, monkeypatch) -> None:
