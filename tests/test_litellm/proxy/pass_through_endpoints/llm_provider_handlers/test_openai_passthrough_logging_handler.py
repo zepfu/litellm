@@ -98,57 +98,57 @@ class TestOpenAIPassthroughLoggingHandler:
     def test_is_openai_chat_completions_route(self):
         """Test OpenAI chat completions route detection"""
         # Positive cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/chat/completions") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openai.azure.com/v1/chat/completions") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openrouter.ai/api/v1/chat/completions") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://integrate.api.nvidia.com/v1/chat/completions") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://cli-chat-proxy.grok.com/v1/chat/completions") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/chat/completions") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openai.azure.com/v1/chat/completions") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://openrouter.ai/api/v1/chat/completions") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://integrate.api.nvidia.com/v1/chat/completions") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://cli-chat-proxy.grok.com/v1/chat/completions") is True
         
         # Negative cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/models") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("http://localhost:4000/openai/v1/chat/completions") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.anthropic.com/v1/messages") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("") == False
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/models") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("http://localhost:4000/openai/v1/chat/completions") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.anthropic.com/v1/messages") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("") is False
 
     def test_is_openai_image_generation_route(self):
         """Test OpenAI image generation route detection"""
         # Positive cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://api.openai.com/v1/images/generations") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://openai.azure.com/v1/images/generations") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://api.openai.com/v1/images/generations") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://openai.azure.com/v1/images/generations") is True
         
         # Negative cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://api.openai.com/v1/chat/completions") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://api.openai.com/v1/images/edits") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("http://localhost:4000/openai/v1/images/generations") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("") == False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://api.openai.com/v1/chat/completions") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("https://api.openai.com/v1/images/edits") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("http://localhost:4000/openai/v1/images/generations") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_generation_route("") is False
 
     def test_is_openai_image_editing_route(self):
         """Test OpenAI image editing route detection"""
         # Positive cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://api.openai.com/v1/images/edits") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://openai.azure.com/v1/images/edits") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://api.openai.com/v1/images/edits") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://openai.azure.com/v1/images/edits") is True
         
         # Negative cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://api.openai.com/v1/chat/completions") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://api.openai.com/v1/images/generations") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("http://localhost:4000/openai/v1/images/edits") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("") == False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://api.openai.com/v1/chat/completions") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("https://api.openai.com/v1/images/generations") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("http://localhost:4000/openai/v1/images/edits") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_image_editing_route("") is False
 
     def test_is_openai_responses_route(self):
         """Test OpenAI responses API route detection"""
         # Positive cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/responses") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openai.azure.com/v1/responses") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/responses") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openrouter.ai/api/v1/responses") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://integrate.api.nvidia.com/v1/responses") == True
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.x.ai/v1/responses") == True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/responses") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openai.azure.com/v1/responses") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/responses") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://openrouter.ai/api/v1/responses") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://integrate.api.nvidia.com/v1/responses") is True
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.x.ai/v1/responses") is True
         
         # Negative cases
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/chat/completions") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/images/generations") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("http://localhost:4000/openai/v1/responses") == False
-        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("") == False
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/chat/completions") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("https://api.openai.com/v1/images/generations") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("http://localhost:4000/openai/v1/responses") is False
+        assert OpenAIPassthroughLoggingHandler.is_openai_responses_route("") is False
 
     @patch('litellm.completion_cost')
     @patch('litellm.litellm_core_utils.litellm_logging.get_standard_logging_object_payload')
@@ -913,9 +913,15 @@ class TestOpenAIPassthroughLoggingHandler:
                 "type": "function_call",
                 "name": "Bash",
                 "call_id": "call_pwd",
-                "arguments": '{"command":"pwd"}',
+                "arguments_hash": "d66a53fedbf412beeadb3868ece33ec9e7e20e9aa0224b75a70c5655b8ca2e2c",
+                "arguments_size_bytes": 17,
             }
         ]
+        metadata_json = json.dumps(metadata)
+        assert '{"command":"pwd"}' not in metadata_json
+        assert "super-secret-token" not in metadata_json
+        assert "API_KEY=leaked" not in metadata_json
+        assert '"arguments":' not in metadata_json
         mock_completion_cost.assert_called_once()
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.456
@@ -992,6 +998,81 @@ class TestOpenAIPassthroughLoggingHandler:
         mock_completion_cost.assert_called_once()
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.457
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_records_compact_tool_state_without_raw_arguments(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.458
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        litellm_params = {"metadata": {"passthrough_route_family": "codex_responses"}}
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": litellm_params,
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-codex-tools","object":"response","created_at":1775868809,"status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.output_item.added',
+            'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_secret","id":"fc_secret","name":"Bash","arguments":""}}',
+            'event: response.function_call_arguments.done',
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc_secret","output_index":0,"arguments":"{\\"command\\":\\"export SECRET=super-secret-token\\"}"}',
+            'event: response.output_item.added',
+            'data: {"type":"response.output_item.added","output_index":1,"item":{"type":"local_shell_call","call_id":"shell_1","id":"shell_1","name":"local_shell","input":{"command":"ls -la"}}}',
+            'event: response.output_item.added',
+            'data: {"type":"response.output_item.added","output_index":2,"item":{"type":"apply_patch_call","call_id":"patch_1","id":"patch_1","name":"apply_patch","patch":"*** Begin Patch\\n*** Update File: secret.py\\n+API_KEY=leaked\\n*** End Patch"}}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-codex-tools","object":"response","created_at":1775868809,"status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}',
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4", "input": "tool metadata"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+            kwargs={"litellm_params": litellm_params},
+        )
+
+        metadata = result["kwargs"]["litellm_params"]["metadata"]
+        assert metadata["responses_stream_tool_call_count"] == 3
+        assert metadata["responses_stream_tool_names"] == [
+            "Bash",
+            "local_shell",
+            "apply_patch",
+        ]
+        assert metadata["responses_stream_tool_state"] == [
+            {
+                "type": "function_call",
+                "name": "Bash",
+                "call_id": "call_secret",
+                "arguments_hash": "df9c4812e948b70ee537d3f817c84993b2143f34812af8af0cc95c37d62977b4",
+                "arguments_size_bytes": 46,
+            },
+            {
+                "type": "local_shell_call",
+                "name": "local_shell",
+                "call_id": "shell_1",
+                "arguments_hash": "1df8bccaec747dc615b50678f35bf5b51756a45f9b2b77b247c7a617fde58b3e",
+                "arguments_size_bytes": 20,
+            },
+            {
+                "type": "apply_patch_call",
+                "name": "apply_patch",
+                "call_id": "patch_1",
+                "arguments_hash": "9dfab7fdeb6aa76caa1b593d61845ec82375dd4f4470a7334bce0250d74771a5",
+                "arguments_size_bytes": 72,
+            },
+        ]
+        metadata_json = json.dumps(metadata)
+        assert "super-secret-token" not in metadata_json
+        assert "API_KEY=leaked" not in metadata_json
+        assert '"arguments"' not in metadata_json
 
     def test_openai_passthrough_handler_adds_codex_usage_normalize_span(self):
         codex_response = {
@@ -1195,7 +1276,12 @@ class TestOpenAIPassthroughLoggingHandler:
     def test_static_methods(self):
         """Test that static methods work correctly"""
         # Test static method calls
-        assert OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route("https://api.openai.com/v1/chat/completions") == True
+        assert (
+            OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route(
+                "https://api.openai.com/v1/chat/completions"
+            )
+            is True
+        )
         # Test instance method
         handler = OpenAIPassthroughLoggingHandler()
         assert handler.get_provider_config("gpt-4o") is not None
@@ -1411,17 +1497,39 @@ class TestOpenAIPassthroughIntegration:
     def test_is_openai_route_detection(self):
         """Test OpenAI route detection in the main success handler"""
         # Positive cases
-        assert self.handler.is_openai_route("https://api.openai.com/v1/chat/completions") == True
-        assert self.handler.is_openai_route("https://openai.azure.com/v1/chat/completions") == True
-        assert self.handler.is_openai_route("https://api.openai.com/v1/models") == True
-        assert self.handler.is_openai_route("https://openrouter.ai/api/v1/responses") == True
-        assert self.handler.is_openai_route("https://api.x.ai/v1/responses") == True
-        
+        assert (
+            self.handler.is_openai_route("https://api.openai.com/v1/chat/completions")
+            is True
+        )
+        assert (
+            self.handler.is_openai_route(
+                "https://openai.azure.com/v1/chat/completions"
+            )
+            is True
+        )
+        assert self.handler.is_openai_route("https://api.openai.com/v1/models") is True
+        assert (
+            self.handler.is_openai_route("https://openrouter.ai/api/v1/responses")
+            is True
+        )
+        assert self.handler.is_openai_route("https://api.x.ai/v1/responses") is True
+
         # Negative cases
-        assert self.handler.is_openai_route("http://localhost:4000/openai/v1/chat/completions") == False
-        assert self.handler.is_openai_route("https://api.anthropic.com/v1/messages") == False
-        assert self.handler.is_openai_route("https://api.assemblyai.com/v2/transcript") == False
-        assert self.handler.is_openai_route("") == False
+        assert (
+            self.handler.is_openai_route(
+                "http://localhost:4000/openai/v1/chat/completions"
+            )
+            is False
+        )
+        assert (
+            self.handler.is_openai_route("https://api.anthropic.com/v1/messages")
+            is False
+        )
+        assert (
+            self.handler.is_openai_route("https://api.assemblyai.com/v2/transcript")
+            is False
+        )
+        assert self.handler.is_openai_route("") is False
 
     @patch('litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler.OpenAIPassthroughLoggingHandler.openai_passthrough_handler')
     @pytest.mark.asyncio

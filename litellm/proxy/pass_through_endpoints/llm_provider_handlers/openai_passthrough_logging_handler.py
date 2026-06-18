@@ -4,6 +4,7 @@ OpenAI Passthrough Logging Handler
 Handles cost tracking and logging for OpenAI passthrough endpoints, specifically /chat/completions.
 """
 
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -922,18 +923,38 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return [output_items[key] for key in ordered_keys if key in output_items]
 
     @staticmethod
-    def _responses_stream_tool_argument_text(item: dict) -> str:
+    def _responses_stream_tool_argument_canonical_bytes(item: dict) -> bytes:
         for key in ("arguments", "input", "action", "patch"):
             value = item.get(key)
             if value is None:
                 continue
             if isinstance(value, str):
-                return value[:1000]
+                return value.encode("utf-8")
             try:
-                return json.dumps(value, sort_keys=True)[:1000]
+                return json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    default=str,
+                ).encode("utf-8")
             except (TypeError, ValueError):
-                return str(value)[:1000]
-        return ""
+                return str(value).encode("utf-8")
+        return b""
+
+    @staticmethod
+    def _responses_stream_tool_argument_summary(item: dict) -> Dict[str, Any]:
+        payload = (
+            OpenAIPassthroughLoggingHandler._responses_stream_tool_argument_canonical_bytes(
+                item
+            )
+        )
+        if not payload:
+            return {"arguments_hash": None, "arguments_size_bytes": 0}
+        return {
+            "arguments_hash": hashlib.sha256(payload).hexdigest(),
+            "arguments_size_bytes": len(payload),
+        }
 
     @staticmethod
     def _summarize_responses_stream_tool_state(
@@ -985,14 +1006,17 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             tool_name = item.get("name")
             if not isinstance(tool_name, str) or not tool_name.strip():
                 tool_name = item_type
+            argument_summary = (
+                OpenAIPassthroughLoggingHandler._responses_stream_tool_argument_summary(
+                    item
+                )
+            )
             tool_state.append(
                 {
                     "type": item_type,
                     "name": tool_name,
                     "call_id": item.get("call_id") or item.get("id"),
-                    "arguments": OpenAIPassthroughLoggingHandler._responses_stream_tool_argument_text(
-                        item
-                    ),
+                    **argument_summary,
                 }
             )
 
