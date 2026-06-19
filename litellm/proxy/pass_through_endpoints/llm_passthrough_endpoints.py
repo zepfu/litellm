@@ -47,8 +47,6 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
 )
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_API_BASE,
-    CHATGPT_CLIENT_ID,
-    CHATGPT_OAUTH_TOKEN_URL,
     get_chatgpt_default_headers,
 )
 from litellm.llms.xai.oauth import (
@@ -1207,7 +1205,6 @@ _google_oauth_access_token_cache: dict[str, tuple[str, int]] = {}
 _google_oauth_access_token_lock = asyncio.Lock()
 _antigravity_oauth_access_token_cache: dict[str, tuple[str, int]] = {}
 _antigravity_oauth_access_token_lock = asyncio.Lock()
-_codex_oauth_auth_file_lock = asyncio.Lock()
 _google_code_assist_project_cache: dict[str, str] = {}
 _google_code_assist_project_lock = asyncio.Lock()
 _google_code_assist_prime_until_monotonic_by_key: dict[str, float] = {}
@@ -11931,73 +11928,6 @@ def _write_json_file_atomic(
         ) from exc
 
 
-async def _refresh_local_codex_auth_data(auth_data: CodexAuthData) -> CodexAuthData:
-    token_data = _get_codex_auth_token_data(auth_data)
-    refresh_token = _clean_codex_auth_value(token_data.get("refresh_token"))
-    if refresh_token is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Codex local auth file access token is expired and does not "
-                "contain a refresh_token. Re-authenticate Codex before using "
-                "the local Codex auth fallback."
-            ),
-        )
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            CHATGPT_OAUTH_TOKEN_URL,
-            json={
-                "client_id": CHATGPT_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "scope": "openid profile email",
-            },
-        )
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail=_format_oauth_refresh_failure_detail(
-                provider_label="Codex",
-                response=response,
-            ),
-        )
-
-    refreshed = response.json()
-    refreshed_access_token = _clean_codex_auth_value(refreshed.get("access_token"))
-    if refreshed_access_token is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Codex OAuth refresh response did not contain an access_token.",
-        )
-
-    refreshed_id_token = _clean_codex_auth_value(refreshed.get("id_token"))
-    updated_token_data = dict(token_data)
-    updated_token_data["access_token"] = refreshed_access_token
-    updated_token_data["refresh_token"] = (
-        _clean_codex_auth_value(refreshed.get("refresh_token")) or refresh_token
-    )
-    if refreshed_id_token is not None:
-        updated_token_data["id_token"] = refreshed_id_token
-    expires_at = _get_codex_auth_token_expiry(refreshed_access_token)
-    if expires_at is not None:
-        updated_token_data["expires_at"] = expires_at
-    account_id = _extract_codex_account_id_from_token(
-        refreshed_id_token or refreshed_access_token
-    )
-    if account_id is not None:
-        updated_token_data["account_id"] = account_id
-
-    updated_auth_data = dict(auth_data)
-    if isinstance(auth_data.get("tokens"), dict):
-        updated_auth_data["tokens"] = updated_token_data
-    else:
-        updated_auth_data.update(updated_token_data)
-    updated_auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
-    return updated_auth_data
-
-
 async def _load_codex_auth_data_from_path(auth_path: Path) -> Optional[CodexAuthData]:
     try:
         auth_data = json.loads(auth_path.read_text())
@@ -12022,22 +11952,15 @@ async def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str,
     if access_token is None:
         return None
     if not _codex_auth_access_token_is_valid(token_data):
-        async with _codex_oauth_auth_file_lock:
-            auth_data = await _load_codex_auth_data_from_path(auth_path)
-            if auth_data is None:
-                return None
-            token_data = _get_codex_auth_token_data(auth_data)
-            if not _codex_auth_access_token_is_valid(token_data):
-                auth_data = await _refresh_local_codex_auth_data(auth_data)
-                _write_json_file_atomic(
-                    auth_path,
-                    auth_data,
-                    failure_label="Codex",
-                )
-        token_data = _get_codex_auth_token_data(auth_data)
-        access_token = _clean_codex_auth_value(token_data.get("access_token"))
-        if access_token is None:
-            return None
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Codex OAuth access token is expired or invalid. The "
+                "provider-status sidecar owns Codex auth refresh; confirm the "
+                "sidecar can write the configured auth file and refresh "
+                f"{auth_path}."
+            ),
+        )
 
     account_id = _clean_codex_auth_value(token_data.get("account_id")) or _extract_codex_account_id_from_token(
         _clean_codex_auth_value(token_data.get("id_token")) or access_token
