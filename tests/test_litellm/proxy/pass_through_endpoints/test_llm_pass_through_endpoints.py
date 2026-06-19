@@ -23578,7 +23578,7 @@ async def test_refresh_local_antigravity_oauth_token_data_retries_cli_client_pai
 
 
 @pytest.mark.asyncio
-async def test_load_valid_local_antigravity_access_token_persists_refresh(
+async def test_load_valid_local_antigravity_access_token_rejects_stale_sidecar_token(
     tmp_path, monkeypatch
 ):
     _antigravity_oauth_access_token_cache.clear()
@@ -23599,38 +23599,22 @@ async def test_load_valid_local_antigravity_access_token_persists_refresh(
     )
     token_path.chmod(0o600)
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
-    monkeypatch.setenv(
-        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
-        "222222222222-client.apps.googleusercontent.com",
-    )
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
-    mock_client = AsyncMock()
-    mock_client.post.return_value = httpx.Response(
-        200,
-        json={"access_token": "ya29.refreshed-antigravity", "expires_in": 3600},
-    )
-    mock_context = AsyncMock()
-    mock_context.__aenter__.return_value = mock_client
-    mock_context.__aexit__.return_value = False
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
-        return_value=mock_context,
-    ):
-        token = await _load_valid_local_antigravity_access_token()
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._refresh_local_antigravity_oauth_token_data",
+        new=AsyncMock(),
+    ) as refresh_mock, pytest.raises(HTTPException, match="sidecar owns"):
+        await _load_valid_local_antigravity_access_token()
 
     persisted = json.loads(token_path.read_text(encoding="utf-8"))
-    assert token == "ya29.refreshed-antigravity"
-    assert persisted["auth_method"] == "consumer"
-    assert persisted["token"]["access_token"] == "ya29.refreshed-antigravity"
+    assert persisted["token"]["access_token"] == "ya29.expired-antigravity"
     assert persisted["token"]["refresh_token"] == "refresh-token-123"
-    assert persisted["token"]["token_type"] == "Bearer"
-    assert isinstance(persisted["token"]["expiry"], str)
     assert token_path.stat().st_mode & 0o777 == 0o600
+    refresh_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallback(
+async def test_load_valid_local_antigravity_access_token_does_not_use_agy_fallback(
     tmp_path, monkeypatch
 ):
     _antigravity_oauth_access_token_cache.clear()
@@ -23657,61 +23641,18 @@ async def test_load_valid_local_antigravity_access_token_uses_agy_models_fallbac
         encoding="utf-8",
     )
     token_path.chmod(0o600)
-    cli_path = tmp_path / "agy"
-    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    cli_path.chmod(0o755)
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_CLI_PATH", str(cli_path))
-    monkeypatch.setenv(
-        "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
-        "222222222222-client.apps.googleusercontent.com",
-    )
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "GOCSPX-secret")
-    mock_client = AsyncMock()
-    mock_client.post.return_value = httpx.Response(
-        401,
-        json={"error": "invalid_client"},
-    )
-    mock_context = AsyncMock()
-    mock_context.__aenter__.return_value = mock_client
-    mock_context.__aexit__.return_value = False
-    subprocess_calls = []
-
-    class FakeProcess:
-        returncode = 0
-
-        async def communicate(self):
-            refreshed = json.loads(token_path.read_text(encoding="utf-8"))
-            refreshed["token"]["access_token"] = "ya29.refreshed-via-agy"
-            refreshed["token"]["expiry"] = (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat()
-            token_path.write_text(json.dumps(refreshed), encoding="utf-8")
-            return b"", b""
-
-        def kill(self):
-            self.returncode = -9
-
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        subprocess_calls.append((args, kwargs))
-        assert args[-1] == "models"
-        assert kwargs["env"]["HOME"] == str(home_path)
-        return FakeProcess()
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
-        return_value=mock_context,
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.create_subprocess_exec",
-        new=fake_create_subprocess_exec,
-    ):
-        token = await _load_valid_local_antigravity_access_token()
+        new=AsyncMock(),
+    ) as subprocess_mock, pytest.raises(HTTPException, match="sidecar owns"):
+        await _load_valid_local_antigravity_access_token()
 
     persisted = json.loads(token_path.read_text(encoding="utf-8"))
-    assert token == "ya29.refreshed-via-agy"
-    assert persisted["token"]["access_token"] == "ya29.refreshed-via-agy"
+    assert persisted["token"]["access_token"] == "ya29.expired-antigravity"
     assert persisted["token"]["refresh_token"] == "refresh-token-123"
-    assert subprocess_calls
+    subprocess_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -24078,18 +24019,19 @@ async def test_refresh_local_antigravity_oauth_token_data_redacts_failure_detail
 
 
 @pytest.mark.asyncio
-async def test_load_valid_local_antigravity_access_token_caches_concurrent_refresh(
+async def test_load_valid_local_antigravity_access_token_caches_valid_sidecar_token(
     tmp_path, monkeypatch
 ):
     _antigravity_oauth_access_token_cache.clear()
     token_path = tmp_path / "antigravity-oauth-token"
+    future_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
     token_path.write_text(
         json.dumps(
             {
                 "auth_method": "consumer",
                 "token": {
-                    "access_token": "ya29.expired-antigravity",
-                    "expiry": "2026-01-01T00:00:00Z",
+                    "access_token": "ya29.valid-antigravity",
+                    "expiry": future_expiry.isoformat(),
                     "refresh_token": "refresh-token-123",
                     "token_type": "Bearer",
                 },
@@ -24097,31 +24039,18 @@ async def test_load_valid_local_antigravity_access_token_caches_concurrent_refre
         )
     )
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
-    future_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
-
-    async def refresh_token_data(_token_data, _auth_path=None):
-        await asyncio.sleep(0.01)
-        return {
-            "auth_method": "consumer",
-            "token": {
-                "access_token": "ya29.refreshed-antigravity",
-                "expiry": future_expiry.isoformat(),
-                "refresh_token": "refresh-token-123",
-                "token_type": "Bearer",
-            },
-        }
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._refresh_local_antigravity_oauth_token_data",
-        new=AsyncMock(side_effect=refresh_token_data),
+        new=AsyncMock(),
     ) as refresh_mock:
         tokens = await asyncio.gather(
             _load_valid_local_antigravity_access_token(),
             _load_valid_local_antigravity_access_token(),
         )
 
-    assert tokens == ["ya29.refreshed-antigravity", "ya29.refreshed-antigravity"]
-    assert refresh_mock.await_count == 1
+    assert tokens == ["ya29.valid-antigravity", "ya29.valid-antigravity"]
+    refresh_mock.assert_not_awaited()
 
 
 def test_join_antigravity_passthrough_url_preserves_code_assist_colon_path():
