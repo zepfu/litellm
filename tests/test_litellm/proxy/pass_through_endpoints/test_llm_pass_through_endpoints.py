@@ -7403,7 +7403,7 @@ def test_build_completion_adapter_metadata_overrides_adapter_owned_keys() -> Non
 
 
 @pytest.mark.asyncio
-async def test_load_local_codex_auth_headers_refreshes_nested_auth_file(
+async def test_load_local_codex_auth_headers_reads_valid_nested_auth_file(
     tmp_path, monkeypatch
 ):
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -7411,118 +7411,47 @@ async def test_load_local_codex_auth_headers_refreshes_nested_auth_file(
     )
 
     auth_path = tmp_path / "auth.json"
-    expired_access_token = _build_test_jwt({"exp": int(time.time()) - 60})
-    refreshed_access_token = _build_test_jwt(
+    access_token = _build_test_jwt(
         {
             "exp": int(time.time()) + 3600,
             "https://api.openai.com/auth": {
-                "chatgpt_account_id": "acct_refreshed"
+                "chatgpt_account_id": "acct_valid"
             },
         }
     )
-    refreshed_id_token = _build_test_jwt(
-        {
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": "acct_refreshed"
-            }
-        }
-    )
-    auth_path.write_text(
+    original_payload = (
         json.dumps(
             {
                 "auth_mode": "chatgpt",
                 "OPENAI_API_KEY": None,
                 "last_refresh": "2026-01-01T00:00:00+00:00",
                 "tokens": {
-                    "access_token": expired_access_token,
+                    "access_token": access_token,
                     "refresh_token": "codex-refresh-token",
-                    "id_token": "old-id-token",
-                    "account_id": "acct_old",
+                    "account_id": "acct_valid",
+                    "expires_at": int(time.time()) + 3600,
                 },
             }
-        ),
-        encoding="utf-8",
+        )
     )
+    auth_path.write_text(original_payload, encoding="utf-8")
     auth_path.chmod(0o600)
     monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
-    captured = {}
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, json):
-            captured["url"] = url
-            captured["json"] = json
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": refreshed_access_token,
-                    "refresh_token": "codex-refresh-token-new",
-                    "id_token": refreshed_id_token,
-                },
-            )
 
     mock_request = MagicMock(spec=Request)
     mock_request.headers = {"session_id": "codex-session-123"}
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
-        FakeClient,
-    ):
-        headers = await _load_local_codex_auth_headers(mock_request)
+    headers = await _load_local_codex_auth_headers(mock_request)
 
-    persisted = json.loads(auth_path.read_text(encoding="utf-8"))
     assert headers is not None
-    assert headers["Authorization"] == f"Bearer {refreshed_access_token}"
-    assert headers["ChatGPT-Account-Id"] == "acct_refreshed"
-    assert captured["json"]["refresh_token"] == "codex-refresh-token"
-    assert persisted["auth_mode"] == "chatgpt"
-    assert persisted["tokens"]["access_token"] == refreshed_access_token
-    assert persisted["tokens"]["refresh_token"] == "codex-refresh-token-new"
-    assert persisted["tokens"]["account_id"] == "acct_refreshed"
-    assert isinstance(persisted["tokens"]["expires_at"], int)
-    assert persisted["last_refresh"] != "2026-01-01T00:00:00+00:00"
+    assert headers["Authorization"] == f"Bearer {access_token}"
+    assert headers["ChatGPT-Account-Id"] == "acct_valid"
+    assert auth_path.read_text(encoding="utf-8") == original_payload
     assert auth_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio
-async def test_load_local_codex_auth_headers_requires_refresh_token(
-    tmp_path, monkeypatch
-):
-    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-        _load_local_codex_auth_headers,
-    )
-
-    auth_path = tmp_path / "auth.json"
-    auth_path.write_text(
-        json.dumps(
-            {
-                "tokens": {
-                    "access_token": _build_test_jwt(
-                        {"exp": int(time.time()) - 60}
-                    )
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
-    mock_request = MagicMock(spec=Request)
-    mock_request.headers = {}
-
-    with pytest.raises(HTTPException, match="refresh_token"):
-        await _load_local_codex_auth_headers(mock_request)
-
-
-@pytest.mark.asyncio
-async def test_load_local_codex_auth_headers_redacts_refresh_failure(
+async def test_load_local_codex_auth_headers_rejects_stale_sidecar_token(
     tmp_path, monkeypatch
 ):
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -7544,121 +7473,22 @@ async def test_load_local_codex_auth_headers_redacts_refresh_failure(
         encoding="utf-8",
     )
     monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, json):
-            return httpx.Response(
-                400,
-                json={
-                    "error": "invalid_grant",
-                    "error_description": "do not leak codex-refresh-token",
-                },
-            )
-
     mock_request = MagicMock(spec=Request)
     mock_request.headers = {}
 
+    original_payload = auth_path.read_text(encoding="utf-8")
+
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
-        FakeClient,
-    ), pytest.raises(HTTPException) as exc_info:
+    ) as client_mock, pytest.raises(HTTPException) as exc_info:
         await _load_local_codex_auth_headers(mock_request)
 
     detail = str(exc_info.value.detail)
-    assert "invalid_grant" in detail
+    assert "sidecar owns Codex auth refresh" in detail
+    assert str(auth_path) in detail
     assert "codex-refresh-token" not in detail
-
-
-@pytest.mark.asyncio
-async def test_load_local_codex_auth_headers_serializes_concurrent_refresh(
-    tmp_path, monkeypatch
-):
-    from litellm.llms.chatgpt.common_utils import (
-        CHATGPT_CLIENT_ID,
-        CHATGPT_OAUTH_TOKEN_URL,
-    )
-    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-        _load_local_codex_auth_headers,
-    )
-
-    refreshed_access_token = _build_test_jwt(
-        {
-            "exp": int(time.time()) + 3600,
-            "https://api.openai.com/auth": {"chatgpt_account_id": "acct_refreshed"},
-        }
-    )
-    auth_path = tmp_path / "auth.json"
-    auth_path.write_text(
-        json.dumps(
-            {
-                "tokens": {
-                    "access_token": _build_test_jwt({"exp": int(time.time()) - 60}),
-                    "refresh_token": "codex-refresh-token",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
-    post_calls = []
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, json):
-            post_calls.append((url, json))
-            await asyncio.sleep(0.01)
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": refreshed_access_token,
-                    "refresh_token": "codex-refresh-token-new",
-                },
-            )
-
-    mock_request = MagicMock(spec=Request)
-    mock_request.headers = {"session_id": "codex-session-123"}
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.httpx.AsyncClient",
-        FakeClient,
-    ):
-        headers = await asyncio.gather(
-            _load_local_codex_auth_headers(mock_request),
-            _load_local_codex_auth_headers(mock_request),
-        )
-
-    assert post_calls == [
-        (
-            CHATGPT_OAUTH_TOKEN_URL,
-            {
-                "client_id": CHATGPT_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": "codex-refresh-token",
-                "scope": "openid profile email",
-            },
-        )
-    ]
-    assert [header["Authorization"] for header in headers if header is not None] == [
-        f"Bearer {refreshed_access_token}",
-        f"Bearer {refreshed_access_token}",
-    ]
+    client_mock.assert_not_called()
+    assert auth_path.read_text(encoding="utf-8") == original_payload
 
 
 class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:

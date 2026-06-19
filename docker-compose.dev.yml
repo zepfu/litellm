@@ -196,6 +196,8 @@ services:
       - /home/zepfu/.grok:/home/zepfu/.grok
       # The provider-status sidecar is the scheduled writer for Antigravity OAuth.
       - /home/zepfu/.gemini:/home/zepfu/.gemini
+      # The provider-status sidecar is the scheduled writer for Codex OAuth.
+      - /home/zepfu/.codex:/home/zepfu/.codex
       # Antigravity CLI binary for OAuth client extraction and fallback refresh.
       - /home/zepfu/.local/bin/agy:/home/zepfu/.local/bin/agy:ro
     environment:
@@ -252,6 +254,13 @@ services:
       - AAWM_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS=${AAWM_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS:-30}
       - AAWM_ANTIGRAVITY_CLI_TIMEOUT_SECONDS=${AAWM_ANTIGRAVITY_CLI_TIMEOUT_SECONDS:-30}
       - AAWM_ANTIGRAVITY_CLI_PATH=${AAWM_ANTIGRAVITY_CLI_PATH:-/home/zepfu/.local/bin/agy}
+      - AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}
+      - AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}
+      - AAWM_CODEX_LOCK_FILE=${AAWM_CODEX_LOCK_FILE:-/home/zepfu/.codex/auth.json.lock}
+      - AAWM_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS=${AAWM_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS:-3600}
+      - AAWM_CODEX_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_CODEX_OAUTH_REFRESH_BUFFER_SECONDS:-300}
+      - AAWM_CODEX_OAUTH_FORCE_REFRESH=${AAWM_CODEX_OAUTH_FORCE_REFRESH:-1}
+      - AAWM_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
       - AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}
       - AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=${AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS:-3600}
       - AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS:-30}
