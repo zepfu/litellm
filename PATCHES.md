@@ -2939,6 +2939,43 @@ D1-329 ChatGPT/Codex records.
 
 ---
 
+### aawm.86 — OpenRouter message-shape failover and Antigravity sidecar auth paths
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.86`. Codex
+auto-agent OpenRouter chat-completions egress now sanitizes malformed empty
+messages while preserving assistant tool calls and tool-result rows, and the
+observed OpenRouter/Cohere `invalid message provided ... must have non-empty
+content or tool calls` failure class now maps to `provider_format_rejected` so
+alias failover can continue instead of surfacing as an unhandled ASGI `500`.
+Antigravity Code Assist OAuth loading now honors
+`LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` before legacy token paths and
+`LITELLM_ANTIGRAVITY_SEED_AUTH_FILE`, with LiteLLM remaining a read-only token
+consumer. The provider-status sidecar runner can also resolve
+`LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` as its managed Antigravity write path.
+
+**Why:** Prod error intake showed OpenRouter/Cohere rejecting a Codex
+Responses-to-chat-completions translation that contained an empty message with
+neither content nor tool calls. Prod Antigravity lane-resolution logs also
+showed the live runtime still attempting stale silent refresh behavior while the
+provider-status sidecar lacked Antigravity write ownership.
+
+**Why not upstream:** This is AAWM-specific Codex auto-agent alias routing,
+OpenRouter completion-adapter request shaping, Antigravity Code Assist OAuth
+ownership, and provider-status sidecar deployment policy.
+
+**Validation status:** Focused tests passed for OpenRouter sanitizer behavior,
+OpenRouter invalid-message failover classification, Antigravity managed/seed
+token precedence, and provider-status managed-auth-file resolution. Dev
+`litellm-dev` was refreshed and runtime probes confirmed the OpenRouter
+sanitizer removed invalid empty messages while preserving tool calls, and that
+Antigravity selected the managed token when legacy, managed, and seed files were
+all valid. Production still requires publishing `v1.82.3-aawm.86`, rebuilding
+`aawm-litellm`, and applying the sibling infrastructure handoff
+`.analysis/handoff-litellm-d1-341-antigravity-prod-sidecar-refresh-20260619.md`
+so `aawm-provider-status-observations-prod` owns managed Antigravity refresh.
+
+---
+
 ### aawm.82 — Post-callback-autobump release candidate retag
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.82` on top of the
