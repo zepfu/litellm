@@ -48,6 +48,12 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     codex_oauth_refresh = importlib.import_module("codex_oauth_refresh")
 
+try:
+    from scripts import xai_oauth_refresh
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    xai_oauth_refresh = importlib.import_module("xai_oauth_refresh")
+
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
@@ -93,6 +99,14 @@ CODEX_SIDECAR_DEFAULT_AUTH_PATHS = (
 )
 DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
 DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_XAI_OAUTH_AUTH_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_AUTH_FILE
+DEFAULT_XAI_OAUTH_LOCK_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_LOCK_FILE
+XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
+    "LITELLM_XAI_OAUTH_AUTH_FILE",
+    "LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE",
+)
+DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -353,6 +367,19 @@ class ProviderStatusLoopConfig:
     )
     codex_force_refresh: bool = False
     codex_http_timeout_seconds: float = DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS
+    xai_oauth_refresh_enabled: bool = False
+    xai_oauth_auth_file: str = DEFAULT_XAI_OAUTH_AUTH_FILE
+    xai_oauth_auth_file_source: str = "default"
+    xai_oauth_lock_file: str = DEFAULT_XAI_OAUTH_LOCK_FILE
+    xai_oauth_scope: str = xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE
+    xai_oauth_refresh_interval_seconds: float = (
+        DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS
+    )
+    xai_oauth_refresh_buffer_seconds: int = (
+        xai_oauth_refresh.DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS
+    )
+    xai_oauth_force_refresh: bool = False
+    xai_oauth_http_timeout_seconds: float = DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS
     grok_billing_poll_enabled: bool = DEFAULT_GROK_BILLING_POLL_ENABLED
     grok_billing_poll_interval_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS
@@ -378,6 +405,7 @@ class SidecarTaskState:
     grok_oidc_last_attempt_monotonic: Optional[float] = None
     antigravity_oauth_last_attempt_monotonic: Optional[float] = None
     codex_oauth_last_attempt_monotonic: Optional[float] = None
+    xai_oauth_last_attempt_monotonic: Optional[float] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
 
 
@@ -481,6 +509,30 @@ def _resolve_codex_sidecar_auth_file(
             return str(Path(token_dir).expanduser() / "auth.json"), env_name
 
     return DEFAULT_CODEX_AUTH_FILE, "default"
+
+
+def _resolve_xai_oauth_sidecar_auth_file(
+    explicit_auth_file: Optional[str],
+) -> tuple[str, str]:
+    explicit_value = (
+        explicit_auth_file.strip()
+        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
+        else None
+    )
+
+    aawm_auth_file = os.getenv("AAWM_XAI_OAUTH_AUTH_FILE", "").strip()
+    if aawm_auth_file:
+        return str(Path(aawm_auth_file).expanduser()), "AAWM_XAI_OAUTH_AUTH_FILE"
+
+    if explicit_value and explicit_value != DEFAULT_XAI_OAUTH_AUTH_FILE:
+        return str(Path(explicit_value).expanduser()), "explicit"
+
+    for env_name in XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS:
+        env_value = os.getenv(env_name, "").strip()
+        if env_value:
+            return str(Path(env_value).expanduser()), env_name
+
+    return DEFAULT_XAI_OAUTH_AUTH_FILE, "default"
 
 
 def _resolve_grok_billing_client_version() -> str:
@@ -872,6 +924,97 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "AAWM_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
+    xai_oauth_group = parser.add_mutually_exclusive_group()
+    xai_oauth_group.add_argument(
+        "--xai-oauth-refresh-enabled",
+        dest="xai_oauth_refresh_enabled",
+        action="store_true",
+        default=_env_bool("AAWM_XAI_OAUTH_REFRESH_ENABLED", False),
+        help=(
+            "Run the managed xAI OAuth auth-file refresh task from this sidecar "
+            "loop. Defaults to AAWM_XAI_OAUTH_REFRESH_ENABLED or false."
+        ),
+    )
+    xai_oauth_group.add_argument(
+        "--no-xai-oauth-refresh",
+        dest="xai_oauth_refresh_enabled",
+        action="store_false",
+        help="Disable the managed xAI OAuth auth-file refresh task.",
+    )
+    parser.add_argument(
+        "--xai-oauth-auth-file",
+        default=os.getenv("AAWM_XAI_OAUTH_AUTH_FILE", DEFAULT_XAI_OAUTH_AUTH_FILE),
+        help=(
+            "Managed xAI OAuth auth JSON file maintained by this sidecar. "
+            "Defaults to AAWM_XAI_OAUTH_AUTH_FILE, then LiteLLM managed xAI "
+            "OAuth auth-file env vars, or /home/zepfu/.litellm/xai/oauth-auth.json."
+        ),
+    )
+    parser.add_argument(
+        "--xai-oauth-lock-file",
+        default=os.getenv("AAWM_XAI_OAUTH_LOCK_FILE", DEFAULT_XAI_OAUTH_LOCK_FILE),
+        help=(
+            "Lock file for sidecar managed xAI OAuth refresh writes. Defaults "
+            "to AAWM_XAI_OAUTH_LOCK_FILE or /home/zepfu/.litellm/xai/oauth-auth.json.lock."
+        ),
+    )
+    parser.add_argument(
+        "--xai-oauth-scope",
+        default=(
+            os.getenv("AAWM_XAI_OAUTH_SCOPE")
+            or os.getenv("LITELLM_XAI_OAUTH_SCOPE")
+            or xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE
+        ),
+        help=(
+            "Managed xAI OAuth credential scope. Defaults to AAWM_XAI_OAUTH_SCOPE, "
+            "LITELLM_XAI_OAUTH_SCOPE, or the Grok subscription scope."
+        ),
+    )
+    parser.add_argument(
+        "--xai-oauth-refresh-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS",
+            DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between managed xAI OAuth refresh attempts. "
+            "Defaults to AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--xai-oauth-refresh-buffer-seconds",
+        type=int,
+        default=_env_int(
+            "AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS",
+            xai_oauth_refresh.DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS,
+        ),
+        help=(
+            "Refresh buffer for non-forced managed xAI OAuth refreshes. "
+            "Defaults to AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS or 300."
+        ),
+    )
+    parser.add_argument(
+        "--xai-oauth-force-refresh",
+        action="store_true",
+        default=_env_bool("AAWM_XAI_OAUTH_FORCE_REFRESH", False),
+        help=(
+            "Refresh the managed xAI OAuth credential on every scheduled "
+            "attempt even when the current access token is still valid."
+        ),
+    )
+    parser.add_argument(
+        "--xai-oauth-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for managed xAI OAuth token endpoint calls. Defaults "
+            "to AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
     billing_group = parser.add_mutually_exclusive_group()
     billing_group.add_argument(
         "--grok-billing-poll-enabled",
@@ -1035,6 +1178,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_grok_oidc_config_args(args)
     _validate_antigravity_config_args(args)
     _validate_codex_config_args(args)
+    _validate_xai_oauth_config_args(args)
     _validate_grok_billing_config_args(args)
 
 
@@ -1084,6 +1228,17 @@ def _validate_codex_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--codex-http-timeout-seconds must be greater than 0")
 
 
+def _validate_xai_oauth_config_args(args: argparse.Namespace) -> None:
+    if not str(args.xai_oauth_scope).strip():
+        raise SystemExit("--xai-oauth-scope must not be empty")
+    if args.xai_oauth_refresh_interval_seconds <= 0:
+        raise SystemExit("--xai-oauth-refresh-interval-seconds must be greater than 0")
+    if args.xai_oauth_refresh_buffer_seconds < 0:
+        raise SystemExit("--xai-oauth-refresh-buffer-seconds must be non-negative")
+    if args.xai_oauth_http_timeout_seconds <= 0:
+        raise SystemExit("--xai-oauth-http-timeout-seconds must be greater than 0")
+
+
 def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
     if args.grok_billing_poll_interval_seconds <= 0:
         raise SystemExit("--grok-billing-poll-interval-seconds must be greater than 0")
@@ -1123,6 +1278,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
     )
     resolved_codex_auth_file, resolved_codex_auth_file_source = (
         _resolve_codex_sidecar_auth_file(args.codex_auth_file)
+    )
+    resolved_xai_oauth_auth_file, resolved_xai_oauth_auth_file_source = (
+        _resolve_xai_oauth_sidecar_auth_file(args.xai_oauth_auth_file)
     )
 
     return ProviderStatusLoopConfig(
@@ -1168,6 +1326,15 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         codex_refresh_buffer_seconds=args.codex_refresh_buffer_seconds,
         codex_force_refresh=args.codex_force_refresh,
         codex_http_timeout_seconds=args.codex_http_timeout_seconds,
+        xai_oauth_refresh_enabled=args.xai_oauth_refresh_enabled,
+        xai_oauth_auth_file=resolved_xai_oauth_auth_file,
+        xai_oauth_auth_file_source=resolved_xai_oauth_auth_file_source,
+        xai_oauth_lock_file=args.xai_oauth_lock_file,
+        xai_oauth_scope=str(args.xai_oauth_scope).strip(),
+        xai_oauth_refresh_interval_seconds=args.xai_oauth_refresh_interval_seconds,
+        xai_oauth_refresh_buffer_seconds=args.xai_oauth_refresh_buffer_seconds,
+        xai_oauth_force_refresh=args.xai_oauth_force_refresh,
+        xai_oauth_http_timeout_seconds=args.xai_oauth_http_timeout_seconds,
         grok_billing_poll_enabled=args.grok_billing_poll_enabled,
         grok_billing_poll_interval_seconds=args.grok_billing_poll_interval_seconds,
         grok_billing_poll_http_timeout_seconds=args.grok_billing_poll_http_timeout_seconds,
@@ -1517,6 +1684,77 @@ def _persist_codex_auth_observation(
         return False, 0, None, "apply_disabled"
 
     observation = _build_codex_auth_observation(config, event)
+    dsn = _resolve_dsn(config)
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            dsn,
+            [observation],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
+
+
+def _build_xai_oauth_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> Dict[str, Any]:
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
+        timezone.utc
+    )
+    expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
+    status = _provider_auth_status_from_event(event)
+    successful_validation = status in {"refreshed", "skipped"} and not event.get(
+        "error_class"
+    )
+    auth_file = event.get("auth_file") or config.xai_oauth_auth_file
+    metadata = {
+        "auth_file_hash_algorithm": "sha256",
+        "auth_file_source": config.xai_oauth_auth_file_source,
+        "refresh_buffer_seconds": config.xai_oauth_refresh_buffer_seconds,
+        "refresh_interval_seconds": config.xai_oauth_refresh_interval_seconds,
+        "force_refresh": config.xai_oauth_force_refresh,
+        "raw_status_flags": {
+            "attempted": bool(event.get("attempted")),
+            "refreshed": bool(event.get("refreshed")),
+            "skipped": bool(event.get("skipped")),
+        },
+    }
+    return {
+        "observed_at": observed_at,
+        "environment": event.get("environment") or config.environment,
+        "provider": "xai",
+        "auth_family": "xai_oauth",
+        "credential_scope": _redacted_summary_field(
+            event.get("scope") or config.xai_oauth_scope,
+            limit=512,
+        ),
+        "auth_file_hash": probes.auth_file_identity_hash(auth_file),
+        "status": status,
+        "attempted": bool(event.get("attempted")),
+        "refreshed": bool(event.get("refreshed")),
+        "skipped": bool(event.get("skipped")),
+        "expires_at": expires_at,
+        "last_success_at": observed_at if successful_validation else None,
+        "source_task": "xai_oauth_refresh",
+        "error_class": _redacted_summary_field(event.get("error_class")),
+        "error_message": _redacted_failure_message(event.get("error_message")),
+        "metadata": metadata,
+    }
+
+
+def _persist_xai_oauth_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+
+    observation = _build_xai_oauth_auth_observation(config, event)
     dsn = _resolve_dsn(config)
     try:
         inserted_count = probes.insert_provider_auth_observations(
@@ -2440,6 +2678,62 @@ def _run_codex_oauth_refresh_task(
     return event
 
 
+def _run_xai_oauth_refresh_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.xai_oauth_refresh_enabled:
+        return None
+    last_attempt = state.xai_oauth_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt < config.xai_oauth_refresh_interval_seconds
+    ):
+        return None
+
+    state.xai_oauth_last_attempt_monotonic = now_monotonic
+    try:
+        summary = xai_oauth_refresh.refresh_xai_oauth_auth_file(
+            config.xai_oauth_auth_file,
+            scope=config.xai_oauth_scope,
+            buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
+            force=config.xai_oauth_force_refresh,
+            lock_file=config.xai_oauth_lock_file,
+            http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
+        )
+    except Exception as exc:
+        summary = {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.xai_oauth_auth_file,
+            "scope": config.xai_oauth_scope,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+
+    event = {
+        "event": "xai_oauth_refresh",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        **summary,
+    }
+    (
+        persisted,
+        inserted_count,
+        skip_error_class,
+        skip_reason,
+    ) = _persist_xai_oauth_auth_observation(config, event)
+    event["auth_observation_status"] = _provider_auth_status_from_event(event)
+    event["auth_observation_persisted"] = persisted
+    event["auth_observation_inserted_count"] = inserted_count
+    event["auth_observation_skip_error_class"] = skip_error_class
+    event["auth_observation_skip_reason"] = skip_reason
+    return event
+
+
 def _run_grok_billing_poll_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -2542,6 +2836,7 @@ def run_due_sidecar_tasks(
         (_run_grok_oidc_refresh_task, "grok_oidc_refresh"),
         (_run_antigravity_oauth_refresh_task, "antigravity_oauth_refresh"),
         (_run_codex_oauth_refresh_task, "codex_oauth_refresh"),
+        (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
     ):
         try:

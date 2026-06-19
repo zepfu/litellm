@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -181,7 +180,10 @@ def test_litellm_dev_grok_native_oidc_auth_is_sidecar_refreshed_read_only() -> N
         and volume.startswith("/home/zepfu/.grok:/home/zepfu/.grok")
     ]
     assert grok_mounts == ["/home/zepfu/.grok:/home/zepfu/.grok:ro"]
-    assert "/home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai" in litellm_dev[
+    assert "/home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro" in litellm_dev[
+        "volumes"
+    ]
+    assert "/home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai" in provider_status[
         "volumes"
     ]
     assert (
@@ -371,58 +373,28 @@ async def test_grok_native_oauth_missing_file_errors_with_sidecar_wording(
 
 
 @pytest.mark.asyncio
-async def test_oa_xai_harness_refreshes_and_serializes_near_expiry_credentials(
+async def test_oa_xai_harness_does_not_refresh_near_expiry_credentials(
     tmp_path,
     monkeypatch,
 ):
     harness = OaXaiHarness()
-    credential_path = harness.write_credential(
-        tmp_path,
-        harness.credential_payload(
-            expires_at=datetime.now(timezone.utc) + timedelta(seconds=5)
-        ),
+    original_payload = harness.credential_payload(
+        token="expiring-managed-token",
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=5),
     )
+    credential_path = harness.write_credential(tmp_path, original_payload)
     monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
     monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
-    refresh_calls: list[dict[str, Any]] = []
 
-    class FakeAsyncClient:
+    class UnexpectedRefreshClient:
         def __init__(self, *args, **kwargs):
-            pass
+            raise AssertionError("managed xAI OAuth path must not call token refresh")
 
-        async def __aenter__(self):
-            return self
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", UnexpectedRefreshClient):
+        with pytest.raises(ValueError, match="provider-status sidecar xAI OAuth refresh"):
+            await oauth.get_xai_oauth_access_token()
 
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, data, headers):
-            refresh_calls.append({"url": url, "data": data, "headers": headers})
-            await asyncio.sleep(0)
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": "refreshed-managed-token",
-                    "refresh_token": "refreshed-refresh-token",
-                    "expires_in": 3600,
-                    "token_type": "Bearer",
-                },
-            )
-
-    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
-        tokens = await asyncio.gather(
-            oauth.get_xai_oauth_access_token(),
-            oauth.get_xai_oauth_access_token(),
-        )
-
-    assert tokens == ["refreshed-managed-token", "refreshed-managed-token"]
-    assert len(refresh_calls) == 1
-    assert refresh_calls[0]["url"] == "https://auth.test/token"
-    assert refresh_calls[0]["data"]["grant_type"] == "refresh_token"
-    assert refresh_calls[0]["data"]["client_id"] == "xai-oauth-client-id"
-    refreshed_payload = json.loads(credential_path.read_text(encoding="utf-8"))
-    assert refreshed_payload["access_token"] == "refreshed-managed-token"
-    assert refreshed_payload["refresh_token"] == "refreshed-refresh-token"
+    assert json.loads(credential_path.read_text(encoding="utf-8")) == original_payload
 
 
 @pytest.mark.asyncio
@@ -460,22 +432,8 @@ async def test_oa_xai_harness_returns_reseed_errors_for_missing_or_terminal_cred
         encoding="utf-8",
     )
 
-    class FailingAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, data, headers):
-            return httpx.Response(400, json={"error": "invalid_grant"})
-
-    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FailingAsyncClient):
-        with pytest.raises(ValueError, match="invalid_grant"):
-            await oauth.get_xai_oauth_access_token()
+    with pytest.raises(ValueError, match="provider-status sidecar xAI OAuth refresh"):
+        await oauth.get_xai_oauth_access_token()
 
 
 @pytest.mark.asyncio

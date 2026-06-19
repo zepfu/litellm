@@ -89,8 +89,9 @@ services:
       # Grok CLI OAuth tokens for native Grok OIDC passthrough. LiteLLM reads only;
       # provider-status-observations owns scheduled refresh writes.
       - /home/zepfu/.grok:/home/zepfu/.grok:ro
-      # LiteLLM-owned xAI OAuth credential migrated from Hermes; refresh persists updated tokens.
-      - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
+      # Managed xAI OAuth credentials for oa_xai/* routes. LiteLLM reads only;
+      # provider-status-observations owns scheduled refresh writes.
+      - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro
       # Home-level local-only analysis artifacts; raw full-payload captures may include credentials.
       - /home/zepfu/.analysis:/home/zepfu/.analysis
       # Gemini CLI install for OAuth client fallback during local adapter testing
@@ -198,6 +199,8 @@ services:
       - /home/zepfu/.gemini:/home/zepfu/.gemini
       # The provider-status sidecar is the scheduled writer for Codex OAuth.
       - /home/zepfu/.codex:/home/zepfu/.codex
+      # The provider-status sidecar is the scheduled writer for managed xAI OAuth.
+      - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
       # Antigravity CLI binary for OAuth client extraction and fallback refresh.
       - /home/zepfu/.local/bin/agy:/home/zepfu/.local/bin/agy:ro
     environment:
@@ -261,6 +264,14 @@ services:
       - AAWM_CODEX_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_CODEX_OAUTH_REFRESH_BUFFER_SECONDS:-300}
       - AAWM_CODEX_OAUTH_FORCE_REFRESH=${AAWM_CODEX_OAUTH_FORCE_REFRESH:-1}
       - AAWM_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
+      - AAWM_XAI_OAUTH_REFRESH_ENABLED=${AAWM_XAI_OAUTH_REFRESH_ENABLED:-1}
+      - AAWM_XAI_OAUTH_AUTH_FILE=${AAWM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
+      - AAWM_XAI_OAUTH_LOCK_FILE=${AAWM_XAI_OAUTH_LOCK_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json.lock}
+      - AAWM_XAI_OAUTH_SCOPE=${AAWM_XAI_OAUTH_SCOPE:-https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828}
+      - AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=${AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS:-3600}
+      - AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS:-300}
+      - AAWM_XAI_OAUTH_FORCE_REFRESH=${AAWM_XAI_OAUTH_FORCE_REFRESH:-1}
+      - AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
       - AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}
       - AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=${AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS:-3600}
       - AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS:-30}
