@@ -2427,6 +2427,129 @@ def test_refresh_antigravity_oauth_token_file_uses_agy_cli_fallback(
     assert persisted["token"]["access_token"] == "ya29.refreshed-via-agy"
 
 
+def test_refresh_antigravity_oauth_token_file_uses_seed_auth_for_agy_cli_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    home_path = tmp_path / "home"
+    seed_path = (
+        home_path
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
+    seed_path.parent.mkdir(parents=True)
+    managed_path.parent.mkdir(parents=True)
+    token_payload = {
+        "auth_method": "consumer",
+        "token": {
+            "access_token": "ya29.expired-antigravity",
+            "expiry": "2026-01-01T00:00:00Z",
+            "refresh_token": "refresh-token-123",
+            "token_type": "Bearer",
+        },
+    }
+    seed_path.write_text(json.dumps(token_payload), encoding="utf-8")
+    managed_path.write_text(json.dumps(token_payload), encoding="utf-8")
+    seed_before = seed_path.read_text(encoding="utf-8")
+    cli_path = tmp_path / "agy"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+
+    def fake_post_refresh_request(**_kwargs):
+        raise antigravity_oauth_refresh._RefreshHttpError(
+            "status=401, error=invalid_client",
+            oauth_error="invalid_client",
+        )
+
+    class FakeCompletedProcess:
+        returncode = 0
+
+    def fake_run(args, stdout, stderr, env, timeout, check):
+        assert args[-1] == "models"
+        assert env["HOME"] != str(home_path)
+        assert timeout == 9.0
+        assert check is False
+        staged_auth_path = (
+            Path(env["HOME"])
+            / ".gemini"
+            / "antigravity-cli"
+            / "antigravity-oauth-token"
+        )
+        refreshed = json.loads(staged_auth_path.read_text(encoding="utf-8"))
+        refreshed["token"]["access_token"] = "ya29.refreshed-via-agy"
+        refreshed["token"]["expiry"] = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+        staged_auth_path.write_text(json.dumps(refreshed), encoding="utf-8")
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(
+        antigravity_oauth_refresh,
+        "_post_refresh_request",
+        fake_post_refresh_request,
+    )
+    monkeypatch.setattr(antigravity_oauth_refresh.subprocess, "run", fake_run)
+
+    summary = antigravity_oauth_refresh.refresh_antigravity_oauth_token_file(
+        managed_path,
+        seed_auth_file=seed_path,
+        force=True,
+        lock_file=tmp_path / "antigravity.lock",
+        cli_path=cli_path,
+        client_id="client-id",
+        client_secret="client-secret",
+        cli_timeout_seconds=9.0,
+    )
+
+    managed_persisted = json.loads(managed_path.read_text(encoding="utf-8"))
+    assert summary["attempted"] is True
+    assert summary["refreshed"] is True
+    assert summary["refresh_method"] == "agy_cli"
+    assert summary["auth_file"] == str(managed_path)
+    assert managed_persisted["token"]["access_token"] == "ya29.refreshed-via-agy"
+    assert seed_path.read_text(encoding="utf-8") == seed_before
+
+
+def test_refresh_antigravity_oauth_token_file_bootstraps_missing_managed_auth_from_seed(
+    tmp_path,
+) -> None:
+    seed_path = (
+        tmp_path
+        / "home"
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
+    seed_path.parent.mkdir(parents=True)
+    seed_payload = {
+        "auth_method": "consumer",
+        "token": {
+            "access_token": "ya29.seed-antigravity",
+            "expiry": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            "refresh_token": "refresh-token-123",
+            "token_type": "Bearer",
+        },
+    }
+    seed_path.write_text(json.dumps(seed_payload), encoding="utf-8")
+
+    summary = antigravity_oauth_refresh.refresh_antigravity_oauth_token_file(
+        managed_path,
+        seed_auth_file=seed_path,
+        force=False,
+        lock_file=tmp_path / "antigravity.lock",
+    )
+
+    managed_persisted = json.loads(managed_path.read_text(encoding="utf-8"))
+    assert summary["attempted"] is True
+    assert summary["refreshed"] is True
+    assert summary["refresh_method"] == "seed_copy"
+    assert summary["auth_file"] == str(managed_path)
+    assert managed_persisted["token"]["access_token"] == "ya29.seed-antigravity"
+    assert managed_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_refresh_codex_oauth_auth_file_writes_direct_response(
     tmp_path, monkeypatch
 ) -> None:

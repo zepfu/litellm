@@ -219,7 +219,10 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    host-side reauth and atomic file replacement are visible inside the
    container. Mount the managed directory read-write into the provider-status
    sidecar and set `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` / the sidecar's
-   `AAWM_ANTIGRAVITY_AUTH_FILE` to that path.
+   `AAWM_ANTIGRAVITY_AUTH_FILE` to that path. Also set the sidecar's
+   `AAWM_ANTIGRAVITY_SEED_AUTH_FILE` to the read-only canonical CLI token path
+   so AGY CLI fallback can refresh from a staged copy and write only the
+   managed auth file.
 
    Prod error-log mirroring also requires a writable mount from this repo's
    `.analysis` directory to the container path named by
