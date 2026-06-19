@@ -34,6 +34,14 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     grok_oidc_refresh = importlib.import_module("grok_oidc_refresh")
 
+try:
+    from scripts import antigravity_oauth_refresh
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    antigravity_oauth_refresh = importlib.import_module(
+        "antigravity_oauth_refresh"
+    )
+
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
@@ -49,6 +57,19 @@ GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS = (
 )
 DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_ANTIGRAVITY_AUTH_FILE = (
+    antigravity_oauth_refresh.DEFAULT_ANTIGRAVITY_AUTH_FILE
+)
+DEFAULT_ANTIGRAVITY_LOCK_FILE = (
+    antigravity_oauth_refresh.DEFAULT_ANTIGRAVITY_LOCK_FILE
+)
+ANTIGRAVITY_SIDECAR_AUTH_FILE_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_AUTH_FILE",
+    "ANTIGRAVITY_OAUTH_TOKEN_FILE",
+)
+DEFAULT_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_ANTIGRAVITY_CLI_TIMEOUT_SECONDS = 30.0
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -283,6 +304,20 @@ class ProviderStatusLoopConfig:
     )
     grok_oidc_force_refresh: bool = False
     grok_oidc_http_timeout_seconds: float = DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS
+    antigravity_oauth_refresh_enabled: bool = False
+    antigravity_auth_file: str = DEFAULT_ANTIGRAVITY_AUTH_FILE
+    antigravity_auth_file_source: str = "default"
+    antigravity_lock_file: str = DEFAULT_ANTIGRAVITY_LOCK_FILE
+    antigravity_refresh_interval_seconds: float = (
+        DEFAULT_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS
+    )
+    antigravity_refresh_buffer_seconds: int = (
+        antigravity_oauth_refresh.DEFAULT_ANTIGRAVITY_REFRESH_BUFFER_SECONDS
+    )
+    antigravity_force_refresh: bool = False
+    antigravity_http_timeout_seconds: float = DEFAULT_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS
+    antigravity_cli_timeout_seconds: float = DEFAULT_ANTIGRAVITY_CLI_TIMEOUT_SECONDS
+    antigravity_cli_path: Optional[str] = None
     grok_billing_poll_enabled: bool = DEFAULT_GROK_BILLING_POLL_ENABLED
     grok_billing_poll_interval_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS
@@ -306,6 +341,7 @@ class ProviderStatusLoopConfig:
 @dataclass
 class SidecarTaskState:
     grok_oidc_last_attempt_monotonic: Optional[float] = None
+    antigravity_oauth_last_attempt_monotonic: Optional[float] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
 
 
@@ -358,6 +394,30 @@ def _resolve_grok_sidecar_auth_file(
     return DEFAULT_GROK_OIDC_AUTH_FILE, "default"
 
 
+def _resolve_antigravity_sidecar_auth_file(
+    explicit_auth_file: Optional[str],
+) -> tuple[str, str]:
+    explicit_value = (
+        explicit_auth_file.strip()
+        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
+        else None
+    )
+
+    aawm_auth_file = os.getenv("AAWM_ANTIGRAVITY_AUTH_FILE", "").strip()
+    if aawm_auth_file:
+        return str(Path(aawm_auth_file).expanduser()), "AAWM_ANTIGRAVITY_AUTH_FILE"
+
+    if explicit_value and explicit_value != DEFAULT_ANTIGRAVITY_AUTH_FILE:
+        return str(Path(explicit_value).expanduser()), "explicit"
+
+    for env_name in ANTIGRAVITY_SIDECAR_AUTH_FILE_ENV_VARS:
+        env_value = os.getenv(env_name, "").strip()
+        if env_value:
+            return str(Path(env_value).expanduser()), env_name
+
+    return DEFAULT_ANTIGRAVITY_AUTH_FILE, "default"
+
+
 def _resolve_grok_billing_client_version() -> str:
     return (
         _first_non_empty_env("AAWM_GROK_BILLING_CLIENT_VERSION")
@@ -381,7 +441,7 @@ def _env_int(name: str, default: int) -> int:
     return int(raw_value)
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--apply",
@@ -564,6 +624,110 @@ def _build_parser() -> argparse.ArgumentParser:
             "AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
+    antigravity_group = parser.add_mutually_exclusive_group()
+    antigravity_group.add_argument(
+        "--antigravity-oauth-refresh-enabled",
+        dest="antigravity_oauth_refresh_enabled",
+        action="store_true",
+        default=_env_bool("AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED", False),
+        help=(
+            "Run the Antigravity OAuth token refresh task from this sidecar "
+            "loop. Defaults to AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED or false."
+        ),
+    )
+    antigravity_group.add_argument(
+        "--no-antigravity-oauth-refresh",
+        dest="antigravity_oauth_refresh_enabled",
+        action="store_false",
+        help="Disable the Antigravity OAuth token refresh task.",
+    )
+    parser.add_argument(
+        "--antigravity-auth-file",
+        default=os.getenv("AAWM_ANTIGRAVITY_AUTH_FILE", DEFAULT_ANTIGRAVITY_AUTH_FILE),
+        help=(
+            "Antigravity OAuth token file maintained by this sidecar. Defaults "
+            "to AAWM_ANTIGRAVITY_AUTH_FILE, then LiteLLM Antigravity auth-file "
+            "env vars, or the Antigravity CLI token file."
+        ),
+    )
+    parser.add_argument(
+        "--antigravity-lock-file",
+        default=os.getenv("AAWM_ANTIGRAVITY_LOCK_FILE", DEFAULT_ANTIGRAVITY_LOCK_FILE),
+        help=(
+            "Lock file for sidecar Antigravity OAuth refresh writes. Defaults "
+            "to AAWM_ANTIGRAVITY_LOCK_FILE or the auth-file sibling lock."
+        ),
+    )
+    parser.add_argument(
+        "--antigravity-refresh-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS",
+            DEFAULT_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Antigravity OAuth refresh attempts. "
+            "Defaults to AAWM_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--antigravity-refresh-buffer-seconds",
+        type=int,
+        default=_env_int(
+            "AAWM_ANTIGRAVITY_REFRESH_BUFFER_SECONDS",
+            antigravity_oauth_refresh.DEFAULT_ANTIGRAVITY_REFRESH_BUFFER_SECONDS,
+        ),
+        help=(
+            "Refresh buffer for non-forced Antigravity OAuth refreshes. "
+            "Defaults to AAWM_ANTIGRAVITY_REFRESH_BUFFER_SECONDS or 300."
+        ),
+    )
+    parser.add_argument(
+        "--antigravity-force-refresh",
+        action="store_true",
+        default=_env_bool("AAWM_ANTIGRAVITY_FORCE_REFRESH", False),
+        help=(
+            "Refresh the Antigravity OAuth token on every scheduled attempt "
+            "even when the current access token is still valid."
+        ),
+    )
+    parser.add_argument(
+        "--antigravity-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Antigravity OAuth token endpoint calls. Defaults "
+            "to AAWM_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    parser.add_argument(
+        "--antigravity-cli-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_ANTIGRAVITY_CLI_TIMEOUT_SECONDS",
+            DEFAULT_ANTIGRAVITY_CLI_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "Timeout for AGY CLI fallback refresh. Defaults to "
+            "AAWM_ANTIGRAVITY_CLI_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    parser.add_argument(
+        "--antigravity-cli-path",
+        default=_first_non_empty_env(
+            "AAWM_ANTIGRAVITY_CLI_PATH",
+            "LITELLM_ANTIGRAVITY_CLI_PATH",
+            "ANTIGRAVITY_CLI_PATH",
+        ),
+        help=(
+            "Optional AGY CLI path for OAuth client extraction and fallback "
+            "refresh. Defaults to AAWM_ANTIGRAVITY_CLI_PATH or LiteLLM "
+            "Antigravity CLI env vars."
+        ),
+    )
     billing_group = parser.add_mutually_exclusive_group()
     billing_group.add_argument(
         "--grok-billing-poll-enabled",
@@ -742,6 +906,16 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         raise SystemExit("--grok-oidc-refresh-buffer-seconds must be non-negative")
     if args.grok_oidc_http_timeout_seconds <= 0:
         raise SystemExit("--grok-oidc-http-timeout-seconds must be greater than 0")
+    if args.antigravity_refresh_interval_seconds <= 0:
+        raise SystemExit(
+            "--antigravity-refresh-interval-seconds must be greater than 0"
+        )
+    if args.antigravity_refresh_buffer_seconds < 0:
+        raise SystemExit("--antigravity-refresh-buffer-seconds must be non-negative")
+    if args.antigravity_http_timeout_seconds <= 0:
+        raise SystemExit("--antigravity-http-timeout-seconds must be greater than 0")
+    if args.antigravity_cli_timeout_seconds <= 0:
+        raise SystemExit("--antigravity-cli-timeout-seconds must be greater than 0")
     if args.grok_billing_poll_interval_seconds <= 0:
         raise SystemExit("--grok-billing-poll-interval-seconds must be greater than 0")
     if args.grok_billing_poll_http_timeout_seconds <= 0:
@@ -769,6 +943,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
     resolved_grok_auth_file, resolved_grok_auth_file_source = (
         _resolve_grok_sidecar_auth_file(args.grok_oidc_auth_file)
     )
+    resolved_antigravity_auth_file, resolved_antigravity_auth_file_source = (
+        _resolve_antigravity_sidecar_auth_file(args.antigravity_auth_file)
+    )
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -793,6 +970,18 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_oidc_refresh_buffer_seconds=args.grok_oidc_refresh_buffer_seconds,
         grok_oidc_force_refresh=args.grok_oidc_force_refresh,
         grok_oidc_http_timeout_seconds=args.grok_oidc_http_timeout_seconds,
+        antigravity_oauth_refresh_enabled=args.antigravity_oauth_refresh_enabled,
+        antigravity_auth_file=resolved_antigravity_auth_file,
+        antigravity_auth_file_source=resolved_antigravity_auth_file_source,
+        antigravity_lock_file=args.antigravity_lock_file,
+        antigravity_refresh_interval_seconds=(
+            args.antigravity_refresh_interval_seconds
+        ),
+        antigravity_refresh_buffer_seconds=args.antigravity_refresh_buffer_seconds,
+        antigravity_force_refresh=args.antigravity_force_refresh,
+        antigravity_http_timeout_seconds=args.antigravity_http_timeout_seconds,
+        antigravity_cli_timeout_seconds=args.antigravity_cli_timeout_seconds,
+        antigravity_cli_path=args.antigravity_cli_path,
         grok_billing_poll_enabled=args.grok_billing_poll_enabled,
         grok_billing_poll_interval_seconds=args.grok_billing_poll_interval_seconds,
         grok_billing_poll_http_timeout_seconds=args.grok_billing_poll_http_timeout_seconds,
@@ -1002,6 +1191,75 @@ def _persist_grok_oidc_auth_observation(
         return False, 0, None, "apply_disabled"
 
     observation = _build_grok_oidc_auth_observation(config, event)
+    dsn = _resolve_dsn(config)
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            dsn,
+            [observation],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
+
+
+def _build_antigravity_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> Dict[str, Any]:
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
+        timezone.utc
+    )
+    expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
+    status = _provider_auth_status_from_event(event)
+    successful_validation = status in {"refreshed", "skipped"} and not event.get(
+        "error_class"
+    )
+    auth_file = event.get("auth_file") or config.antigravity_auth_file
+    metadata = {
+        "auth_file_hash_algorithm": "sha256",
+        "auth_file_source": config.antigravity_auth_file_source,
+        "refresh_buffer_seconds": config.antigravity_refresh_buffer_seconds,
+        "refresh_interval_seconds": config.antigravity_refresh_interval_seconds,
+        "force_refresh": config.antigravity_force_refresh,
+        "refresh_method": _redacted_summary_field(event.get("refresh_method")),
+        "raw_status_flags": {
+            "attempted": bool(event.get("attempted")),
+            "refreshed": bool(event.get("refreshed")),
+            "skipped": bool(event.get("skipped")),
+        },
+    }
+    return {
+        "observed_at": observed_at,
+        "environment": event.get("environment") or config.environment,
+        "provider": "antigravity",
+        "auth_family": "antigravity_oauth",
+        "credential_scope": None,
+        "auth_file_hash": probes.auth_file_identity_hash(auth_file),
+        "status": status,
+        "attempted": bool(event.get("attempted")),
+        "refreshed": bool(event.get("refreshed")),
+        "skipped": bool(event.get("skipped")),
+        "expires_at": expires_at,
+        "last_success_at": observed_at if successful_validation else None,
+        "source_task": "antigravity_oauth_refresh",
+        "error_class": _redacted_summary_field(event.get("error_class")),
+        "error_message": _redacted_failure_message(event.get("error_message")),
+        "metadata": metadata,
+    }
+
+
+def _persist_antigravity_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+
+    observation = _build_antigravity_auth_observation(config, event)
     dsn = _resolve_dsn(config)
     try:
         inserted_count = probes.insert_provider_auth_observations(
@@ -1815,6 +2073,62 @@ def _run_grok_oidc_metadata_repair_task(
     }
 
 
+def _run_antigravity_oauth_refresh_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.antigravity_oauth_refresh_enabled:
+        return None
+    last_attempt = state.antigravity_oauth_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt < config.antigravity_refresh_interval_seconds
+    ):
+        return None
+
+    state.antigravity_oauth_last_attempt_monotonic = now_monotonic
+    try:
+        summary = antigravity_oauth_refresh.refresh_antigravity_oauth_token_file(
+            config.antigravity_auth_file,
+            buffer_seconds=config.antigravity_refresh_buffer_seconds,
+            force=config.antigravity_force_refresh,
+            lock_file=config.antigravity_lock_file,
+            cli_path=config.antigravity_cli_path,
+            http_timeout_seconds=config.antigravity_http_timeout_seconds,
+            cli_timeout_seconds=config.antigravity_cli_timeout_seconds,
+        )
+    except Exception as exc:
+        summary = {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.antigravity_auth_file,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+
+    event = {
+        "event": "antigravity_oauth_refresh",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        **summary,
+    }
+    (
+        persisted,
+        inserted_count,
+        skip_error_class,
+        skip_reason,
+    ) = _persist_antigravity_auth_observation(config, event)
+    event["auth_observation_status"] = _provider_auth_status_from_event(event)
+    event["auth_observation_persisted"] = persisted
+    event["auth_observation_inserted_count"] = inserted_count
+    event["auth_observation_skip_error_class"] = skip_error_class
+    event["auth_observation_skip_reason"] = skip_reason
+    return event
+
+
 def _run_grok_billing_poll_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -1915,6 +2229,7 @@ def run_due_sidecar_tasks(
     for runner, event_name in (
         (_run_grok_oidc_metadata_repair_task, "grok_oidc_metadata_repair"),
         (_run_grok_oidc_refresh_task, "grok_oidc_refresh"),
+        (_run_antigravity_oauth_refresh_task, "antigravity_oauth_refresh"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
     ):
         try:
@@ -2011,7 +2326,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "event": "provider_status_sidecar_task_error",
                     "observed_at": _utc_timestamp(),
                     "environment": config.environment,
-                    "task": "grok_oidc_refresh",
+                    "task": "sidecar_tasks",
                     "error_class": exc.__class__.__name__,
                     "error_message": _redacted_failure_message(str(exc)),
                     "traceback": traceback.format_exc(limit=5),

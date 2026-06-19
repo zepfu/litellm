@@ -2,7 +2,7 @@ import json
 import hashlib
 from io import BytesIO
 from argparse import Namespace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import TimeoutExpired
 from urllib import error as urllib_error
@@ -10,6 +10,7 @@ from urllib import error as urllib_error
 import pytest
 
 from litellm.integrations import aawm_agent_identity
+from scripts import antigravity_oauth_refresh
 from scripts import record_provider_status_observations as probes
 from scripts import run_provider_status_observations_loop as loop
 
@@ -593,7 +594,11 @@ def test_loop_config_uses_explicit_direct_schema_dsn(monkeypatch) -> None:
 
 
 def test_provider_status_compose_hardens_sidecar_db_path() -> None:
-    compose_text = (Path(__file__).resolve().parents[2] / "docker-compose.dev.yml").read_text()
+    repo_root = Path(__file__).resolve().parents[2]
+    compose_text = (repo_root / "docker-compose.dev.yml").read_text()
+    dockerfile_text = (
+        repo_root / "docker/Dockerfile.provider_status_observations"
+    ).read_text()
 
     assert "container_name: aawm-provider-status-observations" in compose_text
     assert "AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}" in compose_text
@@ -624,8 +629,15 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     )
     assert "/home/zepfu/.grok:/home/zepfu/.grok:ro" in compose_text
     assert "/home/zepfu/.grok:/home/zepfu/.grok" in compose_text
+    assert "/home/zepfu/.gemini:/home/zepfu/.gemini:ro" in compose_text
+    assert "/home/zepfu/.gemini:/home/zepfu/.gemini" in compose_text
+    assert "/home/zepfu/.local/bin/agy:/home/zepfu/.local/bin/agy:ro" in compose_text
     assert (
         "LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}"
+        in compose_text
+    )
+    assert (
+        "LITELLM_ANTIGRAVITY_AUTH_FILE=${LITELLM_ANTIGRAVITY_AUTH_FILE:-/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token}"
         in compose_text
     )
     assert "LITELLM_XAI_GROK_SEED_AUTH_FILE" not in compose_text
@@ -655,6 +667,22 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
+    assert (
+        "AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED=${AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_ANTIGRAVITY_AUTH_FILE=${AAWM_ANTIGRAVITY_AUTH_FILE:-/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token}"
+        in compose_text
+    )
+    assert (
+        "AAWM_ANTIGRAVITY_FORCE_REFRESH=${AAWM_ANTIGRAVITY_FORCE_REFRESH:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_ANTIGRAVITY_CLI_PATH=${AAWM_ANTIGRAVITY_CLI_PATH:-/home/zepfu/.local/bin/agy}"
+        in compose_text
+    )
     assert (
         "AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}"
         in compose_text
@@ -695,6 +723,10 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE=${AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE:-1}"
         in compose_text
     )
+    assert (
+        "COPY scripts/antigravity_oauth_refresh.py "
+        "/app/scripts/antigravity_oauth_refresh.py"
+    ) in dockerfile_text
 
 
 def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
@@ -2148,6 +2180,151 @@ def test_run_due_sidecar_tasks_reports_grok_billing_auth_failure_once(
     assert events[0]["error_class"] == "GrokBillingPollError"
 
 
+def test_refresh_antigravity_oauth_token_file_writes_direct_response(
+    tmp_path, monkeypatch
+) -> None:
+    token_path = tmp_path / "antigravity-oauth-token"
+    token_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    token_path.chmod(0o600)
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "access_token": "ya29.refreshed-antigravity",
+                    "expires_in": 3600,
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 12.5
+        assert request.full_url == "https://oauth2.example/token"
+        assert request.data is not None
+        form = request.data.decode("utf-8")
+        assert "client_id=client-id" in form
+        assert "client_secret=client-secret" in form
+        assert "refresh_token=refresh-token-123" in form
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        antigravity_oauth_refresh.urllib_request,
+        "urlopen",
+        fake_urlopen,
+    )
+
+    summary = antigravity_oauth_refresh.refresh_antigravity_oauth_token_file(
+        token_path,
+        force=True,
+        lock_file=tmp_path / "antigravity.lock",
+        token_endpoint="https://oauth2.example/token",
+        client_id="client-id",
+        client_secret="client-secret",
+        http_timeout_seconds=12.5,
+    )
+
+    persisted = json.loads(token_path.read_text(encoding="utf-8"))
+    assert summary["attempted"] is True
+    assert summary["refreshed"] is True
+    assert summary["refresh_method"] == "direct"
+    assert persisted["token"]["access_token"] == "ya29.refreshed-antigravity"
+    assert persisted["token"]["refresh_token"] == "refresh-token-123"
+    assert token_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_refresh_antigravity_oauth_token_file_uses_agy_cli_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    home_path = tmp_path / "home"
+    token_path = (
+        home_path
+        / ".gemini"
+        / "antigravity-cli"
+        / "antigravity-oauth-token"
+    )
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "ya29.expired-antigravity",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cli_path = tmp_path / "agy"
+    cli_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+
+    def fake_post_refresh_request(**_kwargs):
+        raise antigravity_oauth_refresh._RefreshHttpError(
+            "status=401, error=invalid_client",
+            oauth_error="invalid_client",
+        )
+
+    class FakeCompletedProcess:
+        returncode = 0
+
+    def fake_run(args, stdout, stderr, env, timeout, check):
+        assert args[-1] == "models"
+        assert env["HOME"] == str(home_path)
+        assert timeout == 9.0
+        assert check is False
+        refreshed = json.loads(token_path.read_text(encoding="utf-8"))
+        refreshed["token"]["access_token"] = "ya29.refreshed-via-agy"
+        refreshed["token"]["expiry"] = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+        token_path.write_text(json.dumps(refreshed), encoding="utf-8")
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(
+        antigravity_oauth_refresh,
+        "_post_refresh_request",
+        fake_post_refresh_request,
+    )
+    monkeypatch.setattr(antigravity_oauth_refresh.subprocess, "run", fake_run)
+
+    summary = antigravity_oauth_refresh.refresh_antigravity_oauth_token_file(
+        token_path,
+        force=True,
+        lock_file=tmp_path / "antigravity.lock",
+        cli_path=cli_path,
+        client_id="client-id",
+        client_secret="client-secret",
+        cli_timeout_seconds=9.0,
+    )
+
+    persisted = json.loads(token_path.read_text(encoding="utf-8"))
+    assert summary["attempted"] is True
+    assert summary["refreshed"] is True
+    assert summary["refresh_method"] == "agy_cli"
+    assert persisted["token"]["access_token"] == "ya29.refreshed-via-agy"
+
+
 def _grok_oidc_auth_persist_config(**overrides):
     from dataclasses import replace
 
@@ -2333,6 +2510,149 @@ def test_persist_grok_oidc_auth_observation_marks_db_write_failure(monkeypatch) 
     assert inserted == 0
     assert error_class == "OperationalError"
     assert "connection refused" in error_message
+
+
+def _antigravity_auth_persist_config(**overrides):
+    from dataclasses import replace
+
+    config = _grok_oidc_auth_persist_config(
+        grok_oidc_refresh_enabled=False,
+        antigravity_oauth_refresh_enabled=True,
+        antigravity_auth_file=(
+            "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token"
+        ),
+        antigravity_auth_file_source="default",
+        antigravity_lock_file=(
+            "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token.lock"
+        ),
+        antigravity_refresh_interval_seconds=3600.0,
+        antigravity_refresh_buffer_seconds=300,
+        antigravity_force_refresh=False,
+        antigravity_http_timeout_seconds=30.0,
+        antigravity_cli_timeout_seconds=30.0,
+        antigravity_cli_path="/home/zepfu/.local/bin/agy",
+    )
+    if overrides:
+        config = replace(config, **overrides)
+    return config
+
+
+def _antigravity_refresh_sidecar_event(**overrides) -> dict:
+    event = {
+        "event": "antigravity_oauth_refresh",
+        "observed_at": "2026-06-19T12:00:00Z",
+        "environment": "dev",
+        "attempted": True,
+        "refreshed": True,
+        "skipped": False,
+        "auth_file": "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token",
+        "expires_at": "2026-06-19T13:00:00Z",
+        "refresh_method": "direct",
+        "error_class": None,
+        "error_message": None,
+    }
+    event.update(overrides)
+    return event
+
+
+def test_build_antigravity_auth_observation_maps_successful_refresh() -> None:
+    config = _antigravity_auth_persist_config()
+    event = _antigravity_refresh_sidecar_event()
+
+    observation = loop._build_antigravity_auth_observation(config, event)
+
+    assert observation["observed_at"] == datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
+    assert observation["environment"] == "dev"
+    assert observation["provider"] == "antigravity"
+    assert observation["auth_family"] == "antigravity_oauth"
+    assert observation["credential_scope"] is None
+    assert observation["auth_file_hash"] == hashlib.sha256(
+        event["auth_file"].encode("utf-8")
+    ).hexdigest()
+    assert observation["status"] == "refreshed"
+    assert observation["attempted"] is True
+    assert observation["refreshed"] is True
+    assert observation["skipped"] is False
+    assert observation["expires_at"] == datetime(2026, 6, 19, 13, 0, tzinfo=timezone.utc)
+    assert observation["last_success_at"] == observation["observed_at"]
+    assert observation["source_task"] == "antigravity_oauth_refresh"
+    assert observation["metadata"]["refresh_method"] == "direct"
+    observation_json = json.dumps(observation, default=str)
+    assert "refresh_token" not in observation_json
+    assert "access_token" not in observation_json
+    assert "/home/zepfu/.gemini" not in observation_json
+
+
+def test_build_antigravity_auth_observation_sanitizes_refresh_failure() -> None:
+    config = _antigravity_auth_persist_config()
+    event = _antigravity_refresh_sidecar_event(
+        refreshed=False,
+        skipped=False,
+        expires_at=None,
+        error_class="ValueError",
+        error_message=(
+            "token refresh failed with refresh_token=super-secret "
+            "and Authorization=Bearer leaked-token"
+        ),
+    )
+
+    observation = loop._build_antigravity_auth_observation(config, event)
+
+    assert observation["status"] == "failed"
+    assert observation["last_success_at"] is None
+    assert observation["error_class"] == "ValueError"
+    assert "REDACTED" in observation["error_message"]
+    assert "super-secret" not in json.dumps(observation, default=str)
+    assert "leaked-token" not in json.dumps(observation, default=str)
+
+
+def test_run_due_sidecar_tasks_persists_antigravity_auth_observation_when_apply_enabled(
+    monkeypatch,
+) -> None:
+    config = _antigravity_auth_persist_config(
+        antigravity_force_refresh=True,
+        antigravity_refresh_interval_seconds=3600.0,
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        loop.antigravity_oauth_refresh,
+        "refresh_antigravity_oauth_token_file",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "auth_file": config.antigravity_auth_file,
+            "expires_at": "2026-06-19T13:00:00Z",
+            "refresh_method": "direct",
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+
+    def fake_persist(cfg, event):
+        captured["config"] = cfg
+        captured["event"] = event
+        return True, 1, None, None
+
+    monkeypatch.setattr(loop, "_persist_antigravity_auth_observation", fake_persist)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    refresh_events = [
+        event for event in events if event.get("event") == "antigravity_oauth_refresh"
+    ]
+    assert len(refresh_events) == 1
+    assert captured["config"] is config
+    assert captured["event"]["refreshed"] is True
+    assert refresh_events[0]["auth_observation_status"] == "refreshed"
+    assert refresh_events[0]["auth_observation_persisted"] is True
+    assert refresh_events[0]["auth_observation_inserted_count"] == 1
+    assert "access-token" not in json.dumps(refresh_events)
 
 
 def test_run_due_sidecar_tasks_persists_grok_oidc_auth_observation_when_apply_enabled(

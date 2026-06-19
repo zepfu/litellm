@@ -20179,11 +20179,15 @@ async def _load_valid_local_antigravity_access_token() -> str:
 
         token_data, auth_path = await _load_local_antigravity_oauth_token_data()
         if not _antigravity_access_token_is_valid(token_data):
-            token_data = await _refresh_local_antigravity_oauth_token_data(
-                token_data,
-                auth_path,
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Antigravity OAuth token is expired or invalid. The "
+                    "provider-status sidecar owns Antigravity auth refresh; "
+                    "confirm the sidecar can write the configured token file "
+                    f"and refresh {auth_path}."
+                ),
             )
-            _write_antigravity_oauth_token_data_atomic(auth_path, token_data)
 
     token_block = token_data.get("token")
     if not isinstance(token_block, dict):
