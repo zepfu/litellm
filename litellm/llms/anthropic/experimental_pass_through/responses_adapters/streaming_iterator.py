@@ -123,6 +123,52 @@ class AnthropicResponsesStreamWrapper:
             ),
         }
 
+    def _record_client_visible_usage_source(self, source: str) -> None:
+        metadata = self.request_body.get("litellm_metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            self.request_body["litellm_metadata"] = metadata
+        metadata["anthropic_adapter_client_visible_usage_source"] = source
+        metadata["anthropic_adapter_client_visible_usage_estimated"] = (
+            source == "estimated"
+        )
+
+    def _build_message_delta_usage(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cache_creation_tokens: int,
+        cache_read_tokens: int,
+        provider_usage_present: bool,
+    ) -> Dict[str, Any]:
+        usage_delta: Dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        if cache_creation_tokens:
+            usage_delta["cache_creation_input_tokens"] = cache_creation_tokens
+        if cache_read_tokens:
+            usage_delta["cache_read_input_tokens"] = cache_read_tokens
+
+        if provider_usage_present or (
+            usage_delta["input_tokens"] > 0
+            or usage_delta["output_tokens"] > 0
+            or cache_creation_tokens
+            or cache_read_tokens
+        ):
+            self._record_client_visible_usage_source(
+                "provider_reported" if provider_usage_present else "adapter_available"
+            )
+            return usage_delta
+
+        if not self._meaningful_output_seen:
+            self._record_client_visible_usage_source("missing")
+            return usage_delta
+
+        self._record_client_visible_usage_source("estimated")
+        return self._build_fallback_usage_delta()
+
     @staticmethod
     def _get_value(value: Any, key: str, default: Any = None) -> Any:
         if isinstance(value, dict):
@@ -830,6 +876,7 @@ class AnthropicResponsesStreamWrapper:
             output_tokens = 0
             cache_creation_tokens = 0
             cache_read_tokens = 0
+            usage = None
 
             if (
                 self.reject_empty_success
@@ -871,14 +918,13 @@ class AnthropicResponsesStreamWrapper:
                         stop_reason = "tool_use"
                         break
 
-            usage_delta: Dict[str, Any] = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-            }
-            if cache_creation_tokens:
-                usage_delta["cache_creation_input_tokens"] = cache_creation_tokens
-            if cache_read_tokens:
-                usage_delta["cache_read_input_tokens"] = cache_read_tokens
+            usage_delta = self._build_message_delta_usage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_tokens=cache_creation_tokens,
+                cache_read_tokens=cache_read_tokens,
+                provider_usage_present=usage is not None,
+            )
 
             self._chunk_queue.append(
                 {

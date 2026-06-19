@@ -209,6 +209,14 @@ Important notes:
   cost fields.
 - For Anthropic rows, `reasoning_tokens_source=provider_reported` is only valid when the provider supplied a positive count; zero placeholders should fall through to estimation or remain unset.
 - `reasoning_tokens_source` should not remain null in repaired or newly written `session_history` rows; use `not_applicable` when no reasoning is present and `not_available` when reasoning is present but no positive provider/estimated count exists.
+- Anthropic Responses adapter streaming may synthesize client-visible
+  `message_delta.usage` only when upstream Responses events omit usage after
+  active output. Treat
+  `metadata.anthropic_adapter_client_visible_usage_source=estimated` as a
+  Claude Code UI compatibility signal, not provider truth; canonical
+  `session_history` token, cache-token, and cost fields must continue to use
+  provider-reported usage only. Explicit zero provider usage should remain zero
+  and should not be replaced by estimates.
 - Anthropic/OpenAI/OpenRouter `session_history` rows should also carry normalized provider-cache telemetry. Expect `provider_cache_status` to land as `hit`, `write`, `miss`, `unsupported`, or `not_attempted`, with `provider_cache_miss_reason` populated for miss-shaped outcomes. `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` are best-effort and should only appear when the miss token count is explicit enough to price honestly.
 - AAWM alias-routed rows keep concrete provider attribution in
   `session_history.provider` and `session_history.model`. Use
