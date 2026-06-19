@@ -77,6 +77,7 @@ DEFAULT_ANTIGRAVITY_LOCK_FILE = (
 )
 ANTIGRAVITY_SIDECAR_AUTH_FILE_ENV_VARS = (
     "LITELLM_ANTIGRAVITY_AUTH_FILE",
+    "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE",
     "ANTIGRAVITY_OAUTH_TOKEN_FILE",
 )
 DEFAULT_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS = 3600.0
@@ -467,9 +468,13 @@ def _resolve_antigravity_sidecar_auth_file(
         else None
     )
 
-    aawm_auth_file = os.getenv("AAWM_ANTIGRAVITY_AUTH_FILE", "").strip()
-    if aawm_auth_file:
-        return str(Path(aawm_auth_file).expanduser()), "AAWM_ANTIGRAVITY_AUTH_FILE"
+    for env_name in (
+        "AAWM_ANTIGRAVITY_AUTH_FILE",
+        "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE",
+    ):
+        env_value = os.getenv(env_name, "").strip()
+        if env_value:
+            return str(Path(env_value).expanduser()), env_name
 
     if explicit_value and explicit_value != DEFAULT_ANTIGRAVITY_AUTH_FILE:
         return str(Path(explicit_value).expanduser()), "explicit"
@@ -760,11 +765,16 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--antigravity-auth-file",
-        default=os.getenv("AAWM_ANTIGRAVITY_AUTH_FILE", DEFAULT_ANTIGRAVITY_AUTH_FILE),
+        default=(
+            os.getenv("AAWM_ANTIGRAVITY_AUTH_FILE")
+            or os.getenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE")
+            or DEFAULT_ANTIGRAVITY_AUTH_FILE
+        ),
         help=(
             "Antigravity OAuth token file maintained by this sidecar. Defaults "
-            "to AAWM_ANTIGRAVITY_AUTH_FILE, then LiteLLM Antigravity auth-file "
-            "env vars, or the Antigravity CLI token file."
+            "to AAWM_ANTIGRAVITY_AUTH_FILE, then "
+            "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE, then LiteLLM Antigravity "
+            "auth-file env vars, or the Antigravity CLI token file."
         ),
     )
     parser.add_argument(

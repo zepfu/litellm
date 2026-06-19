@@ -275,23 +275,28 @@ auth-file path.
 
 ## Antigravity OAuth Credentials
 
-Antigravity Code Assist routes use the Antigravity CLI OAuth token file,
-normally `/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`.
-LiteLLM is a read-only consumer of that file. During request handling it loads
-the access token only when the token file is present and the access token is
-still valid outside the configured safety window. If the token is expired or
-invalid, LiteLLM fails the Antigravity candidate with a clear sidecar-refresh
-message instead of attempting a direct OAuth refresh or invoking `agy`.
+Antigravity Code Assist routes use sidecar-managed OAuth token data. In prod,
+LiteLLM should be configured with
+`LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` for the provider-status sidecar's
+refreshed token copy and `LITELLM_ANTIGRAVITY_SEED_AUTH_FILE` for the
+read-only Antigravity CLI login seed, normally
+`/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`. LiteLLM is a
+read-only consumer of those files. During request handling it loads the first
+valid candidate token and never attempts a direct OAuth refresh or invokes
+`agy`. If all candidate tokens are expired or invalid, LiteLLM fails the
+Antigravity candidate with a clear sidecar-refresh message.
 
-The provider-status sidecar is the scheduled Antigravity writer. It mounts
-`/home/zepfu/.gemini` writable, locks the configured token file, attempts direct
-OAuth refresh using configured/token/CLI-extracted client values, and falls back
-to `agy models` for Antigravity CLI silent refresh when the direct client pair is
-rejected. The dev LiteLLM container mounts the same host directory read-only.
-In dev compose the sidecar runs with
-`AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED=1`,
+The provider-status sidecar is the scheduled Antigravity writer. It mounts the
+managed token directory writable, locks the configured token file, attempts
+direct OAuth refresh using configured/token/CLI-extracted client values, and
+falls back to `agy models` for Antigravity CLI silent refresh when the direct
+client pair is rejected. It also needs access to the seed Antigravity CLI
+directory and `agy` binary when CLI fallback is expected. In dev compose the
+sidecar runs with `AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED=1`,
 `AAWM_ANTIGRAVITY_AUTH_FILE=/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`,
-and a one-hour refresh interval.
+and a one-hour refresh interval; prod may instead point
+`AAWM_ANTIGRAVITY_AUTH_FILE` at the managed auth copy while LiteLLM also has
+`LITELLM_ANTIGRAVITY_SEED_AUTH_FILE` for read-only fallback.
 
 Each Antigravity refresh attempt writes sanitized provider-auth telemetry into
 the same `provider_auth_observations` table and `provider_auth_current` view
