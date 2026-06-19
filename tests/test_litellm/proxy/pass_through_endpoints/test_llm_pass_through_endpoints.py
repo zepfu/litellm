@@ -6148,6 +6148,95 @@ class TestPassThroughRequestRetryableFailures:
         )
         for key, value in error_context.items():
             assert payload["context"][key] == value
+        assert payload["context"]["failure_kind"] == "streaming_upstream_read_timeout"
+        assert (
+            payload["context"]["stream_failure_stage"]
+            == "stream_interrupted_before_first_chunk"
+        )
+        assert payload["context"]["stream_hidden_retry_safe"] is False
+        assert payload["context"]["stream_chunks_seen"] == 0
+        assert payload["context"]["stream_bytes_seen"] == 0
+        assert "ReadTimeout" in payload["traceback"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_timeout_after_first_chunk_marks_retry_unsafe(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://api.anthropic.com/v1/messages"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/anthropic/v1/messages?beta=true",
+            "upstream_url": target_url,
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "model_alias": None,
+            "route_family": "anthropic_messages",
+            "status_code": None,
+            "trace_id": "trace-stream-after-first-byte",
+            "litellm_call_id": "call-stream-after-first-byte",
+        }
+
+        class PartiallyFailingStreamingResponse:
+            headers = httpx.Headers({})
+
+            async def aiter_bytes(self):
+                yield b"data: {\"type\":\"message_start\"}\n\n"
+                raise httpx.ReadTimeout(
+                    "Timeout on reading data from socket",
+                    request=httpx.Request("POST", target_url),
+                )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        chunks: list[bytes] = []
+        success_handler_kwargs = {"litellm_params": {"metadata": {}}}
+        try:
+            with pytest.raises(httpx.ReadTimeout):
+                async for chunk in PassThroughStreamingHandler.chunk_processor(
+                    response=PartiallyFailingStreamingResponse(),  # type: ignore[arg-type]
+                    request_body={"model": "claude-opus-4-8"},
+                    litellm_logging_obj=MagicMock(),
+                    endpoint_type=EndpointType.ANTHROPIC,
+                    start_time=datetime.now(),
+                    passthrough_success_handler_obj=MagicMock(),
+                    url_route=target_url,
+                    custom_llm_provider="anthropic",
+                    success_handler_kwargs=success_handler_kwargs,
+                    error_log_context=error_context,
+                ):
+                    chunks.append(chunk)
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert chunks == [b"data: {\"type\":\"message_start\"}\n\n"]
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Error in chunk_processor" in item["message"]
+        )
+
+        assert payload["context"]["failure_kind"] == "streaming_upstream_read_timeout"
+        assert (
+            payload["context"]["stream_failure_stage"]
+            == "stream_interrupted_after_first_byte"
+        )
+        assert payload["context"]["stream_hidden_retry_safe"] is False
+        assert payload["context"]["stream_chunks_seen"] == 1
+        assert payload["context"]["stream_bytes_seen"] == len(chunks[0])
         assert "ReadTimeout" in payload["traceback"]
 
     @pytest.mark.asyncio
