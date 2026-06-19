@@ -653,9 +653,71 @@ class PassThroughStreamingHandler:
             verbose_proxy_logger.exception(
                 "Error in chunk_processor: %s",
                 str(e),
-                extra=error_log_context or {},
+                extra=PassThroughStreamingHandler._build_streaming_exception_log_context(
+                    error_log_context=error_log_context,
+                    exc=e,
+                    chunk_count=chunk_count if "chunk_count" in locals() else 0,
+                    total_stream_bytes=(
+                        total_stream_bytes if "total_stream_bytes" in locals() else 0
+                    ),
+                    first_chunk_at=(
+                        first_chunk_at if "first_chunk_at" in locals() else None
+                    ),
+                    first_emitted_at=(
+                        first_emitted_at if "first_emitted_at" in locals() else None
+                    ),
+                ),
             )
             raise
+
+    @staticmethod
+    def _build_streaming_exception_log_context(
+        *,
+        error_log_context: Optional[Dict[str, Any]],
+        exc: Exception,
+        chunk_count: int,
+        total_stream_bytes: int,
+        first_chunk_at: Optional[datetime],
+        first_emitted_at: Optional[datetime],
+    ) -> Dict[str, Any]:
+        failure_context = dict(error_log_context or {})
+        failure_context.update(
+            PassThroughStreamingHandler._build_streaming_failure_context(
+                exc=exc,
+                chunk_count=chunk_count,
+                total_stream_bytes=total_stream_bytes,
+                first_chunk_at=first_chunk_at,
+                first_emitted_at=first_emitted_at,
+            )
+        )
+        return failure_context
+
+    @staticmethod
+    def _build_streaming_failure_context(
+        *,
+        exc: Exception,
+        chunk_count: int,
+        total_stream_bytes: int,
+        first_chunk_at: Optional[datetime],
+        first_emitted_at: Optional[datetime],
+    ) -> Dict[str, Any]:
+        if first_emitted_at is not None:
+            failure_stage = "stream_interrupted_after_first_byte"
+        elif first_chunk_at is not None:
+            failure_stage = "stream_interrupted_before_emit"
+        else:
+            failure_stage = "stream_interrupted_before_first_chunk"
+
+        context: Dict[str, Any] = {
+            "failure_kind": "streaming_upstream_read_failure",
+            "stream_failure_stage": failure_stage,
+            "stream_chunks_seen": chunk_count,
+            "stream_bytes_seen": total_stream_bytes,
+            "stream_hidden_retry_safe": False,
+        }
+        if isinstance(exc, httpx.ReadTimeout):
+            context["failure_kind"] = "streaming_upstream_read_timeout"
+        return context
 
     @staticmethod
     def _set_streaming_handler_branch(
