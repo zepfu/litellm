@@ -248,6 +248,35 @@ CLI credential. The explicit Grok billing poll should run from the same
 sidecar context so quota snapshots use the credential that the sidecar keeps
 fresh, not a second LiteLLM-managed copy.
 
+## Antigravity OAuth Credentials
+
+Antigravity Code Assist routes use the Antigravity CLI OAuth token file,
+normally `/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`.
+LiteLLM is a read-only consumer of that file. During request handling it loads
+the access token only when the token file is present and the access token is
+still valid outside the configured safety window. If the token is expired or
+invalid, LiteLLM fails the Antigravity candidate with a clear sidecar-refresh
+message instead of attempting a direct OAuth refresh or invoking `agy`.
+
+The provider-status sidecar is the scheduled Antigravity writer. It mounts
+`/home/zepfu/.gemini` writable, locks the configured token file, attempts direct
+OAuth refresh using configured/token/CLI-extracted client values, and falls back
+to `agy models` for Antigravity CLI silent refresh when the direct client pair is
+rejected. The dev LiteLLM container mounts the same host directory read-only.
+In dev compose the sidecar runs with
+`AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED=1`,
+`AAWM_ANTIGRAVITY_AUTH_FILE=/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`,
+and a one-hour refresh interval.
+
+Each Antigravity refresh attempt writes sanitized provider-auth telemetry into
+the same `provider_auth_observations` table and `provider_auth_current` view
+used by Grok OIDC. Rows use provider `antigravity`, auth family
+`antigravity_oauth`, source task `antigravity_oauth_refresh`, the auth-file
+identity hash, attempted/refreshed/skipped flags, expiry, last successful
+validation time, and redacted failure class/message. Rows must never include
+access tokens, refresh tokens, raw auth-file contents, or the raw auth-file
+path.
+
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
 tools, and `reasoning` input items that the selected Grok-family model declares
 unsupported. This includes `reasoning` items that carry `encrypted_content` from
