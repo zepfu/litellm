@@ -152,6 +152,12 @@ _ANTIGRAVITY_AUTH_FILE_ENV_VARS = (
     "LITELLM_ANTIGRAVITY_AUTH_FILE",
     "ANTIGRAVITY_OAUTH_TOKEN_FILE",
 )
+_ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE",
+)
+_ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS = (
+    "LITELLM_ANTIGRAVITY_SEED_AUTH_FILE",
+)
 _ANTIGRAVITY_DEFAULT_AUTH_PATHS = (
     "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token",
     "~/.gemini/antigravity-cli/antigravity-oauth-token",
@@ -3012,6 +3018,11 @@ def _add_codex_auto_agent_text_error_tokens(
         in text_lower
     ) or "insufficient tool messages following tool_calls message" in text_lower:
         tokens.add("DEEPSEEK_TOOL_MESSAGE_MISMATCH")
+    if (
+        "invalid message provided" in text_lower
+        and "must have non-empty content or tool calls" in text_lower
+    ):
+        tokens.add("OPENROUTER_INVALID_CHAT_MESSAGE")
 
 
 def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
@@ -3067,6 +3078,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     if tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
         return "capacity_exhausted"
     if "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in tokens:
+        return "provider_format_rejected"
+    if "OPENROUTER_INVALID_CHAT_MESSAGE" in tokens:
         return "provider_format_rejected"
     if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
         return "rate_limited"
@@ -11328,6 +11341,106 @@ def _sanitize_opencode_zen_completion_messages_for_chat_completion(
     return updated_kwargs, changes
 
 
+def _openrouter_chat_message_function_call(message: Any) -> Any:
+    if isinstance(message, dict):
+        return message.get("function_call")
+    return getattr(message, "function_call", None)
+
+
+def _openrouter_chat_message_has_valid_content_or_tool_calls(message: Any) -> bool:
+    role = _opencode_zen_chat_message_role(message)
+    if role == "tool":
+        return _opencode_zen_chat_message_tool_result_id(message) is not None
+
+    if _opencode_zen_chat_message_tool_call_ids(message):
+        return True
+    if _openrouter_chat_message_function_call(message):
+        return True
+
+    if isinstance(message, dict):
+        content = message.get("content")
+    else:
+        content = getattr(message, "content", None)
+    return not _is_codex_google_code_assist_empty_text_content(content)
+
+
+def _sanitize_openrouter_completion_messages_for_chat_completion(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    completion_kwargs, adjacency_changes = (
+        _sanitize_opencode_zen_completion_messages_for_chat_completion(
+            completion_kwargs
+        )
+    )
+
+    messages = completion_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return completion_kwargs, adjacency_changes
+
+    updated_messages: list[Any] = []
+    removed_empty_message_count = 0
+    for message in messages:
+        if _openrouter_chat_message_has_valid_content_or_tool_calls(message):
+            updated_messages.append(message)
+            continue
+        removed_empty_message_count += 1
+
+    if removed_empty_message_count == 0 and not adjacency_changes:
+        return completion_kwargs, {}
+
+    updated_kwargs = dict(completion_kwargs)
+    updated_kwargs["messages"] = updated_messages
+    changes: dict[str, Any] = {
+        "openrouter_chat_message_shape_sanitized": True,
+        "openrouter_chat_message_shape_messages_from_count": len(messages),
+        "openrouter_chat_message_shape_messages_to_count": len(updated_messages),
+        "openrouter_chat_message_shape_removed_empty_message_count": (
+            removed_empty_message_count
+        ),
+    }
+    if adjacency_changes:
+        changes.update(adjacency_changes)
+        changes["openrouter_chat_tool_adjacency_sanitized"] = True
+    return updated_kwargs, changes
+
+
+def _apply_openrouter_completion_message_sanitization(
+    *,
+    request_body: dict[str, Any],
+    completion_kwargs: dict[str, Any],
+    litellm_metadata: dict[str, Any],
+    span_name: str,
+    tag: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    completion_kwargs, sanitization_changes = (
+        _sanitize_openrouter_completion_messages_for_chat_completion(
+            completion_kwargs
+        )
+    )
+    if not sanitization_changes:
+        return request_body, completion_kwargs, litellm_metadata
+
+    metadata_body = _merge_litellm_metadata(
+        {"litellm_metadata": litellm_metadata},
+        tags_to_add=[tag],
+        extra_fields={
+            **sanitization_changes,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name=span_name,
+                    metadata=sanitization_changes,
+                )
+            ],
+        },
+    )
+    litellm_metadata = dict(metadata_body.get("litellm_metadata") or {})
+    request_body = dict(request_body)
+    request_body["litellm_metadata"] = litellm_metadata
+    completion_kwargs = dict(completion_kwargs)
+    completion_kwargs["metadata"] = litellm_metadata
+    return request_body, completion_kwargs, litellm_metadata
+
+
 def _opencode_zen_responses_sse_event(event_type: str, payload: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
@@ -19564,21 +19677,44 @@ def _get_gemini_passthrough_target_base(
     return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
 
 
-def _get_antigravity_auth_file_path() -> Optional[Path]:
-    for env_name in _ANTIGRAVITY_AUTH_FILE_ENV_VARS:
+def _iter_antigravity_auth_file_path_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    seen_paths: set[str] = set()
+    for env_name in (
+        *_ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS,
+        *_ANTIGRAVITY_AUTH_FILE_ENV_VARS,
+        *_ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS,
+    ):
         raw_value = _clean_codex_auth_value(os.getenv(env_name))
         if not raw_value:
             continue
         path = Path(raw_value).expanduser()
-        if path.exists():
-            return path
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        candidates.append(path)
 
     for candidate_str in _ANTIGRAVITY_DEFAULT_AUTH_PATHS:
         candidate = Path(candidate_str).expanduser()
-        if candidate.exists():
-            return candidate
+        if not candidate.exists():
+            continue
+        resolved = str(candidate.resolve())
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        candidates.append(candidate)
+    return candidates
 
-    return None
+
+def _get_antigravity_auth_file_path() -> Optional[Path]:
+    candidates = _iter_antigravity_auth_file_path_candidates()
+    if not candidates:
+        return None
+    return candidates[0]
+
 
 
 async def _load_antigravity_oauth_token_data_from_path(
@@ -19602,18 +19738,41 @@ async def _load_antigravity_oauth_token_data_from_path(
 
 
 async def _load_local_antigravity_oauth_token_data() -> tuple[AntigravityOAuthTokenData, Path]:
-    auth_path = _get_antigravity_auth_file_path()
-    if auth_path is None:
+    candidates = _iter_antigravity_auth_file_path_candidates()
+    if not candidates:
         raise HTTPException(
             status_code=500,
             detail=(
                 "Antigravity passthrough requires local OAuth token data at "
-                "'~/.gemini/antigravity-cli/antigravity-oauth-token' or "
+                "'~/.gemini/antigravity-cli/antigravity-oauth-token', "
+                "'LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE', "
+                "'LITELLM_ANTIGRAVITY_SEED_AUTH_FILE', or "
                 "'LITELLM_ANTIGRAVITY_AUTH_FILE'."
             ),
         )
 
-    return await _load_antigravity_oauth_token_data_from_path(auth_path), auth_path
+    first_loaded: Optional[tuple[AntigravityOAuthTokenData, Path]] = None
+    first_error: Optional[HTTPException] = None
+    for auth_path in candidates:
+        try:
+            token_data = await _load_antigravity_oauth_token_data_from_path(auth_path)
+        except HTTPException as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        if first_loaded is None:
+            first_loaded = (token_data, auth_path)
+        if _antigravity_access_token_is_valid(token_data):
+            return token_data, auth_path
+
+    if first_loaded is not None:
+        return first_loaded
+    if first_error is not None:
+        raise first_error
+    raise HTTPException(
+        status_code=500,
+        detail="Antigravity OAuth token candidate paths could not be loaded.",
+    )
 
 
 def _parse_antigravity_token_expiry(expiry: Any) -> Optional[datetime]:
@@ -24014,6 +24173,15 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         metadata=litellm_metadata,
     )
     completion_kwargs["metadata"] = litellm_metadata
+    request_body, completion_kwargs, litellm_metadata = (
+        _apply_openrouter_completion_message_sanitization(
+            request_body=request_body,
+            completion_kwargs=completion_kwargs,
+            litellm_metadata=litellm_metadata,
+            span_name="codex_openrouter.chat_message_shape_sanitized",
+            tag="openrouter-chat-message-shape-sanitized",
+        )
+    )
 
     target_base_url = _get_openrouter_target_base()
     target_url = f"{target_base_url.rstrip('/')}/v1/chat/completions"

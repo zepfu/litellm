@@ -495,6 +495,52 @@ def test_resolve_grok_sidecar_auth_file_uses_grok_home_and_default(tmp_path, mon
     assert source == "GROK_HOME"
 
 
+def test_resolve_antigravity_sidecar_auth_file_prefers_aawm_override(
+    tmp_path, monkeypatch
+) -> None:
+    aawm_auth = tmp_path / "aawm-antigravity-token"
+    managed_auth = tmp_path / "managed-antigravity-token"
+    aawm_auth.write_text("{}", encoding="utf-8")
+    managed_auth.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("AAWM_ANTIGRAVITY_AUTH_FILE", str(aawm_auth))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_auth))
+
+    resolved_path, source = loop._resolve_antigravity_sidecar_auth_file(
+        loop.DEFAULT_ANTIGRAVITY_AUTH_FILE
+    )
+
+    assert resolved_path == str(aawm_auth)
+    assert source == "AAWM_ANTIGRAVITY_AUTH_FILE"
+
+
+def test_resolve_antigravity_sidecar_auth_file_uses_managed_litellm_env(
+    tmp_path, monkeypatch
+) -> None:
+    managed_auth = tmp_path / "managed-antigravity-token"
+    legacy_auth = tmp_path / "legacy-antigravity-token"
+    managed_auth.write_text("{}", encoding="utf-8")
+    legacy_auth.write_text("{}", encoding="utf-8")
+
+    for env_name in (
+        "AAWM_ANTIGRAVITY_AUTH_FILE",
+        "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE",
+        "LITELLM_ANTIGRAVITY_AUTH_FILE",
+        "ANTIGRAVITY_OAUTH_TOKEN_FILE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_auth))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(legacy_auth))
+
+    resolved_path, source = loop._resolve_antigravity_sidecar_auth_file(
+        loop.DEFAULT_ANTIGRAVITY_AUTH_FILE
+    )
+
+    assert resolved_path == str(managed_auth)
+    assert source == "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE"
+
+
 def test_resolve_grok_billing_client_version_prefers_grok_client_version(monkeypatch) -> None:
     for env_name in (
         "AAWM_GROK_BILLING_CLIENT_VERSION",
