@@ -900,6 +900,9 @@ def _classify_passthrough_hidden_retry_failure(exc: Exception) -> Tuple[
             return None, "transport_dns_failure", "transport_dns_failure"
         return None, "upstream_connectivity_failure", "upstream_connectivity_failure"
 
+    if isinstance(exc, httpx.ReadError):
+        return None, "upstream_connectivity_failure", "upstream_connectivity_failure"
+
     status_code = _extract_exception_status_code(exc)
     if status_code is not None:
         return status_code, f"http_status_{status_code}", None
