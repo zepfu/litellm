@@ -2976,6 +2976,31 @@ so `aawm-provider-status-observations-prod` owns managed Antigravity refresh.
 
 ---
 
+### aawm.87 — Post-harness-autobump release candidate retag
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.87` on top of the
+post-`aawm.86` harness artifact autobump. The code behavior is the OpenRouter
+message-shape failover and Antigravity sidecar-auth path handling described in
+`aawm.86`, with harness metadata advanced to `h-v0.0.36`.
+
+**Why:** The `v1.82.3-aawm.86` tag was created from the prepared release commit,
+but the automatic harness artifact bump moved `main` to `6b01b6f121` before the
+guarded fork image publisher's current-main reachability check completed. Per
+the release runbook, the stale `.86` tag is preserved and this replacement tag
+is cut from current `main`.
+
+**Why not upstream:** This is AAWM release-line bookkeeping for fork image tags
+and independently published overlay artifact versions.
+
+**Validation status:** Release metadata-only retag on top of the tested
+`aawm.86` content and harness overlay autobump. Publish `v1.82.3-aawm.87`,
+then promote through the normal prod `:4000` process. D1-341 still requires the
+sibling infrastructure handoff
+`.analysis/handoff-litellm-d1-341-antigravity-prod-sidecar-refresh-20260619.md`
+before Antigravity sidecar-owned refresh can be marked complete.
+
+---
+
 ### aawm.82 — Post-callback-autobump release candidate retag
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.82` on top of the
