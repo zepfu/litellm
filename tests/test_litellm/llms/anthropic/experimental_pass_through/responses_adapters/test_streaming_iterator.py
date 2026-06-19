@@ -597,6 +597,134 @@ async def test_stream_wrapper_maps_codex_exec_command_deltas_back_to_bash():
 
 
 @pytest.mark.asyncio
+async def test_stream_wrapper_preserves_provider_usage_on_completed_event():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=21,
+            output_tokens=9,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.done",
+            item_id="msg_provider_usage",
+            output_index=0,
+            text="provider usage smoke",
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    request_body = {"model": "openai/gpt-oss-120b:free", "input": "probe"}
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="openai/gpt-oss-120b:free",
+        request_body=request_body,
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["usage"] == {"input_tokens": 21, "output_tokens": 9}
+    assert request_body["litellm_metadata"][
+        "anthropic_adapter_client_visible_usage_source"
+    ] == "provider_reported"
+    assert (
+        request_body["litellm_metadata"][
+            "anthropic_adapter_client_visible_usage_estimated"
+        ]
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_preserves_zero_provider_usage_on_completed_event():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.done",
+            item_id="msg_zero_provider_usage",
+            output_index=0,
+            text="provider zero usage smoke",
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    request_body = {"model": "openai/gpt-oss-120b:free", "input": "probe"}
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="openai/gpt-oss-120b:free",
+        request_body=request_body,
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert request_body["litellm_metadata"][
+        "anthropic_adapter_client_visible_usage_source"
+    ] == "provider_reported"
+    assert (
+        request_body["litellm_metadata"][
+            "anthropic_adapter_client_visible_usage_estimated"
+        ]
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_estimates_usage_on_completed_event_when_provider_usage_missing():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=None,
+        output=[],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.done",
+            item_id="msg_missing_usage",
+            output_index=0,
+            text="estimated usage smoke",
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    request_body = {"model": "openai/gpt-oss-120b:free", "input": "probe"}
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="openai/gpt-oss-120b:free",
+        request_body=request_body,
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["usage"]["input_tokens"] >= 1
+    assert message_delta["usage"]["output_tokens"] >= 1
+    assert request_body["litellm_metadata"][
+        "anthropic_adapter_client_visible_usage_source"
+    ] == "estimated"
+    assert (
+        request_body["litellm_metadata"][
+            "anthropic_adapter_client_visible_usage_estimated"
+        ]
+        is True
+    )
+
+
+@pytest.mark.asyncio
 async def test_stream_wrapper_synthesizes_stop_and_usage_when_completed_is_missing():
     events = [
         SimpleNamespace(type="response.created"),
