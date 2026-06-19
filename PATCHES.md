@@ -2976,6 +2976,39 @@ so `aawm-provider-status-observations-prod` owns managed Antigravity refresh.
 
 ---
 
+### aawm.88 — Antigravity managed-token seed fallback bootstrap
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.88`. The
+provider-status sidecar Antigravity OAuth refresh helper can now use a
+read-only canonical Antigravity CLI seed token as the AGY CLI fallback source
+while writing the refreshed result only to the managed auth file that LiteLLM
+reads. If the managed auth file is missing but a valid seed token exists, the
+sidecar bootstraps the managed file with `refresh_method=seed_copy` instead of
+failing before refresh can run.
+
+**Why:** The initial `aawm.87` prod promotion proved the serving container name
+and image were healthy, but the provider-status sidecar still logged
+`Antigravity OAuth direct refresh failed and AGY CLI silent refresh is
+unavailable for this auth-file path` for the managed path
+`/root/.litellm/antigravity/antigravity-oauth-token`. During container
+recreation it also briefly hit a missing managed token file. The AGY CLI
+fallback only knows how to operate against the canonical
+`~/.gemini/antigravity-cli/antigravity-oauth-token` layout, so the sidecar needs
+an explicit seed path and a temporary staged CLI home while preserving the
+managed-writer ownership split.
+
+**Why not upstream:** This is AAWM-specific Antigravity Code Assist OAuth
+ownership, sidecar credential refresh behavior, and prod infrastructure policy.
+
+**Validation status:** Focused tests cover direct Antigravity refresh,
+canonical AGY fallback, managed-path AGY fallback from a read-only seed, missing
+managed-file seed bootstrap, auth-observation persistence, and sidecar
+auth-file resolution. The prod runbook now requires
+`AAWM_ANTIGRAVITY_SEED_AUTH_FILE` alongside the managed write path before
+promotion.
+
+---
+
 ### aawm.87 — Post-harness-autobump release candidate retag
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.87` on top of the

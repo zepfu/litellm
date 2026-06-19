@@ -79,6 +79,7 @@ def refresh_antigravity_oauth_token_file(
     buffer_seconds: Optional[int] = None,
     force: bool = False,
     lock_file: str | Path | None = None,
+    seed_auth_file: str | Path | None = None,
     token_endpoint: Optional[str] = None,
     client_id: Optional[str] = None,
     client_secret: Optional[str] = None,
@@ -89,6 +90,10 @@ def refresh_antigravity_oauth_token_file(
     """Refresh an Antigravity OAuth token file when near expiry or forced."""
 
     resolved_auth_file = Path(auth_file).expanduser()
+    resolved_seed_auth_file = _resolve_seed_auth_file(
+        auth_file=resolved_auth_file,
+        seed_auth_file=seed_auth_file,
+    )
     resolved_lock_file = (
         Path(lock_file).expanduser()
         if lock_file is not None
@@ -98,12 +103,29 @@ def refresh_antigravity_oauth_token_file(
 
     with _credential_file_lock(resolved_lock_file):
         try:
-            token_data = _read_token_data(resolved_auth_file)
+            loaded_from_seed = False
+            try:
+                token_data = _read_token_data(resolved_auth_file)
+            except _TokenFileNotFound:
+                if resolved_seed_auth_file is None:
+                    raise
+                token_data = _read_token_data(resolved_seed_auth_file)
+                loaded_from_seed = True
             current_expires_at = _format_expires_at(_get_token_expiry(token_data))
             if not force and _token_is_valid(
                 token_data,
                 buffer_seconds=resolved_buffer_seconds,
             ):
+                if loaded_from_seed:
+                    _write_token_data(resolved_auth_file, token_data)
+                    return AntigravityRefreshSummary(
+                        attempted=True,
+                        refreshed=True,
+                        skipped=False,
+                        auth_file=str(resolved_auth_file),
+                        expires_at=current_expires_at,
+                        refresh_method="seed_copy",
+                    ).as_dict()
                 return AntigravityRefreshSummary(
                     attempted=False,
                     refreshed=False,
@@ -135,10 +157,12 @@ def refresh_antigravity_oauth_token_file(
             except _DirectRefreshNeedsCliFallback:
                 refreshed_token_data = _refresh_token_data_via_cli(
                     resolved_auth_file,
+                    seed_auth_file=resolved_seed_auth_file,
                     original_token_data=token_data,
                     cli_path=cli_path,
                     timeout_seconds=cli_timeout_seconds,
                 )
+                _write_token_data(resolved_auth_file, refreshed_token_data)
                 return AntigravityRefreshSummary(
                     attempted=True,
                     refreshed=True,
@@ -158,6 +182,32 @@ def refresh_antigravity_oauth_token_file(
                 error_class=exc.__class__.__name__,
                 error_message=_sanitize_error_message(str(exc)),
             ).as_dict()
+
+
+def _resolve_seed_auth_file(
+    *,
+    auth_file: Path,
+    seed_auth_file: str | Path | None,
+) -> Optional[Path]:
+    if seed_auth_file is not None:
+        resolved_seed_auth_file = Path(seed_auth_file).expanduser()
+        if resolved_seed_auth_file == auth_file:
+            return None
+        return resolved_seed_auth_file
+
+    for env_name in (
+        "AAWM_ANTIGRAVITY_SEED_AUTH_FILE",
+        "LITELLM_ANTIGRAVITY_SEED_AUTH_FILE",
+        "ANTIGRAVITY_SEED_AUTH_FILE",
+    ):
+        env_value = _clean_value(os.getenv(env_name))
+        if env_value is None:
+            continue
+        resolved_seed_auth_file = Path(env_value).expanduser()
+        if resolved_seed_auth_file == auth_file:
+            return None
+        return resolved_seed_auth_file
+    return None
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
@@ -199,7 +249,9 @@ def _read_token_data(auth_path: Path) -> Dict[str, Any]:
         with auth_path.open("r", encoding="utf-8") as handle:
             token_data = json.load(handle)
     except FileNotFoundError as exc:
-        raise ValueError(f"Antigravity OAuth token file not found at {auth_path}.") from exc
+        raise _TokenFileNotFound(
+            f"Antigravity OAuth token file not found at {auth_path}."
+        ) from exc
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Antigravity OAuth token file at {auth_path} is not valid JSON."
@@ -340,6 +392,10 @@ class _DirectRefreshNeedsCliFallback(ValueError):
     pass
 
 
+class _TokenFileNotFound(ValueError):
+    pass
+
+
 class _RefreshHttpError(ValueError):
     def __init__(self, message: str, *, oauth_error: Optional[str] = None) -> None:
         super().__init__(message)
@@ -424,17 +480,35 @@ def _apply_refresh_payload(
 def _refresh_token_data_via_cli(
     auth_path: Path,
     *,
+    seed_auth_file: Optional[Path],
     original_token_data: Mapping[str, Any],
     cli_path: Optional[str | Path],
     timeout_seconds: float,
 ) -> Dict[str, Any]:
-    refresh_home = _get_cli_refresh_home(auth_path)
+    cli_auth_path = seed_auth_file or auth_path
+    refresh_home = _get_cli_refresh_home(cli_auth_path)
     cli_binary = _first_cli_binary(cli_path)
     if refresh_home is None or cli_binary is None:
         raise ValueError(
             "Antigravity OAuth direct refresh failed and AGY CLI silent refresh "
             "is unavailable for this auth-file path."
         )
+
+    staged_home: Optional[Path] = None
+    staged_auth_path = cli_auth_path
+    if seed_auth_file is not None and seed_auth_file != auth_path:
+        staged_home = Path(os.getenv("TMPDIR") or "/tmp") / (
+            f"litellm-antigravity-cli-home-{os.getpid()}-{time.monotonic_ns()}"
+        )
+        staged_auth_path = (
+            staged_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        )
+        staged_auth_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_auth_path.write_text(
+            seed_auth_file.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        refresh_home = staged_home
 
     log_path = Path(os.getenv("TMPDIR") or "/tmp") / (
         f"litellm-antigravity-refresh-{os.getpid()}-{time.monotonic_ns()}.log"
@@ -468,15 +542,26 @@ def _refresh_token_data_via_cli(
             "before using Antigravity passthrough."
         )
 
-    refreshed_token_data = _read_token_data(auth_path)
-    if not _token_is_valid(refreshed_token_data, buffer_seconds=60):
-        if (
-            refreshed_token_data == original_token_data
-            and _token_is_unexpired(refreshed_token_data)
-        ):
-            return refreshed_token_data
-        raise ValueError("AGY CLI silent auth refresh did not produce a valid token.")
-    return refreshed_token_data
+    try:
+        refreshed_token_data = _read_token_data(staged_auth_path)
+        if not _token_is_valid(refreshed_token_data, buffer_seconds=60):
+            if (
+                refreshed_token_data == original_token_data
+                and _token_is_unexpired(refreshed_token_data)
+            ):
+                return refreshed_token_data
+            raise ValueError(
+                "AGY CLI silent auth refresh did not produce a valid token."
+            )
+        return refreshed_token_data
+    finally:
+        if staged_home is not None:
+            try:
+                import shutil
+
+                shutil.rmtree(staged_home)
+            except OSError:
+                pass
 
 
 def _get_cli_refresh_home(auth_path: Path) -> Optional[Path]:
