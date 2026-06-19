@@ -230,6 +230,17 @@ compose the sidecar runs with
 `AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/.grok/auth.json`, and a one-hour refresh
 interval. The dev LiteLLM container mounts the same host directory read-only.
 
+Each Grok OIDC refresh attempt writes sanitized provider-auth telemetry when
+the sidecar runs with DB writes enabled. `provider_auth_observations` is the
+append-only event table, and `provider_auth_current` is the latest-state view
+keyed by environment, provider, auth family, credential scope, and auth-file
+identity hash. Rows include refresh status, attempted/refreshed/skipped flags,
+credential expiry, last successful validation time, source sidecar task, and
+redacted failure class/message. They must never include access tokens, refresh
+tokens, raw auth-file contents, or the raw auth-file path. Dashboard Provider
+Health should use `provider_auth_current` for current expiry and stale/failed
+auth display, then drill into `provider_auth_observations` for history.
+
 Keep the Grok CLI/OIDC credential separate from the managed `oa_xai/*`
 `oauth-auth.json` file. Managed `oa_xai/*` routes still use LiteLLM-owned OAuth
 refresh/write behavior, while native Grok routes rely on the sidecar-maintained

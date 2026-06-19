@@ -920,6 +920,103 @@ def _redacted_summary_field(value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_L
     return PROVIDER_FAILURE_SECRET_RE.sub("REDACTED", text)
 
 
+def _parse_sidecar_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _provider_auth_status_from_event(event: Mapping[str, Any]) -> str:
+    if event.get("error_class"):
+        return "failed"
+    if event.get("refreshed"):
+        return "refreshed"
+    if event.get("skipped"):
+        return "skipped"
+    if event.get("attempted"):
+        return "attempted"
+    return "not_applicable"
+
+
+def _build_grok_oidc_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> Dict[str, Any]:
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
+        timezone.utc
+    )
+    expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
+    status = _provider_auth_status_from_event(event)
+    successful_validation = status in {"refreshed", "skipped"} and not event.get(
+        "error_class"
+    )
+    auth_file = event.get("auth_file") or config.grok_oidc_auth_file
+    metadata = {
+        "auth_file_hash_algorithm": "sha256",
+        "auth_file_source": config.grok_oidc_auth_file_source,
+        "refresh_buffer_seconds": config.grok_oidc_refresh_buffer_seconds,
+        "refresh_interval_seconds": config.grok_oidc_refresh_interval_seconds,
+        "force_refresh": config.grok_oidc_force_refresh,
+        "raw_status_flags": {
+            "attempted": bool(event.get("attempted")),
+            "refreshed": bool(event.get("refreshed")),
+            "skipped": bool(event.get("skipped")),
+        },
+    }
+    return {
+        "observed_at": observed_at,
+        "environment": event.get("environment") or config.environment,
+        "provider": "xai",
+        "auth_family": "grok_oidc",
+        "credential_scope": _redacted_summary_field(
+            event.get("scope"),
+            limit=512,
+        ),
+        "auth_file_hash": probes.auth_file_identity_hash(auth_file),
+        "status": status,
+        "attempted": bool(event.get("attempted")),
+        "refreshed": bool(event.get("refreshed")),
+        "skipped": bool(event.get("skipped")),
+        "expires_at": expires_at,
+        "last_success_at": observed_at if successful_validation else None,
+        "source_task": "grok_oidc_refresh",
+        "error_class": _redacted_summary_field(event.get("error_class")),
+        "error_message": _redacted_failure_message(event.get("error_message")),
+        "metadata": metadata,
+    }
+
+
+def _persist_grok_oidc_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+
+    observation = _build_grok_oidc_auth_observation(config, event)
+    dsn = _resolve_dsn(config)
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            dsn,
+            [observation],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
+
+
 def _provider_failure_summaries(rows: Sequence[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], int]:
     failed_rows = [row for row in rows if not row.get("success")]
     summaries: list[Dict[str, Any]] = []
@@ -1663,12 +1760,24 @@ def _run_grok_oidc_refresh_task(
             "error_message": _redacted_failure_message(str(exc)),
         }
 
-    return {
+    event = {
         "event": "grok_oidc_refresh",
         "observed_at": _utc_timestamp(),
         "environment": config.environment,
         **summary,
     }
+    (
+        persisted,
+        inserted_count,
+        skip_error_class,
+        skip_reason,
+    ) = _persist_grok_oidc_auth_observation(config, event)
+    event["auth_observation_status"] = _provider_auth_status_from_event(event)
+    event["auth_observation_persisted"] = persisted
+    event["auth_observation_inserted_count"] = inserted_count
+    event["auth_observation_skip_error_class"] = skip_error_class
+    event["auth_observation_skip_reason"] = skip_reason
+    return event
 
 
 def _run_grok_oidc_metadata_repair_task(
