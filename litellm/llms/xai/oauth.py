@@ -260,18 +260,18 @@ async def get_xai_oauth_access_token() -> str:
     if not credential_path:
         raise ValueError(
             "xAI OAuth-managed models require LITELLM_XAI_OAUTH_AUTH_FILE to "
-            "point at a LiteLLM-owned xAI OAuth credential file. Reseed or "
-            "relogin the managed credential before calling oa_xai/*."
+            "point at the sidecar-maintained xAI OAuth credential file. Run "
+            "the provider-status sidecar xAI OAuth refresh or reseed/relogin "
+            "the managed credential before calling oa_xai/*."
         )
 
     scope = get_secret_str("LITELLM_XAI_OAUTH_SCOPE") or _DEFAULT_XAI_OAUTH_SCOPE
-    lock_key = f"{credential_path}:{scope}"
+    lock_key = f"xai-oauth-read:{credential_path}:{scope}"
     lock = _refresh_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
-        return await _get_xai_oauth_access_token_locked(
+        return _get_xai_oauth_access_token_read_only(
             credential_path=Path(credential_path),
             scope=scope,
-            is_grok_native_oauth=False,
         )
 
 
@@ -303,6 +303,23 @@ def _grok_native_oauth_refresh_required_error(*, missing_token: bool) -> ValueEr
             "Grok OIDC credential is missing, expired, or near expiry. "
             "Run the health/provider-status sidecar Grok OIDC refresh or "
             "relogin with the Grok CLI before Grok native traffic can proceed."
+        )
+    return ValueError(message)
+
+
+def _xai_oauth_refresh_required_error(*, missing_token: bool) -> ValueError:
+    if missing_token:
+        message = (
+            "Managed xAI OAuth credential does not contain an access token. "
+            "Run the provider-status sidecar xAI OAuth refresh or reseed/relogin "
+            "the managed credential before calling oa_xai/*."
+        )
+    else:
+        message = (
+            "Managed xAI OAuth credential is missing, expired, or near expiry. "
+            "Run the provider-status sidecar xAI OAuth refresh before calling "
+            "oa_xai/*. Reseed or relogin the managed credential if the "
+            "sidecar cannot refresh it."
         )
     return ValueError(message)
 
@@ -340,6 +357,21 @@ def _get_grok_native_oauth_access_token_read_only(
     if not token:
         raise _grok_native_oauth_refresh_required_error(missing_token=True)
     raise _grok_native_oauth_refresh_required_error(missing_token=False)
+
+
+def _get_xai_oauth_access_token_read_only(
+    *,
+    credential_path: Path,
+    scope: str,
+) -> str:
+    raw_payload = _read_credential_payload(credential_path)
+    credential = _select_credential_record(raw_payload, scope)
+    token = _credential_access_token(credential)
+    if token and not _credential_needs_refresh(credential):
+        return token
+    if not token:
+        raise _xai_oauth_refresh_required_error(missing_token=True)
+    raise _xai_oauth_refresh_required_error(missing_token=False)
 
 
 def default_litellm_xai_oauth_auth_path() -> Path:
@@ -652,8 +684,9 @@ def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
             payload = json.load(handle)
     except FileNotFoundError as exc:
         raise ValueError(
-            f"xAI OAuth credential file not found at {credential_path}. Reseed "
-            "or relogin the LiteLLM-managed xAI OAuth credential."
+            f"xAI OAuth credential file not found at {credential_path}. Run the "
+            "provider-status sidecar xAI OAuth refresh or reseed/relogin the "
+            "managed xAI OAuth credential."
         ) from exc
     except json.JSONDecodeError as exc:
         raise ValueError(

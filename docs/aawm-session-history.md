@@ -242,11 +242,36 @@ Health should use `provider_auth_current` for current expiry and stale/failed
 auth display, then drill into `provider_auth_observations` for history.
 
 Keep the Grok CLI/OIDC credential separate from the managed `oa_xai/*`
-`oauth-auth.json` file. Managed `oa_xai/*` routes still use LiteLLM-owned OAuth
-refresh/write behavior, while native Grok routes rely on the sidecar-maintained
-CLI credential. The explicit Grok billing poll should run from the same
+`oauth-auth.json` file. The explicit Grok billing poll should run from the same
 sidecar context so quota snapshots use the credential that the sidecar keeps
 fresh, not a second LiteLLM-managed copy.
+
+## Managed xAI OAuth Credentials
+
+Managed `oa_xai/*` routes read `LITELLM_XAI_OAUTH_AUTH_FILE`, normally
+`/home/zepfu/.litellm/xai/oauth-auth.json`. LiteLLM is a read-only consumer of
+that file. During request handling it selects a valid scoped credential and
+fails with clear sidecar-refresh wording when the credential is missing, lacks
+an access token, or is expired/near expiry. LiteLLM must not refresh or write
+this managed credential during model requests.
+
+The provider-status sidecar is the scheduled managed xAI OAuth writer. It
+mounts `/home/zepfu/.litellm/xai` writable, locks the configured auth file,
+refreshes using the managed credential's refresh token and OIDC client id, and
+writes updated access token, refresh token, ID token, token type, and expiry
+fields atomically. The dev LiteLLM container mounts the same host directory
+read-only. In dev compose the sidecar runs with
+`AAWM_XAI_OAUTH_REFRESH_ENABLED=1`,
+`AAWM_XAI_OAUTH_AUTH_FILE=/home/zepfu/.litellm/xai/oauth-auth.json`, and a
+one-hour refresh interval.
+
+Each managed xAI OAuth refresh attempt writes sanitized provider-auth telemetry
+into `provider_auth_observations` and `provider_auth_current`. Rows use provider
+`xai`, auth family `xai_oauth`, source task `xai_oauth_refresh`, the credential
+scope, the auth-file identity hash, attempted/refreshed/skipped flags, expiry,
+last successful validation time, and redacted failure class/message. Rows must
+never include access tokens, refresh tokens, raw auth-file contents, or the raw
+auth-file path.
 
 ## Antigravity OAuth Credentials
 
