@@ -621,6 +621,16 @@ with status, token, cost, and error fields when building reports.
 
 ## OpenCode Zen Codex Tool-Adjacency Sanitization
 
+OpenCode Zen authentication is API-key based for this LiteLLM integration.
+LiteLLM loads an explicit `LITELLM_OPENCODE_API_KEY` / `OPENCODE_API_KEY`, or a
+provider-scoped `type: "api"` key from `LITELLM_OPENCODE_AUTH_FILE` /
+`~/.local/share/opencode/auth.json`. Non-API auth types are rejected. Because
+there is no refreshable OpenCode credential in this contract, provider-status
+sidecar refresh, validation, and auth-expiry persistence do not apply to
+OpenCode. Dev compose therefore mounts `/home/zepfu/.local/share/opencode`
+read-only into LiteLLM and should not add an OpenCode sidecar writer unless a
+new refreshable credential contract is introduced.
+
 Codex/OpenAI Responses traffic that is adapted to OpenCode Zen chat completions
 must satisfy OpenAI chat tool-call ordering before egress. If a Responses input
 history contains an assistant `function_call` / chat `tool_calls` item without
