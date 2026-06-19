@@ -16,6 +16,7 @@ from scripts import antigravity_oauth_refresh
 from scripts import codex_oauth_refresh
 from scripts import record_provider_status_observations as probes
 from scripts import run_provider_status_observations_loop as loop
+from scripts import xai_oauth_refresh
 
 
 def _build_test_jwt(payload: dict) -> str:
@@ -754,6 +755,33 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     assert (
         "COPY scripts/codex_oauth_refresh.py "
         "/app/scripts/codex_oauth_refresh.py"
+    ) in dockerfile_text
+
+
+def test_provider_status_compose_wires_managed_xai_oauth_sidecar_refresh() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    compose_text = (repo_root / "docker-compose.dev.yml").read_text()
+    dockerfile_text = (
+        repo_root / "docker/Dockerfile.provider_status_observations"
+    ).read_text()
+
+    assert "- /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro" in compose_text
+    assert "- /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai" in compose_text
+    assert (
+        "AAWM_XAI_OAUTH_REFRESH_ENABLED=${AAWM_XAI_OAUTH_REFRESH_ENABLED:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_XAI_OAUTH_AUTH_FILE=${AAWM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}"
+        in compose_text
+    )
+    assert (
+        "AAWM_XAI_OAUTH_FORCE_REFRESH=${AAWM_XAI_OAUTH_FORCE_REFRESH:-1}"
+        in compose_text
+    )
+    assert (
+        "COPY scripts/xai_oauth_refresh.py "
+        "/app/scripts/xai_oauth_refresh.py"
     ) in dockerfile_text
 
 
@@ -2466,6 +2494,106 @@ def test_refresh_codex_oauth_auth_file_reports_missing_refresh_token(
     assert "refresh_token" not in summary["error_message"]
 
 
+def test_refresh_xai_oauth_auth_file_writes_direct_response(
+    tmp_path, monkeypatch
+) -> None:
+    auth_path = tmp_path / "oauth-auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "access_token": "expired-xai-token",
+                "key": "expired-xai-token",
+                "refresh_token": "xai-refresh-token",
+                "expires_at": (
+                    datetime.now(timezone.utc) - timedelta(minutes=5)
+                ).isoformat(),
+                "oidc_client_id": "xai-oauth-client-id",
+                "token_endpoint": "https://auth.example/token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_path.chmod(0o600)
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "access_token": "refreshed-xai-token",
+                    "refresh_token": "refreshed-xai-refresh-token",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 12.5
+        assert request.full_url == "https://auth.example/token"
+        assert request.data is not None
+        form = request.data.decode("utf-8")
+        assert "grant_type=refresh_token" in form
+        assert "refresh_token=xai-refresh-token" in form
+        assert "client_id=xai-oauth-client-id" in form
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        xai_oauth_refresh.urllib_request,
+        "urlopen",
+        fake_urlopen,
+    )
+
+    summary = xai_oauth_refresh.refresh_xai_oauth_auth_file(
+        auth_path,
+        force=True,
+        lock_file=tmp_path / "xai.lock",
+        http_timeout_seconds=12.5,
+    )
+
+    persisted = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert summary["attempted"] is True
+    assert summary["refreshed"] is True
+    assert persisted["access_token"] == "refreshed-xai-token"
+    assert persisted["key"] == "refreshed-xai-token"
+    assert persisted["refresh_token"] == "refreshed-xai-refresh-token"
+    assert persisted["token_type"] == "Bearer"
+    assert isinstance(persisted["expires_at"], str)
+    assert auth_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_refresh_xai_oauth_auth_file_reports_missing_refresh_token(tmp_path) -> None:
+    auth_path = tmp_path / "oauth-auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "access_token": "expired-xai-token",
+                "expires_at": (
+                    datetime.now(timezone.utc) - timedelta(minutes=5)
+                ).isoformat(),
+                "oidc_client_id": "xai-oauth-client-id",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = xai_oauth_refresh.refresh_xai_oauth_auth_file(
+        auth_path,
+        force=True,
+        lock_file=tmp_path / "xai.lock",
+    )
+
+    assert summary["attempted"] is True
+    assert summary["refreshed"] is False
+    assert summary["skipped"] is False
+    assert summary["error_class"] == "ValueError"
+    assert "refresh_token" not in summary["error_message"]
+
+
 def _grok_oidc_auth_persist_config(**overrides):
     from dataclasses import replace
 
@@ -2785,6 +2913,141 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
     assert refresh_events[0]["auth_observation_inserted_count"] == 1
     assert captured["config"] is config
     assert captured["event"]["account_id"] == "acct_refreshed"
+
+
+def _xai_oauth_auth_persist_config(**overrides):
+    from dataclasses import replace
+
+    config = _grok_oidc_auth_persist_config(
+        grok_oidc_refresh_enabled=False,
+        xai_oauth_refresh_enabled=True,
+        xai_oauth_auth_file="/home/zepfu/.litellm/xai/oauth-auth.json",
+        xai_oauth_auth_file_source="default",
+        xai_oauth_lock_file="/home/zepfu/.litellm/xai/oauth-auth.json.lock",
+        xai_oauth_scope=xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE,
+        xai_oauth_refresh_interval_seconds=3600.0,
+        xai_oauth_refresh_buffer_seconds=300,
+        xai_oauth_force_refresh=False,
+        xai_oauth_http_timeout_seconds=30.0,
+    )
+    if overrides:
+        config = replace(config, **overrides)
+    return config
+
+
+def _xai_oauth_refresh_sidecar_event(**overrides) -> dict:
+    event = {
+        "event": "xai_oauth_refresh",
+        "observed_at": "2026-06-19T12:00:00Z",
+        "environment": "dev",
+        "attempted": True,
+        "refreshed": True,
+        "skipped": False,
+        "auth_file": "/home/zepfu/.litellm/xai/oauth-auth.json",
+        "scope": xai_oauth_refresh.DEFAULT_XAI_OAUTH_SCOPE,
+        "expires_at": "2026-06-19T13:00:00Z",
+        "error_class": None,
+        "error_message": None,
+    }
+    event.update(overrides)
+    return event
+
+
+def test_build_xai_oauth_auth_observation_maps_successful_refresh() -> None:
+    config = _xai_oauth_auth_persist_config()
+    event = _xai_oauth_refresh_sidecar_event()
+
+    observation = loop._build_xai_oauth_auth_observation(config, event)
+
+    assert observation["observed_at"] == datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
+    assert observation["environment"] == "dev"
+    assert observation["provider"] == "xai"
+    assert observation["auth_family"] == "xai_oauth"
+    assert observation["credential_scope"] == event["scope"]
+    assert observation["auth_file_hash"] == hashlib.sha256(
+        event["auth_file"].encode("utf-8")
+    ).hexdigest()
+    assert observation["status"] == "refreshed"
+    assert observation["attempted"] is True
+    assert observation["refreshed"] is True
+    assert observation["skipped"] is False
+    assert observation["expires_at"] == datetime(2026, 6, 19, 13, 0, tzinfo=timezone.utc)
+    assert observation["last_success_at"] == observation["observed_at"]
+    assert observation["source_task"] == "xai_oauth_refresh"
+    assert observation["metadata"]["auth_file_source"] == "default"
+    observation_json = json.dumps(observation, default=str)
+    assert "refresh_token" not in observation_json
+    assert "access_token" not in observation_json
+    assert "/home/zepfu/.litellm/xai/oauth-auth.json" not in observation_json
+
+
+def test_build_xai_oauth_auth_observation_sanitizes_refresh_failure() -> None:
+    config = _xai_oauth_auth_persist_config()
+    event = _xai_oauth_refresh_sidecar_event(
+        refreshed=False,
+        skipped=False,
+        expires_at=None,
+        error_class="ValueError",
+        error_message=(
+            "token refresh failed with refresh_token=super-secret "
+            "and Authorization=Bearer leaked-token"
+        ),
+    )
+
+    observation = loop._build_xai_oauth_auth_observation(config, event)
+
+    assert observation["status"] == "failed"
+    assert observation["last_success_at"] is None
+    assert observation["error_class"] == "ValueError"
+    assert "REDACTED" in observation["error_message"]
+    assert "super-secret" not in json.dumps(observation, default=str)
+    assert "leaked-token" not in json.dumps(observation, default=str)
+
+
+def test_run_due_sidecar_tasks_persists_xai_oauth_auth_observation_when_apply_enabled(
+    monkeypatch,
+) -> None:
+    config = _xai_oauth_auth_persist_config(
+        xai_oauth_force_refresh=True,
+        xai_oauth_refresh_interval_seconds=3600.0,
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        loop.xai_oauth_refresh,
+        "refresh_xai_oauth_auth_file",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "auth_file": config.xai_oauth_auth_file,
+            "scope": config.xai_oauth_scope,
+            "expires_at": "2026-06-19T13:00:00Z",
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+
+    def fake_persist(persist_config, event):
+        captured["config"] = persist_config
+        captured["event"] = dict(event)
+        return True, 1, None, None
+
+    monkeypatch.setattr(loop, "_persist_xai_oauth_auth_observation", fake_persist)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    refresh_events = [event for event in events if event.get("event") == "xai_oauth_refresh"]
+    assert len(refresh_events) == 1
+    assert refresh_events[0]["auth_observation_status"] == "refreshed"
+    assert refresh_events[0]["auth_observation_persisted"] is True
+    assert refresh_events[0]["auth_observation_inserted_count"] == 1
+    assert captured["config"] is config
+    assert captured["event"]["scope"] == config.xai_oauth_scope
 
 
 def _antigravity_auth_persist_config(**overrides):
