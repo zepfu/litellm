@@ -2315,6 +2315,81 @@ def _extract_auto_agent_alias_session_id(
     return None
 
 
+def _extract_auto_agent_alias_metadata_value(
+    request_body: dict[str, Any],
+    *keys: str,
+) -> Optional[str]:
+    metadata = request_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        return None
+    for key in keys:
+        value = _clean_codex_auth_value(metadata.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _emit_auto_agent_alias_route_event(
+    event: dict[str, Any],
+    *,
+    level: str = "info",
+) -> None:
+    log_payload = {"event": "aawm_alias_route", **event}
+    message = "AAWM_ALIAS_ROUTE: {}".format(
+        json.dumps(log_payload, sort_keys=True, default=str, separators=(",", ":"))
+    )
+    if level == "warning":
+        verbose_proxy_logger.warning(message)
+    else:
+        verbose_proxy_logger.info(message)
+
+
+def _emit_auto_agent_alias_no_candidate_event(
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    request_body: dict[str, Any],
+    exc: HTTPException,
+) -> None:
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    candidates = detail.get("candidates") if isinstance(detail, dict) else None
+    _emit_auto_agent_alias_route_event(
+        {
+            "observed_at": _format_auto_agent_alias_timestamp(
+                datetime.now(timezone.utc)
+            ),
+            "alias_family": alias_family,
+            "alias_model": alias_model,
+            "session_id": _extract_auto_agent_alias_session_id(
+                request, request_body
+            ),
+            "agent_id": _extract_auto_agent_alias_metadata_value(
+                request_body,
+                "agent_id",
+                "aawm_agent_id",
+                "codex_agent_id",
+                "claude_agent_id",
+            ),
+            "repository": _extract_auto_agent_alias_metadata_value(
+                request_body,
+                "repository",
+                "repo",
+                "repo_name",
+                "repository_name",
+            ),
+            "event_type": "no_candidate_available",
+            "candidate_status": "all_candidates_unavailable",
+            "failure_phase": "candidate_selection",
+            "attempted_provider_call": False,
+            "error_status_code": exc.status_code,
+            "candidate_count": len(candidates) if isinstance(candidates, list) else 0,
+            "candidates": candidates if isinstance(candidates, list) else None,
+        },
+        level="warning",
+    )
+
+
 def _build_auto_agent_alias_audit_event(
     *,
     alias_family: str,
@@ -2335,7 +2410,12 @@ def _build_auto_agent_alias_audit_event(
     cooldown_scope: Optional[str] = None,
     failure_class: Optional[str] = None,
     error_status_code: Optional[Any] = None,
+    error_type: Optional[str] = None,
+    error_code: Optional[Any] = None,
     error_tokens: Optional[Any] = None,
+    retry_after_seconds: Optional[Any] = None,
+    failure_phase: Optional[str] = None,
+    attempted_provider_call: Optional[bool] = None,
     redispatch_required: bool = False,
 ) -> dict[str, Any]:
     normalized_cooldown_seconds = _auto_agent_alias_float(cooldown_seconds)
@@ -2348,6 +2428,20 @@ def _build_auto_agent_alias_audit_event(
         "alias_family": alias_family,
         "alias_model": alias_model,
         "session_id": _extract_auto_agent_alias_session_id(request, request_body),
+        "agent_id": _extract_auto_agent_alias_metadata_value(
+            request_body,
+            "agent_id",
+            "aawm_agent_id",
+            "codex_agent_id",
+            "claude_agent_id",
+        ),
+        "repository": _extract_auto_agent_alias_metadata_value(
+            request_body,
+            "repository",
+            "repo",
+            "repo_name",
+            "repository_name",
+        ),
         "session_key": selection.get("session_key"),
         "provider": candidate.get("provider"),
         "model": candidate.get("model"),
@@ -2360,6 +2454,11 @@ def _build_auto_agent_alias_audit_event(
         "candidate_status": candidate_status,
         "failure_class": failure_class,
         "error_status_code": _auto_agent_alias_int(error_status_code),
+        "error_type": error_type,
+        "error_code": str(error_code) if error_code is not None else None,
+        "retry_after_seconds": _auto_agent_alias_float(retry_after_seconds),
+        "failure_phase": failure_phase,
+        "attempted_provider_call": attempted_provider_call,
         "cooldown_scope": cooldown_scope,
         "cooldown_seconds": (
             round(normalized_cooldown_seconds, 3)
@@ -2462,7 +2561,12 @@ def _build_auto_agent_alias_audit_events(
                 cooldown_scope=attempt.get("cooldown_scope"),
                 failure_class=failure_class,
                 error_status_code=attempt.get("error_status_code"),
+                error_type=attempt.get("error_type"),
+                error_code=attempt.get("error_code"),
                 error_tokens=attempt.get("error_tokens"),
+                retry_after_seconds=attempt.get("retry_after_seconds"),
+                failure_phase=attempt.get("failure_phase"),
+                attempted_provider_call=attempt.get("attempted_provider_call"),
                 redispatch_required=redispatch_required,
             )
         )
@@ -3149,6 +3253,47 @@ def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
     return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
 
 
+def _iter_codex_auto_agent_error_blocks(exc: Any) -> list[dict[str, Any]]:
+    payloads: list[Any] = []
+    detail = getattr(exc, "detail", None)
+    if detail is not None:
+        payloads.append(detail)
+    payloads.extend(_extract_google_adapter_error_payloads(exc))
+
+    error_blocks: list[dict[str, Any]] = []
+    for parsed in payloads:
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                error_blocks.append(error)
+        elif isinstance(parsed, list):
+            error_blocks.extend(
+                item["error"]
+                for item in parsed
+                if isinstance(item, dict) and isinstance(item.get("error"), dict)
+            )
+    return error_blocks
+
+
+def _extract_codex_auto_agent_error_type_and_code(
+    exc: Any,
+) -> tuple[Optional[str], Optional[Any]]:
+    fallback_error_type = _clean_codex_auth_value(getattr(exc, "type", None))
+    fallback_error_code: Optional[Any] = getattr(exc, "code", None)
+    error_type: Optional[str] = None
+    error_code: Optional[Any] = None
+    for error in _iter_codex_auto_agent_error_blocks(exc):
+        if error_type is None:
+            error_type = _clean_codex_auth_value(
+                error.get("type") or error.get("status")
+            )
+        if error_code is None:
+            error_code = error.get("code") or error.get("status")
+        if error_type is not None and error_code is not None:
+            return error_type, error_code
+    return error_type or fallback_error_type, error_code or fallback_error_code
+
+
 async def _set_codex_auto_agent_candidate_cooldowns(
     *,
     candidate: dict[str, Any],
@@ -3174,18 +3319,120 @@ def _update_codex_auto_agent_retryable_attempt_record(
 ) -> set[str]:
     error_tokens = _extract_codex_auto_agent_error_tokens(exc)
     error_status_code = _extract_google_adapter_exception_status_code(exc)
+    error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
+    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
     update: dict[str, Any] = {
         "status": "cooldown_set",
         "cooldown_seconds": round(float(cooldown_seconds), 3),
         "error_class": error_class,
         "error_tokens": sorted(error_tokens),
+        "failure_phase": "provider_attempt",
+        "attempted_provider_call": True,
     }
     if cooldown_scope is not None:
         update["cooldown_scope"] = cooldown_scope
     if error_status_code is not None:
         update["error_status_code"] = error_status_code
+    if error_type is not None:
+        update["error_type"] = error_type
+    if error_code is not None:
+        update["error_code"] = str(error_code)
+    if retry_after_seconds is not None:
+        update["retry_after_seconds"] = round(float(retry_after_seconds), 3)
     attempt_record.update(update)
     return error_tokens
+
+
+def _record_auto_agent_alias_attempt_started(
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    attempt_record: dict[str, Any],
+    add_alias_metadata_fn: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    candidate_body = add_alias_metadata_fn(
+        prepared_request_body,
+        request=request,
+        selection=selection,
+        attempts=attempts,
+    )
+    _safe_set_request_parsed_body(request, candidate_body)
+    _emit_auto_agent_alias_route_event(
+        _build_auto_agent_alias_audit_event(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            request_body=prepared_request_body,
+            selection=selection,
+            candidate=attempt_record,
+            event_type="candidate_attempt_started",
+            candidate_status="attempt_started",
+            attempt_number=len(attempts),
+            selected=True,
+            selection_reason=selection.get("selection_reason"),
+            lane_key=selection.get("lane_key"),
+            attempted_provider_call=False,
+        )
+    )
+    return candidate_body
+
+
+def _record_auto_agent_alias_attempt_failure(
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    attempt_record: dict[str, Any],
+    error_class: str,
+    add_alias_metadata_fn: Callable[..., dict[str, Any]],
+    redispatch_required: bool = False,
+) -> dict[str, Any]:
+    failure_body = add_alias_metadata_fn(
+        prepared_request_body,
+        request=request,
+        selection=selection,
+        attempts=attempts,
+    )
+    _safe_set_request_parsed_body(request, failure_body)
+    _emit_auto_agent_alias_route_event(
+        _build_auto_agent_alias_audit_event(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            request_body=prepared_request_body,
+            selection=selection,
+            candidate=attempt_record,
+            event_type="redispatch_required"
+            if redispatch_required
+            else "candidate_retryable_failure",
+            candidate_status=attempt_record.get("status") or "cooldown_set",
+            attempt_number=len(attempts),
+            selected=True,
+            selection_reason=selection.get("selection_reason"),
+            lane_key=selection.get("lane_key"),
+            cooldown_key=selection.get("cooldown_key"),
+            cooldown_seconds=attempt_record.get("cooldown_seconds"),
+            cooldown_scope=attempt_record.get("cooldown_scope"),
+            failure_class=error_class,
+            error_status_code=attempt_record.get("error_status_code"),
+            error_type=attempt_record.get("error_type"),
+            error_code=attempt_record.get("error_code"),
+            error_tokens=attempt_record.get("error_tokens"),
+            retry_after_seconds=attempt_record.get("retry_after_seconds"),
+            failure_phase=attempt_record.get("failure_phase"),
+            attempted_provider_call=attempt_record.get("attempted_provider_call"),
+            redispatch_required=redispatch_required,
+        ),
+        level="warning",
+    )
+    return failure_body
 
 
 def _add_codex_auto_agent_alias_metadata(
@@ -21697,6 +21944,111 @@ async def is_streaming_request_fn(request: Request) -> bool:
     return False
 
 
+async def _perform_anthropic_auto_agent_alias_candidate_request(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    candidate: dict[str, Any],
+    candidate_body: dict[str, Any],
+    target_url: str,
+    custom_headers: dict[str, Any],
+) -> Response:
+    if candidate["provider"] == _CODEX_AUTO_AGENT_NATIVE_PROVIDER:
+        response = await _handle_anthropic_openai_responses_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=candidate["model"],
+            use_alias_candidate_probe=True,
+        )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
+        response = await _handle_anthropic_google_completion_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=candidate["model"],
+            adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+            use_alias_candidate_probe=True,
+        )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+        response = await _handle_anthropic_google_completion_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=candidate["model"],
+            use_alias_candidate_probe=True,
+        )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+        if candidate.get("route_family") == "anthropic_openrouter_completion_adapter":
+            response = await _handle_anthropic_openrouter_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=candidate_body,
+                adapter_model=candidate["model"],
+            )
+        else:
+            response = await _handle_anthropic_openrouter_responses_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=candidate_body,
+                adapter_model=candidate["model"],
+            )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
+        if candidate.get("route_family") == "anthropic_xai_oauth_responses_adapter":
+            response = await _handle_anthropic_xai_oauth_responses_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=candidate_body,
+                adapter_model=candidate["model"],
+                use_alias_candidate_probe=True,
+            )
+        else:
+            response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=candidate_body,
+                adapter_model=candidate["model"],
+                use_alias_candidate_probe=True,
+            )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
+        response = await _handle_anthropic_opencode_zen_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=candidate["model"],
+            use_alias_candidate_probe=True,
+        )
+    else:
+        _safe_set_request_parsed_body(request, candidate_body)
+        response = await _perform_anthropic_native_passthrough_request(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            target_url=target_url,
+            custom_headers=custom_headers,
+        )
+    return response
+
+
 async def _handle_anthropic_auto_agent_alias_route(
     *,
     endpoint: str,
@@ -21720,10 +22072,21 @@ async def _handle_anthropic_auto_agent_alias_route(
     for _attempt_number in range(
         len(_get_anthropic_auto_agent_candidates_for_alias(alias_model))
     ):
-        selection = await _select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body=prepared_request_body,
-        )
+        try:
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=prepared_request_body,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 429:
+                _emit_auto_agent_alias_no_candidate_event(
+                    alias_family="anthropic_auto_agent",
+                    alias_model=alias_model,
+                    request=request,
+                    request_body=prepared_request_body,
+                    exc=exc,
+                )
+            raise
         candidate = selection["candidate"]
         attempt_record = _codex_auto_agent_candidate_public_shape(
             candidate,
@@ -21731,111 +22094,28 @@ async def _handle_anthropic_auto_agent_alias_route(
             reason=selection.get("selection_reason"),
         )
         attempts.append(attempt_record)
-        candidate_body = _add_anthropic_auto_agent_alias_metadata(
-            prepared_request_body,
+        candidate_body = _record_auto_agent_alias_attempt_started(
+            alias_family="anthropic_auto_agent",
+            alias_model=alias_model,
             request=request,
+            prepared_request_body=prepared_request_body,
             selection=selection,
             attempts=attempts,
+            attempt_record=attempt_record,
+            add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
         )
 
         try:
-            if candidate["provider"] == _CODEX_AUTO_AGENT_NATIVE_PROVIDER:
-                response = await _handle_anthropic_openai_responses_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    use_alias_candidate_probe=True,
-                )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-                response = await _handle_anthropic_google_completion_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
-                    use_alias_candidate_probe=True,
-                )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-                response = await _handle_anthropic_google_completion_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    use_alias_candidate_probe=True,
-                )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-                if (
-                    candidate.get("route_family")
-                    == "anthropic_openrouter_completion_adapter"
-                ):
-                    response = await _handle_anthropic_openrouter_completion_adapter_route(
-                        endpoint=endpoint,
-                        request=request,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        prepared_request_body=candidate_body,
-                        adapter_model=candidate["model"],
-                    )
-                else:
-                    response = await _handle_anthropic_openrouter_responses_adapter_route(
-                        endpoint=endpoint,
-                        request=request,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        prepared_request_body=candidate_body,
-                        adapter_model=candidate["model"],
-                    )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-                if (
-                    candidate.get("route_family")
-                    == "anthropic_xai_oauth_responses_adapter"
-                ):
-                    response = await _handle_anthropic_xai_oauth_responses_adapter_route(
-                        endpoint=endpoint,
-                        request=request,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        prepared_request_body=candidate_body,
-                        adapter_model=candidate["model"],
-                        use_alias_candidate_probe=True,
-                    )
-                else:
-                    response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
-                        endpoint=endpoint,
-                        request=request,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        prepared_request_body=candidate_body,
-                        adapter_model=candidate["model"],
-                        use_alias_candidate_probe=True,
-                    )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
-                response = await _handle_anthropic_opencode_zen_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    use_alias_candidate_probe=True,
-                )
-            else:
-                _safe_set_request_parsed_body(request, candidate_body)
-                response = await _perform_anthropic_native_passthrough_request(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    target_url=target_url,
-                    custom_headers=custom_headers,
-                )
+            response = await _perform_anthropic_auto_agent_alias_candidate_request(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                candidate=candidate,
+                candidate_body=candidate_body,
+                target_url=target_url,
+                custom_headers=custom_headers,
+            )
             await _set_anthropic_auto_agent_session_affinity(
                 selection.get("session_key"),
                 candidate,
@@ -21860,6 +22140,18 @@ async def _handle_anthropic_auto_agent_alias_route(
             )
             if has_continuation_state:
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                _record_auto_agent_alias_attempt_failure(
+                    alias_family="anthropic_auto_agent",
+                    alias_model=alias_model,
+                    request=request,
+                    prepared_request_body=prepared_request_body,
+                    selection=selection,
+                    attempts=attempts,
+                    attempt_record=attempt_record,
+                    error_class=error_class,
+                    add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
+                    redispatch_required=True,
+                )
                 verbose_proxy_logger.warning(
                     "Anthropic auto-agent alias %s target %s/%s hit %s "
                     "for an in-flight session on attempt %s; signaling redispatch",
@@ -21876,6 +22168,17 @@ async def _handle_anthropic_auto_agent_alias_route(
                     error_tokens=error_tokens,
                     alias_model=alias_model,
                 )
+            _record_auto_agent_alias_attempt_failure(
+                alias_family="anthropic_auto_agent",
+                alias_model=alias_model,
+                request=request,
+                prepared_request_body=prepared_request_body,
+                selection=selection,
+                attempts=attempts,
+                attempt_record=attempt_record,
+                error_class=error_class,
+                add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
+            )
             verbose_proxy_logger.warning(
                 "Anthropic auto-agent alias %s target %s/%s hit %s on attempt %s; "
                 "cooldown %.1fs tokens=%s",
@@ -24249,6 +24552,92 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     return _build_responses_response_from_adapter_response(responses_api_response)
 
 
+async def _perform_codex_auto_agent_alias_candidate_request(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    candidate: dict[str, Any],
+    candidate_body: dict[str, Any],
+    target_url: str,
+    api_key: Optional[str],
+    forward_headers: bool,
+) -> Response:
+    if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+        response = await _handle_codex_google_code_assist_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=candidate["model"],
+            use_alias_candidate_probe=True,
+        )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
+        response = await _handle_codex_google_code_assist_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=candidate["model"],
+            adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+            use_alias_candidate_probe=True,
+        )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+        if candidate.get("route_family") == "codex_openrouter_completion_adapter":
+            response = await _perform_codex_auto_agent_openrouter_completion_request(
+                request=request,
+                adapter_model=candidate["model"],
+                request_body=candidate_body,
+            )
+        else:
+            response = await _perform_codex_auto_agent_openrouter_responses_request(
+                endpoint=endpoint,
+                request=request,
+                user_api_key_dict=user_api_key_dict,
+                adapter_model=candidate["model"],
+                request_body=candidate_body,
+            )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
+        if candidate.get("route_family") == "codex_xai_oauth_responses_adapter":
+            response = await _perform_codex_auto_agent_oa_xai_responses_request(
+                endpoint=endpoint,
+                request=request,
+                user_api_key_dict=user_api_key_dict,
+                request_body=candidate_body,
+            )
+        else:
+            response = await _perform_codex_auto_agent_grok_native_responses_request(
+                endpoint=endpoint,
+                request=request,
+                user_api_key_dict=user_api_key_dict,
+                request_body=candidate_body,
+            )
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
+        response = await _handle_codex_opencode_zen_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=candidate["model"],
+            use_alias_candidate_probe=True,
+        )
+    else:
+        response = await _perform_codex_auto_agent_native_openai_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            target_url=target_url,
+            api_key=api_key,
+            forward_headers=forward_headers,
+            request_body=candidate_body,
+        )
+    return response
+
+
 async def _handle_codex_auto_agent_alias_route(
     *,
     endpoint: str,
@@ -24273,10 +24662,21 @@ async def _handle_codex_auto_agent_alias_route(
     for _attempt_number in range(
         len(_get_codex_auto_agent_candidates_for_alias(alias_model))
     ):
-        selection = await _select_codex_auto_agent_candidate(
-            request=request,
-            request_body=prepared_request_body,
-        )
+        try:
+            selection = await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=prepared_request_body,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 429:
+                _emit_auto_agent_alias_no_candidate_event(
+                    alias_family="codex_auto_agent",
+                    alias_model=alias_model,
+                    request=request,
+                    request_body=prepared_request_body,
+                    exc=exc,
+                )
+            raise
         candidate = selection["candidate"]
         attempt_record = _codex_auto_agent_candidate_public_shape(
             candidate,
@@ -24284,91 +24684,29 @@ async def _handle_codex_auto_agent_alias_route(
             reason=selection.get("selection_reason"),
         )
         attempts.append(attempt_record)
-        candidate_body = _add_codex_auto_agent_alias_metadata(
-            prepared_request_body,
+        candidate_body = _record_auto_agent_alias_attempt_started(
+            alias_family="codex_auto_agent",
+            alias_model=alias_model,
             request=request,
+            prepared_request_body=prepared_request_body,
             selection=selection,
             attempts=attempts,
+            attempt_record=attempt_record,
+            add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
         )
 
         try:
-            if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-                response = await _handle_codex_google_code_assist_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    use_alias_candidate_probe=True,
-                )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-                response = await _handle_codex_google_code_assist_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
-                    use_alias_candidate_probe=True,
-                )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-                if (
-                    candidate.get("route_family")
-                    == "codex_openrouter_completion_adapter"
-                ):
-                    response = await _perform_codex_auto_agent_openrouter_completion_request(
-                        request=request,
-                        adapter_model=candidate["model"],
-                        request_body=candidate_body,
-                    )
-                else:
-                    response = await _perform_codex_auto_agent_openrouter_responses_request(
-                        endpoint=endpoint,
-                        request=request,
-                        user_api_key_dict=user_api_key_dict,
-                        adapter_model=candidate["model"],
-                        request_body=candidate_body,
-                    )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-                if (
-                    candidate.get("route_family")
-                    == "codex_xai_oauth_responses_adapter"
-                ):
-                    response = await _perform_codex_auto_agent_oa_xai_responses_request(
-                        endpoint=endpoint,
-                        request=request,
-                        user_api_key_dict=user_api_key_dict,
-                        request_body=candidate_body,
-                    )
-                else:
-                    response = await _perform_codex_auto_agent_grok_native_responses_request(
-                        endpoint=endpoint,
-                        request=request,
-                        user_api_key_dict=user_api_key_dict,
-                        request_body=candidate_body,
-                    )
-            elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
-                response = await _handle_codex_opencode_zen_adapter_route(
-                    endpoint=endpoint,
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    prepared_request_body=candidate_body,
-                    adapter_model=candidate["model"],
-                    use_alias_candidate_probe=True,
-                )
-            else:
-                response = await _perform_codex_auto_agent_native_openai_request(
-                    request=request,
-                    fastapi_response=fastapi_response,
-                    user_api_key_dict=user_api_key_dict,
-                    target_url=target_url,
-                    api_key=api_key,
-                    forward_headers=forward_headers,
-                    request_body=candidate_body,
-                )
+            response = await _perform_codex_auto_agent_alias_candidate_request(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                candidate=candidate,
+                candidate_body=candidate_body,
+                target_url=target_url,
+                api_key=api_key,
+                forward_headers=forward_headers,
+            )
             await _set_codex_auto_agent_session_affinity(
                 selection.get("session_key"),
                 candidate,
@@ -24396,6 +24734,18 @@ async def _handle_codex_auto_agent_alias_route(
             )
             if has_continuation_state:
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                _record_auto_agent_alias_attempt_failure(
+                    alias_family="codex_auto_agent",
+                    alias_model=alias_model,
+                    request=request,
+                    prepared_request_body=prepared_request_body,
+                    selection=selection,
+                    attempts=attempts,
+                    attempt_record=attempt_record,
+                    error_class=error_class,
+                    add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
+                    redispatch_required=True,
+                )
                 verbose_proxy_logger.warning(
                     "Codex auto-agent alias %s target %s/%s hit %s "
                     "for an in-flight session on attempt %s; signaling redispatch",
@@ -24412,6 +24762,17 @@ async def _handle_codex_auto_agent_alias_route(
                     error_tokens=error_tokens,
                     alias_model=alias_model,
                 )
+            _record_auto_agent_alias_attempt_failure(
+                alias_family="codex_auto_agent",
+                alias_model=alias_model,
+                request=request,
+                prepared_request_body=prepared_request_body,
+                selection=selection,
+                attempts=attempts,
+                attempt_record=attempt_record,
+                error_class=error_class,
+                add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
+            )
             verbose_proxy_logger.warning(
                 "Codex auto-agent alias %s target %s/%s hit %s on attempt %s; "
                 "cooldown %.1fs scope=%s tokens=%s",
