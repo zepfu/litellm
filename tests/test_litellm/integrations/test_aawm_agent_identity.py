@@ -8665,6 +8665,12 @@ def test_build_alias_routing_audit_db_payload_includes_provider_timeout_state() 
         "candidate_status": "cooldown_set",
         "failure_class": "rate_limited",
         "error_status_code": 429,
+        "error_type": "rate_limit_error",
+        "error_code": "usage_limit_reached",
+        "retry_after_seconds": 300.0,
+        "failure_phase": "provider_attempt",
+        "attempted_provider_call": True,
+        "agent_id": "agent-alias-timeout",
         "cooldown_scope": "candidate",
         "cooldown_seconds": 120.0,
         "cooldown_until": "2026-06-06T12:02:00Z",
@@ -8699,6 +8705,12 @@ def test_build_alias_routing_audit_db_payload_includes_provider_timeout_state() 
     metadata = json.loads(payload[28])
     assert metadata["session_history_provider"] == "openai"
     assert metadata["session_history_repository"] == "litellm"
+    assert metadata["agent_id"] == "agent-alias-timeout"
+    assert metadata["error_type"] == "rate_limit_error"
+    assert metadata["error_code"] == "usage_limit_reached"
+    assert metadata["retry_after_seconds"] == 300.0
+    assert metadata["failure_phase"] == "provider_attempt"
+    assert metadata["attempted_provider_call"] is True
 
 
 def test_build_tool_definition_snapshot_db_payloads_deduplicates_session_hash() -> None:

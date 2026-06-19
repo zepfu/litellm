@@ -17104,6 +17104,20 @@ def _build_anthropic_auto_agent_body(session_id: str = "claude-session"):
     }
 
 
+def _alias_route_log_payloads(mock_logger: Mock) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for call in mock_logger.call_args_list:
+        if not call.args:
+            continue
+        message = call.args[0]
+        if not isinstance(message, str) or not message.startswith(
+            "AAWM_ALIAS_ROUTE: "
+        ):
+            continue
+        payloads.append(json.loads(message.removeprefix("AAWM_ALIAS_ROUTE: ")))
+    return payloads
+
+
 @pytest.mark.parametrize(
     "alias",
     [
@@ -19286,7 +19300,9 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
     ) as mock_spark, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
         new=AsyncMock(),
-    ) as mock_native:
+    ) as mock_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
         with pytest.raises(HTTPException) as exc_info:
             await _handle_anthropic_auto_agent_alias_route(
                 endpoint="/v1/messages",
@@ -19324,6 +19340,30 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
     assert exc_info.value.headers["Retry-After"] == str(
         exc_info.value.detail["retry_after_seconds"]
     )
+    parsed_body = request.scope["parsed_body"][1]
+    audit_events = parsed_body["litellm_metadata"]["aawm_alias_routing_audit_events"]
+    redispatch_event = next(
+        event for event in audit_events if event["event_type"] == "redispatch_required"
+    )
+    assert redispatch_event["alias_family"] == "anthropic_auto_agent"
+    assert redispatch_event["provider"] == "openrouter"
+    assert redispatch_event["model"] == "deepseek/deepseek-v4-flash"
+    assert redispatch_event["lane_key"] == "openrouter"
+    assert redispatch_event["failure_class"] == "rate_limited"
+    assert redispatch_event["failure_phase"] == "provider_attempt"
+    assert redispatch_event["attempted_provider_call"] is True
+    assert redispatch_event["redispatch_required"] is True
+    route_logs = _alias_route_log_payloads(mock_warning)
+    redispatch_log = next(
+        payload
+        for payload in route_logs
+        if payload["event_type"] == "redispatch_required"
+    )
+    assert redispatch_log["alias_family"] == "anthropic_auto_agent"
+    assert redispatch_log["provider"] == "openrouter"
+    assert redispatch_log["model"] == "deepseek/deepseek-v4-flash"
+    assert redispatch_log["failure_phase"] == "provider_attempt"
+    assert redispatch_log["attempted_provider_call"] is True
     mock_openrouter.assert_awaited_once()
     mock_spark.assert_not_called()
     mock_native.assert_not_called()
@@ -20359,6 +20399,68 @@ async def test_codex_auto_agent_alias_sota_has_no_fallback_candidates():
     ]
     mock_antigravity_lane.assert_not_called()
     mock_google_lane.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota",
+        "litellm_metadata": {
+            "session_id": "codex-session",
+            "agent_id": "agent-123",
+            "repository": "litellm",
+        },
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(),
+    ) as mock_pass_through:
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        await _set_codex_auto_agent_cooldown(selection["cooldown_key"], 60.0)
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value.status_code == 429
+    mock_pass_through.assert_not_called()
+    route_logs = _alias_route_log_payloads(mock_warning)
+    no_candidate_log = next(
+        payload
+        for payload in route_logs
+        if payload["event_type"] == "no_candidate_available"
+    )
+    assert no_candidate_log["alias_family"] == "codex_auto_agent"
+    assert no_candidate_log["alias_model"] == "aawm-sota"
+    assert no_candidate_log["session_id"] == "codex-session"
+    assert no_candidate_log["agent_id"] == "agent-123"
+    assert no_candidate_log["repository"] == "litellm"
+    assert no_candidate_log["failure_phase"] == "candidate_selection"
+    assert no_candidate_log["attempted_provider_call"] is False
+    assert no_candidate_log["error_status_code"] == 429
+    assert no_candidate_log["candidate_count"] == 1
+    assert no_candidate_log["candidates"][0]["provider"] == "openai"
+    assert no_candidate_log["candidates"][0]["model"] == "gpt-5.5"
 
 
 @pytest.mark.asyncio
@@ -22488,7 +22590,9 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     ) as mock_pass_through, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
         new=AsyncMock(return_value=deepseek_success),
-    ) as mock_openrouter:
+    ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -22524,6 +22628,10 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     assert retryable_event["model"] == "gpt-5.3-codex-spark"
     assert retryable_event["failure_class"] == "usage_limit_reached"
     assert retryable_event["error_status_code"] == 429
+    assert retryable_event["error_type"] == "invalid_request_error"
+    assert retryable_event["error_code"] == "usage_limit_reached"
+    assert retryable_event["failure_phase"] == "provider_attempt"
+    assert retryable_event["attempted_provider_call"] is True
     skipped_event = next(
         event
         for event in audit_events
@@ -22534,6 +22642,20 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     )
     assert audit_events[-1]["event_type"] == "candidate_selected"
     assert audit_events[-1]["provider"] == "openrouter"
+    route_logs = _alias_route_log_payloads(mock_warning)
+    failure_log = next(
+        payload
+        for payload in route_logs
+        if payload["event_type"] == "candidate_retryable_failure"
+    )
+    assert failure_log["alias_model"] == "aawm-codex-agent-auto"
+    assert failure_log["provider"] == "openai"
+    assert failure_log["model"] == "gpt-5.3-codex-spark"
+    assert failure_log["route_family"] == "codex_responses"
+    assert failure_log["failure_phase"] == "provider_attempt"
+    assert failure_log["attempted_provider_call"] is True
+    assert failure_log["error_status_code"] == 429
+    assert failure_log["error_code"] == "usage_limit_reached"
 
 
 @pytest.mark.asyncio
@@ -22964,7 +23086,9 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
     ) as mock_openrouter, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(),
-    ) as mock_pass_through:
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
         with pytest.raises(HTTPException) as exc_info:
             await _handle_codex_auto_agent_alias_route(
                 endpoint="/v1/responses",
@@ -23003,6 +23127,28 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
     assert exc_info.value.headers["Retry-After"] == str(
         exc_info.value.detail["retry_after_seconds"]
     )
+    parsed_body = request.scope["parsed_body"][1]
+    audit_events = parsed_body["litellm_metadata"]["aawm_alias_routing_audit_events"]
+    redispatch_event = next(
+        event for event in audit_events if event["event_type"] == "redispatch_required"
+    )
+    assert redispatch_event["provider"] == "openrouter"
+    assert redispatch_event["model"] == "deepseek/deepseek-v4-flash"
+    assert redispatch_event["lane_key"] == "openrouter"
+    assert redispatch_event["failure_class"] == "rate_limited"
+    assert redispatch_event["failure_phase"] == "provider_attempt"
+    assert redispatch_event["attempted_provider_call"] is True
+    assert redispatch_event["redispatch_required"] is True
+    route_logs = _alias_route_log_payloads(mock_warning)
+    redispatch_log = next(
+        payload
+        for payload in route_logs
+        if payload["event_type"] == "redispatch_required"
+    )
+    assert redispatch_log["provider"] == "openrouter"
+    assert redispatch_log["model"] == "deepseek/deepseek-v4-flash"
+    assert redispatch_log["failure_phase"] == "provider_attempt"
+    assert redispatch_log["attempted_provider_call"] is True
     mock_openrouter.assert_awaited_once()
     mock_pass_through.assert_not_called()
 
