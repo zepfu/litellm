@@ -1,4 +1,5 @@
 import json
+import hashlib
 from io import BytesIO
 from argparse import Namespace
 from datetime import datetime, timezone
@@ -285,6 +286,12 @@ def test_setup_schema_executes_provider_status_ddl_with_timeouts(monkeypatch) ->
         assert statement in ddl_statements
     for statement in probes.PROVIDER_STATUS_INDEX_STATEMENTS:
         assert statement in ddl_statements
+    assert probes.PROVIDER_AUTH_OBSERVATIONS_TABLE_SQL in ddl_statements
+    for statement in probes.PROVIDER_AUTH_OBSERVATIONS_ALTER_STATEMENTS:
+        assert statement in ddl_statements
+    for statement in probes.PROVIDER_AUTH_OBSERVATIONS_INDEX_STATEMENTS:
+        assert statement in ddl_statements
+    assert probes.PROVIDER_AUTH_CURRENT_VIEW_SQL in ddl_statements
     assert fake_conn.cursor_instance.executemany_calls == []
     assert fake_conn.commit_count == 1
     assert fake_conn.rollback_count == 0
@@ -2139,3 +2146,299 @@ def test_run_due_sidecar_tasks_reports_grok_billing_auth_failure_once(
     assert events[0]["attempt_count"] == 1
     assert events[0]["retry_count"] == 0
     assert events[0]["error_class"] == "GrokBillingPollError"
+
+
+def _grok_oidc_auth_persist_config(**overrides):
+    from dataclasses import replace
+
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn="postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=123,
+        db_statement_timeout_ms=456,
+        grok_oidc_refresh_enabled=True,
+        grok_oidc_auth_file="/home/zepfu/.grok/auth.json",
+        grok_oidc_auth_file_source="default",
+        grok_oidc_lock_file="/home/zepfu/.grok/auth.json.lock",
+        grok_oidc_refresh_interval_seconds=3600.0,
+        grok_oidc_refresh_buffer_seconds=300,
+        grok_oidc_force_refresh=False,
+        grok_oidc_http_timeout_seconds=30.0,
+        grok_billing_poll_enabled=False,
+    )
+    if overrides:
+        config = replace(config, **overrides)
+    return config
+
+
+def _grok_oidc_refresh_sidecar_event(**overrides) -> dict:
+    event = {
+        "event": "grok_oidc_refresh",
+        "observed_at": "2026-06-19T12:00:00Z",
+        "environment": "dev",
+        "attempted": True,
+        "refreshed": True,
+        "skipped": False,
+        "auth_file": "/home/zepfu/.grok/auth.json",
+        "scope": "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828",
+        "expires_at": "2026-06-19T13:00:00Z",
+        "error_class": None,
+        "error_message": None,
+    }
+    event.update(overrides)
+    return event
+
+
+def test_build_grok_oidc_auth_observation_maps_successful_refresh() -> None:
+    config = _grok_oidc_auth_persist_config()
+    event = _grok_oidc_refresh_sidecar_event()
+
+    observation = loop._build_grok_oidc_auth_observation(
+        config,
+        event,
+    )
+
+    assert observation["observed_at"] == datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
+    assert observation["environment"] == "dev"
+    assert observation["provider"] == "xai"
+    assert observation["auth_family"] == "grok_oidc"
+    assert observation["credential_scope"] == event["scope"]
+    assert observation["auth_file_hash"] == hashlib.sha256(
+        event["auth_file"].encode("utf-8")
+    ).hexdigest()
+    assert observation["status"] == "refreshed"
+    assert observation["attempted"] is True
+    assert observation["refreshed"] is True
+    assert observation["skipped"] is False
+    assert observation["expires_at"] == datetime(2026, 6, 19, 13, 0, tzinfo=timezone.utc)
+    assert observation["last_success_at"] == observation["observed_at"]
+    assert observation["source_task"] == "grok_oidc_refresh"
+    assert observation["error_class"] is None
+    assert observation["error_message"] is None
+    metadata = observation["metadata"]
+    assert metadata["auth_file_source"] == "default"
+    observation_json = json.dumps(observation, default=str)
+    assert "refresh_token" not in observation_json
+    assert "access_token" not in observation_json
+    assert "/home/zepfu/.grok/auth.json" not in observation_json
+
+
+def test_build_grok_oidc_auth_observation_sanitizes_refresh_failure() -> None:
+    config = _grok_oidc_auth_persist_config()
+    event = _grok_oidc_refresh_sidecar_event(
+        refreshed=False,
+        skipped=False,
+        expires_at=None,
+        error_class="HTTPError",
+        error_message=(
+            "token refresh failed with refresh_token=super-secret "
+            "and Authorization=Bearer leaked-token"
+        ),
+    )
+
+    observation = loop._build_grok_oidc_auth_observation(
+        config,
+        event,
+    )
+
+    assert observation["status"] == "failed"
+    assert observation["attempted"] is True
+    assert observation["refreshed"] is False
+    assert observation["skipped"] is False
+    assert observation["last_success_at"] is None
+    assert observation["error_class"] == "HTTPError"
+    assert "REDACTED" in observation["error_message"]
+    assert "super-secret" not in json.dumps(observation, default=str)
+    assert "leaked-token" not in json.dumps(observation, default=str)
+
+
+def test_build_grok_oidc_auth_observation_preserves_skipped_refresh_expiry() -> None:
+    config = _grok_oidc_auth_persist_config()
+    event = _grok_oidc_refresh_sidecar_event(
+        attempted=False,
+        refreshed=False,
+        skipped=True,
+        expires_at="2026-06-19T18:00:00Z",
+    )
+
+    observation = loop._build_grok_oidc_auth_observation(
+        config,
+        event,
+    )
+
+    assert observation["status"] == "skipped"
+    assert observation["attempted"] is False
+    assert observation["refreshed"] is False
+    assert observation["skipped"] is True
+    assert observation["expires_at"] == datetime(2026, 6, 19, 18, 0, tzinfo=timezone.utc)
+    assert observation["last_success_at"] == observation["observed_at"]
+
+
+def test_insert_provider_auth_observations_uses_provider_status_db_path(monkeypatch) -> None:
+    config = _grok_oidc_auth_persist_config()
+    fake_conn = _FakeProviderStatusConnection()
+    monkeypatch.setattr(probes.psycopg, "connect", lambda _dsn: fake_conn)
+    observation = loop._build_grok_oidc_auth_observation(
+        config,
+        _grok_oidc_refresh_sidecar_event(),
+    )
+
+    inserted = probes.insert_provider_auth_observations(
+        "postgresql://example/db",
+        [observation],
+        lock_timeout_ms=123,
+        statement_timeout_ms=456,
+    )
+
+    assert inserted == 1
+    assert fake_conn.cursor_instance.execute_calls[:3] == [
+        (
+            "SELECT set_config('application_name', %s, false)",
+            ("aawm-provider-status-observations",),
+        ),
+        ("SELECT set_config('lock_timeout', %s, true)", ("123ms",)),
+        ("SELECT set_config('statement_timeout', %s, true)", ("456ms",)),
+    ]
+    insert_sql, payloads = fake_conn.cursor_instance.executemany_calls[0]
+    assert insert_sql == probes.PROVIDER_AUTH_OBSERVATIONS_INSERT_SQL
+    assert payloads[0][1] == "dev"
+    assert payloads[0][2] == "xai"
+    assert payloads[0][12] == "grok_oidc_refresh"
+    assert fake_conn.commit_count == 1
+    assert fake_conn.rollback_count == 0
+
+
+def test_persist_grok_oidc_auth_observation_marks_db_write_failure(monkeypatch) -> None:
+    config = _grok_oidc_auth_persist_config()
+
+    def fake_connect(_dsn):
+        raise probes.psycopg.OperationalError("connection refused")
+
+    monkeypatch.setattr(loop.probes.psycopg, "connect", fake_connect)
+
+    persisted, inserted, error_class, error_message = loop._persist_grok_oidc_auth_observation(
+        config,
+        _grok_oidc_refresh_sidecar_event(),
+    )
+
+    assert persisted is False
+    assert inserted == 0
+    assert error_class == "OperationalError"
+    assert "connection refused" in error_message
+
+
+def test_run_due_sidecar_tasks_persists_grok_oidc_auth_observation_when_apply_enabled(
+    monkeypatch,
+) -> None:
+    config = _grok_oidc_auth_persist_config(
+        grok_oidc_force_refresh=True,
+        grok_oidc_refresh_interval_seconds=3600.0,
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "repair_grok_oidc_auth_file_metadata",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "repaired": False,
+            "auth_file": config.grok_oidc_auth_file,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "refresh_grok_oidc_auth_file",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "auth_file": config.grok_oidc_auth_file,
+            "scope": "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828",
+            "expires_at": "2026-06-19T13:00:00Z",
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+
+    def fake_persist(cfg, event):
+        captured["config"] = cfg
+        captured["event"] = event
+        return True, 1, None, None
+
+    monkeypatch.setattr(loop, "_persist_grok_oidc_auth_observation", fake_persist)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    refresh_events = [event for event in events if event.get("event") == "grok_oidc_refresh"]
+    assert len(refresh_events) == 1
+    assert captured["config"] is config
+    assert captured["event"]["refreshed"] is True
+    assert refresh_events[0]["auth_observation_status"] == "refreshed"
+    assert refresh_events[0]["auth_observation_persisted"] is True
+    assert refresh_events[0]["auth_observation_inserted_count"] == 1
+    assert refresh_events[0]["auth_observation_skip_error_class"] is None
+    assert refresh_events[0]["auth_observation_skip_reason"] is None
+    assert "access-token" not in json.dumps(refresh_events)
+
+
+def test_run_due_sidecar_tasks_marks_grok_oidc_auth_persistence_failure(
+    monkeypatch,
+) -> None:
+    config = _grok_oidc_auth_persist_config(
+        grok_oidc_force_refresh=True,
+        grok_oidc_refresh_interval_seconds=3600.0,
+    )
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "repair_grok_oidc_auth_file_metadata",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "refresh_grok_oidc_auth_file",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "auth_file": config.grok_oidc_auth_file,
+            "scope": "scope",
+            "expires_at": "2026-06-19T13:00:00Z",
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_grok_oidc_auth_observation",
+        lambda *_args, **_kwargs: (False, 0, "OperationalError", "connection refused"),
+    )
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    refresh_event = next(
+        event for event in events if event.get("event") == "grok_oidc_refresh"
+    )
+    assert refresh_event["auth_observation_status"] == "refreshed"
+    assert refresh_event["auth_observation_persisted"] is False
+    assert refresh_event["auth_observation_inserted_count"] == 0
+    assert refresh_event["auth_observation_skip_error_class"] == "OperationalError"
+    assert refresh_event["auth_observation_skip_reason"] == "connection refused"

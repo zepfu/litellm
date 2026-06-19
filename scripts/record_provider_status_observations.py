@@ -10,6 +10,7 @@ public.provider_status_observations.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -137,6 +138,108 @@ PROVIDER_STATUS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS provider_status_observations_endpoint_time_idx ON public.provider_status_observations (provider, endpoint_key, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS provider_status_observations_probe_time_idx ON public.provider_status_observations (probe_type, observed_at DESC)",
 )
+
+PROVIDER_AUTH_OBSERVATIONS_INSERT_SQL = """
+INSERT INTO public.provider_auth_observations (
+    observed_at,
+    environment,
+    provider,
+    auth_family,
+    credential_scope,
+    auth_file_hash,
+    status,
+    attempted,
+    refreshed,
+    skipped,
+    expires_at,
+    last_success_at,
+    source_task,
+    error_class,
+    error_message,
+    metadata
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+)
+"""
+PROVIDER_AUTH_OBSERVATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.provider_auth_observations (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    environment TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    auth_family TEXT NOT NULL,
+    credential_scope TEXT,
+    auth_file_hash TEXT,
+    status TEXT NOT NULL,
+    attempted BOOLEAN NOT NULL DEFAULT FALSE,
+    refreshed BOOLEAN NOT NULL DEFAULT FALSE,
+    skipped BOOLEAN NOT NULL DEFAULT FALSE,
+    expires_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    source_task TEXT NOT NULL,
+    error_class TEXT,
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+PROVIDER_AUTH_OBSERVATIONS_ALTER_STATEMENTS = (
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS credential_scope TEXT",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS auth_file_hash TEXT",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS attempted BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS refreshed BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS skipped BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMPTZ",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS source_task TEXT NOT NULL DEFAULT 'unknown'",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS error_class TEXT",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS error_message TEXT",
+    "ALTER TABLE public.provider_auth_observations ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+)
+PROVIDER_AUTH_OBSERVATIONS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS provider_auth_observations_provider_time_idx ON public.provider_auth_observations (provider, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_auth_observations_identity_time_idx ON public.provider_auth_observations (environment, provider, auth_family, credential_scope, auth_file_hash, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_auth_observations_status_time_idx ON public.provider_auth_observations (status, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_auth_observations_expires_idx ON public.provider_auth_observations (expires_at)",
+)
+PROVIDER_AUTH_CURRENT_VIEW_SQL = """
+CREATE OR REPLACE VIEW public.provider_auth_current AS
+SELECT DISTINCT ON (
+    environment,
+    provider,
+    auth_family,
+    COALESCE(credential_scope, ''),
+    COALESCE(auth_file_hash, '')
+)
+    id,
+    observed_at,
+    created_at,
+    environment,
+    provider,
+    auth_family,
+    credential_scope,
+    auth_file_hash,
+    status,
+    attempted,
+    refreshed,
+    skipped,
+    expires_at,
+    last_success_at,
+    source_task,
+    error_class,
+    error_message,
+    metadata
+FROM public.provider_auth_observations
+ORDER BY
+    environment,
+    provider,
+    auth_family,
+    COALESCE(credential_scope, ''),
+    COALESCE(auth_file_hash, ''),
+    observed_at DESC,
+    id DESC
+"""
 
 
 class ProviderStatusDatabaseWriteSkipped(RuntimeError):
@@ -595,6 +698,12 @@ def setup_schema(
                     cur.execute(statement)
                 for statement in PROVIDER_STATUS_INDEX_STATEMENTS:
                     cur.execute(statement)
+                cur.execute(PROVIDER_AUTH_OBSERVATIONS_TABLE_SQL)
+                for statement in PROVIDER_AUTH_OBSERVATIONS_ALTER_STATEMENTS:
+                    cur.execute(statement)
+                for statement in PROVIDER_AUTH_OBSERVATIONS_INDEX_STATEMENTS:
+                    cur.execute(statement)
+                cur.execute(PROVIDER_AUTH_CURRENT_VIEW_SQL)
         except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
             conn.rollback()
             raise ProviderStatusDatabaseWriteSkipped(
@@ -633,6 +742,69 @@ def insert_observations(
                 message=str(exc),
             ) from exc
         conn.commit()
+
+
+def _auth_observation_db_payload(row: Dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("observed_at"),
+        row.get("environment"),
+        row.get("provider"),
+        row.get("auth_family"),
+        row.get("credential_scope"),
+        row.get("auth_file_hash"),
+        row.get("status"),
+        bool(row.get("attempted")),
+        bool(row.get("refreshed")),
+        bool(row.get("skipped")),
+        row.get("expires_at"),
+        row.get("last_success_at"),
+        row.get("source_task"),
+        row.get("error_class"),
+        row.get("error_message"),
+        json.dumps(row.get("metadata") or {}, default=_json_default, sort_keys=True),
+    )
+
+
+def auth_file_identity_hash(auth_file: Any) -> Optional[str]:
+    if auth_file is None:
+        return None
+    value = str(auth_file).strip()
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def insert_provider_auth_observations(
+    dsn: str,
+    rows: List[Dict[str, Any]],
+    *,
+    lock_timeout_ms: int = DEFAULT_DB_LOCK_TIMEOUT_MS,
+    statement_timeout_ms: int = DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+) -> int:
+    if not rows:
+        return 0
+
+    with psycopg.connect(dsn) as conn:
+        try:
+            with conn.cursor() as cur:
+                _set_database_timeouts(
+                    cur,
+                    lock_timeout_ms=lock_timeout_ms,
+                    statement_timeout_ms=statement_timeout_ms,
+                )
+                cur.executemany(
+                    PROVIDER_AUTH_OBSERVATIONS_INSERT_SQL,
+                    [_auth_observation_db_payload(row) for row in rows],
+                )
+                inserted_count = max(0, cur.rowcount)
+        except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
+            conn.rollback()
+            raise ProviderStatusDatabaseWriteSkipped(
+                error_class=exc.__class__.__name__,
+                message=str(exc),
+            ) from exc
+        conn.commit()
+    return inserted_count
 
 
 def _json_default(value: Any) -> str:
