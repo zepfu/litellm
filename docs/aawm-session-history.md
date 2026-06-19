@@ -277,6 +277,34 @@ validation time, and redacted failure class/message. Rows must never include
 access tokens, refresh tokens, raw auth-file contents, or the raw auth-file
 path.
 
+## Codex OAuth Credentials
+
+Codex/OpenAI adapter routes that use ChatGPT-account OAuth read the Codex auth
+JSON file, normally `/home/zepfu/.codex/auth.json`, through
+`LITELLM_CODEX_AUTH_FILE`. LiteLLM is a read-only consumer of that file. During
+request handling it loads headers only when the access token is still valid. If
+the token is expired or invalid, LiteLLM fails with a clear sidecar-refresh
+message instead of attempting OAuth refresh or writing the auth JSON.
+
+The provider-status sidecar is the scheduled Codex OAuth writer. It mounts
+`/home/zepfu/.codex` writable, locks the configured auth file, refreshes with
+the Codex OAuth refresh token, and writes the updated access token, refresh
+token, optional ID token, account ID, expiry, and top-level `last_refresh`
+timestamp atomically. The dev LiteLLM container mounts the same host directory
+read-only. In dev compose the sidecar runs with
+`AAWM_CODEX_OAUTH_REFRESH_ENABLED=1`,
+`AAWM_CODEX_AUTH_FILE=/home/zepfu/.codex/auth.json`, and a one-hour refresh
+interval.
+
+Each Codex OAuth refresh attempt writes sanitized provider-auth telemetry into
+the same `provider_auth_observations` table and `provider_auth_current` view.
+Rows use provider `openai`, auth family `codex_oauth`, source task
+`codex_oauth_refresh`, credential scope set to the sanitized ChatGPT account ID
+when known, the auth-file identity hash, attempted/refreshed/skipped flags,
+expiry, last successful validation time, and redacted failure class/message.
+Rows must never include access tokens, refresh tokens, raw auth-file contents,
+or the raw auth-file path.
+
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
 tools, and `reasoning` input items that the selected Grok-family model declares
 unsupported. This includes `reasoning` items that carry `encrypted_content` from
