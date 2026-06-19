@@ -112,6 +112,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _is_codex_google_code_assist_empty_success_model_response,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
+    _perform_codex_auto_agent_openrouter_completion_request,
     _perform_codex_auto_agent_native_openai_request,
     _resolve_anthropic_auto_agent_alias_model,
     _resolve_anthropic_antigravity_code_assist_adapter_model,
@@ -140,6 +141,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _resolve_codex_opencode_zen_adapter_model,
     _sanitize_google_code_assist_quota_for_logging,
     _sanitize_opencode_zen_completion_messages_for_chat_completion,
+    _sanitize_openrouter_completion_messages_for_chat_completion,
     _set_google_adapter_cooldown,
     _remember_codex_google_code_assist_tool_call_name,
     _wait_for_google_adapter_cooldown_if_needed,
@@ -9482,6 +9484,216 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         )
         assert changes["opencode_zen_chat_tool_adjacency_messages_from_count"] == 7
         assert changes["opencode_zen_chat_tool_adjacency_messages_to_count"] == 4
+
+    def test_openrouter_sanitizer_removes_empty_messages_and_preserves_tool_calls(
+        self,
+    ):
+        completion_kwargs = {
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": ""},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_ok",
+                            "type": "function",
+                            "function": {"name": "Grep", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+                {"role": "user", "content": []},
+                {"role": "assistant", "content": None},
+            ]
+        }
+
+        updated_kwargs, changes = (
+            _sanitize_openrouter_completion_messages_for_chat_completion(
+                completion_kwargs
+            )
+        )
+
+        assert updated_kwargs["messages"] == [
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_ok",
+                        "type": "function",
+                        "function": {"name": "Grep", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+        ]
+        assert changes["openrouter_chat_message_shape_sanitized"] is True
+        assert changes["openrouter_chat_message_shape_removed_empty_message_count"] == 3
+        assert changes["openrouter_chat_message_shape_messages_from_count"] == 6
+        assert changes["openrouter_chat_message_shape_messages_to_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_codex_openrouter_completion_route_sanitizes_empty_messages_before_egress(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+        request = _build_codex_auto_agent_request()
+        request_body = {
+            "model": "openrouter/cohere/north-mini-code:free",
+            "input": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": ""},
+                {
+                    "type": "function_call",
+                    "call_id": "call_ok",
+                    "name": "Grep",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_ok", "output": "ok"},
+                {"role": "user", "content": "continue"},
+            ],
+            "stream": False,
+            "litellm_metadata": {"session_id": "codex-session"},
+        }
+        success = {
+            "id": "chatcmpl_openrouter",
+            "created": 1744974432,
+            "model": "cohere/north-mini-code:free",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "openrouter ok"},
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+        }
+
+        transformed_kwargs = {
+            "model": "cohere/north-mini-code:free",
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": ""},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_ok",
+                            "type": "function",
+                            "function": {"name": "Grep", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+
+        async def perform_operation(adapter_model, operation):
+            return await operation()
+
+        with patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request",
+            return_value=transformed_kwargs,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
+            new=AsyncMock(side_effect=perform_operation),
+        ), patch(
+            "litellm.acompletion",
+            new=AsyncMock(return_value=success),
+        ) as mock_acompletion, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ):
+            response = await _perform_codex_auto_agent_openrouter_completion_request(
+                request=request,
+                adapter_model="openrouter/cohere/north-mini-code:free",
+                request_body=request_body,
+            )
+
+        acompletion_kwargs = mock_acompletion.await_args.kwargs
+        assert [
+            message["role"] if isinstance(message, dict) else message.role
+            for message in acompletion_kwargs["messages"]
+        ] == ["user", "assistant", "tool", "user"]
+        litellm_metadata = acompletion_kwargs["litellm_metadata"]
+        assert litellm_metadata["openrouter_chat_message_shape_sanitized"] is True
+        assert (
+            litellm_metadata[
+                "openrouter_chat_message_shape_removed_empty_message_count"
+            ]
+            == 1
+        )
+        assert "openrouter-chat-message-shape-sanitized" in litellm_metadata["tags"]
+        response_body = json.loads(response.body.decode("utf-8"))
+        assert response_body["output"][0]["content"][0]["text"] == "openrouter ok"
+
+    @pytest.mark.asyncio
+    async def test_codex_auto_agent_alias_openrouter_invalid_message_failsover(
+        self,
+        monkeypatch,
+    ):
+        request = _build_codex_auto_agent_request()
+        body = {
+            "model": "aawm-low",
+            "input": "hello",
+            "stream": False,
+            "litellm_metadata": {"session_id": "codex-session"},
+        }
+        monkeypatch.setitem(
+            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+            "aawm-low",
+            (
+                {
+                    "provider": "openrouter",
+                    "model": "openrouter/cohere/north-mini-code:free",
+                    "route_family": "codex_openrouter_completion_adapter",
+                    "last_resort": False,
+                },
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
+                    "route_family": "codex_responses",
+                    "last_resort": True,
+                },
+            ),
+        )
+        openrouter_format_error = RuntimeError(
+            "OpenRouterException - Error from provider (Cohere): "
+            "invalid request: invalid message provided at index 4: "
+            "must have non-empty content or tool calls."
+        )
+        mini_success = Response(content='{"ok": true}', media_type="application/json")
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+            new=AsyncMock(side_effect=openrouter_format_error),
+        ) as mock_openrouter, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(return_value=mini_success),
+        ) as mock_pass_through:
+            response = await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+        assert response is mini_success
+        mock_openrouter.assert_awaited_once()
+        mock_pass_through.assert_awaited_once()
+        mini_body = mock_pass_through.await_args.kwargs["custom_body"]
+        attempts = mini_body["litellm_metadata"]["codex_auto_agent_attempts"]
+        assert attempts[0]["provider"] == "openrouter"
+        assert attempts[0]["status"] == "cooldown_set"
+        assert attempts[0]["error_class"] == "provider_format_rejected"
+        assert "OPENROUTER_INVALID_CHAT_MESSAGE" in attempts[0]["error_tokens"]
 
     @pytest.mark.asyncio
     async def test_codex_opencode_zen_route_sanitizes_unmatched_tool_call_messages(
@@ -23303,10 +23515,128 @@ async def test_load_valid_local_antigravity_access_token_from_env(
     )
     monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(token_path))
     monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", raising=False)
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", raising=False)
 
     assert await _load_valid_local_antigravity_access_token() == (
         "test-antigravity-token"
     )
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_prefers_managed_auth_file(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    legacy_path = tmp_path / "legacy" / "antigravity-oauth-token"
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
+    seed_path = tmp_path / "seed" / "antigravity-oauth-token"
+    legacy_path.parent.mkdir()
+    managed_path.parent.mkdir()
+    seed_path.parent.mkdir()
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "legacy-antigravity-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "legacy-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    managed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "managed-antigravity-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "managed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    seed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "seed-antigravity-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "seed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(legacy_path))
+    monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(seed_path))
+
+    assert await _load_valid_local_antigravity_access_token() == (
+        "managed-antigravity-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_valid_local_antigravity_access_token_uses_seed_when_managed_stale(
+    tmp_path, monkeypatch
+):
+    _antigravity_oauth_access_token_cache.clear()
+    managed_path = tmp_path / "managed" / "antigravity-oauth-token"
+    seed_path = tmp_path / "seed" / "antigravity-oauth-token"
+    managed_path.parent.mkdir()
+    seed_path.parent.mkdir()
+    managed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "stale-managed-antigravity-token",
+                    "expiry": "2026-01-01T00:00:00Z",
+                    "refresh_token": "managed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    seed_path.write_text(
+        json.dumps(
+            {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "valid-seed-antigravity-token",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "refresh_token": "seed-refresh-token",
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("LITELLM_ANTIGRAVITY_AUTH_FILE", raising=False)
+    monkeypatch.delenv("ANTIGRAVITY_OAUTH_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_path))
+    monkeypatch.setenv("LITELLM_ANTIGRAVITY_SEED_AUTH_FILE", str(seed_path))
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._refresh_local_antigravity_oauth_token_data",
+        new=AsyncMock(),
+    ) as refresh_mock:
+        assert await _load_valid_local_antigravity_access_token() == (
+            "valid-seed-antigravity-token"
+        )
+
+    refresh_mock.assert_not_awaited()
 
 
 def test_load_antigravity_oauth_client_values_from_local_cli_binary(

@@ -38,9 +38,9 @@ Before cutting or promoting a release:
 - Confirm `.env` / production env files contain the provider credentials needed
   for the lanes being validated.
 - Confirm Antigravity Code Assist has separate seed and managed OAuth paths in
-  prod: the seed may be read-only, but the
-  `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` directory must be writable so token
-  refreshes persist.
+  prod: the seed may be mounted read-only into LiteLLM, and the provider-status
+  sidecar must mount the managed auth directory writable so scheduled token
+  refreshes persist at `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE`.
 - Confirm prod error-log mirroring is enabled with a writable mount for this
   repo's `.analysis` directory and
   `LITELLM_AAWM_ERROR_LOG_ENABLED=1`,
@@ -213,11 +213,13 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    IP such as `172.20.0.1`.
 
    Antigravity Code Assist OAuth refresh requires two prod credential mounts:
-   a seed token path from the Antigravity CLI login and a writable LiteLLM-owned
-   managed token path. Prefer mounting the seed credential directory read-only
-   instead of a single token file so host-side reauth and atomic file replacement
-   are visible inside the container. Mount the managed directory read-write and
-   set `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` to that path.
+   a seed token path from the Antigravity CLI login and a writable
+   provider-status-sidecar-owned managed token path. Prefer mounting the seed
+   credential directory read-only into LiteLLM instead of a single token file so
+   host-side reauth and atomic file replacement are visible inside the
+   container. Mount the managed directory read-write into the provider-status
+   sidecar and set `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` / the sidecar's
+   `AAWM_ANTIGRAVITY_AUTH_FILE` to that path.
 
    Prod error-log mirroring also requires a writable mount from this repo's
    `.analysis` directory to the container path named by
