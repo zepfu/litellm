@@ -267,12 +267,6 @@ model_list:
       model: "openrouter/thenlper/gte-large"
     model_info:
       mode: embedding
-  - model_name: "nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1"
-    litellm_params:
-      model: "nvidia_nim/nvidia/llama-3.2-nemoretriever-300m-embed-v1"
-      api_key: "os.environ/NVIDIA_NIM_API_KEY"
-    model_info:
-      mode: embedding
   - model_name: "nvidia_nim/nvidia/nv-embed-v1"
     litellm_params:
       model: "nvidia_nim/nvidia/nv-embed-v1"
@@ -288,12 +282,6 @@ model_list:
   - model_name: "nvidia_nim/nvidia/rerank-qa-mistral-4b"
     litellm_params:
       model: "nvidia_nim/nvidia/rerank-qa-mistral-4b"
-      api_key: "os.environ/NVIDIA_NIM_API_KEY"
-    model_info:
-      mode: rerank
-  - model_name: "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2"
-    litellm_params:
-      model: "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2"
       api_key: "os.environ/NVIDIA_NIM_API_KEY"
     model_info:
       mode: rerank
