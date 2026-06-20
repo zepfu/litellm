@@ -40,7 +40,7 @@ from litellm._logging import (
     verbose_proxy_logger,
 )
 from litellm._uuid import uuid
-from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG
+from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG, PASS_THROUGH_HEADER_PREFIX
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
@@ -110,6 +110,12 @@ _AAWM_PASSTHROUGH_ERROR_LOG_SAFE_QUERY_KEYS = frozenset(
         "beta",
         "stream",
     }
+)
+_AAWM_PASSTHROUGH_ERROR_LOG_AUTH_HEADER_NAMES = (
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
 )
 _AAWM_PASSTHROUGH_ERROR_LOG_MODEL_METADATA_KEYS = (
     "codex_auto_agent_selected_model",
@@ -1155,6 +1161,57 @@ def _build_passthrough_error_log_grok_side_channel_context(
     return context
 
 
+def _normalize_passthrough_header_mapping(headers: Optional[dict]) -> Dict[str, Any]:
+    return {str(key).lower(): value for key, value in dict(headers or {}).items()}
+
+
+def _build_passthrough_error_log_auth_context(
+    *,
+    request: Request,
+    final_headers: Optional[dict],
+    custom_headers: Optional[dict],
+) -> Dict[str, Any]:
+    request_headers = _normalize_passthrough_header_mapping(
+        _safe_get_request_headers(request)
+    )
+    custom_header_map = _normalize_passthrough_header_mapping(custom_headers)
+    final_header_map = _normalize_passthrough_header_mapping(final_headers)
+    auth_header_names: list[str] = []
+    auth_header_sources: list[str] = []
+
+    for header_name in _AAWM_PASSTHROUGH_ERROR_LOG_AUTH_HEADER_NAMES:
+        if header_name not in final_header_map:
+            continue
+
+        auth_header_names.append(header_name)
+        pass_through_header_name = f"{PASS_THROUGH_HEADER_PREFIX}{header_name}"
+        if pass_through_header_name in request_headers:
+            source = f"incoming_pass_through_header:{header_name}"
+        elif header_name in custom_header_map:
+            source = f"route_custom_header:{header_name}"
+        elif header_name in request_headers:
+            source = f"incoming_request:{header_name}"
+        else:
+            source = f"derived_final_header:{header_name}"
+        auth_header_sources.append(source)
+
+    credential_sources = {
+        source.split(":", 1)[0] for source in auth_header_sources if source
+    }
+    if not credential_sources:
+        auth_credential_source = "none"
+    elif len(credential_sources) == 1:
+        auth_credential_source = next(iter(credential_sources))
+    else:
+        auth_credential_source = "mixed"
+
+    return {
+        "auth_header_names": auth_header_names,
+        "auth_header_sources": auth_header_sources,
+        "auth_credential_source": auth_credential_source,
+    }
+
+
 def _build_passthrough_error_log_endpoint(
     request: Request,
     *,
@@ -1226,6 +1283,8 @@ def _build_passthrough_error_log_context(
     custom_llm_provider: Optional[str],
     status_code: Optional[int],
     litellm_call_id: Optional[str],
+    final_headers: Optional[dict] = None,
+    custom_headers: Optional[dict] = None,
 ) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
     if isinstance(parsed_body, dict):
@@ -1296,6 +1355,13 @@ def _build_passthrough_error_log_context(
         ),
     }
     context.update(grok_side_channel_context)
+    context.update(
+        _build_passthrough_error_log_auth_context(
+            request=request,
+            final_headers=final_headers,
+            custom_headers=custom_headers,
+        )
+    )
     return context
 
 
@@ -2294,6 +2360,8 @@ async def pass_through_request(  # noqa: PLR0915
     kwargs: Optional[dict] = None
     error_log_context: Optional[Dict[str, Any]] = None
     raw_body: Optional[bytes] = None
+    route_custom_headers = dict(custom_headers or {})
+    headers: Dict[str, Any] = dict(route_custom_headers)
     retryable_status_codes = {
         status_code
         for status_code in (retryable_upstream_status_codes or [])
@@ -2304,7 +2372,6 @@ async def pass_through_request(  # noqa: PLR0915
     try:
         start_time = datetime.now()
         url = httpx.URL(target)
-        headers = custom_headers
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
             headers=headers,
@@ -2486,6 +2553,8 @@ async def pass_through_request(  # noqa: PLR0915
             parsed_body=_parsed_body,
             kwargs=kwargs,
             passthrough_logging_metadata=passthrough_logging_metadata,
+            final_headers=headers,
+            custom_headers=route_custom_headers,
             custom_llm_provider=custom_llm_provider,
             status_code=None,
             litellm_call_id=litellm_call_id,
@@ -2838,6 +2907,8 @@ async def pass_through_request(  # noqa: PLR0915
                 parsed_body=_parsed_body,
                 kwargs=kwargs,
                 passthrough_logging_metadata=passthrough_logging_metadata,
+                final_headers=headers,
+                custom_headers=route_custom_headers,
                 custom_llm_provider=custom_llm_provider,
                 status_code=status_code,
                 litellm_call_id=litellm_call_id,

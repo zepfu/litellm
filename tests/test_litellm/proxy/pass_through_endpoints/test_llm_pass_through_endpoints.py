@@ -5879,6 +5879,9 @@ class TestPassThroughRequestRetryableFailures:
             "model_alias": "aawm-code-anthropic",
             "route_family": "grok_cli_chat_proxy",
             "status_code": 400,
+            "auth_header_names": [],
+            "auth_header_sources": [],
+            "auth_credential_source": "none",
             "trace_id": "trace-456",
             "litellm_call_id": "call-123",
             "grok_side_channel": True,
@@ -5898,6 +5901,67 @@ class TestPassThroughRequestRetryableFailures:
         assert "api_key" not in serialized_context
         assert "/sessions/body-secret" not in serialized_context
         assert "999" not in serialized_context
+
+    def test_build_passthrough_error_log_context_reports_auth_source_without_values(
+        self,
+    ):
+        incoming_request = MagicMock(spec=Request)
+        incoming_request.method = "POST"
+        incoming_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        incoming_request.query_params = {"beta": "true"}
+        incoming_request.headers = {
+            "x-api-key": "client-secret-key",
+            "anthropic-version": "2023-06-01",
+        }
+
+        incoming_context = _build_passthrough_error_log_context(
+            request=incoming_request,
+            url=httpx.URL("https://api.anthropic.com/v1/messages"),
+            parsed_body={"model": "claude-opus-4-8"},
+            kwargs={},
+            passthrough_logging_metadata=None,
+            custom_llm_provider="anthropic",
+            status_code=401,
+            litellm_call_id="call-123",
+            final_headers={
+                "x-api-key": "client-secret-key",
+                "anthropic-version": "2023-06-01",
+            },
+            custom_headers={},
+        )
+
+        assert incoming_context["auth_header_names"] == ["x-api-key"]
+        assert incoming_context["auth_header_sources"] == [
+            "incoming_request:x-api-key"
+        ]
+        assert incoming_context["auth_credential_source"] == "incoming_request"
+        assert "client-secret-key" not in json.dumps(incoming_context)
+
+        route_request = MagicMock(spec=Request)
+        route_request.method = "POST"
+        route_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        route_request.query_params = {"beta": "true"}
+        route_request.headers = {}
+
+        route_context = _build_passthrough_error_log_context(
+            request=route_request,
+            url=httpx.URL("https://api.anthropic.com/v1/messages"),
+            parsed_body={"model": "claude-opus-4-8"},
+            kwargs={},
+            passthrough_logging_metadata=None,
+            custom_llm_provider="anthropic",
+            status_code=401,
+            litellm_call_id="call-456",
+            final_headers={"x-api-key": "server-secret-key"},
+            custom_headers={"x-api-key": "server-secret-key"},
+        )
+
+        assert route_context["auth_header_names"] == ["x-api-key"]
+        assert route_context["auth_header_sources"] == [
+            "route_custom_header:x-api-key"
+        ]
+        assert route_context["auth_credential_source"] == "route_custom_header"
+        assert "server-secret-key" not in json.dumps(route_context)
 
     def test_build_passthrough_error_log_context_redacts_grok_side_channel_session_ids(
         self,
