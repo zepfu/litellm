@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import os
 import time
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
@@ -742,18 +743,15 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert "- /home/zepfu/.codex:/home/zepfu/.codex" in compose_text
-    assert (
-        "AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}"
-        in compose_text
-    )
-    assert (
-        "AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}"
-        in compose_text
-    )
-    assert (
-        "AAWM_CODEX_OAUTH_FORCE_REFRESH=${AAWM_CODEX_OAUTH_FORCE_REFRESH:-1}"
-        in compose_text
-    )
+    for expected_codex_setting in (
+        "AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}",
+        "AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}",
+        "AAWM_CODEX_AUTH_FILE_UID=${AAWM_CODEX_AUTH_FILE_UID:-1000}",
+        "AAWM_CODEX_AUTH_FILE_GID=${AAWM_CODEX_AUTH_FILE_GID:-1000}",
+        "AAWM_CODEX_AUTH_FILE_MODE=${AAWM_CODEX_AUTH_FILE_MODE:-0o600}",
+        "AAWM_CODEX_OAUTH_FORCE_REFRESH=${AAWM_CODEX_OAUTH_FORCE_REFRESH:-1}",
+    ):
+        assert expected_codex_setting in compose_text
     assert (
         "AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}"
         in compose_text
@@ -2611,11 +2609,15 @@ def test_refresh_codex_oauth_auth_file_writes_direct_response(
         "urlopen",
         fake_urlopen,
     )
+    lock_path = tmp_path / "codex.lock"
+    monkeypatch.setenv("AAWM_CODEX_AUTH_FILE_UID", str(os.getuid()))
+    monkeypatch.setenv("AAWM_CODEX_AUTH_FILE_GID", str(os.getgid()))
+    monkeypatch.setenv("AAWM_CODEX_AUTH_FILE_MODE", "0o600")
 
     summary = codex_oauth_refresh.refresh_codex_oauth_auth_file(
         auth_path,
         force=True,
-        lock_file=tmp_path / "codex.lock",
+        lock_file=lock_path,
         token_endpoint="https://auth.example/token",
         client_id="codex-client-id",
         http_timeout_seconds=12.5,
@@ -2633,6 +2635,53 @@ def test_refresh_codex_oauth_auth_file_writes_direct_response(
     assert persisted["last_refresh"] != "2026-01-01T00:00:00+00:00"
     assert "last_refresh" not in persisted["tokens"]
     assert auth_path.stat().st_mode & 0o777 == 0o600
+    assert auth_path.stat().st_uid == os.getuid()
+    assert auth_path.stat().st_gid == os.getgid()
+    assert lock_path.stat().st_mode & 0o777 == 0o600
+    assert lock_path.stat().st_uid == os.getuid()
+    assert lock_path.stat().st_gid == os.getgid()
+
+
+def test_refresh_codex_oauth_auth_file_repairs_metadata_when_skipped(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    lock_path = tmp_path / "auth.json.lock"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt(
+                        {"exp": int(time.time()) + 3600}
+                    ),
+                    "refresh_token": "codex-refresh-token",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_path.chmod(0o644)
+    lock_path.write_text("", encoding="utf-8")
+    lock_path.chmod(0o644)
+    monkeypatch.setenv("AAWM_CODEX_AUTH_FILE_UID", str(os.getuid()))
+    monkeypatch.setenv("AAWM_CODEX_AUTH_FILE_GID", str(os.getgid()))
+    monkeypatch.setenv("AAWM_CODEX_AUTH_FILE_MODE", "0o600")
+
+    summary = codex_oauth_refresh.refresh_codex_oauth_auth_file(
+        auth_path,
+        lock_file=lock_path,
+    )
+
+    assert summary["attempted"] is False
+    assert summary["refreshed"] is False
+    assert summary["skipped"] is True
+    assert auth_path.stat().st_mode & 0o777 == 0o600
+    assert auth_path.stat().st_uid == os.getuid()
+    assert auth_path.stat().st_gid == os.getgid()
+    assert lock_path.stat().st_mode & 0o777 == 0o600
+    assert lock_path.stat().st_uid == os.getuid()
+    assert lock_path.stat().st_gid == os.getgid()
 
 
 def test_refresh_codex_oauth_auth_file_reports_missing_refresh_token(
