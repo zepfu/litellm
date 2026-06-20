@@ -20409,8 +20409,14 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert metadata["grok_native_oauth_managed"] is True
     assert metadata["grok_model_override"] == "grok-composer-2.5-fast"
     assert metadata["model_group"] == "grok-composer-2.5-fast"
-    assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+    assert metadata["passthrough_route_family"] == (
+        "anthropic_grok_native_responses_adapter"
+    )
+    assert metadata["route_family"] == "anthropic_grok_native_responses_adapter"
+    assert metadata["grok_cli_chat_proxy_used"] is True
+    assert metadata["grok_cli_chat_proxy"] is True
     assert metadata["grok_native_entrypoint"] == "anthropic_messages"
+    assert "route:anthropic_grok_native_responses_adapter" in metadata["tags"]
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
     assert "anthropic-grok-native-responses-adapter" in metadata["tags"]
 
