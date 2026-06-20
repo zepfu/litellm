@@ -323,8 +323,13 @@ token, optional ID token, account ID, expiry, and top-level `last_refresh`
 timestamp atomically. The dev LiteLLM container mounts the same host directory
 read-only. In dev compose the sidecar runs with
 `AAWM_CODEX_OAUTH_REFRESH_ENABLED=1`,
-`AAWM_CODEX_AUTH_FILE=/home/zepfu/.codex/auth.json`, and a one-hour refresh
-interval.
+`AAWM_CODEX_AUTH_FILE=/home/zepfu/.codex/auth.json`, host-user ownership
+defaults `AAWM_CODEX_AUTH_FILE_UID=1000` and
+`AAWM_CODEX_AUTH_FILE_GID=1000`, private mode
+`AAWM_CODEX_AUTH_FILE_MODE=0o600`, and a one-hour refresh interval. The
+refresh path repairs both `auth.json` and `auth.json.lock` metadata while it
+holds the lock, including skipped refresh cycles, so root-owned or container
+UID-owned files do not prevent Codex from launching.
 
 Each Codex OAuth refresh attempt writes sanitized provider-auth telemetry into
 the same `provider_auth_observations` table and `provider_auth_current` view.

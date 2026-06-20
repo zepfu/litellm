@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import stat
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ DEFAULT_CODEX_OAUTH_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
 DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DEFAULT_CODEX_REFRESH_BUFFER_SECONDS = 300
 DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_CODEX_AUTH_FILE_MODE = 0o600
 
 _SECRET_FIELD_NAMES = {
     "access_token",
@@ -41,6 +43,7 @@ class CodexOAuthRefreshSummary:
     expires_at: Optional[str] = None
     error_class: Optional[str] = None
     error_message: Optional[str] = None
+    error_hint: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -52,6 +55,7 @@ class CodexOAuthRefreshSummary:
             "expires_at": self.expires_at,
             "error_class": self.error_class,
             "error_message": self.error_message,
+            "error_hint": self.error_hint,
         }
 
 
@@ -78,6 +82,10 @@ def refresh_codex_oauth_auth_file(
     with _credential_file_lock(resolved_lock_file):
         try:
             auth_data = _read_auth_data(resolved_auth_file)
+            _repair_credential_file_metadata(
+                resolved_auth_file,
+                resolved_lock_file,
+            )
             token_data = _get_token_data(auth_data)
             current_expires_at = _format_expires_at(_get_token_expiry(token_data))
             current_account_id = _extract_account_id(token_data)
@@ -120,7 +128,15 @@ def refresh_codex_oauth_auth_file(
                 auth_file=str(resolved_auth_file),
                 error_class=exc.__class__.__name__,
                 error_message=_sanitize_error_message(str(exc)),
+                error_hint=_extract_oauth_error_hint(exc),
             ).as_dict()
+
+
+@dataclass(frozen=True)
+class _CredentialFileMetadata:
+    uid: Optional[int]
+    gid: Optional[int]
+    mode: int
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
@@ -155,6 +171,79 @@ def _credential_file_lock(lock_path: Path) -> Iterator[None]:
         except (ImportError, OSError):
             pass
         handle.close()
+
+
+def _parse_optional_positive_int(value: Optional[str]) -> Optional[int]:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = int(str(value).strip(), 0)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _resolve_credential_file_mode_override() -> Optional[int]:
+    mode = _parse_optional_positive_int(os.getenv("AAWM_CODEX_AUTH_FILE_MODE"))
+    if mode is None:
+        return None
+    mode = mode & 0o777
+    if mode & 0o077:
+        return DEFAULT_CODEX_AUTH_FILE_MODE
+    return mode
+
+
+def _snapshot_credential_file_metadata(auth_path: Path) -> _CredentialFileMetadata:
+    if not auth_path.exists():
+        return _CredentialFileMetadata(
+            uid=None,
+            gid=None,
+            mode=DEFAULT_CODEX_AUTH_FILE_MODE,
+        )
+    file_stat = auth_path.stat()
+    return _CredentialFileMetadata(
+        uid=file_stat.st_uid,
+        gid=file_stat.st_gid,
+        mode=stat.S_IMODE(file_stat.st_mode),
+    )
+
+
+def _resolve_credential_file_metadata(auth_path: Path) -> _CredentialFileMetadata:
+    metadata = _snapshot_credential_file_metadata(auth_path)
+    uid_override = _parse_optional_positive_int(os.getenv("AAWM_CODEX_AUTH_FILE_UID"))
+    gid_override = _parse_optional_positive_int(os.getenv("AAWM_CODEX_AUTH_FILE_GID"))
+    mode_override = _resolve_credential_file_mode_override()
+    mode = mode_override if mode_override is not None else metadata.mode
+    if mode & 0o077:
+        mode = DEFAULT_CODEX_AUTH_FILE_MODE
+    return _CredentialFileMetadata(
+        uid=uid_override if uid_override is not None else metadata.uid,
+        gid=gid_override if gid_override is not None else metadata.gid,
+        mode=mode,
+    )
+
+
+def _apply_credential_file_metadata(
+    target_path: Path,
+    metadata: _CredentialFileMetadata,
+) -> None:
+    if metadata.uid is not None or metadata.gid is not None:
+        os.chown(
+            target_path,
+            metadata.uid if metadata.uid is not None else -1,
+            metadata.gid if metadata.gid is not None else -1,
+        )
+    os.chmod(target_path, metadata.mode)
+
+
+def _repair_credential_file_metadata(
+    auth_path: Path,
+    lock_path: Path,
+) -> None:
+    metadata = _resolve_credential_file_metadata(auth_path)
+    _apply_credential_file_metadata(auth_path, metadata)
+    if lock_path.exists():
+        _apply_credential_file_metadata(lock_path, metadata)
 
 
 def _read_auth_data(auth_path: Path) -> Dict[str, Any]:
@@ -266,13 +355,23 @@ def _refresh_token_data(
         method="POST",
     )
     try:
-        with urllib_request.urlopen(request, timeout=http_timeout_seconds) as response:
+        with urllib_request.urlopen(
+            request,
+            timeout=http_timeout_seconds,
+        ) as response:
             body = response.read()
     except urllib_error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise ValueError(
-            f"Codex OAuth refresh failed with HTTP {exc.code}: {_sanitize_error_message(body)}"
-        ) from exc
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = ""
+        hint = _extract_oauth_error_hint(error_body)
+        message = f"Codex OAuth refresh failed with HTTP {exc.code}"
+        if hint:
+            message += f": {hint}"
+        elif exc.reason:
+            message += f": {exc.reason}"
+        raise ValueError(message) from exc
     except urllib_error.URLError as exc:
         raise ValueError(
             f"Codex OAuth refresh failed: {_sanitize_error_message(str(exc.reason))}"
@@ -324,15 +423,13 @@ def _update_token_data(
 
 
 def _write_auth_data(auth_path: Path, auth_data: Mapping[str, Any]) -> None:
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = _resolve_credential_file_metadata(auth_path)
     tmp_path = auth_path.with_name(f".{auth_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
         payload = json.dumps(auth_data, indent=2) + "\n"
         tmp_path.write_text(payload, encoding="utf-8")
-        try:
-            current_mode = auth_path.stat().st_mode & 0o777
-            os.chmod(tmp_path, current_mode)
-        except OSError:
-            pass
+        _apply_credential_file_metadata(tmp_path, metadata)
         os.replace(tmp_path, auth_path)
     except (OSError, TypeError, ValueError) as exc:
         try:
@@ -376,6 +473,19 @@ def _clean_string(value: Any) -> Optional[str]:
         return stripped or None
     return None
 
+
+def _extract_oauth_error_hint(response_body: Any) -> Optional[str]:
+    try:
+        payload = json.loads(response_body)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("error", "error_description", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _sanitize_error_message(value.strip())
+    return None
 
 def _sanitize_error_message(message: str, *, limit: int = 500) -> str:
     sanitized = str(message)
