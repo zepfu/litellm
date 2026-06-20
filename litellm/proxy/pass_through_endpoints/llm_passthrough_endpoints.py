@@ -3116,6 +3116,8 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("RATE_LIMIT_EXCEEDED")
     if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
+    if "aawm_auto_agent_failed_responses_payload" in text_lower:
+        tokens.add("aawm_auto_agent_failed_responses_payload")
     if (
         "error from provider (deepseek)" in text_lower
         and "assistant message with 'tool_calls' must be followed by tool messages"
@@ -3185,6 +3187,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "provider_format_rejected"
     if "OPENROUTER_INVALID_CHAT_MESSAGE" in tokens:
         return "provider_format_rejected"
+    if "aawm_auto_agent_failed_responses_payload" in tokens:
+        return "provider_terminal_error"
     if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
         return "rate_limited"
     if status_code == 429:
@@ -12623,11 +12627,25 @@ def _build_anthropic_response_from_responses_response(
     reject_empty_success: bool = False,
     diagnostic_context: Optional[dict[str, Any]] = None,
     use_codex_native_tools: bool = False,
+    retryable_failed_response: bool = False,
+    failed_response_adapter_model: Optional[str] = None,
+    failed_response_adapter: str = "anthropic_responses_adapter",
+    failed_response_adapter_label: str = "Responses",
 ) -> Response:
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
         LiteLLMAnthropicToResponsesAPIAdapter,
     )
     from litellm.types.llms.openai import ResponsesAPIResponse
+
+    if _is_failed_responses_body(response_body):
+        _raise_responses_adapter_failed_response(
+            response_body=response_body,
+            adapter_model=failed_response_adapter_model
+            or str(response_body.get("model") or "unknown-model"),
+            adapter=failed_response_adapter,
+            adapter_label=failed_response_adapter_label,
+            retryable_alias_candidate=retryable_failed_response,
+        )
 
     if reject_empty_success and _is_empty_success_responses_body(response_body):
         diagnostic = _build_empty_success_responses_diagnostic(
@@ -13077,6 +13095,31 @@ def _is_empty_success_responses_body(response_body: dict[str, Any]) -> bool:
     return True
 
 
+def _is_failed_responses_body(response_body: dict[str, Any]) -> bool:
+    return (
+        response_body.get("status") == "failed"
+        or response_body.get("error") is not None
+    )
+
+
+async def _validate_alias_candidate_responses_stream_if_needed(
+    response: Response,
+    *,
+    enabled: bool,
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+) -> Response:
+    if not enabled or not isinstance(response, StreamingResponse):
+        return response
+    return await _validate_codex_auto_agent_responses_payload(
+        response,
+        adapter_model=adapter_model,
+        adapter=adapter,
+        adapter_label=adapter_label,
+    )
+
+
 def _is_codex_auto_agent_empty_success_responses_body(
     response_body: dict[str, Any],
 ) -> bool:
@@ -13227,6 +13270,167 @@ def _raise_codex_auto_agent_empty_success_response(
         },
     )
     raise exc
+
+
+def _build_failed_responses_diagnostic(
+    *,
+    response_body: dict[str, Any],
+    adapter: str,
+    adapter_model: str,
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    output = response_body.get("output") or []
+    diagnostic: dict[str, Any] = {
+        "adapter": adapter,
+        "adapter_model": adapter_model,
+        "response_id": response_body.get("id"),
+        "status": response_body.get("status"),
+        "model": response_body.get("model"),
+        "error": response_body.get("error"),
+        "incomplete_details": response_body.get("incomplete_details"),
+        "output_count": len(output) if isinstance(output, list) else 0,
+        "output_types": [
+            item.get("type") for item in output[:20] if isinstance(item, dict)
+        ]
+        if isinstance(output, list)
+        else [],
+    }
+    if stream_event_summaries is not None:
+        diagnostic["stream_events"] = stream_event_summaries
+    return diagnostic
+
+
+def _raise_codex_auto_agent_failed_responses_payload(
+    *,
+    response_body: dict[str, Any],
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    diagnostic = _build_failed_responses_diagnostic(
+        response_body=response_body,
+        adapter=adapter,
+        adapter_model=adapter_model,
+        stream_event_summaries=stream_event_summaries,
+    )
+    exc = ProxyException(
+        message=(
+            f"Auto-agent {adapter_label} candidate returned a failed Responses "
+            "payload."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_auto_agent_failed_responses_payload",
+                "status": "RESPONSES_STATUS_FAILED",
+                "type": "rate_limit_error",
+            },
+            "diagnostic": diagnostic,
+        },
+    )
+    raise exc
+
+
+def _raise_responses_adapter_failed_response(
+    *,
+    response_body: dict[str, Any],
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+    retryable_alias_candidate: bool = False,
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    if retryable_alias_candidate:
+        _raise_codex_auto_agent_failed_responses_payload(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter=adapter,
+            adapter_label=adapter_label,
+            stream_event_summaries=stream_event_summaries,
+        )
+
+    diagnostic = _build_failed_responses_diagnostic(
+        response_body=response_body,
+        adapter=adapter,
+        adapter_model=adapter_model,
+        stream_event_summaries=stream_event_summaries,
+    )
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "error": f"{adapter_label} Responses adapter returned a failed response.",
+            "diagnostic": diagnostic,
+        },
+    )
+
+
+async def _validate_codex_auto_agent_responses_payload(
+    response: Response,
+    *,
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+) -> Response:
+    if isinstance(response, StreamingResponse):
+        buffered_chunks: list[Any] = []
+        event_summaries: list[dict[str, Any]] = []
+
+        async def _recording_iterator() -> Any:
+            async for raw_chunk in response.body_iterator:
+                buffered_chunks.append(raw_chunk)
+                yield raw_chunk
+
+        recording_response = StreamingResponse(
+            _recording_iterator(),
+            headers=dict(response.headers),
+            status_code=response.status_code,
+            media_type=response.media_type or "text/event-stream",
+        )
+        response_body = await _collect_responses_response_from_stream(
+            recording_response,
+            event_summaries=event_summaries,
+        )
+        if _is_failed_responses_body(response_body):
+            _raise_codex_auto_agent_failed_responses_payload(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                stream_event_summaries=event_summaries,
+            )
+
+        async def _replay_iterator() -> Any:
+            for raw_chunk in buffered_chunks:
+                yield raw_chunk
+
+        return StreamingResponse(
+            _replay_iterator(),
+            headers=dict(response.headers),
+            status_code=response.status_code,
+            media_type=response.media_type or "text/event-stream",
+        )
+
+    if isinstance(response, Response) and not isinstance(response, StreamingResponse):
+        try:
+            response_body = json.loads(_decode_http_response_body(response.body))
+        except Exception:
+            return response
+        if isinstance(response_body, dict) and _is_failed_responses_body(response_body):
+            _raise_codex_auto_agent_failed_responses_payload(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+            )
+    return response
 
 
 def _responses_output_stream_key(
@@ -14235,6 +14439,49 @@ async def _handle_codex_google_code_assist_adapter_route(
     )
 
 
+async def _resolve_anthropic_openai_responses_adapter_auth_context(
+    request: Request,
+) -> tuple[dict[str, Any], bool, bool, Optional[str]]:
+    local_codex_headers = None
+    has_client_auth = _anthropic_adapter_request_has_openai_client_auth(request)
+    uses_codex_native_auth = _anthropic_adapter_request_uses_codex_native_auth(request)
+    if not has_client_auth:
+        local_codex_headers = await _load_local_codex_auth_headers(request)
+
+    custom_headers: dict[str, Any] = {}
+    forward_headers = _anthropic_adapter_should_forward_direct_auth_headers(request)
+    if local_codex_headers is not None:
+        custom_headers = local_codex_headers
+        forward_headers = False
+    elif not has_client_auth:
+        openai_api_key = passthrough_endpoint_router.get_credentials(
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            region_name=None,
+        )
+        if openai_api_key is None:
+            raise Exception(
+                "Anthropic adapter requests for OpenAI/Codex models require forwarded OpenAI/Codex auth headers or 'OPENAI_API_KEY' in environment."
+            )
+        custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+            api_key=openai_api_key,
+            request=request,
+        )
+        forward_headers = False
+
+    use_chatgpt_codex_defaults = (
+        uses_codex_native_auth or local_codex_headers is not None
+    )
+    egress_credential_family = (
+        "openai" if local_codex_headers is not None else None
+    )
+    return (
+        custom_headers,
+        forward_headers,
+        use_chatgpt_codex_defaults,
+        egress_credential_family,
+    )
+
+
 async def _handle_anthropic_openai_responses_adapter_route(
     *,
     endpoint: str,
@@ -14246,13 +14493,12 @@ async def _handle_anthropic_openai_responses_adapter_route(
     use_alias_candidate_probe: bool = False,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
-    local_codex_headers = None
-    has_client_auth = _anthropic_adapter_request_has_openai_client_auth(request)
-    uses_codex_native_auth = _anthropic_adapter_request_uses_codex_native_auth(request)
-    if not has_client_auth:
-        local_codex_headers = await _load_local_codex_auth_headers(request)
-
-    use_chatgpt_codex_defaults = uses_codex_native_auth or local_codex_headers is not None
+    (
+        custom_headers,
+        forward_headers,
+        use_chatgpt_codex_defaults,
+        egress_credential_family,
+    ) = await _resolve_anthropic_openai_responses_adapter_auth_context(request)
     (
         prepared_request_body,
         openai_context_compacted_count,
@@ -14328,26 +14574,6 @@ async def _handle_anthropic_openai_responses_adapter_route(
         normalized_endpoint,
         litellm.LlmProviders.OPENAI.value,
     )
-    forward_headers = _anthropic_adapter_should_forward_direct_auth_headers(request)
-    custom_headers: dict[str, Any] = {}
-
-    if local_codex_headers is not None:
-        custom_headers = local_codex_headers
-        forward_headers = False
-    elif not has_client_auth:
-        openai_api_key = passthrough_endpoint_router.get_credentials(
-            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-            region_name=None,
-        )
-        if openai_api_key is None:
-            raise Exception(
-                "Anthropic adapter requests for OpenAI/Codex models require forwarded OpenAI/Codex auth headers or 'OPENAI_API_KEY' in environment."
-            )
-        custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
-            api_key=openai_api_key,
-            request=request,
-        )
-        forward_headers = False
 
     upstream_response = await pass_through_request(
         request=request,
@@ -14360,7 +14586,7 @@ async def _handle_anthropic_openai_responses_adapter_route(
         allowed_pass_through_prefixed_headers=list(_ANTHROPIC_ADAPTER_OPENAI_XPASS_HEADER_ALLOWLIST),
         stream=bool(translated_request_body.get("stream")),
         custom_llm_provider=adapter_provider,
-        egress_credential_family="openai" if local_codex_headers is not None else None,
+        egress_credential_family=egress_credential_family,
         expected_target_family="openai",
         retryable_upstream_status_codes=[429],
         caller_managed_hidden_retry=use_alias_candidate_probe,
@@ -14368,6 +14594,13 @@ async def _handle_anthropic_openai_responses_adapter_route(
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
     if isinstance(upstream_response, StreamingResponse):
+        upstream_response = await _validate_alias_candidate_responses_stream_if_needed(
+            upstream_response,
+            enabled=use_alias_candidate_probe,
+            adapter_model=adapter_model,
+            adapter="anthropic_openai_responses_adapter",
+            adapter_label="OpenAI",
+        )
         if not client_requested_stream:
             response_body = await _collect_responses_response_from_stream(
                 upstream_response
@@ -14375,6 +14608,10 @@ async def _handle_anthropic_openai_responses_adapter_route(
             translated_response = _build_anthropic_response_from_responses_response(
                 response_body,
                 use_codex_native_tools=use_chatgpt_codex_defaults,
+                retryable_failed_response=use_alias_candidate_probe,
+                failed_response_adapter_model=adapter_model,
+                failed_response_adapter="anthropic_openai_responses_adapter",
+                failed_response_adapter_label="OpenAI",
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -14399,6 +14636,10 @@ async def _handle_anthropic_openai_responses_adapter_route(
     translated_response = _build_anthropic_response_from_responses_response(
         response_body,
         use_codex_native_tools=use_chatgpt_codex_defaults,
+        retryable_failed_response=use_alias_candidate_probe,
+        failed_response_adapter_model=adapter_model,
+        failed_response_adapter="anthropic_openai_responses_adapter",
+        failed_response_adapter_label="OpenAI",
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -14525,12 +14766,23 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
     if isinstance(upstream_response, StreamingResponse):
+        upstream_response = await _validate_alias_candidate_responses_stream_if_needed(
+            upstream_response,
+            enabled=use_alias_candidate_probe,
+            adapter_model=adapter_model,
+            adapter="anthropic_xai_oauth_responses_adapter",
+            adapter_label="xAI OAuth",
+        )
         if not client_requested_stream:
             response_body = await _collect_responses_response_from_stream(
                 upstream_response
             )
             translated_response = _build_anthropic_response_from_responses_response(
-                response_body
+                response_body,
+                retryable_failed_response=use_alias_candidate_probe,
+                failed_response_adapter_model=adapter_model,
+                failed_response_adapter="anthropic_xai_oauth_responses_adapter",
+                failed_response_adapter_label="xAI OAuth",
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -14552,7 +14804,11 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
 
     response_body = json.loads(_decode_http_response_body(upstream_response.body))
     translated_response = _build_anthropic_response_from_responses_response(
-        response_body
+        response_body,
+        retryable_failed_response=use_alias_candidate_probe,
+        failed_response_adapter_model=adapter_model,
+        failed_response_adapter="anthropic_xai_oauth_responses_adapter",
+        failed_response_adapter_label="xAI OAuth",
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -14682,12 +14938,23 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
         raise
 
     if isinstance(upstream_response, StreamingResponse):
+        upstream_response = await _validate_alias_candidate_responses_stream_if_needed(
+            upstream_response,
+            enabled=use_alias_candidate_probe,
+            adapter_model=adapter_model,
+            adapter="anthropic_grok_native_responses_adapter",
+            adapter_label="Grok native",
+        )
         if not client_requested_stream:
             response_body = await _collect_responses_response_from_stream(
                 upstream_response
             )
             translated_response = _build_anthropic_response_from_responses_response(
-                response_body
+                response_body,
+                retryable_failed_response=use_alias_candidate_probe,
+                failed_response_adapter_model=adapter_model,
+                failed_response_adapter="anthropic_grok_native_responses_adapter",
+                failed_response_adapter_label="Grok native",
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -14709,7 +14976,11 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
 
     response_body = json.loads(_decode_http_response_body(upstream_response.body))
     translated_response = _build_anthropic_response_from_responses_response(
-        response_body
+        response_body,
+        retryable_failed_response=use_alias_candidate_probe,
+        failed_response_adapter_model=adapter_model,
+        failed_response_adapter="anthropic_grok_native_responses_adapter",
+        failed_response_adapter_label="Grok native",
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -15087,6 +15358,7 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     client_requested_stream = bool(prepared_request_body.get("stream"))
     (
@@ -15182,6 +15454,13 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
     _annotate_request_scope_for_adapted_access_log(request, target_url)
 
     if isinstance(upstream_response, StreamingResponse):
+        upstream_response = await _validate_alias_candidate_responses_stream_if_needed(
+            upstream_response,
+            enabled=use_alias_candidate_probe,
+            adapter_model=adapter_model,
+            adapter="anthropic_openrouter_responses_adapter",
+            adapter_label="OpenRouter",
+        )
         if not client_requested_stream:
             response_event_summaries: list[dict[str, Any]] = []
             response_body = await _collect_responses_response_from_stream(
@@ -15198,6 +15477,10 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
                     "request_model": translated_request_body.get("model"),
                     "request_stream": translated_request_body.get("stream"),
                 },
+                retryable_failed_response=use_alias_candidate_probe,
+                failed_response_adapter_model=adapter_model,
+                failed_response_adapter="anthropic_openrouter_responses_adapter",
+                failed_response_adapter_label="OpenRouter",
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -15228,6 +15511,10 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
             "request_model": translated_request_body.get("model"),
             "request_stream": translated_request_body.get("stream"),
         },
+        retryable_failed_response=use_alias_candidate_probe,
+        failed_response_adapter_model=adapter_model,
+        failed_response_adapter="anthropic_openrouter_responses_adapter",
+        failed_response_adapter_label="OpenRouter",
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -22004,6 +22291,7 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=candidate_body,
                 adapter_model=candidate["model"],
+                use_alias_candidate_probe=True,
             )
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         if candidate.get("route_family") == "anthropic_xai_oauth_responses_adapter":
@@ -24008,7 +24296,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     assert grok_context is not None
     _, grok_headers, grok_prepared_body, updated_url = grok_context
     try:
-        return await pass_through_request(
+        response = await pass_through_request(
             request=request,
             target=updated_url,
             custom_headers=grok_headers,
@@ -24026,6 +24314,12 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         if _grok_native_candidate_unavailable_detail(exc) is not None:
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
         raise
+    return await _validate_codex_auto_agent_responses_payload(
+        response,
+        adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
+        adapter="codex_auto_agent_grok_native_responses",
+        adapter_label="Grok native",
+    )
 
 
 async def _perform_codex_auto_agent_oa_xai_responses_request(
@@ -24056,7 +24350,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     assert oa_xai_context is not None
     _, oa_xai_api_key, oa_xai_prepared_body, updated_url = oa_xai_context
     try:
-        return await pass_through_request(
+        response = await pass_through_request(
             request=request,
             target=updated_url,
             custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
@@ -24077,6 +24371,12 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
             _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
         raise
+    return await _validate_codex_auto_agent_responses_payload(
+        response,
+        adapter_model=str(oa_xai_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
+        adapter="codex_auto_agent_xai_oauth_responses",
+        adapter_label="xAI OAuth",
+    )
 
 
 async def _validate_codex_auto_agent_openrouter_responses_stream(
@@ -24123,6 +24423,14 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
         _raise_codex_auto_agent_empty_success_response(
             response_body=response_body,
             adapter_model=adapter_model,
+            stream_event_summaries=event_summaries,
+        )
+    if _is_failed_responses_body(response_body):
+        _raise_codex_auto_agent_failed_responses_payload(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter="codex_auto_agent_openrouter_responses",
+            adapter_label="OpenRouter",
             stream_event_summaries=event_summaries,
         )
 
@@ -24218,6 +24526,13 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
             _raise_codex_auto_agent_empty_success_response(
                 response_body=response_body,
                 adapter_model=adapter_model,
+            )
+        if isinstance(response_body, dict) and _is_failed_responses_body(response_body):
+            _raise_codex_auto_agent_failed_responses_payload(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter="codex_auto_agent_openrouter_responses",
+                adapter_label="OpenRouter",
             )
     return response
 
