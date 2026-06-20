@@ -163,6 +163,24 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
+## Anthropic Adapter Usage Visibility
+
+Anthropic-compatible adapter streams can expose client-visible usage estimates
+for Claude Code without changing provider-truth reporting. When a non-Anthropic
+Responses adapter has enough request context, the streamed `message_start`
+event may include an estimated Anthropic-shaped `usage.input_tokens` value so
+Claude Code can show activity before the terminal provider usage arrives.
+
+The terminal `message_delta.usage` remains provider-reported when upstream
+usage is available, and fallback usage remains marked in
+`litellm_metadata.anthropic_adapter_client_visible_usage_source`. Estimated
+message-start usage is marked separately with
+`anthropic_adapter_message_start_usage_source=estimated` and
+`anthropic_adapter_message_start_usage_estimated=true`. These client-visible
+fields must not be treated as canonical provider token or cost truth for
+`session_history`; canonical token and cost columns continue to come from the
+normal upstream usage and cost calculation path.
+
 ## Low Alias Candidates (D1-322)
 
 `aawm-low` and `aawm-low-anthropic` now prepend the default low-alias
@@ -663,6 +681,12 @@ Related route metadata distinguishes Codex and native Grok traffic:
 - Native Grok Composer passthrough traffic uses
   `openai_passthrough_route_family=openai_responses` and
   `passthrough_route_family=grok_cli_chat_proxy`.
+- Anthropic Grok native Responses adapter traffic preserves the selected
+  adapter route family, for example
+  `passthrough_route_family=anthropic_grok_native_responses_adapter`, while
+  retaining Grok transport/auth/quota metadata such as
+  `grok_cli_chat_proxy=true`, `grok_cli_chat_proxy_used=true`, and
+  `route:grok_cli_chat_proxy`.
 - Managed `oa_xai/*` traffic should still be reported as provider `xai` while
   preserving the public `oa_xai/*` model/model_group label.
 
