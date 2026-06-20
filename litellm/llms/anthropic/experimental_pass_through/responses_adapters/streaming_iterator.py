@@ -12,7 +12,9 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.transformation im
     sanitize_anthropic_tool_use_input_json_delta,
 )
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+    AnthropicResponsesProviderError,
     LiteLLMAnthropicToResponsesAPIAdapter,
+    raise_for_failed_responses_response,
 )
 
 
@@ -890,6 +892,10 @@ class AnthropicResponsesStreamWrapper:
                 raise self._empty_success_error("completed_without_output")
 
             if response_obj is not None:
+                raise_for_failed_responses_response(
+                    response_obj,
+                    context=f"Anthropic Responses stream event {event_type}",
+                )
                 status = getattr(response_obj, "status", None)
                 if status == "incomplete":
                     stop_reason = "max_tokens"
@@ -906,6 +912,10 @@ class AnthropicResponsesStreamWrapper:
                     cache_read_tokens = int(
                         getattr(usage, "cache_read_input_tokens", 0) or 0
                     )
+            elif event_type == "response.failed":
+                raise AnthropicResponsesProviderError(
+                    "Anthropic Responses stream emitted response.failed without a response payload."
+                )
 
             # Check if tool_use was in the output to override stop_reason
             if response_obj is not None:
@@ -962,6 +972,9 @@ class AnthropicResponsesStreamWrapper:
         except StopAsyncIteration:
             pass
         except AnthropicResponsesEmptySuccessError as e:
+            verbose_logger.error(str(e))
+            raise
+        except AnthropicResponsesProviderError as e:
             verbose_logger.error(str(e))
             raise
         except Exception as e:

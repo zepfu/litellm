@@ -96,6 +96,9 @@ _FINISH_REASON_MAP: dict[str, OpenAIChatCompletionFinishReason] = {
     "tool_calls": "tool_calls",
     "function_call": "function_call",
     "content_filter": "content_filter",
+    # Provider terminal errors have no OpenAI chat finish_reason equivalent.
+    # Preserve the raw value via native_finish_reason while avoiding a clean stop.
+    "error": "content_filter",
     # Anthropic Sonnet 4
     "content_filtered": "content_filter",
 }

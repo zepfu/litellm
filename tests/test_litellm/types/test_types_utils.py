@@ -1,13 +1,9 @@
-import asyncio
 import os
 import sys
-from typing import Optional
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
 sys.path.insert(0, os.path.abspath("../.."))
-import json
 
 from litellm.types.utils import HiddenParams
 
@@ -265,6 +261,13 @@ class TestNativeFinishReason:
         choice = Choices(finish_reason="SAFETY")
         assert choice.finish_reason == "content_filter"
         assert choice.provider_specific_fields["native_finish_reason"] == "SAFETY"
+
+    def test_error_reason_exposed_without_mapping_to_stop(self):
+        from litellm.types.utils import Choices
+
+        choice = Choices(finish_reason="error")
+        assert choice.finish_reason == "content_filter"
+        assert choice.provider_specific_fields["native_finish_reason"] == "error"
 
     def test_anthropic_tool_use_reason_exposed(self):
         from litellm.types.utils import Choices

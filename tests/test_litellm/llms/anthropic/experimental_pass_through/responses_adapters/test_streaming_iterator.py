@@ -4,6 +4,7 @@ import pytest
 
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
     AnthropicResponsesEmptySuccessError,
+    AnthropicResponsesProviderError,
     AnthropicResponsesStreamWrapper,
 )
 
@@ -88,6 +89,30 @@ async def test_stream_wrapper_emits_mcp_tool_use_and_result_blocks():
     }
     assert chunks[6]["delta"]["stop_reason"] == "end_turn"
     assert chunks[6]["usage"] == {"input_tokens": 10, "output_tokens": 5}
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_failed_response_raises_provider_error():
+    response_obj = SimpleNamespace(
+        status="failed",
+        error={"message": "provider failed"},
+        usage=SimpleNamespace(input_tokens=10, output_tokens=0),
+        output=[],
+    )
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.failed", response=response_obj),
+        ),
+        model="gpt-5.4",
+    )
+
+    with pytest.raises(AnthropicResponsesProviderError) as exc_info:
+        async for _ in wrapper:
+            pass
+
+    assert "failed response" in str(exc_info.value)
+    assert "provider failed" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
