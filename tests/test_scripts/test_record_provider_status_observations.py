@@ -598,9 +598,14 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE",
         "AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS",
         "AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS",
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED",
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS",
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS",
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR",
         "LITELLM_XAI_GROK_CLIENT_VERSION",
         "LITELLM_XAI_GROK_CLIENT_IDENTIFIER",
         "LITELLM_XAI_GROK_XAI_TOKEN_AUTH",
+        "LITELLM_AAWM_ERROR_LOG_DIR",
     ):
         monkeypatch.delenv(env_name, raising=False)
 
@@ -634,6 +639,10 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.grok_billing_include_model_override is True
     assert config.grok_billing_poll_max_attempts == 3
     assert config.grok_billing_poll_retry_backoff_seconds == 0.5
+    assert config.observability_anomaly_scan_enabled is False
+    assert config.observability_anomaly_scan_interval_seconds == 3600.0
+    assert config.observability_anomaly_scan_lookback_hours == 4.0
+    assert config.observability_anomaly_scan_error_log_dir == "/app/.analysis"
 
 
 def test_loop_config_uses_explicit_direct_schema_dsn(monkeypatch) -> None:
@@ -800,6 +809,29 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "COPY scripts/codex_oauth_refresh.py "
         "/app/scripts/codex_oauth_refresh.py"
     ) in dockerfile_text
+
+
+def test_provider_status_compose_wires_observability_anomaly_scan() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    compose_text = (repo_root / "docker-compose.dev.yml").read_text()
+
+    assert "- ./.analysis:/app/.analysis" in compose_text
+    assert (
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED=${AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS=${AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS:-3600}"
+        in compose_text
+    )
+    assert (
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS=${AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS:-4}"
+        in compose_text
+    )
+    assert (
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR=${AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR:-/app/.analysis}"
+        in compose_text
+    )
 
 
 def test_provider_status_compose_wires_managed_xai_oauth_sidecar_refresh() -> None:
@@ -1486,6 +1518,23 @@ def test_loop_config_reads_grok_billing_http_method_override(monkeypatch) -> Non
     config = loop.parse_config([])
 
     assert config.grok_billing_http_method == "POST"
+
+
+def test_loop_config_reads_observability_anomaly_scan_env_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED", "1")
+    monkeypatch.setenv("AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS", "1800")
+    monkeypatch.setenv("AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS", "6")
+    monkeypatch.setenv(
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR",
+        "/tmp/aawm-errors",
+    )
+
+    config = loop.parse_config([])
+
+    assert config.observability_anomaly_scan_enabled is True
+    assert config.observability_anomaly_scan_interval_seconds == 1800.0
+    assert config.observability_anomaly_scan_lookback_hours == 6.0
+    assert config.observability_anomaly_scan_error_log_dir == "/tmp/aawm-errors"
 
 
 def test_grok_billing_request_contract_summary_includes_safe_diagnostics() -> None:
@@ -2278,6 +2327,256 @@ def test_run_due_sidecar_tasks_reports_grok_billing_auth_failure_once(
     assert events[0]["attempt_count"] == 1
     assert events[0]["retry_count"] == 0
     assert events[0]["error_class"] == "GrokBillingPollError"
+
+
+def test_run_due_sidecar_tasks_skips_when_observability_anomaly_scan_disabled(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_enabled=False,
+        observability_anomaly_scan_enabled=False,
+        observability_anomaly_scan_error_log_dir=str(tmp_path),
+    )
+
+    monkeypatch.setattr(
+        loop,
+        "_collect_observability_anomalies",
+        lambda *_args, **_kwargs: pytest.fail("Anomaly scan should not run"),
+    )
+
+    assert loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    ) == []
+
+
+def test_run_due_sidecar_tasks_throttles_observability_anomaly_scan(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_enabled=False,
+        observability_anomaly_scan_enabled=True,
+        observability_anomaly_scan_interval_seconds=3600.0,
+        observability_anomaly_scan_lookback_hours=4.0,
+        observability_anomaly_scan_error_log_dir=str(tmp_path),
+    )
+    calls = {"scan": 0}
+
+    def fake_collect(_config):
+        calls["scan"] += 1
+        return []
+
+    monkeypatch.setattr(loop, "_collect_observability_anomalies", fake_collect)
+
+    state = loop.SidecarTaskState()
+    first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
+    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
+
+    assert calls == {"scan": 2}
+    assert first_events[0]["event"] == "observability_anomaly_scan"
+    assert first_events[0]["status"] == "healthy"
+    assert first_events[0]["anomaly_count"] == 0
+    assert first_events[0]["error_log_record_count"] == 0
+    assert second_events == []
+    assert third_events[0]["event"] == "observability_anomaly_scan"
+
+
+def test_run_due_sidecar_tasks_writes_observability_anomaly_jsonl(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_enabled=False,
+        observability_anomaly_scan_enabled=True,
+        observability_anomaly_scan_error_log_dir=str(tmp_path),
+    )
+    anomalies = [
+        {
+            "anomaly_class": "missing_repository_for_agent_context",
+            "expected": "repository should be derivable",
+            "row_count": 2,
+            "examples": [
+                {
+                    "row_id": 123,
+                    "session_id": "session-123",
+                    "model": "grok-composer-2.5-fast",
+                    "client_name": "Grok",
+                }
+            ],
+        }
+    ]
+
+    monkeypatch.setattr(
+        loop,
+        "_collect_observability_anomalies",
+        lambda _config: anomalies,
+    )
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    error_path = tmp_path / "dev-error.jsonl"
+    lines = error_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert events[0]["event"] == "observability_anomaly_scan"
+    assert events[0]["status"] == "anomalies_found"
+    assert events[0]["anomaly_count"] == 1
+    assert events[0]["error_log_record_count"] == 1
+    assert events[0]["error_log_path"] == str(error_path)
+    assert record["event"] == "aawm_observability_anomaly"
+    assert record["environment"] == "dev"
+    assert record["anomaly_class"] == "missing_repository_for_agent_context"
+    assert record["row_count"] == 2
+    assert record["examples"][0]["row_id"] == 123
+    assert ".analysis/todo.md" in record["recommended_todo"]
+    assert "Clean up" in record["cleanup_requirement"]
+
+
+def test_run_due_sidecar_tasks_reports_observability_anomaly_scan_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_enabled=False,
+        observability_anomaly_scan_enabled=True,
+        observability_anomaly_scan_error_log_dir=str(tmp_path),
+    )
+
+    def fake_collect(_config):
+        raise RuntimeError("database unavailable with token=secret-value")
+
+    monkeypatch.setattr(loop, "_collect_observability_anomalies", fake_collect)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    assert events[0]["event"] == "observability_anomaly_scan"
+    assert events[0]["status"] == "scan_failed"
+    assert events[0]["error_class"] == "RuntimeError"
+    assert "REDACTED" in events[0]["error_message"]
+    assert "secret-value" not in events[0]["error_message"]
+    assert not (tmp_path / "dev-error.jsonl").exists()
+
+
+def test_collect_observability_anomalies_runs_read_only_queries(monkeypatch) -> None:
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.execute_calls = []
+            self.description = []
+            self.rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def execute(self, statement, params=None) -> None:
+            self.execute_calls.append((statement, params))
+            if statement == loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL:
+                self.description = [
+                    ("anomaly_class",),
+                    ("expected",),
+                    ("row_count",),
+                    ("examples",),
+                ]
+                self.rows = [
+                    (
+                        "missing_provider",
+                        "provider should be populated",
+                        2,
+                        [{"row_id": 123}],
+                    )
+                ]
+            elif statement == loop.OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL:
+                self.description = [
+                    ("anomaly_class",),
+                    ("expected",),
+                    ("row_count",),
+                    ("examples",),
+                ]
+                self.rows = [
+                    (
+                        "stale_rate_limit_reset_with_recent_traffic",
+                        "reset should be future",
+                        0,
+                        [],
+                    )
+                ]
+            else:
+                self.description = []
+                self.rows = []
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.cursor_instance = FakeCursor()
+            self.rollback_count = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def cursor(self):
+            return self.cursor_instance
+
+        def rollback(self) -> None:
+            self.rollback_count += 1
+
+    fake_conn = FakeConnection()
+    config = _grok_billing_poll_config(
+        grok_billing_poll_enabled=False,
+        observability_anomaly_scan_enabled=True,
+        observability_anomaly_scan_lookback_hours=6.0,
+    )
+
+    monkeypatch.setattr(loop, "_resolve_dsn", lambda _config: "postgresql://example/db")
+    monkeypatch.setattr(loop.probes.psycopg, "connect", lambda _dsn: fake_conn)
+
+    anomalies = loop._collect_observability_anomalies(config)
+
+    assert anomalies == [
+        {
+            "anomaly_class": "missing_provider",
+            "expected": "provider should be populated",
+            "row_count": 2,
+            "examples": [{"row_id": 123}],
+        }
+    ]
+    assert fake_conn.rollback_count == 0
+    assert fake_conn.cursor_instance.execute_calls[:3] == [
+        (
+            "SELECT set_config('application_name', %s, false)",
+            ("aawm-provider-status-observations-anomaly-scan",),
+        ),
+        ("SELECT set_config('lock_timeout', %s, true)", ("1000ms",)),
+        ("SELECT set_config('statement_timeout', %s, true)", ("5000ms",)),
+    ]
+    assert fake_conn.cursor_instance.execute_calls[3:] == [
+        (
+            loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL,
+            (6.0, 6.0, loop.OBSERVABILITY_ANOMALY_SAMPLE_LIMIT),
+        ),
+        (
+            loop.OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL,
+            (6.0, loop.OBSERVABILITY_ANOMALY_SAMPLE_LIMIT),
+        ),
+    ]
 
 
 def test_refresh_antigravity_oauth_token_file_writes_direct_response(

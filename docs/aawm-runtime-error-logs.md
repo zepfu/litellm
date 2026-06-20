@@ -10,6 +10,14 @@ During the migration window, agents should also inspect legacy
 `.analysis/*-error.log` files. Those plain-text files are retained for discovery
 only until all writers and intake instructions have moved to JSONL.
 
+The provider-status observations sidecar can also append
+structured anomaly rows to the same `<environment>-error.jsonl` convention when
+`AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED=1`. Those rows come from the scheduled
+session-history/rate-limit anomaly scan in
+`scripts/run_provider_status_observations_loop.py`, not from LiteLLM `ERROR`
+logging. See `docs/aawm-provider-status-observations.md` for the sidecar env vars
+and scan behavior.
+
 ## Enablement
 
 Set `LITELLM_AAWM_ERROR_LOG_ENABLED=1` to enable the sink. The target directory
@@ -73,6 +81,24 @@ Practical `context` fields to inspect are:
 - `grok_side_channel_request_body_digest_source`
 - `grok_side_channel_request_json_container_type`
 - `grok_side_channel_request_array_length`
+
+Sidecar anomaly intake lines use the same append-safe JSONL file convention but a
+different event shape. Each detected anomaly class is written as one line with
+`event=aawm_observability_anomaly`. Practical fields to inspect are:
+
+- `anomaly_class`
+- `anomaly_source`
+- `lookback_hours`
+- `row_count`
+- `expected`
+- `examples`
+- `recommended_todo`
+- `cleanup_requirement`
+
+These records summarize telemetry consistency findings from recent database rows.
+They are not traceback-style LiteLLM runtime failures and may omit logger,
+level, traceback, and `context` fields that proxy error mirroring normally
+includes.
 
 Pass-through upstream failures populate this context from safe route metadata.
 For both main pass-through exceptions and streaming chunk-processor exceptions,
@@ -224,6 +250,8 @@ At TODO-driven work startup, inspect:
 
 - `.analysis/*-error.jsonl`
 - legacy `.analysis/*-error.log`
+- sidecar anomaly intake lines with `event=aawm_observability_anomaly`
+
 
 For every active intake file, add or update a `.analysis/todo.md` entry for the
 underlying resolution. Capture the environment, error detail, traceback context,
