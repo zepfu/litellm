@@ -1,7 +1,32 @@
+from pathlib import Path
+from unittest.mock import AsyncMock, patch, MagicMock
+
 import pytest
+import yaml
+
 from litellm.proxy.health_check import _update_litellm_params_for_health_check
 from litellm.litellm_core_utils.health_check_helpers import HealthCheckHelpers
-from unittest.mock import AsyncMock, patch, MagicMock
+
+
+def test_dev_config_excludes_retired_nvidia_nim_health_routes():
+    config_path = Path(__file__).parents[3] / "litellm-dev-config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    exposed_model_names = {
+        entry["model_name"] for entry in config.get("model_list", [])
+    }
+
+    retired_routes = {
+        "nvidia_nim/nvidia/llama-3_2-nemoretriever-300m-embed-v1",
+        "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2",
+    }
+    replacement_routes = {
+        "nvidia_nim/nvidia/nv-embed-v1",
+        "nvidia_nim/nvidia/nv-embedcode-7b-v1",
+        "nvidia_nim/nvidia/rerank-qa-mistral-4b",
+    }
+
+    assert retired_routes.isdisjoint(exposed_model_names)
+    assert replacement_routes.issubset(exposed_model_names)
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ Use Nvidia NIM Rerank models through LiteLLM.
 | Property | Details |
 |----------|---------|
 | Description | Nvidia NIM provides high-performance reranking models for semantic search and retrieval-augmented generation (RAG) |
-| Provider Doc | [Nvidia NIM Rerank API ↗](https://docs.api.nvidia.com/nim/reference/nvidia-llama-3_2-nv-rerankqa-1b-v2-infer) |
+| Provider Doc | [Nvidia NIM API Reference ↗](https://docs.api.nvidia.com/nim/reference/) |
 | Supported Endpoint | `/rerank` |
 
 ## Overview
@@ -32,7 +32,7 @@ See the full list of LiteLLM supported Nvidia NIM rerank models on [Nvidia NIM](
 ### LiteLLM Python SDK
 
 <Tabs>
-<TabItem value="llama-1b" label="LLaMa 1B Model">
+<TabItem value="mistral-4b-shared" label="Mistral 4B Shared Endpoint">
 
 ```python
 import litellm
@@ -41,7 +41,7 @@ import os
 os.environ['NVIDIA_NIM_API_KEY'] = "nvapi-..."
 
 response = litellm.rerank(
-    model="nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2",
+    model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
     query="What is the GPU memory bandwidth of H100 SXM?",
     documents=[
         "The Hopper GPU is paired with the Grace CPU using NVIDIA's ultra-fast chip-to-chip interconnect, delivering 900GB/s of bandwidth.",
@@ -113,7 +113,7 @@ Add Nvidia NIM rerank models to your proxy configuration:
 model_list:
   - model_name: nvidia-rerank
     litellm_params:
-      model: nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2
+      model: nvidia_nim/nvidia/rerank-qa-mistral-4b
       api_key: os.environ/NVIDIA_NIM_API_KEY
 ```
 
@@ -141,11 +141,20 @@ curl -X POST http://0.0.0.0:4000/rerank \
   }'
 ```
 
-## `/v1/ranking` Models (llama-3.2-nv-rerankqa-1b-v2)
+## `/v1/ranking` Models
 
 Some Nvidia NIM rerank models use the `/v1/ranking` endpoint instead of the default `/v1/retrieval/{model}/reranking` endpoint.
 
 Use the `ranking/` prefix to force requests to the `/v1/ranking` endpoint:
+
+:::caution
+
+Nvidia has retired some older hosted rerank endpoints, including the previous
+`llama-3.2-nv-rerankqa-1b-v2` hosted route. Only add `ranking/` routes for
+models that Nvidia currently documents as available for your account or
+deployment.
+
+:::
 
 ### LiteLLM Python SDK
 
@@ -157,7 +166,7 @@ os.environ['NVIDIA_NIM_API_KEY'] = "nvapi-..."
 
 # Use "ranking/" prefix to force /v1/ranking endpoint
 response = litellm.rerank(
-    model="nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2",
+    model="nvidia_nim/ranking/nvidia/current-ranking-model",
     query="which way did the traveler go?",
     documents=[
         "two roads diverged in a yellow wood...",
@@ -177,7 +186,7 @@ print(response)
 model_list:
   - model_name: nvidia-ranking
     litellm_params:
-      model: nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2
+      model: nvidia_nim/ranking/nvidia/current-ranking-model
       api_key: os.environ/NVIDIA_NIM_API_KEY
 ```
 
@@ -201,7 +210,7 @@ curl -X POST http://0.0.0.0:4000/rerank \
 **Ranking Endpoint (`/v1/ranking`):**
 
 ```
-model: nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2
+model: nvidia_nim/ranking/nvidia/current-ranking-model
        └────┬────┘ └──┬──┘ └─────────────┬──────────────────┘
             │        │                   │
             │        │                   └────▶ Model name sent to provider
@@ -238,11 +247,11 @@ model: "nvidia_nim/ranking/nvidia/model-name"
 | Endpoint | Model Prefix | Use Case |
 |----------|--------------|----------|
 | `/v1/retrieval/{model}/reranking` | `nvidia_nim/<model>` | Default for most rerank models |
-| `/v1/ranking` | `nvidia_nim/ranking/<model>` | For models like `nvidia/llama-3.2-nv-rerankqa-1b-v2` that require this endpoint |
+| `/v1/ranking` | `nvidia_nim/ranking/<model>` | For currently available Nvidia NIM models that require this endpoint |
 
 :::tip
 
-Check the [Nvidia NIM model deployment page](https://build.nvidia.com/nvidia/llama-3_2-nv-rerankqa-1b-v2/deploy) to see which endpoint your model requires.
+Check Nvidia's model deployment page for your selected model to see which endpoint it requires.
 
 :::
 
@@ -270,7 +279,7 @@ Check the [Nvidia NIM model deployment page](https://build.nvidia.com/nvidia/lla
 
 ```python
 response = litellm.rerank(
-    model="nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2",
+    model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
     query="GPU performance",
     documents=["High performance computing", "Fast GPU processing"],
     top_n=2,
@@ -298,7 +307,7 @@ os.environ['NVIDIA_NIM_API_KEY'] = "nvapi-..."
 
 # Or pass directly
 response = litellm.rerank(
-    model="nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2",
+    model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
     query="test",
     documents=["doc1"],
     api_key="nvapi-...",
@@ -322,7 +331,7 @@ export NVIDIA_NIM_API_BASE="https://your-custom-endpoint.com"
 
 ```python
 response = litellm.rerank(
-    model="nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2",
+    model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
     query="test",
     documents=["doc1"],
     api_base="https://your-custom-endpoint.com",
@@ -335,10 +344,10 @@ If you have the complete endpoint URL, you can pass it directly:
 
 ```python
 response = litellm.rerank(
-    model="nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2",
+    model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
     query="test",
     documents=["doc1"],
-    api_base="https://your-custom-endpoint.com/v1/retrieval/nvidia/llama-3_2-nv-rerankqa-1b-v2/reranking",
+    api_base="https://your-custom-endpoint.com/v1/retrieval/nvidia/reranking",
 )
 ```
 
