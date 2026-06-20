@@ -3365,23 +3365,6 @@ def _record_auto_agent_alias_attempt_started(
         attempts=attempts,
     )
     _safe_set_request_parsed_body(request, candidate_body)
-    _emit_auto_agent_alias_route_event(
-        _build_auto_agent_alias_audit_event(
-            alias_family=alias_family,
-            alias_model=alias_model,
-            request=request,
-            request_body=prepared_request_body,
-            selection=selection,
-            candidate=attempt_record,
-            event_type="candidate_attempt_started",
-            candidate_status="attempt_started",
-            attempt_number=len(attempts),
-            selected=True,
-            selection_reason=selection.get("selection_reason"),
-            lane_key=selection.get("lane_key"),
-            attempted_provider_call=False,
-        )
-    )
     return candidate_body
 
 
