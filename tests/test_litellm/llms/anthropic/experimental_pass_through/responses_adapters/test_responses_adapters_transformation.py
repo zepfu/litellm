@@ -18,6 +18,7 @@ from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler
     _build_responses_kwargs,
 )
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
+    AnthropicResponsesProviderError,
     LiteLLMAnthropicToResponsesAPIAdapter,
 )
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
@@ -1739,6 +1740,16 @@ class TestTranslateResponse:
         assert len(result["content"]) == 1
         assert result["content"][0]["type"] == "text"
         assert result["content"][0]["text"] == "Hello!"
+
+    def test_failed_response_status_raises_provider_error(self):
+        response = _make_mock_response(output=[], status="failed")
+        response.error = {"message": "provider failed"}
+
+        with pytest.raises(AnthropicResponsesProviderError) as exc_info:
+            _ADAPTER.translate_response(response)
+
+        assert "failed response" in str(exc_info.value)
+        assert "provider failed" in str(exc_info.value)
 
     def test_multiple_text_parts(self):
         """Multiple output_text parts become multiple text content blocks."""

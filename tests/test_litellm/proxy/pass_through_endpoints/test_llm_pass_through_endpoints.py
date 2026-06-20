@@ -54,6 +54,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _build_completion_adapter_metadata,
     _build_google_code_assist_request_from_completion_kwargs,
     _collect_responses_response_from_stream,
+    _raise_codex_auto_agent_failed_responses_payload,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _classify_codex_auto_agent_retryable_exhaustion,
@@ -21018,6 +21019,29 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_timeout_status():
     )
 
     assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_timeout"
+
+
+def test_codex_auto_agent_retryable_exhaustion_classifies_failed_responses_payload():
+    with pytest.raises(Exception) as exc_info:
+        _raise_codex_auto_agent_failed_responses_payload(
+            response_body={
+                "id": "resp_failed",
+                "status": "failed",
+                "model": "grok-composer-2.5-fast",
+                "error": {"message": "provider failed"},
+                "output": [],
+            },
+            adapter_model="grok-composer-2.5-fast",
+            adapter="codex_auto_agent_grok_native_responses",
+            adapter_label="Grok native",
+        )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc_info.value) == (
+        "provider_terminal_error"
+    )
+    assert "aawm_auto_agent_failed_responses_payload" in (
+        _extract_codex_auto_agent_error_tokens(exc_info.value)
+    )
 
 
 @pytest.mark.asyncio

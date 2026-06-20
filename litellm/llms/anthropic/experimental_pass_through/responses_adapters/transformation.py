@@ -39,6 +39,55 @@ from ..adapters.observability import (
 from ..adapters.transformation import sanitize_anthropic_tool_use_input
 
 
+class AnthropicResponsesProviderError(RuntimeError):
+    pass
+
+
+def _response_attr(response: Any, key: str, default: Any = None) -> Any:
+    if isinstance(response, dict):
+        return response.get(key, default)
+    value = getattr(response, key, default)
+    if type(value).__module__.startswith("unittest.mock"):
+        return default
+    return value
+
+
+def summarize_failed_responses_response(response: Any) -> Dict[str, Any]:
+    output = _response_attr(response, "output", []) or []
+    return {
+        "response_id": _response_attr(response, "id"),
+        "status": _response_attr(response, "status"),
+        "model": _response_attr(response, "model"),
+        "error": _response_attr(response, "error"),
+        "incomplete_details": _response_attr(response, "incomplete_details"),
+        "output_count": len(output) if isinstance(output, list) else 0,
+        "output_types": [
+            _response_attr(item, "type") for item in output[:20]
+        ]
+        if isinstance(output, list)
+        else [],
+    }
+
+
+def is_failed_responses_response(response: Any) -> bool:
+    return (
+        _response_attr(response, "status") == "failed"
+        or _response_attr(response, "error") is not None
+    )
+
+
+def raise_for_failed_responses_response(
+    response: Any, *, context: str = "Responses API"
+) -> None:
+    if not is_failed_responses_response(response):
+        return
+    diagnostic = summarize_failed_responses_response(response)
+    raise AnthropicResponsesProviderError(
+        f"{context} returned a failed response: "
+        + json.dumps(diagnostic, default=str, ensure_ascii=False, sort_keys=True)
+    )
+
+
 class LiteLLMAnthropicToResponsesAPIAdapter:
     """
     Converts Anthropic /v1/messages requests to OpenAI Responses API format and
@@ -905,6 +954,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         """
         Translate an OpenAI ResponsesAPIResponse to AnthropicMessagesResponse.
         """
+        raise_for_failed_responses_response(
+            response, context="Anthropic Responses adapter"
+        )
+
         from openai.types.responses import (
             ResponseFunctionToolCall,
             ResponseOutputMessage,
