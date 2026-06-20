@@ -17119,6 +17119,25 @@ def _alias_route_log_payloads(mock_logger: Mock) -> list[dict[str, Any]]:
     return payloads
 
 
+def _alias_route_event_types(mock_logger: Mock) -> list[str]:
+    return [
+        str(payload.get("event_type"))
+        for payload in _alias_route_log_payloads(mock_logger)
+        if payload.get("event_type") is not None
+    ]
+
+
+def _assert_alias_route_logs_exclude_event_types(
+    mock_logger: Mock,
+    *event_types: str,
+) -> None:
+    forbidden = set(event_types)
+    observed = set(_alias_route_event_types(mock_logger))
+    assert observed.isdisjoint(forbidden), (
+        f"unexpected alias route events: {sorted(observed & forbidden)}"
+    )
+
+
 @pytest.mark.parametrize(
     "alias",
     [
@@ -17764,6 +17783,122 @@ async def test_anthropic_auto_agent_alias_falls_back_to_deepseek_after_spark_429
     assert selected_event["event_type"] == "candidate_selected"
     assert selected_event["provider"] == "openrouter"
     assert selected_event["model"] == "deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_success_preserves_attempt_metadata_without_info_alias_route_logs(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(return_value=success),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+    ) as mock_info, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    mock_spark.assert_awaited_once()
+    prepared_body = mock_spark.await_args.kwargs["prepared_request_body"]
+    metadata = prepared_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-anthropic-agent-auto"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["route_family"] == "anthropic_openai_responses_adapter"
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    assert audit_events[-1]["event_type"] == "candidate_selected"
+    _assert_alias_route_logs_exclude_event_types(
+        mock_info,
+        "candidate_attempt_started",
+    )
+    _assert_alias_route_logs_exclude_event_types(
+        mock_warning,
+        "candidate_attempt_started",
+        "candidate_selected",
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_retryable_failure_emits_warning_alias_route_with_route_context(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    spark_error = ProxyException(
+        message="usage limit",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    spark_error.detail = {
+        "error": {
+            "message": "usage_limit_reached",
+            "code": "usage_limit_reached",
+        }
+    }
+    deepseek_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=spark_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
+        new=AsyncMock(return_value=deepseek_success),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+    ) as mock_info, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    _assert_alias_route_logs_exclude_event_types(
+        mock_info,
+        "candidate_attempt_started",
+    )
+    route_logs = _alias_route_log_payloads(mock_warning)
+    failure_log = next(
+        payload
+        for payload in route_logs
+        if payload["event_type"] == "candidate_retryable_failure"
+    )
+    assert failure_log["alias_family"] == "anthropic_auto_agent"
+    assert failure_log["alias_model"] == "aawm-anthropic-agent-auto"
+    assert failure_log["provider"] == "openai"
+    assert failure_log["model"] == "gpt-5.3-codex-spark"
+    assert failure_log["route_family"] == "anthropic_openai_responses_adapter"
+    assert failure_log["failure_phase"] == "provider_attempt"
+    assert failure_log["attempted_provider_call"] is True
+    _assert_alias_route_logs_exclude_event_types(
+        mock_warning,
+        "candidate_attempt_started",
+    )
 
 
 @pytest.mark.asyncio
@@ -20421,6 +20556,8 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
         new=AsyncMock(),
     ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+    ) as mock_info, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
     ) as mock_warning, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
@@ -20462,6 +20599,11 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
     assert no_candidate_log["candidate_count"] == 1
     assert no_candidate_log["candidates"][0]["provider"] == "openai"
     assert no_candidate_log["candidates"][0]["model"] == "gpt-5.5"
+    _assert_alias_route_logs_exclude_event_types(
+        mock_info,
+        "candidate_attempt_started",
+    )
+    assert _alias_route_event_types(mock_warning) == ["no_candidate_available"]
 
 
 @pytest.mark.asyncio
@@ -22584,6 +22726,70 @@ async def test_codex_auto_agent_alias_native_success_sets_session_affinity_for_c
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_alias_success_preserves_attempt_metadata_without_info_alias_route_logs(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(return_value="google-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=success),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+    ) as mock_info, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    mock_pass_through.assert_awaited_once()
+    custom_body = mock_pass_through.await_args.kwargs["custom_body"]
+    metadata = custom_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-codex-agent-auto"
+    assert metadata["codex_auto_agent_selected_provider"] == "openai"
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    assert metadata["codex_auto_agent_selected_route_family"] == "codex_responses"
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["provider"] == "openai"
+    assert attempts[0]["model"] == "gpt-5.3-codex-spark"
+    assert attempts[0]["route_family"] == "codex_responses"
+    assert attempts[0]["reason"] == "first_available"
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    assert audit_events[-1]["event_type"] == "candidate_selected"
+    assert audit_events[-1]["provider"] == "openai"
+    assert audit_events[-1]["route_family"] == "codex_responses"
+    _assert_alias_route_logs_exclude_event_types(
+        mock_info,
+        "candidate_attempt_started",
+    )
+    _assert_alias_route_logs_exclude_event_types(
+        mock_warning,
+        "candidate_attempt_started",
+        "candidate_selected",
+    )
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     monkeypatch,
 ):
@@ -22615,6 +22821,8 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
         new=AsyncMock(return_value=deepseek_success),
     ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
+    ) as mock_info, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
     ) as mock_warning:
         response = await _handle_codex_auto_agent_alias_route(
@@ -22631,6 +22839,10 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     assert response is deepseek_success
     assert mock_pass_through.await_count == 1
     mock_openrouter.assert_awaited_once()
+    _assert_alias_route_logs_exclude_event_types(
+        mock_info,
+        "candidate_attempt_started",
+    )
     assert mock_openrouter.await_args.kwargs["adapter_model"] == (
         "deepseek/deepseek-v4-flash"
     )
@@ -22680,6 +22892,10 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     assert failure_log["attempted_provider_call"] is True
     assert failure_log["error_status_code"] == 429
     assert failure_log["error_code"] == "usage_limit_reached"
+    _assert_alias_route_logs_exclude_event_types(
+        mock_warning,
+        "candidate_attempt_started",
+    )
 
 
 @pytest.mark.asyncio
