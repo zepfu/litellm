@@ -50,6 +50,7 @@ from litellm.llms.chatgpt.common_utils import (
     get_chatgpt_default_headers,
 )
 from litellm.llms.xai.oauth import (
+    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
     build_grok_native_oauth_metadata,
     get_grok_native_oauth_access_token,
     is_grok_native_oauth_model,
@@ -1698,10 +1699,32 @@ def _add_grok_native_oauth_metadata(
 ) -> dict[str, Any]:
     metadata = build_grok_native_oauth_metadata(model)
     metadata_tags = metadata.pop("tags", [])
+    existing_litellm_metadata = request_body.get("litellm_metadata")
+    preserved_route_family: Optional[str] = None
+    if isinstance(existing_litellm_metadata, dict):
+        for route_family_key in ("passthrough_route_family", "route_family"):
+            route_family_value = existing_litellm_metadata.get(route_family_key)
+            if isinstance(route_family_value, str) and route_family_value.strip():
+                preserved_route_family = route_family_value.strip()
+                break
+
     merged_extra_fields = {
-        **(extra_fields or {}),
         **metadata,
+        **(extra_fields or {}),
     }
+    if preserved_route_family:
+        merged_extra_fields["passthrough_route_family"] = preserved_route_family
+        merged_extra_fields["route_family"] = preserved_route_family
+        merged_extra_fields["grok_cli_chat_proxy_used"] = True
+        metadata_tags = [
+            *(
+                tag
+                for tag in metadata_tags
+                if tag != f"route:{GROK_NATIVE_OAUTH_ROUTE_FAMILY}"
+            ),
+            f"route:{preserved_route_family}",
+            f"route:{GROK_NATIVE_OAUTH_ROUTE_FAMILY}",
+        ]
     return _merge_litellm_metadata(
         request_body,
         tags_to_add=[

@@ -171,6 +171,34 @@ class AnthropicResponsesStreamWrapper:
         self._record_client_visible_usage_source("estimated")
         return self._build_fallback_usage_delta()
 
+    def _estimate_message_start_input_tokens(self) -> int:
+        if not self.request_body:
+            return 0
+        prompt_payload = {
+            key: value
+            for key, value in self.request_body.items()
+            if key not in {"litellm_metadata", "metadata", "stream", "store"}
+        }
+        return self._estimate_token_count(prompt_payload or self.request_body)
+
+    def _build_message_start_usage(self) -> Dict[str, Any]:
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+        estimated_input_tokens = self._estimate_message_start_input_tokens()
+        if estimated_input_tokens > 0:
+            usage["input_tokens"] = estimated_input_tokens
+            metadata = self.request_body.get("litellm_metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                self.request_body["litellm_metadata"] = metadata
+            metadata["anthropic_adapter_message_start_usage_source"] = "estimated"
+            metadata["anthropic_adapter_message_start_usage_estimated"] = True
+        return usage
+
     @staticmethod
     def _get_value(value: Any, key: str, default: Any = None) -> Any:
         if isinstance(value, dict):
@@ -326,12 +354,7 @@ class AnthropicResponsesStreamWrapper:
                 "model": self.model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                },
+                "usage": self._build_message_start_usage(),
             },
         }
 

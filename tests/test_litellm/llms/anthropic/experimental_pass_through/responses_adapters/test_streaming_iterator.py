@@ -622,6 +622,159 @@ async def test_stream_wrapper_maps_codex_exec_command_deltas_back_to_bash():
 
 
 @pytest.mark.asyncio
+async def test_stream_wrapper_estimates_message_start_usage_for_adapter_visibility():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=21,
+            output_tokens=9,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.done",
+            item_id="msg_provider_usage",
+            output_index=0,
+            text="provider usage smoke",
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "probe",
+        "tools": [
+            {
+                "type": "function",
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="grok-composer-2.5-fast",
+        request_body=request_body,
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    message_start = chunks[0]
+    message_start_usage = message_start["message"]["usage"]
+    assert message_start_usage["input_tokens"] > 0
+    assert message_start_usage["output_tokens"] == 0
+    assert message_start_usage["cache_creation_input_tokens"] == 0
+    assert message_start_usage["cache_read_input_tokens"] == 0
+    assert "token_count" not in message_start_usage
+    assert "cost" not in message_start_usage
+
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["usage"] == {"input_tokens": 21, "output_tokens": 9}
+    assert "token_count" not in message_delta["usage"]
+    assert "cost" not in message_delta["usage"]
+    assert request_body["litellm_metadata"][
+        "anthropic_adapter_message_start_usage_source"
+    ] == "estimated"
+    assert (
+        request_body["litellm_metadata"][
+            "anthropic_adapter_message_start_usage_estimated"
+        ]
+        is True
+    )
+    assert request_body["litellm_metadata"][
+        "anthropic_adapter_client_visible_usage_source"
+    ] == "provider_reported"
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_estimates_message_start_usage_before_tool_use():
+    response_obj = SimpleNamespace(
+        status="completed",
+        usage=SimpleNamespace(
+            input_tokens=34,
+            output_tokens=12,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[
+            {
+                "type": "function_call",
+                "id": "fc_usage",
+                "call_id": "call_fc_usage",
+                "name": "Bash",
+                "arguments": {"command": "pwd"},
+            }
+        ],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_usage",
+                call_id="call_fc_usage",
+                name="Bash",
+                arguments={"command": "pwd"},
+            ),
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_usage",
+                call_id="call_fc_usage",
+                name="Bash",
+                arguments={"command": "pwd"},
+            ),
+        ),
+        SimpleNamespace(type="response.completed", response=response_obj),
+    ]
+
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "use the Bash tool",
+        "tools": [
+            {
+                "type": "function",
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        ],
+    }
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(*events),
+        model="grok-composer-2.5-fast",
+        request_body=request_body,
+    )
+    chunks = [chunk async for chunk in wrapper]
+
+    assert chunks[0]["type"] == "message_start"
+    assert chunks[0]["message"]["usage"]["input_tokens"] > 0
+    assert "cost" not in chunks[0]["message"]["usage"]
+    assert "token_count" not in chunks[0]["message"]["usage"]
+    assert chunks[1]["content_block"] == {
+        "type": "tool_use",
+        "id": "call_fc_usage",
+        "name": "Bash",
+        "input": {"command": "pwd"},
+    }
+    message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
+    assert message_delta["usage"] == {"input_tokens": 34, "output_tokens": 12}
+
+
+@pytest.mark.asyncio
 async def test_stream_wrapper_preserves_provider_usage_on_completed_event():
     response_obj = SimpleNamespace(
         status="completed",
