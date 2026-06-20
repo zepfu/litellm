@@ -166,3 +166,66 @@ values, raw auth payloads, resolved IP addresses, and the configured
 `x-xai-token-auth` value. Compare that passthrough fingerprint with the
 sidecar `request_contract_fingerprint` when investigating sidecar billing poll
 parity.
+
+## Observability Anomaly Scan Task
+
+The same sidecar can also run a scheduled session-history and rate-limit
+telemetry anomaly scan. This is separate from the five-minute provider
+front-door probes and the hourly credential or billing tasks. When enabled, the
+scan reads recent `public.session_history` and `public.rate_limit_observations`
+rows and looks for persistence or mapping inconsistencies such as missing
+provider/model fields, alias metadata that was not promoted, token or git/tool
+activity counters that do not match persisted activity, or stale rate-limit
+reset timestamps that still have matching recent traffic.
+
+Relevant environment variables:
+
+- `AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED`: enables the scheduled scan task.
+- `AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS`: minimum seconds between
+  scan attempts. Defaults to `3600`.
+- `AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS`: recent database window
+  scanned for anomalies. Defaults to `4`.
+- `AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR`: directory where detected
+  anomalies are appended as `<environment>-error.jsonl`. Defaults to
+  `LITELLM_AAWM_ERROR_LOG_DIR` when set, otherwise `/app/.analysis`.
+
+In managed dev compose the task is enabled by default on the same hourly cadence
+as the other scheduled sidecar tasks. The scan uses the sidecar environment name
+(`AAWM_LITELLM_ENVIRONMENT`) for the output filename, so a `dev` sidecar writes
+`/app/.analysis/dev-error.jsonl` inside the container and `.analysis/dev-error.jsonl`
+in this repo when `.analysis` is mounted.
+
+Each due attempt emits a separate `observability_anomaly_scan` JSON line with
+sanitized status fields such as `attempted`, `status`, `lookback_hours`,
+`anomaly_count`, `anomaly_classes`, `error_log_record_count`, and
+`error_log_path`. Healthy scans keep `status=healthy`. When one or more anomaly
+classes match, the scan sets `status=anomalies_found` and appends one append-safe
+JSONL record per anomaly class to the environment error file.
+
+Each appended anomaly record uses `event=aawm_observability_anomaly` and should
+include at least:
+
+- `environment`
+- `observed_at`
+- `error_class`
+- `error_message`
+- `anomaly_class`
+- `anomaly_source` (`provider_status_observations_sidecar`)
+- `lookback_hours`
+- `row_count`
+- `expected`
+- bounded `examples`
+- `recommended_todo`
+- `cleanup_requirement`
+
+The examples are intentionally bounded samples for triage. They must not include
+raw prompts, tool arguments, request or response bodies, auth headers, API keys,
+or credential payloads.
+
+Treat these JSONL rows as normal active error intake, not as a separate queue.
+Convert each anomaly class into or update a matching `.analysis/todo.md` item,
+investigate the underlying telemetry mapping or persistence path, verify healthy
+data, and then delete or archive the source `<environment>-error.jsonl` file once
+the anomaly is resolved and recorded in completed notes. Scan failures are logged
+as `status=scan_failed` on the sidecar event and do not raise out of the sidecar
+loop.

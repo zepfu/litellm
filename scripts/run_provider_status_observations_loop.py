@@ -119,6 +119,11 @@ DEFAULT_GROK_BILLING_MODEL = "grok-build"
 DEFAULT_GROK_BILLING_HTTP_METHOD = "GET"
 DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS = 3
 DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
+DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED = False
+DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS = 3600.0
+DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS = 4.0
+DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR = "/app/.analysis"
+OBSERVABILITY_ANOMALY_SAMPLE_LIMIT = 5
 GROK_BILLING_IDENTITY_HEADER_FIELDS = (
     ("x-userid", "user_id"),
     ("x-grok-user-id", "user_id"),
@@ -141,6 +146,13 @@ GROK_BILLING_RETRYABLE_ERROR_HINTS = (
     "timeout expired",
 )
 GROK_BILLING_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
+OBSERVABILITY_ANOMALY_ALIAS_METADATA_KEYS = (
+    "requested_model_alias",
+    "model_alias_label",
+    "codex_auto_agent_alias",
+    "anthropic_auto_agent_alias",
+    "aawm_auto_agent_alias",
+)
 PROVIDER_FAILURE_SECRET_RE = re.compile(
     "|".join(
         (
@@ -313,6 +325,449 @@ WHERE NOT EXISTS (
 )
 """
 
+OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL = """
+WITH recent_session_history AS (
+    SELECT
+        id,
+        created_at,
+        COALESCE(end_time, start_time, created_at) AS observed_at,
+        litellm_call_id,
+        session_id,
+        trace_id,
+        provider,
+        model,
+        inbound_model_alias,
+        model_group,
+        agent_name,
+        agent_id,
+        repository,
+        client_name,
+        client_version,
+        call_type,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+        response_cost_usd,
+        tool_call_count,
+        git_commit_count,
+        git_push_count,
+        metadata
+    FROM public.session_history
+    WHERE COALESCE(end_time, start_time, created_at) >= (
+        NOW() - (%s::double precision * INTERVAL '1 hour')
+    )
+),
+tool_activity AS (
+    SELECT
+        litellm_call_id,
+        COUNT(*)::int AS tool_activity_count,
+        COALESCE(SUM(git_commit_count), 0)::int AS activity_git_commit_count,
+        COALESCE(SUM(git_push_count), 0)::int AS activity_git_push_count,
+        BOOL_OR(
+            COALESCE(command_text, '') ~* '(^|[[:space:];|&])git[[:space:]]+commit([[:space:]]|$)'
+        ) AS activity_git_commit_command,
+        BOOL_OR(
+            COALESCE(command_text, '') ~* '(^|[[:space:];|&])git[[:space:]]+push([[:space:]]|$)'
+        ) AS activity_git_push_command
+    FROM public.session_history_tool_activity
+    WHERE created_at >= (NOW() - (%s::double precision * INTERVAL '1 hour'))
+      AND litellm_call_id IS NOT NULL
+    GROUP BY litellm_call_id
+),
+base AS (
+    SELECT
+        sh.*,
+        COALESCE(ta.tool_activity_count, 0) AS tool_activity_count,
+        COALESCE(ta.activity_git_commit_count, 0) AS activity_git_commit_count,
+        COALESCE(ta.activity_git_push_count, 0) AS activity_git_push_count,
+        COALESCE(ta.activity_git_commit_command, FALSE) AS activity_git_commit_command,
+        COALESCE(ta.activity_git_push_command, FALSE) AS activity_git_push_command,
+        jsonb_strip_nulls(
+            jsonb_build_object(
+                'row_id', sh.id,
+                'created_at', sh.created_at,
+                'observed_at', sh.observed_at,
+                'litellm_call_id', sh.litellm_call_id,
+                'session_id', sh.session_id,
+                'trace_id', sh.trace_id,
+                'provider', sh.provider,
+                'model', sh.model,
+                'inbound_model_alias', sh.inbound_model_alias,
+                'model_group', sh.model_group,
+                'agent_name', sh.agent_name,
+                'agent_id', sh.agent_id,
+                'repository', sh.repository,
+                'client_name', sh.client_name,
+                'client_version', sh.client_version,
+                'call_type', sh.call_type
+            )
+        ) AS sample_base,
+        jsonb_strip_nulls(
+            jsonb_build_object(
+                'requested_model_alias', sh.metadata->>'requested_model_alias',
+                'model_alias_label', sh.metadata->>'model_alias_label',
+                'codex_auto_agent_alias', sh.metadata->>'codex_auto_agent_alias',
+                'anthropic_auto_agent_alias', sh.metadata->>'anthropic_auto_agent_alias',
+                'aawm_auto_agent_alias', sh.metadata->>'aawm_auto_agent_alias'
+            )
+        ) AS metadata_aliases
+    FROM recent_session_history AS sh
+    LEFT JOIN tool_activity AS ta
+      ON ta.litellm_call_id = sh.litellm_call_id
+),
+anomalies AS (
+    SELECT
+        id,
+        observed_at,
+        'missing_provider' AS anomaly_class,
+        'session_history.provider should be populated for non-excluded usage rows' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object('provider', provider)
+        ) AS sample
+    FROM base
+    WHERE NULLIF(BTRIM(COALESCE(provider, '')), '') IS NULL
+      AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'missing_model' AS anomaly_class,
+        'session_history.model should be populated for persisted rows' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object('model', model)
+        ) AS sample
+    FROM base
+    WHERE NULLIF(BTRIM(COALESCE(model, '')), '') IS NULL
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'missing_repository_for_agent_context' AS anomaly_class,
+        'TUI agent traffic with agent or AAWM alias context should include repository when derivable' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object(
+                'repository', repository,
+                'client_name', client_name,
+                'agent_name', agent_name,
+                'agent_id', agent_id,
+                'inbound_model_alias', inbound_model_alias
+            )
+        ) AS sample
+    FROM base
+    WHERE NULLIF(BTRIM(COALESCE(repository, '')), '') IS NULL
+      AND LOWER(COALESCE(client_name, '')) ~ '^(claude|codex|grok)'
+      AND (
+          NULLIF(BTRIM(COALESCE(agent_name, '')), '') IS NOT NULL
+          OR NULLIF(BTRIM(COALESCE(agent_id, '')), '') IS NOT NULL
+          OR COALESCE(inbound_model_alias, '') LIKE 'aawm-%'
+      )
+      AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'alias_metadata_not_promoted' AS anomaly_class,
+        'inbound_model_alias should be populated when alias metadata is present' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object(
+                'inbound_model_alias', inbound_model_alias,
+                'metadata_aliases', metadata_aliases
+            )
+        ) AS sample
+    FROM base
+    WHERE NULLIF(BTRIM(COALESCE(inbound_model_alias, '')), '') IS NULL
+      AND metadata ?| ARRAY[
+          'requested_model_alias',
+          'model_alias_label',
+          'codex_auto_agent_alias',
+          'anthropic_auto_agent_alias',
+          'aawm_auto_agent_alias'
+      ]
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'negative_token_or_cost_value' AS anomaly_class,
+        'token and cost values should not be negative' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object(
+                'input_tokens', input_tokens,
+                'output_tokens', output_tokens,
+                'total_tokens', total_tokens,
+                'cache_read_input_tokens', cache_read_input_tokens,
+                'cache_creation_input_tokens', cache_creation_input_tokens,
+                'response_cost_usd', response_cost_usd
+            )
+        ) AS sample
+    FROM base
+    WHERE input_tokens < 0
+       OR output_tokens < 0
+       OR total_tokens < 0
+       OR cache_read_input_tokens < 0
+       OR cache_creation_input_tokens < 0
+       OR response_cost_usd < 0
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'token_total_less_than_parts' AS anomaly_class,
+        'total_tokens should be at least input_tokens + output_tokens when all are reported' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object(
+                'input_tokens', input_tokens,
+                'output_tokens', output_tokens,
+                'total_tokens', total_tokens
+            )
+        ) AS sample
+    FROM base
+    WHERE total_tokens > 0
+      AND input_tokens >= 0
+      AND output_tokens >= 0
+      AND (input_tokens + output_tokens) > total_tokens
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'tool_activity_not_reflected_on_session_history' AS anomaly_class,
+        'session_history.tool_call_count should reflect persisted tool activity for the same LiteLLM call' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object(
+                'tool_call_count', tool_call_count,
+                'tool_activity_count', tool_activity_count
+            )
+        ) AS sample
+    FROM base
+    WHERE tool_activity_count > 0
+      AND tool_call_count < tool_activity_count
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'git_commit_activity_not_reflected' AS anomaly_class,
+        'session_history.git_commit_count should reflect git commit tool activity' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object(
+                'git_commit_count', git_commit_count,
+                'activity_git_commit_count', activity_git_commit_count,
+                'activity_git_commit_command', activity_git_commit_command
+            )
+        ) AS sample
+    FROM base
+    WHERE git_commit_count = 0
+      AND (
+          activity_git_commit_count > 0
+          OR activity_git_commit_command
+      )
+
+    UNION ALL
+
+    SELECT
+        id,
+        observed_at,
+        'git_push_activity_not_reflected' AS anomaly_class,
+        'session_history.git_push_count should reflect git push tool activity' AS expected,
+        sample_base || jsonb_build_object(
+            'observed',
+            jsonb_build_object(
+                'git_push_count', git_push_count,
+                'activity_git_push_count', activity_git_push_count,
+                'activity_git_push_command', activity_git_push_command
+            )
+        ) AS sample
+    FROM base
+    WHERE git_push_count = 0
+      AND (
+          activity_git_push_count > 0
+          OR activity_git_push_command
+      )
+),
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY anomaly_class
+            ORDER BY observed_at DESC, id DESC
+        ) AS sample_rank
+    FROM anomalies
+)
+SELECT
+    anomaly_class,
+    expected,
+    COUNT(*)::int AS row_count,
+    COALESCE(
+        jsonb_agg(sample ORDER BY observed_at DESC, id DESC)
+        FILTER (WHERE sample_rank <= %s::int),
+        '[]'::jsonb
+    ) AS examples
+FROM ranked
+GROUP BY anomaly_class, expected
+ORDER BY row_count DESC, anomaly_class
+"""
+
+OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL = """
+WITH latest_observations AS (
+    SELECT DISTINCT ON (
+        provider,
+        COALESCE(model, ''),
+        quota_key,
+        COALESCE(account_hash, ''),
+        COALESCE(client, '')
+    )
+        id,
+        observed_at,
+        client,
+        client_version,
+        account_hash,
+        provider,
+        model,
+        quota_key,
+        quota_period,
+        quota_type,
+        expected_reset_at,
+        source,
+        session_id,
+        trace_id,
+        litellm_call_id
+    FROM public.rate_limit_observations
+    WHERE expected_reset_at IS NOT NULL
+    ORDER BY
+        provider,
+        COALESCE(model, ''),
+        quota_key,
+        COALESCE(account_hash, ''),
+        COALESCE(client, ''),
+        observed_at DESC,
+        id DESC
+),
+recent_traffic AS (
+    SELECT
+        provider,
+        model,
+        model_group,
+        inbound_model_alias,
+        MAX(COALESCE(end_time, start_time, created_at)) AS last_traffic_at,
+        COUNT(*)::int AS traffic_count
+    FROM public.session_history
+    WHERE COALESCE(end_time, start_time, created_at) >= (
+        NOW() - (%s::double precision * INTERVAL '1 hour')
+    )
+      AND NULLIF(BTRIM(COALESCE(provider, '')), '') IS NOT NULL
+    GROUP BY provider, model, model_group, inbound_model_alias
+),
+matched AS (
+    SELECT
+        latest.id,
+        latest.observed_at,
+        latest.client,
+        latest.client_version,
+        latest.account_hash,
+        latest.provider,
+        latest.model,
+        latest.quota_key,
+        latest.quota_period,
+        latest.quota_type,
+        latest.expected_reset_at,
+        latest.source,
+        latest.session_id,
+        latest.trace_id,
+        latest.litellm_call_id,
+        SUM(traffic.traffic_count)::int AS recent_traffic_count,
+        MAX(traffic.last_traffic_at) AS last_traffic_at
+    FROM latest_observations AS latest
+    JOIN recent_traffic AS traffic
+      ON LOWER(traffic.provider) = LOWER(latest.provider)
+     AND (
+          latest.model IS NULL
+          OR LOWER(latest.model) = LOWER(traffic.model)
+          OR LOWER(latest.model) = LOWER(traffic.model_group)
+          OR LOWER(latest.model) = LOWER(traffic.inbound_model_alias)
+      )
+    WHERE latest.expected_reset_at < NOW()
+      AND traffic.last_traffic_at > latest.expected_reset_at
+    GROUP BY
+        latest.id,
+        latest.observed_at,
+        latest.client,
+        latest.client_version,
+        latest.account_hash,
+        latest.provider,
+        latest.model,
+        latest.quota_key,
+        latest.quota_period,
+        latest.quota_type,
+        latest.expected_reset_at,
+        latest.source,
+        latest.session_id,
+        latest.trace_id,
+        latest.litellm_call_id
+),
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY provider, COALESCE(model, ''), quota_key
+            ORDER BY last_traffic_at DESC, id DESC
+        ) AS sample_rank
+    FROM matched
+)
+SELECT
+    'stale_rate_limit_reset_with_recent_traffic' AS anomaly_class,
+    'active rate-limit reset timestamps should be in the future when matching provider/model traffic continues' AS expected,
+    COUNT(*)::int AS row_count,
+    COALESCE(
+        jsonb_agg(
+            jsonb_strip_nulls(
+                jsonb_build_object(
+                    'rate_limit_observation_id', id,
+                    'observed_at', observed_at,
+                    'client', client,
+                    'client_version', client_version,
+                    'account_hash', account_hash,
+                    'provider', provider,
+                    'model', model,
+                    'quota_key', quota_key,
+                    'quota_period', quota_period,
+                    'quota_type', quota_type,
+                    'expected_reset_at', expected_reset_at,
+                    'last_traffic_at', last_traffic_at,
+                    'recent_traffic_count', recent_traffic_count,
+                    'source', source,
+                    'session_id', session_id,
+                    'trace_id', trace_id,
+                    'litellm_call_id', litellm_call_id
+                )
+            )
+            ORDER BY last_traffic_at DESC, id DESC
+        ) FILTER (WHERE sample_rank <= %s::int),
+        '[]'::jsonb
+    ) AS examples
+FROM ranked
+"""
+
 
 @dataclass(frozen=True)
 class ProviderStatusLoopConfig:
@@ -399,6 +854,18 @@ class ProviderStatusLoopConfig:
     grok_billing_poll_retry_backoff_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
     )
+    observability_anomaly_scan_enabled: bool = (
+        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED
+    )
+    observability_anomaly_scan_interval_seconds: float = (
+        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS
+    )
+    observability_anomaly_scan_lookback_hours: float = (
+        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS
+    )
+    observability_anomaly_scan_error_log_dir: str = (
+        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR
+    )
 
 
 @dataclass
@@ -408,6 +875,7 @@ class SidecarTaskState:
     codex_oauth_last_attempt_monotonic: Optional[float] = None
     xai_oauth_last_attempt_monotonic: Optional[float] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
+    observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1180,6 +1648,67 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "Defaults to AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS or 0.5."
         ),
     )
+    anomaly_group = parser.add_mutually_exclusive_group()
+    anomaly_group.add_argument(
+        "--observability-anomaly-scan-enabled",
+        dest="observability_anomaly_scan_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED",
+            DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED,
+        ),
+        help=(
+            "Run the hourly session-history/rate-limit anomaly scan from this "
+            "sidecar loop. Defaults to AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED "
+            "or false."
+        ),
+    )
+    anomaly_group.add_argument(
+        "--no-observability-anomaly-scan",
+        dest="observability_anomaly_scan_enabled",
+        action="store_false",
+        help="Disable the observability anomaly scan task.",
+    )
+    parser.add_argument(
+        "--observability-anomaly-scan-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS",
+            DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between observability anomaly scans. Defaults to "
+            "AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--observability-anomaly-scan-lookback-hours",
+        type=float,
+        default=_env_float(
+            "AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS",
+            DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS,
+        ),
+        help=(
+            "Recent database window scanned for telemetry anomalies. Defaults "
+            "to AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS or 4."
+        ),
+    )
+    parser.add_argument(
+        "--observability-anomaly-scan-error-log-dir",
+        default=os.getenv(
+            "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR",
+            os.getenv(
+                "LITELLM_AAWM_ERROR_LOG_DIR",
+                DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR,
+            ),
+        ),
+        help=(
+            "Directory where detected anomalies are appended as "
+            "<environment>-error.jsonl. Defaults to "
+            "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR, "
+            "LITELLM_AAWM_ERROR_LOG_DIR, or /app/.analysis."
+        ),
+    )
     return parser
 
 
@@ -1190,6 +1719,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_codex_config_args(args)
     _validate_xai_oauth_config_args(args)
     _validate_grok_billing_config_args(args)
+    _validate_observability_anomaly_scan_config_args(args)
 
 
 def _validate_core_config_args(args: argparse.Namespace) -> None:
@@ -1275,6 +1805,19 @@ def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_observability_anomaly_scan_config_args(args: argparse.Namespace) -> None:
+    if args.observability_anomaly_scan_interval_seconds <= 0:
+        raise SystemExit(
+            "--observability-anomaly-scan-interval-seconds must be greater than 0"
+        )
+    if args.observability_anomaly_scan_lookback_hours <= 0:
+        raise SystemExit(
+            "--observability-anomaly-scan-lookback-hours must be greater than 0"
+        )
+    if not str(args.observability_anomaly_scan_error_log_dir).strip():
+        raise SystemExit("--observability-anomaly-scan-error-log-dir must not be empty")
+
+
 def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConfig:
     args = _build_parser().parse_args(argv)
     _validate_config_args(args)
@@ -1358,6 +1901,18 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_poll_max_attempts=args.grok_billing_poll_max_attempts,
         grok_billing_poll_retry_backoff_seconds=(
             args.grok_billing_poll_retry_backoff_seconds
+        ),
+        observability_anomaly_scan_enabled=(
+            args.observability_anomaly_scan_enabled
+        ),
+        observability_anomaly_scan_interval_seconds=(
+            args.observability_anomaly_scan_interval_seconds
+        ),
+        observability_anomaly_scan_lookback_hours=(
+            args.observability_anomaly_scan_lookback_hours
+        ),
+        observability_anomaly_scan_error_log_dir=(
+            args.observability_anomaly_scan_error_log_dir
         ),
     )
 
@@ -2472,6 +3027,160 @@ def _set_grok_billing_database_timeouts(
     )
 
 
+def _set_observability_anomaly_scan_database_timeouts(
+    cur: Any,
+    *,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+) -> None:
+    cur.execute(
+        "SELECT set_config('application_name', %s, false)",
+        (f"{probes._provider_status_db_application_name()}-anomaly-scan",),
+    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{statement_timeout_ms}ms",),
+    )
+
+
+def _rows_as_dicts(cur: Any) -> list[Dict[str, Any]]:
+    columns = []
+    for column in cur.description or ():
+        name = getattr(column, "name", None)
+        if name is None:
+            name = column[0]
+        columns.append(name)
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def _collect_observability_anomalies(
+    config: ProviderStatusLoopConfig,
+) -> list[Dict[str, Any]]:
+    dsn = _resolve_dsn(config)
+    lookback_hours = config.observability_anomaly_scan_lookback_hours
+    sample_limit = OBSERVABILITY_ANOMALY_SAMPLE_LIMIT
+    anomalies: list[Dict[str, Any]] = []
+    try:
+        with probes.psycopg.connect(dsn) as conn:
+            try:
+                with conn.cursor() as cur:
+                    _set_observability_anomaly_scan_database_timeouts(
+                        cur,
+                        lock_timeout_ms=config.db_lock_timeout_ms,
+                        statement_timeout_ms=config.db_statement_timeout_ms,
+                    )
+                    cur.execute(
+                        OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL,
+                        (lookback_hours, lookback_hours, sample_limit),
+                    )
+                    anomalies.extend(_rows_as_dicts(cur))
+                    cur.execute(
+                        OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL,
+                        (lookback_hours, sample_limit),
+                    )
+                    anomalies.extend(_rows_as_dicts(cur))
+            except (
+                probes.psycopg.errors.LockNotAvailable,
+                probes.psycopg.errors.QueryCanceled,
+            ) as exc:
+                conn.rollback()
+                raise probes.ProviderStatusDatabaseWriteSkipped(
+                    error_class=exc.__class__.__name__,
+                    message=str(exc),
+                ) from exc
+    except probes.ProviderStatusDatabaseWriteSkipped:
+        raise
+
+    return [
+        {
+            **anomaly,
+            "row_count": int(anomaly.get("row_count") or 0),
+            "examples": anomaly.get("examples") or [],
+        }
+        for anomaly in anomalies
+        if int(anomaly.get("row_count") or 0) > 0
+    ]
+
+
+def _observability_anomaly_error_log_path(
+    config: ProviderStatusLoopConfig,
+) -> Path:
+    directory = Path(
+        config.observability_anomaly_scan_error_log_dir
+    ).expanduser()
+    environment = re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "_",
+        (config.environment or "unknown").strip() or "unknown",
+    )
+    return directory / f"{environment}-error.jsonl"
+
+
+def _build_observability_anomaly_error_record(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    anomaly: Mapping[str, Any],
+) -> Dict[str, Any]:
+    anomaly_class = str(anomaly.get("anomaly_class") or "observability_anomaly")
+    row_count = int(anomaly.get("row_count") or 0)
+    expected = str(anomaly.get("expected") or "observability data should be consistent")
+    return {
+        "event": "aawm_observability_anomaly",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        "error_class": "ObservabilityAnomaly",
+        "error_message": (
+            f"{anomaly_class}: {row_count} recent row(s) violated "
+            "session-history or rate-limit telemetry expectations"
+        ),
+        "anomaly_class": anomaly_class,
+        "anomaly_source": "provider_status_observations_sidecar",
+        "lookback_hours": config.observability_anomaly_scan_lookback_hours,
+        "row_count": row_count,
+        "expected": expected,
+        "examples": anomaly.get("examples") or [],
+        "recommended_todo": (
+            "Investigate the underlying telemetry mapping or persistence path, "
+            "add/update the matching .analysis/todo.md item, verify healthy data, "
+            "then remove or archive this error intake file."
+        ),
+        "cleanup_requirement": (
+            "Clean up this environment error JSONL after the anomaly is resolved "
+            "and represented in completed notes."
+        ),
+    }
+
+
+def _write_observability_anomaly_error_records(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    anomalies: Sequence[Mapping[str, Any]],
+) -> tuple[int, Path]:
+    path = _observability_anomaly_error_log_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with path.open("a", encoding="utf-8") as handle:
+        for anomaly in anomalies:
+            record = _build_observability_anomaly_error_record(
+                config,
+                observed_at=observed_at,
+                anomaly=anomaly,
+            )
+            handle.write(
+                json.dumps(
+                    _json_safe_grok_billing_value(record),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            handle.write("\n")
+            written += 1
+    return written, path
+
+
 def _build_grok_billing_observations_for_dry_run(
     config: ProviderStatusLoopConfig,
     *,
@@ -2833,6 +3542,69 @@ def _run_grok_billing_poll_task(
     }
 
 
+def _run_observability_anomaly_scan_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.observability_anomaly_scan_enabled:
+        return None
+    last_attempt = state.observability_anomaly_scan_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt
+        < config.observability_anomaly_scan_interval_seconds
+    ):
+        return None
+
+    state.observability_anomaly_scan_last_attempt_monotonic = now_monotonic
+    observed_at = datetime.now(timezone.utc)
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "status": "healthy",
+        "lookback_hours": config.observability_anomaly_scan_lookback_hours,
+        "anomaly_count": 0,
+        "anomaly_classes": [],
+        "error_log_record_count": 0,
+        "error_log_path": str(_observability_anomaly_error_log_path(config)),
+    }
+    try:
+        anomalies = _collect_observability_anomalies(config)
+        if anomalies:
+            written_count, path = _write_observability_anomaly_error_records(
+                config,
+                observed_at=observed_at,
+                anomalies=anomalies,
+            )
+            summary.update(
+                {
+                    "status": "anomalies_found",
+                    "anomaly_count": len(anomalies),
+                    "anomaly_classes": [
+                        anomaly.get("anomaly_class") for anomaly in anomalies
+                    ],
+                    "error_log_record_count": written_count,
+                    "error_log_path": str(path),
+                }
+            )
+    except Exception as exc:
+        summary.update(
+            {
+                "status": "scan_failed",
+                "error_class": exc.__class__.__name__,
+                "error_message": _redacted_failure_message(str(exc)),
+            }
+        )
+
+    return {
+        "event": "observability_anomaly_scan",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
+
+
 def run_due_sidecar_tasks(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -2848,6 +3620,7 @@ def run_due_sidecar_tasks(
         (_run_codex_oauth_refresh_task, "codex_oauth_refresh"),
         (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
+        (_run_observability_anomaly_scan_task, "observability_anomaly_scan"),
     ):
         try:
             event = runner(config, state, now_monotonic=now)
