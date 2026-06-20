@@ -2939,6 +2939,40 @@ D1-329 ChatGPT/Codex records.
 
 ---
 
+### aawm.89 — Failed Responses payload failover and native finish-reason preservation
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.89`. Failed
+OpenAI Responses payloads and stream events now raise provider-terminal errors
+before Anthropic adapter translation can synthesize a clean `end_turn` stop.
+AAWM Codex/Anthropic auto-agent Responses-adapter probes classify failed
+payloads as `provider_terminal_error` so alias failover can continue when a
+candidate returns `status="failed"` or a non-null `error`. Raw provider
+`finish_reason="error"` is mapped to an OpenAI-compatible terminal reason
+without falling through to `stop`, while preserving the native value in
+`provider_specific_fields["native_finish_reason"]`.
+
+**Why:** Dev `litellm-dev` logs showed `Unmapped finish_reason 'error',
+defaulting to 'stop'` during AAWM code-agent traffic. Treating provider
+terminal failures as ordinary stops made agents appear successful and prevented
+alias failover or session-history diagnostics from reflecting the real upstream
+failure.
+
+**Why not upstream:** This is AAWM-specific auto-agent failover behavior around
+the Anthropic-route Responses adapters and local provider-terminal-error
+classification. The native finish-reason preservation follows LiteLLM's
+existing provider-specific field contract but is driven by AAWM's observed
+agent-routing failure mode.
+
+**Validation status:** Focused compile, ruff, and pytest coverage passed for
+native finish-reason mapping, failed Responses translation, streaming
+`response.failed` handling, failed auto-agent payload classification, and
+existing persisted-output stream reconstruction behavior. Promote by merging
+`develop` to `main`, publishing `v1.82.3-aawm.89`, rebuilding the prod
+infrastructure image on the exact tag, and running the relevant prod adapter
+and log/session-history validation from `PROD_RELEASE.md`.
+
+---
+
 ### aawm.86 — OpenRouter message-shape failover and Antigravity sidecar auth paths
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.86`. Codex
