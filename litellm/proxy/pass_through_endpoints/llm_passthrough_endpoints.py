@@ -1040,6 +1040,9 @@ _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = (
 _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset(
     {408, 429, 500, 502, 503, 504}
 )
+_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES = sorted(
+    PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES - {429}
+)
 _ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS = (
     "LITELLM_CODEX_AUTH_FILE",
     "CHATGPT_AUTH_FILE",
@@ -3216,7 +3219,7 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "rate_limited"
     if status_code == 429:
         return "rate_limited"
-    if status_code in {503, 529}:
+    if status_code in {500, 502, 503, 529}:
         return "upstream_overloaded"
     if status_code == 504:
         return "upstream_timeout"
@@ -14594,7 +14597,11 @@ async def _handle_anthropic_openai_responses_adapter_route(
         custom_llm_provider=adapter_provider,
         egress_credential_family=egress_credential_family,
         expected_target_family="openai",
-        retryable_upstream_status_codes=[429],
+        retryable_upstream_status_codes=(
+            [429] + _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES
+            if use_alias_candidate_probe
+            else [429]
+        ),
         caller_managed_hidden_retry=use_alias_candidate_probe,
     )
     _annotate_request_scope_for_adapted_access_log(request, target_url)
@@ -14760,6 +14767,11 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            retryable_upstream_status_codes=(
+                _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES
+                if use_alias_candidate_probe
+                else None
+            ),
             caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
@@ -14933,6 +14945,11 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
+            retryable_upstream_status_codes=(
+                _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES
+                if use_alias_candidate_probe
+                else None
+            ),
             caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
@@ -15614,6 +15631,11 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
             custom_llm_provider=_OPENCODE_ZEN_PROVIDER,
             egress_credential_family="opencode",
             expected_target_family="opencode",
+            retryable_upstream_status_codes=(
+                _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES
+                if use_alias_candidate_probe
+                else None
+            ),
             caller_managed_hidden_retry=use_alias_candidate_probe,
         )
     except Exception as exc:
@@ -24313,7 +24335,10 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
-            retryable_upstream_status_codes=[429],
+            retryable_upstream_status_codes=[
+                429,
+                *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
+            ],
             caller_managed_hidden_retry=True,
         )
     except Exception as exc:
@@ -24370,7 +24395,10 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             custom_llm_provider=litellm.LlmProviders.XAI.value,
             egress_credential_family="xai",
             expected_target_family="xai",
-            retryable_upstream_status_codes=[429],
+            retryable_upstream_status_codes=[
+                429,
+                *_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES,
+            ],
             caller_managed_hidden_retry=True,
         )
     except Exception as exc:

@@ -115,6 +115,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_google_adapter_pass_through_request,
     _perform_codex_auto_agent_openrouter_completion_request,
     _perform_codex_auto_agent_native_openai_request,
+    _perform_codex_auto_agent_grok_native_responses_request,
+    _perform_codex_auto_agent_oa_xai_responses_request,
     _resolve_anthropic_auto_agent_alias_model,
     _resolve_anthropic_antigravity_code_assist_adapter_model,
     _resolve_anthropic_opencode_zen_adapter_model,
@@ -224,6 +226,7 @@ _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION = (
     "Agent-role guidance below only helps choose which agent to use after "
     "spawning is already authorized; it never authorizes spawning by itself."
 )
+_AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES = [500, 502, 503, 504, 529]
 
 
 def _build_test_jwt(payload: dict[str, Any]) -> str:
@@ -7783,6 +7786,9 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             )
 
         assert response is translated_response
+        assert mock_pass_through.await_args.kwargs[
+            "retryable_upstream_status_codes"
+        ] == [429, *_AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES]
         assert mock_pass_through.await_args.kwargs[
             "caller_managed_hidden_retry"
         ] is True
@@ -20106,6 +20112,8 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
     assert call_kwargs["egress_credential_family"] == "xai"
     assert call_kwargs["expected_target_family"] == "xai"
+    assert call_kwargs["retryable_upstream_status_codes"] is None
+    assert call_kwargs["caller_managed_hidden_retry"] is False
     custom_body = call_kwargs["custom_body"]
     assert custom_body["model"] == upstream_model
     assert "reasoning" not in custom_body
@@ -20123,6 +20131,53 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert "route:xai_oauth_api" in metadata["tags"]
     assert "route:anthropic_xai_oauth_responses_adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_xai_oauth_alias_probe_marks_transient_statuses_alias_managed(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-xai-session"},
+    }
+    success_response = Response(content='{"ok": true}', media_type="application/json")
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="xai-oauth-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+        return_value=success_response,
+    ):
+        response = await _handle_anthropic_xai_oauth_responses_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model="oa_xai/grok-build",
+            use_alias_candidate_probe=True,
+        )
+
+    assert response is success_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["retryable_upstream_status_codes"] == (
+        _AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES
+    )
+    assert call_kwargs["caller_managed_hidden_retry"] is True
 
 
 @pytest.mark.asyncio
@@ -20399,6 +20454,8 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
     assert call_kwargs["egress_credential_family"] == "xai"
     assert call_kwargs["expected_target_family"] == "xai"
+    assert call_kwargs["retryable_upstream_status_codes"] is None
+    assert call_kwargs["caller_managed_hidden_retry"] is False
     custom_body = call_kwargs["custom_body"]
     assert custom_body["model"] == "grok-composer-2.5-fast"
     assert "reasoning" not in custom_body
@@ -20419,6 +20476,56 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert "route:anthropic_grok_native_responses_adapter" in metadata["tags"]
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
     assert "anthropic-grok-native-responses-adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_grok_native_alias_probe_marks_transient_statuses_alias_managed(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "http://localhost:4001/grok/v1",
+    )
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-grok-session"},
+    }
+    success_response = Response(content='{"ok": true}', media_type="application/json")
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","model":"grok-composer-2.5-fast","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+        return_value=success_response,
+    ):
+        response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model="grok-composer-2.5-fast",
+            use_alias_candidate_probe=True,
+        )
+
+    assert response is success_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["retryable_upstream_status_codes"] == (
+        _AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES
+    )
+    assert call_kwargs["caller_managed_hidden_retry"] is True
 
 
 @pytest.mark.asyncio
@@ -20790,6 +20897,110 @@ async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabl
     assert call_kwargs["caller_managed_hidden_retry"] is False
     assert call_kwargs["expected_target_family"] == "openai"
     assert call_kwargs["egress_credential_family"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_grok_native_marks_transient_statuses_alias_managed():
+    request = _build_codex_auto_agent_request()
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"requested_model_alias": "aawm-code"},
+    }
+    grok_prepared_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+        "stream": False,
+    }
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch.object(
+        BaseOpenAIPassThroughHandler,
+        "_prepare_openai_grok_native_oauth_context",
+        new=AsyncMock(
+            return_value=(
+                "http://localhost:4001/grok",
+                {"authorization": "Bearer grok-oidc-token"},
+                grok_prepared_body,
+                "http://localhost:4001/grok/v1/responses",
+            )
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through:
+        response = await _perform_codex_auto_agent_grok_native_responses_request(
+            endpoint="/v1/responses",
+            request=request,
+            user_api_key_dict=MagicMock(),
+            request_body=request_body,
+        )
+
+    assert response is upstream_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["retryable_upstream_status_codes"] == [
+        429,
+        *_AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES,
+    ]
+    assert call_kwargs["caller_managed_hidden_retry"] is True
+    assert call_kwargs["expected_target_family"] == "xai"
+    assert call_kwargs["egress_credential_family"] == "xai"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_oa_xai_marks_transient_statuses_alias_managed():
+    request = _build_codex_auto_agent_request()
+    request_body = {
+        "model": "oa_xai/grok-build",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"requested_model_alias": "aawm-code"},
+    }
+    oa_xai_prepared_body = {
+        "model": "grok-build",
+        "input": "hello",
+        "stream": False,
+    }
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch.object(
+        BaseOpenAIPassThroughHandler,
+        "_prepare_openai_oa_xai_context",
+        new=AsyncMock(
+            return_value=(
+                "https://api.x.ai/v1",
+                "xai-oauth-token",
+                oa_xai_prepared_body,
+                "https://api.x.ai/v1/responses",
+            )
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through:
+        response = await _perform_codex_auto_agent_oa_xai_responses_request(
+            endpoint="/v1/responses",
+            request=request,
+            user_api_key_dict=MagicMock(),
+            request_body=request_body,
+        )
+
+    assert response is upstream_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["retryable_upstream_status_codes"] == [
+        429,
+        *_AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES,
+    ]
+    assert call_kwargs["caller_managed_hidden_retry"] is True
+    assert call_kwargs["expected_target_family"] == "xai"
+    assert call_kwargs["egress_credential_family"] == "xai"
 
 
 def test_codex_auto_agent_alias_last_resort_sets_default_medium_reasoning():
@@ -21231,6 +21442,22 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_timeout_status():
     )
 
     assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_timeout"
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 529])
+def test_codex_auto_agent_retryable_exhaustion_classifies_transient_upstream_status(
+    status_code,
+):
+    exc = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=status_code,
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "upstream_overloaded"
+    )
 
 
 def test_codex_auto_agent_retryable_exhaustion_classifies_failed_responses_payload():
@@ -22230,6 +22457,50 @@ async def test_anthropic_opencode_zen_alias_probe_error_is_candidate_unavailable
     assert exc_info.value.detail["error"]["code"] == (
         "aawm_codex_auto_agent_candidate_unavailable"
     )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_opencode_zen_alias_probe_marks_transient_statuses_alias_managed():
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "opencode_zen/deepseek-v4-flash",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-session"},
+    }
+    success_response = Response(content='{"ok": true}', media_type="application/json")
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_opencode_zen_headers",
+        new=AsyncMock(return_value={"authorization": "Bearer opencode-test-key"}),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+        return_value=success_response,
+    ):
+        response = await _handle_anthropic_opencode_zen_responses_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model="deepseek-v4-flash",
+            use_alias_candidate_probe=True,
+        )
+
+    assert response is success_response
+    call_kwargs = mock_pass_through.await_args.kwargs
+    assert call_kwargs["retryable_upstream_status_codes"] == (
+        _AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES
+    )
+    assert call_kwargs["caller_managed_hidden_retry"] is True
 
 
 @pytest.mark.asyncio
