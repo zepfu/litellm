@@ -151,6 +151,16 @@ double retry. This includes Google/Antigravity adapter calls, OpenRouter adapter
 calls, Codex/auto-agent candidate probes, Cursor lifecycle calls, and Grok
 session side-channel mutation routes.
 
+Alias candidate probes also pass their caller-managed transient upstream status
+set into the pass-through layer. For current AAWM Codex/Anthropic alias probes,
+upstream `500`/`502`/`503`/`504`/`529` responses are owned by alias candidate
+progression, not by generic pass-through exception intake. The pass-through
+layer preserves the upstream status for the alias wrapper, skips generic
+traceback-style `.analysis/*-error.jsonl` emission for those handled statuses,
+and lets the alias layer record candidate failure, cooldown, skipped candidates,
+and final redispatch/no-candidate metadata. Direct non-probe routes still use
+their normal logging behavior for exhausted transient upstream failures.
+
 Successful or exhausted hidden retries add bounded metadata under
 `litellm_params.metadata`, including
 `aawm_passthrough_hidden_retry_attempts`,
