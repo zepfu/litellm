@@ -939,15 +939,61 @@ def _should_log_passthrough_terminal_failure_without_traceback(
     kwargs: Optional[dict],
     status_code: Optional[int],
 ) -> bool:
-    if status_code == 429:
+    try:
+        metadata = _ensure_passthrough_metadata(kwargs)
+        final_outcome = metadata.get("aawm_passthrough_hidden_retry_final_outcome")
+        if final_outcome not in {"failed_after_retry", "failed_without_retry"}:
+            return False
+
+        if (
+            status_code in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
+            or status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            or status_code == status.HTTP_507_INSUFFICIENT_STORAGE
+        ):
+            return True
+
+        if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+            return True
+
+        failure_classification = metadata.get(
+            "aawm_passthrough_hidden_retry_failure_classification"
+        )
+        return failure_classification in {
+            "upstream_connectivity_failure",
+            "transport_dns_failure",
+        }
+    except Exception as classification_exc:
+        verbose_proxy_logger.warning(
+            "Failed to classify pass-through terminal failure logging: %s",
+            classification_exc,
+        )
         return False
 
-    metadata = _ensure_passthrough_metadata(kwargs)
-    final_outcome = metadata.get("aawm_passthrough_hidden_retry_final_outcome")
-    if final_outcome not in {"failed_after_retry", "failed_without_retry"}:
+
+def _is_passthrough_rate_limit_retryable(
+    *,
+    status_code: Optional[int],
+    metadata: dict,
+) -> bool:
+    if status_code != 429:
         return False
+    return metadata.get("aawm_passthrough_rate_limit_retry_enabled") is True
+
+
+def _is_passthrough_retryable(
+    *,
+    exc: Exception,
+    status_code: Optional[int],
+    metadata: dict,
+) -> bool:
+    if _is_passthrough_rate_limit_retryable(status_code=status_code, metadata=metadata):
+        return True
 
     if status_code in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES:
+        # If the exception is a standard HTTPException (e.g. raised by LiteLLM or FastAPI),
+        # we preserve the original behavior and log with traceback.
+        if isinstance(exc, HTTPException):
+            return False
         return True
 
     if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
