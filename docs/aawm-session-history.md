@@ -82,12 +82,19 @@ or "connection was closed in the middle of operation" during pool acquire/init,
 are treated as degraded persistence telemetry while the retry budget is still
 active. LiteLLM drops the cached session-history pool before retrying those
 failures, writes a temporary retry write-ahead spool file before the inline
-retry, and removes that temporary spool after a successful retry. If retries are
-exhausted, the write-ahead spool file remains in place for replay. Recovered
-retryable disconnects should produce warning/recovery telemetry with
-`retry_count`, `db_pool_reset`, `spooled`, `spool_pending`,
-`flush_recovered`, and a bounded failure fingerprint rather than an active
-`*-error.jsonl` intake record.
+retry, and marks the writer as `db_degraded_spooling` for a short bounded
+window. While that degraded window is active, newly accepted records bypass the
+normal in-memory-only enqueue path and are durably spooled for replay; the
+enqueue path also drains a small batch of already queued records into the same
+spool artifact when possible. This reduces the restart-loss window and avoids
+creating one tiny overflow file per record during bursts. The degraded window
+clears after a successful retry. If retries are exhausted, the write-ahead spool
+file remains in place for replay. Recovered retryable disconnects should produce
+warning/recovery telemetry with `retry_count`, `db_pool_reset`, `spooled`,
+`spool_pending`, `spool_bytes`, `flush_recovered`, and a bounded failure
+fingerprint rather than an active `*-error.jsonl` intake record.
+`AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS` controls the degraded enqueue
+spooling window and defaults to 30 seconds.
 
 Each `.jsonl` artifact contains one JSON object per line. The first line is a
 metadata/header record with `type=metadata`, `format_version`, `spooled_at`,
@@ -106,11 +113,24 @@ without waiting for a new failed batch. If the spool directory exists but
 cannot be listed temporarily, startup and replay summaries report
 `spool_pending=unknown` instead of `spool_pending=0`; future drainer triggers
 retry the listing rather than treating the backlog as empty. Missing directories
-still report `spool_pending=0`. Replay is at-least-once. The database
-insert path remains idempotent, so recovery tools and the in-process drainer
-should assume duplicates are possible after a crash or partial outage. The spool
-contains local sensitive session metadata and must stay out of git, shared logs,
-and external artifacts unless it has been reviewed and sanitized.
+still report `spool_pending=0`. Spool-write warnings include
+`spool_write_succeeded=true`, the artifact path, record count, byte count, queue
+depth, pending-file count, and oldest pending age when available. Queue-full
+warnings include a terminal `queue_disposition` such as `queued_after_wait`,
+`overflow_flush_started`, `spool_write_started`, `db_degraded_spooling`, or
+`spool_write_failed`. Replay logs include `spool_replay_started`,
+`spool_replay_recovered`, `spool_replay_failed`, attempted-file count,
+removed-file count, replay duration, and the remaining spool summary so
+operators do not need to infer whether `/mnt/e/litellm/session_history` was
+actually used. If replay fails, the drainer stays active and retries the spool
+batch with bounded backoff before leaving the files in place for a future
+trigger. `AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS` accepts a
+comma-separated retry schedule and defaults to `5,15,30,60,120`. Replay is
+at-least-once. The database insert path remains idempotent, so recovery tools
+and the in-process drainer should assume duplicates are possible after a crash
+or partial outage. The spool contains local sensitive session metadata and must
+stay out of git, shared logs, and external artifacts unless it has been reviewed
+and sanitized.
 
 ## Durable Alias Routing State (D1-323)
 

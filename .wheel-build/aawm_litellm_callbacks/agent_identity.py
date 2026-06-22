@@ -2718,6 +2718,14 @@ _AAWM_SESSION_HISTORY_APPLICATION_NAME = "aawm-litellm-session-history"
 _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
 _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS = 1.0
 _AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES = 3
+_AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS = 30.0
+_AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS: Tuple[float, ...] = (
+    5.0,
+    15.0,
+    30.0,
+    60.0,
+    120.0,
+)
 _AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES = frozenset(
     {
         "ConnectionDoesNotExistError",
@@ -2741,6 +2749,7 @@ _AAWM_SESSION_HISTORY_SPOOL_DIR_ENV = "AAWM_SESSION_HISTORY_SPOOL_DIR"
 _AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT = "/mnt/e/litellm/session_history"
 _AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER = "__aawm_datetime__"
 _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME = "aawm-session-history-spool-drainer"
+_AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS = 64
 _aawm_session_history_schema_ready = False
 _aawm_session_history_schema_lock = threading.Lock()
 _aawm_session_history_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=1024)
@@ -2759,6 +2768,9 @@ _aawm_session_history_spool_startup_bootstrapped = False
 _aawm_session_history_flush_failure_lock = threading.Lock()
 _aawm_session_history_flush_failure_active = False
 _aawm_session_history_suppressed_flush_failures = 0
+_aawm_session_history_degraded_lock = threading.Lock()
+_aawm_session_history_degraded_until_monotonic = 0.0
+_aawm_session_history_degraded_failure_fingerprint: Optional[str] = None
 
 
 def _get_session_history_batch_size() -> int:
@@ -2825,6 +2837,32 @@ def _get_session_history_failed_flush_max_retries() -> int:
     return max(0, parsed_value)
 
 
+def _get_session_history_degraded_spool_seconds() -> float:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS") or ""
+    try:
+        parsed_value = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS
+    return max(0.0, parsed_value)
+
+
+def _get_session_history_spool_replay_backoff_seconds() -> Tuple[float, ...]:
+    raw_value = get_secret_str("AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS")
+    if not raw_value:
+        return _AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS
+
+    parsed_values: List[float] = []
+    for raw_part in str(raw_value).split(","):
+        stripped = raw_part.strip()
+        if not stripped:
+            continue
+        try:
+            parsed_values.append(max(0.0, float(stripped)))
+        except (TypeError, ValueError):
+            continue
+    return tuple(parsed_values)
+
+
 def _get_session_history_spool_dir() -> str:
     configured = get_secret_str(_AAWM_SESSION_HISTORY_SPOOL_DIR_ENV) or ""
     configured_path = str(configured).strip()
@@ -2841,6 +2879,55 @@ def _session_history_queue_depth_summary() -> str:
         queue_size = "unknown"
     max_size = getattr(_aawm_session_history_queue, "maxsize", "unknown")
     return f"queue_depth={queue_size}/{max_size}"
+
+
+def _session_history_queue_depth_values() -> Tuple[Union[int, str], Union[int, str]]:
+    queue_size: Union[int, str]
+    try:
+        queue_size = _aawm_session_history_queue.qsize()
+    except Exception:
+        queue_size = "unknown"
+    return queue_size, getattr(_aawm_session_history_queue, "maxsize", "unknown")
+
+
+def _mark_session_history_degraded_for_spooling(
+    *,
+    failure_fingerprint: Optional[str],
+) -> None:
+    global _aawm_session_history_degraded_until_monotonic
+    global _aawm_session_history_degraded_failure_fingerprint
+
+    degraded_seconds = _get_session_history_degraded_spool_seconds()
+    if degraded_seconds <= 0:
+        return
+    with _aawm_session_history_degraded_lock:
+        _aawm_session_history_degraded_until_monotonic = max(
+            _aawm_session_history_degraded_until_monotonic,
+            time.monotonic() + degraded_seconds,
+        )
+        _aawm_session_history_degraded_failure_fingerprint = failure_fingerprint
+
+
+def _clear_session_history_degraded_spooling() -> None:
+    global _aawm_session_history_degraded_until_monotonic
+    global _aawm_session_history_degraded_failure_fingerprint
+
+    with _aawm_session_history_degraded_lock:
+        _aawm_session_history_degraded_until_monotonic = 0.0
+        _aawm_session_history_degraded_failure_fingerprint = None
+
+
+def _get_session_history_degraded_spooling_context() -> Optional[Dict[str, Any]]:
+    with _aawm_session_history_degraded_lock:
+        remaining_seconds = (
+            _aawm_session_history_degraded_until_monotonic - time.monotonic()
+        )
+        if remaining_seconds <= 0:
+            return None
+        return {
+            "remaining_seconds": round(remaining_seconds, 3),
+            "failure_fingerprint": _aawm_session_history_degraded_failure_fingerprint,
+        }
 
 
 def _mark_session_history_flush_failure_for_logging() -> bool:
@@ -2924,18 +3011,29 @@ def _session_history_spool_summary(
     paths_list = list(listing.paths)
 
     oldest_mtime: Optional[float] = None
+    total_bytes = 0
+    byte_count_known = True
     for path in paths_list:
         try:
             mtime = os.path.getmtime(path)
+            total_bytes += os.path.getsize(path)
         except OSError:
+            byte_count_known = False
             continue
         oldest_mtime = mtime if oldest_mtime is None else min(oldest_mtime, mtime)
 
+    byte_summary = (
+        f", spool_bytes={total_bytes}" if byte_count_known else ", spool_bytes=unknown"
+    )
     if oldest_mtime is None:
-        return f"spool_pending={len(paths_list)}, oldest_pending_age_s=unknown"
+        return (
+            f"spool_pending={len(paths_list)}, oldest_pending_age_s=unknown"
+            f"{byte_summary}"
+        )
     oldest_age = max(0.0, time.time() - oldest_mtime)
     return (
         f"spool_pending={len(paths_list)}, oldest_pending_age_s={oldest_age:.1f}"
+        f"{byte_summary}"
     )
 
 
@@ -3058,6 +3156,9 @@ def _session_history_spool_drainer_main() -> None:
         return
     try:
         batch_size = _get_session_history_batch_size()
+        replay_backoff_seconds = _get_session_history_spool_replay_backoff_seconds()
+        replay_retry_count = 0
+        replay_started_at = time.perf_counter()
         while True:
             listing = _list_session_history_spool()
             if listing.availability == "unavailable":
@@ -3070,6 +3171,13 @@ def _session_history_spool_drainer_main() -> None:
             paths = list(listing.paths)
             if not paths:
                 return
+            verbose_logger.warning(
+                "AawmAgentIdentity: session_history spool replay started "
+                "(spool_replay_started=true, pending_files=%d, batch_size=%d, %s)",
+                len(paths),
+                batch_size,
+                _session_history_spool_summary(paths),
+            )
 
             batch_paths = paths[:batch_size]
             batch: List[Dict[str, Any]] = []
@@ -3085,14 +3193,37 @@ def _session_history_spool_drainer_main() -> None:
                 continue
 
             if not _flush_session_history_batch(batch):
+                if replay_retry_count < len(replay_backoff_seconds):
+                    wait_seconds = replay_backoff_seconds[replay_retry_count]
+                    replay_retry_count += 1
+                    verbose_logger.warning(
+                        "AawmAgentIdentity: session_history spool replay failed; "
+                        "retrying after backoff (spool_replay_retrying=true, "
+                        "retry_count=%d, wait_seconds=%.1f, attempted_files=%d, "
+                        "batch_size=%d, record_count=%d, %s)",
+                        replay_retry_count,
+                        wait_seconds,
+                        len(batch_paths),
+                        len(batch),
+                        len(batch),
+                        _session_history_spool_summary(paths),
+                    )
+                    time.sleep(wait_seconds)
+                    continue
                 verbose_logger.warning(
                     "AawmAgentIdentity: session_history spool drain failed; "
-                    "records remain spooled (batch_size=%d, %s)",
+                    "records remain spooled (spool_replay_failed=true, "
+                    "retry_exhausted=true, retry_count=%d, attempted_files=%d, "
+                    "batch_size=%d, record_count=%d, %s)",
+                    replay_retry_count,
+                    len(batch_paths),
+                    len(batch),
                     len(batch),
                     _session_history_spool_summary(paths),
                 )
                 return
 
+            replay_retry_count = 0
             drained_record_count = len(batch)
             removed = 0
             for path in kept_paths:
@@ -3110,9 +3241,16 @@ def _session_history_spool_drainer_main() -> None:
                     )
             verbose_logger.warning(
                 "AawmAgentIdentity: recovered %d spooled session_history records "
-                "from %d files (%s)",
+                "from %d attempted files; removed %d files "
+                "(spool_replay_recovered=true, record_count=%d, "
+                "attempted_files=%d, removed_files=%d, duration_ms=%.2f, %s)",
                 drained_record_count,
+                len(kept_paths),
                 removed,
+                drained_record_count,
+                len(kept_paths),
+                removed,
+                (time.perf_counter() - replay_started_at) * 1000.0,
                 _session_history_spool_summary(),
             )
     finally:
@@ -3262,13 +3400,22 @@ def _spool_session_history_records(
             )
             spool_file.write("\n")
     os.replace(tmp_path, final_path)
+    try:
+        spool_bytes: Union[int, str] = os.path.getsize(final_path)
+    except OSError:
+        spool_bytes = "unknown"
+    queue_size, queue_maxsize = _session_history_queue_depth_values()
     verbose_logger.warning(
         "AawmAgentIdentity: protected %d session_history records by spooling "
-        "for replay (path=%s, reason=%s, %s, %s)",
+        "for replay (spool_write_succeeded=true, path=%s, reason=%s, "
+        "record_count=%d, spool_bytes=%s, queue_depth=%s/%s, %s)",
         len(records),
         final_path,
         reason,
-        _session_history_queue_depth_summary(),
+        len(records),
+        spool_bytes,
+        queue_size,
+        queue_maxsize,
         _session_history_spool_summary(),
     )
     if start_drainer:
@@ -3549,6 +3696,9 @@ def _prepare_session_history_retry_after_failure(
     retryable_failure_fingerprint = _session_history_persistence_failure_fingerprint(
         last_failure
     )
+    _mark_session_history_degraded_for_spooling(
+        failure_fingerprint=retryable_failure_fingerprint,
+    )
     if retry_write_ahead_spool_path is None:
         try:
             retry_write_ahead_spool_path = _spool_session_history_records(
@@ -3634,6 +3784,7 @@ def _log_recovered_retryable_session_history_flush(
     retry_write_ahead_spool_path: Optional[str],
     failure_fingerprint: Optional[str],
 ) -> None:
+    _clear_session_history_degraded_spooling()
     removed_retry_spool = _remove_recovered_session_history_retry_spool(
         retry_write_ahead_spool_path
     )
@@ -3818,10 +3969,86 @@ def _format_exception_for_warning(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc!r}"
 
 
+def _drain_session_history_queue_for_spool(max_records: int) -> List[Dict[str, Any]]:
+    drained: List[Dict[str, Any]] = []
+    get_nowait = getattr(_aawm_session_history_queue, "get_nowait", None)
+    if not callable(get_nowait):
+        return drained
+    sentinel_seen = False
+    while len(drained) < max_records:
+        try:
+            item = get_nowait()
+        except queue.Empty:
+            break
+        if item is None:
+            sentinel_seen = True
+            break
+        drained.append(item)
+
+    if sentinel_seen:
+        try:
+            _aawm_session_history_queue.put_nowait(None)
+        except queue.Full:
+            verbose_logger.warning(
+                "AawmAgentIdentity: session_history shutdown sentinel could not "
+                "be restored while draining queue for spool (%s)",
+                _session_history_queue_depth_summary(),
+            )
+    return drained
+
+
 def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
     _ensure_session_history_worker_started()
+    degraded_context = _get_session_history_degraded_spooling_context()
+    if degraded_context is not None:
+        drained_records = _drain_session_history_queue_for_spool(
+            max(
+                0,
+                min(
+                    _get_session_history_batch_size() - 1,
+                    _AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS,
+                ),
+            )
+        )
+        spool_batch = [*drained_records, record]
+        verbose_logger.warning(
+            "AawmAgentIdentity: session_history DB degraded; spooling enqueue "
+            "batch for replay (queue_disposition=db_degraded_spooling, "
+            "drained_queue_records=%d, record_count=%d, degraded_remaining_s=%s, "
+            "failure_fingerprint=%s, %s)",
+            len(drained_records),
+            len(spool_batch),
+            degraded_context.get("remaining_seconds"),
+            degraded_context.get("failure_fingerprint"),
+            _session_history_queue_depth_summary(),
+        )
+        try:
+            _spool_session_history_records(
+                spool_batch,
+                reason="db degraded enqueue",
+                start_drainer=False,
+            )
+            return
+        except Exception as exc:
+            verbose_logger.exception(
+                "AawmAgentIdentity: failed to spool session_history record "
+                "during DB degraded mode; falling back to inline protection "
+                "(queue_disposition=spool_write_failed, "
+                "unprotected_record_risk=true, record_count=%d): %s",
+                len(spool_batch),
+                _format_exception_for_warning(exc),
+            )
+            _flush_session_history_batch_with_retry(
+                spool_batch,
+                retry_message="inline session_history degraded spool failure",
+            )
+            return
+
     try:
-        _aawm_session_history_queue.put(record, timeout=_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS)
+        _aawm_session_history_queue.put(
+            record,
+            timeout=_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
+        )
     except queue.Full:
         if not _aawm_session_history_overflow_flush_semaphore.acquire(blocking=False):
             try:
@@ -3832,32 +4059,56 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
                         _get_session_history_flush_interval_seconds(),
                     ),
                 )
+                verbose_logger.warning(
+                    "AawmAgentIdentity: session_history queue full; queued "
+                    "record after waiting (queue_disposition=queued_after_wait, %s)",
+                    _session_history_queue_depth_summary(),
+                )
                 return
             except queue.Full:
                 pass
 
+            drain_limit = max(
+                0,
+                min(
+                    _get_session_history_batch_size() - 1,
+                    _AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS,
+                ),
+            )
+            drained_records = _drain_session_history_queue_for_spool(drain_limit)
+            spool_batch = [*drained_records, record]
             verbose_logger.warning(
                 "AawmAgentIdentity: session_history queue full and overflow flusher "
-                "busy; spooling overflow record for retry (%s)",
+                "busy; spooling overflow batch for retry "
+                "(queue_disposition=spool_write_started, drained_queue_records=%d, "
+                "record_count=%d, %s)",
+                len(drained_records),
+                len(spool_batch),
                 _session_history_queue_depth_summary(),
             )
             try:
-                _spool_session_history_record(record)
+                _spool_session_history_records(
+                    spool_batch,
+                    reason="queue full overflow",
+                )
             except Exception as exc:
                 verbose_logger.exception(
                     "AawmAgentIdentity: failed to spool session_history overflow "
-                    "record; potential data loss until inline retry succeeds: %s",
+                    "batch; potential data loss until inline retry succeeds "
+                    "(queue_disposition=spool_write_failed, "
+                    "unprotected_record_risk=true, record_count=%d): %s",
+                    len(spool_batch),
                     _format_exception_for_warning(exc),
                 )
                 _flush_session_history_batch_with_retry(
-                    [record],
+                    spool_batch,
                     retry_message="inline session_history overflow after spool failure",
                 )
             return
 
         verbose_logger.warning(
             "AawmAgentIdentity: session_history queue full; flushing overflow "
-            "record in background (%s)",
+            "record in background (queue_disposition=overflow_flush_started, %s)",
             _session_history_queue_depth_summary(),
         )
         try:
