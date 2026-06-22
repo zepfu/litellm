@@ -77,6 +77,17 @@ fallback file is only container-local and can be lost on recreate. Failed
 flushes retry every `AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS` seconds,
 and `AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES` controls how many retry
 attempts happen before the batch is atomically written to the spool.
+Retryable asyncpg connection interruptions, such as `ConnectionDoesNotExistError`
+or "connection was closed in the middle of operation" during pool acquire/init,
+are treated as degraded persistence telemetry while the retry budget is still
+active. LiteLLM drops the cached session-history pool before retrying those
+failures, writes a temporary retry write-ahead spool file before the inline
+retry, and removes that temporary spool after a successful retry. If retries are
+exhausted, the write-ahead spool file remains in place for replay. Recovered
+retryable disconnects should produce warning/recovery telemetry with
+`retry_count`, `db_pool_reset`, `spooled`, `spool_pending`,
+`flush_recovered`, and a bounded failure fingerprint rather than an active
+`*-error.jsonl` intake record.
 
 Each `.jsonl` artifact contains one JSON object per line. The first line is a
 metadata/header record with `type=metadata`, `format_version`, `spooled_at`,
