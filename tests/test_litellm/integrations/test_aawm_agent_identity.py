@@ -9678,6 +9678,160 @@ def test_flush_session_history_batch_logs_exception_type_when_message_is_empty(
     assert exception_mock.call_args.args[3].startswith("queue_depth=")
 
 
+def test_retryable_session_history_failure_recovers_without_error_intake(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class ConnectionDoesNotExistError(Exception):
+        pass
+
+    records = [{"litellm_call_id": "call-retryable-recovered", "trace_id": "trace-db"}]
+    attempts = []
+    pool_reset_loops = []
+    drainer_starts = []
+
+    async def flaky_persist(batch):
+        attempts.append(batch)
+        if len(attempts) == 1:
+            raise ConnectionDoesNotExistError(
+                "connection was closed in the middle of operation"
+            )
+
+    def fake_secret(key: str):
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV:
+            return str(tmp_path)
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES":
+            return "1"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS":
+            return "0.1"
+        return None
+
+    exception_mock = MagicMock()
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", fake_secret)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        flaky_persist,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_reset_session_history_pool_after_retryable_failure",
+        lambda loop: pool_reset_loops.append(loop) or 1,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        lambda: drainer_starts.append("start"),
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    loop = aawm_agent_identity.asyncio.new_event_loop()
+    try:
+        aawm_agent_identity._flush_session_history_batch_with_retry(
+            records,
+            loop=loop,
+        )
+    finally:
+        loop.close()
+
+    assert attempts == [records, records]
+    assert pool_reset_loops == [loop]
+    assert exception_mock.call_count == 0
+    assert aawm_agent_identity._session_history_spool_paths() == []
+    assert drainer_starts == ["start"]
+
+    warning_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any("retryable session_history persistence degradation" in message for message in warning_messages)
+    assert any("protected %d session_history records by spooling" in message for message in warning_messages)
+    assert any("session_history flush recovered after retry" in message for message in warning_messages)
+
+
+def test_retryable_session_history_failure_keeps_write_ahead_spool_after_retry_budget(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class ConnectionDoesNotExistError(Exception):
+        pass
+
+    records = [
+        {"litellm_call_id": "call-retryable-spooled", "trace_id": "trace-db-spool"}
+    ]
+    attempts = []
+
+    async def failing_persist(batch):
+        attempts.append(batch)
+        raise ConnectionDoesNotExistError(
+            "connection was closed in the middle of operation"
+        )
+
+    def fake_secret(key: str):
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV:
+            return str(tmp_path)
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES":
+            return "1"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS":
+            return "0.1"
+        return None
+
+    exception_mock = MagicMock()
+    warning_mock = MagicMock()
+    drainer_starts = []
+
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", fake_secret)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        failing_persist,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_reset_session_history_pool_after_retryable_failure",
+        lambda loop: 1,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        lambda: drainer_starts.append("start"),
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    loop = aawm_agent_identity.asyncio.new_event_loop()
+    try:
+        aawm_agent_identity._flush_session_history_batch_with_retry(
+            records,
+            loop=loop,
+        )
+    finally:
+        loop.close()
+
+    paths = aawm_agent_identity._session_history_spool_paths()
+    assert attempts == [records, records]
+    assert len(paths) == 1
+    assert aawm_agent_identity._load_session_history_spool_records(paths[0]) == records
+    assert exception_mock.call_count == 0
+    assert drainer_starts == ["start"]
+
+    raw_lines = [
+        json.loads(line)
+        for line in Path(paths[0]).read_text().splitlines()
+        if line.strip()
+    ]
+    assert raw_lines[0]["reason"] == "session_history batch flush retry write-ahead"
+    assert raw_lines[0]["failure"] == {"type": "ConnectionDoesNotExistError"}
+
+    warning_messages = [call.args[0] for call in warning_mock.call_args_list]
+    assert any(
+        "retry write-ahead spool remains protected for replay" in message
+        for message in warning_messages
+    )
+
+
 def test_enqueue_session_history_record_retries_queue_when_overflow_busy(monkeypatch) -> None:
     class FullThenAvailableQueue:
         def __init__(self):

@@ -27,6 +27,7 @@ import asyncio
 import atexit
 import base64
 import hashlib
+import inspect
 import ipaddress
 import importlib
 import json
@@ -2717,6 +2718,25 @@ _AAWM_SESSION_HISTORY_APPLICATION_NAME = "aawm-litellm-session-history"
 _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
 _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS = 1.0
 _AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES = 3
+_AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES = frozenset(
+    {
+        "ConnectionDoesNotExistError",
+        "ConnectionFailureError",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "BrokenPipeError",
+    }
+)
+_AAWM_SESSION_HISTORY_RETRYABLE_MESSAGE_MARKERS = (
+    "connection was closed",
+    "connection is closed",
+    "connection has been closed",
+    "closed in the middle of operation",
+    "server closed the connection",
+    "connection reset",
+    "connection lost",
+    "connection terminated",
+)
 _AAWM_SESSION_HISTORY_SPOOL_DIR_ENV = "AAWM_SESSION_HISTORY_SPOOL_DIR"
 _AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT = "/mnt/e/litellm/session_history"
 _AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER = "__aawm_datetime__"
@@ -3196,6 +3216,7 @@ def _spool_session_history_records(
     reason: str,
     retry_count: Optional[int] = None,
     failure: Optional[Exception] = None,
+    start_drainer: bool = True,
 ) -> str:
     if not records:
         raise ValueError("session_history spool requires at least one record")
@@ -3250,7 +3271,8 @@ def _spool_session_history_records(
         _session_history_queue_depth_summary(),
         _session_history_spool_summary(),
     )
-    _ensure_session_history_spool_drainer_started()
+    if start_drainer:
+        _ensure_session_history_spool_drainer_started()
     return final_path
 
 
@@ -3267,12 +3289,103 @@ async def _close_aawm_session_history_pools_for_current_loop() -> None:
         await pool.close()
 
 
+def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    seen: Set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_retryable_session_history_persistence_failure(exc: Exception) -> bool:
+    for chained_exc in _iter_exception_chain(exc):
+        exc_name = type(chained_exc).__name__
+        if exc_name in _AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES:
+            return True
+        message = str(chained_exc).lower()
+        if message and any(
+            marker in message
+            for marker in _AAWM_SESSION_HISTORY_RETRYABLE_MESSAGE_MARKERS
+        ):
+            return True
+    return False
+
+
+def _session_history_persistence_failure_fingerprint(exc: Exception) -> str:
+    fingerprint_source = [
+        {
+            "type": type(chained_exc).__name__,
+            "message": str(chained_exc),
+        }
+        for chained_exc in _iter_exception_chain(exc)
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint_source,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+async def _drop_aawm_session_history_pools_for_current_loop() -> int:
+    loop = asyncio.get_running_loop()
+    pools_to_drop: List[Any] = []
+    with _aawm_session_history_pool_lock:
+        for key, pool in list(_aawm_session_history_pools.items()):
+            if key[0] is loop:
+                pools_to_drop.append(pool)
+                del _aawm_session_history_pools[key]
+
+    for pool in pools_to_drop:
+        try:
+            terminate = getattr(pool, "terminate", None)
+            if callable(terminate):
+                result = terminate()
+                if inspect.isawaitable(result):
+                    await result
+                continue
+            close = getattr(pool, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            verbose_logger.warning(
+                "AawmAgentIdentity: failed to drop cached session_history "
+                "pool during retry reset: %s",
+                _format_exception_for_warning(exc),
+            )
+    return len(pools_to_drop)
+
+
+def _reset_session_history_pool_after_retryable_failure(
+    loop: Optional[asyncio.AbstractEventLoop],
+) -> int:
+    if loop is None or loop.is_closed() or loop.is_running():
+        return 0
+    try:
+        return int(
+            loop.run_until_complete(_drop_aawm_session_history_pools_for_current_loop())
+        )
+    except Exception as exc:
+        verbose_logger.warning(
+            "AawmAgentIdentity: failed to reset session_history DB pool before "
+            "retry: %s",
+            _format_exception_for_warning(exc),
+        )
+        return 0
+
+
 def _flush_session_history_batch(
     records: List[Dict[str, Any]],
     loop: Optional[asyncio.AbstractEventLoop] = None,
     *,
     log_exception: bool = True,
     failure_callback: Optional[Callable[[Exception], None]] = None,
+    ensure_spool_drainer: bool = True,
 ) -> bool:
     if not records:
         return True
@@ -3295,7 +3408,20 @@ def _flush_session_history_batch(
     except Exception as exc:
         if failure_callback is not None:
             failure_callback(exc)
-        if log_exception and _mark_session_history_flush_failure_for_logging():
+        retryable_failure = _is_retryable_session_history_persistence_failure(exc)
+        if retryable_failure:
+            verbose_logger.warning(
+                "AawmAgentIdentity: retryable session_history persistence "
+                "degradation; retrying without active error intake: %s "
+                "(batch_size=%d, degraded_telemetry=true, spooled=false, "
+                "failure_fingerprint=%s, %s, %s)",
+                _format_exception_for_warning(exc),
+                len(records),
+                _session_history_persistence_failure_fingerprint(exc),
+                _session_history_queue_depth_summary(),
+                _session_history_spool_summary(),
+            )
+        elif log_exception and _mark_session_history_flush_failure_for_logging():
             verbose_logger.exception(
                 "AawmAgentIdentity: failed to flush %d session_history records; "
                 "retrying within the configured retry budget: %s (%s)",
@@ -3327,7 +3453,10 @@ def _flush_session_history_batch(
         (time.perf_counter() - started_at) * 1000.0,
         _session_history_queue_depth_summary(),
     )
-    if threading.current_thread().name != _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME:
+    if (
+        ensure_spool_drainer
+        and threading.current_thread().name != _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME
+    ):
         _ensure_session_history_spool_drainer_started()
     return True
 
@@ -3342,6 +3471,190 @@ def _flush_session_history_overflow_record(record: Dict[str, Any]) -> None:
         _aawm_session_history_overflow_flush_semaphore.release()
 
 
+def _start_session_history_spool_drainer_after_retry_exhaustion() -> None:
+    try:
+        _ensure_session_history_spool_drainer_started()
+    except Exception as drainer_exc:
+        verbose_logger.warning(
+            "AawmAgentIdentity: failed to start session_history "
+            "spool drainer after retry exhaustion: %s",
+            _format_exception_for_warning(drainer_exc),
+        )
+
+
+def _handle_session_history_retry_exhaustion(
+    batch: List[Dict[str, Any]],
+    *,
+    retry_message: str,
+    retry_count: int,
+    last_failure: Optional[Exception],
+    retry_write_ahead_spool_path: Optional[str],
+) -> bool:
+    if retry_write_ahead_spool_path is not None:
+        verbose_logger.warning(
+            "AawmAgentIdentity: %s failed after %d retries; retry "
+            "write-ahead spool remains protected for replay "
+            "(path=%s, batch_size=%d, spooled=true, %s)",
+            retry_message,
+            retry_count,
+            retry_write_ahead_spool_path,
+            len(batch),
+            _session_history_spool_summary(),
+        )
+        _start_session_history_spool_drainer_after_retry_exhaustion()
+        return True
+
+    try:
+        spool_path = _spool_session_history_records(
+            batch,
+            reason=f"{retry_message} failed",
+            retry_count=retry_count,
+            failure=last_failure,
+        )
+        verbose_logger.warning(
+            "AawmAgentIdentity: %s failed after %d retries; "
+            "protected batch by spooling for replay (path=%s, batch_size=%d, %s)",
+            retry_message,
+            retry_count,
+            spool_path,
+            len(batch),
+            _session_history_spool_summary(),
+        )
+        return True
+    except Exception as spool_exc:
+        verbose_logger.exception(
+            "AawmAgentIdentity: failed to spool %s after %d retries; "
+            "potential session_history data loss until inline retry succeeds: %s",
+            retry_message,
+            retry_count,
+            _format_exception_for_warning(spool_exc),
+        )
+        return False
+
+
+def _prepare_session_history_retry_after_failure(
+    batch: List[Dict[str, Any]],
+    *,
+    loop: Optional[asyncio.AbstractEventLoop],
+    retry_message: str,
+    retry_count: int,
+    last_failure: Optional[Exception],
+    retry_write_ahead_spool_path: Optional[str],
+) -> Tuple[bool, Optional[str], int, Optional[str]]:
+    if last_failure is None or not _is_retryable_session_history_persistence_failure(
+        last_failure
+    ):
+        return False, retry_write_ahead_spool_path, 0, None
+
+    retryable_failure_fingerprint = _session_history_persistence_failure_fingerprint(
+        last_failure
+    )
+    if retry_write_ahead_spool_path is None:
+        try:
+            retry_write_ahead_spool_path = _spool_session_history_records(
+                batch,
+                reason=f"{retry_message} retry write-ahead",
+                retry_count=retry_count,
+                failure=last_failure,
+                start_drainer=False,
+            )
+        except Exception as spool_exc:
+            verbose_logger.exception(
+                "AawmAgentIdentity: failed to write retry-protection "
+                "spool for %s; potential session_history data loss if "
+                "the process exits before retry succeeds: %s",
+                retry_message,
+                _format_exception_for_warning(spool_exc),
+            )
+    db_pool_reset_count = _reset_session_history_pool_after_retryable_failure(loop)
+    return (
+        True,
+        retry_write_ahead_spool_path,
+        db_pool_reset_count,
+        retryable_failure_fingerprint,
+    )
+
+
+def _log_session_history_retry(
+    *,
+    retry_message: str,
+    retry_count: int,
+    batch_size: int,
+    retryable_last_failure: bool,
+    db_pool_reset_this_retry: int,
+    db_pool_reset_count: int,
+    spooled: bool,
+    degraded_telemetry: bool,
+    failure_fingerprint: Optional[str],
+) -> None:
+    verbose_logger.warning(
+        "AawmAgentIdentity: retrying %s within the configured retry budget "
+        "(retry_count=%d, batch_size=%d, retryable=%s, "
+        "db_pool_reset=%d, db_pool_reset_count=%d, spooled=%s, "
+        "degraded_telemetry=%s, failure_fingerprint=%s, %s)",
+        retry_message,
+        retry_count,
+        batch_size,
+        retryable_last_failure,
+        db_pool_reset_this_retry,
+        db_pool_reset_count,
+        spooled,
+        degraded_telemetry,
+        failure_fingerprint,
+        _session_history_queue_depth_summary(),
+    )
+
+
+def _remove_recovered_session_history_retry_spool(
+    retry_write_ahead_spool_path: Optional[str],
+) -> bool:
+    if retry_write_ahead_spool_path is None:
+        return False
+    try:
+        os.remove(retry_write_ahead_spool_path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        verbose_logger.warning(
+            "AawmAgentIdentity: failed to remove recovered "
+            "session_history retry spool %s; replay may retry the "
+            "idempotent batch: %s",
+            retry_write_ahead_spool_path,
+            _format_exception_for_warning(exc),
+        )
+        return False
+
+
+def _log_recovered_retryable_session_history_flush(
+    *,
+    retry_count: int,
+    batch_size: int,
+    db_pool_reset_count: int,
+    retry_write_ahead_spool_path: Optional[str],
+    failure_fingerprint: Optional[str],
+) -> None:
+    removed_retry_spool = _remove_recovered_session_history_retry_spool(
+        retry_write_ahead_spool_path
+    )
+    verbose_logger.warning(
+        "AawmAgentIdentity: session_history flush recovered after retry "
+        "(flush_recovered=true, retry_count=%d, batch_size=%d, "
+        "db_pool_reset_count=%d, spooled=false, "
+        "retry_spool_removed=%s, degraded_telemetry=true, "
+        "failure_fingerprint=%s, %s, %s)",
+        retry_count,
+        batch_size,
+        db_pool_reset_count,
+        removed_retry_spool,
+        failure_fingerprint,
+        _session_history_queue_depth_summary(),
+        _session_history_spool_summary(),
+    )
+    if threading.current_thread().name != _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME:
+        _ensure_session_history_spool_drainer_started()
+
+
 def _flush_session_history_batch_with_retry(
     batch: List[Dict[str, Any]],
     *,
@@ -3352,6 +3665,10 @@ def _flush_session_history_batch_with_retry(
     max_retries = _get_session_history_failed_flush_max_retries()
     retry_count = 0
     last_failure: Optional[Exception] = None
+    retryable_failure_seen = False
+    retryable_failure_fingerprint: Optional[str] = None
+    retry_write_ahead_spool_path: Optional[str] = None
+    db_pool_reset_count = 0
 
     def _capture_failure(exc: Exception) -> None:
         nonlocal last_failure
@@ -3362,44 +3679,58 @@ def _flush_session_history_batch_with_retry(
         loop=loop,
         log_exception=retry_count == 0,
         failure_callback=_capture_failure,
+        ensure_spool_drainer=retry_write_ahead_spool_path is None,
     ):
         if retry_count >= max_retries:
-            try:
-                spool_path = _spool_session_history_records(
-                    batch,
-                    reason=f"{retry_message} failed",
-                    retry_count=retry_count,
-                    failure=last_failure,
-                )
-                verbose_logger.warning(
-                    "AawmAgentIdentity: %s failed after %d retries; "
-                    "protected batch by spooling for replay (path=%s, batch_size=%d, %s)",
-                    retry_message,
-                    retry_count,
-                    spool_path,
-                    len(batch),
-                    _session_history_spool_summary(),
-                )
+            if _handle_session_history_retry_exhaustion(
+                batch,
+                retry_message=retry_message,
+                retry_count=retry_count,
+                last_failure=last_failure,
+                retry_write_ahead_spool_path=retry_write_ahead_spool_path,
+            ):
                 return
-            except Exception as spool_exc:
-                verbose_logger.exception(
-                    "AawmAgentIdentity: failed to spool %s after %d retries; "
-                    "potential session_history data loss until inline retry succeeds: %s",
-                    retry_message,
-                    retry_count,
-                    _format_exception_for_warning(spool_exc),
-                )
+
+        (
+            retryable_last_failure,
+            retry_write_ahead_spool_path,
+            db_pool_reset_this_retry,
+            current_failure_fingerprint,
+        ) = _prepare_session_history_retry_after_failure(
+            batch,
+            loop=loop,
+            retry_message=retry_message,
+            retry_count=retry_count,
+            last_failure=last_failure,
+            retry_write_ahead_spool_path=retry_write_ahead_spool_path,
+        )
+        if retryable_last_failure:
+            retryable_failure_seen = True
+            retryable_failure_fingerprint = current_failure_fingerprint
+            db_pool_reset_count += db_pool_reset_this_retry
 
         retry_count += 1
-        verbose_logger.warning(
-            "AawmAgentIdentity: retrying %s within the configured retry budget "
-            "(retry_count=%d, batch_size=%d, %s)",
-            retry_message,
-            retry_count,
-            len(batch),
-            _session_history_queue_depth_summary(),
+        _log_session_history_retry(
+            retry_message=retry_message,
+            retry_count=retry_count,
+            batch_size=len(batch),
+            retryable_last_failure=retryable_last_failure,
+            db_pool_reset_this_retry=db_pool_reset_this_retry,
+            db_pool_reset_count=db_pool_reset_count,
+            spooled=retry_write_ahead_spool_path is not None,
+            degraded_telemetry=retryable_failure_seen,
+            failure_fingerprint=retryable_failure_fingerprint,
         )
         time.sleep(retry_seconds)
+
+    if retryable_failure_seen:
+        _log_recovered_retryable_session_history_flush(
+            retry_count=retry_count,
+            batch_size=len(batch),
+            db_pool_reset_count=db_pool_reset_count,
+            retry_write_ahead_spool_path=retry_write_ahead_spool_path,
+            failure_fingerprint=retryable_failure_fingerprint,
+        )
 
 
 def _session_history_worker_main() -> None:
@@ -8816,6 +9147,14 @@ def _build_provider_error_observation(
         "shared_quota_family",
         "grok_subscription_quota_shared",
         "passthrough_route_family",
+        "grok_side_channel",
+        "grok_side_channel_endpoint_type",
+        "grok_side_channel_endpoint_path_template",
+        "grok_side_channel_request_content_type",
+        "grok_side_channel_request_body_byte_length",
+        "grok_side_channel_request_body_digest_source",
+        "grok_side_channel_request_json_container_type",
+        "grok_side_channel_request_array_length",
     ):
         value = metadata.get(key)
         if value is not None:
