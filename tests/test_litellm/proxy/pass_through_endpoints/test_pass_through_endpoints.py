@@ -3267,6 +3267,13 @@ class TestPassThroughTerminalFailureLogging:
             status_code=529,
         )
 
+    def test_terminal_failure_classifier_without_hidden_retry_metadata_is_safe(self):
+        assert not _should_log_passthrough_terminal_failure_without_traceback(
+            exc=HTTPException(status_code=507, detail="buffer limit"),
+            kwargs={},
+            status_code=507,
+        )
+
     def test_terminal_failure_classifier_keeps_auth_errors_exceptional(self):
         kwargs = {
             "litellm_params": {
@@ -3280,6 +3287,49 @@ class TestPassThroughTerminalFailureLogging:
             exc=HTTPException(status_code=401, detail="unauthorized"),
             kwargs=kwargs,
             status_code=401,
+        )
+
+    def test_terminal_failure_classifier_is_side_effect_safe_when_metadata_is_missing(
+        self,
+    ):
+        assert not _should_log_passthrough_terminal_failure_without_traceback(
+            exc=HTTPException(status_code=529, detail="overloaded"),
+            kwargs=None,
+            status_code=529,
+        )
+
+    @pytest.mark.parametrize(
+        ("status_code", "detail"),
+        [
+            (
+                429,
+                "429: b'RESOURCE_EXHAUSTED quotaResetTimeStamp=2026-06-26T11:28:58Z'",
+            ),
+            (
+                507,
+                "507: b'exceeded request buffer limit while retrying upstream'",
+            ),
+        ],
+    )
+    def test_terminal_failure_classifier_matches_hidden_retry_terminal_statuses(
+        self,
+        status_code,
+        detail,
+    ):
+        kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "aawm_passthrough_hidden_retry_final_outcome": "failed_after_retry",
+                    "aawm_passthrough_hidden_retry_failure_classification": None,
+                    "aawm_passthrough_hidden_retry_count": 1,
+                }
+            }
+        }
+
+        assert _should_log_passthrough_terminal_failure_without_traceback(
+            exc=HTTPException(status_code=status_code, detail=detail),
+            kwargs=kwargs,
+            status_code=status_code,
         )
 
     @pytest.mark.asyncio
@@ -3457,6 +3507,105 @@ class TestPassThroughTerminalFailureLogging:
             )
 
         assert not (tmp_path / "dev-error.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_terminal_507_hidden_retry_logs_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        upstream_detail = "507: b'exceeded request buffer limit while retrying upstream'"
+        upstream_response = httpx.Response(
+            status_code=507,
+            content=upstream_detail.encode("utf-8"),
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+        hidden_retry_metadata = {
+            "aawm_passthrough_hidden_retry_final_outcome": "failed_after_retry",
+            "aawm_passthrough_hidden_retry_failure_classification": None,
+            "aawm_passthrough_hidden_retry_count": 1,
+        }
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value={"model": "gpt-5.5"},
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._ensure_passthrough_metadata",
+                return_value=hidden_retry_metadata,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(),
+            ), patch.object(
+                verbose_proxy_logger,
+                "exception",
+            ) as mock_exception:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value={"model": "gpt-5.5"}
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=mock_request,
+                        target=target_url,
+                        custom_headers={"authorization": "Bearer test"},
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                    )
+
+                assert exc_info.value.code == "507"
+                assert upstream_detail in str(exc_info.value.message)
+                mock_exception.assert_not_called()
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "exhausted hidden retries for upstream failure" in item["message"]
+        )
+        assert payload["context"]["status_code"] == 507
+        assert "buffer limit" in payload["message"]
+        assert payload.get("traceback") in (None, "")
 
     @pytest.mark.asyncio
     async def test_pass_through_request_chatgpt_codex_block_page_warns_with_failure_kind(
