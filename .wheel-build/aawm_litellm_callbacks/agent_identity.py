@@ -2001,6 +2001,98 @@ WHERE quota_key = $1
 ORDER BY observed_at DESC, id DESC
 LIMIT 1
 """
+_AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL = """
+WITH candidate AS (
+    SELECT
+        input.ordinal::bigint AS ordinal,
+        input.quota_key::text AS quota_key,
+        input.provider::text AS provider,
+        input.client::text AS client,
+        input.account_hash::text AS account_hash,
+        input.source::text AS source,
+        input.observed_at::timestamptz AS observed_at
+    FROM unnest(
+        $1::text[],
+        $2::text[],
+        $3::text[],
+        $4::text[],
+        $5::text[],
+        $6::timestamptz[]
+    ) WITH ORDINALITY AS input(
+        quota_key,
+        provider,
+        client,
+        account_hash,
+        source,
+        observed_at,
+        ordinal
+    )
+)
+SELECT
+    candidate.quota_key AS input_limit_key,
+    latest.observed_at,
+    latest.source,
+    latest.provider,
+    latest.client AS client_family,
+    latest.account_hash,
+    NULL::text AS environment,
+    NULL::text AS tenant_id,
+    NULL::text AS repository,
+    latest.quota_key AS limit_key,
+    latest.quota_key AS limit_id,
+    latest.quota_key AS limit_name,
+    latest.quota_type AS limit_scope,
+    NULL::integer AS window_minutes,
+    latest.quota_period,
+    latest.expected_reset_at AS provider_resets_at,
+    NULL::timestamptz AS inferred_window_start_at,
+    CASE
+        WHEN latest.remaining_pct IS NULL THEN NULL
+        ELSE GREATEST(0.0, LEAST(100.0, 100.0 - latest.remaining_pct))
+    END AS used_percentage,
+    NULL::integer AS remaining_requests,
+    NULL::integer AS used_requests,
+    NULL::integer AS total_requests,
+    CASE WHEN latest.remaining_pct <= 0 THEN 'exhausted' ELSE 'observed' END AS status,
+    COALESCE(latest.remaining_pct <= 0, FALSE) AS exhausted,
+    NULL::text AS exhaustion_kind,
+    NULL::integer AS reset_hint_seconds,
+    latest.model,
+    latest.quota_limit,
+    latest.quota_used,
+    latest.quota_remaining,
+    latest.billing_period_start_at,
+    latest.billing_period_end_at,
+    NULL::text AS model_family,
+    NULL::text AS model_tier,
+    NULL::text AS parent_limit_key,
+    latest.session_id,
+    latest.trace_id,
+    latest.litellm_call_id,
+    NULL::text AS route_family,
+    NULL::text AS request_model,
+    NULL::text AS response_model,
+    latest.client AS client_name,
+    latest.client_version,
+    NULL::text AS client_user_agent,
+    COALESCE(latest.raw_provider_fields, '{}'::jsonb) AS raw_provider_fields,
+    COALESCE(latest.evidence, '{}'::jsonb) AS evidence,
+    '{}'::jsonb AS metadata
+FROM candidate
+JOIN LATERAL (
+    SELECT *
+    FROM public.rate_limit_observations AS previous
+    WHERE previous.quota_key = candidate.quota_key
+      AND previous.provider = candidate.provider
+      AND previous.client IS NOT DISTINCT FROM candidate.client
+      AND previous.account_hash IS NOT DISTINCT FROM candidate.account_hash
+      AND previous.source IS NOT DISTINCT FROM candidate.source
+      AND previous.observed_at < candidate.observed_at
+    ORDER BY previous.observed_at DESC, previous.id DESC
+    LIMIT 1
+) AS latest ON TRUE
+ORDER BY candidate.ordinal
+"""
 _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL = """
 INSERT INTO public.rate_limit_transitions (
     transition_key,
@@ -18137,6 +18229,67 @@ async def _persist_alias_routing_audit_best_effort(
     await conn.executemany(_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL, payloads)
 
 
+_AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS: Tuple[str, ...] = (
+    "observed_at",
+    "source",
+    "provider",
+    "client_family",
+    "account_hash",
+    "environment",
+    "tenant_id",
+    "repository",
+    "limit_key",
+    "limit_id",
+    "limit_name",
+    "limit_scope",
+    "window_minutes",
+    "quota_period",
+    "provider_resets_at",
+    "inferred_window_start_at",
+    "used_percentage",
+    "remaining_requests",
+    "used_requests",
+    "total_requests",
+    "status",
+    "exhausted",
+    "exhaustion_kind",
+    "reset_hint_seconds",
+    "model",
+    "quota_limit",
+    "quota_used",
+    "quota_remaining",
+    "billing_period_start_at",
+    "billing_period_end_at",
+    "model_family",
+    "model_tier",
+    "parent_limit_key",
+    "session_id",
+    "trace_id",
+    "litellm_call_id",
+    "route_family",
+    "request_model",
+    "response_model",
+    "client_name",
+    "client_version",
+    "client_user_agent",
+    "raw_provider_fields",
+    "evidence",
+    "metadata",
+)
+
+
+def _rate_limit_previous_observation_row_to_dict(row: Any) -> Dict[str, Any]:
+    try:
+        row_dict = dict(row)
+    except Exception:
+        return {
+            key: _maybe_get(row, key)
+            for key in _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS
+        }
+    row_dict.pop("input_limit_key", None)
+    return row_dict
+
+
 async def _fetch_previous_rate_limit_observation(
     conn: Any,
     observation: Dict[str, Any],
@@ -18155,59 +18308,61 @@ async def _fetch_previous_rate_limit_observation(
     )
     if row is None:
         return None
-    try:
-        return dict(row)
-    except Exception:
-        return {
-            key: _maybe_get(row, key)
-            for key in (
-                "observed_at",
-                "source",
-                "provider",
-                "client_family",
-                "account_hash",
-                "environment",
-                "tenant_id",
-                "repository",
-                "limit_key",
-                "limit_id",
-                "limit_name",
-                "limit_scope",
-                "window_minutes",
-                "quota_period",
-                "provider_resets_at",
-                "inferred_window_start_at",
-                "used_percentage",
-                "remaining_requests",
-                "used_requests",
-                "total_requests",
-                "status",
-                "exhausted",
-                "exhaustion_kind",
-                "reset_hint_seconds",
-                "model",
-                "quota_limit",
-                "quota_used",
-                "quota_remaining",
-                "billing_period_start_at",
-                "billing_period_end_at",
-                "model_family",
-                "model_tier",
-                "parent_limit_key",
-                "session_id",
-                "trace_id",
-                "litellm_call_id",
-                "route_family",
-                "request_model",
-                "response_model",
-                "client_name",
-                "client_version",
-                "client_user_agent",
-                "raw_provider_fields",
-                "evidence",
-                "metadata",
+    return _rate_limit_previous_observation_row_to_dict(row)
+
+
+async def _fetch_previous_rate_limit_observations(
+    conn: Any,
+    observations: List[Dict[str, Any]],
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    first_observation_by_limit_key: Dict[str, Dict[str, Any]] = {}
+    for observation in observations:
+        limit_key = _rate_limit_storage_quota_key(observation)
+        if (
+            not isinstance(limit_key, str)
+            or not limit_key
+            or not observation.get("observed_at")
+            or limit_key in first_observation_by_limit_key
+        ):
+            continue
+        first_observation_by_limit_key[limit_key] = observation
+
+    if not first_observation_by_limit_key:
+        return {}
+
+    limit_keys: List[str] = []
+    providers: List[str] = []
+    clients: List[Optional[str]] = []
+    account_hashes: List[Optional[str]] = []
+    sources: List[Optional[str]] = []
+    observed_ats: List[Any] = []
+    for limit_key, observation in first_observation_by_limit_key.items():
+        limit_keys.append(limit_key)
+        providers.append(_rate_limit_storage_provider(observation))
+        clients.append(_rate_limit_storage_client(observation))
+        account_hashes.append(observation.get("account_hash"))
+        sources.append(observation.get("source"))
+        observed_ats.append(observation["observed_at"])
+
+    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {
+        limit_key: None for limit_key in limit_keys
+    }
+    rows = await conn.fetch(
+        _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL,
+        limit_keys,
+        providers,
+        clients,
+        account_hashes,
+        sources,
+        observed_ats,
+    )
+    for row in rows:
+        limit_key = _maybe_get(row, "input_limit_key")
+        if isinstance(limit_key, str) and limit_key in previous_by_limit_key:
+            previous_by_limit_key[limit_key] = (
+                _rate_limit_previous_observation_row_to_dict(row)
             )
-        }
+    return previous_by_limit_key
 
 
 async def _derive_rate_limit_transitions(
@@ -18222,19 +18377,31 @@ async def _derive_rate_limit_transitions(
     ordered_observations = sorted(
         observations,
         key=lambda item: (
-            str(item.get("limit_key") or ""),
+            _rate_limit_storage_quota_key(item),
             item.get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
         ),
     )
+    missing_previous_observations: List[Dict[str, Any]] = []
     for observation in ordered_observations:
-        limit_key = observation.get("limit_key")
+        limit_key = _rate_limit_storage_quota_key(observation)
+        if (
+            isinstance(limit_key, str)
+            and limit_key
+            and limit_key not in previous_by_limit_key
+        ):
+            previous_by_limit_key[limit_key] = None
+            missing_previous_observations.append(observation)
+    if missing_previous_observations:
+        previous_by_limit_key.update(
+            await _fetch_previous_rate_limit_observations(
+                conn,
+                missing_previous_observations,
+            )
+    )
+    for observation in ordered_observations:
+        limit_key = _rate_limit_storage_quota_key(observation)
         if not isinstance(limit_key, str) or not limit_key:
             continue
-        if limit_key not in previous_by_limit_key:
-            previous_by_limit_key[limit_key] = await _fetch_previous_rate_limit_observation(
-                conn,
-                observation,
-            )
         previous = previous_by_limit_key.get(limit_key)
         if previous is not None:
             classification = _classify_rate_limit_transition(previous, observation)
@@ -18261,19 +18428,22 @@ async def _filter_meaningful_rate_limit_observations(
     ]
     indexed_observations.sort(
         key=lambda item: (
-            str(item[1].get("limit_key") or ""),
+            _rate_limit_storage_quota_key(item[1]),
             item[1].get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
             item[0],
         )
     )
 
-    for index, observation in indexed_observations:
-        limit_key = observation["limit_key"]
-        if limit_key not in rolling_previous_by_limit_key:
-            previous = await _fetch_previous_rate_limit_observation(conn, observation)
-            rolling_previous_by_limit_key[limit_key] = previous
-            initial_previous_by_limit_key[limit_key] = previous
+    initial_previous_by_limit_key.update(
+        await _fetch_previous_rate_limit_observations(
+            conn,
+            [observation for _index, observation in indexed_observations],
+        )
+    )
+    rolling_previous_by_limit_key.update(initial_previous_by_limit_key)
 
+    for index, observation in indexed_observations:
+        limit_key = _rate_limit_storage_quota_key(observation)
         previous = rolling_previous_by_limit_key.get(limit_key)
         if not _rate_limit_observation_has_meaningful_change(previous, observation):
             continue
