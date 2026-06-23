@@ -49,6 +49,8 @@ from litellm.llms.chatgpt.common_utils import (
     CHATGPT_API_BASE,
     get_chatgpt_default_headers,
 )
+from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key
+from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
 from litellm.llms.xai.oauth import (
     build_grok_native_oauth_metadata,
     get_grok_native_oauth_access_token,
@@ -23204,6 +23206,20 @@ _ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX = "[1m]"
 _ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
 _ANTHROPIC_BETA_HEADER_NAME = "anthropic-beta"
 _ANTHROPIC_BETA_XPASS_HEADER_NAME = f"x-pass-{_ANTHROPIC_BETA_HEADER_NAME}"
+_ANTHROPIC_DANGEROUS_DIRECT_BROWSER_ACCESS_HEADER_NAME = (
+    "anthropic-dangerous-direct-browser-access"
+)
+_ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES = {
+    "opus": "claude-opus-4-6",
+    "opus-4-6": "claude-opus-4-6",
+    "opus-4-8": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-20250514",
+    "sonnet-4-6": "claude-sonnet-4-6",
+    "sonnet-4-20250514": "claude-sonnet-4-20250514",
+    "haiku": "claude-haiku-4-5",
+    "haiku-4-5": "claude-haiku-4-5",
+    "haiku-4-5-20251001": "claude-haiku-4-5-20251001",
+}
 
 
 def _get_header_value_case_insensitive(
@@ -23251,6 +23267,79 @@ def _append_anthropic_beta_header_value(
         existing_values.append(beta_value)
     headers[_ANTHROPIC_BETA_HEADER_NAME] = ", ".join(existing_values)
     return headers
+
+
+def _prepare_anthropic_oauth_native_passthrough_headers(
+    *,
+    request: Request,
+    custom_headers: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    auth_header = _get_header_value_case_insensitive(request.headers, "authorization")
+    if not is_anthropic_oauth_key(auth_header):
+        return custom_headers, False
+
+    updated_headers = dict(custom_headers)
+    request_beta = _get_header_value_case_insensitive(
+        request.headers,
+        _ANTHROPIC_BETA_HEADER_NAME,
+    )
+    if request_beta:
+        for beta_value in str(request_beta).split(","):
+            stripped_beta_value = beta_value.strip()
+            if stripped_beta_value:
+                _append_anthropic_beta_header_value(
+                    updated_headers,
+                    stripped_beta_value,
+                )
+    _append_anthropic_beta_header_value(
+        updated_headers,
+        ANTHROPIC_OAUTH_BETA_HEADER,
+    )
+    updated_headers[_ANTHROPIC_DANGEROUS_DIRECT_BROWSER_ACCESS_HEADER_NAME] = "true"
+    return updated_headers, True
+
+
+def _normalize_anthropic_native_passthrough_model_alias(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    model = request_body.get("model")
+    if not isinstance(model, str):
+        return request_body, False
+
+    stripped_model = model.strip()
+    if not stripped_model:
+        return request_body, False
+
+    suffix = ""
+    alias_model = stripped_model
+    if stripped_model.lower().endswith(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX):
+        suffix = stripped_model[-len(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX) :]
+        alias_model = stripped_model[: -len(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX)].strip()
+
+    normalized_model = _ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES.get(
+        alias_model.lower()
+    )
+    if normalized_model is None:
+        return request_body, False
+
+    provider_model = f"{normalized_model}{suffix}"
+    if provider_model == stripped_model:
+        return request_body, False
+
+    updated_body = dict(request_body)
+    updated_body["model"] = provider_model
+    metadata = updated_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    metadata.setdefault("inbound_model_alias", stripped_model)
+    metadata.setdefault("requested_model_alias", stripped_model)
+    metadata.setdefault("model_alias_label", stripped_model)
+    metadata["anthropic_native_passthrough_model_alias"] = stripped_model
+    metadata["anthropic_native_passthrough_normalized_model"] = provider_model
+    updated_body["litellm_metadata"] = metadata
+    return updated_body, True
 
 
 def _prepare_anthropic_context_1m_native_passthrough(
@@ -23331,6 +23420,13 @@ async def anthropic_proxy_route(
         and anthropic_api_key is not None
     ):
         custom_headers["x-api-key"] = "{}".format(anthropic_api_key)
+    (
+        custom_headers,
+        normalized_oauth_native_passthrough_headers,
+    ) = _prepare_anthropic_oauth_native_passthrough_headers(
+        request=request,
+        custom_headers=custom_headers,
+    )
 
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None
     if request.method == "POST":
@@ -23507,6 +23603,13 @@ async def anthropic_proxy_route(
                 prepared_request_body=prepared_request_body,
                 adapter_model=openrouter_adapter_model,
             )
+
+        (
+            prepared_request_body,
+            normalized_native_model_alias,
+        ) = _normalize_anthropic_native_passthrough_model_alias(prepared_request_body)
+        if normalized_native_model_alias or normalized_oauth_native_passthrough_headers:
+            _safe_set_request_parsed_body(request, prepared_request_body)
 
         (
             prepared_request_body,
