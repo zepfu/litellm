@@ -50,7 +50,6 @@ from litellm.llms.chatgpt.common_utils import (
     get_chatgpt_default_headers,
 )
 from litellm.llms.xai.oauth import (
-    GROK_NATIVE_OAUTH_ROUTE_FAMILY,
     build_grok_native_oauth_metadata,
     get_grok_native_oauth_access_token,
     is_grok_native_oauth_model,
@@ -362,6 +361,11 @@ _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = (
 _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
     _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
 )
+_CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS = 5 * 60.0
+_CODEX_AUTO_AGENT_AUTH_DEGRADED_LOG_INTERVAL_SECONDS = 60.0
+_CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY = (
+    "antigravity:auth_degraded"
+)
 _ANTHROPIC_AUTO_AGENT_NO_TOOL_COMPATIBLE_RETRY_AFTER_SECONDS = 5 * 60
 _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS = frozenset(
     {
@@ -389,6 +393,7 @@ _CODEX_AUTO_AGENT_OPENCODE_PROVIDER = _OPENCODE_ZEN_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
 _CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
 _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _OPENCODE_ZEN_PROVIDER
+_codex_auto_agent_antigravity_auth_degraded_log_until_monotonic = 0.0
 _CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -1716,18 +1721,11 @@ def _add_grok_native_oauth_metadata(
         **(extra_fields or {}),
     }
     if preserved_route_family:
-        merged_extra_fields["passthrough_route_family"] = preserved_route_family
-        merged_extra_fields["route_family"] = preserved_route_family
+        merged_extra_fields.setdefault(
+            "source_passthrough_route_family", preserved_route_family
+        )
+        merged_extra_fields.setdefault("source_route_family", preserved_route_family)
         merged_extra_fields["grok_cli_chat_proxy_used"] = True
-        metadata_tags = [
-            *(
-                tag
-                for tag in metadata_tags
-                if tag != f"route:{GROK_NATIVE_OAUTH_ROUTE_FAMILY}"
-            ),
-            f"route:{preserved_route_family}",
-            f"route:{GROK_NATIVE_OAUTH_ROUTE_FAMILY}",
-        ]
     return _merge_litellm_metadata(
         request_body,
         tags_to_add=[
@@ -2207,6 +2205,37 @@ async def _resolve_codex_auto_agent_google_lane_key() -> str:
         return "__default__"
 
 
+def _is_codex_auto_agent_antigravity_auth_degraded_exception(exc: Any) -> bool:
+    if not isinstance(exc, HTTPException):
+        return False
+    detail_text = str(getattr(exc, "detail", ""))
+    return "Antigravity OAuth" in detail_text and (
+        "expired or invalid" in detail_text
+        or "does not contain" in detail_text
+        or "sidecar owns Antigravity auth refresh" in detail_text
+    )
+
+
+def _log_codex_auto_agent_antigravity_auth_degraded(exc: HTTPException) -> None:
+    global _codex_auto_agent_antigravity_auth_degraded_log_until_monotonic
+
+    now = time.monotonic()
+    if now < _codex_auto_agent_antigravity_auth_degraded_log_until_monotonic:
+        return
+    _codex_auto_agent_antigravity_auth_degraded_log_until_monotonic = (
+        now + _CODEX_AUTO_AGENT_AUTH_DEGRADED_LOG_INTERVAL_SECONDS
+    )
+    verbose_proxy_logger.warning(
+        "Codex auto-agent alias marked Antigravity Code Assist lane degraded; "
+        "using auth-degraded lane sentinel until sidecar refresh is available "
+        "(provider=antigravity, failure_kind=auth_degraded, status_code=%s, "
+        "cooldown_seconds=%.1f, detail=%s)",
+        exc.status_code,
+        _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS,
+        str(exc.detail),
+    )
+
+
 async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
     try:
         antigravity_access_token = await _load_valid_local_antigravity_access_token()
@@ -2221,12 +2250,29 @@ async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
                 companion_project=antigravity_project,
             )
         )
-    except Exception:
-        verbose_proxy_logger.warning(
+    except Exception as exc:
+        if _is_codex_auto_agent_antigravity_auth_degraded_exception(exc):
+            _log_codex_auto_agent_antigravity_auth_degraded(cast(HTTPException, exc))
+            return _CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY
+        verbose_proxy_logger.error(
             "Codex auto-agent alias could not resolve Antigravity Code Assist lane; using default lane",
             exc_info=True,
         )
         return "__default__"
+
+
+async def _resolve_codex_auto_agent_antigravity_lane_state() -> dict[str, Any]:
+    lane_key = await _resolve_codex_auto_agent_antigravity_lane_key()
+    if lane_key != _CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY:
+        return {"lane_key": lane_key}
+    return {
+        "lane_key": lane_key,
+        "forced_cooldown_seconds": _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS,
+        "skip_reason": "auth_degraded",
+        "cooldown_state_source": "auth_degraded",
+        "failure_phase": "auth",
+        "attempted_provider_call": False,
+    }
 
 
 def _resolve_codex_auto_agent_session_key(
@@ -2524,6 +2570,11 @@ def _build_auto_agent_alias_audit_events(
             if not isinstance(skipped_candidate, dict):
                 continue
             reason = str(skipped_candidate.get("reason") or "cooldown")
+            event_type = (
+                "candidate_skipped_provider_degraded"
+                if reason == "auth_degraded"
+                else "candidate_skipped_cooldown"
+            )
             events.append(
                 _build_auto_agent_alias_audit_event(
                     alias_family=alias_family,
@@ -2532,13 +2583,17 @@ def _build_auto_agent_alias_audit_events(
                     request_body=request_body,
                     selection=selection,
                     candidate=skipped_candidate,
-                    event_type="candidate_skipped_cooldown",
+                    event_type=event_type,
                     candidate_status=f"skipped_{reason}",
                     selected=False,
                     skipped=True,
                     selection_reason=reason,
                     lane_key=skipped_candidate.get("lane_key"),
                     cooldown_seconds=skipped_candidate.get("cooldown_seconds"),
+                    failure_phase=skipped_candidate.get("failure_phase"),
+                    attempted_provider_call=skipped_candidate.get(
+                        "attempted_provider_call"
+                    ),
                 )
             )
 
@@ -2874,6 +2929,42 @@ def _find_codex_auto_agent_candidate(
     return None
 
 
+def _build_auto_agent_skipped_candidates_from_states(
+    states: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    skipped: list[dict[str, Any]] = []
+    for state in states:
+        if state["cooldown_seconds"] <= 0:
+            continue
+        shaped = _codex_auto_agent_candidate_public_shape(
+            state["candidate"],
+            lane_key=state["lane_key"],
+            cooldown_seconds=state["cooldown_seconds"],
+            reason=state.get("skip_reason") or "cooldown",
+        )
+        for field in ("failure_phase", "attempted_provider_call"):
+            if field in state:
+                shaped[field] = state[field]
+        skipped.append(shaped)
+    return skipped
+
+
+async def _apply_codex_auto_agent_forced_candidate_cooldown(
+    *,
+    cooldown_key: str,
+    cooldown_seconds: float,
+) -> None:
+    await _set_codex_auto_agent_cooldown(cooldown_key, cooldown_seconds)
+
+
+async def _apply_anthropic_auto_agent_forced_candidate_cooldown(
+    *,
+    cooldown_key: str,
+    cooldown_seconds: float,
+) -> None:
+    await _set_anthropic_auto_agent_cooldown(cooldown_key, cooldown_seconds)
+
+
 async def _build_codex_auto_agent_candidate_states(
     request: Request,
     *,
@@ -2881,22 +2972,42 @@ async def _build_codex_auto_agent_candidate_states(
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     google_lane_key: Optional[str] = None
-    antigravity_lane_key: Optional[str] = None
+    antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
     for candidate_template in _get_codex_auto_agent_candidates_for_alias(
         alias_model
     ):
         candidate = dict(candidate_template)
+        forced_cooldown_seconds: Optional[float] = None
+        skip_reason: Optional[str] = None
+        cooldown_state_source_override: Optional[str] = None
+        failure_phase: Optional[str] = None
+        attempted_provider_call: Optional[bool] = None
         if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
             if google_lane_key is None:
                 google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
             lane_key = google_lane_key
         elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-            if antigravity_lane_key is None:
-                antigravity_lane_key = (
-                    await _resolve_codex_auto_agent_antigravity_lane_key()
+            if antigravity_lane_state is None:
+                antigravity_lane_state = (
+                    await _resolve_codex_auto_agent_antigravity_lane_state()
                 )
-            lane_key = antigravity_lane_key
+            lane_key = str(antigravity_lane_state["lane_key"])
+            forced_cooldown_seconds = _auto_agent_alias_float(
+                antigravity_lane_state.get("forced_cooldown_seconds")
+            )
+            skip_reason = cast(
+                Optional[str], antigravity_lane_state.get("skip_reason")
+            )
+            cooldown_state_source_override = cast(
+                Optional[str], antigravity_lane_state.get("cooldown_state_source")
+            )
+            failure_phase = cast(
+                Optional[str], antigravity_lane_state.get("failure_phase")
+            )
+            attempted_provider_call = cast(
+                Optional[bool], antigravity_lane_state.get("attempted_provider_call")
+            )
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
@@ -2909,15 +3020,32 @@ async def _build_codex_auto_agent_candidate_states(
         cooldown_seconds, cooldown_state_source = (
             await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
         )
-        states.append(
-            {
-                "candidate": candidate,
-                "lane_key": lane_key,
-                "cooldown_key": cooldown_key,
-                "cooldown_seconds": cooldown_seconds,
-                "cooldown_state_source": cooldown_state_source,
-            }
-        )
+        if (
+            forced_cooldown_seconds is not None
+            and forced_cooldown_seconds > cooldown_seconds
+        ):
+            await _apply_codex_auto_agent_forced_candidate_cooldown(
+                cooldown_key=cooldown_key,
+                cooldown_seconds=forced_cooldown_seconds,
+            )
+            cooldown_seconds = forced_cooldown_seconds
+            cooldown_state_source = (
+                cooldown_state_source_override or "forced_candidate_cooldown"
+            )
+        state = {
+            "candidate": candidate,
+            "lane_key": lane_key,
+            "cooldown_key": cooldown_key,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_state_source": cooldown_state_source,
+        }
+        if skip_reason is not None:
+            state["skip_reason"] = skip_reason
+        if failure_phase is not None:
+            state["failure_phase"] = failure_phase
+        if attempted_provider_call is not None:
+            state["attempted_provider_call"] = attempted_provider_call
+        states.append(state)
     return states
 
 
@@ -2961,16 +3089,7 @@ async def _select_codex_auto_agent_candidate(
         request,
         alias_model=alias_model,
     )
-    skipped = [
-        _codex_auto_agent_candidate_public_shape(
-            state["candidate"],
-            lane_key=state["lane_key"],
-            cooldown_seconds=state["cooldown_seconds"],
-            reason="cooldown",
-        )
-        for state in states
-        if state["cooldown_seconds"] > 0
-    ]
+    skipped = _build_auto_agent_skipped_candidates_from_states(states)
 
     affinity = await _get_codex_auto_agent_session_affinity(session_key)
     if affinity is not None and not has_continuation_state:
@@ -3195,6 +3314,8 @@ def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
                     tokens.add("MODEL_CAPACITY_EXHAUSTED")
     text_lower = _codex_auto_agent_error_text(exc).lower()
     _add_codex_auto_agent_text_error_tokens(tokens, text_lower)
+    if _is_openrouter_adapter_provider_raw_error(exc):
+        tokens.add("OPENROUTER_PROVIDER_RAW_ERROR")
     return tokens
 
 
@@ -3213,6 +3334,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "provider_format_rejected"
     if "OPENROUTER_INVALID_CHAT_MESSAGE" in tokens:
         return "provider_format_rejected"
+    if "OPENROUTER_PROVIDER_RAW_ERROR" in tokens:
+        return "provider_terminal_error"
     if "aawm_auto_agent_failed_responses_payload" in tokens:
         return "provider_terminal_error"
     if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
@@ -3784,22 +3907,42 @@ async def _build_anthropic_auto_agent_candidate_states(
         request
     )
     google_lane_key: Optional[str] = None
-    antigravity_lane_key: Optional[str] = None
+    antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
     for candidate_template in _get_anthropic_auto_agent_candidates_for_alias(
         alias_model
     ):
         candidate = dict(candidate_template)
+        forced_cooldown_seconds: Optional[float] = None
+        skip_reason: Optional[str] = None
+        cooldown_state_source_override: Optional[str] = None
+        failure_phase: Optional[str] = None
+        attempted_provider_call: Optional[bool] = None
         if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
             if google_lane_key is None:
                 google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
             lane_key = google_lane_key
         elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-            if antigravity_lane_key is None:
-                antigravity_lane_key = (
-                    await _resolve_codex_auto_agent_antigravity_lane_key()
+            if antigravity_lane_state is None:
+                antigravity_lane_state = (
+                    await _resolve_codex_auto_agent_antigravity_lane_state()
                 )
-            lane_key = antigravity_lane_key
+            lane_key = str(antigravity_lane_state["lane_key"])
+            forced_cooldown_seconds = _auto_agent_alias_float(
+                antigravity_lane_state.get("forced_cooldown_seconds")
+            )
+            skip_reason = cast(
+                Optional[str], antigravity_lane_state.get("skip_reason")
+            )
+            cooldown_state_source_override = cast(
+                Optional[str], antigravity_lane_state.get("cooldown_state_source")
+            )
+            failure_phase = cast(
+                Optional[str], antigravity_lane_state.get("failure_phase")
+            )
+            attempted_provider_call = cast(
+                Optional[bool], antigravity_lane_state.get("attempted_provider_call")
+            )
         elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
             lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
         elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
@@ -3814,15 +3957,32 @@ async def _build_anthropic_auto_agent_candidate_states(
         cooldown_seconds, cooldown_state_source = (
             await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
         )
-        states.append(
-            {
-                "candidate": candidate,
-                "lane_key": lane_key,
-                "cooldown_key": cooldown_key,
-                "cooldown_seconds": cooldown_seconds,
-                "cooldown_state_source": cooldown_state_source,
-            }
-        )
+        if (
+            forced_cooldown_seconds is not None
+            and forced_cooldown_seconds > cooldown_seconds
+        ):
+            await _apply_anthropic_auto_agent_forced_candidate_cooldown(
+                cooldown_key=cooldown_key,
+                cooldown_seconds=forced_cooldown_seconds,
+            )
+            cooldown_seconds = forced_cooldown_seconds
+            cooldown_state_source = (
+                cooldown_state_source_override or "forced_candidate_cooldown"
+            )
+        state = {
+            "candidate": candidate,
+            "lane_key": lane_key,
+            "cooldown_key": cooldown_key,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_state_source": cooldown_state_source,
+        }
+        if skip_reason is not None:
+            state["skip_reason"] = skip_reason
+        if failure_phase is not None:
+            state["failure_phase"] = failure_phase
+        if attempted_provider_call is not None:
+            state["attempted_provider_call"] = attempted_provider_call
+        states.append(state)
     return states
 
 
@@ -3920,16 +4080,7 @@ async def _select_anthropic_auto_agent_candidate(
         request,
         alias_model=alias_model,
     )
-    skipped = [
-        _codex_auto_agent_candidate_public_shape(
-            state["candidate"],
-            lane_key=state["lane_key"],
-            cooldown_seconds=state["cooldown_seconds"],
-            reason="cooldown",
-        )
-        for state in states
-        if state["cooldown_seconds"] > 0
-    ]
+    skipped = _build_auto_agent_skipped_candidates_from_states(states)
 
     affinity = await _get_anthropic_auto_agent_session_affinity(session_key)
     if affinity is not None and not has_continuation_state:
@@ -5066,6 +5217,25 @@ def _selected_google_contents_have_paired_function_responses(
     return True
 
 
+def _selected_google_contents_have_complete_function_exchanges(
+    contents: list[Any],
+    selected_indices: list[int],
+) -> bool:
+    seen_function_call_ids: set[str] = set()
+    pending_function_call_ids: set[str] = set()
+    for index in selected_indices:
+        content = contents[index]
+        response_ids = _google_content_function_response_ids(content)
+        if response_ids and not response_ids.issubset(seen_function_call_ids):
+            return False
+        pending_function_call_ids.difference_update(response_ids)
+
+        function_call_ids = _google_content_function_call_ids(content)
+        seen_function_call_ids.update(function_call_ids)
+        pending_function_call_ids.update(function_call_ids)
+    return not pending_function_call_ids
+
+
 def _find_prior_google_function_call_content_index(
     contents: list[Any],
     *,
@@ -5121,7 +5291,7 @@ def _trim_google_content_indices_to_window(
             trial_indices = (
                 selected_indices[:position] + selected_indices[position + 1 :]
             )
-            if _selected_google_contents_have_paired_function_responses(
+            if _selected_google_contents_have_complete_function_exchanges(
                 contents,
                 trial_indices,
             ):
@@ -5141,18 +5311,30 @@ def _trim_google_content_indices_to_window(
         )
         selected_indices.pop(removable_position)
 
-    while not _selected_google_contents_have_paired_function_responses(
+    while not _selected_google_contents_have_complete_function_exchanges(
         contents,
         selected_indices,
     ):
         for position, index in enumerate(selected_indices):
             response_ids = _google_content_function_response_ids(contents[index])
-            if not response_ids:
-                continue
             prior_call_ids: set[str] = set()
             for prior_index in selected_indices[:position]:
-                prior_call_ids.update(_google_content_function_call_ids(contents[prior_index]))
+                prior_call_ids.update(
+                    _google_content_function_call_ids(contents[prior_index])
+                )
             if not response_ids.issubset(prior_call_ids):
+                selected_indices.pop(position)
+                break
+
+            function_call_ids = _google_content_function_call_ids(contents[index])
+            later_response_ids: set[str] = set()
+            for later_index in selected_indices[position + 1 :]:
+                later_response_ids.update(
+                    _google_content_function_response_ids(contents[later_index])
+                )
+            if function_call_ids and not function_call_ids.issubset(
+                later_response_ids
+            ):
                 selected_indices.pop(position)
                 break
         else:
@@ -6684,6 +6866,29 @@ def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
     if isinstance(error_message, str) and error_message:
         return error_message
     return None
+
+
+def _is_openrouter_adapter_provider_raw_error(exc: Any) -> bool:
+    payload = _extract_openrouter_adapter_error_payload(exc)
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    metadata = error.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    raw_message = metadata.get("raw")
+    provider_name = metadata.get("provider_name")
+    error_message = error.get("message")
+    return (
+        isinstance(provider_name, str)
+        and bool(provider_name.strip())
+        and isinstance(raw_message, str)
+        and raw_message.strip().upper() == "ERROR"
+        and isinstance(error_message, str)
+        and "provider" in error_message.lower()
+    )
 
 
 def _extract_openrouter_adapter_error_headers(exc: Any) -> dict[str, Any]:
@@ -14906,6 +15111,8 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
                 "anthropic_grok_native_adapter_model": adapter_model,
                 "anthropic_adapter_target_endpoint": "xai:/v1/responses",
                 "grok_native_entrypoint": "anthropic_messages",
+                "passthrough_route_family": "anthropic_grok_native_responses_adapter",
+                "route_family": "anthropic_grok_native_responses_adapter",
             },
         )
     except Exception as exc:
