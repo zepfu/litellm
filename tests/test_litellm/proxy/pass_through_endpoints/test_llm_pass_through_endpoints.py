@@ -6767,6 +6767,140 @@ class TestPassThroughRequestRetryableFailures:
         mock_logging_obj.post_call_failure_hook.assert_not_awaited()
         mock_log_exception.assert_not_called()
 
+    def test_google_code_assist_tos_detector_accepts_bytes_detail(self):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            _is_known_google_code_assist_tos_violation_response,
+        )
+
+        payload = {
+            "error": {
+                "code": 403,
+                "message": (
+                    "This service has been disabled in this account for violation "
+                    "of Terms of Service."
+                ),
+                "status": "PERMISSION_DENIED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "TOS_VIOLATION",
+                        "domain": "cloudcode-pa.googleapis.com",
+                    }
+                ],
+            }
+        }
+        exc = HTTPException(
+            status_code=403,
+            detail=str(json.dumps(payload).encode("utf-8")),
+        )
+
+        assert _is_known_google_code_assist_tos_violation_response(
+            url=httpx.URL(
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+            ),
+            custom_llm_provider="antigravity",
+            status_code=403,
+            exc=exc,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_suppresses_google_code_assist_tos_traceback(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = (
+            "https://daily-cloudcode-pa.googleapis.com/"
+            "v1internal:streamGenerateContent"
+        )
+        upstream_payload = {
+            "error": {
+                "code": 403,
+                "message": (
+                    "This service has been disabled in this account for violation "
+                    "of Terms of Service. Please submit an appeal to continue using "
+                    "this product."
+                ),
+                "status": "PERMISSION_DENIED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "TOS_VIOLATION",
+                        "domain": "cloudcode-pa.googleapis.com",
+                    }
+                ],
+            }
+        }
+        upstream_response = httpx.Response(
+            status_code=403,
+            content=json.dumps(upstream_payload).encode("utf-8"),
+            request=httpx.Request("POST", target_url),
+        )
+        custom_body = {
+            "model": "gemini-3.5-flash-low",
+            "litellm_metadata": {
+                "requested_model_alias": "aawm-low",
+                "passthrough_route_family": "codex_antigravity_code_assist_adapter",
+            },
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value=custom_body,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=AsyncMock(return_value=upstream_response),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.verbose_proxy_logger.exception"
+        ) as mock_log_exception, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.verbose_proxy_logger.warning"
+        ) as mock_log_warning:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    stream=False,
+                    custom_body=custom_body,
+                    custom_llm_provider="antigravity",
+                )
+
+        assert exc_info.value.code == "403"
+        mock_log_exception.assert_not_called()
+        warning_call = next(
+            call
+            for call in mock_log_warning.call_args_list
+            if "Google Code Assist account TOS violation" in str(call.args[0])
+        )
+        assert warning_call.kwargs["extra"]["failure_kind"] == (
+            "google_code_assist_tos_violation"
+        )
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
+            is None
+        )
+
     @pytest.mark.asyncio
     async def test_pass_through_request_normalizes_openai_function_tool_schemas(
         self,
