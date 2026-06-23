@@ -145,6 +145,13 @@ streaming response has been handed to the client, midstream failures remain
 terminal for that stream and are recorded through the streaming error context
 path instead of replaying the request.
 
+Any runtime path that emits a traceback is active error intake, independent of
+the logger level that produced it. Expected degraded states should avoid
+`exc_info=True` and write structured degraded-provider metadata instead. If a
+`WARNING` or ASGI path still emits a traceback, it should be captured in the
+environment's `*-error.jsonl` intake or changed so the traceback is no longer
+emitted for expected behavior.
+
 Routes with their own retry, cooldown, or alias-candidate progression set
 `caller_managed_hidden_retry=True` so the shared pass-through wrapper does not
 double retry. This includes Google/Antigravity adapter calls, OpenRouter adapter

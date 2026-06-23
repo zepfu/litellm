@@ -276,7 +276,7 @@ class AawmErrorLogFileHandler(logging.Handler):
     _emit_state = threading.local()
 
     def __init__(self) -> None:
-        super().__init__(level=logging.ERROR)
+        super().__init__(level=logging.WARNING)
         self.name = _AAWM_ERROR_LOG_HANDLER_NAME
         self.addFilter(_secret_filter)
         self.setFormatter(self._formatter)
@@ -284,7 +284,7 @@ class AawmErrorLogFileHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(self._emit_state, "active", False):
             return
-        if record.levelno > logging.ERROR and record.exc_info is None:
+        if record.levelno < logging.ERROR and record.exc_info is None:
             return
 
         log_path = _get_aawm_error_log_path()
@@ -777,29 +777,6 @@ _ensure_filter_on_logger(
 )
 
 
-def _ensure_aawm_error_log_handler_on_logger(logger: logging.Logger) -> None:
-    for existing_handler in logger.handlers:
-        if getattr(existing_handler, "name", None) == _AAWM_ERROR_LOG_HANDLER_NAME:
-            return
-    logger.addHandler(AawmErrorLogFileHandler())
-
-
-def _configure_aawm_error_log_handlers() -> None:
-    if _get_aawm_error_log_path() is None:
-        return
-
-    for logger in (
-        verbose_logger,
-        verbose_proxy_logger,
-        verbose_router_logger,
-        logging.getLogger("uvicorn.error"),
-    ):
-        _ensure_aawm_error_log_handler_on_logger(logger)
-
-
-_configure_aawm_error_log_handlers()
-
-
 def _get_loggers_to_initialize():
     """
     Get all loggers that should be initialized with the JSON handler.
@@ -807,19 +784,62 @@ def _get_loggers_to_initialize():
     Includes third-party integration loggers (like langfuse) if they are
     configured as callbacks.
     """
-    import litellm
-
     loggers = list(ALL_LOGGERS)
 
     # Add langfuse logger if langfuse is being used as a callback
     langfuse_callbacks = {"langfuse", "langfuse_otel"}
-    all_callbacks = set(litellm.success_callback + litellm.failure_callback)
+    litellm_module = sys.modules.get("litellm")
+    success_callbacks = getattr(litellm_module, "success_callback", []) or []
+    failure_callbacks = getattr(litellm_module, "failure_callback", []) or []
+    all_callbacks = set(success_callbacks + failure_callbacks)
     if langfuse_callbacks & all_callbacks:
         loggers.append(logging.getLogger("langfuse"))
 
     return loggers
 
 
+
+_aawm_error_log_handler: Optional[logging.Handler] = None
+
+
+def _get_aawm_error_log_handler() -> Optional[logging.Handler]:
+    global _aawm_error_log_handler
+    if _aawm_error_log_handler is not None:
+        return _aawm_error_log_handler
+
+    log_path = _get_aawm_error_log_path()
+    if log_path is not None:
+        _aawm_error_log_handler = AawmErrorLogFileHandler()
+        _aawm_error_log_handler.name = _AAWM_ERROR_LOG_HANDLER_NAME
+        return _aawm_error_log_handler
+    return None
+
+
+def _ensure_aawm_error_log_handler_on_logger(logger: logging.Logger) -> None:
+    # Check if a handler with this name is already present in this logger or its parents (if propagating)
+    curr = logger
+    while curr:
+        for h in curr.handlers:
+            if getattr(h, "name", None) == _AAWM_ERROR_LOG_HANDLER_NAME:
+                return
+        if not curr.propagate or curr.parent is None:
+            break
+        curr = curr.parent
+
+    handler = _get_aawm_error_log_handler()
+    if handler:
+        logger.addHandler(handler)
+
+
+def _configure_aawm_error_log_handlers() -> None:
+    if _get_aawm_error_log_path() is None:
+        return
+
+    for lg in _get_loggers_to_initialize():
+        _ensure_aawm_error_log_handler_on_logger(lg)
+
+
+_configure_aawm_error_log_handlers()
 def _initialize_loggers_with_handler(handler: logging.Handler):
     """
     Initialize all loggers with a handler
@@ -835,8 +855,6 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
         _ensure_filter_on_logger(lg, _egress_guard_alert_filter)
         _ensure_filter_on_logger(lg, _langfuse_support_string_diagnostic_filter)
         lg.addHandler(handler)  # add JSON formatter handler
-        if lg.name == "langfuse" and _get_aawm_error_log_path() is not None:
-            _ensure_aawm_error_log_handler_on_logger(lg)
         lg.propagate = False  # prevent bubbling to parent/root
     _configure_aawm_error_log_handlers()
 
