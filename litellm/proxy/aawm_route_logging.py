@@ -1,8 +1,10 @@
+import atexit
 import logging
 import os
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Optional, Union
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -21,6 +23,24 @@ _AAWM_ROUTE_ACCESS_LOG_TYPE = "ROUTE"
 _AAWM_ROUTE_LOG_MAX_FIELD_CHARS = 180
 _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS = 96
 _AAWM_ROUTE_LOG_DEDUP_LIMIT = 4096
+_AAWM_ROUTE_ROLLUP_INTERVAL_ENV = "AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS"
+_AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS = 60
+_AAWM_ROUTE_ROLLUP_MAX_GROUPS = 256
+_AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
+_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+_AAWM_ROUTE_ROLLUP_STATUS_VALUES = (
+    "Degraded",
+    "Cooling Down",
+    "Failed",
+    "Exhausted",
+)
+_aawm_route_rollup_lock = threading.Lock()
+_aawm_route_rollup_accumulator: Optional["AawmRouteRollupAccumulator"] = None
+_aawm_route_rollup_flush_stop = threading.Event()
+_aawm_route_rollup_flush_thread: Optional[threading.Thread] = None
+_aawm_route_rollup_flush_thread_lock = threading.Lock()
+_aawm_route_rollup_flush_poll_seconds = 1.0
+_aawm_route_rollup_monotonic_now: Callable[[], float] = time.monotonic
 _aawm_route_log_dedup_lock = threading.Lock()
 _aawm_route_log_dedup_seen: dict[tuple[str, ...], float] = {}
 _aawm_route_log_dedup_order: deque[tuple[str, ...]] = deque()
@@ -175,6 +195,622 @@ def clear_aawm_route_log_dedup_state() -> None:
     with _aawm_route_log_dedup_lock:
         _aawm_route_log_dedup_seen.clear()
         _aawm_route_log_dedup_order.clear()
+
+
+def get_aawm_route_rollup_interval_seconds() -> int:
+    raw_value = os.getenv(
+        _AAWM_ROUTE_ROLLUP_INTERVAL_ENV,
+        str(_AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS),
+    )
+    try:
+        return max(0, int(float(raw_value)))
+    except Exception:
+        return _AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS
+
+
+def aawm_route_rollups_enabled() -> bool:
+    return get_aawm_route_rollup_interval_seconds() > 0
+
+
+def _normalize_aawm_route_rollup_status(status: Optional[str]) -> Optional[str]:
+    if status is None:
+        return None
+    cleaned = " ".join(str(status).strip().split())
+    if not cleaned:
+        return None
+    for allowed_status in _AAWM_ROUTE_ROLLUP_STATUS_VALUES:
+        if cleaned.casefold() == allowed_status.casefold():
+            return allowed_status
+    return None
+
+
+def _format_aawm_route_rollup_client_context_label(
+    *,
+    group_header_label: str,
+    client_product_label: Optional[str],
+) -> Optional[str]:
+    repository = _normalize_aawm_route_log_repository_label(group_header_label)
+    client_label = None
+    if client_product_label and "/" in client_product_label:
+        client_name, client_version = client_product_label.split("/", 1)
+        client_label = (
+            f"{_normalize_aawm_route_log_known_client_name(client_name)}"
+            f"[{client_version}]"
+        )
+    elif client_product_label:
+        client_label = _normalize_aawm_route_log_known_client_name(
+            client_product_label
+        )
+    if repository and client_label:
+        return f"{repository}@{client_label}"
+    return repository or client_label
+
+
+def build_aawm_route_rollup_group_header_label(
+    *,
+    repository: Optional[str],
+    client_product_label: Optional[str],
+) -> Optional[str]:
+    return _format_aawm_route_rollup_client_context_label(
+        group_header_label=repository or "",
+        client_product_label=client_product_label,
+    )
+
+
+def _format_aawm_route_rollup_status_tag(status: Optional[str]) -> str:
+    normalized_status = _normalize_aawm_route_rollup_status(status)
+    if not normalized_status:
+        return ""
+    return f" [{normalized_status}]"
+
+
+def _format_aawm_route_rollup_lines(
+    *,
+    group_header_label: str,
+    incoming_endpoint: str,
+    outgoing_target: str,
+    sublines: list[tuple[str, int, Optional[str]]],
+    now: Optional[datetime] = None,
+    early: bool = False,
+) -> list[str]:
+    timestamp = (now or datetime.now()).strftime("%Y%m%d %H:%M:%S")
+    header_segments = [timestamp]
+    if early:
+        header_segments.append("[EARLY]")
+    header_segments.extend(
+        [
+            group_header_label,
+            f"{incoming_endpoint} -> {outgoing_target}",
+        ]
+    )
+    lines = [" ".join(header_segments)]
+    for model_label, turns, status in sublines:
+        lines.append(
+            f" - {model_label} - Turns: {turns}"
+            f"{_format_aawm_route_rollup_status_tag(status)}"
+        )
+    return lines
+
+
+@dataclass
+class _AawmRouteRollupSubline:
+    turns: int = 0
+    status: Optional[str] = None
+    status_sequence: int = 0
+
+
+@dataclass
+class _AawmRouteRollupGroup:
+    group_header_label: str
+    incoming_endpoint: str
+    outgoing_target: str
+    sublines: dict[str, _AawmRouteRollupSubline] = field(default_factory=dict)
+    subline_order: list[str] = field(default_factory=list)
+    event_sequence: int = 0
+
+    def ordered_sublines(self) -> list[tuple[str, int, Optional[str]]]:
+        return [
+            (
+                model_label,
+                self.sublines[model_label].turns,
+                self.sublines[model_label].status,
+            )
+            for model_label in self.subline_order
+            if model_label in self.sublines
+        ]
+
+
+class AawmRouteRollupAccumulator:
+    def __init__(
+        self,
+        *,
+        interval_seconds: Optional[int] = None,
+        max_groups: int = _AAWM_ROUTE_ROLLUP_MAX_GROUPS,
+        max_sublines: int = _AAWM_ROUTE_ROLLUP_MAX_SUBLINES,
+    ) -> None:
+        self._interval_seconds = (
+            get_aawm_route_rollup_interval_seconds()
+            if interval_seconds is None
+            else max(0, int(interval_seconds))
+        )
+        self._max_groups = max(1, max_groups)
+        self._max_sublines = max(1, max_sublines)
+        self._groups: dict[tuple[str, str, str], _AawmRouteRollupGroup] = {}
+        self._last_flush_monotonic = time.monotonic()
+
+    def interval_seconds(self) -> int:
+        return self._interval_seconds
+
+    def enabled(self) -> bool:
+        return self._interval_seconds > 0
+
+    def clear(self) -> None:
+        self._groups.clear()
+        self._last_flush_monotonic = time.monotonic()
+
+    def record(
+        self,
+        *,
+        group_header_label: str,
+        incoming_endpoint: str,
+        outgoing_target: str,
+        model_label: str,
+        turns: int = 1,
+        status: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> list[str]:
+        if not self.enabled():
+            return []
+
+        cleaned_group_header = _clean_aawm_route_log_field(group_header_label)
+        cleaned_incoming_endpoint = _clean_aawm_route_log_field(incoming_endpoint)
+        cleaned_outgoing_target = _clean_aawm_route_log_field(outgoing_target)
+        cleaned_model_label = _clean_aawm_route_log_field(model_label)
+        if (
+            not cleaned_group_header
+            or not cleaned_incoming_endpoint
+            or not cleaned_outgoing_target
+            or not cleaned_model_label
+        ):
+            return []
+
+        normalized_status = _normalize_aawm_route_rollup_status(status)
+        emitted_lines: list[str] = []
+        group_key = (
+            cleaned_group_header,
+            cleaned_incoming_endpoint,
+            cleaned_outgoing_target,
+        )
+        group = self._groups.get(group_key)
+        if group is None and len(self._groups) >= self._max_groups:
+            emitted_lines.extend(self.flush(force=True, now=now, early=True))
+            group = None
+        if group is None:
+            group = _AawmRouteRollupGroup(
+                group_header_label=cleaned_group_header,
+                incoming_endpoint=cleaned_incoming_endpoint,
+                outgoing_target=cleaned_outgoing_target,
+            )
+            self._groups[group_key] = group
+
+        subline = group.sublines.get(cleaned_model_label)
+        if subline is None:
+            if len(group.subline_order) >= self._max_sublines:
+                emitted_lines.extend(
+                    self._flush_group(group, now=now, early=True, remove=True)
+                )
+                group = _AawmRouteRollupGroup(
+                    group_header_label=cleaned_group_header,
+                    incoming_endpoint=cleaned_incoming_endpoint,
+                    outgoing_target=cleaned_outgoing_target,
+                )
+                self._groups[group_key] = group
+                subline = None
+
+        if subline is None:
+            subline = _AawmRouteRollupSubline()
+            group.sublines[cleaned_model_label] = subline
+            group.subline_order.append(cleaned_model_label)
+
+        if turns > 0:
+            subline.turns += turns
+        if normalized_status is not None:
+            group.event_sequence += 1
+            subline.status = normalized_status
+            subline.status_sequence = group.event_sequence
+
+        emitted_lines.extend(self.flush_due(now=now))
+        return emitted_lines
+
+    def flush_due(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        monotonic_now: Optional[float] = None,
+    ) -> list[str]:
+        if not self.enabled() or not self._groups:
+            return []
+        current_monotonic = (
+            time.monotonic() if monotonic_now is None else monotonic_now
+        )
+        if current_monotonic - self._last_flush_monotonic < self._interval_seconds:
+            return []
+        return self.flush(force=True, now=now)
+
+    def flush(
+        self,
+        *,
+        force: bool = False,
+        now: Optional[datetime] = None,
+        early: bool = False,
+    ) -> list[str]:
+        if not self._groups:
+            return []
+        if not force and not self.enabled():
+            return []
+
+        emitted_lines: list[str] = []
+        for group_key, group in list(self._groups.items()):
+            emitted_lines.extend(
+                self._flush_group(group, now=now, early=early, remove=True)
+            )
+            self._groups.pop(group_key, None)
+        self._last_flush_monotonic = time.monotonic()
+        return emitted_lines
+
+    def _flush_group(
+        self,
+        group: _AawmRouteRollupGroup,
+        *,
+        now: Optional[datetime] = None,
+        early: bool = False,
+        remove: bool,
+    ) -> list[str]:
+        if not group.sublines:
+            return []
+        lines = _format_aawm_route_rollup_lines(
+            group_header_label=group.group_header_label,
+            incoming_endpoint=group.incoming_endpoint,
+            outgoing_target=group.outgoing_target,
+            sublines=group.ordered_sublines(),
+            now=now,
+            early=early,
+        )
+        if remove:
+            group_key = (
+                group.group_header_label,
+                group.incoming_endpoint,
+                group.outgoing_target,
+            )
+            self._groups.pop(group_key, None)
+        return lines
+
+
+def get_aawm_route_rollup_accumulator() -> AawmRouteRollupAccumulator:
+    global _aawm_route_rollup_accumulator
+    with _aawm_route_rollup_lock:
+        interval_seconds = get_aawm_route_rollup_interval_seconds()
+        if (
+            _aawm_route_rollup_accumulator is None
+            or _aawm_route_rollup_accumulator.interval_seconds() != interval_seconds
+        ):
+            _aawm_route_rollup_accumulator = AawmRouteRollupAccumulator()
+        accumulator = _aawm_route_rollup_accumulator
+    _ensure_aawm_route_rollup_flush_worker()
+    return accumulator
+
+
+def clear_aawm_route_rollups() -> None:
+    global _aawm_route_rollup_accumulator
+    with _aawm_route_rollup_lock:
+        if _aawm_route_rollup_accumulator is None:
+            _aawm_route_rollup_accumulator = AawmRouteRollupAccumulator()
+        else:
+            _aawm_route_rollup_accumulator.clear()
+
+
+def _set_aawm_route_rollup_monotonic_now_for_tests(
+    monotonic_now: Optional[Callable[[], float]],
+) -> None:
+    global _aawm_route_rollup_monotonic_now
+    _aawm_route_rollup_monotonic_now = (
+        time.monotonic if monotonic_now is None else monotonic_now
+    )
+
+
+def _tick_aawm_route_rollup_interval_flush() -> None:
+    if not aawm_route_rollups_enabled():
+        return
+    with _aawm_route_rollup_lock:
+        accumulator = _aawm_route_rollup_accumulator
+        if accumulator is None or not accumulator.enabled():
+            return
+        lines = accumulator.flush_due(monotonic_now=_aawm_route_rollup_monotonic_now())
+    _emit_aawm_route_rollup_lines(lines)
+
+
+def _aawm_route_rollup_flush_worker_main() -> None:
+    while not _aawm_route_rollup_flush_stop.is_set():
+        interval_seconds = get_aawm_route_rollup_interval_seconds()
+        if interval_seconds <= 0:
+            if _aawm_route_rollup_flush_stop.wait(timeout=_aawm_route_rollup_flush_poll_seconds):
+                break
+            continue
+        _tick_aawm_route_rollup_interval_flush()
+        if _aawm_route_rollup_flush_stop.wait(
+            timeout=min(float(interval_seconds), _aawm_route_rollup_flush_poll_seconds)
+        ):
+            break
+
+
+def _stop_aawm_route_rollup_flush_worker() -> None:
+    global _aawm_route_rollup_flush_thread
+    _aawm_route_rollup_flush_stop.set()
+    with _aawm_route_rollup_flush_thread_lock:
+        worker = _aawm_route_rollup_flush_thread
+        _aawm_route_rollup_flush_thread = None
+    if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+        worker.join(timeout=1.0)
+    _aawm_route_rollup_flush_stop.clear()
+
+
+def _ensure_aawm_route_rollup_flush_worker() -> None:
+    global _aawm_route_rollup_flush_thread
+    interval_seconds = get_aawm_route_rollup_interval_seconds()
+    if interval_seconds <= 0:
+        _stop_aawm_route_rollup_flush_worker()
+        return
+    with _aawm_route_rollup_flush_thread_lock:
+        worker = _aawm_route_rollup_flush_thread
+        if worker is not None and worker.is_alive():
+            return
+        _aawm_route_rollup_flush_stop.clear()
+        _aawm_route_rollup_flush_thread = threading.Thread(
+            target=_aawm_route_rollup_flush_worker_main,
+            name="aawm-route-rollup-flush",
+            daemon=True,
+        )
+        _aawm_route_rollup_flush_thread.start()
+
+
+def flush_aawm_route_rollups(
+    *,
+    force: bool = True,
+    now: Optional[datetime] = None,
+    early: bool = False,
+) -> list[str]:
+    accumulator = get_aawm_route_rollup_accumulator()
+    with _aawm_route_rollup_lock:
+        return accumulator.flush(force=force, now=now, early=early)
+
+
+def _emit_aawm_route_rollup_lines(lines: list[str]) -> None:
+    if not lines:
+        return
+    logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info("%s", "\n".join(lines))
+
+
+def emit_flush_aawm_route_rollups(
+    *,
+    force: bool = True,
+    now: Optional[datetime] = None,
+    early: bool = False,
+) -> None:
+    _emit_aawm_route_rollup_lines(
+        flush_aawm_route_rollups(force=force, now=now, early=early)
+    )
+
+
+def _get_aawm_route_rollup_metadata(kwargs: Optional[dict]) -> Optional[dict[str, Any]]:
+    if not isinstance(kwargs, dict):
+        return None
+    litellm_params = kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        metadata = litellm_params.get("metadata")
+        if isinstance(metadata, dict):
+            return metadata
+    metadata = kwargs.get("metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    return None
+
+
+def _set_aawm_route_rollup_metadata(
+    kwargs: Optional[dict],
+) -> Optional[dict[str, Any]]:
+    if not isinstance(kwargs, dict):
+        return None
+    litellm_params = kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        litellm_params = {}
+        kwargs["litellm_params"] = litellm_params
+    metadata = litellm_params.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        litellm_params["metadata"] = metadata
+    return metadata
+
+
+def _get_aawm_route_rollup_model_label(
+    *,
+    agent_name: Optional[str],
+    repository: Optional[str],
+    model_label: Optional[str],
+) -> Optional[str]:
+    if not model_label:
+        return None
+    if agent_name and agent_name != repository:
+        return f"{agent_name}.{model_label}"
+    return model_label
+
+
+def build_aawm_route_rollup_context(
+    *,
+    request: Request,
+    target: Union[str, httpx.URL],
+    request_body: Optional[dict[str, Any]] = None,
+    kwargs: Optional[dict] = None,
+    route_type: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
+    headers = dict(getattr(request, "headers", {}) or {})
+    client_product_label = _get_aawm_route_log_client_product_label(metadata, headers)
+    repository = _first_aawm_route_log_value(
+        metadata,
+        keys=_AAWM_ROUTE_LOG_REPOSITORY_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_log_repository_label,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_LOG_REPOSITORY_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_log_repository_label,
+    ) or _get_aawm_route_log_trace_user_repository(
+        metadata,
+        headers,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_LOG_REPOSITORY_TENANT_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_log_tenant_repository_label,
+    )
+    group_header_label = build_aawm_route_rollup_group_header_label(
+        repository=repository,
+        client_product_label=client_product_label,
+    )
+    agent_name = _first_aawm_route_log_value(
+        metadata,
+        keys=_AAWM_ROUTE_LOG_AGENT_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_log_agent_label,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_log_agent_label,
+    )
+    model_label = _get_aawm_route_rollup_model_label(
+        agent_name=agent_name,
+        repository=repository,
+        model_label=_get_aawm_route_log_model_label(request_body, metadata),
+    )
+    incoming_endpoint = _safe_aawm_route_endpoint_label(request)
+    outgoing_target = _safe_aawm_route_target_label(target)
+    log_type = _normalize_aawm_route_log_type(route_type, incoming_endpoint)
+    if not group_header_label or not model_label:
+        return None
+    return {
+        "group_header_label": group_header_label,
+        "incoming_endpoint": incoming_endpoint,
+        "outgoing_target": outgoing_target,
+        "model_label": model_label,
+        "route_type": log_type,
+    }
+
+
+def attach_aawm_route_rollup_context(
+    *,
+    request: Request,
+    target: Union[str, httpx.URL],
+    request_body: Optional[dict[str, Any]] = None,
+    kwargs: Optional[dict] = None,
+    route_type: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target=target,
+        request_body=request_body,
+        kwargs=kwargs,
+        route_type=route_type,
+    )
+    if context is None:
+        return None
+    metadata = _set_aawm_route_rollup_metadata(kwargs)
+    if metadata is not None:
+        metadata[_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY] = context
+    return context
+
+
+def record_aawm_route_rollup(
+    *,
+    group_header_label: str,
+    incoming_endpoint: str,
+    outgoing_target: str,
+    model_label: str,
+    turns: int = 1,
+    status: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> None:
+    accumulator = get_aawm_route_rollup_accumulator()
+    with _aawm_route_rollup_lock:
+        lines = accumulator.record(
+            group_header_label=group_header_label,
+            incoming_endpoint=incoming_endpoint,
+            outgoing_target=outgoing_target,
+            model_label=model_label,
+            turns=turns,
+            status=status,
+            now=now,
+        )
+    _emit_aawm_route_rollup_lines(lines)
+
+
+def record_aawm_route_rollup_turn(
+    kwargs: Optional[dict],
+    *,
+    turns: int = 1,
+    now: Optional[datetime] = None,
+) -> None:
+    if not aawm_route_rollups_enabled():
+        return
+    metadata = _get_aawm_route_rollup_metadata(kwargs)
+    if not isinstance(metadata, dict):
+        return
+    context = metadata.get(_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY)
+    if not isinstance(context, dict):
+        return
+    if metadata.get("aawm_route_rollup_turn_recorded"):
+        return
+    metadata["aawm_route_rollup_turn_recorded"] = True
+    record_aawm_route_rollup(
+        group_header_label=str(context.get("group_header_label") or ""),
+        incoming_endpoint=str(context.get("incoming_endpoint") or ""),
+        outgoing_target=str(context.get("outgoing_target") or ""),
+        model_label=str(context.get("model_label") or ""),
+        turns=turns,
+        now=now,
+    )
+
+
+def emit_aawm_route_status_event(
+    *,
+    alias_model: Optional[str],
+    model_label: Optional[str],
+    status: str,
+    message: Optional[str],
+    now: Optional[datetime] = None,
+) -> None:
+    normalized_status = _normalize_aawm_route_rollup_status(status) or status
+    alias = _clean_aawm_route_log_field(alias_model) or "unknown-alias"
+    model = _clean_aawm_route_log_field(model_label) or "unknown-model"
+    detail = _clean_aawm_route_log_field(message) or "no detail"
+    timestamp = (now or datetime.now()).strftime("%Y%m%d %H:%M:%S")
+    logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).warning(
+        "%s - %s: %s Status: %s - Message: %s",
+        timestamp,
+        alias,
+        model,
+        normalized_status,
+        detail,
+    )
+
+
+def _flush_aawm_route_rollups_at_exit() -> None:
+    try:
+        emit_flush_aawm_route_rollups(force=True)
+    except Exception:
+        logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).debug(
+            "Failed to flush AAWM route rollups at process exit",
+            exc_info=True,
+        )
+
+
+atexit.register(_flush_aawm_route_rollups_at_exit)
 
 
 def _should_emit_aawm_route_access_log_key(key: tuple[str, ...]) -> bool:
@@ -729,6 +1365,7 @@ def emit_aawm_route_access_log(
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
     route_type: Optional[str] = None,
+    completed: bool = False,
 ) -> None:
     scope = getattr(request, "scope", None)
     if isinstance(scope, dict):
@@ -745,6 +1382,17 @@ def emit_aawm_route_access_log(
         route_type=route_type,
     )
     _register_aawm_route_access_log_replacement(request)
+    if aawm_route_rollups_enabled():
+        attach_aawm_route_rollup_context(
+            request=request,
+            target=target,
+            request_body=request_body,
+            kwargs=kwargs,
+            route_type=route_type,
+        )
+        if completed:
+            record_aawm_route_rollup_turn(kwargs)
+        return
     if not _should_emit_aawm_route_access_log_key(dedup_key):
         return
     logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info("%s", line)

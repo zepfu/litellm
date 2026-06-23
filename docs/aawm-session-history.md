@@ -471,6 +471,32 @@ logs. The matching native access record is still suppressed for each coalesced
 request. Set `AAWM_ROUTE_LOG_DEDUP_WINDOW_SECONDS=0` to disable coalescing, or
 increase the value for targeted noisy-window capture reduction.
 
+When `AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS` is greater than zero (default `60`),
+healthy per-request enriched `[ROUTE]` lines are not emitted immediately.
+Instead, completed requests are grouped into periodic rollup blocks in the
+process-local proxy logger. Set `AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS=0` to
+restore immediate per-request `[ROUTE]` lines for debug windows. Rollup headers
+use:
+
+```text
+YYYYMMDD HH:MM:SS [EARLY] repo@Client[version] /incoming -> outgoing
+```
+
+`[EARLY]` appears only when a bounded in-memory cap forces a flush before the
+interval elapses. Each rollup subline uses ` - model(alias) - Turns: N` with an
+optional trailing status tag (`[Degraded]`, `[Cooling Down]`, `[Failed]`, or
+`[Exhausted]`). `Turns` counts completed requests only. Alias-route candidate
+events that degrade, cool down, fail, or exhaust before a successful completion
+emit an immediate compact status line:
+
+```text
+YYYYMMDD HH:MM:SS - <alias>: <model> Status: <status> - Message: <details>
+```
+
+Those events also contribute zero-turn rollup sublines so multiple failed
+candidates remain visible in the same bucket. Rollups flush on the configured
+interval and at process shutdown via a shutdown-safe flush helper.
+
 AAWM alias routing audit events are still attached to request metadata for
 session-history and diagnostic consumers. Container log emission is narrower:
 failures, cooldowns, redispatches, no-candidate outcomes, and explicit warning
