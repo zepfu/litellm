@@ -7013,6 +7013,54 @@ class TestPassThroughRequestRetryableFailures:
         ]
 
     @pytest.mark.asyncio
+    async def test_build_passthrough_request_observability_envelope_preserves_body_reference(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+        parsed_body = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "spawn_agent", "parameters": {"type": "object"}},
+                }
+            ],
+            "litellm_metadata": {
+                "session_id": "session-abc",
+                "repository": "/home/zepfu/projects/litellm",
+                "requested_model_alias": "aawm-code",
+                "passthrough_route_family": "codex_responses",
+            },
+        }
+        original_keys = set(parsed_body)
+        call_count = {"count": 0}
+        original_safe_dumps = pte.safe_dumps
+
+        def counting_safe_dumps(value):
+            if value is parsed_body:
+                call_count["count"] += 1
+            return original_safe_dumps(value)
+
+        with patch.object(pte, "safe_dumps", side_effect=counting_safe_dumps):
+            envelope = pte._build_passthrough_request_observability_envelope(
+                parsed_body
+            )
+
+        assert call_count["count"] == 1
+        assert envelope.parsed_body is parsed_body
+        assert envelope.complete_input_dict is parsed_body
+        assert envelope.logging_input == [
+            {"role": "user", "content": envelope.serialized_body}
+        ]
+        assert set(parsed_body) == original_keys
+
+        parsed_body["model"] = "mutated"
+        assert envelope.parsed_body["model"] == "mutated"
+        assert envelope.complete_input_dict["model"] == "mutated"
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_reuses_single_passthrough_logging_input(
         self,
     ):

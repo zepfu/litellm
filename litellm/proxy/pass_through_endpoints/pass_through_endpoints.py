@@ -9,6 +9,7 @@ import traceback
 from base64 import b64encode
 from datetime import datetime, timezone
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlparse
 
@@ -471,11 +472,35 @@ def _extract_exception_status_code(exc: Exception) -> Optional[int]:
 
 
 
+@dataclass(frozen=True)
+class PassthroughRequestObservabilityEnvelope:
+    """Reusable passthrough request-body observability envelope."""
+
+    parsed_body: Optional[dict]
+    serialized_body: str
+    logging_input: List[Dict[str, str]]
+
+    @property
+    def complete_input_dict(self) -> Optional[dict]:
+        return self.parsed_body
+
+
+def _build_passthrough_request_observability_envelope(
+    parsed_body: Optional[dict],
+) -> PassthroughRequestObservabilityEnvelope:
+    serialized_body = safe_dumps(parsed_body)
+    return PassthroughRequestObservabilityEnvelope(
+        parsed_body=parsed_body,
+        serialized_body=serialized_body,
+        logging_input=[{"role": "user", "content": serialized_body}],
+    )
+
+
 def _build_passthrough_logging_input(
     parsed_body: Optional[dict],
 ) -> List[Dict[str, str]]:
     """Build the serialized passthrough logging envelope once for reuse."""
-    return [{"role": "user", "content": safe_dumps(parsed_body)}]
+    return _build_passthrough_request_observability_envelope(parsed_body).logging_input
 
 
 def _extract_passthrough_exception_detail(exc: Exception) -> Optional[str]:
@@ -2751,14 +2776,17 @@ async def pass_through_request(  # noqa: PLR0915
             custom_llm_provider=custom_llm_provider,
         )
 
-        passthrough_logging_input = _build_passthrough_logging_input(_parsed_body)
+        request_observability_envelope = (
+            _build_passthrough_request_observability_envelope(_parsed_body)
+        )
+        passthrough_logging_input = request_observability_envelope.logging_input
         logging_obj.update_messages(passthrough_logging_input)
 
         logging_obj.pre_call(
             input=passthrough_logging_input,
             api_key="",
             additional_args={
-                "complete_input_dict": _parsed_body,
+                "complete_input_dict": request_observability_envelope.complete_input_dict,
                 "api_base": str(logging_url),
                 "headers": masked_headers,
             },
