@@ -33,6 +33,10 @@ from litellm._logging import (
     verbose_proxy_logger,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.proxy.aawm_route_logging import (
+    clear_aawm_route_rollups,
+    flush_aawm_route_rollups,
+)
 from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
@@ -405,8 +409,10 @@ def test_build_aawm_route_access_log_line_classifies_route_type(
     assert line.startswith(f"20260614 19:31:05 [{expected_log_type}] - test-model ")
 
 
-def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
+def test_emit_aawm_route_access_log_is_scoped_once(caplog, monkeypatch) -> None:
     clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
     request = _build_aawm_route_log_request()
     request_body = {
         "model": "claude-sonnet-4-6",
@@ -459,8 +465,11 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog) -> None:
 
 def test_emit_aawm_route_access_log_refreshes_suppression_for_same_scope(
     caplog,
+    monkeypatch,
 ) -> None:
     clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
     request = _build_aawm_route_log_request()
     request_body = {
         "model": "gpt-5.3-codex-spark",
@@ -620,8 +629,10 @@ def test_aawm_route_logger_emits_info_level_access_lines() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
+async def test_pass_through_request_emits_aawm_route_access_log(caplog, monkeypatch) -> None:
     clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
     request = _build_aawm_route_log_request(
         url="http://127.0.0.1:4001/openai_passthrough/responses?stream=false",
         client=("172.19.0.1", 44766),
@@ -724,6 +735,66 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog) -> None:
     )
     assert "redacted" not in route_records[0]
     assert "api_key" not in route_records[0]
+    clear_aawm_route_rollups()
+
+
+@pytest.mark.asyncio
+async def test_pass_through_async_success_handler_records_completed_route_rollup_turn(
+    monkeypatch,
+) -> None:
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "aawm_route_rollup_context": {
+                    "group_header_label": "litellm@Codex[0.119.0-alpha.29]",
+                    "incoming_endpoint": "/openai_passthrough/responses",
+                    "outgoing_target": "api.openai.com/v1/responses",
+                    "model_label": "gpt-5.3-codex-spark(aawm-code)",
+                }
+            }
+        }
+    }
+    handler = PassThroughEndpointLogging()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = '{"success": true}'
+    mock_response.headers = {}
+    mock_response.request = MagicMock(method="POST", url="https://api.openai.com/v1/responses")
+
+    with patch.object(
+        handler,
+        "_handle_logging",
+        new=AsyncMock(return_value=None),
+    ):
+        await handler.pass_through_async_success_handler(
+            httpx_response=mock_response,
+            response_body={"success": True},
+            logging_obj=MagicMock(),
+            url_route="https://api.openai.com/v1/responses",
+            result="",
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            cache_hit=False,
+            request_body={"model": "gpt-5.3-codex-spark"},
+            passthrough_logging_payload=MagicMock(),
+            custom_llm_provider="openai",
+            **kwargs,
+        )
+
+    flushed = flush_aawm_route_rollups(force=True)
+    rendered = "\n".join(flushed)
+
+    assert len(flushed) == 2
+    assert (
+        "litellm@Codex[0.119.0-alpha.29] /openai_passthrough/responses -> "
+        "api.openai.com/v1/responses"
+    ) in rendered
+    assert " - gpt-5.3-codex-spark(aawm-code) - Turns: 1" in rendered
+    assert kwargs["litellm_params"]["metadata"]["aawm_route_rollup_turn_recorded"] is True
+    clear_aawm_route_rollups()
 
 
 # Test is_multipart

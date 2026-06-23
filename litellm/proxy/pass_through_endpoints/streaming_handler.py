@@ -13,6 +13,7 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
+from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
     sanitize_google_code_assist_quota_for_logging,
@@ -1041,6 +1042,7 @@ class PassThroughStreamingHandler:
                 litellm_logging_obj,
                 kwargs,
             )
+            record_aawm_route_rollup_turn(kwargs)
             handler_branch = (
                 await PassThroughStreamingHandler._dispatch_streaming_success_callbacks(
                     litellm_logging_obj=litellm_logging_obj,

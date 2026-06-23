@@ -86,6 +86,11 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
 from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
     sanitize_google_code_assist_quota_for_logging as _sanitize_google_code_assist_quota_for_logging,
 )
+from litellm.proxy.aawm_route_logging import (
+    build_aawm_route_rollup_group_header_label,
+    emit_aawm_route_status_event,
+    record_aawm_route_rollup,
+)
 try:
     from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
         add_claude_post_rewrite_context_file_logging_metadata as _aawm_add_claude_post_rewrite_context_file_logging_metadata,
@@ -2401,11 +2406,180 @@ def _extract_auto_agent_alias_metadata_value(
     return None
 
 
+def _normalize_auto_agent_alias_client_product(value: Any) -> Optional[str]:
+    cleaned = _clean_codex_auth_value(value)
+    if cleaned is None:
+        return None
+    product = cleaned.split()[0].strip("()")
+    if not product:
+        return None
+    if "/" not in product:
+        return product
+    name, version = product.split("/", 1)
+    normalized_name = name.lower().replace("_", "-")
+    if normalized_name in {"codex", "codex-cli", "codex-tui", "codex-cli-rs"}:
+        name = "Codex"
+    elif normalized_name in {"claude", "claude-cli", "claude-code"}:
+        name = "Claude"
+    elif normalized_name in {"grok", "grok-build", "grok-pager"}:
+        name = "Grok"
+    return f"{name}/{version}"
+
+
+def _extract_auto_agent_alias_client_product_label(
+    request: Request,
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    metadata = request_body.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        for key in (
+            "client_name_version",
+            "client_label",
+            "client_user_agent",
+            "user_agent",
+        ):
+            value = _normalize_auto_agent_alias_client_product(metadata.get(key))
+            if value:
+                return value
+        name = _normalize_auto_agent_alias_client_product(
+            metadata.get("client_name")
+        )
+        version = _clean_codex_auth_value(metadata.get("client_version"))
+        if name and version and "/" not in name:
+            return f"{name}/{version}"
+        if name:
+            return name
+    headers = _safe_get_request_headers(request)
+    for header_name in (
+        "x-aawm-client",
+        "x-litellm-client",
+        "x-client-name-version",
+        "user-agent",
+    ):
+        value = _normalize_auto_agent_alias_client_product(
+            _get_codex_auto_agent_header(headers, header_name)
+        )
+        if value:
+            return value
+    return None
+
+
+def _extract_auto_agent_alias_incoming_endpoint(request: Request) -> str:
+    parsed_url = urlparse(str(getattr(request, "url", "") or ""))
+    path = parsed_url.path or getattr(request, "path", None) or "/"
+    safe_pairs: list[tuple[str, str]] = []
+    for key, value in parse_qsl(parsed_url.query, keep_blank_values=True):
+        if key.lower() not in {"alt", "api-version", "beta", "stream"}:
+            continue
+        safe_key = _clean_codex_auth_value(key)
+        safe_value = _clean_codex_auth_value(value)
+        if safe_key and safe_value is not None:
+            safe_pairs.append((safe_key, safe_value))
+    if not safe_pairs:
+        return path
+    return f"{path}?{urlencode(safe_pairs)}"
+
+
+def _auto_agent_alias_model_rollup_label(event: dict[str, Any]) -> Optional[str]:
+    model = _clean_codex_auth_value(event.get("model"))
+    alias_model = _clean_codex_auth_value(event.get("alias_model"))
+    if model and alias_model and model != alias_model:
+        return f"{model}({alias_model})"
+    return model or alias_model
+
+
+def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str]:
+    event_type = str(event.get("event_type") or "")
+    candidate_status = str(event.get("candidate_status") or "")
+    selection_reason = str(event.get("selection_reason") or "")
+    failure_class = str(event.get("failure_class") or "")
+    if event_type == "no_candidate_available":
+        return "Exhausted"
+    if "auth_degraded" in candidate_status or "auth_degraded" in selection_reason:
+        return "Degraded"
+    if event.get("redispatch_required") or "cooldown" in candidate_status:
+        return "Cooling Down"
+    if failure_class in {"rate_limited", "capacity_exhausted", "transient_error"}:
+        return "Cooling Down"
+    if event.get("error_status_code") or failure_class:
+        return "Failed"
+    return None
+
+
+def _auto_agent_alias_route_status_message(event: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "failure_class",
+        "error_type",
+        "error_code",
+        "error_status_code",
+        "candidate_status",
+        "selection_reason",
+    ):
+        value = event.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
+    error_tokens = event.get("error_tokens")
+    if isinstance(error_tokens, list) and error_tokens:
+        parts.append("error_tokens={}".format(",".join(str(v) for v in error_tokens[:5])))
+    return "; ".join(parts) or "route status changed"
+
+
+def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
+    status = _auto_agent_alias_route_rollup_status(event)
+    if status is None:
+        return
+    alias_model = _clean_codex_auth_value(event.get("alias_model"))
+    model_labels: list[str] = []
+    model_label = _auto_agent_alias_model_rollup_label(event)
+    if model_label:
+        model_labels.append(model_label)
+    candidates = event.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_model = _clean_codex_auth_value(candidate.get("model"))
+            if candidate_model and alias_model and candidate_model != alias_model:
+                candidate_model = f"{candidate_model}({alias_model})"
+            if candidate_model and candidate_model not in model_labels:
+                model_labels.append(candidate_model)
+    if not model_labels:
+        return
+
+    message = _auto_agent_alias_route_status_message(event)
+    for label in model_labels:
+        emit_aawm_route_status_event(
+            alias_model=alias_model,
+            model_label=label.split("(", 1)[0],
+            status=status,
+            message=message,
+        )
+
+    group_header_label = _clean_codex_auth_value(event.get("rollup_group_header_label"))
+    incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
+    outgoing_target = _clean_codex_auth_value(event.get("outgoing_target")) or (
+        _clean_codex_auth_value(event.get("route_family")) or "candidate_selection"
+    )
+    if not group_header_label or not incoming_endpoint:
+        return
+    for label in model_labels:
+        record_aawm_route_rollup(
+            group_header_label=group_header_label,
+            incoming_endpoint=incoming_endpoint,
+            outgoing_target=outgoing_target,
+            model_label=label,
+            turns=0,
+            status=status,
+        )
+
+
 def _emit_auto_agent_alias_route_event(
     event: dict[str, Any],
     *,
     level: str = "info",
 ) -> None:
+    _record_auto_agent_alias_route_status_rollup(event)
     if not _should_emit_auto_agent_alias_route_event(event, level=level):
         return
     log_payload = {"event": "aawm_alias_route", **event}
@@ -2462,6 +2636,17 @@ def _emit_auto_agent_alias_no_candidate_event(
 ) -> None:
     detail = exc.detail if isinstance(exc.detail, dict) else {}
     candidates = detail.get("candidates") if isinstance(detail, dict) else None
+    repository = _extract_auto_agent_alias_metadata_value(
+        request_body,
+        "repository",
+        "repo",
+        "repo_name",
+        "repository_name",
+    )
+    client_product_label = _extract_auto_agent_alias_client_product_label(
+        request,
+        request_body,
+    )
     _emit_auto_agent_alias_route_event(
         {
             "observed_at": _format_auto_agent_alias_timestamp(
@@ -2479,13 +2664,14 @@ def _emit_auto_agent_alias_no_candidate_event(
                 "codex_agent_id",
                 "claude_agent_id",
             ),
-            "repository": _extract_auto_agent_alias_metadata_value(
-                request_body,
-                "repository",
-                "repo",
-                "repo_name",
-                "repository_name",
+            "repository": repository,
+            "client_product_label": client_product_label,
+            "rollup_group_header_label": build_aawm_route_rollup_group_header_label(
+                repository=repository,
+                client_product_label=client_product_label,
             ),
+            "incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint(request),
+            "outgoing_target": "candidate_selection",
             "event_type": "no_candidate_available",
             "candidate_status": "all_candidates_unavailable",
             "failure_phase": "candidate_selection",
@@ -2531,6 +2717,17 @@ def _build_auto_agent_alias_audit_event(
         lane_key = selection.get("lane_key")
     if cooldown_key is None and lane_key is not None:
         cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
+    repository = _extract_auto_agent_alias_metadata_value(
+        request_body,
+        "repository",
+        "repo",
+        "repo_name",
+        "repository_name",
+    )
+    client_product_label = _extract_auto_agent_alias_client_product_label(
+        request,
+        request_body,
+    )
     event: dict[str, Any] = {
         "observed_at": _format_auto_agent_alias_timestamp(datetime.now(timezone.utc)),
         "alias_family": alias_family,
@@ -2543,13 +2740,14 @@ def _build_auto_agent_alias_audit_event(
             "codex_agent_id",
             "claude_agent_id",
         ),
-        "repository": _extract_auto_agent_alias_metadata_value(
-            request_body,
-            "repository",
-            "repo",
-            "repo_name",
-            "repository_name",
+        "repository": repository,
+        "client_product_label": client_product_label,
+        "rollup_group_header_label": build_aawm_route_rollup_group_header_label(
+            repository=repository,
+            client_product_label=client_product_label,
         ),
+        "incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint(request),
+        "outgoing_target": candidate.get("route_family"),
         "session_key": selection.get("session_key"),
         "provider": candidate.get("provider"),
         "model": candidate.get("model"),

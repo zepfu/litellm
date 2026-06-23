@@ -21542,17 +21542,25 @@ def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
 
     emitted = []
+    route_status = []
     monkeypatch.setattr(
         endpoints.verbose_proxy_logger,
         "warning",
         lambda message: emitted.append(message),
     )
+    monkeypatch.setattr(
+        endpoints,
+        "emit_aawm_route_status_event",
+        lambda **kwargs: route_status.append(kwargs),
+    )
+    monkeypatch.setattr(endpoints, "record_aawm_route_rollup", lambda **kwargs: None)
 
     endpoints._emit_auto_agent_alias_route_event(
         {
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "rate_limited",
+            "alias_model": "aawm-low",
             "provider": "antigravity",
             "model": "gemini-3.5-flash-low",
         },
@@ -21561,6 +21569,54 @@ def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
 
     assert len(emitted) == 1
     assert "AAWM_ALIAS_ROUTE:" in emitted[0]
+    assert route_status == [
+        {
+            "alias_model": "aawm-low",
+            "model_label": "gemini-3.5-flash-low",
+            "status": "Cooling Down",
+            "message": (
+                "failure_class=rate_limited; candidate_status=cooldown_set"
+            ),
+        }
+    ]
+
+
+def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    rollups = []
+    monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
+    monkeypatch.setattr(
+        endpoints,
+        "record_aawm_route_rollup",
+        lambda **kwargs: rollups.append(kwargs),
+    )
+    monkeypatch.setattr(endpoints.verbose_proxy_logger, "warning", lambda message: None)
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "capacity_exhausted",
+            "alias_model": "aawm-low",
+            "model": "grok-composer-2.5-fast",
+            "rollup_group_header_label": "litellm@Codex[0.141.0]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "grok_cli_chat_proxy",
+        },
+        level="warning",
+    )
+
+    assert rollups == [
+        {
+            "group_header_label": "litellm@Codex[0.141.0]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "grok_cli_chat_proxy",
+            "model_label": "grok-composer-2.5-fast(aawm-low)",
+            "turns": 0,
+            "status": "Cooling Down",
+        }
+    ]
 
 
 @pytest.mark.asyncio
