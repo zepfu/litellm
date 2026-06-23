@@ -471,6 +471,13 @@ def _extract_exception_status_code(exc: Exception) -> Optional[int]:
 
 
 
+def _build_passthrough_logging_input(
+    parsed_body: Optional[dict],
+) -> List[Dict[str, str]]:
+    """Build the serialized passthrough logging envelope once for reuse."""
+    return [{"role": "user", "content": safe_dumps(parsed_body)}]
+
+
 def _extract_passthrough_exception_detail(exc: Exception) -> Optional[str]:
     for attr_name in ("detail", "message"):
         value = getattr(exc, attr_name, None)
@@ -2598,7 +2605,7 @@ async def pass_through_request(  # noqa: PLR0915
         ## LOGGING OBJECT ## - initialize before pre_call_hook so guardrails can access it
         logging_obj = Logging(
             model="unknown",
-            messages=[{"role": "user", "content": safe_dumps(_parsed_body)}],
+            messages=None,
             stream=False,
             call_type="pass_through_endpoint",
             start_time=start_time,
@@ -2639,6 +2646,7 @@ async def pass_through_request(  # noqa: PLR0915
                 str(url),
                 invalid_openai_tool_schemas[:10],
             )
+
         async_client_obj = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
             params={"timeout": 600},
@@ -2743,8 +2751,11 @@ async def pass_through_request(  # noqa: PLR0915
             custom_llm_provider=custom_llm_provider,
         )
 
+        passthrough_logging_input = _build_passthrough_logging_input(_parsed_body)
+        logging_obj.update_messages(passthrough_logging_input)
+
         logging_obj.pre_call(
-            input=[{"role": "user", "content": safe_dumps(_parsed_body)}],
+            input=passthrough_logging_input,
             api_key="",
             additional_args={
                 "complete_input_dict": _parsed_body,
