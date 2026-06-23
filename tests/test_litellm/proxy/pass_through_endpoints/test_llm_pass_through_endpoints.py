@@ -64,6 +64,10 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _codex_google_code_assist_tool_call_name_cache,
     _codex_auto_agent_cooldown_until_monotonic_by_key,
     _codex_auto_agent_session_affinity_by_key,
+    _codex_auto_agent_google_lane_key_until_monotonic_by_key,
+    _codex_auto_agent_google_lane_key_by_key,
+    _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key,
+    _codex_auto_agent_antigravity_lane_key_by_key,
     _anthropic_auto_agent_cooldown_until_monotonic_by_key,
     _anthropic_auto_agent_session_affinity_by_key,
     _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
@@ -17067,18 +17071,26 @@ def _build_codex_auto_agent_request(session_id: str = "codex-session"):
 def clear_codex_auto_agent_alias_state():
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
+    _codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
+    _codex_auto_agent_google_lane_key_by_key.clear()
+    _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.clear()
+    _codex_auto_agent_antigravity_lane_key_by_key.clear()
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
     clear_aawm_route_rollups()
     yield
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
+    _codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
+    _codex_auto_agent_google_lane_key_by_key.clear()
+    _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.clear()
+    _codex_auto_agent_antigravity_lane_key_by_key.clear()
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
     clear_aawm_route_rollups()
 
 
-def test_aawm_alias_candidate_maps_exclude_google_and_retired_free_deepseek():
+def test_aawm_alias_candidate_maps_exclude_google_antigravity_and_retired_free_deepseek():
     candidate_maps = {
         **_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
         **_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
@@ -17091,20 +17103,13 @@ def test_aawm_alias_candidate_maps_exclude_google_and_retired_free_deepseek():
             model = str(candidate["model"]).lower()
             route_family = str(candidate["route_family"]).lower()
             haystack = f"{provider} {model} {route_family}"
+            if alias.startswith(("aawm-low", "aawm-code")) and (
+                provider == "antigravity" or "antigravity" in route_family
+            ):
+                violations.append(f"{alias} exposes antigravity candidate:{model}")
             if provider == "google_code_assist":
                 violations.append(f"{alias} exposes google_code_assist:{model}")
-            if (
-                any(token in haystack for token in ("gemini", "gemma"))
-                and not (
-                    alias in {"aawm-low", "aawm-low-anthropic"}
-                    and provider == "antigravity"
-                    and model == "gemini-3.5-flash-low"
-                    and route_family in {
-                        "codex_antigravity_code_assist_adapter",
-                        "anthropic_antigravity_completion_adapter",
-                    }
-                )
-            ):
+            if any(token in haystack for token in ("gemini", "gemma")):
                 violations.append(f"{alias} exposes google-backed candidate:{model}")
             if model == "deepseek/deepseek-v4-flash:free":
                 violations.append(f"{alias} exposes retired free DeepSeek lane")
@@ -17420,22 +17425,18 @@ async def test_anthropic_auto_agent_alias_sota_has_no_fallback_candidates():
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_selects_antigravity_first():
+async def test_anthropic_auto_agent_alias_code_selects_spark_first():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
-        new=AsyncMock(return_value="google-lane"),
-    ):
-        selection = await _select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
 
-    assert selection["candidate"]["provider"] == "antigravity"
-    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["selection_reason"] == "first_available"
     assert selection["skipped"] == []
 
@@ -17446,12 +17447,6 @@ async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates(
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
     expected_candidates = [
-        (
-            "antigravity",
-            "claude-sonnet-4-6",
-            "anthropic_antigravity_completion_adapter",
-            False,
-        ),
         (
             "openai",
             "gpt-5.3-codex-spark",
@@ -17468,31 +17463,27 @@ async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates(
         ("anthropic", "claude-sonnet-4-6", "anthropic_messages", True),
     ]
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
+    for index, (provider, model, route_family, last_resort) in enumerate(
+        expected_candidates
     ):
-        for index, (provider, model, route_family, last_resort) in enumerate(
-            expected_candidates
-        ):
-            selection = await _select_anthropic_auto_agent_candidate(
-                request=request,
-                request_body=body,
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        candidate = selection["candidate"]
+        assert candidate["provider"] == provider
+        assert candidate["model"] == model
+        assert candidate["route_family"] == route_family
+        assert candidate["last_resort"] is last_resort
+        if last_resort:
+            assert selection["selection_reason"] == "last_resort"
+        else:
+            assert selection["selection_reason"] == "first_available"
+        if index < len(expected_candidates) - 1:
+            await _set_anthropic_auto_agent_cooldown(
+                selection["cooldown_key"],
+                60.0,
             )
-            candidate = selection["candidate"]
-            assert candidate["provider"] == provider
-            assert candidate["model"] == model
-            assert candidate["route_family"] == route_family
-            assert candidate["last_resort"] is last_resort
-            if last_resort:
-                assert selection["selection_reason"] == "last_resort"
-            else:
-                assert selection["selection_reason"] == "first_available"
-            if index < len(expected_candidates) - 1:
-                await _set_anthropic_auto_agent_cooldown(
-                    selection["cooldown_key"],
-                    60.0,
-                )
 
 
 def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
@@ -17504,13 +17495,13 @@ def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
         request=request,
         selection={
             "candidate": {
-                "provider": "antigravity",
-                "model": "claude-sonnet-4-6",
-                "route_family": "anthropic_antigravity_code_assist_adapter",
+                "provider": "openai",
+                "model": "gpt-5.3-codex-spark",
+                "route_family": "anthropic_openai_responses_adapter",
                 "last_resort": False,
             },
             "selection_reason": "first_available",
-            "lane_key": "antigravity-lane",
+            "lane_key": "__default__",
             "skipped": [],
         },
         attempts=[],
@@ -17523,8 +17514,8 @@ def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
     audit_events = metadata["aawm_alias_routing_audit_events"]
     assert len(audit_events) == 1
     assert audit_events[0]["event_type"] == "candidate_selected"
-    assert audit_events[0]["provider"] == "antigravity"
-    assert audit_events[0]["model"] == "claude-sonnet-4-6"
+    assert audit_events[0]["provider"] == "openai"
+    assert audit_events[0]["model"] == "gpt-5.3-codex-spark"
     assert "model-alias:aawm-code-anthropic" in metadata["tags"]
 
 
@@ -17563,7 +17554,7 @@ async def test_anthropic_auto_agent_alias_session_affinity_reports_routing_state
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
             new=AsyncMock(return_value="antigravity-lane"),
-        ):
+        ) as mock_antigravity_lane:
             selection = await _select_anthropic_auto_agent_candidate(
                 request=request,
                 request_body=body,
@@ -17574,6 +17565,7 @@ async def test_anthropic_auto_agent_alias_session_affinity_reports_routing_state
     assert selection["selection_reason"] == "session_affinity"
     assert selection["affinity_state_source"] == "durable_cache"
     assert selection["cooldown_state_source"] == "local_fallback"
+    mock_antigravity_lane.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -17634,6 +17626,115 @@ async def test_codex_auto_agent_alias_continuation_affinity_uses_single_candidat
     assert selection["cooldown_state_source"] == "local_fallback"
     assert selection["in_flight_session"] is True
     assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_google_lane_resolver_reuses_cache_within_ttl(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    monkeypatch.setenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS", "30")
+    load_token_mock = AsyncMock(return_value="ya29.valid-google")
+    load_project_mock = AsyncMock(return_value="google-project")
+    rate_limit_key_mock = MagicMock(return_value="shared-google-lane")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
+        new=load_token_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+        new=load_project_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_google_adapter_rate_limit_key",
+        new=rate_limit_key_mock,
+    ):
+        first_lane = await endpoints._resolve_codex_auto_agent_google_lane_key()
+        second_lane = await endpoints._resolve_codex_auto_agent_google_lane_key()
+
+    assert first_lane == "shared-google-lane"
+    assert second_lane == "shared-google-lane"
+    assert load_token_mock.await_count == 1
+    assert load_project_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_antigravity_lane_state_resolver_reuses_cache_within_ttl(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    monkeypatch.setenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS", "30")
+    load_token_mock = AsyncMock(return_value="ya29.valid-antigravity")
+    load_project_mock = AsyncMock(return_value="antigravity-project")
+    rate_limit_key_mock = MagicMock(return_value="shared-antigravity-lane")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        new=load_token_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+        new=load_project_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_google_adapter_rate_limit_key",
+        new=rate_limit_key_mock,
+    ):
+        first_state = await endpoints._resolve_codex_auto_agent_antigravity_lane_state()
+        second_state = await endpoints._resolve_codex_auto_agent_antigravity_lane_state()
+
+    assert first_state["lane_key"] == "antigravity:shared-antigravity-lane"
+    assert second_state["lane_key"] == "antigravity:shared-antigravity-lane"
+    assert load_token_mock.await_count == 1
+    assert load_project_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_antigravity_default_lane_fallback_is_not_cached(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    monkeypatch.setenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS", "30")
+    load_token_mock = AsyncMock(side_effect=RuntimeError("project lookup failed"))
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        new=load_token_mock,
+    ), patch.object(endpoints.verbose_proxy_logger, "error"):
+        first_state = await endpoints._resolve_codex_auto_agent_antigravity_lane_state()
+        second_state = await endpoints._resolve_codex_auto_agent_antigravity_lane_state()
+
+    assert first_state == {"lane_key": "__default__"}
+    assert second_state == {"lane_key": "__default__"}
+    assert load_token_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_antigravity_lane_cache_expires_after_ttl(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    monkeypatch.setenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS", "30")
+    load_token_mock = AsyncMock(return_value="ya29.valid-antigravity")
+    load_project_mock = AsyncMock(return_value="antigravity-project")
+    rate_limit_key_mock = MagicMock(return_value="shared-antigravity-lane")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        new=load_token_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_or_load_google_code_assist_project",
+        new=load_project_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_google_adapter_rate_limit_key",
+        new=rate_limit_key_mock,
+    ):
+        await endpoints._resolve_codex_auto_agent_antigravity_lane_state()
+        cache_key = endpoints._get_codex_auto_agent_antigravity_lane_cache_key()
+        endpoints._codex_auto_agent_antigravity_lane_key_until_monotonic_by_key[
+            cache_key
+        ] = time.monotonic() - 1
+        await endpoints._resolve_codex_auto_agent_antigravity_lane_state()
+
+    assert load_token_mock.await_count == 2
+    assert load_project_mock.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -17714,17 +17815,13 @@ async def test_anthropic_auto_agent_alias_fresh_dispatch_ignores_session_affinit
         "expires_at_monotonic": time.monotonic() + 3600,
     }
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ):
-        selection = await _select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
 
-    assert selection["candidate"]["provider"] == "antigravity"
-    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["selection_reason"] == "first_available"
 
 
@@ -17803,17 +17900,17 @@ async def test_anthropic_auto_agent_alias_low_uses_default_low_candidates(
         request_body=body,
     )
 
-    assert selection["candidate"]["provider"] == "antigravity"
-    assert selection["candidate"]["model"] == "gemini-3.5-flash-low"
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
     assert selection["candidate"]["route_family"] == (
-        "anthropic_antigravity_completion_adapter"
+        "anthropic_openrouter_completion_adapter"
     )
     candidates = _get_anthropic_auto_agent_candidates_for_alias("aawm-low-anthropic")
     candidate_models = [candidate["model"] for candidate in candidates]
     assert candidate_models[:3] == [
-        "gemini-3.5-flash-low",
         "openrouter/cohere/north-mini-code:free",
         "openrouter/owl-alpha",
+        "deepseek-v4-flash",
     ]
 
 
@@ -17825,12 +17922,6 @@ async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
     expected_candidates = [
-        (
-            "antigravity",
-            "gemini-3.5-flash-low",
-            "anthropic_antigravity_completion_adapter",
-            False,
-        ),
         (
             "openrouter",
             "openrouter/cohere/north-mini-code:free",
@@ -17863,35 +17954,31 @@ async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
         ),
     ]
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
+    for index, (provider, model, route_family, last_resort) in enumerate(
+        expected_candidates
     ):
-        for index, (provider, model, route_family, last_resort) in enumerate(
-            expected_candidates
-        ):
-            selection = await _select_anthropic_auto_agent_candidate(
-                request=request,
-                request_body=body,
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        candidate = selection["candidate"]
+        assert candidate["provider"] == provider
+        assert candidate["model"] == model
+        assert candidate["route_family"] == route_family
+        assert candidate["last_resort"] is last_resort
+        if last_resort:
+            assert selection["selection_reason"] == "last_resort"
+        else:
+            assert selection["selection_reason"] == "first_available"
+        if index < len(expected_candidates) - 1:
+            await _set_anthropic_auto_agent_cooldown(
+                selection["cooldown_key"],
+                60.0,
             )
-            candidate = selection["candidate"]
-            assert candidate["provider"] == provider
-            assert candidate["model"] == model
-            assert candidate["route_family"] == route_family
-            assert candidate["last_resort"] is last_resort
-            if last_resort:
-                assert selection["selection_reason"] == "last_resort"
-            else:
-                assert selection["selection_reason"] == "first_available"
-            if index < len(expected_candidates) - 1:
-                await _set_anthropic_auto_agent_cooldown(
-                    selection["cooldown_key"],
-                    60.0,
-                )
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_order_unchanged_with_low_defaults(
+async def test_anthropic_auto_agent_alias_code_order_omits_antigravity(
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
@@ -17902,16 +17989,15 @@ async def test_anthropic_auto_agent_alias_code_order_unchanged_with_low_defaults
         request_body=body,
     )
 
-    assert selection["candidate"]["provider"] == "antigravity"
-    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["candidate"]["route_family"] == (
-        "anthropic_antigravity_completion_adapter"
+        "anthropic_openai_responses_adapter"
     )
     candidates = _get_anthropic_auto_agent_candidates_for_alias(
         "aawm-code-anthropic"
     )
     assert [candidate["model"] for candidate in candidates] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
@@ -18367,69 +18453,67 @@ async def test_anthropic_antigravity_completion_adapter_probe_preserves_request_
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigravity_429(
+async def test_anthropic_auto_agent_alias_code_falls_back_to_composer_after_spark_429(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
-    antigravity_error = ProxyException(
-        message="antigravity quota exhausted",
+    spark_error = ProxyException(
+        message="spark quota exhausted",
         type="rate_limit_error",
         param="model",
         code=429,
     )
-    antigravity_error.detail = {
+    spark_error.detail = {
         "error": {
-            "message": "RESOURCE_EXHAUSTED",
+            "message": "usage_limit_reached",
             "code": 429,
             "status": "RESOURCE_EXHAUSTED",
         }
     }
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
+    composer_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ) as mock_antigravity, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
+        new=AsyncMock(side_effect=spark_error),
     ) as mock_spark:
-        response = await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
-        )
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+            new=AsyncMock(return_value=composer_success),
+        ) as mock_composer:
+            response = await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
 
-    assert response is spark_success
-    mock_antigravity.assert_awaited_once()
+    assert response is composer_success
     mock_spark.assert_awaited_once()
-    assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
-    assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
     assert mock_spark.await_args.kwargs["adapter_model"] == "gpt-5.3-codex-spark"
     assert mock_spark.await_args.kwargs["use_alias_candidate_probe"] is True
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
+    mock_composer.assert_awaited_once()
+    assert mock_composer.await_args.kwargs["adapter_model"] == "grok-composer-2.5-fast"
+    assert mock_composer.await_args.kwargs["use_alias_candidate_probe"] is True
+    composer_body = mock_composer.await_args.kwargs["prepared_request_body"]
+    metadata = composer_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
     assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
     assert metadata["anthropic_auto_agent_selected_route_family"] == (
-        "anthropic_openai_responses_adapter"
+        "anthropic_grok_native_responses_adapter"
     )
     assert metadata["anthropic_auto_agent_attempts"][0]["status"] == "cooldown_set"
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
-        "antigravity"
+        "openai"
     )
     assert [attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
     ]
     audit_events = metadata["aawm_alias_routing_audit_events"]
     retryable_index = next(
@@ -18444,16 +18528,16 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_spark_after_antigra
     )
     assert retryable_index < selected_index
     retryable_event = audit_events[retryable_index]
-    assert retryable_event["provider"] == "antigravity"
-    assert retryable_event["model"] == "claude-sonnet-4-6"
+    assert retryable_event["provider"] == "openai"
+    assert retryable_event["model"] == "gpt-5.3-codex-spark"
     assert retryable_event["failure_class"]
     selected_event = audit_events[selected_index]
-    assert selected_event["provider"] == "openai"
-    assert selected_event["model"] == "gpt-5.3-codex-spark"
+    assert selected_event["provider"] == "xai"
+    assert selected_event["model"] == "grok-composer-2.5-fast"
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_spark_after_antigravity_429(
+async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_composer_after_spark_429(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -18475,31 +18559,28 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_spark_
         }
     ]
     body["tool_choice"] = {"type": "function", "name": "Bash"}
-    antigravity_error = ProxyException(
-        message="antigravity quota exhausted",
+    spark_error = ProxyException(
+        message="spark quota exhausted",
         type="rate_limit_error",
         param="model",
         code=429,
     )
-    antigravity_error.detail = {
+    spark_error.detail = {
         "error": {
-            "message": "RESOURCE_EXHAUSTED",
+            "message": "usage_limit_reached",
             "code": 429,
             "status": "RESOURCE_EXHAUSTED",
         }
     }
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
+    composer_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ) as mock_antigravity, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
+        new=AsyncMock(side_effect=spark_error),
     ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=composer_success),
+    ) as mock_composer, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
         new=AsyncMock(),
     ) as mock_native, patch(
@@ -18515,21 +18596,21 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_spark_
             custom_headers={"x-api-key": "anthropic-key"},
         )
 
-    assert response is spark_success
-    mock_antigravity.assert_awaited_once()
+    assert response is composer_success
     mock_spark.assert_awaited_once()
+    mock_composer.assert_awaited_once()
     mock_native.assert_not_called()
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
+    composer_body = mock_composer.await_args.kwargs["prepared_request_body"]
+    metadata = composer_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "grok-composer-2.5-fast"
     assert metadata["anthropic_auto_agent_selected_route_family"] == (
-        "anthropic_openai_responses_adapter"
+        "anthropic_grok_native_responses_adapter"
     )
     assert metadata["anthropic_auto_agent_attempts"][0]["status"] == "cooldown_set"
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
-        "antigravity"
+        "openai"
     )
     _assert_no_anthropic_code_selector_compatibility_skips(
         metadata["anthropic_auto_agent_skipped_candidates"]
@@ -18560,23 +18641,20 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_nex
     ]
     body["tool_choice"] = {"type": "function", "name": "Bash"}
     await _set_anthropic_auto_agent_cooldown(
-        "antigravity:claude-sonnet-4-6:antigravity-lane",
+        "openai:gpt-5.3-codex-spark:__default__",
         10691.0,
     )
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
+    composer_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
         new=AsyncMock(),
-    ) as mock_antigravity, patch(
+    ) as mock_antigravity_lane, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
+        new=AsyncMock(),
     ) as mock_spark, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
-        new=AsyncMock(),
+        new=AsyncMock(return_value=composer_success),
     ) as mock_grok_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
         new=AsyncMock(),
@@ -18594,18 +18672,18 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_nex
             custom_headers={"x-api-key": "anthropic-key"},
         )
 
-    assert response is spark_success
-    mock_antigravity.assert_not_called()
-    mock_spark.assert_awaited_once()
-    mock_grok_native.assert_not_called()
+    assert response is composer_success
+    mock_antigravity_lane.assert_not_called()
+    mock_spark.assert_not_called()
+    mock_grok_native.assert_awaited_once()
     mock_xai_oauth.assert_not_called()
     mock_native.assert_not_called()
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    composer_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
+    metadata = composer_body["litellm_metadata"]
+    assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "grok-composer-2.5-fast"
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
-        "antigravity"
+        "openai"
     )
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["reason"] == "cooldown"
     _assert_no_anthropic_code_selector_compatibility_skips(
@@ -18633,23 +18711,20 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_next_de
         }
     ]
     await _set_anthropic_auto_agent_cooldown(
-        "antigravity:claude-sonnet-4-6:antigravity-lane",
+        "openai:gpt-5.3-codex-spark:__default__",
         10691.0,
     )
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
+    composer_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
         new=AsyncMock(),
-    ) as mock_antigravity, patch(
+    ) as mock_antigravity_lane, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
+        new=AsyncMock(),
     ) as mock_spark, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
-        new=AsyncMock(),
+        new=AsyncMock(return_value=composer_success),
     ) as mock_grok_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
         new=AsyncMock(),
@@ -18667,19 +18742,19 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_next_de
             custom_headers={"x-api-key": "anthropic-key"},
         )
 
-    assert response is spark_success
-    mock_antigravity.assert_not_called()
-    mock_spark.assert_awaited_once()
-    mock_grok_native.assert_not_called()
+    assert response is composer_success
+    mock_antigravity_lane.assert_not_called()
+    mock_spark.assert_not_called()
+    mock_grok_native.assert_awaited_once()
     mock_xai_oauth.assert_not_called()
     mock_native.assert_not_called()
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
+    composer_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
+    metadata = composer_body["litellm_metadata"]
+    assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "grok-composer-2.5-fast"
     assert metadata["aawm_alias_routing_audit_events"][-1]["in_flight_session"] is True
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
-        "antigravity"
+        "openai"
     )
     _assert_no_anthropic_code_selector_compatibility_skips(
         metadata["anthropic_auto_agent_skipped_candidates"]
@@ -18708,21 +18783,16 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_
     ]
     body["tool_choice"] = {"type": "function", "name": "Bash"}
     for cooldown_key in (
-        "antigravity:claude-sonnet-4-6:antigravity-lane",
         "openai:gpt-5.3-codex-spark:__default__",
         "xai:grok-composer-2.5-fast:xai_grok_native",
         "xai:oa_xai/grok-build:xai_grok_native",
     ):
         await _set_anthropic_auto_agent_cooldown(cooldown_key, 60.0)
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ):
-        selection = await _select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
 
     assert selection["candidate"]["provider"] == "anthropic"
     assert selection["candidate"]["model"] == "claude-sonnet-4-6"
@@ -18731,258 +18801,11 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_
         (candidate["provider"], candidate["model"], candidate["reason"])
         for candidate in selection["skipped"]
     ] == [
-        ("antigravity", "claude-sonnet-4-6", "cooldown"),
         ("openai", "gpt-5.3-codex-spark", "cooldown"),
         ("xai", "grok-composer-2.5-fast", "cooldown"),
         ("xai", "oa_xai/grok-build", "cooldown"),
     ]
     _assert_no_anthropic_code_selector_compatibility_skips(selection["skipped"])
-
-
-@pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_after_antigravity_auth_unavailable(
-    monkeypatch,
-):
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
-    body["tools"] = [
-        {
-            "type": "function",
-            "function": {
-                "name": "Bash",
-                "description": "Run shell command",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-    ]
-    body["tool_choice"] = {"type": "function", "name": "Bash"}
-    antigravity_auth_error = HTTPException(
-        status_code=500,
-        detail=(
-            "Failed to get OAuth token: error getting token source from auth "
-            "provider: You are not logged into Antigravity."
-        ),
-    )
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
-        new=AsyncMock(side_effect=antigravity_auth_error),
-    ) as mock_prepare_antigravity, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
-    ) as mock_spark, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
-        new=AsyncMock(),
-    ) as mock_native, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body",
-    ):
-        response = await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
-        )
-
-    assert response is spark_success
-    mock_prepare_antigravity.assert_awaited_once()
-    mock_spark.assert_awaited_once()
-    mock_native.assert_not_called()
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    assert metadata["anthropic_auto_agent_attempts"][0]["error_class"] == (
-        "candidate_unavailable"
-    )
-    _assert_no_anthropic_code_selector_compatibility_skips(
-        metadata["anthropic_auto_agent_skipped_candidates"]
-    )
-
-
-@pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_falls_back_after_antigravity_not_logged_in(
-    monkeypatch,
-):
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
-    antigravity_auth_error = HTTPException(
-        status_code=500,
-        detail=(
-            "Failed to get OAuth token: error getting token source from auth "
-            "provider: You are not logged into Antigravity."
-        ),
-    )
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
-        new=AsyncMock(side_effect=antigravity_auth_error),
-    ) as mock_prepare_antigravity, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
-    ) as mock_spark:
-        response = await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
-        )
-
-    assert response is spark_success
-    mock_prepare_antigravity.assert_awaited_once()
-    assert mock_prepare_antigravity.await_args.kwargs["adapter_model"] == (
-        "claude-sonnet-4-6"
-    )
-    assert mock_prepare_antigravity.await_args.kwargs["adapter_provider"] == (
-        "antigravity"
-    )
-    mock_spark.assert_awaited_once()
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    assert metadata["anthropic_auto_agent_selected_route_family"] == (
-        "anthropic_openai_responses_adapter"
-    )
-    first_attempt = metadata["anthropic_auto_agent_attempts"][0]
-    assert first_attempt["provider"] == "antigravity"
-    assert first_attempt["model"] == "claude-sonnet-4-6"
-    assert first_attempt["status"] == "cooldown_set"
-    assert first_attempt["cooldown_scope"] == "candidate"
-    assert first_attempt["error_class"] == "candidate_unavailable"
-    assert (
-        "aawm_codex_auto_agent_candidate_unavailable"
-        in first_attempt["error_tokens"]
-    )
-    skipped = metadata["anthropic_auto_agent_skipped_candidates"][0]
-    assert skipped["provider"] == "antigravity"
-    assert skipped["model"] == "claude-sonnet-4-6"
-    assert skipped["lane_key"] == "antigravity-lane"
-
-
-@pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_falls_back_after_antigravity_silent_auth_refresh_no_token(
-    monkeypatch,
-):
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
-    antigravity_auth_error = HTTPException(
-        status_code=500,
-        detail="AGY CLI silent auth refresh did not produce a valid token.",
-    )
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_google_completion_adapter_request",
-        new=AsyncMock(side_effect=antigravity_auth_error),
-    ) as mock_prepare_antigravity, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
-    ) as mock_spark:
-        response = await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
-        )
-
-    assert response is spark_success
-    mock_prepare_antigravity.assert_awaited_once()
-    mock_spark.assert_awaited_once()
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    first_attempt = metadata["anthropic_auto_agent_attempts"][0]
-    assert first_attempt["provider"] == "antigravity"
-    assert first_attempt["status"] == "cooldown_set"
-    assert first_attempt["cooldown_scope"] == "candidate"
-    assert first_attempt["error_class"] == "candidate_unavailable"
-    assert (
-        "aawm_codex_auto_agent_candidate_unavailable"
-        in first_attempt["error_tokens"]
-    )
-    skipped = metadata["anthropic_auto_agent_skipped_candidates"][0]
-    assert skipped["provider"] == "antigravity"
-    assert skipped["model"] == "claude-sonnet-4-6"
-    assert skipped["lane_key"] == "antigravity-lane"
-
-
-@pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_falls_back_after_capacity_text(
-    monkeypatch,
-):
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
-    antigravity_error = RuntimeError(
-        "Selected model is at capacity. Please try a different model."
-    )
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ) as mock_antigravity, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(return_value=spark_success),
-    ) as mock_spark:
-        response = await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
-        )
-
-    assert response is spark_success
-    mock_antigravity.assert_awaited_once()
-    mock_spark.assert_awaited_once()
-    spark_body = mock_spark.await_args.kwargs["prepared_request_body"]
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["anthropic_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    attempt = metadata["anthropic_auto_agent_attempts"][0]
-    assert attempt["provider"] == "antigravity"
-    assert attempt["model"] == "claude-sonnet-4-6"
-    assert attempt["status"] == "cooldown_set"
-    assert attempt["cooldown_scope"] == "candidate"
-    assert attempt["error_class"] == "capacity_exhausted"
-    assert "MODEL_AT_CAPACITY" in attempt["error_tokens"]
 
 
 @pytest.mark.asyncio
@@ -18992,18 +18815,6 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
-    antigravity_error = ProxyException(
-        message="antigravity unavailable",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    antigravity_error.detail = {
-        "error": {
-            "message": "Antigravity credential unavailable",
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
     spark_error = ProxyException(
         message="spark usage limit",
         type="rate_limit_error",
@@ -19033,12 +18844,6 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
     )
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
         new=AsyncMock(side_effect=spark_error),
     ), patch(
@@ -19075,12 +18880,11 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
     assert [
         attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]
     ] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
-    assert metadata["anthropic_auto_agent_attempts"][2]["status"] == "cooldown_set"
+    assert metadata["anthropic_auto_agent_attempts"][1]["status"] == "cooldown_set"
 
 
 @pytest.mark.asyncio
@@ -19090,16 +18894,9 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
-    await _set_anthropic_auto_agent_cooldown(
-        "antigravity:gemini-3.5-flash-low:antigravity-lane",
-        60.0,
-    )
     success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
         return_value=None,
     ) as mock_openrouter_key, patch(
@@ -19183,17 +18980,10 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
-    await _set_anthropic_auto_agent_cooldown(
-        "antigravity:gemini-3.5-flash-low:antigravity-lane",
-        60.0,
-    )
     free_usage_error = _build_opencode_zen_free_usage_limit_error()
     success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
         return_value=None,
     ) as mock_openrouter_key, patch(
@@ -19339,16 +19129,9 @@ async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrout
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
-    await _set_anthropic_auto_agent_cooldown(
-        "antigravity:gemini-3.5-flash-low:antigravity-lane",
-        60.0,
-    )
     success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
         new=AsyncMock(return_value=success),
     ) as mock_openrouter_completion, patch(
@@ -19388,57 +19171,26 @@ async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrout
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_low_routes_gemini_through_antigravity_completion_adapter(
+async def test_anthropic_auto_agent_alias_low_does_not_resolve_antigravity_lane(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-low-anthropic"
-    success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
-        new=AsyncMock(return_value=success),
-    ) as mock_antigravity, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
-        new=AsyncMock(),
-    ) as mock_openrouter, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_opencode_zen_adapter_route",
-        new=AsyncMock(),
-    ) as mock_opencode:
-        response = await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
+        new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+    ) as mock_antigravity_lane:
+        selection = await _select_anthropic_auto_agent_candidate(
             request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
+            request_body=body,
         )
 
-    assert response is success
-    mock_antigravity.assert_awaited_once()
-    assert mock_antigravity.await_args.kwargs["adapter_provider"] == (
-        "antigravity"
-    )
-    assert mock_antigravity.await_args.kwargs["adapter_model"] == (
-        "gemini-3.5-flash-low"
-    )
-    assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
-    mock_openrouter.assert_not_awaited()
-    mock_opencode.assert_not_awaited()
-    candidate_body = mock_antigravity.await_args.kwargs["prepared_request_body"]
-    assert candidate_body["model"] == "gemini-3.5-flash-low"
-    assert candidate_body["litellm_metadata"]["requested_model_alias"] == (
-        "aawm-low-anthropic"
-    )
-    assert (
-        candidate_body["litellm_metadata"]["anthropic_auto_agent_selected_route_family"]
-        == "anthropic_antigravity_completion_adapter"
-    )
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
+    assert selection["skipped"] == []
+    mock_antigravity_lane.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -20913,34 +20665,30 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_through_from_antigravity_to_spark():
+async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_composer():
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-code",
         "litellm_metadata": {"session_id": "codex-session"},
     }
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
-        new=AsyncMock(return_value="google-lane"),
-    ):
-        selection = await _select_codex_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
-        await _set_codex_auto_agent_cooldown(selection["cooldown_key"], 60.0)
-        fallback_selection = await _select_codex_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
+    selection = await _select_codex_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+    await _set_codex_auto_agent_cooldown(selection["cooldown_key"], 60.0)
+    fallback_selection = await _select_codex_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
 
-    assert selection["candidate"]["provider"] == "antigravity"
-    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
-    assert fallback_selection["candidate"]["provider"] == "openai"
-    assert fallback_selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert fallback_selection["candidate"]["provider"] == "xai"
+    assert fallback_selection["candidate"]["model"] == "grok-composer-2.5-fast"
     assert fallback_selection["selection_reason"] == "first_available"
-    assert fallback_selection["skipped"][0]["provider"] == "antigravity"
-    assert fallback_selection["skipped"][0]["model"] == "claude-sonnet-4-6"
+    assert fallback_selection["skipped"][0]["provider"] == "openai"
+    assert fallback_selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
 
 
 @pytest.mark.asyncio
@@ -20951,12 +20699,6 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
         "litellm_metadata": {"session_id": "codex-session"},
     }
     expected_candidates = [
-        (
-            "antigravity",
-            "claude-sonnet-4-6",
-            "codex_antigravity_code_assist_adapter",
-            False,
-        ),
         ("openai", "gpt-5.3-codex-spark", "codex_responses", False),
         (
             "xai",
@@ -20968,32 +20710,28 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
         ("openai", "gpt-5.5", "codex_responses", True),
     ]
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
+    for index, (provider, model, route_family, last_resort) in enumerate(
+        expected_candidates
     ):
-        for index, (provider, model, route_family, last_resort) in enumerate(
-            expected_candidates
-        ):
-            selection = await _select_codex_auto_agent_candidate(
-                request=request,
-                request_body=body,
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        candidate = selection["candidate"]
+        assert candidate["provider"] == provider
+        assert candidate["model"] == model
+        assert candidate["route_family"] == route_family
+        assert candidate["last_resort"] is last_resort
+        if last_resort:
+            assert selection["selection_reason"] == "last_resort"
+            assert candidate["default_reasoning_effort"] == "medium"
+        else:
+            assert selection["selection_reason"] == "first_available"
+        if index < len(expected_candidates) - 1:
+            await _set_codex_auto_agent_cooldown(
+                selection["cooldown_key"],
+                60.0,
             )
-            candidate = selection["candidate"]
-            assert candidate["provider"] == provider
-            assert candidate["model"] == model
-            assert candidate["route_family"] == route_family
-            assert candidate["last_resort"] is last_resort
-            if last_resort:
-                assert selection["selection_reason"] == "last_resort"
-                assert candidate["default_reasoning_effort"] == "medium"
-            else:
-                assert selection["selection_reason"] == "first_available"
-            if index < len(expected_candidates) - 1:
-                await _set_codex_auto_agent_cooldown(
-                    selection["cooldown_key"],
-                    60.0,
-                )
 
 
 @pytest.mark.asyncio
@@ -21194,8 +20932,8 @@ async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55()
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
+        new=AsyncMock(),
+    ) as mock_antigravity_lane, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(return_value=success),
     ) as mock_pass_through:
@@ -21211,6 +20949,7 @@ async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55()
         )
 
     assert response is success
+    mock_antigravity_lane.assert_not_called()
     mock_pass_through.assert_awaited_once()
     candidate_body = mock_pass_through.await_args.kwargs["custom_body"]
     assert candidate_body["model"] == "gpt-5.5"
@@ -21235,17 +20974,17 @@ async def test_codex_auto_agent_alias_low_uses_default_low_candidates(
         request_body=body,
     )
 
-    assert selection["candidate"]["provider"] == "antigravity"
-    assert selection["candidate"]["model"] == "gemini-3.5-flash-low"
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
     assert selection["candidate"]["route_family"] == (
-        "codex_antigravity_code_assist_adapter"
+        "codex_openrouter_completion_adapter"
     )
     candidates = _get_codex_auto_agent_candidates_for_alias("aawm-low")
     candidate_models = [candidate["model"] for candidate in candidates]
     assert candidate_models[:3] == [
-        "gemini-3.5-flash-low",
         "openrouter/cohere/north-mini-code:free",
         "openrouter/owl-alpha",
+        "deepseek-v4-flash",
     ]
 
 
@@ -21259,12 +20998,6 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
         "litellm_metadata": {"session_id": "codex-session"},
     }
     expected_candidates = [
-        (
-            "antigravity",
-            "gemini-3.5-flash-low",
-            "codex_antigravity_code_assist_adapter",
-            False,
-        ),
         (
             "openrouter",
             "openrouter/cohere/north-mini-code:free",
@@ -21292,38 +21025,31 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
         ("openai", "gpt-5.4-mini", "codex_responses", True),
     ]
 
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
-        new=AsyncMock(return_value="google-lane"),
+    for index, (provider, model, route_family, last_resort) in enumerate(
+        expected_candidates
     ):
-        for index, (provider, model, route_family, last_resort) in enumerate(
-            expected_candidates
-        ):
-            selection = await _select_codex_auto_agent_candidate(
-                request=request,
-                request_body=body,
-            )
-            candidate = selection["candidate"]
-            assert candidate["provider"] == provider
-            assert candidate["model"] == model
-            assert candidate["route_family"] == route_family
-            assert candidate["last_resort"] is last_resort
-            if last_resort:
-                assert selection["selection_reason"] == "last_resort"
-            else:
-                assert selection["selection_reason"] == "first_available"
-            if index < len(expected_candidates) - 1:
-                await _set_codex_auto_agent_cooldown(
-                    selection["cooldown_key"],
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        candidate = selection["candidate"]
+        assert candidate["provider"] == provider
+        assert candidate["model"] == model
+        assert candidate["route_family"] == route_family
+        assert candidate["last_resort"] is last_resort
+        if last_resort:
+            assert selection["selection_reason"] == "last_resort"
+        else:
+            assert selection["selection_reason"] == "first_available"
+        if index < len(expected_candidates) - 1:
+            await _set_codex_auto_agent_cooldown(
+                selection["cooldown_key"],
                 60.0,
             )
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_order_unchanged_with_low_defaults(
+async def test_codex_auto_agent_alias_code_order_omits_antigravity(
 ):
     request = _build_codex_auto_agent_request()
     body = {
@@ -21336,14 +21062,13 @@ async def test_codex_auto_agent_alias_code_order_unchanged_with_low_defaults(
         request_body=body,
     )
 
-    assert selection["candidate"]["provider"] == "antigravity"
-    assert selection["candidate"]["model"] == "claude-sonnet-4-6"
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
     assert selection["candidate"]["route_family"] == (
-        "codex_antigravity_code_assist_adapter"
+        "codex_responses"
     )
     candidates = _get_codex_auto_agent_candidates_for_alias("aawm-code")
     assert [candidate["model"] for candidate in candidates] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
@@ -21427,7 +21152,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_back_to_spark_after_antigravity_429(
+async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_429(
     monkeypatch,
 ):
     request = _build_codex_auto_agent_request()
@@ -21437,62 +21162,60 @@ async def test_codex_auto_agent_alias_code_falls_back_to_spark_after_antigravity
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    antigravity_error = ProxyException(
-        message="antigravity quota exhausted",
+    spark_error = ProxyException(
+        message="spark quota exhausted",
         type="rate_limit_error",
         param="model",
         code=429,
     )
-    antigravity_error.detail = {
+    spark_error.detail = {
         "error": {
-            "message": "RESOURCE_EXHAUSTED",
+            "message": "usage_limit_reached",
             "code": 429,
             "status": "RESOURCE_EXHAUSTED",
         }
     }
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
+    composer_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ) as mock_antigravity, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(return_value=spark_success),
+        new=AsyncMock(side_effect=spark_error),
     ) as mock_pass_through:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+            new=AsyncMock(return_value=composer_success),
+        ) as mock_composer:
+            response = await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
 
-    assert response is spark_success
-    mock_antigravity.assert_awaited_once()
+    assert response is composer_success
     mock_pass_through.assert_awaited_once()
-    assert mock_antigravity.await_args.kwargs["adapter_provider"] == "antigravity"
-    assert mock_antigravity.await_args.kwargs["adapter_model"] == "claude-sonnet-4-6"
-    assert mock_antigravity.await_args.kwargs["use_alias_candidate_probe"] is True
-    spark_body = mock_pass_through.await_args.kwargs["custom_body"]
-    metadata = spark_body["litellm_metadata"]
+    mock_composer.assert_awaited_once()
+    assert mock_composer.await_args.kwargs["request_body"]["model"] == (
+        "grok-composer-2.5-fast"
+    )
+    composer_body = mock_composer.await_args.kwargs["request_body"]
+    metadata = composer_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code"
     assert metadata["codex_auto_agent_alias"] == "aawm-code"
-    assert metadata["codex_auto_agent_selected_provider"] == "openai"
-    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    assert metadata["codex_auto_agent_selected_route_family"] == "codex_responses"
-    assert metadata["codex_auto_agent_attempts"][0]["status"] == "cooldown_set"
-    assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == (
-        "antigravity"
+    assert metadata["codex_auto_agent_selected_provider"] == "xai"
+    assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["codex_auto_agent_selected_route_family"] == (
+        "codex_grok_native_responses_adapter"
     )
+    assert metadata["codex_auto_agent_attempts"][0]["status"] == "cooldown_set"
+    assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == "openai"
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
     ]
     audit_events = metadata["aawm_alias_routing_audit_events"]
     retryable_index = next(
@@ -21507,12 +21230,12 @@ async def test_codex_auto_agent_alias_code_falls_back_to_spark_after_antigravity
     )
     assert retryable_index < selected_index
     retryable_event = audit_events[retryable_index]
-    assert retryable_event["provider"] == "antigravity"
-    assert retryable_event["model"] == "claude-sonnet-4-6"
+    assert retryable_event["provider"] == "openai"
+    assert retryable_event["model"] == "gpt-5.3-codex-spark"
     assert retryable_event["failure_class"]
     selected_event = audit_events[selected_index]
-    assert selected_event["provider"] == "openai"
-    assert selected_event["model"] == "gpt-5.3-codex-spark"
+    assert selected_event["provider"] == "xai"
+    assert selected_event["model"] == "grok-composer-2.5-fast"
 
 
 @pytest.mark.parametrize(
@@ -21654,8 +21377,8 @@ def test_auto_agent_alias_route_event_suppresses_healthy_selection(monkeypatch):
             "event_type": "candidate_selected",
             "candidate_status": "selected",
             "selection_reason": "session_affinity",
-            "provider": "antigravity",
-            "model": "gemini-3.5-flash-low",
+            "provider": "openrouter",
+            "model": "openrouter/cohere/north-mini-code:free",
         }
     )
 
@@ -21685,8 +21408,8 @@ def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
             "candidate_status": "cooldown_set",
             "failure_class": "rate_limited",
             "alias_model": "aawm-low",
-            "provider": "antigravity",
-            "model": "gemini-3.5-flash-low",
+            "provider": "openrouter",
+            "model": "openrouter/cohere/north-mini-code:free",
         },
         level="warning",
     )
@@ -21696,7 +21419,7 @@ def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
     assert route_status == [
         {
             "alias_model": "aawm-low",
-            "model_label": "gemini-3.5-flash-low",
+            "model_label": "openrouter/cohere/north-mini-code:free",
             "status": "Cooling Down",
             "message": (
                 "failure_class=rate_limited; candidate_status=cooldown_set"
@@ -21913,9 +21636,6 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         "tool_choice": {"type": "custom", "name": "exec_command"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    antigravity_error = RuntimeError(
-        "We're currently experiencing high demand, which may cause temporary errors."
-    )
     spark_error = RuntimeError(
         "Selected model is at capacity. Please try a different model."
     )
@@ -21925,18 +21645,18 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         os.environ,
         {"GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL": "https://api.x.ai/v1"},
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ) as mock_antigravity, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[spark_error, grok_success]),
     ) as mock_pass_through, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
         new=AsyncMock(return_value="grok-oidc-token"),
-    ):
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+    ) as mock_antigravity_lane, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(),
+    ) as mock_antigravity:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -21949,7 +21669,8 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         )
 
     assert response is grok_success
-    mock_antigravity.assert_awaited_once()
+    mock_antigravity.assert_not_awaited()
+    mock_antigravity_lane.assert_not_called()
     assert mock_pass_through.await_count == 2
     grok_call = mock_pass_through.await_args_list[1].kwargs
     assert grok_call["target"] == "https://api.x.ai/v1/responses"
@@ -21972,16 +21693,10 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         "name": "exec_command",
     }
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
         "grok-composer-2.5-fast",
     ]
-    antigravity_attempt = metadata["codex_auto_agent_attempts"][0]
-    assert antigravity_attempt["status"] == "cooldown_set"
-    assert antigravity_attempt["cooldown_scope"] == "candidate"
-    assert antigravity_attempt["error_class"] == "capacity_exhausted"
-    assert "HIGH_DEMAND" in antigravity_attempt["error_tokens"]
-    spark_attempt = metadata["codex_auto_agent_attempts"][1]
+    spark_attempt = metadata["codex_auto_agent_attempts"][0]
     assert spark_attempt["status"] == "cooldown_set"
     assert spark_attempt["cooldown_scope"] == "candidate"
     assert spark_attempt["error_class"] == "capacity_exhausted"
@@ -21990,7 +21705,6 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
     }
-    assert "claude-sonnet-4-6" in skipped_models
     assert "gpt-5.3-codex-spark" in skipped_models
     audit_events = metadata["aawm_alias_routing_audit_events"]
     progression_events = [
@@ -22000,19 +21714,17 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         in {"candidate_retryable_failure", "candidate_selected"}
     ]
     assert [event["model"] for event in progression_events] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
         "grok-composer-2.5-fast",
     ]
     assert [event["event_type"] for event in progression_events] == [
-        "candidate_retryable_failure",
         "candidate_retryable_failure",
         "candidate_selected",
     ]
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_invalid_client(
+async def test_codex_auto_agent_alias_code_does_not_load_antigravity_auth(
     monkeypatch,
 ):
     request = _build_codex_auto_agent_request()
@@ -22022,21 +21734,14 @@ async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_invalid_
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    antigravity_refresh_error = HTTPException(
-        status_code=500,
-        detail=(
-            "Failed to refresh Antigravity OAuth access token: "
-            '{"error":"invalid_client"}'
-        ),
-    )
     spark_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
+        new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+    ) as mock_antigravity_lane, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
-        new=AsyncMock(side_effect=antigravity_refresh_error),
+        new=AsyncMock(side_effect=AssertionError("Antigravity auth must not load")),
     ) as mock_load_antigravity, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(return_value=spark_success),
@@ -22053,76 +21758,39 @@ async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_invalid_
         )
 
     assert response is spark_success
-    mock_load_antigravity.assert_awaited_once()
+    mock_antigravity_lane.assert_not_called()
+    mock_load_antigravity.assert_not_called()
     mock_pass_through.assert_awaited_once()
     spark_body = mock_pass_through.await_args.kwargs["custom_body"]
     metadata = spark_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    assert metadata["codex_auto_agent_attempts"][0]["provider"] == "antigravity"
-    assert metadata["codex_auto_agent_attempts"][0]["status"] == "cooldown_set"
-    assert (
-        "aawm_codex_auto_agent_candidate_unavailable"
-        in metadata["codex_auto_agent_attempts"][0]["error_tokens"]
-    )
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_back_after_antigravity_silent_auth_refresh_no_token(
+async def test_codex_auto_agent_alias_low_does_not_resolve_antigravity_lane(
     monkeypatch,
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
-        "input": "hello",
-        "stream": False,
+        "model": "aawm-low",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    antigravity_refresh_error = HTTPException(
-        status_code=500,
-        detail="AGY CLI silent auth refresh did not produce a valid token.",
-    )
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
-        new=AsyncMock(side_effect=antigravity_refresh_error),
-    ) as mock_load_antigravity, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(return_value=spark_success),
-    ) as mock_pass_through:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
+        new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+    ) as mock_antigravity_lane:
+        selection = await _select_codex_auto_agent_candidate(
             request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
+            request_body=body,
         )
 
-    assert response is spark_success
-    mock_load_antigravity.assert_awaited_once()
-    mock_pass_through.assert_awaited_once()
-    spark_body = mock_pass_through.await_args.kwargs["custom_body"]
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code"
-    assert metadata["codex_auto_agent_selected_provider"] == "openai"
-    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    first_attempt = metadata["codex_auto_agent_attempts"][0]
-    assert first_attempt["provider"] == "antigravity"
-    assert first_attempt["status"] == "cooldown_set"
-    assert first_attempt["cooldown_scope"] == "candidate"
-    assert first_attempt["error_class"] == "candidate_unavailable"
-    assert (
-        "aawm_codex_auto_agent_candidate_unavailable"
-        in first_attempt["error_tokens"]
-    )
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
+    assert selection["skipped"] == []
+    mock_antigravity_lane.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -22146,18 +21814,6 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
         "tool_choice": {"type": "custom", "name": "exec_command"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    antigravity_error = ProxyException(
-        message="antigravity unavailable",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    antigravity_error.detail = {
-        "error": {
-            "message": "Antigravity credential unavailable",
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
     spark_error = ProxyException(
         message="spark usage limit",
         type="rate_limit_error",
@@ -22180,12 +21836,6 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
     )
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
-        new=AsyncMock(side_effect=antigravity_error),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[spark_error, managed_xai_success]),
     ) as mock_pass_through, patch(
@@ -22194,7 +21844,13 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
     ) as mock_grok_token, patch(
         "litellm.llms.xai.oauth.get_xai_oauth_access_token",
         new=AsyncMock(return_value="xai-oauth-token"),
-    ) as mock_xai_token:
+    ) as mock_xai_token, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+    ) as mock_antigravity_lane, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
+        new=AsyncMock(),
+    ) as mock_antigravity:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -22208,6 +21864,8 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
 
     assert response is managed_xai_success
     assert mock_pass_through.await_count == 2
+    mock_antigravity.assert_not_awaited()
+    mock_antigravity_lane.assert_not_called()
     mock_grok_token.assert_awaited_once()
     mock_xai_token.assert_awaited_once()
     managed_call = mock_pass_through.await_args_list[1].kwargs
@@ -22241,20 +21899,18 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
         "name": "exec_command",
     }
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
-        "claude-sonnet-4-6",
         "gpt-5.3-codex-spark",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
     assert [attempt["provider"] for attempt in metadata["codex_auto_agent_attempts"]] == [
-        "antigravity",
         "openai",
         "xai",
         "xai",
     ]
     assert (
         "aawm_codex_auto_agent_candidate_unavailable"
-        in metadata["codex_auto_agent_attempts"][2]["error_tokens"]
+        in metadata["codex_auto_agent_attempts"][1]["error_tokens"]
     )
 
 
@@ -22269,16 +21925,9 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    await _set_codex_auto_agent_cooldown(
-        "antigravity:gemini-3.5-flash-low:antigravity-lane",
-        60.0,
-    )
     mini_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_api_key",
         return_value=None,
     ) as mock_openrouter_key, patch(
@@ -22485,10 +22134,6 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
     }
     mini_success = Response(content='{"ok": true}', media_type="application/json")
     await _set_codex_auto_agent_cooldown(
-        "antigravity:gemini-3.5-flash-low:antigravity-lane",
-        60.0,
-    )
-    await _set_codex_auto_agent_cooldown(
         "openrouter:openrouter/cohere/north-mini-code:free:openrouter",
         60.0,
     )
@@ -22498,9 +22143,6 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
     )
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
         new=AsyncMock(return_value="opencode-test-key"),
     ) as mock_load_opencode_key, patch(
@@ -22545,7 +22187,6 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
     }
-    assert "gemini-3.5-flash-low" in skipped_models
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
@@ -23005,10 +22646,6 @@ async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    await _set_codex_auto_agent_cooldown(
-        "antigravity:gemini-3.5-flash-low:antigravity-lane",
-        60.0,
-    )
     raw_provider_error = ProxyException(
         message="Provider returned error",
         type="bad_request_error",
@@ -23029,9 +22666,6 @@ async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_
     owl_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
         new=AsyncMock(side_effect=[raw_provider_error, owl_success]),
     ) as mock_openrouter:
@@ -23066,7 +22700,6 @@ async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
     }
-    assert "gemini-3.5-flash-low" in skipped_models
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
 
 
@@ -23227,10 +22860,6 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    await _set_codex_auto_agent_cooldown(
-        "antigravity:gemini-3.5-flash-low:antigravity-lane",
-        60.0,
-    )
     for cooldown_key in cooldown_keys:
         await _set_codex_auto_agent_cooldown(cooldown_key, 60.0)
     success = {
@@ -23254,9 +22883,6 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
         return await operation()
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
-        new=AsyncMock(return_value="antigravity-lane"),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
         new=AsyncMock(side_effect=fake_openrouter_completion_operation),
     ) as mock_openrouter, patch(
@@ -23301,7 +22927,7 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_low_skips_antigravity_when_sidecar_token_stale(
+async def test_codex_auto_agent_alias_low_ignores_stale_antigravity_sidecar_token(
     monkeypatch,
 ):
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
@@ -23330,7 +22956,9 @@ async def test_codex_auto_agent_alias_low_skips_antigravity_when_sidecar_token_s
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
         new=AsyncMock(side_effect=stale_token_error),
-    ), patch.object(endpoints.verbose_proxy_logger, "warning", warning_mock):
+    ) as mock_load_antigravity, patch.object(
+        endpoints.verbose_proxy_logger, "warning", warning_mock
+    ):
         selection = await _select_codex_auto_agent_candidate(
             request=request,
             request_body=body,
@@ -23338,21 +22966,14 @@ async def test_codex_auto_agent_alias_low_skips_antigravity_when_sidecar_token_s
 
     assert selection["candidate"]["provider"] == "openrouter"
     assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
-    skipped = selection["skipped"][0]
-    assert skipped["provider"] == "antigravity"
-    assert skipped["model"] == "gemini-3.5-flash-low"
-    assert skipped["reason"] == "auth_degraded"
-    assert skipped["lane_key"] == "antigravity:auth_degraded"
-    assert skipped["cooldown_seconds"] == 300.0
-    assert skipped["failure_phase"] == "auth"
-    assert skipped["attempted_provider_call"] is False
+    assert selection["skipped"] == []
     assert selection["cooldown_state_source"] == "local_fallback"
-    warning_mock.assert_called_once()
-    assert warning_mock.call_args.kwargs.get("exc_info") is None
+    mock_load_antigravity.assert_not_called()
+    warning_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_skips_antigravity_when_sidecar_token_stale(
+async def test_anthropic_auto_agent_alias_code_ignores_stale_antigravity_sidecar_token(
     monkeypatch,
 ):
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
@@ -23378,7 +22999,9 @@ async def test_anthropic_auto_agent_alias_code_skips_antigravity_when_sidecar_to
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
         new=AsyncMock(side_effect=stale_token_error),
-    ), patch.object(endpoints.verbose_proxy_logger, "warning"):
+    ) as mock_load_antigravity, patch.object(
+        endpoints.verbose_proxy_logger, "warning"
+    ) as warning_mock:
         selection = await _select_anthropic_auto_agent_candidate(
             request=request,
             request_body=body,
@@ -23386,13 +23009,9 @@ async def test_anthropic_auto_agent_alias_code_skips_antigravity_when_sidecar_to
 
     assert selection["candidate"]["provider"] == "openai"
     assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
-    skipped = selection["skipped"][0]
-    assert skipped["provider"] == "antigravity"
-    assert skipped["model"] == "claude-sonnet-4-6"
-    assert skipped["reason"] == "auth_degraded"
-    assert skipped["lane_key"] == "antigravity:auth_degraded"
-    assert skipped["cooldown_seconds"] == 300.0
-    assert skipped["attempted_provider_call"] is False
+    assert selection["skipped"] == []
+    mock_load_antigravity.assert_not_called()
+    warning_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -30287,9 +29906,9 @@ async def test_aawm_alias_routing_durable_anthropic_affinity_recovers_after_memo
     dual_cache = _FakeAawmAliasRoutingDualCache()
     session_key = "aawm-code-anthropic:claude-session:session:claude-session"
     candidate = {
-        "provider": "antigravity",
-        "model": "claude-sonnet-4-6",
-        "route_family": "anthropic_antigravity_completion_adapter",
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
         "last_resort": False,
     }
     with patch(
@@ -30301,8 +29920,8 @@ async def test_aawm_alias_routing_durable_anthropic_affinity_recovers_after_memo
         recovered = await _get_anthropic_auto_agent_session_affinity(session_key)
 
     assert recovered is not None
-    assert recovered["provider"] == "antigravity"
-    assert recovered["model"] == "claude-sonnet-4-6"
+    assert recovered["provider"] == "openai"
+    assert recovered["model"] == "gpt-5.3-codex-spark"
     assert recovered["affinity_state_source"] == "durable_cache"
 
 
@@ -30311,9 +29930,9 @@ async def test_aawm_alias_routing_durable_affinity_payload_is_sanitized():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     session_key = "aawm-code-anthropic:claude-session:session:claude-session"
     candidate = {
-        "provider": "antigravity",
-        "model": "claude-sonnet-4-6",
-        "route_family": "anthropic_antigravity_completion_adapter",
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
         "last_resort": False,
     }
     with patch(
@@ -30331,11 +29950,106 @@ async def test_aawm_alias_routing_durable_affinity_payload_is_sanitized():
         "last_resort",
         "expires_at_epoch",
     }
-    assert payload["provider"] == "antigravity"
-    assert payload["model"] == "claude-sonnet-4-6"
-    assert payload["route_family"] == "anthropic_antigravity_completion_adapter"
+    assert payload["provider"] == "openai"
+    assert payload["model"] == "gpt-5.3-codex-spark"
+    assert payload["route_family"] == "anthropic_openai_responses_adapter"
     assert payload["last_resort"] is False
     assert isinstance(payload["expires_at_epoch"], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_aawm_code_alias_ignores_stale_antigravity_durable_affinity():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    stale_candidate = {
+        "provider": "antigravity",
+        "model": "claude-sonnet-4-6",
+        "route_family": "codex_antigravity_code_assist_adapter",
+        "last_resort": False,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_session_affinity(
+            "aawm-code:codex-session:session:codex-session",
+            stale_candidate,
+        )
+        _codex_auto_agent_session_affinity_by_key.clear()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+            new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+        ) as mock_antigravity_lane:
+            selection = await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "first_available"
+    mock_antigravity_lane.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aawm_code_anthropic_alias_ignores_stale_antigravity_durable_affinity():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    stale_candidate = {
+        "provider": "antigravity",
+        "model": "claude-sonnet-4-6",
+        "route_family": "anthropic_antigravity_completion_adapter",
+        "last_resort": False,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_anthropic_auto_agent_session_affinity(
+            "aawm-code-anthropic:claude-session:session:claude-session",
+            stale_candidate,
+        )
+        _anthropic_auto_agent_session_affinity_by_key.clear()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+            new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+        ) as mock_antigravity_lane:
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "first_available"
+    mock_antigravity_lane.assert_not_called()
 
 
 @pytest.mark.asyncio

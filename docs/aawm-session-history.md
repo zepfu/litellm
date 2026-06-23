@@ -193,7 +193,7 @@ For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the
 next configured usable candidate. For tool-bearing or stateful
 `aawm-code-anthropic` requests, every declared candidate route is treated as a
-Claude Code tool-contract route: if the alias declares Antigravity, OpenAI, xAI,
+Claude Code tool-contract route: if the alias declares OpenAI, xAI,
 native Anthropic, or another provider/model target, that target must preserve
 tool calls, tool-use ids, tool arguments, tool-result replay, and ordered
 failover metadata for engineering-agent traffic. A declared candidate must not
@@ -220,35 +220,46 @@ fields must not be treated as canonical provider token or cost truth for
 `session_history`; canonical token and cost columns continue to come from the
 normal upstream usage and cost calculation path.
 
-## Low Alias Candidates (D1-322)
+## AAWM Alias Candidate Orders (D1-363)
 
-`aawm-low` and `aawm-low-anthropic` now prepend the default low-alias
-candidates in this order:
+`aawm-low`, `aawm-low-anthropic`, `aawm-code`, and `aawm-code-anthropic` do
+not prepend or select Antigravity-backed candidates during normal alias
+selection. These aliases follow their declared non-Antigravity failover order
+below. Direct explicit Antigravity routes remain available separately and are
+documented in the Antigravity OAuth Credentials section.
 
-1. Antigravity `gemini-3.5-flash-low`
-2. OpenRouter North Mini (`openrouter/cohere/north-mini-code:free`)
-3. OpenRouter Owl Alpha (`openrouter/owl-alpha`)
-4. the existing configured candidates
+`aawm-low` and `aawm-low-anthropic` use this order:
 
-This is default low-alias behavior; no staging environment variable is required
-for dev or production routing.
+1. OpenRouter North Mini (`openrouter/cohere/north-mini-code:free`)
+2. OpenRouter Owl Alpha (`openrouter/owl-alpha`)
+3. OpenCode Zen `deepseek-v4-flash`
+4. OpenCode Zen `big-pickle`
+5. `gpt-5.4-mini` as the OpenAI last-resort candidate for `aawm-low`
+6. native Anthropic Haiku as the last-resort candidate for `aawm-low-anthropic`
+
+`aawm-code` uses this order:
+
+1. `gpt-5.3-codex-spark`
+2. `grok-composer-2.5-fast`
+3. `oa_xai/grok-build`
+4. `gpt-5.5` as the OpenAI last-resort candidate with medium reasoning
+
+`aawm-code-anthropic` uses this order:
+
+1. `gpt-5.3-codex-spark`
+2. `grok-composer-2.5-fast`
+3. `oa_xai/grok-build`
+4. native Anthropic `claude-sonnet-4-6` as the last-resort candidate
+
+This is default alias behavior; no staging environment variable is required for
+dev or production routing.
 
 Alias-visible metadata (for example, route audit fields and session-history
 model keys) must keep the provider-prefixed names (`openrouter/...`) so
 operators can distinguish the declared OpenRouter candidates. The OpenRouter
 completion adapter must continue to send the provider-stripped model slug
 upstream (`cohere/north-mini-code:free`, `owl-alpha`) to match OpenRouter
-ingress expectations. Antigravity `gemini-3.5-flash-low` keeps the plain model
-slug and routes through the Antigravity completion adapters.
-
-Antigravity Gemini Code Assist candidates, including
-`gemini-3.5-flash-low`, are quota-backed Antigravity traffic rather than public
-Gemini API spend. Gemini passthrough logging must still preserve native usage
-metadata and Antigravity route/quota identity for those responses, while cost
-attribution uses the public Gemini model pricing key. For example,
-`gemini-3.5-flash-low` keeps the logged model/provider identity but looks up
-cost using public `gemini-3.5-flash` rates so `session_history.response_cost_usd`
-reflects token usage instead of being forced to zero.
+ingress expectations.
 
 The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate,
 not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejects the
