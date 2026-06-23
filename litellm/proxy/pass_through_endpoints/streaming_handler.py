@@ -1,4 +1,6 @@
 import asyncio
+import codecs
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -39,7 +41,49 @@ from .llm_provider_handlers.vertex_passthrough_logging_handler import (
 from .success_handler import PassThroughEndpointLogging
 
 
+
+
+def _truthy_env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+class _PassThroughStreamLineAccumulator:
+    """Incrementally decode raw stream bytes into non-empty SSE/log lines."""
+
+    __slots__ = ("_decoder", "_pending", "lines")
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+        self._pending = ""
+        self.lines: List[str] = []
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._pending += self._decoder.decode(chunk)
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            stripped = line.strip()
+            if stripped:
+                self.lines.append(stripped)
+
+    def finish(self) -> List[str]:
+        tail = self._decoder.decode(b"", final=True)
+        if tail:
+            self._pending += tail
+        stripped = self._pending.strip()
+        if stripped:
+            self.lines.append(stripped)
+        self._pending = ""
+        return self.lines
+
+
 class PassThroughStreamingHandler:
+    _AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV = "AAWM_STREAM_SUMMARY_FIRST_FINALIZE"
+
     _ANTHROPIC_RATE_LIMIT_HEADER_PREFIXES = (
         "anthropic-ratelimit-",
         "x-ratelimit-",
@@ -485,7 +529,7 @@ class PassThroughStreamingHandler:
         )
 
     @staticmethod
-    async def chunk_processor(
+    async def chunk_processor(  # noqa: PLR0915
         response: httpx.Response,
         request_body: Optional[dict],
         litellm_logging_obj: LiteLLMLoggingObj,
@@ -508,6 +552,13 @@ class PassThroughStreamingHandler:
         """
         try:
             raw_bytes: List[bytes] = []
+            line_accumulator: Optional[_PassThroughStreamLineAccumulator] = None
+            if PassThroughStreamingHandler._stream_summary_first_finalize_eligible(
+                endpoint_type=endpoint_type,
+                url_route=url_route,
+                custom_llm_provider=custom_llm_provider,
+            ):
+                line_accumulator = _PassThroughStreamLineAccumulator()
             chunk_count = 0
             total_stream_bytes = 0
             first_chunk_at: Optional[datetime] = None
@@ -568,6 +619,8 @@ class PassThroughStreamingHandler:
                     )
 
                 raw_bytes.append(chunk)
+                if line_accumulator is not None:
+                    line_accumulator.feed(chunk)
                 if (
                     getattr(litellm, "include_cost_in_streaming_usage", False)
                     and model_name
@@ -632,6 +685,10 @@ class PassThroughStreamingHandler:
                 },
             )
 
+            precomputed_lines: Optional[List[str]] = None
+            if line_accumulator is not None:
+                precomputed_lines = line_accumulator.finish()
+
             asyncio.create_task(
                 PassThroughStreamingHandler._route_streaming_logging_to_handler(
                     litellm_logging_obj=litellm_logging_obj,
@@ -642,6 +699,7 @@ class PassThroughStreamingHandler:
                     endpoint_type=endpoint_type,
                     start_time=start_time,
                     raw_bytes=raw_bytes,
+                    precomputed_lines=precomputed_lines,
                     end_time=end_time,
                     passthrough_logging_payload=passthrough_logging_payload,
                     custom_llm_provider=custom_llm_provider,
@@ -978,6 +1036,7 @@ class PassThroughStreamingHandler:
         start_time: datetime,
         raw_bytes: List[bytes],
         end_time: datetime,
+        precomputed_lines: Optional[List[str]] = None,
         model: Optional[str] = None,
         passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = None,
         custom_llm_provider: Optional[str] = None,
@@ -997,8 +1056,13 @@ class PassThroughStreamingHandler:
         handler_branch = handler_branch_state[0]
         try:
             finalize_started_at = datetime.now()
-            all_chunks = PassThroughStreamingHandler._convert_raw_bytes_to_str_lines(
-                raw_bytes
+            all_chunks = PassThroughStreamingHandler._resolve_stream_logging_lines(
+                raw_bytes=raw_bytes,
+                precomputed_lines=precomputed_lines,
+                endpoint_type=endpoint_type,
+                url_route=url_route,
+                custom_llm_provider=custom_llm_provider,
+                success_handler_kwargs=success_handler_kwargs,
             )
             kwargs: dict = (
                 success_handler_kwargs
@@ -1101,6 +1165,46 @@ class PassThroughStreamingHandler:
                 return model
 
         return None
+
+    @staticmethod
+    def _stream_summary_first_finalize_enabled() -> bool:
+        return _truthy_env_flag(
+            PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV
+        )
+
+    @staticmethod
+    def _stream_summary_first_finalize_eligible(
+        *,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+    ) -> bool:
+        if not PassThroughStreamingHandler._stream_summary_first_finalize_enabled():
+            return False
+        if endpoint_type == EndpointType.ANTHROPIC:
+            return True
+        if endpoint_type == EndpointType.OPENAI:
+            return OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+        return False
+
+    @staticmethod
+    def _resolve_stream_logging_lines(
+        *,
+        raw_bytes: List[bytes],
+        precomputed_lines: Optional[List[str]],
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+        success_handler_kwargs: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
+            success_handler_kwargs
+        )
+        if precomputed_lines is not None:
+            metadata["aawm_stream_finalize_line_source"] = "incremental_summary"
+            return list(precomputed_lines)
+        metadata["aawm_stream_finalize_line_source"] = "raw_bytes_rebuild"
+        return PassThroughStreamingHandler._convert_raw_bytes_to_str_lines(raw_bytes)
 
     @staticmethod
     def _convert_raw_bytes_to_str_lines(raw_bytes: List[bytes]) -> List[str]:
