@@ -3021,6 +3021,38 @@ the infrastructure pin, rebuilding/restarting `aawm-litellm`, and validating
 
 ---
 
+### aawm.92 — Preserve JSON content type for Codex passthrough egress
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.92`. Codex
+OpenAI passthrough JSON egress now preserves existing JSON media types such as
+`application/json` and `+json`, sets `content-type: application/json` when
+JSON egress has no content type, and only replaces stale non-JSON content
+types before calling the ChatGPT Codex backend.
+
+**Why:** The `aawm.91` release candidate fixed missing JSON content-type
+handling but overcorrected by removing even valid `application/json` headers.
+Fresh dev traffic on `litellm-dev` returned
+`400 {"detail":"Unsupported content type"}` from
+`chatgpt.com/backend-api/codex/responses` with safe error metadata proving
+`aawm_passthrough_json_egress_content_type_removed=true` and removed value
+`application/json`.
+
+**Why not upstream:** This is a local AAWM ChatGPT-account Codex passthrough
+egress policy fix for the fork's OpenAI passthrough route and error-intake
+workflow. It preserves the prior raw-body and multipart boundaries while
+restoring the explicit JSON media type required by the Codex backend.
+
+**Validation status:** Focused pytest coverage passed for JSON content-type
+preservation, missing content-type fallback, stale non-JSON replacement, and
+the Codex streaming `400` error-intake path. `litellm-dev` was recreated on
+`:4001`, readiness returned healthy, runtime inspection inside the container
+proved the JSON helper preserves `application/json`, and post-restart Codex
+passthrough traffic produced no fresh `Unsupported content type` error intake.
+Production promotion must use `v1.82.3-aawm.92` or newer; the already-published
+`v1.82.3-aawm.91` image predates this fix.
+
+---
+
 ### aawm.91 — Codex passthrough content-type and auto-review hosted-tool policy
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.91`. Codex
