@@ -149,6 +149,18 @@ _AAWM_PASSTHROUGH_ERROR_LOG_TRACE_METADATA_KEYS = (
     "existing_trace_id",
     "langfuse_existing_trace_id",
 )
+_AAWM_PASSTHROUGH_ERROR_LOG_REQUEST_SHAPE_KEYS = (
+    "aawm_passthrough_inbound_content_type",
+    "aawm_passthrough_json_egress_content_type_removed",
+    "aawm_passthrough_json_egress_content_type_removed_value",
+    "aawm_passthrough_body_container_type",
+    "aawm_passthrough_body_top_level_keys",
+    "aawm_passthrough_input_container_type",
+    "aawm_passthrough_input_item_count",
+    "aawm_passthrough_input_item_type_counts",
+    "aawm_passthrough_tool_count",
+    "aawm_passthrough_tool_type_counts",
+)
 _AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS = (
     "grok_side_channel",
     "grok_side_channel_endpoint_type",
@@ -1354,7 +1366,33 @@ def _passthrough_error_context_metadata_value(value: Any) -> Any:
         return value
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value
+    if isinstance(value, list):
+        cleaned_list = [
+            cleaned
+            for item in value[:20]
+            if (cleaned := _clean_passthrough_error_context_value(item)) is not None
+        ]
+        return cleaned_list
+    if isinstance(value, dict):
+        cleaned_dict: Dict[str, Any] = {}
+        for key, item in list(value.items())[:20]:
+            cleaned_key = _clean_passthrough_error_context_value(key)
+            cleaned_value = _passthrough_error_context_metadata_value(item)
+            if cleaned_key is not None and cleaned_value is not None:
+                cleaned_dict[cleaned_key] = cleaned_value
+        return cleaned_dict
     return _clean_passthrough_error_context_value(value)
+
+
+def _build_passthrough_error_log_request_shape_context(
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    for field_name in _AAWM_PASSTHROUGH_ERROR_LOG_REQUEST_SHAPE_KEYS:
+        value = _passthrough_error_context_metadata_value(metadata.get(field_name))
+        if value is not None:
+            context[field_name] = value
+    return context
 
 
 def _build_passthrough_error_log_grok_side_channel_context(
@@ -1417,6 +1455,115 @@ def _build_passthrough_error_log_auth_context(
         "auth_header_sources": auth_header_sources,
         "auth_credential_source": auth_credential_source,
     }
+
+
+def _passthrough_container_type(value: Any) -> str:
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _count_passthrough_item_types(items: Any) -> Dict[str, int]:
+    if not isinstance(items, list):
+        return {}
+
+    type_counts: Dict[str, int] = {}
+    for item in items:
+        if isinstance(item, dict):
+            item_type = _clean_passthrough_error_context_value(item.get("type"))
+            if not item_type:
+                item_type = "object_without_type"
+        else:
+            item_type = _passthrough_container_type(item)
+        type_counts[item_type] = type_counts.get(item_type, 0) + 1
+    return dict(sorted(type_counts.items()))
+
+
+def _merge_passthrough_request_shape_metadata(
+    metadata: Dict[str, Any],
+    *,
+    request: Request,
+    parsed_body: Optional[dict],
+    provider_bound_body: Optional[dict],
+    json_egress_content_type_removed: Optional[str] = None,
+) -> None:
+    inbound_content_type = _clean_passthrough_error_context_value(
+        request.headers.get("content-type")
+    )
+    if inbound_content_type:
+        metadata.setdefault(
+            "aawm_passthrough_inbound_content_type",
+            inbound_content_type,
+        )
+
+    if json_egress_content_type_removed:
+        metadata["aawm_passthrough_json_egress_content_type_removed"] = True
+        metadata["aawm_passthrough_json_egress_content_type_removed_value"] = (
+            _clean_passthrough_error_context_value(json_egress_content_type_removed)
+        )
+
+    body = provider_bound_body if isinstance(provider_bound_body, dict) else parsed_body
+    metadata["aawm_passthrough_body_container_type"] = _passthrough_container_type(body)
+    if not isinstance(body, dict):
+        return
+
+    top_level_keys = [
+        key
+        for key in (
+            _clean_passthrough_error_context_value(key)
+            for key in sorted(body.keys(), key=str)
+        )
+        if key is not None and key != "litellm_logging_obj"
+    ]
+    metadata["aawm_passthrough_body_top_level_keys"] = top_level_keys[:40]
+
+    input_value = body.get("input")
+    metadata["aawm_passthrough_input_container_type"] = _passthrough_container_type(
+        input_value
+    )
+    if isinstance(input_value, list):
+        metadata["aawm_passthrough_input_item_count"] = len(input_value)
+        metadata["aawm_passthrough_input_item_type_counts"] = (
+            _count_passthrough_item_types(input_value)
+        )
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        metadata["aawm_passthrough_tool_count"] = len(tools)
+        metadata["aawm_passthrough_tool_type_counts"] = (
+            _count_passthrough_item_types(tools)
+        )
+
+
+def _headers_for_json_passthrough_egress(
+    headers: Dict[str, Any],
+) -> tuple[Dict[str, Any], Optional[str]]:
+    json_headers = dict(headers)
+    removed_content_type: Optional[str] = None
+    for header_name in list(json_headers.keys()):
+        if str(header_name).lower() == "content-type":
+            removed_content_type = _clean_passthrough_error_context_value(
+                json_headers.pop(header_name)
+            )
+    return json_headers, removed_content_type
+
+
+def _is_json_passthrough_egress(
+    *,
+    request: Request,
+    raw_body: Optional[bytes],
+    provider_bound_body: Optional[dict],
+) -> bool:
+    if request.method == "GET" or raw_body is not None:
+        return False
+    return not (
+        HttpPassThroughEndpointHelpers.is_multipart(request) is True
+        and not provider_bound_body
+    )
 
 
 def _build_passthrough_error_log_endpoint(
@@ -1561,6 +1708,7 @@ def _build_passthrough_error_log_context(
             litellm_call_id
         ),
     }
+    context.update(_build_passthrough_error_log_request_shape_context(metadata))
     context.update(grok_side_channel_context)
     context.update(
         _build_passthrough_error_log_auth_context(
@@ -2209,10 +2357,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 params=requested_query_params,
             )
         else:
+            json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
+                headers
+            )
             response = await async_client.request(
                 method=request.method,
                 url=url,
-                headers=headers,
+                headers=json_headers,
                 params=requested_query_params,
                 json=custom_body,
             )
@@ -2263,10 +2414,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             )
         else:
             # Generic httpx method
+            json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
+                headers
+            )
             response = await async_client.request(
                 method=request.method,
                 url=url,
-                headers=headers,
+                headers=json_headers,
                 params=requested_query_params,
                 json=_parsed_body,
             )
@@ -2760,6 +2914,12 @@ async def pass_through_request(  # noqa: PLR0915
 
         metadata = _ensure_passthrough_metadata(kwargs)
         metadata["aawm_passthrough_endpoint_type"] = endpoint_type.value
+        _merge_passthrough_request_shape_metadata(
+            metadata,
+            request=request,
+            parsed_body=_parsed_body,
+            provider_bound_body=provider_bound_body,
+        )
         error_log_context = _build_passthrough_error_log_context(
             request=request,
             url=url,
@@ -2852,17 +3012,41 @@ async def pass_through_request(  # noqa: PLR0915
                 stream=stream,
             )
         )
+        use_json_egress = _is_json_passthrough_egress(
+            request=request,
+            raw_body=raw_body,
+            provider_bound_body=provider_bound_body,
+        )
 
         if stream:
             upstream_wait_started_at = datetime.now()
 
             async def _send_stream_pre_first_byte() -> Tuple[httpx.Response, httpx.Request]:
+                stream_headers = headers
+                if use_json_egress:
+                    stream_headers, removed_content_type = (
+                        _headers_for_json_passthrough_egress(headers)
+                    )
+                    if removed_content_type:
+                        _merge_passthrough_request_shape_metadata(
+                            metadata,
+                            request=request,
+                            parsed_body=_parsed_body,
+                            provider_bound_body=provider_bound_body,
+                            json_egress_content_type_removed=removed_content_type,
+                        )
+                        if error_log_context is not None:
+                            error_log_context.update(
+                                _build_passthrough_error_log_request_shape_context(
+                                    metadata
+                                )
+                            )
                 req = async_client.build_request(
                     "POST",
                     url,
                     json=provider_bound_body,
                     params=requested_query_params,
-                    headers=headers,
+                    headers=stream_headers,
                 )
                 response = await async_client.send(req, stream=stream)
                 try:
@@ -2930,12 +3114,31 @@ async def pass_through_request(  # noqa: PLR0915
         upstream_wait_started_at = datetime.now()
 
         async def _send_non_stream_pre_first_byte() -> httpx.Response:
+            non_stream_headers = headers
+            if use_json_egress:
+                non_stream_headers, removed_content_type = (
+                    _headers_for_json_passthrough_egress(headers)
+                )
+                if removed_content_type:
+                    _merge_passthrough_request_shape_metadata(
+                        metadata,
+                        request=request,
+                        parsed_body=_parsed_body,
+                        provider_bound_body=provider_bound_body,
+                        json_egress_content_type_removed=removed_content_type,
+                    )
+                    if error_log_context is not None:
+                        error_log_context.update(
+                            _build_passthrough_error_log_request_shape_context(
+                                metadata
+                            )
+                        )
             response = (
                 await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
                     request=request,
                     async_client=async_client,
                     url=url,
-                    headers=headers,
+                    headers=non_stream_headers,
                     requested_query_params=requested_query_params,
                     _parsed_body=provider_bound_body,
                     raw_body=raw_body,

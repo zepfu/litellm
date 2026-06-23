@@ -73,6 +73,16 @@ Practical `context` fields to inspect are:
 - `queue_maxsize`
 - `coroutine_name`
 - `worker_delivery_state`
+- `aawm_passthrough_inbound_content_type`
+- `aawm_passthrough_json_egress_content_type_removed`
+- `aawm_passthrough_json_egress_content_type_removed_value`
+- `aawm_passthrough_body_container_type`
+- `aawm_passthrough_body_top_level_keys`
+- `aawm_passthrough_input_container_type`
+- `aawm_passthrough_input_item_count`
+- `aawm_passthrough_input_item_type_counts`
+- `aawm_passthrough_tool_count`
+- `aawm_passthrough_tool_type_counts`
 - `grok_side_channel`
 - `grok_side_channel_endpoint_type`
 - `grok_side_channel_endpoint_path_template`
@@ -107,6 +117,17 @@ provider, selected/requested model label, model alias, route family, status
 code when available, trace id, and LiteLLM call id. The pass-through sink
 intentionally omits raw request bodies, response bodies, headers, prompts, and
 credentials.
+
+For JSON pass-through egress, LiteLLM removes any inbound `content-type` header
+before calling `httpx` with `json=...`, allowing `httpx` to set the correct JSON
+content type for the serialized provider-bound body. This normalization is
+limited to JSON egress. Raw-body passthrough and multipart forwarding preserve
+or rebuild their own content-type handling as appropriate. When JSON egress
+removes an inbound content type, the runtime error JSONL context records only
+safe shape metadata such as the removed content-type value, provider-bound
+top-level keys, input container type/counts, and tool type counts. It must not
+record raw prompts, tool arguments, request bodies, credentials, or concrete
+session identifiers.
 
 Pass-through `httpx.TimeoutException` failures during upstream setup are
 reported as status code `504` so alias wrappers can classify them as upstream
