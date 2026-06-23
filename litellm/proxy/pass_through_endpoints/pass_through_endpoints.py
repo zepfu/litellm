@@ -170,6 +170,9 @@ _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
     "unable to load site",
     "cdn-cgi/challenge-platform",
 )
+_GOOGLE_CODE_ASSIST_HOST_SUFFIX = "cloudcode-pa.googleapis.com"
+_GOOGLE_CODE_ASSIST_TOS_REASON = "TOS_VIOLATION"
+_GOOGLE_CODE_ASSIST_PERMISSION_DENIED_STATUS = "PERMISSION_DENIED"
 
 
 def get_response_body(response: httpx.Response) -> Optional[dict]:
@@ -326,6 +329,16 @@ def _coerce_upstream_error_payload(detail: Any) -> Optional[dict[str, Any]]:
         detail_text = detail.decode("utf-8", errors="replace")
     elif isinstance(detail, str):
         detail_text = detail
+        stripped_detail = detail_text.strip()
+        if stripped_detail.startswith(("b'", 'b"')):
+            try:
+                literal_detail = ast.literal_eval(stripped_detail)
+            except Exception:
+                literal_detail = None
+            if isinstance(literal_detail, bytes):
+                detail_text = literal_detail.decode("utf-8", errors="replace")
+            elif isinstance(literal_detail, str):
+                detail_text = literal_detail
     elif isinstance(detail, dict):
         return detail
     else:
@@ -612,6 +625,72 @@ def _is_known_chatgpt_codex_block_page_response(
     return any(
         marker in normalized_detail for marker in _CHATGPT_CODEX_BLOCK_PAGE_MARKERS
     )
+
+
+def _is_google_code_assist_passthrough_target(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+) -> bool:
+    provider = str(custom_llm_provider or "").strip().lower()
+    hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
+    return (
+        provider in {"google_code_assist", "antigravity"}
+        or hostname.endswith(_GOOGLE_CODE_ASSIST_HOST_SUFFIX)
+    )
+
+
+def _is_google_code_assist_tos_violation_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+
+    code = error.get("code")
+    status_text = str(error.get("status") or "").strip().upper()
+    if code != status.HTTP_403_FORBIDDEN and status_text != (
+        _GOOGLE_CODE_ASSIST_PERMISSION_DENIED_STATUS
+    ):
+        return False
+
+    details = error.get("details")
+    if not isinstance(details, list):
+        return False
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        reason = str(detail.get("reason") or "").strip().upper()
+        domain = str(detail.get("domain") or "").strip().lower()
+        if reason == _GOOGLE_CODE_ASSIST_TOS_REASON and domain.endswith(
+            _GOOGLE_CODE_ASSIST_HOST_SUFFIX
+        ):
+            return True
+    return False
+
+
+def _is_known_google_code_assist_tos_violation_response(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_403_FORBIDDEN:
+        return False
+
+    if not _is_google_code_assist_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if detail is None:
+        return False
+
+    payload = _coerce_upstream_error_payload(detail)
+    return _is_google_code_assist_tos_violation_payload(payload)
 
 
 def _get_case_insensitive_mapping_value(
@@ -2999,6 +3078,14 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_google_code_assist_tos_traceback = (
+            _is_known_google_code_assist_tos_violation_response(
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
@@ -3042,6 +3129,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": "openai_chatgpt_codex_block_page",
+                },
+            )
+        elif suppress_google_code_assist_tos_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced Google Code Assist account TOS violation status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": "google_code_assist_tos_violation",
                 },
             )
         elif suppress_terminal_failure_traceback:
@@ -3114,6 +3211,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_chatgpt_codex_block_page_traceback
+            and not suppress_google_code_assist_tos_traceback
         ):
             traceback_str = traceback.format_exc(
                 limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,
