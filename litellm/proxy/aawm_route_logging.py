@@ -264,6 +264,59 @@ def _format_aawm_route_rollup_status_tag(status: Optional[str]) -> str:
     return f" [{normalized_status}]"
 
 
+def _resolve_aawm_route_rollup_default_destination(
+    incoming_endpoint: str,
+) -> Optional[str]:
+    parsed_endpoint = urlparse(incoming_endpoint)
+    endpoint_path = parsed_endpoint.path
+    if endpoint_path.startswith("/anthropic/"):
+        return f"api.anthropic.com{endpoint_path.removeprefix('/anthropic')}"
+    if endpoint_path.startswith("/openai_passthrough/"):
+        provider_path = endpoint_path.removeprefix("/openai_passthrough/")
+        if provider_path.startswith("v1/"):
+            provider_path = provider_path.removeprefix("v1/")
+        if provider_path:
+            return f"chatgpt.com/backend-api/codex/{provider_path}"
+    return None
+
+
+def _resolve_aawm_route_rollup_redundant_destination(
+    *,
+    incoming_endpoint: str,
+    sublines: list[tuple[str, int, Optional[str], str]],
+) -> Optional[str]:
+    default_destination = _resolve_aawm_route_rollup_default_destination(
+        incoming_endpoint
+    )
+    if default_destination is not None:
+        return default_destination
+    if not sublines:
+        return None
+
+    destinations: set[str] = set()
+    for _, _, _, outgoing_target in sublines:
+        if not outgoing_target:
+            continue
+        destinations.add(outgoing_target)
+        if len(destinations) > 1:
+            return None
+    if not destinations:
+        return None
+    return next(iter(destinations))
+
+
+def _format_aawm_route_rollup_subline_destination_suffix(
+    *,
+    outgoing_target: str,
+    common_destination: Optional[str],
+) -> str:
+    if not outgoing_target:
+        return ""
+    if common_destination is not None and outgoing_target == common_destination:
+        return ""
+    return f" -> {outgoing_target}"
+
+
 def _format_aawm_route_rollup_lines(
     *,
     group_header_label: str,
@@ -283,11 +336,15 @@ def _format_aawm_route_rollup_lines(
         ]
     )
     lines = [" ".join(header_segments)]
+    common_destination = _resolve_aawm_route_rollup_redundant_destination(
+        incoming_endpoint=incoming_endpoint,
+        sublines=sublines,
+    )
     for model_label, turns, status, outgoing_target in sublines:
         lines.append(
             f" - {model_label} - Turns: {turns}"
             f"{_format_aawm_route_rollup_status_tag(status)}"
-            f" -> {outgoing_target}"
+            f"{_format_aawm_route_rollup_subline_destination_suffix(outgoing_target=outgoing_target, common_destination=common_destination)}"
         )
     return lines
 

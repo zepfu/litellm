@@ -53,6 +53,36 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.94 — Route rollup redundant destination suppression
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.94`. Periodic
+AAWM route rollup logs now omit redundant subline destinations when the
+destination matches the incoming endpoint's default upstream target, while
+preserving divergent provider destinations for mixed-route buckets. Native
+Anthropic sublines under `/anthropic/v1/messages` no longer repeat
+`api.anthropic.com/v1/messages`, and native Codex passthrough sublines under
+`/openai_passthrough/responses` no longer repeat
+`chatgpt.com/backend-api/codex/responses`; adapter routes such as Grok,
+Google, OpenRouter, or OpenCode remain explicit when they differ.
+
+**Why:** The healthy rollup format had become easier to scan after moving
+destinations to model sublines, but buckets whose models all used the local
+endpoint's normal upstream repeated the same destination on every line. That
+noise obscured the useful signal: which sublines in the same repo/client
+bucket took a different provider path.
+
+**Why not upstream:** AAWM route rollups, endpoint-default semantics, and the
+Codex/Claude adapter observability shape are fork-local operational logging
+features.
+
+**Validation status:** Focused route-rollup unit coverage exercises all-same
+destination suppression, mixed Anthropic/Grok retention, mixed Codex/Gemini
+retention, status tags, and disabled-rollup immediate logging. Release requires
+dev runtime verification in `litellm-dev` and then production promotion per
+`PROD_RELEASE.md`.
+
+---
+
 ### aawm.2 — Skip x-api-key in /anthropic/ pass-through when OAuth token present
 
 **File:** `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`
